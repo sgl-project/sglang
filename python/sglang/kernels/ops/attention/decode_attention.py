@@ -46,11 +46,12 @@ logger = logging.getLogger(__name__)
 _MIN_BLOCK_KV = 32
 
 
-def _rotate_batch(batch: int) -> bool:
+def _rotate_batch(batch: int, uneven_batch: Optional[torch.Tensor]) -> bool:
     # HIP hands workgroups to XCDs round-robin. With batch as the fastest grid axis,
     # an even batch keeps each request on a subset of XCDs, so a long request or
-    # CUDA-graph padding rows leave the other XCDs idle.
-    return _is_hip and batch % 2 == 0
+    # CUDA-graph padding rows leave the other XCDs idle. A balanced batch is already
+    # spread evenly, so the kernels only rotate while uneven_batch holds 1.
+    return _is_hip and batch % 2 == 0 and uneven_batch is not None
 
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
@@ -272,13 +273,15 @@ def _fwd_kernel_stage1(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    uneven_batch=None,
     ROTATE_BATCH: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
     if ROTATE_BATCH:
-        cur_batch = (cur_batch + cur_head + split_kv_id) % tl.num_programs(0)
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + cur_head + split_kv_id) % tl.num_programs(0)
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
     cur_batch = cur_batch.to(tl.int64)
@@ -438,6 +441,7 @@ def _decode_att_m_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -515,7 +519,8 @@ def _decode_att_m_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
-        ROTATE_BATCH=_rotate_batch(batch),
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
     )
 
 
@@ -567,13 +572,17 @@ def _fwd_grouped_kernel_stage1(
     aux0_len=0,
     forced_kv_splits=0,
     USE_FORCED: tl.constexpr = False,
+    uneven_batch=None,
     ROTATE_BATCH: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     split_kv_id = tl.program_id(2)
     if ROTATE_BATCH:
-        cur_batch = (cur_batch + cur_head_id + split_kv_id) % tl.num_programs(0)
+        # Only the split rotates: the head tiles of one (request, split) read the same
+        # kv_indices (and the same latent KV under MLA), so they stay on one XCD.
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + split_kv_id) % tl.num_programs(0)
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
     cur_batch = cur_batch.to(tl.int64)
@@ -802,6 +811,7 @@ def _decode_grouped_att_m_fwd(
     aux_tensors=None,
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
+    uneven_batch=None,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -913,7 +923,8 @@ def _decode_grouped_att_m_fwd(
         aux0_len=aux0_len,
         forced_kv_splits=forced_kv_splits,
         USE_FORCED=forced_kv_splits > 0,
-        ROTATE_BATCH=_rotate_batch(batch),
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
         **extra_kargs,
     )
 
@@ -1079,6 +1090,7 @@ def decode_attention_fwd_normal(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1096,6 +1108,7 @@ def decode_attention_fwd_normal(
         page_size=page_size,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1132,6 +1145,7 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1154,6 +1168,7 @@ def decode_attention_fwd_grouped(
         aux_tensors=aux_tensors,
         tune_mla=tune_mla,
         forced_kv_splits=forced_kv_splits,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1198,6 +1213,7 @@ def decode_attention_fwd(
     lean_Lp=None,
     lean_Op=None,
     lean_locks=None,
+    uneven_batch=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1269,6 +1285,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            uneven_batch=uneven_batch,
         )
     else:
         # GQA/MQA/MLA
@@ -1293,6 +1310,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            uneven_batch=uneven_batch,
         )
 
 

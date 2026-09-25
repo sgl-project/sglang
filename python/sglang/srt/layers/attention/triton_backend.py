@@ -138,6 +138,8 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    # One int32, set by get_num_kv_splits when the decode seq lens are uneven
+    uneven_batch: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -414,6 +416,7 @@ class TritonAttnBackend(AttentionBackend):
         self,
         num_kv_splits: torch.Tensor,
         seq_lens: torch.Tensor,
+        uneven_batch: Optional[torch.Tensor] = None,
     ):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         # NOTE(alcanderian): Considering speculative_decodeing,
@@ -457,6 +460,7 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits,
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
+            uneven_batch_ptr=uneven_batch,
         )
 
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
@@ -821,6 +825,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lean decode buffers are only allocated on the decode path below; default
         # to None so the shared ForwardMetadata constructor works for extend/verify.
         lean_Mp = lean_Lp = lean_Op = lean_locks = None
+        uneven_batch = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -890,6 +895,7 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
+            uneven_batch = torch.zeros((1,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(
                 num_kv_splits,
                 (
@@ -897,6 +903,7 @@ class TritonAttnBackend(AttentionBackend):
                     if self.dcp_size > 1
                     else forward_batch.seq_lens
                 ),
+                uneven_batch,
             )
 
             # Lean decode persistent-grid partial-result buffers.
@@ -1063,6 +1070,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
             lean_locks=lean_locks,
+            uneven_batch=uneven_batch,
         )
 
     def init_cuda_graph_state(
@@ -1125,6 +1133,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
+        self.cuda_graph_uneven_batch = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
 
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
@@ -1230,6 +1241,7 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Lp=self.cuda_graph_lean_Lp,
                 lean_Op=self.cuda_graph_lean_Op,
                 lean_locks=self.cuda_graph_lean_locks,
+                uneven_batch=self.cuda_graph_uneven_batch,
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -1325,7 +1337,9 @@ class TritonAttnBackend(AttentionBackend):
                 bs, seq_lens, req_pool_indices
             )
             self.get_num_kv_splits(
-                self.cuda_graph_num_kv_splits[:bs], num_kv_splits_lens[:bs]
+                self.cuda_graph_num_kv_splits[:bs],
+                num_kv_splits_lens[:bs],
+                self.cuda_graph_uneven_batch,
             )
             if window_kv_lens is not None:
                 self.get_num_kv_splits(
@@ -2329,6 +2343,7 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Lp=self.forward_metadata.lean_Lp,
                 lean_Op=self.forward_metadata.lean_Op,
                 lean_locks=self.forward_metadata.lean_locks,
+                uneven_batch=self.forward_metadata.uneven_batch,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -2366,6 +2381,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=self.forward_metadata.lean_Lp,
             lean_Op=self.forward_metadata.lean_Op,
             lean_locks=self.forward_metadata.lean_locks,
+            uneven_batch=self.forward_metadata.uneven_batch,
         )
         return o
 
