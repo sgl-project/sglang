@@ -83,6 +83,46 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 
 
+class _LastRowTrunk:
+    """Wraps a model's headless trunk so a forward returns only its last row.
+
+    Attribute access (``embed_tokens``, ``args``, ...) resolves to the real trunk.
+    """
+
+    __slots__ = ("_trunk",)
+
+    def __init__(self, trunk):
+        self._trunk = trunk
+
+    def __call__(self, *args, **kwargs):
+        return self._trunk(*args, **kwargs)[:, -1:, :]
+
+    def __getattr__(self, name):
+        return getattr(self._trunk, name)
+
+
+class _LastRowModel:
+    """Stand-in ``self`` for ``Model.__call__`` that computes logits for the last position only.
+
+    mlx-lm models run ``self.model`` (the trunk) and then apply the head to every
+    position, so a chunk of T tokens produces a [T, vocab] logits array of which
+    the runner reads one row. Calling ``type(model).__call__(_LastRowModel(model),
+    ...)`` runs the same method with ``.model`` replaced by a trunk whose output is
+    sliced to its last row, so the head, and whatever the model does after it
+    (soft-capping, scaling), run on one row. Every other attribute resolves to the
+    real model, and nothing on the model is mutated.
+    """
+
+    __slots__ = ("_model", "model")
+
+    def __init__(self, model, trunk):
+        self._model = model
+        self.model = _LastRowTrunk(trunk)
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
 @dataclass
 class MlxPendingPrefill:
     """Lazy prefill state, finalised after ``mx.eval``/``async_eval``.
@@ -1149,7 +1189,8 @@ class MlxModelRunner:
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Forward one chunk, returning (lazy next-token, lazy logprobs).
 
-        Skips the logit head for discarded-output chunks when possible.
+        Skips the logit head for discarded-output chunks when possible, and
+        applies it to the last position only otherwise.
         """
         if not needs_logits:
             hidden = self._trunk_forward(input_ids, cache)
@@ -1161,7 +1202,17 @@ class MlxModelRunner:
             model_output = self.model(input_ids, cache=cache)
             logits = self._extract_logits(model_output)
             return mx.argmax(logits[:, -1, :], axis=-1), None
-        model_output = self.model(input_ids, cache=cache)
+        if input_ids.shape[1] > 1 and self._trunk is not None:
+            # Only the last row of the logits is read, but the model's own
+            # forward applies the head to every position: [chunk, vocab] bf16
+            # logits, 2.3 GB for an 8192-token chunk of a 152k vocab, and the
+            # largest transient allocation in the process. The trunk still runs
+            # once over the whole chunk, so the KV cache is unchanged.
+            model_output = type(self.model).__call__(
+                _LastRowModel(self.model, self._trunk), input_ids, cache=cache
+            )
+        else:
+            model_output = self.model(input_ids, cache=cache)
         logits = self._extract_logits(model_output)
         edits = logit_edit_row[None, :] if logit_edit_row is not None else None
         return self._select_tokens_with_logprobs(
