@@ -14,10 +14,13 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .topk import topk_transform_bf16_small
 from .utils import make_name
 
 if TYPE_CHECKING:
     pass
+
+CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
 
 
 @cache_once
@@ -91,3 +94,70 @@ def sort_candidate_blocks(
         blocks, seq_lens, page_table, out_pages, page_size
     )
     return out_pages
+
+
+def build_sparse_indexer_schedule(
+    blocks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    q_dtype: torch.dtype,
+    request_ids: torch.Tensor,
+) -> torch.Tensor:
+    """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
+    int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
+    ``request_ids`` ``[rows]`` int32 lets DeepGEMM pair two rows of a request on
+    one KV pass; each row keeps its own block list and output layout, and paired
+    rows must share their page-table row."""
+    import deep_gemm
+
+    return deep_gemm.get_paged_sparse_mqa_logits_metadata(
+        seq_lens.contiguous(),
+        page_table,
+        request_ids,
+        page_size,
+        blocks,
+        q_dtype,
+        CANDIDATE_BLOCK_SIZE,
+    )
+
+
+def sparse_logits(
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    schedule: torch.Tensor,
+    topk_blocks: int,
+) -> torch.Tensor:
+    """bf16 logits ``[rows, topk_blocks * 8]`` of the published blocks: ``q_fp4``
+    ``[rows, 1, heads, 64]`` int8 with ``q_sf`` ``[rows, 1, heads]`` int32 (packed
+    ue8m0), ``k_cache`` ``[pages, page_size, 1, 68]`` uint8 whose page stride is
+    a multiple of 512 bytes, ``weights`` ``[rows, heads]`` bf16, ``schedule`` the
+    ``build_sparse_indexer_schedule`` of the ``topk_blocks`` published blocks."""
+    import deep_gemm
+
+    return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+        (q_fp4, q_sf),
+        k_cache,
+        weights,
+        schedule,
+        topk_blocks,
+        CANDIDATE_BLOCK_SIZE,
+    )
+
+
+def topk_transform_sparse(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    phys_blocks: torch.Tensor,
+    page_indices: torch.Tensor,
+) -> None:
+    """Top-``k`` (``k = page_indices.shape[1]``) of every row of the sparse
+    ``logits`` (bf16 ``[rows, topk_blocks * 8]``) within its first ``valid_lens[b]``
+    columns, written as pool slots, ``-1`` where a row has fewer than ``k`` valid
+    columns, in no particular order; ``phys_blocks`` ``[rows, topk_blocks]`` int32
+    holds the published blocks as pool slots / 8."""
+    topk_transform_bf16_small(
+        logits, valid_lens, phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
+    )
