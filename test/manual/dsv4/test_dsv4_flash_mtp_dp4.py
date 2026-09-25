@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -128,15 +128,14 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
         """Accuracy + spec path full forward."""
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.95)
 
@@ -144,15 +143,14 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
         """Degenerate spec step (still cuda-graph captured)."""
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=100,
-            max_new_tokens=1,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=100,
+            max_tokens=1,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["output_throughput"], 50)
 
     def test_request_abort(self):
