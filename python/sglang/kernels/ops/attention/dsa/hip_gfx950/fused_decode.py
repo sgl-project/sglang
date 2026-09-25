@@ -231,8 +231,7 @@ class Gfx950FusedIndexer:
                         "gfx950 fused DSA indexer: workspace is %d columns wide "
                         "but this call needs %d, so the standard indexer runs "
                         "instead. The workspace must cover the decode graph's "
-                        "page-table width; check "
-                        "SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.",
+                        "page-table width.",
                         ws.max_cols,
                         max_cols,
                     )
@@ -298,7 +297,7 @@ class Gfx950FusedIndexer:
 
         # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
         # indexer_k_quant_and_cache(k) | head gate.  hadamard=True is why
-        # gfx950 has its own gate; see dsa/utils.assert_hadamard_preserved.
+        # gfx950 has its own gate; see dsa/utils.hadamard_preserved.
         qk.indexer_qk_rope_hadamard_quant_and_cache(
             q_proj.view(rows, N_HEADS, HEAD_DIM),
             q_fp8,

@@ -35,9 +35,9 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
-    assert_hadamard_preserved,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
+    hadamard_preserved,
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
@@ -407,10 +407,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 "using the legacy ROCm indexer writer"
             )
         elif self.use_aiter_fused_fp8_writer:
-            global _FUSED_FP8_WRITER_LOGGED
-            if not _FUSED_FP8_WRITER_LOGGED:
-                logger.info("Enabled AITER fused FP8 DSA indexer writer")
-                _FUSED_FP8_WRITER_LOGGED = True
             self._fused_fp8_rope_cache_key = None
             self._fused_fp8_cos_cache = None
             self._fused_fp8_sin_cache = None
@@ -489,7 +485,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 gfx950_weights_ok,
             )
         if self.use_gfx950_fused_indexer:
-            assert_hadamard_preserved(self)
+            # The fused kernels write Hadamard-rotated index-K, and prefill must
+            # write the same format; the AITER fused FP8 writer skips the rotation.
+            self.use_aiter_fused_fp8_writer = False
+            self.k_norm = LayerNorm(self.head_dim, dtype=torch.bfloat16)
+            # Off rather than fatal: without the fused path both phases share a format.
+            self.use_gfx950_fused_indexer = hadamard_preserved(self)
+        if self.use_gfx950_fused_indexer:
             from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
                 Gfx950FusedIndexer,
                 consume_fresh_allocation,
@@ -516,15 +518,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if max_ctx:
                 pages = -(-(max_ctx + extra) // 64) + _PAGE_SLACK
                 max_ctx = pages * 64
-            cap = envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get()
-            if cap:
-                max_ctx = min(max_ctx, cap)
             if max_ctx:
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),
                     max_cols=max_ctx,
                     fp8_dtype=fp8_dtype,
                 )
+
+        # After the gfx950 fused indexer's gate, which may turn the writer off.
+        global _FUSED_FP8_WRITER_LOGGED
+        if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
+            logger.info("Enabled AITER fused FP8 DSA indexer writer")
+            _FUSED_FP8_WRITER_LOGGED = True
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
