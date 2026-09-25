@@ -449,14 +449,20 @@ class SchedulePolicy:
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        reserve_tokens: int,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
-        if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
-        ):
+        shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        if (not shortest_first and reserve_tokens == 0) or budget < 2 * page_size:
             return None
+        cap = budget - page_size
+        if reserve_tokens > 0:
+            cap = min(cap, reserve_tokens)
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
         )
@@ -464,8 +470,10 @@ class SchedulePolicy:
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
-                break
+            if work >= remaining or reserved + charge > cap:
+                if shortest_first:
+                    break
+                continue
             reserved += charge
         if not reserved:
             return None
@@ -1427,9 +1435,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                get_schedule().schedule_policy == "shortest-prefill-first"
+                or get_schedule().chunked_prefill_reserve_tokens > 0
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

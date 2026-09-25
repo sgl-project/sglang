@@ -79,6 +79,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    chunked_prefill_reserve_tokens: A[
+        int,
+        "Maximum tokens of each prefill step an in-flight chunked request leaves to waiting requests that fit whole, without reordering the waiting queue. Also caps the shortest-prefill-first reservation. Set to 0 to disable.",
+    ] = 0
     schedule_policy: A[
         str,
         Arg(
