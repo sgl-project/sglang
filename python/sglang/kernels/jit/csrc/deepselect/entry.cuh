@@ -143,11 +143,9 @@ auto make_plan(
   const DLDevice dev = device.unwrap();
   const auto input_stride_elements = input_stride.unwrap();
   CHECK_HOST(input_stride_elements >= 0) << "input row stride must be non-negative";
-  CHECK_HOST(
-      static_cast<uint64_t>(input_stride_elements) * sizeof(ValueT) % INPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
+  CHECK_HOST(static_cast<uint64_t>(input_stride_elements) * sizeof(ValueT) % INPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
       << "input row stride must be a multiple of " << INPUT_STRIDE_ALIGNMENT_REQUIREMENT << " bytes";
-  CHECK_HOST(
-      static_cast<uint64_t>(index_stride.unwrap()) * sizeof(OutIdxT) % OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
+  CHECK_HOST(static_cast<uint64_t>(index_stride.unwrap()) * sizeof(OutIdxT) % OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
       << "output_index row stride must be a multiple of " << OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT << " bytes";
 
   if (batch_size != 0 && vocab_size != 0) {

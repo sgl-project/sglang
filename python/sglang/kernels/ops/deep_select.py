@@ -187,7 +187,10 @@ def is_deepselect_supported(device=None) -> bool:
         )
         if normalized_device.type != "cuda":
             return False
-        return torch.cuda.get_device_capability(normalized_device) in _SUPPORTED_CAPABILITIES
+        return (
+            torch.cuda.get_device_capability(normalized_device)
+            in _SUPPORTED_CAPABILITIES
+        )
     except (RuntimeError, TypeError, ValueError):
         return False
 
@@ -293,8 +296,7 @@ def topk(
         cluster_size if use_cluster else 1,
     )
     input_storage_bytes = (
-        input.untyped_storage().nbytes()
-        - input.storage_offset() * input.element_size()
+        input.untyped_storage().nbytes() - input.storage_offset() * input.element_size()
     )
     module.topk(
         input,
