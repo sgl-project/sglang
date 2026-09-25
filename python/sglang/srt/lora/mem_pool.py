@@ -20,8 +20,9 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -290,6 +291,38 @@ class LoRAMemoryPool:
             return self.attn_tp_size
         return self.tp_size
 
+    def _dense_local_dim(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+        axis: str,
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
+            return None
+        linears = getattr(self, "_dense_linears", None)
+        if linears is None:
+            linears = {}
+            for name, module in base_model.named_modules():
+                layer_id = get_layer_id(name)
+                base_layer = unwrap_lora_layer(module)
+                if layer_id is not None and (
+                    hasattr(base_layer, "input_size_per_partition")
+                    or hasattr(base_layer, "output_partition_sizes")
+                ):
+                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+            self._dense_linears = linears
+        base_layer = linears.get((module_name, layer_idx))
+        if base_layer is None:
+            return None
+        if axis == "input":
+            return getattr(base_layer, "input_size_per_partition", None)
+        partitions = getattr(base_layer, "output_partition_sizes", None)
+        if not partitions:
+            return None
+        return sum(partitions[: get_stacked_multiply(module_name, base_model)])
+
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
         cfg = base_model.config
@@ -525,54 +558,6 @@ class LoRAMemoryPool:
         cache[key] = out
         return out
 
-    def _column_parallel_out_partition(
-        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
-    ):
-        """Actual per-rank output dim of a non-MoE column-parallel base module.
-
-        Reads ``output_size_per_partition`` from the matching base linear -- the
-        ground truth that ``set_lora_info`` validates against. Critically handles
-        the dense MLP ``gate_up_proj`` that is fully REPLICATED under
-        ``--moe-dense-tp-size 1`` (``output_size_per_partition == output_size``),
-        where dividing ``get_hidden_dim``'s output by the global ``tp_size``
-        undersizes LoRA-B and raises "LoRA B output dim != base partition prefix
-        dim". Returns ``None`` if no base module is found. Cached per
-        ``(module_name, layer_idx)``.
-        """
-        cache = getattr(self, "_col_parallel_out_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(self, "_col_parallel_out_cache", cache)
-        key = (module_name, layer_idx)
-        if key in cache:
-            return cache[key]
-
-        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
-
-        def _probe(m):
-            ops = getattr(m, "output_size_per_partition", None)
-            if ops is not None and ops > 0:
-                return ops
-            inner = getattr(m, "base_layer", None)
-            if inner is not None and inner is not m:
-                return _probe(inner)
-            return None
-
-        suffix = f".{module_name}"
-        found = None
-        for _name, module in base_model.named_modules():
-            if not _name.endswith(suffix):
-                continue
-            if not any(marker in _name for marker in layer_markers):
-                continue
-            r = _probe(module)
-            if r is not None:
-                found = r
-                break
-
-        cache[key] = found
-        return found
-
     def _get_standard_shape(
         self,
         module_name: str,
@@ -613,11 +598,16 @@ class LoRAMemoryPool:
         c = get_stacked_multiply(module_name, base_model)
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "input"
+            )
+            if local_dim is not None:
+                input_dim = local_dim
+            elif effective_tp_size > 1:
+                input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
@@ -711,26 +701,15 @@ class LoRAMemoryPool:
         # Same sharding rule as get_lora_A_shape above.
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            # If the base column-parallel module is fully REPLICATED (its actual
-            # output_size_per_partition still equals the full output_dim -- e.g. the
-            # dense MLP gate_up under --moe-dense-tp-size 1), its output is NOT
-            # sharded, so keep LoRA-B at the full output dim. Dividing by the global
-            # tp_size here undersizes B and crashes set_lora_info ("LoRA B output dim
-            # != base partition prefix dim"). Non-MoE only; MoE shards by moe_tp_size.
-            probed_out = (
-                None
-                if self.is_moe_module(module_name)
-                else self._column_parallel_out_partition(
-                    module_name, base_model, layer_idx
-                )
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "output"
             )
-            if probed_out is not None and probed_out == output_dim:
-                pass  # replicated base: keep full B output dim
-            else:
+            if local_dim is not None:
+                output_dim = local_dim
+            elif effective_tp_size > 1:
                 output_dim = self._column_parallel_lora_b_per_rank_dim(
                     module_name, output_dim, effective_tp_size
                 )
