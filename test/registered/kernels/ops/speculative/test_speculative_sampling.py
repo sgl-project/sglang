@@ -13,7 +13,7 @@ if torch.version.cuda is not None:
 else:
     from sgl_kernel import tree_speculative_sampling_target_only
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=46, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 test_cases = [
     (

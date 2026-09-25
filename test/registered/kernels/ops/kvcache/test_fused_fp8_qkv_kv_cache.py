@@ -4,7 +4,7 @@ import torch
 from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 FP8 = torch.float8_e4m3fn

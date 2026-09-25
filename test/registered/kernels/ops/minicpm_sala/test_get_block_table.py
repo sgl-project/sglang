@@ -4,7 +4,7 @@ import torch
 from sglang.kernels.ops.minicpm_sala.get_block_table import get_block_table
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _HEAD_GROUP = 2
 _SPARSE_BLOCK_SIZE = 64

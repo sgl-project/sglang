@@ -31,7 +31,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=131, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")

@@ -101,7 +101,7 @@ Use the lightest suite that meets your test's needs:
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
 - **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
-- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-large`
+- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-small` (default; SM90-only kernels → `base-b-kernel-unit-test-1-gpu-large`)
 - **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-test-4-gpu-b200`
 - **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-large`
 - **Multi-GPU** → only when the test actually needs multiple GPUs
@@ -335,7 +335,7 @@ They are ordinary registered tests; only their stage differs:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/kernels/ops/<group>/
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 

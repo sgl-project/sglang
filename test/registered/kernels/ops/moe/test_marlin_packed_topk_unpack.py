@@ -17,7 +17,7 @@ import torch
 from sglang.srt.layers.moe.moe_runner.marlin import _fused_unpack_packed_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _torch_unpack(packed: torch.Tensor):
