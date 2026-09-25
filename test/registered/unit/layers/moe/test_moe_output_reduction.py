@@ -14,6 +14,7 @@ from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
     post_experts_output_is_complete,
     reduce_moe_output,
+    should_add_replicated_moe_output,
 )
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -34,13 +35,21 @@ def a2a(name=None):
 
 @contextlib.contextmanager
 def moe_config(
-    *, tp_size=2, dwdp_size=1, backend=None, fp4_allgather=False, reduce_scatterv=False
+    *,
+    tp_size=2,
+    tp_rank=0,
+    dwdp_size=1,
+    backend=None,
+    fp4_allgather=False,
+    reduce_scatterv=False,
 ):
     with (
         patch.object(
             moe_utils,
             "get_parallel",
-            return_value=types.SimpleNamespace(tp_size=tp_size, dwdp_size=dwdp_size),
+            return_value=types.SimpleNamespace(
+                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size
+            ),
         ),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a(backend)),
         patch.object(
@@ -104,6 +113,83 @@ class TestReduceMoeOutput(CustomTestCase):
     def test_fp4_allgather_only_completes_the_tp_sum(self):
         with moe_config(fp4_allgather=True):
             self.assertFalse(post_experts_output_is_complete(is_tp_path=False))
+
+
+class TestReplicatedMoeOutput(CustomTestCase):
+    """A shared expert replicated with tp_size=1 holds its full output on every
+    rank; whatever sums the MoE output over TP must count it once."""
+
+    def summed_over_two_ranks(self, *, flags=None, **config):
+        routed = [torch.full((2, 3), 1.0), torch.full((2, 3), 2.0)]
+        shared = torch.full((2, 3), 10.0)
+        outputs = []
+        for rank in (0, 1):
+            with (
+                moe_config(tp_rank=rank, **config),
+                get_forward().scoped(**(flags or {})),
+            ):
+                output = routed[rank]
+                if should_add_replicated_moe_output():
+                    output = output + shared
+            outputs.append(output)
+        return outputs
+
+    def test_a_later_sum_counts_it_once(self):
+        for flags, config in (
+            ({"fuse_mlp_allreduce": True}, {}),
+            ({"mlp_reduce_scatter": True}, {}),
+            ({}, {"reduce_scatterv": True}),
+        ):
+            with self.subTest(flags=flags, config=config):
+                outputs = self.summed_over_two_ranks(flags=flags, **config)
+                torch.testing.assert_close(sum(outputs), torch.full((2, 3), 13.0))
+
+    def test_every_rank_adds_it_to_a_reduced_or_complete_output(self):
+        for config in ({}, {"backend": "flashinfer"}, {"fp4_allgather": True}):
+            with self.subTest(**config):
+                outputs = self.summed_over_two_ranks(**config)
+                torch.testing.assert_close(outputs[1], torch.full((2, 3), 12.0))
+
+    def test_a_single_rank_adds_it(self):
+        with (
+            moe_config(tp_size=1, tp_rank=0),
+            get_forward().scoped(fuse_mlp_allreduce=True),
+        ):
+            self.assertTrue(should_add_replicated_moe_output())
+
+
+def reads_the_tp1_shared_expert_switch(tree):
+    return any(
+        isinstance(node, ast.Attribute) and node.attr == "SGLANG_SHARED_EXPERT_TP1"
+        for node in ast.walk(tree)
+    )
+
+
+def calls(tree, name):
+    return any(
+        isinstance(node, ast.Call)
+        and name in (getattr(node.func, "id", None), getattr(node.func, "attr", None))
+        for node in ast.walk(tree)
+    )
+
+
+class TestReplicatedSharedExpertsCountOnce(CustomTestCase):
+    def test_models_that_replicate_the_shared_expert_add_it_once(self):
+        # SGLANG_SHARED_EXPERT_TP1 replicates the shared expert without an a2a
+        # backend, so the MoE output can still owe a later TP sum.
+        subjects = {}
+        for path in sorted(MODELS_DIR.rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            if reads_the_tp1_shared_expert_switch(tree):
+                subjects[str(path.relative_to(MODELS_DIR))] = calls(
+                    tree, "should_add_replicated_moe_output"
+                )
+        self.assertTrue(subjects, "no model reads SGLANG_SHARED_EXPERT_TP1")
+        self.assertEqual(
+            [name for name, ok in subjects.items() if not ok],
+            [],
+            "add the replicated shared output under should_add_replicated_moe_output",
+        )
 
 
 def open_coded_reductions(tree):
