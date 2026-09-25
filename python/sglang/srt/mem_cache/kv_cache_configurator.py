@@ -1390,6 +1390,16 @@ class KVCacheConfigurator:
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            layer_ids=(
+                self.layer_info.layer_ids
+                if get_parallel().pp_virtual_stages > 1
+                else tuple(
+                    range(
+                        self.layer_info.start_layer,
+                        self.layer_info.end_layer,
+                    )
+                )
+            ),
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
             unified_fp8=unified_fp8,

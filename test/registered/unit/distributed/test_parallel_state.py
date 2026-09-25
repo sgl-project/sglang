@@ -37,7 +37,7 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -170,6 +170,60 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
         outplace_all_reduce_method="ca",
     )
     coordinator.pynccl_comm.all_reduce.assert_not_called()
+
+
+def test_pp2_duplicate_transport_uses_matching_rank_groups():
+    world_size = 8
+    created_groups = {}
+
+    def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+        group_name = kwargs.get("group_name", "unknown")
+        created_groups[group_name] = group_ranks
+        group = Mock()
+        group.device_group = Mock()
+        return group
+
+    group_globals = (
+        "_TP",
+        "_DCP",
+        "_ATTN_CP",
+        "_ATTN_TP",
+        "_MOE_DP",
+        "_MOE_EP",
+        "_MOE_TP",
+        "_PP",
+        "_VPP_PP_REVERSE",
+        "_SELF_PP",
+    )
+    with ExitStack() as stack:
+        for name in group_globals:
+            stack.enter_context(patch.object(parallel_state, name, None))
+        stack.enter_context(
+            patch("torch.distributed.is_initialized", return_value=True)
+        )
+        stack.enter_context(
+            patch("torch.distributed.get_world_size", return_value=world_size)
+        )
+        stack.enter_context(patch("torch.distributed.get_rank", return_value=0))
+        stack.enter_context(patch("torch.distributed.get_backend", return_value="nccl"))
+        stack.enter_context(
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            )
+        )
+        mock_world_group = stack.enter_context(
+            patch.object(parallel_state, "get_world_group")
+        )
+        mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
+
+        publish_build_topology(tp_size=4, pp_size=2)
+        parallel_state.initialize_model_parallel(duplicate_pp_group=True)
+
+    expected = [[0, 4], [1, 5], [2, 6], [3, 7]]
+    assert created_groups["pp"] == expected
+    assert created_groups["vpp_pp_reverse"] == expected
 
 
 def test_parallel_group_construction_tp8_attn_cp2():

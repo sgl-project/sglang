@@ -63,6 +63,25 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 
+def resolve_dsv4_local_pool_layout(
+    compression_ratios: list[int],
+    kv_source_layer_ids: list[int],
+    layer_ids: tuple[int, ...],
+) -> tuple[list[int], set[int]]:
+    local_ratios = [compression_ratios[layer_id] for layer_id in layer_ids]
+    low_ratio_sources = {
+        max(
+            source
+            for source in kv_source_layer_ids
+            if source <= layer_id
+            and compression_ratios[source] == compression_ratios[layer_id]
+        )
+        for layer_id in layer_ids
+        if compression_ratios[layer_id] in (1, 2)
+    }
+    return local_ratios, low_ratio_sources
+
+
 @dataclass
 class MemoryPoolConfig:
     """Resolved memory pool config, shared between target and draft workers."""
@@ -991,19 +1010,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
-        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
-        stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
-        self.stage_compress_ratios = cfg.compress_ratios[stage.start : stage.stop]
+        self.layer_ids = (
+            kvc.layer_info.layer_ids
+            if get_parallel().pp_virtual_stages > 1
+            else tuple(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+        )
+        self.stage_compress_ratios, low_ratio_sources = resolve_dsv4_local_pool_layout(
+            cfg.compress_ratios,
+            cfg.hf_config.kv_source_layer_ids,
+            self.layer_ids,
+        )
         if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
-                f"layers=[{stage.start},{stage.stop}) "
+                f"layers={self.layer_ids} "
                 f"local={len(self.stage_compress_ratios)}/{len(cfg.compress_ratios)}"
             )
         # Layers of this stage that own compressed storage, per ratio. Same rule
         # as the pool, so a ratio budgeted here is one it allocates.
         self.stage_owner_layers = collect_sources_by_ratio(
-            cfg.compress_ratios, cfg.hf_config.kv_source_layer_ids, stage
+            cfg.compress_ratios, cfg.hf_config.kv_source_layer_ids, self.layer_ids
         )
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
@@ -1047,6 +1073,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
+        )
+        self.low_ratio_bytes_per_full_token = sum(
+            (self.kv_bytes + self.low_ratio_index_bytes) / cfg.compress_ratios[source]
+            for source in low_ratio_sources
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.

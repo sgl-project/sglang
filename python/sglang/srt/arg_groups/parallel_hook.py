@@ -38,6 +38,29 @@ def handle_context_parallelism(server_args: Any):
     run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
+    if cfg.pp_virtual_stages < 1:
+        raise ValueError("--pp-virtual-stages must be at least 1")
+    if cfg.pp_virtual_stages > 1 and cfg.pp_size == 1:
+        raise ValueError("--pp-virtual-stages > 1 requires --pp-size > 1")
+    if cfg.pp_vpp_prefill_burst_size < 1:
+        raise ValueError("--pp-vpp-prefill-burst-size must be at least 1")
+    if cfg.pp_vpp_prefill_burst_size > 1 and cfg.pp_virtual_stages != 2:
+        raise ValueError(
+            "--pp-vpp-prefill-burst-size > 1 requires --pp-virtual-stages 2"
+        )
+    if cfg.pp_vpp_max_inflight is not None:
+        if cfg.pp_virtual_stages != 2:
+            raise ValueError("--pp-vpp-max-inflight requires --pp-virtual-stages 2")
+        default_window = (
+            cfg.pp_size
+            if cfg.pp_vpp_prefill_burst_size == 1
+            else cfg.pp_size + cfg.pp_vpp_prefill_burst_size
+        )
+        if cfg.pp_vpp_max_inflight < default_window:
+            raise ValueError(
+                "--pp-vpp-max-inflight must be at least "
+                f"{default_window} for the configured PP/burst window"
+            )
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config

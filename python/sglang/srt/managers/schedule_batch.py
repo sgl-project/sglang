@@ -1153,6 +1153,9 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # One-shot PP consensus cap for the next prefill admission. It keeps
+        # all physical PP ranks on the same cached-prefix boundary.
+        self.vpp_prefix_limit: Optional[int] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1693,6 +1696,8 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.vpp_prefix_limit is not None:
+            max_prefix_len = min(max_prefix_len, self.vpp_prefix_limit)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -2348,6 +2353,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    disagg_prefill_chunk_end_by_rid: Optional[Dict[str, int]] = None
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -3837,6 +3843,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             after_idle_gap=self.after_idle_gap,
             split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
+            disagg_prefill_chunk_end_by_rid=self.disagg_prefill_chunk_end_by_rid,
         )
 
     def maybe_evict_swa(self):

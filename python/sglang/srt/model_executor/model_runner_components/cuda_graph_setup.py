@@ -62,6 +62,13 @@ logger = logging.getLogger(__name__)
 _deep_gemm_layout_memory_budget_initialized = False
 
 
+def _should_capture_decode_cuda_graph(capture_requested: bool) -> bool:
+    return capture_requested and not (
+        get_parallel().pp_virtual_stages > 1
+        and get_disagg().disaggregation_mode == "prefill"
+    )
+
+
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
@@ -376,6 +383,9 @@ def capture_cuda_graphs(
 
     """
 
+    capture_decode_cuda_graph = _should_capture_decode_cuda_graph(
+        capture_decode_cuda_graph
+    )
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )

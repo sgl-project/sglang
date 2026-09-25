@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import warnings
 import weakref
 from collections import namedtuple
@@ -119,6 +120,401 @@ class GraphCaptureContext:
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
+
+
+class _WorkGroupWaiter:
+    def __init__(self, works: List[torch.distributed.Work]):
+        self._works = works
+        self._error = None
+        self._done = threading.Event()
+        threading.Thread(target=self._wait, daemon=True).start()
+
+    def _wait(self) -> None:
+        try:
+            for work in self._works:
+                work.wait()
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def completed(self) -> bool:
+        return self._done.is_set()
+
+    def wait(self) -> None:
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+
+
+class P2PWorkGroup:
+    def __init__(self, items: List[P2PWork]):
+        self.items = items
+        cpu_works = [
+            item.work
+            for item in items
+            if item.work is not None
+            and isinstance(item.work, torch.distributed.Work)
+            and isinstance(item.payload, torch.Tensor)
+            and item.payload.is_cpu
+        ]
+        self._cpu_waiter = _WorkGroupWaiter(cpu_works) if cpu_works else None
+
+    def poll(self) -> bool:
+        if self._cpu_waiter is not None and not self._cpu_waiter.completed():
+            return False
+        for item in self.items:
+            if (
+                item.work is not None
+                and not (
+                    isinstance(item.work, torch.distributed.Work)
+                    and isinstance(item.payload, torch.Tensor)
+                    and item.payload.is_cpu
+                )
+                and not item.work.is_completed()
+            ):
+                return False
+
+        if self._cpu_waiter is not None:
+            self._cpu_waiter.wait()
+        for item in self.items:
+            if item.work is None:
+                continue
+            is_cpu_work = (
+                isinstance(item.work, torch.distributed.Work)
+                and isinstance(item.payload, torch.Tensor)
+                and item.payload.is_cpu
+            )
+            if not is_cpu_work:
+                item.work.wait()
+            item.work = None
+        self.items.clear()
+        return True
+
+    def payload_bytes(self) -> int:
+        return sum(
+            item.payload.numel() * item.payload.element_size()
+            for item in self.items
+            if isinstance(item.payload, torch.Tensor)
+        )
+
+
+class TensorDictRecvHandle:
+    _MAX_METADATA_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        coordinator: "GroupCoordinator",
+        src: int,
+        all_gather_group: Optional["GroupCoordinator"],
+        batch_p2p: bool,
+        tag: int,
+    ):
+        self._coordinator = coordinator
+        self._src = src
+        self._all_gather_group = all_gather_group
+        self._batch_p2p = batch_p2p
+        self._tag = tag
+        self._state = "metadata_size"
+        self._size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        self._metadata_tensor = None
+        self._metadata_work = None
+        self._metadata_waiter = None
+        self._payload_works = []
+        self._payload_waiter = None
+        self._tensor_entries = []
+        self._all_gather_entries = []
+        self._all_gather_waiter = None
+        self._result = None
+        self._size_work = torch.distributed.irecv(
+            self._size_tensor,
+            src=coordinator.ranks[src],
+            group=coordinator.cpu_group,
+            tag=tag,
+        )
+        self._size_waiter = self._make_waiter([self._size_work])
+
+    @staticmethod
+    def _make_waiter(works):
+        if works and all(isinstance(work, torch.distributed.Work) for work in works):
+            return _WorkGroupWaiter(works)
+        return None
+
+    @staticmethod
+    def _work_ready(work, block: bool, waiter=None) -> bool:
+        if waiter is not None:
+            if not block and not waiter.completed():
+                return False
+            waiter.wait()
+            return True
+        if block:
+            work.wait()
+            return True
+        if not work.is_completed():
+            return False
+        work.wait()
+        return True
+
+    def _poll_metadata_size(self, block: bool) -> bool:
+        if not self._work_ready(self._size_work, block, self._size_waiter):
+            return False
+        metadata_size = int(self._size_tensor.item())
+        if not 0 < metadata_size <= self._MAX_METADATA_BYTES:
+            raise RuntimeError(f"Invalid tensor-dict metadata size: {metadata_size}")
+        self._metadata_tensor = torch.empty(
+            metadata_size,
+            dtype=torch.uint8,
+            device="cpu",
+        )
+        self._metadata_work = torch.distributed.irecv(
+            self._metadata_tensor,
+            src=self._coordinator.ranks[self._src],
+            group=self._coordinator.cpu_group,
+            tag=self._tag,
+        )
+        self._metadata_waiter = self._make_waiter([self._metadata_work])
+        self._state = "metadata"
+        return True
+
+    def _poll_metadata(self, block: bool) -> bool:
+        if not self._work_ready(
+            self._metadata_work,
+            block,
+            self._metadata_waiter,
+        ):
+            return False
+        metadata_list = pickle.loads(self._metadata_tensor.numpy().tobytes())
+        if not isinstance(metadata_list, list):
+            raise RuntimeError("Tensor-dict metadata must be a list")
+
+        tensor_dict = {}
+        tensors_to_recv = []
+        seen_keys = set()
+        all_gather_size = (
+            1 if self._all_gather_group is None else self._all_gather_group.world_size
+        )
+        all_gather_rank = (
+            0
+            if self._all_gather_group is None
+            else self._all_gather_group.rank_in_group
+        )
+        for item in metadata_list:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise RuntimeError("Invalid tensor-dict metadata entry")
+            key, value = item
+            if key in seen_keys:
+                raise RuntimeError(f"Duplicate tensor-dict metadata key: {key}")
+            seen_keys.add(key)
+            if not isinstance(value, TensorMetadata):
+                tensor_dict[key] = value
+                continue
+
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            if tensor.numel() == 0:
+                tensor_dict[key] = tensor
+                continue
+            use_all_gather = (
+                self._all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            )
+            orig_shape = tensor.shape if use_all_gather else None
+            recv_tensor = (
+                tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                if use_all_gather
+                else tensor
+            )
+            comm_group = (
+                self._coordinator.cpu_group
+                if recv_tensor.is_cpu
+                else self._coordinator.device_group
+            )
+            tensors_to_recv.append(
+                (key, recv_tensor, orig_shape, comm_group, use_all_gather)
+            )
+
+        self._result = tensor_dict
+        self._tensor_entries = tensors_to_recv
+        can_batch_p2p = (
+            self._batch_p2p
+            and tensors_to_recv
+            and all(not tensor.is_cpu for _, tensor, _, _, _ in tensors_to_recv)
+        )
+        if can_batch_p2p:
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    tensor,
+                    self._coordinator.ranks[self._src],
+                    group=comm_group,
+                )
+                for _, tensor, _, comm_group, _ in tensors_to_recv
+            ]
+            self._payload_works = torch.distributed.batch_isend_irecv(ops)
+        else:
+            self._payload_works = [
+                torch.distributed.irecv(
+                    tensor,
+                    src=self._coordinator.ranks[self._src],
+                    group=comm_group,
+                    **({"tag": self._tag} if self._tag and tensor.is_cpu else {}),
+                )
+                for _, tensor, _, comm_group, _ in tensors_to_recv
+            ]
+        if tensors_to_recv and all(
+            tensor.is_cpu for _, tensor, _, _, _ in tensors_to_recv
+        ):
+            self._payload_waiter = self._make_waiter(self._payload_works)
+        self._state = "payload"
+        return True
+
+    def _poll_payload(self, block: bool) -> bool:
+        if self._payload_waiter is not None:
+            if not block and not self._payload_waiter.completed():
+                return False
+            self._payload_waiter.wait()
+        elif block:
+            for work in self._payload_works:
+                work.wait()
+        else:
+            if any(not work.is_completed() for work in self._payload_works):
+                return False
+            for work in self._payload_works:
+                work.wait()
+
+        self._state = "all_gather_start"
+        return True
+
+    def _start_all_gather(self) -> None:
+        if self._state != "all_gather_start":
+            return
+        for key, tensor, orig_shape, _, use_all_gather in self._tensor_entries:
+            if use_all_gather:
+                gather_input = tensor.contiguous()
+                gather_output = torch.empty(
+                    gather_input.numel() * self._all_gather_group.world_size,
+                    dtype=gather_input.dtype,
+                    device=gather_input.device,
+                )
+                gather_group = (
+                    self._all_gather_group.cpu_group
+                    if gather_input.is_cpu
+                    else self._all_gather_group.device_group
+                )
+                gather_work = torch.distributed.all_gather_into_tensor(
+                    gather_output,
+                    gather_input,
+                    group=gather_group,
+                    async_op=True,
+                )
+                self._all_gather_entries.append(
+                    (key, gather_output, orig_shape, gather_work, gather_input)
+                )
+            else:
+                self._result[key] = tensor
+        self._payload_works = []
+        self._payload_waiter = None
+        self._tensor_entries = []
+        if self._all_gather_entries and all(
+            output.is_cpu for _, output, _, _, _ in self._all_gather_entries
+        ):
+            self._all_gather_waiter = self._make_waiter(
+                [entry[3] for entry in self._all_gather_entries]
+            )
+        self._state = "all_gather"
+
+    def _poll_all_gather(self, block: bool) -> bool:
+        works = [entry[3] for entry in self._all_gather_entries]
+        if self._all_gather_waiter is not None:
+            if not block and not self._all_gather_waiter.completed():
+                return False
+            self._all_gather_waiter.wait()
+        elif block:
+            for work in works:
+                work.wait()
+        else:
+            if any(not work.is_completed() for work in works):
+                return False
+            for work in works:
+                work.wait()
+        for key, output, orig_shape, _, _ in self._all_gather_entries:
+            self._result[key] = output.reshape(orig_shape)
+        self._all_gather_entries = []
+        self._all_gather_waiter = None
+        self._metadata_tensor = None
+        self._metadata_work = None
+        self._metadata_waiter = None
+        self._size_tensor = None
+        self._size_work = None
+        self._size_waiter = None
+        self._state = "complete"
+        return True
+
+    def _advance(self, block: bool):
+        while self._state != "complete":
+            if self._state == "metadata_size":
+                if not self._poll_metadata_size(block):
+                    return None
+            elif self._state == "metadata":
+                if not self._poll_metadata(block):
+                    return None
+            elif self._state == "payload":
+                if not self._poll_payload(block):
+                    return None
+            elif self._state == "all_gather_start":
+                self._start_all_gather()
+            elif self._state == "all_gather":
+                if not self._poll_all_gather(block):
+                    return None
+        return self._result
+
+    def poll_payload_ready(self) -> bool:
+        while self._state in ("metadata_size", "metadata", "payload"):
+            if self._state == "metadata_size":
+                if not self._poll_metadata_size(block=False):
+                    return False
+            elif self._state == "metadata":
+                if not self._poll_metadata(block=False):
+                    return False
+            elif not self._poll_payload(block=False):
+                return False
+        return self._state in ("all_gather_start", "all_gather", "complete")
+
+    def start_all_gather(self) -> None:
+        self._start_all_gather()
+
+    def poll_all_gather(self) -> bool:
+        if self._state == "all_gather_start":
+            self._start_all_gather()
+        if self._state == "all_gather" and not self._poll_all_gather(block=False):
+            return False
+        return self._state == "complete"
+
+    def result(self) -> Dict[str, Any]:
+        if self._state != "complete":
+            raise RuntimeError("Tensor-dict receive is not complete")
+        return self._result
+
+    def buffered_tensor_bytes(self) -> int:
+        tensors = [tensor for _, tensor, _, _, _ in self._tensor_entries] + [
+            output for _, output, _, _, _ in self._all_gather_entries
+        ]
+        if self._result is not None:
+            tensors.extend(
+                value
+                for value in self._result.values()
+                if isinstance(value, torch.Tensor)
+            )
+        unique = {id(tensor): tensor for tensor in tensors}
+        return sum(tensor.numel() * tensor.element_size() for tensor in unique.values())
+
+    def poll(self) -> Optional[Dict[str, Any]]:
+        return self._advance(block=False)
+
+    def wait(self) -> Dict[str, Any]:
+        return self._advance(block=True)
+
+    def is_completed(self) -> bool:
+        return self._state == "complete"
 
 
 def _split_tensor_dict(
@@ -1758,6 +2154,8 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        batch_p2p: bool = False,
+        tag: int = 0,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1790,8 +2188,36 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works = self.send_object(
+            metadata_list,
+            dst=dst,
+            async_send=async_send,
+            tag=tag,
+        )
 
+        if not batch_p2p:
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                if (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
+                ):
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                tensor = tensor.contiguous()
+                comm_group = metadata_group if tensor.is_cpu else group
+                send_kwargs = {"tag": tag} if tag and tensor.is_cpu else {}
+                work = send_func(
+                    tensor,
+                    self.ranks[dst],
+                    group=comm_group,
+                    **send_kwargs,
+                )
+                if async_send:
+                    p2p_works.append(P2PWork(work, tensor))
+            return p2p_works
+
+        tensors_to_send = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -1801,16 +2227,37 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
+            tensor = tensor.contiguous()
             comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
+            tensors_to_send.append((tensor, comm_group))
+        if tensors_to_send:
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    tensor,
+                    self.ranks[dst],
+                    group=comm_group,
+                    **({"tag": tag} if tag and tensor.is_cpu else {}),
+                )
+                for tensor, comm_group in tensors_to_send
+            ]
+            works = torch.distributed.batch_isend_irecv(ops)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+                p2p_works.extend(
+                    P2PWork(work, tensor)
+                    for work, (tensor, _) in zip(works, tensors_to_send)
+                )
+            else:
+                for work in works:
+                    work.wait()
         return p2p_works
 
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        batch_p2p: bool = False,
+        tag: int = 0,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1831,8 +2278,42 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self.recv_object(src=src, tag=tag)
         tensor_dict: Dict[str, Any] = {}
+        if not batch_p2p:
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                    if tensor.numel() == 0:
+                        tensor_dict[key] = tensor
+                        continue
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    recv_kwargs = {"tag": tag} if tag and tensor.is_cpu else {}
+                    work = torch.distributed.irecv(
+                        tensor,
+                        src=self.ranks[src],
+                        group=comm_group,
+                        **recv_kwargs,
+                    )
+                    work.wait()
+                    if use_all_gather:
+                        tensor = all_gather_group.all_gather(tensor, dim=0)
+                        tensor = tensor.reshape(orig_shape)
+                    tensor_dict[key] = tensor
+                else:
+                    tensor_dict[key] = value
+            return tensor_dict
+
+        tensors_to_recv = []
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
@@ -1847,24 +2328,34 @@ class GroupCoordinator:
                     and tensor.numel() % all_gather_size == 0
                 )
 
+                orig_shape = None
                 if use_all_gather:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-                # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
-
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
+                tensors_to_recv.append((key, tensor, orig_shape, comm_group))
             else:
                 tensor_dict[key] = value
+        if tensors_to_recv:
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    tensor,
+                    self.ranks[src],
+                    group=comm_group,
+                    **({"tag": tag} if tag and tensor.is_cpu else {}),
+                )
+                for _, tensor, _, comm_group in tensors_to_recv
+            ]
+            works = torch.distributed.batch_isend_irecv(ops)
+            for work in works:
+                work.wait()
+        for key, tensor, orig_shape, _ in tensors_to_recv:
+            if orig_shape is not None:
+                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            tensor_dict[key] = tensor
         return tensor_dict
 
     def send_recv_tensor_dict(
@@ -2021,6 +2512,29 @@ class GroupCoordinator:
             recv_tensor_dict[key] = tensor
 
         return recv_tensor_dict
+
+    def recv_tensor_dict_async(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+        batch_p2p: bool = False,
+        tag: int = 0,
+    ) -> TensorDictRecvHandle:
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            raise RuntimeError("Async tensor-dict receive requires a distributed peer")
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+        assert src != self.rank_in_group, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
+        return TensorDictRecvHandle(
+            coordinator=self,
+            src=src,
+            all_gather_group=all_gather_group,
+            batch_p2p=batch_p2p,
+            tag=tag,
+        )
 
     def barrier(self):
         """Barrier synchronization among the group.
@@ -2219,7 +2733,13 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_VPP_PP_REVERSE: Optional[GroupCoordinator] = None
 _SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_vpp_pp_reverse_group() -> GroupCoordinator:
+    assert _VPP_PP_REVERSE is not None, "VPP reverse pipeline group is not initialized"
+    return _VPP_PP_REVERSE
 
 
 def get_self_pp_group() -> GroupCoordinator:
@@ -2518,6 +3038,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    duplicate_pp_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups at the published widths.
@@ -2913,6 +3434,23 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    global _VPP_PP_REVERSE
+    assert _VPP_PP_REVERSE is None, "VPP reverse pipeline group is already initialized"
+    if duplicate_pp_group:
+        if pipeline_model_parallel_size != 2:
+            raise ValueError("duplicate PP transport is only valid for PP2")
+        _VPP_PP_REVERSE = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="vpp_pp_reverse",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     # The one-layer draft uses a singleton PP group; every rank creates all groups
     # because new_group is collective.
     global _SELF_PP
@@ -3224,6 +3762,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _VPP_PP_REVERSE
+    if _VPP_PP_REVERSE:
+        _VPP_PP_REVERSE.destroy()
+    _VPP_PP_REVERSE = None
 
     global _DCP
     if _DCP:

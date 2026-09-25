@@ -1400,6 +1400,20 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(self.parser)
 
+    def test_vpp_prefill_burst_size_cli(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--pp-vpp-prefill-burst-size", "6"]
+        )
+
+        self.assertEqual(args.pp_vpp_prefill_burst_size, 6)
+
+    def test_vpp_max_inflight_cli(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--pp-vpp-max-inflight", "3"]
+        )
+
+        self.assertEqual(args.pp_vpp_max_inflight, 3)
+
     def _new_cp_args(self, **overrides):
         # Constructed, not conjured: a Struct has no uninitialized form, and
         # every field this case does not name wants its declared default
@@ -1414,6 +1428,9 @@ class TestContextParallelServerArgs(CustomTestCase):
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
+            pp_virtual_stages=1,
+            pp_vpp_prefill_burst_size=1,
+            pp_vpp_max_inflight=None,
             dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
@@ -1432,6 +1449,29 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "--cp-strategy"):
             handle_context_parallelism(server_args)
+
+    def test_vpp_prefill_burst_size_requires_vpp2(self):
+        server_args = self._new_cp_args(
+            pp_virtual_stages=1,
+            pp_vpp_prefill_burst_size=6,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--pp-virtual-stages 2"):
+            handle_context_parallelism(server_args)
+
+    def test_vpp_max_inflight_requires_vpp2_and_existing_window(self):
+        with self.assertRaisesRegex(ValueError, "requires --pp-virtual-stages 2"):
+            handle_context_parallelism(self._new_cp_args(pp_vpp_max_inflight=3))
+
+        with self.assertRaisesRegex(ValueError, "must be at least 4"):
+            handle_context_parallelism(
+                self._new_cp_args(
+                    pp_size=2,
+                    pp_virtual_stages=2,
+                    pp_vpp_prefill_burst_size=2,
+                    pp_vpp_max_inflight=3,
+                )
+            )
 
     @override_platform(is_hip=False, is_npu=False)
     def test_deepseek_v32_prefill_cp_rejects_zigzag(self):

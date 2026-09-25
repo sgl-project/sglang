@@ -60,6 +60,11 @@ def should_run_flashinfer_autotune(
     mr = model_runner
     if mr.device != "cuda":
         return False
+    if (
+        get_parallel().pp_virtual_stages > 1
+        and get_disagg().disaggregation_mode == "prefill"
+    ):
+        return False
     if get_exec().kernel.disable_flashinfer_autotune:
         return False
     if get_exec().deterministic.enable_deterministic_inference:

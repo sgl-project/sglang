@@ -50,6 +50,29 @@ class TestComputeAttentionAndMoeLayers(CustomTestCase):
         self.assertEqual(attention_layers, [None, None, local_attention])
         self.assertEqual(mha_companion_layers, [None, None, None])
 
+    def test_resolve_layer_indices_preserves_non_contiguous_ownership(self):
+        model = SimpleNamespace(
+            start_layer=0,
+            end_layer=25,
+            layer_ids=(0, 1, 2, 3, 4, 20, 21, 22, 23, 24),
+        )
+        model_config = SimpleNamespace(
+            num_hidden_layers=40,
+            num_attention_layers=40,
+            num_nextn_predict_layers=None,
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        )
+        info = resolve_layer_indices(
+            model=model,
+            model_config=model_config,
+            is_draft_worker=False,
+        )
+
+        self.assertEqual(info.start_layer, 0)
+        self.assertEqual(info.end_layer, 25)
+        self.assertEqual(info.num_effective_layers, 10)
+        self.assertEqual(info.layer_ids, model.layer_ids)
+
 
 NUM_LAYERS = 36
 GLOBAL_FULL_IDS = list(range(1, NUM_LAYERS, 2))
