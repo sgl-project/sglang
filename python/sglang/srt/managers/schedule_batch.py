@@ -141,6 +141,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
@@ -1220,7 +1221,6 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
-        self.send_output_sampling_mask_offset: int = 0
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -1256,12 +1256,9 @@ class Req(ReqDllmMixin):
             # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
             self.logprob.output_token_ids_logprobs_val = []
             self.logprob.output_token_ids_logprobs_idx = []
-        if return_sampling_mask:
-            self.output_token_sampling_mask = []
-            self.output_token_sampling_logprobs = []
-        else:
-            self.output_token_sampling_mask = None
-            self.output_token_sampling_logprobs = None
+        self.sampling_mask_rows: Optional[SamplingMaskRows] = (
+            SamplingMaskRows() if return_sampling_mask else None
+        )
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None

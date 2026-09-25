@@ -1163,11 +1163,9 @@ class SchedulerBatchResultProcessor:
         output: LogitsProcessorOutput,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
-        mask = output.next_token_sampling_mask_idx
-        logprobs = output.next_token_sampling_logprobs
-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
-        req.output_token_sampling_logprobs.append(
-            None if logprobs is None else logprobs[i]
+        req.sampling_mask_rows.append(
+            output.next_token_sampling_mask_idx[i],
+            output.next_token_sampling_logprobs[i],
         )
 
     @staticmethod
@@ -1175,14 +1173,13 @@ class SchedulerBatchResultProcessor:
         reqs: List[Req],
         output: Optional[LogitsProcessorOutput],
     ) -> None:
-        """Convert opted-in tensor rows to batch-aligned Python results."""
+        """Convert opted-in tensor rows to batch-aligned host rows."""
         if output is None or output.sampling_mask_output is None:
             return
 
         sampling_output = output.sampling_mask_output
         batch_indices = [i for i, req in enumerate(reqs) if req.return_sampling_mask]
         lengths = sampling_output.lengths.tolist()
-        selected_logprobs = sampling_output.selected_logprobs.tolist()
         statuses = sampling_output.statuses.tolist()
         assert len(batch_indices) == len(lengths)
 
@@ -1190,13 +1187,13 @@ class SchedulerBatchResultProcessor:
         masks = [None] * batch_size
         logprobs = [None] * batch_size
         status_by_batch = [None] * batch_size
-        token_ids = sampling_output.token_ids.cpu()
+        token_ids = sampling_output.token_ids.cpu().numpy()
+        selected_logprobs = sampling_output.selected_logprobs.cpu().numpy()
         support_logprobs = (
             None
             if sampling_output.support_logprobs is None
-            else sampling_output.support_logprobs.cpu()
+            else sampling_output.support_logprobs.cpu().numpy()
         )
-        packed_width = token_ids.shape[1]
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             returns_support_logprobs = (
@@ -1204,17 +1201,13 @@ class SchedulerBatchResultProcessor:
             )
             status = int(statuses[row])
             length = int(lengths[row])
-            if status == SamplingMaskStatus.OK and not (0 <= length <= packed_width):
-                status = SamplingMaskStatus.INVALID
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                masks[batch_index] = token_ids[row, :length].tolist()
+                masks[batch_index] = token_ids[row, :length]
                 if returns_support_logprobs:
-                    logprobs[batch_index] = support_logprobs[
-                        support_row, :length
-                    ].tolist()
+                    logprobs[batch_index] = support_logprobs[support_row, :length]
                 else:
-                    logprobs[batch_index] = float(selected_logprobs[row])
+                    logprobs[batch_index] = selected_logprobs[row : row + 1]
             if returns_support_logprobs:
                 support_row += 1
 
