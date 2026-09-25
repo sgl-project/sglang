@@ -17,8 +17,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
 
-_B200_DEFAULT_RUNNER = _partition.B200_RERUN_RUNNER
-
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
 # substitution happens before bash parses, so shell metacharacters in the
@@ -591,7 +589,7 @@ MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
     "2-gpu": "2-gpu-h100",
-    "b200": _B200_DEFAULT_RUNNER,
+    "b200": _partition.B200_RERUN_RUNNER,
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
@@ -947,14 +945,10 @@ _OTHER_BACKEND_REGISTERS = {
 }
 
 
-# CPU suites whose per-commit job runs on ubuntu-latest, the only CPU pool in
-# rerun-test.yml. Other CPU suites need their own hardware and image.
-_UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
+# CPU suite suffix -> (hardware, workflow) for suites rerun-test.yml cannot run.
 _CPU_SUITE_POOLS = {
-    "stage-a-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
-    "stage-b-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
-    "stage-a-tp-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
-    "base-b-test-cpu-arm64": ("arm64", "the pr-test-arm64.yml"),
+    "-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
+    "-arm64": ("arm64", "the pr-test-arm64.yml"),
 }
 
 
@@ -1005,14 +999,9 @@ def _resolve_runner_config(rc, full_path, suite):
             f"passes this string verbatim into a shell step, so it must "
             f"match `scripts/ci/cuda/*.sh`.",
         )
-    runs_on = cfg.get("runs_on")
-    # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-    # so always pick the non-kernel b200 pool.
-    if runs_on == "$b200_runner":
-        runs_on = _B200_DEFAULT_RUNNER
     return {
         "suite": suite,
-        "runner_label": runs_on,
+        "runner_label": _partition.resolve_runs_on(cfg),
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
         "rdma_devices": cfg.get("rdma_devices", ""),
@@ -1059,10 +1048,11 @@ def detect_suite(file_path_from_test):
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         cpu_suites = sorted(set(_extract_suites(content, "register_cpu_ci")))
-        if cpu_suites and not set(cpu_suites) & _UBUNTU_CPU_SUITES:
+        if cpu_suites and not set(cpu_suites) & _partition.UBUNTU_CPU_SUITES:
             suite = cpu_suites[0]
-            pool, workflow = _CPU_SUITE_POOLS.get(
-                suite, ("a dedicated CPU runner", "its own")
+            pool, workflow = next(
+                (v for k, v in _CPU_SUITE_POOLS.items() if suite.endswith(k)),
+                ("a dedicated CPU runner", "its own"),
             )
             return [
                 _dispatch_err(

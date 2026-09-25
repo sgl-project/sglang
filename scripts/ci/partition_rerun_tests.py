@@ -20,16 +20,21 @@ B200_RERUN_RUNNER = "4-gpu-b200"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_lpt():
+@functools.cache
+def _lpt():
+    """Load partitioning.py by path; it has no sglang imports."""
     path = _REPO_ROOT / "python/sglang/multimodal_gen/test/partitioning.py"
     spec = importlib.util.spec_from_file_location("rerun_test_partitioning", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.PartitionItem, module.partition_items_by_lpt
+    return module
 
 
-PartitionItem, partition_items_by_lpt = _load_lpt()
+def resolve_runs_on(cfg):
+    """runs_on of a runner_configs.yml entry, with `$b200_runner` resolved."""
+    runs_on = cfg.get("runs_on")
+    return B200_RERUN_RUNNER if runs_on == "$b200_runner" else runs_on
 
 
 @functools.cache
@@ -39,12 +44,7 @@ def _runner_config_labels():
         import runner_configs
     except ImportError:  # no PyYAML: fall back to the largest registration
         return {}
-    return {
-        name: (
-            B200_RERUN_RUNNER if cfg["runs_on"] == "$b200_runner" else cfg["runs_on"]
-        )
-        for name, cfg in runner_configs.load().items()
-    }
+    return {name: resolve_runs_on(cfg) for name, cfg in runner_configs.load().items()}
 
 
 def _registrations(path, register_name):
@@ -136,7 +136,7 @@ def _pack(items):
     """Split into the fewest LPT partitions that each fit PARTITION_SECONDS."""
     count = math.ceil(sum(item.est_time for item in items) / PARTITION_SECONDS)
     while True:
-        partitions = partition_items_by_lpt(items, count)
+        partitions = _lpt().partition_items_by_lpt(items, count)
         if all(sum(i.est_time for i in p) <= PARTITION_SECONDS for p in partitions):
             return [p for p in partitions if p]
         count += 1
@@ -153,11 +153,9 @@ def partition_commands(commands, root, mode, runs_on=""):
             alone.append([idx])
         else:
             items.append(
-                PartitionItem(kind="test", item_id=str(idx), est_time=estimate)
+                _lpt().PartitionItem(kind="test", item_id=str(idx), est_time=estimate)
             )
-    batches = alone + [
-        [int(i.item_id) for i in p] for p in (_pack(items) if items else [])
-    ]
+    batches = alone + [[int(i.item_id) for i in p] for p in _pack(items)]
     if len(batches) > 256:
         raise ValueError("Test commands exceed the 256-job matrix limit")
     batches = sorted(sorted(batch) for batch in batches)
