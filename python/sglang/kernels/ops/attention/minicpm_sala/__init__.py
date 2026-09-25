@@ -5,12 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.minicpm_sala.get_block_table import get_block_table
+    from sglang.kernels.ops.attention.minicpm_sala.get_block_table import (
+        get_block_table,
+    )
 
 
 def __getattr__(name: str) -> Any:
     if name == "get_block_table":
-        from sglang.kernels.ops.minicpm_sala.get_block_table import get_block_table
+        from sglang.kernels.ops.attention.minicpm_sala.get_block_table import (
+            get_block_table,
+        )
 
         globals()[name] = get_block_table
         return get_block_table

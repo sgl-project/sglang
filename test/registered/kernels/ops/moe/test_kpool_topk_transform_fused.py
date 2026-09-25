@@ -18,7 +18,9 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.moe.kpool_topk_transform import fast_kpool_topk_transform_fused
+from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
+    fast_kpool_topk_transform_fused,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 

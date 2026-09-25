@@ -30,13 +30,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import (
-    k3_ar_fusion,
-    k3_sp_collective,
-    zero_copy_context,
-)
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -773,7 +770,7 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,

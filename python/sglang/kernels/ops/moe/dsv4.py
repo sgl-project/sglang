@@ -11,9 +11,11 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_xpu
 
-from .utils import make_name
-
 _is_xpu = is_xpu()
+
+
+def make_name(name: str) -> str:
+    return f"dpsk_v4_{name}"
 
 
 @cache_once

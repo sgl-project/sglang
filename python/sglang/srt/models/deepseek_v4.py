@@ -32,13 +32,13 @@ from sglang.kernels.ops.attention.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
-from sglang.kernels.ops.attention.dsv4.wo_a import (
-    fused_rope_wo_a_bf16,
+from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
+from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
+from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
-from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,

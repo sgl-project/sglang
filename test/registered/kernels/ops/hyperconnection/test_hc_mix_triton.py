@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.hc_mix_triton import (
+from sglang.kernels.ops.gemm.hc_mix import (
     _FUSED_MIX_MAX_ROWS,
     fused_hc_mix,
     fused_hc_mix_supported,

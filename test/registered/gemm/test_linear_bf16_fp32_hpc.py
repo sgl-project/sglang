@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.gemm import (
+from sglang.kernels.ops.gemm.bf16_fp32 import (
     _hpc_gemm_bf16xfp32_available,
     _linear_bf16_fp32_hpc,
     hpc_bf16xfp32_gemm_enabled,

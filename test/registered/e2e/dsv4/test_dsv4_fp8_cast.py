@@ -18,7 +18,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp8_cvt import cvt_fp8_e4m3
+from sglang.kernels.ops.quantization.fp8_cvt import cvt_fp8_e4m3
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci

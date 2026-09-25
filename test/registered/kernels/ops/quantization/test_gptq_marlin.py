@@ -4,7 +4,7 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
 )
