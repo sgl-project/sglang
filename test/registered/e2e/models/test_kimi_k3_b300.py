@@ -22,6 +22,8 @@ MODEL_PATH = "moonshotai/Kimi-K3"
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
 MEGAMOE_URL = "http://0.0.0.0:30000"
 MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 12}'
+MEGAMOE_MEM_FRACTION_STATIC = "0.82"
+MEGAMOE_MAX_RUNNING_REQUESTS = "24"
 MEGAMOE_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
@@ -101,7 +103,14 @@ class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
                 "--dcp-size",
                 "8",
                 "--mem-fraction-static",
-                "0.85",
+                MEGAMOE_MEM_FRACTION_STATIC,
+                # Keep the CI-sized GSM8K load below the DSPARK default of 48
+                # so MegaMoE has enough headroom for FlashInfer autotune and
+                # decode CUDA graph capture on B300.
+                "--max-running-requests",
+                MEGAMOE_MAX_RUNNING_REQUESTS,
+                "--cuda-graph-max-bs-decode",
+                MEGAMOE_MAX_RUNNING_REQUESTS,
                 "--model-loader-extra-config",
                 MODEL_LOADER_EXTRA_CONFIG,
                 "--reasoning-parser",
