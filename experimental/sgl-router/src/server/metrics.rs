@@ -44,9 +44,6 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
-//! | `sgl_router_tokenizer_backend` | Gauge | `backend` |
-//! | `sgl_router_tokenizer_l1_state` | Gauge | `state` |
-//! | `sgl_router_tokenizer_l1_lookups_total` | Counter | `outcome` |
 //! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
 //!
 //! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].

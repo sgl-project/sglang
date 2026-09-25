@@ -152,21 +152,21 @@ fn v4_l1_cache_matches_uncached_across_turns() {
         messages.push(json!({"role": "user", "content": format!("{} (turn {turn})", snippets[turn % snippets.len()])}));
         let request = json!({"model": "m", "messages": messages});
         let expected = formatter.encode(&plain, &request).unwrap();
-        for (tokenizer, _) in &cached {
+        for (tokenizer, stats) in &cached {
+            let cached_before = stats.l1_tokens().0;
             assert_eq!(
                 formatter.encode(tokenizer, &request).unwrap(),
                 expected,
                 "turn {turn}"
             );
+            if turn > 0 {
+                assert!(
+                    stats.l1_tokens().0 > cached_before,
+                    "turn {turn} must reuse tokens"
+                );
+            }
         }
         messages.push(json!({"role": "assistant", "content": format!("Answer {turn}: {}", snippets[(turn + 2) % snippets.len()])}));
-    }
-    for (_, stats) in &cached {
-        let (hits, misses) = stats.l1_lookups();
-        assert!(
-            hits >= 10,
-            "later turns must reuse cached prefixes: {hits} hits, {misses} misses"
-        );
     }
 }
 
