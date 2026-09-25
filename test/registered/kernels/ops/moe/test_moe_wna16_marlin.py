@@ -886,7 +886,8 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
             up = (x.double() @ references["w3"][expert].T).bfloat16().clamp(-10, 10)
             activated = torch.nn.functional.silu(gate) * up
             projected = activated.double() @ references["w2"][expert].T
-            expected.append((projected * weights[:, expert, None]).bfloat16())
+            # Marlin rounds GEMM2 before multiplying its BF16 routing weight.
+            expected.append(projected.bfloat16() * weights[:, expert, None].bfloat16())
         reference = torch.stack(expected).float().sum(0).bfloat16()
         torch.testing.assert_close(
             actual,
