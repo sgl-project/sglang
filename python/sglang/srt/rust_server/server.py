@@ -427,6 +427,29 @@ class RustServer:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
 
+        # Trailing scheduler snapshots, in BatchHeader order. The preceding
+        # twelve extras shape columns keep their positions even on plain frames.
+        if not has_extra:
+            header_cols.extend([[] for _ in range(12)])
+        statistics = (
+            payload.cached_tokens,
+            payload.cached_tokens_details,
+            payload.reasoning_tokens,
+            payload.retraction_counts,
+            payload.dp_ranks or [],  # Idle batches carry no rank column.
+        )
+        if any(col is None or len(col) != len(rids) for col in statistics):
+            raise ValueError("generation statistics must have one entry per request")
+        header_cols.extend(statistics)
+
+        # Current version is shared by the batch; terminal spans already come
+        # from the scheduler. Keep both after the existing positional columns.
+        if payload.weight_versions is not None and len(payload.weight_versions) != len(
+            rids
+        ):
+            raise ValueError("weight versions must have one entry per request")
+        header_cols.extend((get_serving().weight_version, payload.weight_versions))
+
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.

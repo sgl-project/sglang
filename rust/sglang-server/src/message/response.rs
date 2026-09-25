@@ -3,6 +3,9 @@
 //! (batch / control result / error), and the columnar batch decode into
 //! per-request [`ChunkEvent`]s.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -119,9 +122,10 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
-/// `RustTokenizerManager.push_generation`'s `header_cols` in
+/// required; trailing extras default empty and omitted scheduler metadata stays
+/// absent for older producers. New producers include statistics and weight
+/// versions even without logprob/hidden columns.
+/// Field order is the wire ABI and must match `RustServer.push_generation` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
 /// Field names follow `direction_family_shape`:
@@ -164,6 +168,30 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub cached_tokens: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub cached_tokens_details: Option<Vec<Option<BTreeMap<String, CacheDetailValue>>>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub reasoning_tokens: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub retraction_counts: Option<Vec<u64>>,
+    #[serde(default, deserialize_with = "present_column")]
+    pub dp_ranks: Option<Vec<Option<u32>>>,
+    #[serde(default)]
+    pub weight_version: Option<String>,
+    #[serde(default)]
+    pub weight_versions: Option<Vec<Option<Vec<WeightVersionSpan>>>>,
+}
+
+/// Only an omitted tail column is absent. A supplied column must be an array,
+/// including on idle batches; `null` is allowed inside nullable columns only.
+fn present_column<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::deserialize(deserializer).map(Some)
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -265,6 +293,38 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
         reject!()
     }
+    // A snapshot is all-or-nothing. Null details/ranks are entries, not absent
+    // columns; accepting a partial snapshot would fabricate metadata defaults.
+    let stats_lengths = [
+        h.cached_tokens.as_ref().map(Vec::len),
+        h.cached_tokens_details.as_ref().map(Vec::len),
+        h.reasoning_tokens.as_ref().map(Vec::len),
+        h.retraction_counts.as_ref().map(Vec::len),
+        h.dp_ranks.as_ref().map(Vec::len),
+    ];
+    let has_stats = stats_lengths.iter().any(Option::is_some);
+    if has_stats && stats_lengths.iter().any(|&len| len != Some(n)) {
+        reject!()
+    }
+    if let Some(columns) = &h.weight_versions {
+        if h.weight_version.is_none() || columns.len() != n {
+            reject!()
+        }
+        for (i, spans) in columns.iter().enumerate() {
+            if let Some(spans) = spans
+                && (h.finish_reasons[i].is_none()
+                    || spans.is_empty()
+                    || spans[0].start != 0
+                    || spans.iter().any(|span| span.start > span.end)
+                    || spans.windows(2).any(|pair| pair[0].end != pair[1].start))
+            {
+                reject!()
+            }
+        }
+    }
+    // One shared version per batch; terminal histories move into shared slices
+    // so folding an event never deep-copies the scheduler's span list.
+    let weight_version = h.weight_version.take().map(Arc::<str>::from);
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
     let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
@@ -449,6 +509,22 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
+            stats: has_stats.then(|| GenerationStats {
+                // Presence and lengths were checked before any request is routed.
+                cached_tokens: h.cached_tokens.as_ref().unwrap()[i],
+                cached_tokens_details: h.cached_tokens_details.as_mut().unwrap()[i].take(),
+                reasoning_tokens: h.reasoning_tokens.as_ref().unwrap()[i],
+                num_retractions: h.retraction_counts.as_ref().unwrap()[i],
+                dp_rank: h.dp_ranks.as_ref().unwrap()[i],
+            }),
+            weight_version: weight_version.as_ref().map(|current| WeightVersionInfo {
+                current: Arc::clone(current),
+                spans: h
+                    .weight_versions
+                    .as_mut()
+                    .and_then(|v| v[i].take())
+                    .map(Arc::from),
+            }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
             // until it is actually decoded. With the struct-update syntax it
@@ -556,10 +632,52 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Latest scheduler snapshot, independent of per-step token/logprob deltas.
+    /// None for older producers or synthetic events without updated statistics.
+    pub stats: Option<GenerationStats>,
+    /// Current scheduler version and, on terminal events, the complete history.
+    pub weight_version: Option<WeightVersionInfo>,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
     pub extras: Option<Box<ChunkExtras>>,
+}
+
+/// One scheduler-owned half-open token range. Python's array-like
+/// `WeightVersionSpan` has this field order; native JSON uses named members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightVersionSpan {
+    pub version: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Latest version snapshot, separate from cumulative generation statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightVersionInfo {
+    pub current: Arc<str>,
+    pub spans: Option<Arc<[WeightVersionSpan]>>,
+}
+
+/// Scheduler-owned cumulative counts and cache/routing state. Replaced as one
+/// snapshot, never summed. Nullable fields remain present in native metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GenerationStats {
+    pub cached_tokens: u64,
+    pub cached_tokens_details: Option<BTreeMap<String, CacheDetailValue>>,
+    pub reasoning_tokens: u64,
+    pub num_retractions: u64,
+    pub dp_rank: Option<u32>,
+}
+
+/// Values admitted by Python's cache breakdown: counts, backend names, or null.
+/// Keep every key, including backend-specific details, without opaque JSON data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CacheDetailValue {
+    Count(u64),
+    Text(String),
+    Null,
 }
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
@@ -622,6 +740,238 @@ impl ChunkExtras {
 mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
+
+    /// Captured from RustServer.push_generation using the Python CPU test's
+    /// two-request payload (details=true, rank=1), encoded by msgspec.
+    #[test]
+    fn decodes_python_statistics_header() {
+        let header =
+            b"\xdc\x00\x15\x92\xa1\x30\xa1\x31\x92\xc0\xc0\x92\x02\x02\x92\x01\x01\x90\x90\x90\
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x92\x00\x07\x92\xc0\x84\xa6\x64\x65\x76\x69\
+\x63\x65\x03\xa4\x68\x6f\x73\x74\x02\xa7\x73\x74\x6f\x72\x61\x67\x65\x02\xaf\x73\
+\x74\x6f\x72\x61\x67\x65\x5f\x62\x61\x63\x6b\x65\x6e\x64\xa4\x74\x65\x73\x74\x92\
+\x00\x04\x92\x00\x02\x92\x01\x01";
+        let frame = frame_decode_batch_cols(header, &[&3i32.to_le_bytes(), &3i32.to_le_bytes()]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+        assert_eq!(events.len(), 2);
+        let empty = events[0].stats.as_ref().unwrap();
+        assert_eq!(
+            (empty.cached_tokens, empty.reasoning_tokens, empty.dp_rank),
+            (0, 0, Some(1))
+        );
+        assert!(empty.cached_tokens_details.is_none());
+        let stats = events[1].stats.as_ref().unwrap();
+        assert_eq!(
+            (
+                stats.cached_tokens,
+                stats.reasoning_tokens,
+                stats.num_retractions
+            ),
+            (7, 4, 2)
+        );
+        assert_eq!(
+            serde_json::to_value(&stats.cached_tokens_details).unwrap(),
+            serde_json::json!({"device":3,"host":2,"storage":2,"storage_backend":"test"})
+        );
+        assert_eq!(events[1].token_ids, vec![3]);
+    }
+
+    #[test]
+    fn statistics_columns_are_complete_and_typed() {
+        let header = BatchHeader {
+            rids: vec!["a".into(), "b".into()],
+            finish_reasons: vec![None, None],
+            prompt_tokens: vec![2, 3],
+            tok_lens: vec![0, 0],
+            cached_tokens: Some(vec![0, 7]),
+            cached_tokens_details: Some(vec![
+                None,
+                Some([("device".into(), CacheDetailValue::Count(7))].into()),
+            ]),
+            reasoning_tokens: Some(vec![0, 4]),
+            retraction_counts: Some(vec![0, 2]),
+            dp_ranks: Some(vec![None, Some(1)]),
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec(&header).unwrap();
+        let columns: Vec<rmpv::Value> = rmp_serde::from_slice(&bytes).unwrap();
+        for extras in [false, true] {
+            let mut columns = columns.clone();
+            let data = if extras {
+                columns[4] = rmpv::Value::Array(vec![1.into(), 0.into()]);
+                [(-0.5f32).to_le_bytes(), 42i32.to_le_bytes()].concat()
+            } else {
+                Vec::new()
+            };
+            let mut events = Vec::new();
+            let bytes = rmp_serde::to_vec(&columns).unwrap();
+            let frame = frame_decode_batch_cols(&bytes, &[&data]);
+            assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+            assert_eq!(events[0].stats, Some(GenerationStats::default()));
+            let stats = events[1].stats.as_ref().unwrap();
+            assert_eq!(
+                (
+                    stats.cached_tokens,
+                    stats.reasoning_tokens,
+                    stats.num_retractions,
+                    stats.dp_rank
+                ),
+                (7, 4, 2, Some(1))
+            );
+            assert_eq!(
+                stats.cached_tokens_details.as_ref().unwrap()["device"],
+                CacheDetailValue::Count(7)
+            );
+            assert_eq!(events[0].extras.is_some(), extras);
+
+            // Existing four-/sixteen-column producers remain readable, without
+            // inventing statistics; extras still consume the same raw buffers.
+            let old = rmp_serde::to_vec(&columns[..if extras { 16 } else { 4 }]).unwrap();
+            let frame = frame_decode_batch_cols(&old, &[&data]);
+            assert!(for_each_chunk(&frame[1..], |event| assert!(event.stats.is_none())).ok);
+
+            for column in 16..21 {
+                for invalid in [
+                    rmpv::Value::Nil,
+                    rmpv::Value::Array(vec![]),
+                    rmpv::Value::Array(vec![0.into()]),
+                    rmpv::Value::Array(vec![true.into(), false.into()]),
+                ] {
+                    let mut malformed = columns.clone();
+                    malformed[column] = invalid;
+                    let bytes = rmp_serde::to_vec(&malformed).unwrap();
+                    let frame = frame_decode_batch_cols(&bytes, &[&data]);
+                    let decoded =
+                        for_each_chunk(&frame[1..], |_| panic!("partial statistics were routed"));
+                    assert!(!decoded.ok, "column {column}");
+                    assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
+                }
+            }
+            for count in 17..21 {
+                let bytes = rmp_serde::to_vec(&columns[..count]).unwrap();
+                let frame = frame_decode_batch_cols(&bytes, &[&data]);
+                assert!(!for_each_chunk(&frame[1..], |_| panic!("partial header")).ok);
+            }
+        }
+
+        // Empty supplied columns are valid only for an empty batch. Partial
+        // tails remain malformed even when every supplied column is empty.
+        for requests in [false, true] {
+            let mut empty = vec![rmpv::Value::Array(vec![]); 21];
+            if requests {
+                empty[..4].clone_from_slice(&columns[..4]);
+            }
+            for count in 17..=21 {
+                let bytes = rmp_serde::to_vec(&empty[..count]).unwrap();
+                let frame = frame_decode_batch_cols(&bytes, &[]);
+                assert_eq!(
+                    for_each_chunk(&frame[1..], |_| panic!("empty statistics were routed")).ok,
+                    !requests && count == 21
+                );
+            }
+        }
+    }
+
+    /// Captured from the Python test helper: payload(rust=True, version="v2",
+    /// finished=(1,)), sent through RustServer.push_generation with version v2.
+    #[test]
+    fn decodes_python_weight_version_spans() {
+        let header =
+            b"\xdc\x00\x17\x92\xa1\x30\xa1\x31\x92\xc0\x82\xa4\x74\x79\x70\x65\xa6\x6c\x65\x6e\
+\x67\x74\x68\xa6\x6c\x65\x6e\x67\x74\x68\x01\x92\x02\x02\x92\x01\x01\x90\x90\x90\
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x92\x00\x07\x92\xc0\x82\xa6\x64\x65\x76\x69\
+\x63\x65\x07\xa4\x68\x6f\x73\x74\x00\x92\x00\x04\x92\x00\x02\x92\xc0\xc0\xa2\x76\
+\x32\x92\xc0\x92\x93\xa2\x76\x30\x00\x00\x93\xa2\x76\x32\x00\x01";
+        let frame = frame_decode_batch_cols(header, &[&3i32.to_le_bytes(), &3i32.to_le_bytes()]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |e| events.push(e)).ok);
+        assert!(events[0].weight_version.as_ref().unwrap().spans.is_none());
+        let info = events[1].weight_version.as_ref().unwrap();
+        assert_eq!(info.current.as_ref(), "v2");
+        assert_eq!(
+            serde_json::to_value(info.spans.as_deref().unwrap()).unwrap(),
+            serde_json::json!([
+                {"version":"v0", "start":0, "end":0},
+                {"version":"v2", "start":0, "end":1},
+            ])
+        );
+        assert_eq!(events[1].token_ids, vec![3]);
+        assert_eq!(events[1].stats.as_ref().unwrap().cached_tokens, 7);
+    }
+
+    #[test]
+    fn weight_versions_are_validated_before_routing() {
+        use serde_json::json;
+
+        let mut columns = vec![json!([]); 23];
+        columns[..4].clone_from_slice(&[
+            json!(["a", "b"]),
+            json!([null, {"type":"length", "length":2}]),
+            json!([3, 3]),
+            json!([0, 0]),
+        ]);
+        columns[16..21].clone_from_slice(&[
+            json!([0, 0]),
+            json!([null, null]),
+            json!([0, 0]),
+            json!([0, 0]),
+            json!([null, null]),
+        ]);
+        columns[21] = json!("v2");
+        columns[22] = json!([null, [["v1", 0, 1], ["v2", 1, 2]]]);
+        let frame_for = |columns: &[serde_json::Value]| {
+            frame_decode_batch_cols(&rmp_serde::to_vec(columns).unwrap(), &[])
+        };
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame_for(&columns)[1..], |e| events.push(e)).ok);
+        let a = events[0].weight_version.as_ref().unwrap();
+        let b = events[1].weight_version.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&a.current, &b.current));
+        assert!(a.spans.is_none());
+        assert_eq!(b.spans.as_ref().unwrap()[1].start, 1);
+        for count in [4, 16, 21] {
+            assert!(
+                for_each_chunk(&frame_for(&columns[..count])[1..], |e| assert!(
+                    e.weight_version.is_none()
+                ))
+                .ok
+            );
+        }
+        for (column, invalid) in [
+            (21, json!(null)),
+            (21, json!(42)),
+            (22, json!([])),
+            (22, json!([null])),
+            (22, json!([[["v2", 0, 1]], null])), // Nonterminal request.
+            (22, json!([null, []])),
+            (22, json!([null, [["v1", 1, 2]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 3, 4]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 1, 4]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 2, 1]]])),
+            (22, json!([null, [["v1", 0, -1]]])),
+            (22, json!([null, [[true, 0, 1]]])),
+        ] {
+            let mut bad = columns.clone();
+            bad[column] = invalid;
+            let decoded = for_each_chunk(&frame_for(&bad)[1..], |_| {
+                panic!("invalid version data routed")
+            });
+            assert!(!decoded.ok, "{bad:?}");
+            assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
+        }
+        for spans in [json!(null), json!([null, [["v1", 0, 0]]])] {
+            columns[22] = spans;
+            assert!(for_each_chunk(&frame_for(&columns)[1..], |_| {}).ok);
+        }
+        let mut idle = vec![json!([]); 21];
+        idle.push(json!("default"));
+        for spans in [json!(null), json!([])] {
+            let mut idle = idle.clone();
+            idle.push(spans);
+            assert!(for_each_chunk(&frame_for(&idle)[1..], |_| panic!("idle batch")).ok);
+        }
+    }
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {
@@ -1157,13 +1507,13 @@ mod tests {
         assert_ne!(events[0].rid, events[1].rid);
     }
 
-    /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// Statistics (56 bytes) and shared version references (32 bytes) stay inline;
+    /// rare logprob/hidden columns remain boxed. No box per scheduler snapshot.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 232,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }

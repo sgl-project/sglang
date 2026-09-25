@@ -43,9 +43,7 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block, at Python wire indices 25–31.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +51,10 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        /// Routing-key placeholder so `require_reasoning` lands at index 33.
+        routing_key: (),
+        /// Last emitted field; Python defaults the remaining omitted tail.
+        require_reasoning: bool,
     }
 }
 
@@ -114,6 +116,8 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: req.require_reasoning,
         }
     }
 }
@@ -180,9 +184,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); we emit 34 (through
+        // `require_reasoning`). Trailing defaulted fields are omitted.
+        assert_eq!(arr.len(), 34, "header ends at require_reasoning");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -210,6 +214,34 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert!(arr[32].is_nil(), "routing_key at idx 32");
+        assert_eq!(
+            arr[33].as_bool(),
+            Some(false),
+            "require_reasoning at idx 33"
+        );
+    }
+
+    /// Exercise the HTTP body through the scheduler header, not just a wire struct.
+    #[test]
+    fn require_reasoning_reaches_scheduler_header() {
+        use super::super::request::GenerateBody;
+
+        for flag in [false, true] {
+            let body = serde_json::json!({"input_ids": [[1, 2], [3]], "require_reasoning": flag});
+            let (requests, _) = serde_json::from_value::<GenerateBody>(body)
+                .unwrap()
+                .into_requests()
+                .unwrap();
+            for req in requests {
+                let bytes = req.encode_header().unwrap();
+                let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+                let arr = val.as_array().unwrap();
+                assert_eq!(arr.len(), 34);
+                assert!(arr[32].is_nil());
+                assert_eq!(arr[33].as_bool(), Some(flag));
+            }
+        }
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler
