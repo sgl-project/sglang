@@ -1,7 +1,4 @@
-"""Config-time override declarations for gemma4.
-
-Architectures: Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration.
-"""
+"""Config-time override declarations for gemma4."""
 
 import logging
 from typing import Any, Dict
@@ -21,11 +18,20 @@ logger = logging.getLogger(__name__)
     "Gemma4ForConditionalGeneration",
     "Gemma4ForCausalLM",
     "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
 )
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if get_platform().is_sm100 else "triton"
+    is_diffusion = (
+        hf_config is not None
+        and hf_config.architectures[0] == "DiffusionGemmaForBlockDiffusion"
+    )
+    default_attention_backend = (
+        "triton"
+        if is_diffusion
+        else ("trtllm_mha" if get_platform().is_sm100 else "triton")
+    )
     if is_attention_backend_not_set(cfg):
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"

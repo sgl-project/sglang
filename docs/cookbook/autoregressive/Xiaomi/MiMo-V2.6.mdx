@@ -1,12 +1,12 @@
 ---
 title: MiMo-V2.6
-description: "Deploy MiMo-V2.6-Flash and Pro with SGLang on NVIDIA B300 GPUs, using MXFP4 MoE weights, BF16 routing, DFlash decoding, and a 1M-token context window."
+description: "Deploy MiMo-V2.6-Flash and Pro with SGLang on NVIDIA H200 and B300 GPUs, using MXFP4 MoE weights, BF16 routing, DFlash decoding, and a 1M-token context window."
 tag: NEW
 ---
 
 ## Deployment
 
-The recipes below target **MiMo-V2.6-Flash on 4× B300** and **MiMo-V2.6-Pro on 8× B300**, each on a single node. Both use MXFP4 MoE weights, a BF16 MoE router, and DFlash speculative decoding. B300 validation was reported by the model team; the launch settings come from [SGLang PR #40448](https://github.com/sgl-project/sglang/pull/40448).
+The recipes below target **MiMo-V2.6-Flash on 4× H200 or B300** and **MiMo-V2.6-Pro on 8× H200 or B300**, each on a single node. Both use MXFP4 MoE weights, a BF16 MoE router, and DFlash speculative decoding.
 
 <a id="install" />
 
@@ -69,7 +69,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
       <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Total parameters</th>
       <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context window</th>
-      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>B300 recipe</th>
+      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Recipe (H200 / B300)</th>
     </tr>
   </thead>
   <tbody>
@@ -97,9 +97,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 ### Parallelism and precision
 
 - **Flash:** `--tp 4 --ep 4`; **Pro:** `--tp 8 --ep 8`. Both keep `--dp 1 --pp-size 1`. TP and EP use the same GPU ranks; do not multiply them to determine the GPU count.
-- **MoE compute and communication:** Keep `--moe-runner-backend deep_gemm --moe-a2a-backend deepep --deepep-mode auto`, together with `--moe-dense-tp-size 1` and `--enable-dp-lm-head`, as in the PR.
+- **MoE compute and communication:** Keep `--moe-runner-backend deep_gemm` on B300 and `--moe-runner-backend marlin` on H200, with `--moe-a2a-backend deepep --deepep-mode auto`, together with `--moe-dense-tp-size 1` and `--enable-dp-lm-head`, as in the PR.
 - **Precision:** MXFP4 describes the MoE expert weights, not the entire model. BF16 router weights are selected by the checkpoint's `moe_router_dtype`; the support commit computes router output logits in FP32. The PR relies on checkpoint quantization metadata and does not add a `--quantization` override.
-- **Attention:** Keep `--attention-backend fa4` and `--mm-attention-backend fa4` on B300. The recipe also enables `--mm-enable-dp-encoder` for multimodal encoding.
+- **Attention:** Keep `--attention-backend fa4` and `--mm-attention-backend fa4` on both H200 and B300. The recipe also enables `--mm-enable-dp-encoder` for multimodal encoding.
 
 ### Context length and memory
 

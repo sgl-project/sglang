@@ -988,8 +988,12 @@ class OutputLogprobProcessor:
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
+            # no_copy_to_cpu avoids the .item()/.tolist() CUDA sync that regresses
+            # prefill-only Score throughput at high concurrency.
             (
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+            ) = get_token_ids_logprobs(
+                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            )
         return result
