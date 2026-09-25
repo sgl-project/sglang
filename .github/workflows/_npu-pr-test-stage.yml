@@ -19,7 +19,7 @@ on:
         type: string
         required: true
       npu_device_type:
-        description: 'NPU device type, e.g. 910b, a3.'
+        description: 'NPU device type, e.g. a3, 950.'
         type: string
         default: 'a3'
       run_timeout_minutes:

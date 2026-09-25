@@ -46,7 +46,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
-    set_dp_buffer_len,
+    set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
@@ -571,6 +571,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
+    # Setwise pooling readout positions (CPU tensors, one per request)
+    token_indices_to_pool: Optional[List[torch.Tensor]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -688,6 +691,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
+    # under MAX_LEN, padded to the max. None when the raw list already is.
+    global_num_tokens_padded_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1155,6 +1161,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for r in batch.reqs
                 ]
 
+            # Setwise readout: pool the head AT token_indices_to_pool instead of
+            # the last token. The scheduler keeps readout batches homogeneous
+            # (get_new_batch_prefill), so build only when every request carries
+            # the field and otherwise fall back to standard pooling.
+            if batch.reqs and all(
+                r.token_indices_to_pool is not None for r in batch.reqs
+            ):
+                self.token_indices_to_pool = [
+                    torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
         ]
@@ -1583,13 +1601,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(
-            buffer_len,
-            num_tokens,
-            dp_padding_mode.is_max_len(),
-            global_num_tokens,
-            self.global_num_tokens_gpu,
-        )
+        self.global_num_tokens_padded_cpu = global_num_tokens
+        set_dp_buffer_len_from_batch(self)
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
