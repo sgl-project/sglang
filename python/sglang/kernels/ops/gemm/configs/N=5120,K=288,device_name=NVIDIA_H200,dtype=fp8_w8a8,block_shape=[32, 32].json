@@ -59,6 +59,14 @@
         "SWAP_AB": true,
         "SPLIT_K": 4
     },
+    "33": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 3
+    },
     "64": {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 32,
