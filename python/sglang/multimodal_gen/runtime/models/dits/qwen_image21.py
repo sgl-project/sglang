@@ -69,6 +69,9 @@ _KV_PACK_CUDA_FUSION = BitExactFusionGate(
 _KV_PROJECT_INTO_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 K/V projection written into the packed KV buffers"
 )
+_QKV_PACK_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
+)
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
@@ -351,6 +354,40 @@ class QwenImage21Attention(nn.Module):
         self.target_attn = USPAttention(
             self.heads, self.head_dim, supported_attention_backends=backends
         )
+        # Set by pack_qkv_weights: one [3C, C] buffer whose row slices are the
+        # to_q/to_k/to_v weights, and the pointers those slices must keep.
+        self.qkv_weight = None
+        self.qkv_weight_ptrs = ()
+
+    def pack_qkv_weights(self):
+        """Share one [3C, C] buffer between to_q/to_k/to_v so one GEMM projects all three.
+
+        The parameters keep their names and shapes (state_dict, LoRA merge and
+        weight updates that copy in place all stay valid); only their storage
+        moves. Layers that are not plain bf16 unquantized projections are left
+        alone and the packed path stays off.
+        """
+        layers = (self.to_q, self.to_k, self.to_v)
+        if not all(
+            type(layer) is ColumnParallelLinear
+            and isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is None
+            and not layer.gather_output
+            and layer.weight.is_cuda
+            and layer.weight.dtype is torch.bfloat16
+            and layer.weight.is_contiguous()
+            and layer.weight.shape == self.to_q.weight.shape
+            for layer in layers
+        ):
+            self.qkv_weight = None
+            self.qkv_weight_ptrs = ()
+            return
+        packed = torch.cat([layer.weight.data for layer in layers], dim=0)
+        rows = self.to_q.weight.shape[0]
+        for index, layer in enumerate(layers):
+            layer.weight.data = packed[index * rows : (index + 1) * rows]
+        self.qkv_weight = packed
+        self.qkv_weight_ptrs = tuple(layer.weight.data_ptr() for layer in layers)
 
     def project_qkv(self, x):
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
@@ -423,6 +460,45 @@ class QwenImage21Attention(nn.Module):
         return _KV_PACK_CUDA_FUSION.accept_or_fallback(
             (q, k_out, v_out), reference, equal=tensors_equal, logger=logger
         )
+
+    def _project_qkv_packed(self, x, layouts, caches):
+        """One GEMM writes Q, K and V into a ``[1, P+S, 3C]`` buffer; ``None`` keeps the plain path.
+
+        Q/K/V become column views with token stride ``3C`` (heads stay contiguous);
+        the fused norm + RoPE kernel and SDPA both accept that layout. The first
+        call compares every slice against the module forwards.
+        """
+        layers = (self.to_q, self.to_k, self.to_v)
+        if not (
+            self.qkv_weight is not None
+            and x.shape[0] == 1
+            and len(layouts) == 1
+            and get_sp_world_size() == 1
+            and _QKV_PACK_FUSION.can_attempt_once()
+            and all(can_project_into(layer, x) for layer in layers)
+            and tuple(layer.weight.data_ptr() for layer in layers) == self.qkv_weight_ptrs
+        ):
+            return None
+        cache = caches[0]
+        prefix = cache["key"].shape[1] if cache else layouts[0]["prefix_rope"].shape[0]
+        seq = x.shape[1]
+        rows = self.qkv_weight.shape[0] // 3
+        buffer = x.new_empty(1, prefix + seq, 3 * rows)
+        torch.mm(x.view(seq, x.shape[-1]), self.qkv_weight.t(), out=buffer[0, prefix:])
+        q = buffer[:, prefix:, :rows].view(1, seq, self.heads, self.head_dim)
+        k_out = buffer[:, :, rows : 2 * rows].view(1, prefix + seq, self.heads, self.head_dim)
+        v_out = buffer[:, :, 2 * rows :].view(1, prefix + seq, self.heads, self.head_dim)
+        k, v = k_out[:, prefix:], v_out[:, prefix:]
+        if not _QKV_PACK_FUSION.verified:
+            reference = tuple(
+                layer(x)[0].unflatten(-1, (self.heads, self.head_dim)) for layer in layers
+            )
+            accepted = _QKV_PACK_FUSION.accept_or_fallback(
+                (q, k, v), reference, equal=tensors_equal, logger=logger
+            )
+            if accepted is reference:
+                return None
+        return q, k, v, k_out, v_out
 
     def _project_kv_into_buffers(self, x, layouts, caches):
         """Project K/V straight into ``[1, P+S, H, D]`` buffers; ``None`` keeps the plain path."""
@@ -513,13 +589,17 @@ class QwenImage21Attention(nn.Module):
 
     def forward(self, x, ropes, prefixes, layouts, caches):
         # batch target projections while retaining each sample's unpadded prefix
-        buffers = self._project_kv_into_buffers(x, layouts, caches)
-        if buffers is None:
-            q, k, v = self.project_qkv(x)
-            k_out = v_out = None
+        packed = self._project_qkv_packed(x, layouts, caches)
+        if packed is not None:
+            q, k, v, k_out, v_out = packed
         else:
-            q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-            k, v, k_out, v_out = buffers
+            buffers = self._project_kv_into_buffers(x, layouts, caches)
+            if buffers is None:
+                q, k, v = self.project_qkv(x)
+                k_out = v_out = None
+            else:
+                q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
+                k, v, k_out, v_out = buffers
         outputs, prefix_outputs = [], []
         for sample, layout in enumerate(layouts):
             out, prefix_out = self.attend_sample(
@@ -656,6 +736,11 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         )
         self.norm_out = QwenImage21OutputNorm(ac.hidden_size, ac.eps)
         self.proj_out = nn.Linear(ac.hidden_size, ac.out_channels, bias=False)
+
+    def post_load_weights(self):
+        super().post_load_weights()
+        for block in self.transformer_blocks:
+            block.attn.pack_qkv_weights()
 
     def prepare_modulation(self, temb):
         # All blocks share these gates. Preserve the native tanh and its dtype,

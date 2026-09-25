@@ -395,6 +395,7 @@ def bf16_model_hd128(model):
         torch.nn.init.normal_(param, std=0.02)
         if name.endswith(("norm_q.weight", "norm_k.weight")):
             torch.nn.init.normal_(param, mean=1.0, std=0.1)
+    result.post_load_weights()
     return result
 
 
@@ -433,6 +434,7 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
         reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
         reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
         reference.setattr(model_module, "_KV_PROJECT_INTO_FUSION", disabled)
+        reference.setattr(model_module, "_QKV_PACK_FUSION", disabled)
         for timestep in (700, 300, 10):
             reference_kwargs["timestep"].fill_(timestep)
             expected.append(actual_model(**reference_kwargs))
@@ -440,15 +442,19 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
     qk_gate = BitExactFusionGate("test CUDA Q/K norm + RoPE")
     kv_gate = BitExactFusionGate("test CUDA KV packing")
     project_gate = BitExactFusionGate("test K/V projection into buffers")
+    qkv_gate = BitExactFusionGate("test packed Q/K/V projection")
     monkeypatch.setattr(model_module, "_QK_ROPE_CUDA_FUSION", qk_gate)
     monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", kv_gate)
     monkeypatch.setattr(model_module, "_KV_PROJECT_INTO_FUSION", project_gate)
+    monkeypatch.setattr(model_module, "_QKV_PACK_FUSION", qkv_gate)
     with set_forward_context(None, None):
         for timestep, output in zip((700, 300, 10), expected, strict=True):
             kwargs["timestep"].fill_(timestep)
             torch.testing.assert_close(actual_model(**kwargs), output, atol=0, rtol=0)
-    for gate in (qk_gate, kv_gate, project_gate):
+    for gate in (qk_gate, kv_gate, qkv_gate):
         assert gate.verified and not gate.disabled, gate.name
+    # the packed projection supersedes the per-layer direct write
+    assert not project_gate.verified and not project_gate.disabled
     for actual, reference in zip(
         kwargs["prefix_caches"][0], reference_kwargs["prefix_caches"][0], strict=True
     ):
@@ -481,6 +487,7 @@ def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch)
     with monkeypatch.context() as reference, set_forward_context(None, None):
         reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
         reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_QKV_PACK_FUSION", disabled)
         expected = bf16_model_hd128(**reference_kwargs)
 
     kv_gate = BitExactFusionGate("test mismatched KV packing")
@@ -494,3 +501,23 @@ def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch)
     with set_forward_context(None, None):
         torch.testing.assert_close(bf16_model_hd128(**kwargs), expected, atol=0, rtol=0)
     assert kv_gate.disabled and not kv_gate.verified
+
+
+@torch.no_grad()
+def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(bf16_model_hd128):
+    # pack_qkv_weights must keep parameter names/values and alias the packed buffer,
+    # so a merge-mode LoRA delta written into to_q.weight is what the packed GEMM sees.
+    attn = bf16_model_hd128.transformer_blocks[0].attn
+    assert attn.qkv_weight is not None
+    rows = attn.to_q.weight.shape[0]
+    assert torch.equal(attn.qkv_weight[:rows], attn.to_q.weight)
+    assert torch.equal(attn.qkv_weight[rows : 2 * rows], attn.to_k.weight)
+    assert torch.equal(attn.qkv_weight[2 * rows :], attn.to_v.weight)
+    keys = set(bf16_model_hd128.state_dict().keys())
+    assert "transformer_blocks.0.attn.to_q.weight" in keys
+    assert not any("qkv_weight" in key for key in keys)
+    before = attn.qkv_weight[:rows].clone()
+    attn.to_q.weight.add_(1.0)
+    assert torch.equal(attn.qkv_weight[:rows], before + 1.0)
+    attn.to_q.weight.sub_(1.0)
+    assert tuple(layer.weight.data_ptr() for layer in (attn.to_q, attn.to_k, attn.to_v)) == attn.qkv_weight_ptrs
