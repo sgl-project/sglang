@@ -303,6 +303,27 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras={"enable_teacache": True},
         ),
     ),
+    # The text encoder's resident set placed at load and never released. The
+    # guard is TextEncodingStage: with the set on the device the stage is
+    # compute only, and if the layers ever go back to being transferred per
+    # request the stage regains that whole transfer, well past the
+    # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
+    # it also pins that the placement happens at load, not on the first use.
+    # The encoder is already layerwise under the default component set.
+    # No consistency check: the lifetime moves weights, not math, so the
+    # output is the base case's and that case already guards it.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_encoder_permanent_residents",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--layerwise-resident-layers text_encoder=0.8 "
+                "--layerwise-residency-lifetime text_encoder=permanent",
+            ],
+        ),
+        DiffusionSamplingParams(prompt=T2V_PROMPT),
+        run_consistency_check=False,
+    ),
     # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
     DiffusionTestCase(

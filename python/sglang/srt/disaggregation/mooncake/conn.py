@@ -217,6 +217,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
+    # Bootstrap thread defers the ABORT ack until the transfer worker drains.
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,
@@ -2469,9 +2471,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # first would let the worker drain+ack while the room is
                         # not yet Failed, so a newly enqueued chunk could still
                         # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
+                        # acks once its in-flight write drains.
+                        if (
+                            room_active
+                            or self._staging_outstanding.get(room_to_be_aborted, 0) > 0
+                        ):
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self.register_deferred_ack_target(
                                 room_to_be_aborted, decode_ip, decode_port
@@ -2483,10 +2487,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
+                        else:
+                            # Concluded/unknown AND quiescent (the branch above
+                            # already took every case with writes outstanding):
+                            # ack now so decode releases without the timeout.
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )

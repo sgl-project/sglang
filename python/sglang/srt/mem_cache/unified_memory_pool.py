@@ -154,15 +154,6 @@ class MHASubPoolSpec(SubPoolSpec):
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
-    def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
-
-    def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return (
-            self.layer_k_offset_in_page(layer_id, page_size)
-            + page_size * self.k_row_bytes()
-        )
-
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
@@ -635,6 +626,20 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def get_page_envelope_buffer(self) -> torch.Tensor:
+        """Return this sub-pool's page-strided view of the shared allocation."""
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        page_count = (
+            self._unified_buffer.max_slots(self._sub_pool_name) // self.page_size
+        )
+        return raw[: page_count * self._page_bytes].view(page_count, self._page_bytes)
+
+    @property
+    def grow_direction(self) -> str:
+        """Physical growth direction used by this sub-pool's L1 allocator."""
+        return self._unified_buffer.spec(self._sub_pool_name).grow_direction
 
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return (indices // self.page_size) * (
