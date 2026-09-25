@@ -99,6 +99,15 @@ class TestDcpStorageIdentity(CustomTestCase):
             make_config(dcp_size=1),
             replace(config, logical_page_size=256),
             replace(config, kv_cache_dtype=torch.float16),
+            replace(config, kv_cache_dtype=torch.float8_e4m3fn),
+            replace(config, kv_cache_dtype=torch.float8_e5m2),
+            replace(config, pp_size=2, pp_rank=0),
+            replace(config, pp_size=2, pp_rank=1),
+            replace(config, attn_cp_size=2, attn_cp_rank=0),
+            replace(config, attn_cp_size=2, attn_cp_rank=1),
+            replace(
+                config, host_layout="page_first_direct", is_page_first_layout=False
+            ),
             replace(config, host_layout="layer_first", is_page_first_layout=False),
             replace(config, model_name="different/model"),
         ]

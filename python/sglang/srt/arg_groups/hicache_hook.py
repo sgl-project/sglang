@@ -144,51 +144,15 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     )
 
 
-def validate_hicache_dcp_storage(
-    server_args: Any,
-    *,
-    storage_backend=None,
-    prefetch_policy=None,
-    write_policy=None,
-):
-    """Shared startup/runtime contract for the first DCP L3 implementation."""
+def validate_hicache_dcp_storage(server_args: Any, *, storage_backend=None):
+    """Only the MLA file path currently implements DCP shard storage."""
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1:
         return
-    checks = (
-        ((storage_backend or cfg.hicache_storage_backend) == "file", "file storage"),
-        (use_mla_backend(server_args), "dense MLA"),
-        (cfg.hicache_mem_layout == "page_first", "page_first layout"),
-        (cfg.hicache_io_backend == "kernel", "kernel I/O"),
-        (
-            cfg.dtype in ("auto", "bfloat16")
-            and cfg.kv_cache_dtype in ("auto", "bf16", "bfloat16"),
-            "BF16 KV",
-        ),
-        (
-            (write_policy or cfg.hicache_write_policy) == "write_through",
-            "write_through",
-        ),
-        (
-            (prefetch_policy or cfg.hicache_storage_prefetch_policy) == "wait_complete",
-            "wait_complete",
-        ),
-        (cfg.hicache_host_memory_mode == "cache", "cache host memory mode"),
-        (
-            cfg.pp_size == cfg.dp_size == cfg.attn_cp_size == 1,
-            "PP/DP/other CP sizes of 1",
-        ),
-        (not cfg.enable_dp_attention, "attention DP disabled"),
-        (cfg.speculative_algorithm is None, "speculative decoding disabled"),
-        (
-            not cfg.enable_hisparse and not cfg.enable_lmcache,
-            "HiSparse and LMCache disabled",
-        ),
-        (cfg.disaggregation_mode == "null", "disaggregation disabled"),
-    )
-    for valid, requirement in checks:
-        if not valid:
-            raise NotImplementedError(f"HiCache L3 with DCP requires {requirement}.")
+    if not use_mla_backend(server_args):
+        raise NotImplementedError("HiCache L3 with DCP requires MLA.")
+    if (storage_backend or cfg.hicache_storage_backend) != "file":
+        raise NotImplementedError("HiCache L3 with DCP requires file storage.")
 
 
 def resolve_layout_io_compatibility(server_args: Any):

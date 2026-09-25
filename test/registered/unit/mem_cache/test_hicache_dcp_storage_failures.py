@@ -57,6 +57,8 @@ def _worker(rank, directory):
         "missing",
         "evicted_after_lookup",
         "backup_delayed",
+        "best_effort",
+        "timeout",
     )
     for case in cases:
         storage_dir = Path(directory) / case
@@ -145,6 +147,16 @@ def _worker(rank, directory):
                     dist.barrier()
                     op.host_indices = pool.alloc(op.storage_hit_count)
                     cache.ongoing_prefetch[op.handle] = SimpleNamespace(operation=op)
+                    if case in ("best_effort", "timeout"):
+                        cache.prefetch_stop_policy = case
+                        cache.pp_rank = 0
+                        cache.prefetch_timeout_base = 0
+                        cache.prefetch_timeout_per_page = 0
+                        cache._all_reduce = lambda tensor, reduce_op: dist.all_reduce(
+                            tensor, op=reduce_op
+                        )
+                        assert cache._can_terminate_prefetch(op)
+                        cc.terminate_prefetch(op)
                     cc.prefetch_buffer.put(op)
                     acks = []
                     while True:
@@ -158,6 +170,8 @@ def _worker(rank, directory):
                     expected = (
                         128 if case in ("missing", "evicted_after_lookup") else 384
                     )
+                    if case in ("best_effort", "timeout"):
+                        expected = 0
                     assert op.completed_tokens == expected, (
                         case,
                         rank,
@@ -228,8 +242,8 @@ class TestDcpStorageFailures(unittest.TestCase):
                 json.loads(Path(directory, f"rank-{rank}.json").read_text())
                 for rank in range(4)
             ]
-            self.assertTrue(all(len(rank) == 4 for rank in reports))
-            for case_index in range(4):
+            self.assertTrue(all(len(rank) == 6 for rank in reports))
+            for case_index in range(6):
                 rows = [rank[case_index] for rank in reports]
                 self.assertEqual(len({row["tokens"] for row in rows}), 1)
                 self.assertTrue(all(row["remaining_slots"] == 0 for row in rows))

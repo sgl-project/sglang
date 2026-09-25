@@ -998,8 +998,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def _storage_page_index(self, index: int) -> int:
         if self.dcp_size == 1:
             return index
-        if self.layout != "page_first":
-            raise NotImplementedError("DCP L3 page access requires page_first layout.")
         index = int(index)
         if index < 0 or index % self.logical_page_size != 0:
             raise ValueError(

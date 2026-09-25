@@ -3,6 +3,9 @@
 Run with four free GPUs visible and the model cached:
   python -m pytest test/manual/hicache/test_dcp_l3.py -q -s
 Set DCP_L3_OUTPUT_DIR to retain server logs and the JSON result table.
+DCP_L3_PROFILE selects an inherited MLA configuration (see PROFILES below).
+Extended profiles default to TP=2/DCP=2.
+DCP_L3_PORT selects the server port when running independent profiles in parallel.
 """
 
 import json
@@ -24,6 +27,26 @@ from sglang.test.test_utils import popen_launch_server, terminate_and_kill_proce
 MODEL = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 
 
+PROFILES = {
+    "default": {},
+    "fp8": {"--kv-cache-dtype": "fp8_e4m3"},
+    "layer_first_fp16": {"--dtype": "float16", "--hicache-mem-layout": "layer_first"},
+    "direct": {
+        "--hicache-mem-layout": "page_first_direct",
+        "--hicache-io-backend": "direct",
+    },
+    "buffer_only": {"--hicache-host-memory-mode": "buffer_only"},
+    "selective": {"--hicache-write-policy": "write_through_selective"},
+    "write_back": {
+        "--hicache-write-policy": "write_back",
+        "--max-total-tokens": "2048",
+    },
+    "best_effort": {"--hicache-storage-prefetch-policy": "best_effort"},
+    "timeout": {"--hicache-storage-prefetch-policy": "timeout"},
+    "pp": {"--pp-size": "2"},
+}
+
+
 class TestDcpL3(unittest.TestCase):
     def test_fresh_engines(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -43,18 +66,25 @@ class TestDcpL3(unittest.TestCase):
                 * (config.kv_lora_rank + config.qk_rope_head_dim)
                 * 2
             )
+            profile = os.environ.get("DCP_L3_PROFILE", "default")
+            options = PROFILES[profile]
+            if profile == "fp8":
+                payload_bytes //= 2
+            pp = int(options.get("--pp-size", "1"))
+            partial_prefetch = profile in ("best_effort", "timeout")
+            base_port = int(os.environ.get("DCP_L3_PORT", "31000"))
             visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3").split(",")
-            self.assertGreaterEqual(len(visible), 4)
+            self.assertGreaterEqual(len(visible), 2)
             reports = []
 
             @contextmanager
             def server(name, tp, dcp, storage, devices=None, runtime_attach=False):
                 log = output / f"{name}.log"
-                port = 31002 if name.endswith("parallel-b") else 31000
+                port = base_port + 2 if name.endswith("parallel-b") else base_port
                 url = f"http://127.0.0.1:{port}"
                 env = dict(
                     os.environ,
-                    CUDA_VISIBLE_DEVICES=",".join(devices or visible[:tp]),
+                    CUDA_VISIBLE_DEVICES=",".join(devices or visible[: tp * pp]),
                     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=str(storage),
                 )
                 args = [
@@ -104,6 +134,13 @@ class TestDcpL3(unittest.TestCase):
                     "--log-level",
                     "debug",
                 ]
+                for flag, value in options.items():
+                    if flag in args:
+                        args[args.index(flag) + 1] = value
+                    else:
+                        args.append(flag)
+                        if value is not None:
+                            args.append(value)
                 if runtime_attach:
                     backend_index = args.index("--hicache-storage-backend")
                     del args[backend_index : backend_index + 2]
@@ -150,11 +187,11 @@ class TestDcpL3(unittest.TestCase):
                     finally:
                         terminate_and_kill_process_tree(process)
 
-            def generate(url):
+            def generate(url, input_ids=None):
                 response = requests.post(
                     url + "/generate",
                     json={
-                        "input_ids": tokens,
+                        "input_ids": tokens if input_ids is None else input_ids,
                         "sampling_params": {
                             "temperature": 0,
                             "max_new_tokens": 8,
@@ -167,24 +204,63 @@ class TestDcpL3(unittest.TestCase):
                 return response.json()
 
             def storage_tokens(result):
-                return result["meta_info"]["cached_tokens_details"]["storage"]
+                details = result["meta_info"]["cached_tokens_details"]
+                if details is None:
+                    self.assertEqual(result["meta_info"]["cached_tokens"], 0)
+                    return 0
+                return details["storage"]
 
             def wait_files(storage, hashes, dcp):
                 deadline = time.monotonic() + 60
                 while time.monotonic() < deadline:
                     files = list(storage.glob("*.bin"))
-                    if all(len(list(storage.glob(h + "*.bin"))) == dcp for h in hashes):
-                        self.assertEqual(len(files), len(hashes) * dcp)
+                    if all(
+                        len(list(storage.glob(h + "*.bin"))) == dcp * pp for h in hashes
+                    ):
+                        target_files = [
+                            p
+                            for p in files
+                            if any(p.name.startswith(h) for h in hashes)
+                        ]
+                        self.assertEqual(len(target_files), len(hashes) * dcp * pp)
                         self.assertEqual(
-                            {p.stat().st_size for p in files}, {payload_bytes}
+                            sum(p.stat().st_size for p in target_files),
+                            len(hashes) * dcp * payload_bytes,
                         )
-                        return files
+                        if pp == 1:
+                            self.assertEqual(
+                                {p.stat().st_size for p in target_files},
+                                {payload_bytes},
+                            )
+                        if profile != "write_back":
+                            self.assertEqual(len(files), len(target_files))
+                        return target_files
                     time.sleep(0.1)
                 self.fail(
                     "Timed out waiting for complete files from every shard writer"
                 )
 
             def read_counts(log, tp, expected):
+                if pp > 1:
+                    matches = re.findall(
+                        r"PP(\d+) TP\d+\].*DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)",
+                        log.read_text(),
+                    )
+                    counts = {
+                        (int(stage), int(rank)): int(count)
+                        for stage, rank, count in matches
+                    }
+                    self.assertEqual(
+                        counts,
+                        {
+                            (stage, rank): expected
+                            for stage in range(pp)
+                            for rank in range(tp)
+                        },
+                    )
+                    return [
+                        counts[stage, rank] for stage in range(pp) for rank in range(tp)
+                    ]
                 matches = re.findall(
                     r"DCP L3 prefetch: tp_rank=(\d+) tokens=(\d+)", log.read_text()
                 )
@@ -192,9 +268,11 @@ class TestDcpL3(unittest.TestCase):
                 self.assertEqual(counts, {rank: expected for rank in range(tp)})
                 return [counts[rank] for rank in range(tp)]
 
-            topologies = os.environ.get("DCP_L3_TOPOLOGIES", "2:2,4:2,4:4")
+            default_topologies = "2:2,4:2,4:4" if profile == "default" else "2:2"
+            topologies = os.environ.get("DCP_L3_TOPOLOGIES", default_topologies)
             for topology in topologies.split(","):
                 tp, dcp = map(int, topology.split(":"))
+                self.assertGreaterEqual(len(visible), tp * pp)
                 name = f"tp{tp}-dcp{dcp}"
                 storage = Path(temp) / name
                 storage.mkdir()
@@ -203,6 +281,18 @@ class TestDcpL3(unittest.TestCase):
                 with server(name + "-writer", tp, dcp, storage) as (url, _):
                     cold = generate(url)
                     self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
+                    if profile == "selective":
+                        for _ in range(3):
+                            generate(url)
+                    if profile == "write_back":
+                        pressure = tokenizer.encode(
+                            "A different story about mountains and rivers. " * 200
+                        )[:1537]
+                        # DCP widens logical capacity; use distinct prompts
+                        # until their combined footprint exceeds that capacity.
+                        for sequence in range(3):
+                            pressure[1] = 100 + sequence
+                            generate(url, pressure)
                     files = wait_files(storage, hashes, dcp)
                 with server(
                     name + "-reader",
@@ -213,19 +303,28 @@ class TestDcpL3(unittest.TestCase):
                 ) as (url, log):
                     warm = generate(url)
                     self.assertEqual(warm["output_ids"], cold["output_ids"])
-                    self.assertEqual(storage_tokens(warm), 1024)
-                    counts = read_counts(log, tp, 1024)
+                    if partial_prefetch:
+                        self.assertGreaterEqual(storage_tokens(warm), 0)
+                        self.assertLessEqual(storage_tokens(warm), 1024)
+                        self.assertEqual(storage_tokens(warm) % page, 0)
+                        counts = None
+                    else:
+                        self.assertEqual(storage_tokens(warm), 1024)
+                        counts = read_counts(log, tp, 1024)
                 report = dict(
+                    profile=profile,
                     tp=tp,
                     dcp=dcp,
+                    pp=pp,
                     pages=len(hashes),
                     objects=len(files),
-                    bytes_per_object=payload_bytes,
+                    object_byte_sizes=sorted({p.stat().st_size for p in files}),
                     restored_tokens=counts,
+                    used_storage_tokens=storage_tokens(warm),
                     cold_output_ids=cold["output_ids"],
                     restored_output_ids=warm["output_ids"],
                 )
-                if (tp, dcp) == (4, 2):
+                if (tp, dcp) == (4, 2) and profile == "default":
                     missing = next(
                         p
                         for p in storage.glob(hashes[1] + "*.bin")
@@ -243,7 +342,11 @@ class TestDcpL3(unittest.TestCase):
                 (output / "results.json").write_text(json.dumps(reports, indent=2))
                 print("DCP_L3_RESULT=" + json.dumps(report), flush=True)
 
-            if os.environ.get("DCP_L3_SKIP_CONCURRENCY") != "1":
+            if (
+                profile == "default"
+                and os.environ.get("DCP_L3_SKIP_CONCURRENCY") != "1"
+            ):
+                self.assertGreaterEqual(len(visible), 4)
                 storage = Path(temp) / "concurrent"
                 storage.mkdir()
                 hashes = get_storage_hash_str(tokens[:1024], None, page_size=128)

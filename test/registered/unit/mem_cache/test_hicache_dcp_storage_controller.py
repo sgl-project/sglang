@@ -50,12 +50,15 @@ def _parallel(rank, dcp_size):
     )
 
 
-def _controller(rank, dcp_size=2, is_mla=True):
+def _controller(rank, dcp_size=2, is_mla=True, dtype=torch.bfloat16, parallel=None):
     # GPU allocation and process-group creation are outside this component test.
     device = SimpleNamespace(
         size=256,
         host_capacity_tokens=None,
-        store_dtype=torch.bfloat16,
+        store_dtype=torch.uint8
+        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        else dtype,
+        dtype=dtype,
         kv_lora_rank=8,
         qk_rope_head_dim=4,
         layer_num=2,
@@ -94,11 +97,11 @@ def _controller(rank, dcp_size=2, is_mla=True):
     with (
         mock.patch(
             "sglang.srt.managers.cache_controller.get_parallel",
-            return_value=_parallel(rank, dcp_size),
+            return_value=parallel or _parallel(rank, dcp_size),
         ),
         mock.patch(
             "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
-            return_value=False,
+            return_value=parallel is not None,
         ),
     ):
         cc.storage_config = cc._generate_storage_config(
@@ -280,6 +283,61 @@ class TestDcpStorageController(CustomTestCase):
                         cc.storage_backend._evictor.is_storage_owner, not cc.backup_skip
                     )
 
+    def test_keys_use_kv_format_instead_of_host_byte_dtype(self):
+        a = _controller(0, dtype=torch.float8_e4m3fn)
+        b = _controller(0, dtype=torch.float8_e5m2)
+        self.assertEqual(a.storage_host_pool.dtype, b.storage_host_pool.dtype)
+        self.assertNotEqual(
+            a.storage_config.kv_cache_dtype, b.storage_config.kv_cache_dtype
+        )
+        self.assertNotEqual(
+            a.storage_backend._get_suffixed_key("page"),
+            b.storage_backend._get_suffixed_key("page"),
+        )
+
+    def test_attention_dp_uses_local_shard_ranks(self):
+        keys = []
+        for dp in range(2):
+            for rank in range(4):
+                parallel = _parallel(rank + dp * 4, 2)
+                parallel.tp_size = 8
+                parallel.attn_tp_rank = rank
+                parallel.attn_tp_size = 4
+                parallel.attn_dp_rank = dp
+                cc = _controller(rank, parallel=parallel)
+                self.assertEqual(cc.storage_config.tp_rank, rank)
+                self.assertEqual(cc.storage_config.tp_size, 4)
+                self.assertEqual(cc.backup_skip, rank >= 2)
+                keys.append(cc.storage_backend._get_suffixed_key("page"))
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_runtime_attach_rejects_incomplete_file_payloads(self):
+        for representation in ("dummy", "split", "scales", "extra_pool"):
+            cc = _controller(0, dtype=torch.float16)
+            if representation == "dummy":
+                cc.storage_host_pool.kv_buffer = None
+            elif representation == "split":
+                cc.storage_host_pool.layout = "page_first_kv_split"
+            elif representation == "scales":
+                cc.storage_host_pool.device_pool.kv_scale_buffer = [torch.zeros(1)]
+            else:
+                cc.mem_pool_host = SimpleNamespace(entries=[object(), object()])
+            cc._stop_storage_threads = mock.Mock()
+            with (
+                self.subTest(representation=representation),
+                mock.patch(
+                    "sglang.srt.managers.cache_controller.get_parallel",
+                    return_value=_parallel(0, 2),
+                ),
+                mock.patch("sglang.srt.runtime_context.get_server_args"),
+                mock.patch(
+                    "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
+                ),
+                self.assertRaises(NotImplementedError),
+            ):
+                cc.attach_storage_backend("file")
+            cc._stop_storage_threads.assert_not_called()
+
     def test_runtime_attach_rejects_unsupported_pool_before_side_effects(self):
         cc = HiCacheController.__new__(HiCacheController)
         cc.enable_storage = False
@@ -300,7 +358,7 @@ class TestDcpStorageController(CustomTestCase):
                     "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
                 ),
                 self.assertRaisesRegex(
-                    NotImplementedError, "single dense BF16 MLA pool"
+                    NotImplementedError, "one materialized MLA host pool"
                 ),
             ):
                 cc.attach_storage_backend("file")

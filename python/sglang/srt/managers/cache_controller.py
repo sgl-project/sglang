@@ -539,18 +539,29 @@ class HiCacheController:
             validate_hicache_dcp_storage(
                 get_server_args(),
                 storage_backend=storage_backend,
-                write_policy=self.write_policy,
-                # Startup and StorageAttachment validate the effective policy;
-                # runtime attachment can override the original server args.
-                prefetch_policy="wait_complete",
             )
             if (
-                type(self.storage_host_pool) is not MLATokenToKVPoolHost
-                or self.storage_host_pool.dtype != torch.bfloat16
+                not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
+                or self.storage_host_pool.kv_buffer is None
                 or len(getattr(self.mem_pool_host, "entries", [None])) != 1
             ):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires a single dense BF16 MLA pool."
+                    "HiCache L3 with DCP requires one materialized MLA host pool."
+                )
+            if self.storage_host_pool.layout not in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a generic MLA file-page layout."
+                )
+            if (
+                getattr(self.storage_host_pool.device_pool, "kv_scale_buffer", None)
+                is not None
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP cannot store separate KV scale buffers."
                 )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
@@ -770,7 +781,10 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
-            kv_cache_dtype=self.storage_host_pool.dtype if dcp_size > 1 else None,
+            # FP8 caches use uint8 host buffers; key by the actual KV format.
+            kv_cache_dtype=(
+                self.storage_host_pool.device_pool.dtype if dcp_size > 1 else None
+            ),
             host_layout=self.storage_host_pool.layout if dcp_size > 1 else None,
         )
 

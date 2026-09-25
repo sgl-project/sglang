@@ -45,71 +45,111 @@ class TestDcpStorageGuards(unittest.TestCase):
                 with self.subTest(kv_cache_dtype=dtype):
                     resolve_hicache_dcp_compatibility(_args(kv_cache_dtype=dtype))
 
-    def test_unsupported_options(self):
-        cases = dict(
-            hicache_storage_backend="mooncake",
-            hicache_mem_layout="layer_first",
-            hicache_io_backend="direct",
-            dtype="float16",
-            kv_cache_dtype="fp8_e4m3",
-            hicache_write_policy="write_back",
-            hicache_storage_prefetch_policy="timeout",
-            hicache_host_memory_mode="buffer_only",
-            pp_size=2,
-            dp_size=2,
-            attn_cp_size=2,
-            enable_dp_attention=True,
-            speculative_algorithm="DSPARK",
-            enable_hisparse=True,
-            enable_lmcache=True,
-            disaggregation_mode="prefill",
+    def test_inherits_mla_hicache_options(self):
+        cases = (
+            dict(hicache_mem_layout="layer_first"),
+            dict(hicache_mem_layout="page_first_direct", hicache_io_backend="direct"),
+            dict(dtype="float16"),
+            dict(kv_cache_dtype="fp8_e4m3"),
+            dict(hicache_write_policy="write_back"),
+            dict(hicache_write_policy="write_through_selective"),
+            dict(hicache_storage_prefetch_policy="best_effort"),
+            dict(hicache_storage_prefetch_policy="timeout"),
+            dict(hicache_host_memory_mode="buffer_only"),
+            dict(pp_size=2),
+            dict(dp_size=2),
+            dict(attn_cp_size=2),
+            dict(dp_size=2, enable_dp_attention=True),
+            dict(speculative_algorithm="DSPARK"),
+            dict(disaggregation_mode="prefill"),
         )
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
         ):
-            for name, value in cases.items():
+            for options in cases:
+                with self.subTest(options=options):
+                    resolve_hicache_dcp_compatibility(_args(**options))
+
+    def test_keeps_existing_dcp_constraints(self):
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            for options in (
+                dict(enable_hisparse=True),
+                dict(enable_lmcache=True),
+                dict(speculative_algorithm="EAGLE"),
+            ):
                 with (
-                    self.subTest(name=name),
-                    self.assertRaisesRegex(
-                        NotImplementedError, "HiCache L3 with DCP requires"
+                    self.subTest(options=options),
+                    self.assertRaises(NotImplementedError),
+                ):
+                    resolve_hicache_dcp_compatibility(_args(**options))
+
+    def test_runtime_rejection_has_no_side_effects(self):
+        for attached in (False, True):
+            for mla, backend, message in (
+                (False, "file", "MLA"),
+                (True, "mooncake", "file storage"),
+            ):
+                cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(), enable_storage=attached
+                )
+                attachment = StorageAttachment(cache)
+                attachment._apply_policies = mock.Mock()
+                with (
+                    self.subTest(attached=attached, mla=mla, backend=backend),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=2),
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_server_args",
+                        return_value=_args(),
+                    ),
+                    mock.patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=mla,
                     ),
                 ):
-                    resolve_hicache_dcp_compatibility(_args(**{name: value}))
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=False
-        ):
-            with self.assertRaisesRegex(NotImplementedError, "dense MLA"):
-                validate_hicache_dcp_storage(_args())
-
-    def test_runtime_policy_rejection_has_no_side_effects(self):
-        for attached in (False, True):
-            cache = SimpleNamespace(
-                cache_controller=SimpleNamespace(write_policy="write_through"),
-                prefetch_stop_policy="wait_complete",
-                enable_storage=attached,
-            )
-            attachment = StorageAttachment(cache)
-            attachment._apply_policies = mock.Mock()
-            with (
-                mock.patch(
-                    "sglang.srt.runtime_context.get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=2),
-                ),
-                mock.patch(
-                    "sglang.srt.runtime_context.get_server_args", return_value=_args()
-                ),
-                mock.patch(
-                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
-                    return_value=True,
-                ),
-            ):
-                for policy in (
-                    dict(hicache_write_policy="write_back"),
-                    dict(hicache_storage_prefetch_policy="timeout"),
-                ):
-                    ok, reason = attachment.attach("file", **policy)
+                    ok, reason = attachment.attach(backend)
                     self.assertFalse(ok)
-                    self.assertIn("requires", reason)
+                    self.assertIn(message, reason)
+                    with self.assertRaisesRegex(NotImplementedError, message):
+                        validate_hicache_dcp_storage(_args(), storage_backend=backend)
+                attachment._apply_policies.assert_not_called()
+
+    def test_runtime_policy_updates_use_existing_validation(self):
+        cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(storage_backend_type="file"),
+            enable_storage=True,
+        )
+        attachment = StorageAttachment(cache)
+        attachment._apply_policies = mock.Mock()
+        with (
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=2),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args", return_value=_args()
+            ),
+            mock.patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+            ),
+        ):
+            for write in ("write_back", "write_through", "write_through_selective"):
+                for prefetch in ("best_effort", "timeout", "wait_complete"):
+                    with self.subTest(write=write, prefetch=prefetch):
+                        ok, reason = attachment.attach(
+                            "file",
+                            hicache_write_policy=write,
+                            hicache_storage_prefetch_policy=prefetch,
+                        )
+                        self.assertTrue(ok, reason)
+                        attachment._apply_policies.assert_called_with(prefetch, write)
+            attachment._apply_policies.reset_mock()
+            ok, _ = attachment.attach("file", hicache_write_policy="invalid")
+            self.assertFalse(ok)
             attachment._apply_policies.assert_not_called()
 
 

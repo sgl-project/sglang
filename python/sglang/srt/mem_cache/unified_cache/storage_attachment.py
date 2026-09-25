@@ -82,9 +82,6 @@ class StorageAttachment:
                 validate_hicache_dcp_storage(
                     get_server_args(),
                     storage_backend=storage_backend,
-                    prefetch_policy=hicache_storage_prefetch_policy
-                    or cache.prefetch_stop_policy,
-                    write_policy=hicache_write_policy or controller.write_policy,
                 )
             except NotImplementedError as e:
                 return False, str(e)

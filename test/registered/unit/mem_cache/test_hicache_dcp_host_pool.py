@@ -12,6 +12,7 @@ kernels.
 
 import tempfile
 import unittest
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -200,11 +201,6 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_unsupported_layout_is_guarded(self):
-        pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(NotImplementedError):
-            pool.get_data_page(0)
-
 
 class TestDcpStoragePages(CustomTestCase):
     def test_file_round_trip_to_different_allocations(self):
@@ -212,26 +208,31 @@ class TestDcpStoragePages(CustomTestCase):
             tempfile.TemporaryDirectory() as directory,
             envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(directory),
         ):
-            for dcp_size in (2, 4):
+            for dcp_size, layout, kv_dtype in product(
+                (2, 4),
+                ("layer_first", "page_first", "page_first_direct"),
+                (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2),
+            ):
+                dtype = (
+                    torch.uint8
+                    if kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    else kv_dtype
+                )
                 for rank in range(dcp_size):
-                    with self.subTest(dcp_size=dcp_size, rank=rank):
+                    with self.subTest(
+                        dcp_size=dcp_size, rank=rank, layout=layout, dtype=kv_dtype
+                    ):
                         source = _make_host_pool(
-                            rank,
-                            dcp_size=dcp_size,
-                            layout="page_first",
-                            dtype=torch.bfloat16,
+                            rank, dcp_size=dcp_size, layout=layout, dtype=dtype
                         )
                         target = _make_host_pool(
-                            rank,
-                            dcp_size=dcp_size,
-                            layout="page_first",
-                            dtype=torch.bfloat16,
+                            rank, dcp_size=dcp_size, layout=layout, dtype=dtype
                         )
                         values = (
                             torch.arange(source.kv_buffer.numel()) * 13 + rank * 17
                         ) % 251
                         source.kv_buffer.copy_(values.reshape(source.kv_buffer.shape))
-                        target.kv_buffer.fill_(-1)
+                        target.kv_buffer.fill_(255)
                         expected = target.kv_buffer.clone()
                         backend = HiCacheFile(
                             HiCacheStorageConfig(
@@ -243,13 +244,13 @@ class TestDcpStoragePages(CustomTestCase):
                                 attn_cp_size=1,
                                 is_mla_model=True,
                                 enable_storage_metrics=False,
-                                is_page_first_layout=True,
+                                is_page_first_layout=layout == "page_first",
                                 model_name="page-test",
                                 dcp_size=dcp_size,
                                 dcp_rank=rank,
                                 logical_page_size=64 * dcp_size,
-                                kv_cache_dtype=torch.bfloat16,
-                                host_layout="page_first",
+                                kv_cache_dtype=kv_dtype,
+                                host_layout=layout,
                                 extra_config={
                                     "max_size": "0",
                                     "min_free_space": "0",
@@ -257,35 +258,41 @@ class TestDcpStoragePages(CustomTestCase):
                                 },
                             )
                         )
-                        # Nonadjacent pages in reversed order, restored elsewhere.
+
+                        def page_view(buffer, page):
+                            if layout == "layer_first":
+                                return buffer[:, page * 64 : (page + 1) * 64]
+                            if layout == "page_first":
+                                return buffer[page * 64 : (page + 1) * 64]
+                            return buffer[page : page + 1]
+
                         for source_page, target_page in ((3, 5), (1, 0)):
                             key = f"page-{source_page}"
                             payload = source.get_data_page(source_page * 64 * dcp_size)
+                            expected_bytes = (
+                                64 * 2 * 12 * source.kv_buffer.element_size()
+                            )
                             self.assertEqual(
-                                payload.numel() * payload.element_size(), 3072
+                                payload.numel() * payload.element_size(), expected_bytes
                             )
                             torch.testing.assert_close(
                                 payload,
-                                source.kv_buffer[
-                                    source_page * 64 : (source_page + 1) * 64
-                                ].flatten(),
+                                page_view(source.kv_buffer, source_page).flatten(),
                             )
                             self.assertTrue(backend.set(key, payload))
                             path = (
                                 Path(directory)
                                 / f"{backend._get_suffixed_key(key)}.bin"
                             )
-                            self.assertEqual(path.stat().st_size, 3072)
+                            self.assertEqual(path.stat().st_size, expected_bytes)
                             restored = backend.get(
                                 key, target.get_dummy_flat_data_page()
                             )
                             target.set_from_flat_data_page(
                                 target_page * 64 * dcp_size, restored
                             )
-                            expected[target_page * 64 : (target_page + 1) * 64] = (
-                                source.kv_buffer[
-                                    source_page * 64 : (source_page + 1) * 64
-                                ]
+                            page_view(expected, target_page).copy_(
+                                page_view(source.kv_buffer, source_page)
                             )
                         torch.testing.assert_close(
                             target.kv_buffer, expected, rtol=0, atol=0
