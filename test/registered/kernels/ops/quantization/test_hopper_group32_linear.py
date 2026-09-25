@@ -79,7 +79,11 @@ def test_cached_weight_linear(m, k):
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="Hopper group32 path")
 def test_cached_weight_refresh():
+    from sglang.srt.environ import envs
     from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        _unsupported_derived_weight_cache_error,
+    )
 
     method = Fp8LinearMethod(
         Fp8Config(
@@ -106,6 +110,11 @@ def test_cached_weight_refresh():
             atol=0,
         )
         assert "_block_fp8_bf16_weight" not in layer.state_dict()
+        assert "Hopper FP8" in _unsupported_derived_weight_cache_error(layer)
+    with envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.override(False):
+        method.process_weights_after_loading_block_quant(layer)
+        assert layer._block_fp8_bf16_weight is None
+        assert layer._derived_weight_cache_error is None
     layer.keep_plain_weight_layout = True
     method.process_weights_after_loading_block_quant(layer)
     assert layer._block_fp8_bf16_weight is None
