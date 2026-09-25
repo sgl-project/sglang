@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -710,6 +711,19 @@ def _verify_uses_greedy(
     return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
 
 
+def _verify_row_argmax(next_token_logits: torch.Tensor) -> torch.Tensor:
+    # row_argmax resolves ties to the lowest index like torch.argmax, so the
+    # committed token is identical. Its preconditions are the common case here,
+    # not a guarantee, so fall back rather than assert.
+    if (
+        next_token_logits.dim() == 2
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(1) == 1
+    ):
+        return row_argmax(next_token_logits)
+    return torch.argmax(next_token_logits, dim=-1)
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -814,7 +828,7 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        target_predict = _verify_row_argmax(next_token_logits)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
