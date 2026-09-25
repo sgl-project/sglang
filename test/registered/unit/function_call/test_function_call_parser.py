@@ -1307,6 +1307,101 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
 
+    def test_finish_releases_calls_that_completed_in_one_delta(self):
+        """Both calls in a single delta must reach the client.
+
+        A multi-token delta (speculative decoding / MTP, stream_interval > 1)
+        can carry more than one complete tool call. The incremental parser
+        leaves the tail of such a delta pending for the next delta; when the
+        stream ends there, the second call was dropped entirely and the first
+        arrived with empty arguments, while the non-streaming path returned
+        both.
+        """
+        text = (
+            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}'
+            ';{"name": "get_tourist_attractions", "parameters": {"city": "Paris"}}'
+        )
+        detector = Llama32Detector()
+        chunk = detector.parse_streaming_increment(text, self.tools)
+        end = detector.finish(self.tools)
+        calls = list(chunk.calls) + list(end.calls)
+
+        self.assertEqual(
+            [call.name for call in calls if call.name],
+            ["get_weather", "get_tourist_attractions"],
+        )
+
+        streamed_args = {}
+        for call in calls:
+            streamed_args[call.tool_index] = streamed_args.get(call.tool_index, "") + (
+                call.parameters or ""
+            )
+        non_stream_args = {
+            call.tool_index: call.parameters
+            for call in Llama32Detector().detect_and_parse(text, self.tools).calls
+        }
+        self.assertEqual(len(non_stream_args), 2)
+        self.assertEqual(streamed_args, non_stream_args)
+
+    def test_finish_is_a_noop_when_nothing_is_pending(self):
+        text = '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}'
+        detector = Llama32Detector()
+        detector.parse_streaming_increment(text, self.tools)
+        detector.parse_streaming_increment("", self.tools)
+
+        end = detector.finish(self.tools)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(end.normal_text, "")
+
+
+
+    def test_finish_releases_trailing_text_after_the_pending_calls(self):
+        """The drain must return both calls *and* the text still in the buffer.
+
+        A single multi-token delta can carry two complete calls plus trailing
+        prose. The calls are left pending by the one-unit-per-increment parser and
+        recovered by the drain; the trailing prose sits in the buffer and has to
+        come out as well, because ``detect_and_parse`` reports it for the same
+        input.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get the weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}'
+            ';{"name": "get_weather", "parameters": {"city": "Rome"}} after'
+        )
+
+        detector = Llama32Detector()
+        chunk = detector.parse_streaming_increment(text, tools)
+        end = detector.finish(tools)
+
+        self.assertEqual(end.normal_text, " after")
+        merged, seen = {}, []
+        for call in list(chunk.calls or []) + list(end.calls or []):
+            if call.tool_index not in merged:
+                merged[call.tool_index] = [call.name, ""]
+                seen.append(call.tool_index)
+            if call.name:
+                merged[call.tool_index][0] = call.name
+            merged[call.tool_index][1] += call.parameters or ""
+        self.assertEqual(
+            [(merged[i][0], json.loads(merged[i][1])) for i in seen],
+            [
+                ("get_weather", {"city": "Paris"}),
+                ("get_weather", {"city": "Rome"}),
+            ],
+        )
 
 class TestKimiK2Detector(unittest.TestCase):
     def setUp(self):
