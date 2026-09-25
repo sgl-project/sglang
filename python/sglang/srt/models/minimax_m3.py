@@ -39,7 +39,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
-    UnreducedOutput,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1395,36 +1394,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        if self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
-            # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
-            should_allreduce_fusion = False
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-                should_allreduce_fusion=should_allreduce_fusion,
-                use_reduce_scatter=use_reduce_scatter,
-            )
-
-        if should_allreduce_fusion:
-            hidden_states = UnreducedOutput(hidden_states)
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            if self.is_layer_sparse or hidden_states.shape[0] != 0:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch=forward_batch,
+                    should_allreduce_fusion=ffn_exit.fuse_mlp_allreduce,
+                    use_reduce_scatter=ffn_exit.mlp_reduce_scatter,
+                )
+        return ffn_exit.finish(hidden_states, residual)
 
 
 class MiniMaxM3Model(nn.Module):

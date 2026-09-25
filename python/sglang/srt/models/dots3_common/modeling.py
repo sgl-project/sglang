@@ -60,7 +60,6 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    UnreducedOutput,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -1623,30 +1622,14 @@ class Dots3DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                ffn_exit.fuse_mlp_allreduce,
+                ffn_exit.mlp_reduce_scatter,
             )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-
-        if should_allreduce_fusion:
-            hidden_states = UnreducedOutput(hidden_states)
-
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return ffn_exit.finish(hidden_states, residual)
 
     def op_comm_prepare_attn(
         self,
