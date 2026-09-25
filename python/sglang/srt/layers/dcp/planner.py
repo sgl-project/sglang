@@ -46,6 +46,18 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    backend_builder = get_attn_backend().dcp_metadata_builder
+    if backend_builder is not None:
+        return backend_builder(
+            seq_lens=seq_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+        )
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,

@@ -54,6 +54,35 @@ def maybe_dcp_kernel_indices(
     return indices[dcp_rank::dcp_size] // dcp_size
 
 
+def remap_dcp_write_locations_fixed_shape(
+    virtual_locs: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    *,
+    dummy_loc: int = 0,
+) -> torch.Tensor:
+    """Map virtual DCP slots to a rank-local pool without compacting tensors.
+
+    Each rank owns ``virtual_loc % dcp_size == dcp_rank`` and stores the slot at
+    ``virtual_loc // dcp_size``.  Locations owned by another rank are redirected
+    to the allocator-reserved dummy slot.  Keeping the original tensor shape is
+    intentional: Ascend boolean indexing lowers to ``aclnnNonzeroV2`` and can
+    fail in the 64-rank target-verify path, while the following scatter already
+    accepts repeated writes to dummy slot 0.
+    """
+    if dcp_size <= 0 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            f"invalid DCP topology: dcp_size={dcp_size}, dcp_rank={dcp_rank}"
+        )
+    owner_mask = torch.remainder(virtual_locs, dcp_size) == dcp_rank
+    local_locs = torch.div(virtual_locs, dcp_size, rounding_mode="floor")
+    return torch.where(
+        owner_mask,
+        local_locs,
+        torch.full_like(local_locs, dummy_loc),
+    )
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     """Keep this rank's share of a read-index tensor, still WIDENED.
 
