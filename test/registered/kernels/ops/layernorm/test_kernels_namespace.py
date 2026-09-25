@@ -191,7 +191,6 @@ def test_import_stays_metadata_only():
         ("attention.flydsl_kimi_k3_kda_decode_with_f_b", KernelBackend.FLYDSL, "hip"),
         ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),
         ("communication.gemm_ag_up_proj", KernelBackend.JIT, "cuda"),
-        ("communication.o_proj_gemm_ar", KernelBackend.JIT, "cuda"),
         ("communication.reduce_scatter_res", KernelBackend.JIT, "cuda"),
     ],
 )
