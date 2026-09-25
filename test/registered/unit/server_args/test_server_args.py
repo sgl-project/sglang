@@ -221,22 +221,33 @@ class TestPrepareServerArgs(CustomTestCase):
                 args.resolve_once()
 
     def test_megamoe_requires_sm90_or_sm100(self):
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+        # is_hip is pinned as well: override_platform only replaces the facts it is
+        # given, so on a ROCm host these would otherwise describe a machine that is
+        # both CUDA and HIP, and megamoe's ROCm arm would answer instead.
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "SM90"):
                 args.resolve_once()
-        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+        with override_platform(
+            is_cuda=False, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 args.resolve_once()
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
 
     def test_megamoe_token_budget_must_cover_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
 
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             args = ServerArgs(
                 model_path="dummy",
                 moe_a2a_backend="megamoe",
