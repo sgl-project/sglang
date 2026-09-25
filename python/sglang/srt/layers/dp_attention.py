@@ -64,18 +64,45 @@ def dp_gather_width() -> int:
     """Return the DP gather width.
 
     After elastic scale-up, the gather spans the expanded WORLD; otherwise
-    it spans the attention-DP replicas.
+    it spans the attention-DP replicas. Inside a draft scope that owns its
+    attention, it is still the target's gather (see patch_tensor_parallel_group).
     """
     parallel = get_parallel()
-    return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
+    if world_dp_gather_enabled():
+        return parallel.dp_size
+    if get_flags().dp.scoped_gather_slot is not None:
+        return deployment_attn_dp_size()
+    return parallel.attn_dp_size
+
+
+def dp_slot_in(per_rank) -> int:
+    """Return this process's slot in a per-DP-replica sequence.
+
+    The sequence carries one entry per replica of the gather this process
+    takes part in, so its length is the gather width. Length one is the
+    all-gather-skipped batch, which carries this process's entry alone.
+    """
+    if len(per_rank) == 1:
+        return 0
+    width = dp_gather_width()
+    if len(per_rank) != width:
+        raise ValueError(
+            f"a per-replica sequence of {len(per_rank)} entries does not "
+            f"belong to a DP gather of width {width}"
+        )
+    return dp_gather_slot()
 
 
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
     After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank.
+    use the attention-DP rank. Inside a draft scope that owns its attention,
+    it is still the slot in the target's gather (see patch_tensor_parallel_group).
     """
+    scoped = get_flags().dp.scoped_gather_slot
+    if scoped is not None:
+        return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
         return parallel.tp_rank + parallel.ep_join_rank_offset
@@ -337,6 +364,24 @@ def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
     _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
 
 
+def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
+    """Publish the DP gather sizes ``forward_batch`` carries: the buffer
+    length, the per-rank token counts as padded for the gather, this rank's
+    entry, and the padding mode. Capture batches carry no separately padded
+    list, so the raw counts stand in for it."""
+    global_num_tokens = forward_batch.global_num_tokens_padded_cpu
+    if global_num_tokens is None:
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    set_dp_buffer_len(
+        forward_batch.global_dp_buffer_len,
+        global_num_tokens[dp_rank],
+        forward_batch.dp_padding_mode.is_max_len(),
+        global_num_tokens,
+        forward_batch.global_num_tokens_gpu,
+    )
+
+
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
@@ -440,9 +485,8 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    dp_rank = dp_gather_slot()
-
     if forward_batch.dp_local_start_pos is None:
+        dp_rank = dp_slot_in(forward_batch.global_num_tokens_gpu)
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
@@ -464,7 +508,7 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = dp_gather_slot()
+    dp_rank = dp_slot_in(global_num_tokens)
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch
@@ -782,7 +826,7 @@ def _dp_gather_via_all_gatherv(
     # each rank's local tensor up to sizes[rank] with zeros (matching the
     # buffer's reserved per-rank slot) so sum(sizes) == buffer rows and there
     # is no uninitialized tail for the MoE to read.
-    rank = get_parallel().attn_dp_rank
+    rank = dp_slot_in(sizes)
     local_rows = sizes[rank]
     if local_tokens.shape[0] == local_rows:
         local_real = local_tokens
