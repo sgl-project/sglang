@@ -1394,5 +1394,138 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
 
 
+class TestDSV4LowRatioBudget(CustomTestCase):
+    """Price the real CPU tensors built by the FlashMLA pool factories.
+
+    These tests select an already-supported layout at the device boundary; they
+    exercise allocation and sizing, not whether a CPU can run the GPU readers.
+    """
+
+    @contextlib.contextmanager
+    def _planner(
+        self, layout, option, page_size, index_page_size, ratios, sources, stage=None
+    ):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=len(ratios),
+            page_size=page_size,
+            sliding_window_size=128,
+            max_running_requests=2,
+        )
+        _publish_config(
+            self,
+            dsv4_attn_backend="flashmla",
+            enable_encoder_swa_bounded_replay=False,
+            page_size=page_size,
+            max_running_requests=2,
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            disaggregation_mode="null",
+            disaggregation_decode_extra_slots=0,
+            chunked_prefill_size=None,
+            enable_hisparse=False,
+        )
+        mr.server_args = get_server_args()
+        mr.kv_cache_dtype_str = "fp8_e4m3"
+        mr.model_config.qk_nope_head_dim = 448
+        mr.model_config.index_head_dim = 128
+        mr.model_config.compress_ratios = ratios
+        mr.model_config.window_size = 128
+        mr.model_config.hf_config.kv_source_layer_ids = sources
+        if stage is not None:
+            mr.layer_info.start_layer, mr.layer_info.end_layer = stage
+            mr.pp_size = 2
+        module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
+        with (
+            patch(
+                f"{module}.select_dsv4_kv_layout",
+                return_value=(KVLayout(layout), option),
+            ),
+            patch(f"{module}.DSV41_INDEX_PAGE_SIZE", index_page_size),
+        ):
+            planner = DSV4PoolConfigurator(mr)
+            # Isolate global KV and its request-scoped pair state. SWA's existing
+            # ratio/cap/replay tests above cover its separate budget contract.
+            planner.swa_cap_tokens = 0
+            planner.request_window_bytes = 0
+            planner.bytes_per_full_token = planner._get_bytes_per_full_token()
+            yield planner
+
+    def _allocated_bytes(self, planner, full_tokens, layout, option):
+        import torch
+
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        # Run the production factories, including their page rounding and
+        # dummy pages, without allocating unrelated SWA or model weights.
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.uniform_fp8 = False
+        pool.compressed_pool_configs = {}
+        pool.sources_by_ratio = planner.stage_owner_layers
+        pool.full_size = full_tokens
+        pool.qk_nope_head_dim = 448
+        pool.qk_rope_head_dim = 64
+        pool.indexer_head_dim = 128
+        pool.kv_layout = KVLayout(layout)
+        pool.compressed_kv_layout_option = option
+        pool.device = "cpu"
+        pool.num_req_slots = planner.requested_max_running_requests_per_worker + 1
+        pool._init_compressed_pools(
+            stage_ratios=planner.stage_compress_ratios,
+            page_size=planner.page_size,
+            dtype=torch.float8_e4m3fn,
+            device="cpu",
+            enable_memory_saver=False,
+            enable_hisparse=False,
+            kv_pool_cls=DeepSeekV4SingleKVPool,
+        )
+        main = sum(b.nbytes for p in pool.kv_pools.values() for b in p.kv_buffer)
+        index = sum(
+            b.nbytes
+            for p in pool.index_pools.values()
+            for b in p.contiguous_page_row_buffers()
+        )
+        state = sum(
+            pool._make_pair_state_pool(False).kv_score_buffer.kv_score.nbytes
+            for _ in pool.sources_by_ratio.get(2, ())
+        )
+        return main, index, state
+
+    def test_low_ratio_coefficient_matches_allocated_growth(self):
+        from itertools import product
+
+        layouts = (("v4", None), ("v41", "fp8"), ("v41", "fp4"), ("v41", None))
+        owners = (([1], [0]), ([2], [0]), ([2, 2, 2, 1], [0, 1, 2, 3]))
+        for (layout, option), page, index_page, (ratios, sources) in product(
+            layouts, (128, 256), (64, 128), owners
+        ):
+            with (
+                self.subTest(
+                    layout=layout,
+                    option=option,
+                    page=page,
+                    index_page=index_page,
+                    ratios=ratios,
+                ),
+                self._planner(
+                    layout, option, page, index_page, ratios, sources
+                ) as planner,
+            ):
+                small = self._allocated_bytes(planner, 0, layout, option)
+                large = self._allocated_bytes(planner, 2 * page, layout, option)
+                # Two full pages also span an index page at ratio 2 / page 128.
+                growth = sum(large) - sum(small)
+                self.assertEqual(planner.bytes_per_full_token * 2 * page, growth)
+                self.assertEqual(small[2], large[2])
+
+
 if __name__ == "__main__":
     unittest.main()
