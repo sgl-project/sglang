@@ -49,10 +49,6 @@ __device__ __forceinline__ ushort_t f32_to_bf16_rne(float f) {
   return static_cast<ushort_t>(u >> 16);
 }
 
-__device__ __forceinline__ uint4 load_w(const uint4* p) {
-  return *p;
-}
-
 // gfx950 exact-Q path.  This is the reduction topology used by the production
 // hipBLASLt MT16x16x512 kernel: four local-split-U accumulators, each owning a
 // contiguous 128-K slice of every DepthU=512 tile, reduced in wave order.
@@ -109,8 +105,6 @@ __device__ __forceinline__ void gemv_q_mfma_lsu4(
   const int lane = tid & 63;
   const auto* x = reinterpret_cast<const bf16_t*>(Xv);
   const auto* w = reinterpret_cast<const bf16_t*>(Wv);
-  const int operand_row = lane & 15;
-  const int kg = lane >> 4;
   float4_t acc = {};
   // Shift the next global-load pair ahead of the current dependent MFMA.
   // The accumulator visits the same 16 K fragments in the same order; only
@@ -197,7 +191,7 @@ __device__ __forceinline__ void gemv_group(
     const uint4* wp = Wv + (long)(col < N ? col : 0) * ldwv + lane;
 #pragma unroll
     for (int p = 0; p < VPT; ++p) {
-      wr[c][p] = load_w(wp + p * TPC);
+      wr[c][p] = wp[p * TPC];
     }
   }
 
@@ -259,9 +253,7 @@ __device__ __forceinline__ void gemv_group(
 template <int M, int THREADS, int TPCK, int NCOLK, int VPTK, int TPCQ, int NCOLQ, int VPTQ, int QPIPE = 0>
 __global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
     const uint4* __restrict__ Xq,
-    long ldxq,
     const uint4* __restrict__ Wq,
-    long ldwq,
     ushort_t* __restrict__ Oq,
     long ldoq,
     int Nq,
@@ -295,9 +287,7 @@ __global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
 
 struct Args {
   const uint4* Xq;
-  long ldxq;
   const uint4* Wq;
-  long ldwq;
   ushort_t* Oq;
   long ldoq;
   int Nq;
@@ -317,25 +307,21 @@ template <int M, int THREADS, int TPCK, int NCOLK, int TPCQ, int NCOLQ, int QPIP
 void launch(const Args& a) {
   constexpr int kColsK = (THREADS / TPCK) * NCOLK;
   constexpr int kColsQ = (THREADS / TPCQ) * NCOLQ;
-  const int VPTK = (a.Kk / 8) / TPCK;
-  const int VPTQ = (a.Kq / 8) / TPCQ;
-  RuntimeCheck(VPTK * TPCK * 8 == a.Kk, "Kk not divisible by 8*TPCK");
-  RuntimeCheck(VPTQ * TPCQ * 8 == a.Kq, "Kq not divisible by 8*TPCQ");
+  // The shipped configuration is the only one this file builds: 16-byte
+  // vectors per thread, 3 on the K half and 1 on the Q half.
+  constexpr int VPTK = 3;
+  constexpr int VPTQ = 1;
+  RuntimeCheck(
+      a.Kk == VPTK * TPCK * 8 && a.Kq == VPTQ * TPCQ * 8,
+      "dual_gemv is built for Kk=6144, Kq=2048; got Kk=",
+      a.Kk,
+      " Kq=",
+      a.Kq);
   const int nblk_k = (a.Nk + kColsK - 1) / kColsK;
   const int nblk_q = (a.Nq + kColsQ - 1) / kColsQ;
-
-#define DG_CALL(VK, VQ)                                                                                              \
-  do {                                                                                                               \
-    dual_gemv_kernel<M, THREADS, TPCK, NCOLK, VK, TPCQ, NCOLQ, VQ, QPIPE>                                            \
-        <<<dim3(nblk_k + nblk_q), dim3(THREADS), 0, a.stream>>>(                                                     \
-            a.Xq, a.ldxq, a.Wq, a.ldwq, a.Oq, a.ldoq, a.Nq, a.Xk, a.ldxk, a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_k); \
-  } while (0)
-
-  // The shipped configuration is the only one this file builds; the template
-  // arguments record it rather than select it.
-  RuntimeCheck(VPTK == 3 && VPTQ == 1, "dual_gemv is built for Kk=6144, Kq=2048; got Kk=", a.Kk, " Kq=", a.Kq);
-  DG_CALL(3, 1);
-#undef DG_CALL
+  dual_gemv_kernel<M, THREADS, TPCK, NCOLK, VPTK, TPCQ, NCOLQ, VPTQ, QPIPE>
+      <<<dim3(nblk_k + nblk_q), dim3(THREADS), 0, a.stream>>>(
+          a.Xq, a.Wq, a.Oq, a.ldoq, a.Nq, a.Xk, a.ldxk, a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_k);
 }
 
 // The accepted configuration.  Its parameters are template arguments, not a
@@ -369,8 +355,7 @@ struct DualGemvBf16Kernel {
     device_.set_options<kDLCUDA>();
 
     // The Q half addresses x + operand_row * K, so a padded tensor would read
-    // the wrong rows with no other symptom.  Hence packed strides on Xq/Wq
-    // rather than a check on the derived ldxq.
+    // the wrong rows with no other symptom; hence packed strides on Xq/Wq.
     TensorMatcher({M_, Kq_}).with_dtype<bf16_t>().with_device(device_).with_strides({Kq_, 1}).verify(Xq);
     TensorMatcher({Nq_, Kq_}).with_dtype<bf16_t>().with_device(device_).with_strides({Kq_, 1}).verify(Wq);
     TensorMatcher({M_, Nq_}).with_dtype<bf16_t>().with_device(device_).with_strides({-1, 1}).verify(Oq);
@@ -387,8 +372,6 @@ struct DualGemvBf16Kernel {
     a.Oq = reinterpret_cast<impl::ushort_t*>(Oq.data_ptr());
     a.Kq = static_cast<int>(Kq_.unwrap());
     a.Nq = static_cast<int>(Nq_.unwrap());
-    a.ldxq = Xq.stride(0) / 8;
-    a.ldwq = Wq.stride(0) / 8;
     a.ldoq = Oq.stride(0);
     a.Xk = reinterpret_cast<const uint4*>(Xk.data_ptr());
     a.Wk = reinterpret_cast<const uint4*>(Wk.data_ptr());
@@ -400,9 +383,8 @@ struct DualGemvBf16Kernel {
     a.ldok = Ok.stride(0);
     a.stream = LaunchKernel::resolve_device(device_.unwrap());
 
-    // A 16-byte (8 bf16) load is the unit on both halves, so every row start
-    // has to land on one.
-    RuntimeCheck(Xq.stride(0) % 8 == 0 && Wq.stride(0) % 8 == 0, "the Q operands must start on an 8-element boundary");
+    // A 16-byte (8 bf16) load is the unit, so every K-half row start has to
+    // land on one; the Q half is packed with Kq == 2048.
     RuntimeCheck(Xk.stride(0) % 8 == 0 && Wk.stride(0) % 8 == 0, "the K operands must start on an 8-element boundary");
 
     switch (M) {
@@ -430,8 +412,6 @@ struct DualGemvBf16Kernel {
       case 8:
         impl::dispatch<8>(a);
         break;
-      default:
-        RuntimeCheck(false, "unreachable");
     }
     RuntimeDeviceCheck();
   }

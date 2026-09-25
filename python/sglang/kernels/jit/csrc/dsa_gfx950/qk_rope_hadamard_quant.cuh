@@ -24,7 +24,6 @@
 #include "opus/opus.hpp"
 #include <algorithm>
 #include <cstdint>
-#include <string>
 
 namespace sglang {
 
@@ -48,27 +47,15 @@ __device__ __forceinline__ float wred64(float v, F op) {
   return wave_reduce<float, F, 64, true>(v, op);
 }
 
-// rope on the low 64 dims, held one-per-lane in `v`.  `partner` comes from a
-// cross-lane shuffle instead of LDS; the arithmetic is byte-for-byte the same.
+// Interleaved rope on the low 64 dims, held one-per-lane in `v`.  The pair
+// comes from a cross-lane shuffle instead of LDS; the arithmetic is the same.
 __device__ __forceinline__ float
-rope_lo(float v, int t, bool is_neox, const scalar_t* __restrict__ cos_ptr, const scalar_t* __restrict__ sin_ptr) {
-  float pair_val;
-  int cos_idx;
-  bool first;
-  if (is_neox) {
-    constexpr int HALF = ROPE_DIM / 2;
-    pair_val = __shfl_xor(v, HALF, 64);
-    cos_idx = t < HALF ? t : t - HALF;
-    first = t < HALF;
-  } else {
-    pair_val = __shfl_xor(v, 1, 64);
-    cos_idx = t / 2;
-    first = (t % 2 == 0);
-  }
-  float cos_v, sin_v;
-  cos_v = static_cast<float>(cos_ptr[cos_idx]);
-  sin_v = static_cast<float>(sin_ptr[cos_idx]);
-  v = first ? (v * cos_v - pair_val * sin_v) : (v * cos_v + pair_val * sin_v);
+rope_lo(float v, int t, const scalar_t* __restrict__ cos_ptr, const scalar_t* __restrict__ sin_ptr) {
+  const float pair_val = __shfl_xor(v, 1, 64);
+  const int cos_idx = t / 2;
+  const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+  const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+  v = (t % 2 == 0) ? (v * cos_v - pair_val * sin_v) : (v * cos_v + pair_val * sin_v);
   return static_cast<float>(static_cast<scalar_t>(v));
 }
 
@@ -121,21 +108,12 @@ __global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
     const float weights_scale,
     const float hadamard_scale,
     const int max_position) {
-  constexpr bool use_ue8m0 = true;
-  constexpr bool preshuffle = true;
-  constexpr bool is_neox = false;
-  constexpr bool compute_all_q_rope = true;
-  constexpr int qblk = HEAD_DIM;
   const int64_t token_idx = blockIdx.x;
-  const int head_idx = blockIdx.y;
-  const int t = threadIdx.x;  // owns dim t and dim t + 64
+  const int head_idx = blockIdx.y;  // n_heads + 1 of them: the last is the k side
+  const int t = threadIdx.x;        // owns dim t and dim t + 64
   const bool do_q = head_idx < n_heads;
-  const bool do_k = head_idx == n_heads;
-  // num_tokens == gridDim.x by construction, so the bound check is free
-  if (head_idx >= n_heads + 1) return;
 
   const int64_t slot_idx = slot_mapping[token_idx];
-  if (!compute_all_q_rope && slot_idx < 0) return;
   // Clamped unconditionally: pos indexes cos_cache/sin_cache on both branches,
   // and clamping only the slot_idx < 0 one left the common path free to read at
   // an arbitrary offset.
@@ -154,22 +132,19 @@ __global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
     float lo = static_cast<float>(q_row[t]);
     float hi = static_cast<float>(q_row[t + HALF_DIM]);
 
-    float q_amax;
-    lo = rope_lo(lo, t, is_neox, cos_ptr, sin_ptr);  // dims >=64 untouched
+    lo = rope_lo(lo, t, cos_ptr, sin_ptr);  // dims >=64 untouched
 
-    {
-      hadamard128_wave(lo, hi, t, hadamard_scale);
-      lo = static_cast<float>(static_cast<scalar_t>(lo));
-      hi = static_cast<float>(static_cast<scalar_t>(hi));
-    }
+    hadamard128_wave(lo, hi, t, hadamard_scale);
+    lo = static_cast<float>(static_cast<scalar_t>(lo));
+    hi = static_cast<float>(static_cast<scalar_t>(hi));
 
     const float a0 = wred64(fabsf(lo), max_func);
     const float a1 = wred64(fabsf(hi), max_func);
-    q_amax = max_func(a1, a0);  // block_reduce's order
+    const float q_amax = max_func(a1, a0);  // block_reduce's order
 
     const float q_inv_fp8_max = 1.0f / q_fp8_max;
-    float q_scale = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
-    if (use_ue8m0) q_scale = exp2f(ceilf(log2f(q_scale)));
+    // ue8m0: the scale is rounded up to a power of two.
+    const float q_scale = exp2f(ceilf(log2f(fmaxf(q_amax, 1e-10f) * q_inv_fp8_max)));
     const float q_inv_scale = 1.0f / q_scale;
     cache_t* qo = q_out + token_idx * q_out_stride_t + head_idx * q_out_stride_h;
     qo[t] = opus::cast<cache_t>(lo * q_inv_scale);
@@ -183,68 +158,61 @@ __global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
     }
   }
 
-  if (!do_k || slot_idx < 0) return;
+  if (do_q || slot_idx < 0) return;
 
   // ------------------------------- k side ---------------------------------
   const scalar_t* k_row = k + token_idx * k_stride_t;
-  float xlo = static_cast<float>(k_row[t]);
-  float xhi = static_cast<float>(k_row[t + HALF_DIM]);
+  const float xlo = static_cast<float>(k_row[t]);
+  const float xhi = static_cast<float>(k_row[t + HALF_DIM]);
 
-  float klo, khi, k_amax;
   const float s0 = wred64(xlo, sum_func);
   const float s1 = wred64(xhi, sum_func);
   const float mean = sum_func(s1, s0) / static_cast<float>(HEAD_DIM);
 
-  float clo = xlo - mean;
-  float chi = xhi - mean;
+  const float clo = xlo - mean;
+  const float chi = xhi - mean;
   const float q0 = wred64(clo * clo, sum_func);
   const float q1 = wred64(chi * chi, sum_func);
   const float ss = sum_func(q1, q0);
   const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
 
-  klo = clo * inv_std * norm_weight[t] + norm_bias[t];
-  khi = chi * inv_std * norm_weight[t + HALF_DIM] + norm_bias[t + HALF_DIM];
+  float klo = clo * inv_std * norm_weight[t] + norm_bias[t];
+  float khi = chi * inv_std * norm_weight[t + HALF_DIM] + norm_bias[t + HALF_DIM];
   klo = static_cast<float>(static_cast<scalar_t>(klo));
   khi = static_cast<float>(static_cast<scalar_t>(khi));
 
-  klo = rope_lo(klo, t, is_neox, cos_ptr, sin_ptr);
+  klo = rope_lo(klo, t, cos_ptr, sin_ptr);
 
-  {
-    hadamard128_wave(klo, khi, t, hadamard_scale);
-    klo = static_cast<float>(static_cast<scalar_t>(klo));
-    khi = static_cast<float>(static_cast<scalar_t>(khi));
-  }
+  hadamard128_wave(klo, khi, t, hadamard_scale);
+  klo = static_cast<float>(static_cast<scalar_t>(klo));
+  khi = static_cast<float>(static_cast<scalar_t>(khi));
 
   const float m0 = wred64(fabsf(klo), max_func);
   const float m1 = wred64(fabsf(khi), max_func);
-  k_amax = max_func(m1, m0);
-  float k_scale = fmaxf(k_amax, 1e-4f) / q_fp8_max;
-  if (use_ue8m0) k_scale = exp2f(ceilf(log2f(k_scale)));
+  const float k_amax = max_func(m1, m0);
+  const float k_scale = exp2f(ceilf(log2f(fmaxf(k_amax, 1e-4f) / q_fp8_max)));  // ue8m0
 
   const int64_t block_idx = slot_idx / cache_block_size;
   const int64_t block_offset = slot_idx % cache_block_size;
   const int64_t page_base = block_idx * cache_block_size * cache_stride;
   if (t == 0) {
-    const int64_t dst_scale_idx = page_base + cache_block_size * HEAD_DIM + block_offset * HEAD_DIM * 4 / qblk;
+    // One fp32 scale per token, after the page's K bytes: quant block == HEAD_DIM.
+    const int64_t dst_scale_idx = page_base + cache_block_size * HEAD_DIM + block_offset * 4;
     reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = k_scale;
   }
   const float k_inv_scale = 1.0f / k_scale;
 
+  // Preshuffled page layout: 16x16 (token x dim) tiles.
+  constexpr int TILE = 16;
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     const int dim = t + h * HALF_DIM;
-    int64_t dst_offset;
-    if (preshuffle) {
-      constexpr int TILE = 16;
-      const int token_tile_id = block_offset / TILE;
-      const int token_in_tile = block_offset % TILE;
-      const int col_tile_id = dim / TILE;
-      const int col_in_tile = dim % TILE;
-      dst_offset = page_base + token_tile_id * (TILE * HEAD_DIM) + col_tile_id * (TILE * TILE) + token_in_tile * TILE +
-                   col_in_tile;
-    } else {
-      dst_offset = page_base + block_offset * HEAD_DIM + dim;
-    }
+    const int token_tile_id = block_offset / TILE;
+    const int token_in_tile = block_offset % TILE;
+    const int col_tile_id = dim / TILE;
+    const int col_in_tile = dim % TILE;
+    const int64_t dst_offset = page_base + token_tile_id * (TILE * HEAD_DIM) + col_tile_id * (TILE * TILE) +
+                               token_in_tile * TILE + col_in_tile;
     kv_cache[dst_offset] = opus::cast<cache_t>((h == 0 ? klo : khi) * k_inv_scale);
   }
 }
@@ -252,7 +220,9 @@ __global__ __launch_bounds__(HALF_DIM) void qk_rope_hadamard_quant_kernel(
 }  // namespace dsa_gfx950::qk_rope
 
 struct QkRopeHadamardQuantKernel {
-  /// AITER indexer_qk_rope_quant_and_cache plus the inline 128-point Hadamard.
+  /// AITER indexer_qk_rope_quant_and_cache plus the inline 128-point Hadamard,
+  /// specialised to ue8m0 scales, the preshuffled cache, interleaved rope and a
+  /// 128-wide quant block; the Python gate admits nothing else.
   static void
   run(const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView q_out,
@@ -267,13 +237,7 @@ struct QkRopeHadamardQuantKernel {
       const tvm::ffi::TensorView cos_cache,
       const tvm::ffi::TensorView sin_cache,
       double epsilon,
-      int64_t quant_block_size,
-      std::string scale_fmt,
-      double weights_scale,
-      bool preshuffle,
-      bool is_neox,
-      bool compute_all_q_rope,
-      bool hadamard) {
+      double weights_scale) {
     using namespace host;
     namespace impl = dsa_gfx950::qk_rope;
 
@@ -296,11 +260,9 @@ struct QkRopeHadamardQuantKernel {
     const int cache_block_size = static_cast<int>(kv_cache.size(1));
     const int cache_stride = static_cast<int>(kv_cache.size(2));
     const int max_position = static_cast<int>(cos_cache.size(0));
-    const bool use_ue8m0 = scale_fmt == "ue8m0";
 
     RuntimeCheck(head_dim == impl::HEAD_DIM, "head_dim must be 128");
     RuntimeCheck(rope_dim == impl::ROPE_DIM, "rope_dim must be 64");
-    RuntimeCheck(quant_block_size == head_dim, "quant_block_size must equal head_dim");
     RuntimeCheck(is_type<bf16_t>(q.dtype()) && is_type<bf16_t>(k.dtype()), "q/k must be bf16");
     RuntimeCheck(is_type<bf16_t>(weights.dtype()), "weights must be bf16");
     RuntimeCheck(
@@ -337,12 +299,6 @@ struct QkRopeHadamardQuantKernel {
     RuntimeCheck(q.stride(2) == 1 && q_out.stride(2) == 1 && k.stride(1) == 1, "wave kernel needs contiguous head dim");
     RuntimeCheck(
         weights.stride(1) == 1 && weights_out.stride(1) == 1, "wave kernel needs contiguous head axis on weights");
-    // The kernel is written for exactly this configuration, so refuse any call
-    // that is not on it rather than silently computing something else.
-    RuntimeCheck(hadamard, "the fused indexer requires the inline Hadamard");
-    RuntimeCheck(
-        use_ue8m0 && preshuffle && !is_neox && compute_all_q_rope && quant_block_size == impl::HEAD_DIM,
-        "specialised for ue8m0 + preshuffle + interleaved rope + compute_all_q_rope + quant_block == 128");
 
     LaunchKernel(dim3(num_tokens, n_heads + 1), dim3(impl::HALF_DIM), q.device())(
         impl::qk_rope_hadamard_quant_kernel,

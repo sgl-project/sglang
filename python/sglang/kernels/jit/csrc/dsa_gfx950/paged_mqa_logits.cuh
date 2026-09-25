@@ -31,6 +31,9 @@ typedef __attribute__((__vector_size__(4 * sizeof(float)))) float f32x4;
 
 #define PAGE_TOK 64
 #define HD 128
+#define HEADS 32
+// topk_transform.cuh's TOPK: both kernels must agree on which rows get binned.
+#define LG_TOPK 2048
 #define TOK_STRIDE 132
 #define PAGE_BYTES (PAGE_TOK * TOK_STRIDE)  // 8448
 #define K_BYTES (PAGE_TOK * HD)             // 8192
@@ -60,8 +63,8 @@ __device__ __forceinline__ float xor16(float x, int lane) {
 }
 
 // The top-k stage's histogram, built here while this kernel waits on KV loads.
-// Its three invariants are enforced rather than described: the shared key
-// (order_bin_fast), the npages clamp, and do_hist with its topk TORCH_CHECK.
+// It shares three invariants with topk_transform.cuh: the key (order_bin_fast),
+// the npages clamp, and do_hist's TOPK.
 #define LG_CBITS 6
 #define LG_CBINS (1 << LG_CBITS)
 
@@ -69,7 +72,7 @@ __device__ __forceinline__ float xor16(float x, int lane) {
 // histogram is what lets the top-k stage skip a separate scoring pass.
 
 // order_key16(x) >> LOWB in 4 VALU ops after the cvt, with no branch and no
-// v_cndmask.  Bit-identical to topk_transform.cu's order_key16(x) >> LOWB for
+// v_cndmask.  Bit-identical to topk_transform.cuh's order_key16(x) >> LOWB for
 // every finite x and for +/-0.
 template <int LOWB>
 __device__ __forceinline__ uint32_t order_bin_fast(float x) {
@@ -87,10 +90,8 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
     const int* __restrict__ ptable,
     float* __restrict__ out,
     unsigned int* __restrict__ ghist,
-    int heads,
     int max_pages,
-    int out_stride,
-    int topk) {
+    int out_stride) {
   constexpr int NBIN = 1 << HB;
   constexpr int LOWB = 16 - HB;
   constexpr int GHS = NBIN + LG_CBINS;
@@ -107,7 +108,7 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   const int lane = threadIdx.x & 63;
   const int warp = threadIdx.x >> 6;
   const int seqlen = seqlens[row];
-  // seqlen is device data, so no TORCH_CHECK can bound it.  Without the clamp
+  // seqlen is device data, so no host check can bound it.  Without the clamp
   // an oversized row walks into the NEXT row's page table -- valid memory,
   // plausible page ids, confidently wrong logits.
   const int npages_raw = (seqlen + PAGE_TOK - 1) / PAGE_TOK;
@@ -116,9 +117,8 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   // while the row is only as long as seqlens says -- so a table wider than
   // `out` is legal, and without the second term an oversized seqlen writes
   // past the end of the row.
-  const int pages_pt = max_pages;
   const int pages_out = out_stride / PAGE_TOK;
-  const int npages_cap = pages_pt < pages_out ? pages_pt : pages_out;
+  const int npages_cap = max_pages < pages_out ? max_pages : pages_out;
   const int npages = npages_raw < npages_cap ? npages_raw : npages_cap;
   const int g = lane >> 4, c = lane & 15;
   // Nothing to rank when the row is shorter than topk: everything is selected,
@@ -129,20 +129,20 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   // row_len <= TOPK early return).  A row binned here but skipped there is
   // never zeroed, and the histogram stays dirty for the life of the process.
   const int seqlen_eff = seqlen < npages_cap * PAGE_TOK ? seqlen : npages_cap * PAGE_TOK;
-  const bool do_hist = (seqlen_eff > topk);
+  const bool do_hist = (seqlen_eff > LG_TOPK);
 
   if (do_hist) {
     for (int i = threadIdx.x; i < NBIN; i += NTH)
       s_hist[i] = 0u;
   }
 
-  const uint8_t* qp = q + (size_t)row * (size_t)(heads * HD) + (size_t)c * HD + g * 32;
+  const uint8_t* qp = q + (size_t)row * (size_t)(HEADS * HD) + (size_t)c * HD + g * 32;
   V8 qa0, qa1;
   qa0.h[0] = *(const i32x4*)(qp);
   qa0.h[1] = *(const i32x4*)(qp + 16);
   qa1.h[0] = *(const i32x4*)(qp + 16 * HD);
   qa1.h[1] = *(const i32x4*)(qp + 16 * HD + 16);
-  const float* wp = wgt + (size_t)row * heads + g * 4;
+  const float* wp = wgt + (size_t)row * HEADS + g * 4;
   f32x4 w0 = *(const f32x4*)(wp);
   f32x4 w1 = *(const f32x4*)(wp + 16);
 
@@ -220,12 +220,12 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
   }
 }
 
-/// The fp8 e4m3 dtypes the kernel reads as raw bytes.  Checked by hand rather
+/// The fp8 dtype the MFMA reads as raw OCP e4m3 bytes.  Checked by hand rather
 /// than through ``with_dtype<fp8_e4m3_t>``: on ROCm ``sglang::fp8_e4m3_t`` is
 /// ``uint8_t``, which ``DLDataTypeTrait`` maps to kDLUInt -- that would reject a
 /// genuine fp8 tensor and accept a uint8 one, exactly backwards.
-inline auto is_fp8_e4m3(DLDataType dtype) -> bool {
-  return dtype.lanes == 1 && dtype.bits == 8 && (dtype.code == kDLFloat8_e4m3fn || dtype.code == kDLFloat8_e4m3fnuz);
+inline auto is_fp8_e4m3fn(DLDataType dtype) -> bool {
+  return dtype.lanes == 1 && dtype.bits == 8 && dtype.code == kDLFloat8_e4m3fn;
 }
 
 }  // namespace dsa_gfx950::logits
@@ -239,8 +239,7 @@ struct PagedMqaLogitsKernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView ghist,
-      int64_t blocks_per_row,
-      int64_t topk) {
+      int64_t blocks_per_row) {
     using namespace host;
     namespace impl = dsa_gfx950::logits;
 
@@ -252,26 +251,25 @@ struct PagedMqaLogitsKernel {
     constexpr int64_t HOST_GHS = (int64_t{1} << HOST_HB) + LG_CBINS;
 
     auto rows_ = SymbolicSize{"rows"};
-    auto heads_ = SymbolicSize{"heads"};
     auto pages_ = SymbolicSize{"table_pages"};
     auto cols_ = SymbolicSize{"logits_cols"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
     // Rebinding one symbolic dtype across q and kv is the "kv must have the
-    // same fp8 dtype as q" check; the options stay open because neither fp8
-    // e4m3 flavour has a DLDataTypeTrait on ROCm.
+    // same fp8 dtype as q" check; the options stay open because e4m3fn has no
+    // DLDataTypeTrait on ROCm.
     auto fp8_ = SymbolicDType{};
 
     // No with_strides means TensorMatcher demands full contiguity, which is
     // what each of these wants.
-    TensorMatcher({rows_, heads_, int64_t{HD}}).with_dtype(fp8_).with_device(device_).verify(q);
+    TensorMatcher({rows_, int64_t{HEADS}, int64_t{HD}}).with_dtype(fp8_).with_device(device_).verify(q);
     // PAGE_TOK and TOK_STRIDE are compiled in; a cache laid out differently
     // would be read as garbage rather than refused, hence the row width here.
     TensorMatcher({-1, int64_t{PAGE_TOK} * TOK_STRIDE}).with_dtype(fp8_).with_device(device_).verify(kv);
-    RuntimeCheck(impl::is_fp8_e4m3(fp8_.unwrap()), "q and the kv cache must be fp8 e4m3; they are read as raw bytes");
-    RuntimeCheck(heads_.unwrap() == 32, "q must have 32 heads, got ", heads_.unwrap());
+    RuntimeCheck(
+        impl::is_fp8_e4m3fn(fp8_.unwrap()), "q and the kv cache must be fp8 e4m3fn; they are read as raw bytes");
 
-    TensorMatcher({rows_, heads_}).with_dtype<fp32_t>().with_device(device_).verify(weights);
+    TensorMatcher({rows_, int64_t{HEADS}}).with_dtype<fp32_t>().with_device(device_).verify(weights);
     TensorMatcher({rows_, pages_}).with_dtype<int32_t>().with_device(device_).verify(page_table);
     TensorMatcher({rows_, HOST_GHS})
         .with_dtype<int32_t>()
@@ -295,10 +293,6 @@ struct PagedMqaLogitsKernel {
     // as seqlens says, so it may exceed `out`; what must hold is that `out`
     // covers whole pages.
     RuntimeCheck(cols_.unwrap() % PAGE_TOK == 0, "out row must be a whole number of pages, got ", cols_.unwrap());
-    // topk_transform.cuh hardcodes TOPK, and the two must agree on which rows
-    // get binned: a row binned here but skipped there is never zeroed, and the
-    // histogram stays dirty for the life of the process.
-    RuntimeCheck(topk == 2048, "the paired top-k kernel is built for k=2048, got ", topk);
 
     LaunchKernel(
         dim3(static_cast<int>(blocks_per_row), static_cast<int>(rows_.unwrap())), dim3(8 * 64), device_.unwrap())(
@@ -310,10 +304,8 @@ struct PagedMqaLogitsKernel {
         static_cast<int*>(page_table.data_ptr()),
         static_cast<fp32_t*>(out.data_ptr()),
         reinterpret_cast<unsigned int*>(ghist.data_ptr()),
-        static_cast<int>(heads_.unwrap()),
         static_cast<int>(pages_.unwrap()),
-        static_cast<int>(out.stride(0)),
-        static_cast<int>(topk));
+        static_cast<int>(out.stride(0)));
   }
 };
 
@@ -323,6 +315,8 @@ struct PagedMqaLogitsKernel {
 // compiled into the same translation unit; they exist only for the kernel above.
 #undef PAGE_TOK
 #undef HD
+#undef HEADS
+#undef LG_TOPK
 #undef TOK_STRIDE
 #undef PAGE_BYTES
 #undef K_BYTES
