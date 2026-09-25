@@ -88,20 +88,15 @@ def _run_sgl_eval(
     *,
     eval_name: str,
     score_threshold: float,
-    metric: str = "score",
-    n_repeats: int = 1,
     num_examples: Optional[int] = None,
     num_threads: int = 512,
     thinking: bool = True,
     chat_template_kwargs: Optional[dict] = None,
-    reasoning_effort: Optional[str] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
     accept_length_thres: Optional[float] = None,
-    summary_label: Optional[str] = None,
 ):
-    """Shared sgl-eval driver for the reasoning mixins and the ``sgl_eval`` backend.
+    """Shared sgl-eval driver for the MMLU sanity gate and the GSM8K ``sgl_eval`` backend.
 
     ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking": True}``
     so the server separates reasoning from the final answer.
@@ -119,13 +114,10 @@ def _run_sgl_eval(
         eval_name=eval_name,
         base_url=test_case.base_url,
         model=getattr(test_case, "model", None),
-        repeat=n_repeats,
         num_examples=num_examples,
         num_threads=num_threads,
         max_tokens=max_tokens,
-        reasoning_effort=reasoning_effort,
         temperature=temperature,
-        top_p=top_p,
         chat_template_kwargs=(
             chat_template_kwargs
             if chat_template_kwargs is not None
@@ -133,15 +125,14 @@ def _run_sgl_eval(
         ),
     )
     metrics = run_sgl_eval(args)
-    score = metrics[metric]
-    print(f"{eval_name} sgl-eval {metric}={score:.4f}")
+    score = metrics["score"]
+    print(f"{eval_name} sgl-eval score={score:.4f}")
     _finalize_eval(
         test_case,
         eval_name=eval_name,
         score=score,
         score_threshold=score_threshold,
         accept_length_thres=accept_length_thres,
-        summary_label=summary_label,
     )
     return metrics
 
@@ -185,7 +176,6 @@ class GSM8KMixin:
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
-    gsm8k_n_repeats: int = 1  # sgl_eval backend
     # None keeps run_eval's greedy default; set both to route the run through
     # the sampling path.
     gsm8k_temperature: Optional[float] = None
@@ -206,7 +196,6 @@ class GSM8KMixin:
                 self,
                 eval_name="gsm8k",
                 score_threshold=threshold,
-                n_repeats=self.gsm8k_n_repeats,
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
@@ -230,42 +219,22 @@ class GSM8KMixin:
 
 
 class MMLUMixin:
-    """Mixin for MMLU evaluation.
-
-    Both ``mmlu_backend`` values score through ``run_sgl_eval``; ``"run_eval"``
-    keeps the 2048-token cap and no thinking, ``"sgl_eval"`` uses the reasoning
-    driver's knobs (``mmlu_thinking``, ``mmlu_n_repeats``, uncapped tokens).
-    """
+    """Mixin for MMLU evaluation via sgl-eval (2048-token cap, no thinking)."""
 
     mmlu_score_threshold: float = _THRESHOLD_NOT_SET
     mmlu_accept_length_thres: Optional[float] = None
     mmlu_num_examples: int = 5000
     mmlu_num_threads: int = 1024
-    mmlu_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
-    mmlu_thinking: bool = False  # sgl_eval backend
-    mmlu_n_repeats: int = 1  # sgl_eval backend
 
     def test_mmlu(self):
-        if self.mmlu_backend == "sgl_eval":
-            _run_sgl_eval(
-                self,
-                eval_name="mmlu",
-                score_threshold=self.mmlu_score_threshold,
-                n_repeats=self.mmlu_n_repeats,
-                num_examples=self.mmlu_num_examples,
-                num_threads=self.mmlu_num_threads,
-                thinking=self.mmlu_thinking,
-                accept_length_thres=self.mmlu_accept_length_thres,
-            )
-        else:
-            _run_accuracy_eval(
-                self,
-                eval_name="mmlu",
-                score_threshold=self.mmlu_score_threshold,
-                num_examples=self.mmlu_num_examples,
-                num_threads=self.mmlu_num_threads,
-                accept_length_thres=self.mmlu_accept_length_thres,
-            )
+        _run_accuracy_eval(
+            self,
+            eval_name="mmlu",
+            score_threshold=self.mmlu_score_threshold,
+            num_examples=self.mmlu_num_examples,
+            num_threads=self.mmlu_num_threads,
+            accept_length_thres=self.mmlu_accept_length_thres,
+        )
 
 
 class MMMUProMixin:
@@ -294,78 +263,6 @@ class MMMUProMixin:
             accept_length_thres=self.mmmu_pro_accept_length_thres,
             model=None,
             load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
-        )
-
-
-class GPQAMixin:
-    """Mixin for GPQA-Diamond evaluation via sgl-eval (198 questions).
-
-    Unset sampling knobs keep sgl-eval's defaults; DeepSeek-V4 Think-Max wants
-    reasoning_effort="max", max_tokens=200000, temperature=1.0, top_p=1.0.
-    Raise gpqa_n_repeats (e.g. 16) for a stable number.
-    """
-
-    gpqa_score_threshold: float = _THRESHOLD_NOT_SET
-    gpqa_accept_length_thres: Optional[float] = None
-    gpqa_num_examples: Optional[int] = None
-    gpqa_num_threads: int = 1024
-    gpqa_n_repeats: int = 1
-    gpqa_thinking: bool = True
-    gpqa_reasoning_effort: Optional[str] = None
-    gpqa_max_tokens: Optional[int] = None
-    gpqa_temperature: Optional[float] = None
-    gpqa_top_p: Optional[float] = None
-
-    def test_gpqa(self):
-        _run_sgl_eval(
-            self,
-            eval_name="gpqa",
-            score_threshold=self.gpqa_score_threshold,
-            n_repeats=self.gpqa_n_repeats,
-            num_examples=self.gpqa_num_examples,
-            num_threads=self.gpqa_num_threads,
-            thinking=self.gpqa_thinking,
-            reasoning_effort=self.gpqa_reasoning_effort,
-            max_tokens=self.gpqa_max_tokens,
-            temperature=self.gpqa_temperature,
-            top_p=self.gpqa_top_p,
-            accept_length_thres=self.gpqa_accept_length_thres,
-        )
-
-
-class AIME25Mixin:
-    """Mixin for AIME 2025 evaluation via sgl-eval (30 problems, high variance).
-
-    Unset sampling knobs keep sgl-eval's defaults; DeepSeek-V4 Think-Max wants
-    reasoning_effort="max", max_tokens=200000, temperature=1.0, top_p=1.0.
-    Raise aime25_n_repeats (e.g. 16) for a stable number.
-    """
-
-    aime25_score_threshold: float = _THRESHOLD_NOT_SET
-    aime25_accept_length_thres: Optional[float] = None
-    aime25_num_examples: Optional[int] = None
-    aime25_num_threads: int = 1024
-    aime25_n_repeats: int = 1
-    aime25_thinking: bool = True
-    aime25_reasoning_effort: Optional[str] = None
-    aime25_max_tokens: Optional[int] = None
-    aime25_temperature: Optional[float] = None
-    aime25_top_p: Optional[float] = None
-
-    def test_aime25(self):
-        _run_sgl_eval(
-            self,
-            eval_name="aime25",
-            score_threshold=self.aime25_score_threshold,
-            n_repeats=self.aime25_n_repeats,
-            num_examples=self.aime25_num_examples,
-            num_threads=self.aime25_num_threads,
-            thinking=self.aime25_thinking,
-            reasoning_effort=self.aime25_reasoning_effort,
-            max_tokens=self.aime25_max_tokens,
-            temperature=self.aime25_temperature,
-            top_p=self.aime25_top_p,
-            accept_length_thres=self.aime25_accept_length_thres,
         )
 
 

@@ -32,8 +32,6 @@ class AccuracyTestParams:
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
     seed: Optional[int] = None  # pin for reproducibility when temperature > 0
-    # sgl-eval datasets only: True/False force thinking and enable_thinking; None sends neither.
-    sgl_eval_thinking: Optional[bool] = None
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
 
@@ -89,7 +87,6 @@ def _run_simple_eval(
     repeat: Optional[int] = None,
     api: Optional[str] = None,
     seed: Optional[int] = None,
-    sgl_eval_thinking: Optional[bool] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval."""
     process = None
@@ -139,9 +136,6 @@ def _run_simple_eval(
 
         if seed is not None:
             args.seed = seed
-
-        if sgl_eval_thinking is not None:
-            args.sgl_eval_thinking = sgl_eval_thinking
 
         evaluate = run_sgl_eval if dataset in SGL_EVAL_BENCHMARKS else run_eval
         result = evaluate(args)
@@ -193,7 +187,6 @@ def run_accuracy_test(
         repeat=params.repeat,
         api=params.api,
         seed=params.seed,
-        sgl_eval_thinking=params.sgl_eval_thinking,
     )
 
     if not success:

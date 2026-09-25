@@ -12,7 +12,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits import eval_accuracy_kit as kit
-from sglang.test.kits.eval_accuracy_kit import GPQAMixin, GSM8KMixin, MMMUProMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, MMMUProMixin
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -69,13 +69,17 @@ class TestEvalKitBackendDispatch(CustomTestCase):
 
     def test_sgl_eval_path_skips_when_not_installed(self):
         # None in sys.modules makes ``import sgl_eval`` raise ImportError.
-        host = _make_host(GPQAMixin, "test_gpqa")
+        host = _make_host(GSM8KMixin, "test_gsm8k")
         host.base_url = "http://127.0.0.1:0"
         host.model = "m"
-        host.gpqa_score_threshold = 0.5
-        with patch.dict(sys.modules, {"sgl_eval": None}):
+        host.gsm8k_backend = "sgl_eval"
+        host.gsm8k_score_threshold = 0.5
+        with (
+            patch.dict(sys.modules, {"sgl_eval": None}),
+            patch.object(kit.requests, "get", side_effect=_fake_get),
+        ):
             with self.assertRaises(unittest.SkipTest):
-                host.test_gpqa()
+                host.test_gsm8k()
 
     def _run_mmmu_pro(self, score):
         captured = {}
