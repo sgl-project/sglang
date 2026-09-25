@@ -90,7 +90,7 @@ root and mirror the operator group under `python/sglang/kernels/ops/`. Helpers
 stay alongside the kernel source under `python/sglang/kernels/jit/` and are
 imported by absolute path:
 
-- Correctness tests: `test/registered/kernels/ops/<group>/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
+- Correctness tests: `test/registered/kernels/ops/<group>/test_*.py` → `base-b-kernel-unit-test-1-gpu-small` (use `base-b-kernel-unit-test-1-gpu-large` only for SM90-only kernels or shapes that exceed the 5090's ~99 KB shared memory)
 - Benchmarks: `test/registered/kernels/benchmark/<group>/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
@@ -102,7 +102,7 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 | No GPU required | `base-a-test-cpu` |
 | Small GPU (fits 5090, 32GB) | `base-b-test-1-gpu-small` (most tests go here) |
 | Large GPU memory or Hopper features | `base-b-test-1-gpu-large` |
-| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
+| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-small` (SM90-only kernels: `base-b-kernel-unit-test-1-gpu-large`) |
 | JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
 | Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |

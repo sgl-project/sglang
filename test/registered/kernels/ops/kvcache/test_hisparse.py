@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import (
 )
 
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
 if is_xpu():

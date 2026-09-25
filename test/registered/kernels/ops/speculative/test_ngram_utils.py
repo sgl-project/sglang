@@ -10,7 +10,7 @@ if torch.version.cuda is not None:
 else:
     from sgl_kernel import reconstruct_indices_from_tree_mask
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_reconstruct_indices_from_tree_mask():
