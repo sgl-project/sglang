@@ -1,9 +1,11 @@
 import random
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
+import sglang.kernels.ops.attention.decode_attention as decode_attention_module
 from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
@@ -862,6 +864,68 @@ class TestTritonAttention(CustomTestCase):
         for S in seq_lens:
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
+
+    def test_decode_attention_batch_rotation(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        D = 128
+        max_kv_splits = 8
+        sm_scale = 1.0 / (D**0.5)
+        # Ragged lengths with seq_len=1 rows, like a padded CUDA-graph batch.
+        seq_lens = [700, 33, 1, 260, 1, 5, 128, 1]
+        B = len(seq_lens)
+        b_seq_len = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(b_seq_len, dim=0)
+        total_tokens = sum(seq_lens)
+        kv_indices = torch.randperm(total_tokens, device=device)
+        num_kv_splits = torch.clamp((b_seq_len + 63) // 64, 1, max_kv_splits).to(
+            torch.int32
+        )
+
+        for fwd, H_Q, H_KV in (
+            (decode_attention_fwd_normal, 8, 8),
+            (decode_attention_fwd_grouped, 16, 2),
+        ):
+            q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+            k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+            v_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+            outs = []
+            for rotate in (False, True):
+                o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
+                attn_logits = torch.empty(
+                    (B, H_Q, max_kv_splits, D), dtype=torch.float32, device=device
+                )
+                attn_lse = torch.empty(
+                    (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+                )
+                with mock.patch.object(
+                    decode_attention_module, "_rotate_batch", return_value=rotate
+                ) as rotate_batch:
+                    fwd(
+                        q,
+                        k_buffer,
+                        v_buffer,
+                        o,
+                        kv_indptr,
+                        kv_indices,
+                        attn_logits,
+                        attn_lse,
+                        num_kv_splits,
+                        max_kv_splits,
+                        sm_scale,
+                        1.0,
+                    )
+                rotate_batch.assert_called_once_with(B)
+                outs.append(o)
+
+            self.assertTrue(torch.equal(outs[0], outs[1]))
+            o_ref = decode_attention_fwd_torch(
+                q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
+            )
+            self.assertTrue(
+                torch.allclose(outs[1].to(torch.float32), o_ref, atol=3e-2, rtol=1e-2)
+            )
 
     def test_decode_attention_large_batch_int64_offset(self):
         """Regression for int32 Mid_O offset overflow (PR #28788).

@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 _MIN_BLOCK_KV = 32
 
+
+def _rotate_batch(batch: int) -> bool:
+    # HIP hands workgroups to XCDs round-robin. With batch as the fastest grid axis,
+    # an even batch keeps each request on a subset of XCDs, so a long request or
+    # CUDA-graph padding rows leave the other XCDs idle.
+    return _is_hip and batch % 2 == 0
+
+
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
 
@@ -264,12 +272,16 @@ def _fwd_kernel_stage1(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
-    # int64 to avoid overflow of flat offsets into Mid_O when
-    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        cur_batch = (cur_batch + cur_head + split_kv_id) % tl.num_programs(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = cur_batch.to(tl.int64)
 
     cur_kv_head = cur_head // kv_group_num
 
@@ -503,6 +515,7 @@ def _decode_att_m_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        ROTATE_BATCH=_rotate_batch(batch),
     )
 
 
@@ -554,13 +567,17 @@ def _fwd_grouped_kernel_stage1(
     aux0_len=0,
     forced_kv_splits=0,
     USE_FORCED: tl.constexpr = False,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        cur_batch = (cur_batch + cur_head_id + split_kv_id) % tl.num_programs(0)
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
-    cur_head_id = tl.program_id(1)
+    cur_batch = cur_batch.to(tl.int64)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
-    split_kv_id = tl.program_id(2)
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -896,6 +913,7 @@ def _decode_grouped_att_m_fwd(
         aux0_len=aux0_len,
         forced_kv_splits=forced_kv_splits,
         USE_FORCED=forced_kv_splits > 0,
+        ROTATE_BATCH=_rotate_batch(batch),
         **extra_kargs,
     )
 
