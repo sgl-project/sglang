@@ -4,7 +4,6 @@ from typing import List, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
@@ -87,6 +86,7 @@ class KvChecksumComputer:
         kv_item_lens: Sequence[int],
         state_data_ptrs: NestedInts = (),
         state_item_lens: NestedInts = (),
+        state_types: Optional[Sequence[str]] = None,
     ):
         assert len(kv_data_ptrs) == len(kv_item_lens)
         assert len(kv_data_ptrs) > 0
@@ -96,13 +96,27 @@ class KvChecksumComputer:
         self._state_data_ptrs = _flatten_ints(state_data_ptrs)
         self._state_item_lens = _flatten_ints(state_item_lens)
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
+        if self._device.type == "npu" and state_types:
+            # compute() currently supplies one index vector for all state
+            # descriptors. Heterogeneous components (e.g. DSV4 C128 and C4
+            # ring state) require separate index mappings before flattening.
+            if set(state_types) not in ({"mamba"}, {"swa"}):
+                raise NotImplementedError(
+                    "NPU KV checksum requires a shared Mamba or SWA state index "
+                    f"mapping; unsupported state components: {list(state_types)}"
+                )
 
     def compute(
         self,
         kv_page_indices_gpu: torch.Tensor,
         state_indices_gpu: Optional[torch.Tensor] = None,
     ) -> int:
-        assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
+        expected_device = self._device.type
+        assert expected_device in ("cuda", "npu")
+        assert kv_page_indices_gpu.device.type == expected_device
+        if self._device.index is not None:
+            assert kv_page_indices_gpu.device == self._device
+        assert kv_page_indices_gpu.is_contiguous()
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
         all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
@@ -110,8 +124,16 @@ class KvChecksumComputer:
         )
         if self._state_data_ptrs:
             assert state_indices_gpu is not None
-            assert state_indices_gpu.is_cuda and state_indices_gpu.is_contiguous()
+            assert state_indices_gpu.device == kv_page_indices_gpu.device
+            assert state_indices_gpu.is_contiguous()
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
             all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
+        if expected_device == "npu":
+            from sglang.srt.hardware_backend.npu.checksum import (
+                adler32_strided_checksum,
+            )
+        else:
+            from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
+
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)
