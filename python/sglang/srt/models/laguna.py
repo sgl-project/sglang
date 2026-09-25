@@ -17,15 +17,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    complete_deferred_allreduce,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -38,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -54,7 +51,7 @@ from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -226,10 +223,7 @@ class LagunaMoE(nn.Module):
         else:
             final = routed_out + shared_out
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final = tensor_model_parallel_all_reduce(final)
+        final = reduce_moe_output(final)
         if self._shared_expert_tp1:
             final = final + shared_out
         return final
@@ -495,30 +489,12 @@ class LagunaDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch=forward_batch,
             )
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -534,7 +510,7 @@ class LagunaModel(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -615,6 +591,7 @@ class LagunaModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
@@ -623,6 +600,10 @@ class LagunaModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -656,7 +637,7 @@ class LagunaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.model = LagunaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)

@@ -4,7 +4,7 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 
 ## Design Goals
 
-1. **Unified tree structure** — One radix tree manages all KV cache types instead of separate specialized implementations (`SWARadixCache`, `MambaRadixCache`, etc.).
+1. **Unified tree structure** — One radix tree manages all KV cache types, replacing the separate specialized implementations that preceded it.
 2. **Pluggable components** — Each attention/state type (Full, SWA, Mamba) is a `TreeComponent` that implements hook interfaces. Adding a new cache type only requires adding a new component.
 3. **Per-component resource isolation** — Each component has its own lock reference counting, evictable/protected size tracking, and eviction driver. Auxiliary components use per-component LRUs; Full uses device/host leaf sets.
 4. **Cascade eviction with priority** — When a component evicts a node, lower-or-equal-priority components on the same node are evicted together, maintaining cross-component consistency.
@@ -228,16 +228,16 @@ receipt proves were taken. The eventual full release must pass
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
+### `cache_finished_req(req: Req, *, owned_kv_len: int)`
 
 Cache a completed request's KV data into the tree.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
+| **Inputs** | `req` — the finished request; `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache`. A request that leaves without inserting goes through `release_kv_cache(is_insert=False)` instead, which frees the row and calls `on_release(req, inserted=False)` for component cleanup |
 | **Output** | `None` |
-| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
+| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**

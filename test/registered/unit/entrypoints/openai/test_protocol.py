@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
+import json
 import unittest
 from typing import List, Optional
 
@@ -116,6 +117,31 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
+    def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
+        constraint = ("full_assistant_ebnf", 'root ::= "generated"')
+        for explicit in (
+            {},
+            {"ebnf": 'root ::= "OK"'},
+            {"response_format": {"type": "json_object"}},
+        ):
+            with self.subTest(explicit=explicit):
+                request = ChatCompletionRequest(
+                    model="test",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    tool_choice="required",
+                    **explicit,
+                )
+                params = request.to_sampling_params([], {}, constraint)
+                self.assertEqual(params.get("ebnf_full_assistant", False), not explicit)
+                if "ebnf" in explicit:
+                    self.assertEqual(params["ebnf"], explicit["ebnf"])
+                elif "response_format" in explicit:
+                    self.assertEqual(
+                        json.loads(params["json_schema"]), {"type": "object"}
+                    )
+                else:
+                    self.assertEqual(params["ebnf"], constraint[1])
+
     def test_json_schema_strict_requires_json_boolean(self):
         base_request = {
             "model": "test-model",
@@ -163,6 +189,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertFalse(request.return_sampling_mask)
+        self.assertIsNone(request.sampling_logprobs_mode)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
     def test_image_content_hash_validation(self):
