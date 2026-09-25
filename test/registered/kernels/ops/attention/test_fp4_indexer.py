@@ -467,34 +467,38 @@ def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
 
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize(
-    "ratio,width,masked",
+    "batch,ratio,width,masked",
     [
-        (1, 193, False),
-        (2, 193, True),
-        (1, 16385, True),
-        (2, 8193, False),
-        (1, 32769, False),
+        (6, 1, 193, False),
+        (6, 2, 193, True),
+        (6, 1, 16385, True),
+        (6, 2, 8193, False),
+        (6, 1, 32769, False),
+        (64, 1, 32769, True),
     ],
 )
-def test_fp4_paged_logits_replay(ratio, width, masked):
+def test_fp4_paged_logits_replay(batch, ratio, width, masked):
     from sglang.kernels.ops.attention.dsv4.candidate_table import amax_topk_blocks
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
         topk_transform_paged_v2,
     )
 
-    q, weights, slots, lens, table = _make_logits_case(6, 32, width)
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
     capacity = 1048580 // ratio
-    req = torch.arange(6, device=q.device, dtype=torch.int32)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32)
     req_table = torch.full(
-        (6, capacity * ratio), -1, device=q.device, dtype=torch.int32
+        (batch, capacity * ratio), -1, device=q.device, dtype=torch.int32
     )
     req_table[:, : width * ratio : ratio] = (slots * ratio).to(torch.int32)
     lengths = lens.to(torch.int32)
-    candidate_mask = torch.rand(6, capacity, device=q.device) > 0.3 if masked else None
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
     k = min(512, width)
 
     def run():
+        plan = plan_topk_v2(lengths)
         scores = fp4_index_logits_paged(
             q,
             weights,
@@ -507,10 +511,8 @@ def test_fp4_paged_logits_replay(ratio, width, masked):
             ratio,
             candidate_mask,
         )
-        indices = torch.empty((6, k), dtype=torch.int32, device=q.device)
-        topk_transform_paged_v2(
-            scores, lengths, None, indices, 1, plan_topk_v2(lengths)
-        )
+        indices = torch.empty((batch, k), dtype=torch.int32, device=q.device)
+        topk_transform_paged_v2(scores, lengths, None, indices, 1, plan)
         return scores, indices
 
     for _ in range(3):
@@ -519,7 +521,7 @@ def test_fp4_paged_logits_replay(ratio, width, masked):
     with torch.cuda.graph(graph):
         scores, indices = run()
     for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
-        lens.copy_((visible - torch.arange(6, device=q.device)).clamp_min(0))
+        lens.copy_((visible - torch.arange(batch, device=q.device)).clamp_min(0))
         lengths.copy_(lens)
         req.copy_(req.roll(1))
         slots.copy_(slots.roll(step, dims=1))

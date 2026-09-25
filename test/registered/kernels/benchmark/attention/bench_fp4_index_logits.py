@@ -19,11 +19,12 @@ register_cuda_ci(
 
 def index_topk(q, weights, req, req_table, lens, table, capacity, paged):
     if paged:
+        plan = plan_topk_v2(lens)
         scores = fp4_index_logits_paged(
             q, weights, req, req_table, lens, table, 64, capacity, 1
         )
         indices = torch.empty((q.shape[0], 512), dtype=torch.int32, device=q.device)
-        topk_transform_paged_v2(scores, lens, None, indices, 1, plan_topk_v2(lens))
+        topk_transform_paged_v2(scores, lens, None, indices, 1, plan)
         return indices
     positions = torch.arange(capacity, device=q.device)
     slots = req_table[req[:, None], positions[None, :]].long()
