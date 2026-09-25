@@ -49,6 +49,27 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     )
 
 
+def _k3_channel_fp8_to_tensor_fp8(
+    module: nn.Module, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize a per-output-channel FP8 weight to (per-tensor FP8, scalar
+    scale) for the aiter absorb GEMM. Must run before the kv_b head split."""
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.srt.layers.quantization.fp8_utils import (
+        channel_quant_to_tensor_quant,
+        normalize_e4m3fn_to_e4m3fnuz,
+    )
+
+    weight_scale = module.weight_scale
+    if is_fp8_fnuz():
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=None
+        )
+    if weight_scale.dim() == 1:
+        weight_scale = weight_scale.view(-1, 1)
+    return channel_quant_to_tensor_quant(weight, weight_scale)
+
+
 def _k3_is_raw_quark_channel_fp8(module: nn.Module) -> bool:
     """Quark per-channel FP8 with dynamic activations, not yet post-processed."""
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
