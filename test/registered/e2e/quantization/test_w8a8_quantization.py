@@ -78,7 +78,6 @@ class BaseW8A8Test(CustomTestCase):
         return response.json()
 
     def test_throughput(self):
-
         max_tokens = 256
         tic = time.perf_counter()
         res = self.run_decode(max_tokens)
