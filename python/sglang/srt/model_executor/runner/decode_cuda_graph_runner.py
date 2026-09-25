@@ -849,7 +849,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         export_cuda_graph_capture_trace(
             prof_context,
             runner_name=type(self).__name__,
-            tp_rank=get_parallel().tp_rank,
         )
 
     def capture_prepare(

@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -54,6 +54,7 @@ from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
+    should_advance_eplb_counter,
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
@@ -132,7 +133,6 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
     ModelLayerInfo,
-    adjust_hybrid_swa_layer_ids,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -437,7 +437,7 @@ class ModelRunner:
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
-        set_offloader(create_offloader(dp_rank=get_parallel().dp_rank))
+        set_offloader(create_offloader())
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -582,7 +582,6 @@ class ModelRunner:
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
-            tp_rank=get_parallel().tp_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -653,12 +652,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
-        prepare_moe_topk(
-            model=self.model,
-            model_config=self.model_config,
-            moe_ep_size=get_parallel().moe_ep_size,
-            moe_ep_rank=get_parallel().moe_ep_rank,
-        )
+        prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
 
@@ -672,12 +666,7 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-        )
-        adjust_hybrid_swa_layer_ids(
-            model_config=self.model_config,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_hybrid_swa=self.is_hybrid_swa,
+            draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
@@ -754,8 +743,6 @@ class ModelRunner:
         self.expert_backup_client = (
             ExpertBackupClient(
                 model_config=self.model_config,
-                moe_ep_size=get_parallel().moe_ep_size,
-                moe_ep_rank=get_parallel().moe_ep_rank,
                 get_model=lambda: self.model,
             )
             if (
@@ -797,16 +784,12 @@ class ModelRunner:
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
@@ -974,7 +957,6 @@ class ModelRunner:
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
-                pp_size=get_parallel().pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
@@ -1786,7 +1768,8 @@ class ModelRunner:
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
+        # should_advance_eplb_counter is always True on non-hip platform
+        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
@@ -1919,6 +1902,7 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+                and forward_batch.token_indices_to_pool is None
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )
@@ -2067,9 +2051,19 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+        *,
+        role: str,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
+            role=role,
         )
 
     def _expand_eplb_metadata_for_scale(

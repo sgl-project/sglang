@@ -63,7 +63,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -73,7 +73,6 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
@@ -103,55 +102,6 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-
-    def _split_qkv_rmsnorm_rope_fake_impl(
-        qkv: torch.Tensor,
-        sin: torch.Tensor,
-        cos: torch.Tensor,
-        q_size: int,
-        kv_size: int,
-        head_dim: int,
-        eps: float = 1e-6,
-        q_weight: Optional[torch.Tensor] = None,
-        k_weight: Optional[torch.Tensor] = None,
-        q_bias: Optional[torch.Tensor] = None,
-        k_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        del sin, cos, head_dim, eps, q_weight, k_weight, q_bias, k_bias
-        output_shape = qkv.shape[:-1]
-        return (
-            qkv.new_empty((*output_shape, q_size)),
-            qkv.new_empty((*output_shape, kv_size)),
-            qkv.new_empty((*output_shape, kv_size)),
-        )
-
-    @register_custom_op(fake_impl=_split_qkv_rmsnorm_rope_fake_impl)
-    def _split_qkv_rmsnorm_rope_custom(
-        qkv: torch.Tensor,
-        sin: torch.Tensor,
-        cos: torch.Tensor,
-        q_size: int,
-        kv_size: int,
-        head_dim: int,
-        eps: float = 1e-6,
-        q_weight: Optional[torch.Tensor] = None,
-        k_weight: Optional[torch.Tensor] = None,
-        q_bias: Optional[torch.Tensor] = None,
-        k_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return split_qkv_rmsnorm_rope(
-            qkv,
-            sin,
-            cos,
-            q_size,
-            kv_size,
-            head_dim,
-            eps=eps,
-            q_weight=q_weight,
-            k_weight=k_weight,
-            q_bias=q_bias,
-            k_bias=k_bias,
-        )
 
 
 def compute_yarn_parameters(
@@ -672,7 +622,7 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
-        q, k, v = _split_qkv_rmsnorm_rope_custom(
+        q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
@@ -923,7 +873,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -957,29 +906,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
