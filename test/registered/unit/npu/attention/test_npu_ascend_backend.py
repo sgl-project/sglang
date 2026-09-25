@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -28,6 +28,9 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+from sglang.srt.hardware_backend.npu.attention import (
+    ascend_backend as ascend_backend_module,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
@@ -698,6 +701,114 @@ class TestGetVerifyBuffers(unittest.TestCase):
         backend.update_verify_buffers_to_fill_after_draft(None, None)
         backend.update_verify_buffers_to_fill_after_draft(MagicMock(), 4)
         backend.update_verify_buffers_to_fill_after_draft(None, 16)
+
+
+class TestPrefillPageSizeDispatch(unittest.TestCase):
+    def _run_forward_extend(self, page_size):
+        seq_len = 9
+        num_query_heads = 16
+        num_kv_heads = 8
+        head_dim = 128
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.is_dllm_model = False
+        backend.enable_sparsity_driven_kv_offload = False
+        backend.use_mla = False
+        backend.attn_cp_size = 1
+        backend.is_hybrid_swa = False
+        backend.use_fia = False
+        backend.use_fa = False
+        backend.use_alibi = False
+        backend.use_native_sdpa = False
+        backend.page_size = page_size
+        backend.fia_mask = torch.zeros(128, 128, dtype=torch.bool)
+        backend.mask = torch.zeros(128, 128, dtype=torch.bfloat16)
+        backend.forward_metadata = SimpleNamespace(
+            block_tables=torch.ones(1, 1, dtype=torch.int32),
+            extend_seq_lens_cpu_int=torch.tensor([seq_len], dtype=torch.int32),
+            seq_lens_cpu_int=torch.tensor([seq_len], dtype=torch.int32),
+            seq_lens_list_cumsum=[seq_len],
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+            swa_out_cache_loc=None,
+        )
+
+        key_cache = torch.zeros(
+            2, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
+        )
+        value_cache = torch.zeros_like(key_cache)
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool.get_key_buffer.return_value = key_cache
+        backend.token_to_kv_pool.get_value_buffer.return_value = value_cache
+        backend.native_attn = MagicMock()
+        backend.native_attn.run_sdpa_forward_extend.return_value = torch.zeros(
+            seq_len, num_query_heads * head_dim, dtype=torch.bfloat16
+        )
+
+        mode = MagicMock()
+        mode.is_target_verify.return_value = False
+        mode.is_draft_extend_v2.return_value = False
+        mode.is_context_parallel_extend.return_value = False
+        forward_batch = SimpleNamespace(
+            forward_mode=mode,
+            attn_cp_metadata=None,
+            encoder_lens=None,
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([seq_len]),
+            extend_prefix_lens=torch.tensor([0]),
+            extend_seq_lens=torch.tensor([seq_len]),
+            extend_seq_lens_cpu=[seq_len],
+            global_num_token_non_padded_cpu=seq_len,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            is_cross_attention=False,
+            attn_type=None,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            tp_q_head_num=num_query_heads,
+            tp_k_head_num=num_kv_heads,
+            tp_v_head_num=num_kv_heads,
+            logit_cap=0,
+            scaling=head_dim**-0.5,
+            sliding_window_size=-1,
+        )
+        q = torch.zeros(seq_len, num_query_heads * head_dim, dtype=torch.bfloat16)
+        k = torch.zeros(seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16)
+        v = torch.zeros_like(k)
+
+        fused_output = torch.zeros(
+            seq_len, num_query_heads, head_dim, dtype=torch.bfloat16
+        )
+        fake_torch_npu = MagicMock()
+        fake_torch_npu.npu_fused_infer_attention_score.return_value = (
+            fused_output,
+            None,
+        )
+        with patch.object(ascend_backend_module, "torch_npu", fake_torch_npu):
+            result = backend.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache=False
+            )
+        return backend, result, fake_torch_npu
+
+    def test_small_pages_use_fused_infer_attention(self):
+        for page_size in (16, 32, 64):
+            with self.subTest(page_size=page_size):
+                backend, result, fake_torch_npu = self._run_forward_extend(
+                    page_size=page_size
+                )
+
+                fake_torch_npu._npu_flash_attention_qlens.assert_not_called()
+                fake_torch_npu.npu_fused_infer_attention_score.assert_called_once()
+                self.assertEqual(result.shape, (9, 16 * 128))
+                backend.native_attn.run_sdpa_forward_extend.assert_not_called()
+
+    def test_default_page_keeps_flash_attention_qlens(self):
+        backend, result, fake_torch_npu = self._run_forward_extend(page_size=128)
+
+        fake_torch_npu._npu_flash_attention_qlens.assert_called_once()
+        fake_torch_npu.npu_fused_infer_attention_score.assert_not_called()
+        self.assertEqual(result.shape, (9, 16 * 128))
+        backend.native_attn.run_sdpa_forward_extend.assert_not_called()
 
 
 class TestCommonTemplate(unittest.TestCase):

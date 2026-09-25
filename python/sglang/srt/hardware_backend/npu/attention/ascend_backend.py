@@ -53,6 +53,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+NPU_FLASH_ATTN_QLENS_MIN_PAGE_SIZE = 128
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -1543,7 +1544,10 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_output
 
-            if self.use_fia:
+            # The legacy qlens operator silently returns invalid results for
+            # page sizes below 128. The FIA operator supports aligned small
+            # pages and uses the same paged KV layout.
+            if self.use_fia or self.page_size < NPU_FLASH_ATTN_QLENS_MIN_PAGE_SIZE:
                 if self._can_use_tnd(layer):
                     """FIA supports multi-bs in the current version of CANN"""
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
