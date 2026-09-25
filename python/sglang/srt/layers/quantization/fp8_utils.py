@@ -14,6 +14,7 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    dequant_group_fp8_to_bf16,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -1430,6 +1431,7 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     act_scale_ue8m0: bool = False,
+    weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
         # Pre-quantized input: ``input`` is already fp8 and ``input_scale`` is
@@ -1454,9 +1456,30 @@ def triton_w8a8_block_fp8_linear(
                 input_2d, block_size[1], column_major_scales=False
             )
 
-    output = w8a8_block_fp8_matmul_triton(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
-    )
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if (
+        weight_bf16 is not None
+        and input_scale is None
+        and act_scale_ue8m0
+        and block_size == [32, 32]
+        and q_input.shape[0] >= 64
+        and output_dtype == torch.bfloat16
+        and not is_batch_invariant_mode_enabled()
+    ):
+        # Keep activation quantization: only the GEMM implementation changes.
+        output = torch.nn.functional.linear(
+            dequant_group_fp8_to_bf16(q_input, x_scale), weight_bf16
+        )
+    else:
+        output = w8a8_block_fp8_matmul_triton(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
