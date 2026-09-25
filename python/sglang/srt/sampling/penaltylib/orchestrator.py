@@ -42,15 +42,17 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(self, output_ids: torch.Tensor, row_start: int = 0):
         """
         Feed the output tokens to the penalizers.
 
         Args:
-            output_ids (torch.Tensor): The output tokens.
+            output_ids (torch.Tensor): The output tokens, one per request row.
+            row_start (int): The batch row of output_ids[0]; the rows before it
+                and after the last one are left unchanged.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            penalizer.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -209,11 +211,12 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(self, output_ids: torch.Tensor, row_start: int = 0):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        rows = slice(row_start, row_start + output_ids.shape[0])
+        self._cumulate_output_tokens(output_ids=output_ids, rows=rows)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,10 +254,11 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(self, output_ids: torch.Tensor, rows: slice):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        output_ids[i] belongs to batch row rows.start + i; other rows are untouched.
         """
         pass
 
