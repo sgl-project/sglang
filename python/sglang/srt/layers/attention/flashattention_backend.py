@@ -22,6 +22,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -46,6 +50,7 @@ from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
@@ -145,6 +150,10 @@ class FlashAttentionBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    # Set from the pool type in __init__; the class default keeps the extend
+    # metadata guard readable on instances built with __new__ (test stubs).
+    _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
     supports_full_cuda_graph_chunked_prefix = True
@@ -194,7 +203,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.kv_index_translator = model_runner.kv_index_translator
         self.skip_prefill = skip_prefill
-        self.attn_cp_size = model_runner.ps.attn_cp_size
+        self.attn_cp_size = model_runner.attn_cp_size
         self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -204,6 +213,12 @@ class FlashAttentionBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        # begin_shard_extend builds the owner-major gather plan from host-side
+        # prefix/final lengths. Normal FA3 metadata is device-only, so opt the
+        # sharded variant back into FutureMap's CPU mirror publication.
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
 
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -316,12 +331,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
+        attention_tp_size = get_parallel().attn_tp_size
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.ps.tp_size
+            // attention_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.ps.tp_size
+            attention_tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
@@ -401,6 +417,12 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        if self.use_mla and self.fa_impl_ver != 3:
+            raise ValueError(
+                "Elastic EP CUDA graph recapture with MLA requires FlashAttention 3."
+            )
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -1154,6 +1176,23 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
 
+        # Logical-page KV sharding: capture the batch's gather plan and swap the
+        # page table to scratch rows. During a sharded extend, attention reads
+        # the assembled [prefix | chunk] scratch, never the striped pool rows;
+        # the plan capture also kicks the first layer's prefix gather.
+        #
+        # Runs after KVIndexTranslator and before the `// page_size` reduction.
+        # The unified-memory UnifiedKVPool and page-interleaved pools are
+        # alternatives, so at most one translation fires.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+        ):
+            metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                metadata.page_table
+            ).to(torch.int32)
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1 and not _unified_read:
             self.strided_indices = torch.arange(
@@ -1895,7 +1934,12 @@ class FlashAttentionBackend(AttentionBackend):
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        if is_swa_layer and layer.attn_type == AttentionType.ENCODER_ONLY:
+            window_size = (layer.sliding_window_size, layer.sliding_window_size)
+        elif is_swa_layer:
+            window_size = (layer.sliding_window_size, 0)
+        else:
+            window_size = (-1, -1)
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -2117,7 +2161,6 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
-
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,

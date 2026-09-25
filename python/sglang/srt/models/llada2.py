@@ -27,11 +27,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -54,7 +49,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -309,7 +304,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.ep_size = get_parallel().tp_size
 
             self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -386,10 +381,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward_deepep(
@@ -405,7 +397,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -628,8 +620,6 @@ class LLaDA2MoeBlock(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -717,7 +707,7 @@ class LLaDA2MoeModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
@@ -804,7 +794,7 @@ class LLaDA2MoeModelLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None
