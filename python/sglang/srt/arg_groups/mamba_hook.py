@@ -91,6 +91,11 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             f"radix cache; --radix-cache-backend={cfg.radix_cache_backend!r} "
             "is not int8-aware. Omit --radix-cache-backend."
         )
+    if cfg.enable_lmcache:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
+        )
 
 
 def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):

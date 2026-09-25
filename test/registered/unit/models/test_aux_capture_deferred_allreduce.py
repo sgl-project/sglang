@@ -37,6 +37,10 @@ def all_reduce(hidden_states):
     return hidden_states * 2
 
 
+# The group a deferred FFN output owes its sum over.
+GROUP = SimpleNamespace(all_reduce=all_reduce)
+
+
 class DeferringLayer(nn.Module):
     def __init__(self, defer, return_topk=False):
         super().__init__()
@@ -45,6 +49,10 @@ class DeferringLayer(nn.Module):
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )
+        self.layer_communicator.should_defer_ffn_reduction = lambda batch: defer
+        self.layer_communicator.is_last_layer = False
+        self.layer_communicator._postprocess_scatters_to_local_tokens = False
+        self.layer_communicator.ffn_reduction_group = lambda: GROUP
         self.layer_communicator.should_use_reduce_scatter = lambda batch: False
         self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
             all_reduce(hidden),
@@ -60,7 +68,7 @@ class DeferringLayer(nn.Module):
         *args,
         **kwargs,
     ):
-        hidden_states = comm.complete_deferred_allreduce(hidden_states)
+        hidden_states = comm.reduce_output(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:
@@ -123,9 +131,7 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                             model=model_cls.__name__, defer=defer, capture=capture
                         ),
                         patch.object(
-                            comm,
-                            "deferred_post_experts_all_reduce",
-                            side_effect=all_reduce,
+                            GROUP, "all_reduce", side_effect=all_reduce
                         ) as reduce,
                     ):
                         model = build_model(model_cls, defer=defer, capture=capture)

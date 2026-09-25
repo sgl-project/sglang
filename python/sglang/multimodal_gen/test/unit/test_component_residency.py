@@ -617,6 +617,38 @@ def test_declared_component_use_admits_explicit_component_offload():
     manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
 
 
+@pytest.mark.parametrize(
+    "mode", ["component-offload", "snapshot-offload", "layerwise-offload"]
+)
+def test_partial_execution_validates_the_full_pipeline(mode):
+    validation = _Stage()
+    encoding = _Stage(ComponentUse("encode", "text_encoder"))
+    denoising = _Stage(ComponentUse("denoise", "transformer"))
+    pipeline = SimpleNamespace(
+        modules={
+            name: torch.nn.Linear(2, 2) for name in ("text_encoder", "transformer")
+        },
+        _stage_name_mapping={
+            "validate": validation,
+            "encode": encoding,
+            "denoise": denoising,
+        },
+        component_residency_strategies={},
+    )
+    server_args = _server_args_with_component_offload("transformer")
+    server_args.component_residency = dict.fromkeys(pipeline.modules, mode)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    for stages in ([validation], [encoding, denoising]):
+        manager.begin_request(stages, SimpleNamespace(is_warmup=False), server_args)
+        assert manager.state.stages == stages
+        assert manager._ordered_uses == tuple(
+            use for stage in stages for use in stage.component_uses(server_args)
+        )
+        manager.finish_request()
+
+
 def test_single_component_stage_is_prepared_at_stage_entry():
     module = torch.nn.Linear(2, 2)
     use = ComponentUse("stage", "text_encoder")

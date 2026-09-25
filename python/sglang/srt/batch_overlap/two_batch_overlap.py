@@ -18,6 +18,7 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
     ScatterMode,
+    reduce_output,
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -966,6 +967,7 @@ def _model_forward_tbo(
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
+    inputs["hidden_states"] = reduce_output(inputs["hidden_states"])
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
