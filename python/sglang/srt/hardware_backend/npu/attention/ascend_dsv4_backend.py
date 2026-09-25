@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -134,20 +136,13 @@ def _build_explicit_state_block_table(
     ).contiguous()
 
 
-def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Atlas A5 cache_mode=2 request-bank table.
 
-    A5 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the A3 explicit
-    per-token location table.
-    """
-    if req_pool_indices.ndim != 1:
-        raise ValueError(
-            "Atlas A5 compressor requires a 1-D request-bank table, got "
-            f"shape={tuple(req_pool_indices.shape)}"
-        )
-    return req_pool_indices.to(dtype=torch.int32).contiguous()
-
+def _pos_repr(fm) -> str:
+    """start_pos may be a tensor or a plain list; render it uniformly."""
+    t = getattr(fm, "start_pos", None)
+    if torch.is_tensor(t):
+        return str(t.tolist())
+    return str(t)
 
 class CompressorAscendBackendMixin:
     @staticmethod
@@ -180,11 +175,6 @@ class CompressorAscendBackendMixin:
 
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
-        fm.dsv4_cycle_state_block_table = (
-            _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35()
-            else None
-        )
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
@@ -438,27 +428,100 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        if is_npu_arch35():
-            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
-            # compressor derives the in-bank offset from start_pos; passing
-            # the A3 explicit [B, width] table here would be an ABI violation.
-            state_block_table = fm.dsv4_cycle_state_block_table
-        else:
-            table_cache = fm.dsv4_explicit_state_block_tables
-            if ratio not in table_cache:
-                table_cache[ratio] = _build_explicit_state_block_table(
-                    compress_ratio=ratio,
-                    coff=coff,
-                    state_pool=state_pool,
-                    token_to_kv_pool=pool,
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    start_pos=fm.start_pos,
-                    cu_seqlens=fm.actual_seq_lengths_q_pa,
-                    seqused=fm.seqused,
-                    max_input_capacity=fm.dsv4_max_input_capacity,
+        table_cache = fm.dsv4_explicit_state_block_tables
+        if ratio not in table_cache:
+            table_cache[ratio] = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=coff,
+                state_pool=state_pool,
+                token_to_kv_pool=pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                start_pos=fm.start_pos,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
+                seqused=fm.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+        state_block_table = table_cache[ratio]
+
+        import os
+
+        # A full DSV4_DUMP is tens of thousands of lines. DSV4_DUMP_LAYERS keeps
+        # only the layers in question and DSV4_DUMP_MIN/MAX_POS only the decode
+        # window, so one capture stays small enough to diff by hand.
+        _dump_on = False
+        if os.environ.get("DSV4_DUMP"):
+            import hashlib
+
+            _lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+            _hi = int(os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+            _cap = int(os.environ.get("DSV4_DUMP_MAX_CALLS", "0"))
+            _layers = {
+                int(v)
+                for v in os.environ.get("DSV4_DUMP_LAYERS", "").split(",")
+                if v.strip()
+            }
+            _pos = int(fm.start_pos.max().item()) if fm.start_pos.numel() else -1
+            _used = getattr(self, "_dsv4_dump_calls", 0)
+            _dump_on = (
+                _lo <= _pos <= _hi
+                and (not _layers or compressor.layer_id in _layers)
+                and (_cap == 0 or _used < _cap)
+            )
+            if _dump_on:
+                self._dsv4_dump_calls = _used + 1
+
+            _tag = f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)}"
+
+            if _dump_on:
+                for _name, _t in (("x", x), ("table", state_block_table)):
+                    _a = _t.detach().to(torch.float32).cpu().numpy()
+                    _s = (
+                        "sum=0 absmax=0 md5=empty"
+                        if _a.size == 0
+                        else f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                        f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
+                    )
+                    print(
+                        f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}",
+                        flush=True,
+                    )
+                print(
+                    f"[CIN] {_tag} state_cache shape={tuple(state_cache.shape)} "
+                    f"ptr={state_cache.data_ptr()}",
+                    flush=True,
                 )
-            state_block_table = table_cache[ratio]
+                _all = state_block_table.reshape(-1).to(torch.int64)
+                _rows_n = state_cache.reshape(-1, state_cache.shape[-1]).shape[0]
+                print(
+                    f"[CIN] {_tag} state_range n={_all.numel()} "
+                    f"min={int(_all.min())} max={int(_all.max())} rows={_rows_n} "
+                    f"oob={int((_all >= _rows_n).sum())}",
+                    flush=True,
+                )
+                print(
+                    f"[CIN] {_tag} start_pos={fm.start_pos.tolist()} "
+                    f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
+                    flush=True,
+                )
+                if os.environ.get("DSV4_DUMP_STATE"):
+                    # no spaces: dump_diff.py keys lines by whitespace token
+                    _tv = ",".join(
+                        str(int(v)) for v in state_block_table.reshape(-1).tolist()
+                    )
+                    print(f"[CIN] {_tag} table_vals {_tv}", flush=True)
+                    _flat = state_cache.reshape(-1, state_cache.shape[-1])
+                    _locs = _all[(_all >= 0) & (_all < _flat.shape[0])]
+                    if _locs.numel():
+                        _rows = _flat.index_select(0, _locs)
+                        _a = _rows.detach().to(torch.float32).cpu().numpy()
+                        print(
+                            f"[CIN] pid={os.getpid()} start_pos={_pos_repr(fm)} "
+                            f"{_tag} state_rows n={_rows.shape[0]} "
+                            f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                            f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -469,10 +532,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
-        compressor_op = (
-            torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
-        )
+        compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
@@ -509,6 +569,23 @@ class CompressorAscendBackendMixin:
                     f"epilog: mode={forward_batch.forward_mode}, ratio={ratio}, "
                     f"loc={loc.numel()}, kv={cmp_kv.shape[0]}"
                 )
+
+        if _dump_on:
+            import hashlib
+
+            _a = cmp_kv.detach().to(torch.float32).cpu().numpy()
+            _s = (
+                "sum=0 absmax=0 md5=empty"
+                if _a.size == 0
+                else f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
+            )
+            print(
+                f"[COUT] pid={os.getpid()} start_pos={_pos_repr(fm)} "
+                f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)} "
+                f"n={cmp_kv.shape[0]} {_s}",
+                flush=True,
+            )
 
         if self.graph_mode or cmp_kv.shape[0] > 0:
             if compressor.rotate:
@@ -1329,11 +1406,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        metadata.dsv4_cycle_state_block_table = (
-            torch.zeros(bs, dtype=torch.int32, device=device)
-            if is_npu_arch35()
-            else None
-        )
         metadata.dsv4_explicit_state_block_tables = {
             ratio: torch.full(
                 (
@@ -1810,11 +1882,6 @@ class DeepseekV4AscendAttnBackend(
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
-        if is_npu_arch35():
-            ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices[: ctx.bs]
-            )
-
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)
 
@@ -1927,6 +1994,210 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
+            self._dump_compress_metadata(fm, forward_batch)
+
+    def _dump_compress_metadata(self, fm, forward_batch: ForwardBatch) -> None:
+        """One line per forward step naming the metadata the attention reads.
+
+        Called from init_forward_metadata, i.e. host side and outside any graph
+        capture, so it stays at one line per step and also covers the prefill --
+        a request with no prefill line is the cache hit. Hashing each table
+        shrinks "which field differs on the hit path" to one md5 comparison.
+        """
+        import hashlib
+        import os
+
+        if not os.environ.get("DSV4_DUMP_META"):
+            return
+
+        def _h(t) -> str:
+            if t is None:
+                return "none"
+            a = t.detach().to(torch.float32).cpu().numpy()
+            if a.size == 0:
+                return "empty"
+            return hashlib.md5(a.tobytes()).hexdigest()[:12]
+
+        def _l(t) -> str:
+            if t is None or not torch.is_tensor(t):
+                return str(t)
+            return str(t.tolist())
+
+        print(
+            f"[META] mode={forward_batch.forward_mode} bs={forward_batch.batch_size} "
+            f"start_pos={_l(getattr(fm, 'start_pos', None))} "
+            f"seqused={_l(getattr(fm, 'seqused', None))} "
+            f"swa={_h(getattr(fm, 'swa_page_table', None))} "
+            f"c4pt={_h(getattr(fm, 'c4_page_table', None))} "
+            f"c128pt={_h(getattr(fm, 'c128_page_table', None))} "
+            f"c4loc={_h(getattr(fm, 'c4_loc', None))} "
+            f"c128loc={_h(getattr(fm, 'c128_loc', None))} "
+            f"kv={_h(getattr(fm, 'actual_seq_lengths_kv', None))}",
+            flush=True,
+        )
+        if os.environ.get("DSV4_DUMP_META_VALS"):
+            # Page ids legitimately differ on a hit (prefix from cache, suffix
+            # freshly allocated), so the hashes alone cannot tell a benign
+            # remap from a wrong window; this prints the mapping itself.
+            swa_t = getattr(fm, "swa_page_table", None)
+            row = swa_t[0].tolist() if torch.is_tensor(swa_t) and swa_t.dim() >= 2 else []
+            print(
+                f"[METAV] start_pos={_l(getattr(fm, 'start_pos', None))} "
+                f"swa_len={len(row)} swa_row0={row}",
+                flush=True,
+            )
+        if os.environ.get("DSV4_DUMP_SWA_KV"):
+            # Content behind the local window: hash the SWA pages the table maps
+            # at the sequence tail, where a resume re-reads history. Tail pages
+            # only and native dtype bytes: hashing the whole sequence as float32
+            # costs tens of MB per step and would distort the run it measures.
+            try:
+                layer = int(os.environ.get("DSV4_DUMP_SWA_KV", "0"))
+                pool = self.token_to_kv_pool
+                buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
+                tbl = getattr(fm, "swa_page_table", None)
+                if tbl is not None and tbl.numel():
+                    # The local window is the trailing SWA page plus the one
+                    # before it. Address them by position and print the ids, so
+                    # both runs compare the same slot: a tail-of-row heuristic
+                    # picks padding and silently hashes a different page set.
+                    # Slice, never gather: fp8 has no NPU index_select (161002).
+                    vals = tbl[0].reshape(-1).tolist()
+                    pos = int(fm.start_pos.reshape(-1)[0].item()) if fm.start_pos.numel() else 0
+                    pg = pos // int(pool.swa_kv_pool.kernel_page_size)
+                    idx = sorted({max(0, pg - 1), min(pg, len(vals) - 1)})
+                    ids = [int(vals[i]) for i in idx]
+                    ids = [v for v in ids if 0 <= v < buf.shape[0]]
+                    if ids:
+                        lo = min(ids)
+                        span = max(ids) - lo + 1
+                        slab_t = (
+                            buf.narrow(0, lo, span).view(torch.uint8).detach().cpu()
+                        )
+                        raw = slab_t.numpy().tobytes()
+                        # Token-resolved window hash: only the rows of the tokens
+                        # the window covers, so a relocated-but-equal page set
+                        # compares equal and a genuinely wrong window does not.
+                        page_sz = int(pool.swa_kv_pool.kernel_page_size)
+                        h = hashlib.md5()
+                        nrows = 0
+                        for p in range(max(0, pos - (page_sz - 1)), pos + 1):
+                            col = p // page_sz
+                            pid = int(vals[col]) if col < len(vals) else -1
+                            if lo <= pid < lo + span:
+                                h.update(
+                                    slab_t[pid - lo, p % page_sz]
+                                    .contiguous()
+                                    .numpy()
+                                    .tobytes()
+                                )
+                                nrows += 1
+                        # The read path derives (page, row) as (table[p // page],
+                        # p % page) from the page's first token, while the write
+                        # path uses each token's own swa loc. They agree only if
+                        # swa_loc(p) % page == p % page; count the violations.
+                        try:
+                            rp = forward_batch.req_pool_indices[:1].to(torch.int64)
+                            full = self.req_to_token[rp][0].to(torch.int64)
+                            lo_p = max(0, pos - (page_sz - 1))
+                            swa = pool.full_to_swa_index_mapping[full[lo_p : pos + 1]]
+                            pp = torch.arange(lo_p, pos + 1, device=swa.device)
+                            phase = int(
+                                (((swa % page_sz) != (pp % page_sz)) & (swa > 0)).sum()
+                            )
+                            n_zero = int((swa == 0).sum())
+                            mapped = swa[swa > 0]
+                            min_l = int(mapped.min()) if mapped.numel() else -1
+                            max_l = int(mapped.max()) if mapped.numel() else -1
+                            cols = (pp // page_sz).clamp(0, len(vals) - 1)
+                            table_t = torch.tensor(
+                                [vals[c] for c in cols.tolist()],
+                                device=swa.device,
+                                dtype=swa.dtype,
+                            )
+                            qbad = int(
+                                (
+                                    ((swa // page_sz) != table_t)
+                                    & (full[lo_p : pos + 1] >= 0)
+                                ).sum()
+                            )
+                        except Exception:
+                            phase = -1
+                            n_zero = -1
+                            min_l = -1
+                            max_l = -1
+                            qbad = -1
+                        try:
+                            slot0 = hashlib.md5(
+                                buf[0]
+                                .view(torch.uint8)
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .tobytes()
+                            ).hexdigest()[:16]
+                        except Exception:
+                            slot0 = "n/a"
+                        _swkv_line = (
+                            f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
+                            f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]} "
+                            f"win={h.hexdigest()[:16]} rows={nrows} phase={phase} "
+                            f"zero={n_zero} minl={min_l} maxl={max_l} slot0={slot0} "
+                            f"qbad={qbad}"
+                        )
+                        if not os.environ.get("DSV4_DUMP_SWA_FIXED_ONLY"):
+                            print(_swkv_line, flush=True)
+                        _sw = getattr(fm, "start_pos", None)
+                        if torch.is_tensor(_sw) and _sw.numel():
+                            _swaf_pos = int(_sw.max().item())
+                        elif isinstance(_sw, (list, tuple)) and _sw:
+                            _swaf_pos = int(max(_sw))
+                        else:
+                            _swaf_pos = -1
+                        _swaf_lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
+                        _swaf_hi = int(os.environ.get("DSV4_DUMP_MAX_POS", "17530"))
+                        _swaf_at = int(os.environ.get("DSV4_DUMP_SWA_FIXED_AT", "16384"))
+                        if (
+                            _swaf_pos == _swaf_at
+                            or _swaf_lo <= _swaf_pos <= _swaf_hi
+                        ) and getattr(self, "_swaf_printed", 0) < 64:
+                            try:
+                                f_lo = int(os.environ.get("DSV4_DUMP_SWA_FIXED_LO", "16256"))
+                                f_hi = int(os.environ.get("DSV4_DUMP_SWA_FIXED_HI", "16384"))
+                                if 0 <= f_lo < f_hi <= full.numel():
+                                    self._swaf_printed = getattr(self, "_swaf_printed", 0) + 1
+                                    hh = hashlib.md5()
+                                    unmapped = 0
+                                    first = -1
+                                    last = -1
+                                    for p in range(f_lo, f_hi):
+                                        col = p // page_sz
+                                        pid = int(vals[col]) if col < len(vals) else -1
+                                        if pid <= 0:
+                                            unmapped += 1
+                                            continue
+                                        hh.update(
+                                            buf[pid, p % page_sz]
+                                            .detach()
+                                            .view(torch.uint8)
+                                            .cpu()
+                                            .numpy()
+                                            .tobytes()
+                                        )
+                                        if first < 0:
+                                            first = pid
+                                        last = pid
+                                    print(
+                                        f"[SWAF] pid={os.getpid()} "
+                                        f"start_pos={_l(getattr(fm, 'start_pos', None))} "
+                                        f"layer={layer} pos=[{f_lo},{f_hi}) unmapped={unmapped} "
+                                        f"ids=[{first},{last}] win={hh.hexdigest()[:16]}",
+                                        flush=True,
+                                    )
+                            except Exception as exc:
+                                print(f"[SWAF] skipped: {exc}", flush=True)
+            except Exception as exc:
+                print(f"[SWAKV] skipped: {exc}", flush=True)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
@@ -2212,6 +2483,35 @@ class DeepseekV4AscendAttnBackend(
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        _swaw_pos = (
+            int(forward_batch.positions.reshape(-1)[-1].item())
+            if torch.is_tensor(getattr(forward_batch, "positions", None))
+            and forward_batch.positions.numel()
+            else -1
+        )
+        _swaw_lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
+        _swaw_hi = int(os.environ.get("DSV4_DUMP_MAX_POS", "17530"))
+        if (
+            int(os.environ.get("DSV4_DUMP_SWA_KV", "0")) == layer_id
+            and (
+                _swaw_pos == int(os.environ.get("DSV4_DUMP_SWA_FIXED_AT", "16384"))
+                or _swaw_lo <= _swaw_pos <= _swaw_hi
+            )
+            and getattr(self, "_swaw_printed", 0) < 64
+        ):
+            try:
+                raw = swa_k.detach().view(torch.uint8).cpu().numpy().tobytes()
+                locs = swa_loc.reshape(-1)
+                self._swaw_printed = getattr(self, "_swaw_printed", 0) + 1
+                print(
+                    f"[SWAW] start_pos={forward_batch.positions.reshape(-1)[-1].item()} "
+                    f"layer={layer_id} n={locs.numel()} "
+                    f"loc=[{int(locs.min().item())},{int(locs.max().item())}] "
+                    f"md5={hashlib.md5(raw).hexdigest()[:16]} bytes={len(raw)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[SWAW] skipped: {exc}", flush=True)
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,

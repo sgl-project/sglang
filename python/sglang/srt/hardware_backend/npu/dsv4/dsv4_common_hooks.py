@@ -11,8 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and A5 C4
-compress-state rows.
+NPU-specific payloads for the independently addressed C128 KV pool.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -28,8 +27,37 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> None:
+    """Re-point full->swa for the reused prefix window, before the forward pass.
+
+    A hit restores only the Full req_to_token rows; attention reads the window's
+    SWA pages through the allocator-global table, which the previous owner may
+    have cleared or rebound. Running before the forward is what matters: the
+    prefill computes its own KV from this window.
+    """
+    tree_cache = getattr(batch, "tree_cache", None)
+    components = getattr(tree_cache, "components", None)
+    if not components:
+        return
+    component = components.get(ComponentType.SWA)
+    if component is None:
+        return
+    for i, req in enumerate(batch.reqs):
+        if i >= len(prefix_lens_cpu) or int(prefix_lens_cpu[i]) <= 0:
+            continue
+        node_id = getattr(req, "last_node", None)
+        if node_id is not None:
+            # deepest match node can be the freshly-extended suffix node; the
+            # window to repair ends at this req's cached prefix length instead.
+            component.resync_window_full_to_swa_mapping(
+                node_id, int(prefix_lens_cpu[i])
+            )
 
 
 def maybe_write_dsv4_extend(
@@ -41,10 +69,12 @@ def maybe_write_dsv4_extend(
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
     Spreads the flat ``out_c128_loc`` tensor across requests and writes newly
-    allocated page ids into ``req_to_c128_sidecar``. C4 locations are derived
+    allocated page ids into ``req_to_c128_sidecar``.     C4 locations are derived
     from the full-token table.
 
     """
+    _resync_swa_window(batch, prefix_lens_cpu)
+
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
     bundle = batch.out_cache_loc_dsv4
@@ -78,20 +108,14 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
-      and decode derive physical rows using their own local ring sizes, so
-      decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
-      Pre-A5 uses EXPLICIT cache_mode and the C4 state is handled by the
-      shared ``StateType.SWA`` payload.
+
+    The C4 compress state is explicit-location addressed and transports with the
+    shared ``StateType.SWA`` payload on every arch.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-        c4_state_transfer_indices,
-    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -110,20 +134,7 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
-    if is_npu_arch35():
-
-        def c4_state_indices():
-            return c4_state_transfer_indices(
-                req_pool_idx,
-                seq_len,
-                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
-            )
-
-        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
-
-    return payloads
+    return {AscendStateType.DSV4_C128: c128_kv_pages}
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
