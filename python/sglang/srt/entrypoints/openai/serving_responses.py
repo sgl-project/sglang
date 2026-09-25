@@ -97,6 +97,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ``ReasoningEffortTier`` (protocol.py) accepts more tiers than the OpenAI SDK's
+# ``ReasoningEffort`` literal (minimal/low/medium/high) can represent. The streaming
+# ``Response*`` event models validate against the SDK literal, so the extra tiers are
+# mapped onto the nearest representable one when echoed back to the client.
+_SDK_UNREPRESENTABLE_EFFORTS = {
+    "xhigh": "high",
+    "max": "high",
+    "none": "minimal",
+}
+
 
 class _MediaInputValidationError(ValueError):
     pass
@@ -1969,8 +1979,23 @@ class OpenAIServingResponses(OpenAIServingChat):
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic
         # validation failures on extended tool types.
+        #
+        # ``reasoning.effort`` has the same problem. ``ReasoningEffortTier`` in
+        # ``protocol.py`` accepts none/minimal/low/medium/high/xhigh/max, but the
+        # OpenAI SDK's ``ReasoningEffort`` literal is only minimal/low/medium/high,
+        # so echoing back an accepted ``xhigh``/``max``/``none`` raises
+        # ``ValidationError`` inside ``ResponseCreatedEvent`` and aborts the stream
+        # before any content is sent. Collapse the echoed value onto the nearest
+        # representable tier, mirroring what the Anthropic entrypoint already does.
+        # Only the echoed value changes; sampling params are resolved earlier, so
+        # generation still runs at the requested effort.
         def _sanitize_response_dict(d: dict) -> dict:
             d["tools"] = []
+            reasoning = d.get("reasoning")
+            if isinstance(reasoning, dict):
+                effort = reasoning.get("effort")
+                if effort in _SDK_UNREPRESENTABLE_EFFORTS:
+                    reasoning["effort"] = _SDK_UNREPRESENTABLE_EFFORTS[effort]
             return d
 
         initial_response = _sanitize_response_dict(
