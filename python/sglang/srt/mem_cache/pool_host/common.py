@@ -20,6 +20,38 @@ _is_hip = is_hip()
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
 
+def consume_pending_cuda_error() -> None:
+    """Consume a CUDA error left pending by a failed cudart call.
+
+    A failed ``cudaHostRegister``/``cudaHostUnregister`` does not only affect the
+    call that failed: the error stays pending in the current thread's CUDA error
+    slot and is raised by the *next* unrelated CUDA call (typically as a
+    confusing "invalid argument"), which makes a registration failure look like a
+    random device failure somewhere else. Measured on H20 / CUDA 13.0 /
+    torch 2.13.0+cu130: ``torch.cuda.synchronize()`` does not clear it, a tiny
+    kernel launch does, and ``cudaGetLastError`` is not exposed by that torch
+    build's cudart binding -- hence the kernel launch as the primary route.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        cudart = torch.cuda.cudart()
+    except Exception:
+        return
+    get_last_error = getattr(cudart, "cudaGetLastError", None)
+    if get_last_error is not None:
+        try:
+            get_last_error()
+            return
+        except Exception:
+            # Fall through to the kernel-launch probe below.
+            pass
+    try:
+        torch.zeros(1, device="cuda")
+    except Exception:
+        pass
+
+
 class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
@@ -188,6 +220,12 @@ def _cuda_host_register(
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
     except Exception:
+        # Consume the pending CUDA error as part of the failure path: left
+        # pending, it surfaces at the next unrelated CUDA call as a confusing
+        # "invalid argument". Doing it before the rollback is defensive (the
+        # rollback's cudaHostUnregister has been observed to succeed while the
+        # error is pending, but that is not guaranteed on every driver).
+        consume_pending_cuda_error()
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
         )
