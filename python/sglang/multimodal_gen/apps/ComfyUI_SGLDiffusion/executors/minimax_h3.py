@@ -54,7 +54,7 @@ def _split_av(x) -> tuple[torch.Tensor, torch.Tensor]:
         if len(parts) >= 2:
             return parts[0], parts[1]
     raise TypeError(
-        "MiniMax H3 ComfyUI forward expects x to be [video, audio], " f"got {type(x)!r}"
+        f"MiniMax H3 ComfyUI forward expects x to be [video, audio], got {type(x)!r}"
     )
 
 
