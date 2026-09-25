@@ -1615,9 +1615,12 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         is_arch35 = is_npu_arch35()
-        # NOTE(dcp-port): upstream gates this on `is_arch35` (950/A5 only). The
-        # gate is dropped because `dsa_layer_skips_topk` reads the model config,
-        # not the device, and the elision is worth ~222 GiB on A3.
+        # Deliberately not gated on `is_arch35`. Which layers own an Indexer is a
+        # property of the model config -- `dsa_layer_skips_topk` reads
+        # `index_topk_freq` and `index_skip_topk_offset` -- not of the die, and a
+        # layer with `self.indexer is None` (deepseek_v2.py) never writes index-K
+        # on any hardware. The arch test only ever described where the layout had
+        # been exercised.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
             is_draft_worker=self.is_draft_worker
         )
