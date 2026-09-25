@@ -773,16 +773,17 @@ class LayerCommunicator:
 
     def _declared_sides(self) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and a dense MLP on the TP group under attention DP, without CP
-        or LayerNorm SP, in a layer that takes the rows a dense layer or the
-        embedding hands on. None when the steps come from the scatter modes."""
+        attention and a dense MLP on the TP group, without CP, LayerNorm SP or
+        input-scattered attention, in a layer that takes the rows a dense layer
+        or the embedding hands on. None when the steps come from the scatter
+        modes."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
         if not (
             self._takes_declared_boundaries
-            and parallel.attn_dp_size > 1
             and parallel.attn_cp_size == 1
             and not layernorm_sp.layernorm_sp_enabled()
+            and not parallel.enable_attn_tp_input_scattered
             and not modes.is_layer_sparse
             and not enable_moe_dense_fully_dp()
             and (modes.is_first_layer or modes.is_previous_layer_sparse is False)
@@ -805,18 +806,32 @@ class LayerCommunicator:
         self._communicate_simple_fn = _select_attention_input_move(
             sides.layer_rows, sides.attention
         )
+        # Neither fused kernel runs under attention DP, where the FFN input is
+        # gathered.
+        fusions = (
+            self._select_mlp_input_fusions()
+            if sides.attention_output.layout == sides.ffn.layout
+            else ()
+        )
         self._mlp_input = _select_ffn_input(
             sides.attention_output,
             residual=sides.layer_rows,
             need=sides.ffn,
             force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
+            fusions=fusions,
         )
-        # Neither fused kernel runs under attention DP.
-        self._mlp_input_may_fuse = False
+        self._mlp_input_may_fuse = (
+            self._mlp_input_reduce_output_and_update_and_read_residual in fusions
+        )
         self._ffn_output = sides.ffn_output
         self._postprocess_scatters_to_local_tokens = _ffn_output_returns_over_dp(
             sides.ffn_output, sides.layer_rows
         )
+        if not self._postprocess_scatters_to_local_tokens:
+            # The FFN output is already on the layer's rows.
+            self._communicate_summable_tensor_pair_fn = (
+                CommunicateSummableTensorPairFn._trivial
+            )
         self._ffn_sum_is_movable = sides.ffn_output.group is not None
 
     def _select_boundaries_from_scatter_modes(self) -> None:
@@ -1097,9 +1112,7 @@ class LayerCommunicator:
             )
         # Neither fused kernel runs under attention DP.
         fusions = (
-            self._select_mlp_input_fusions(residual_input_mode)
-            if self._context.attn_dp_size == 1
-            else ()
+            self._select_mlp_input_fusions() if self._context.attn_dp_size == 1 else ()
         )
         steps = partial(
             _mlp_input_gather,
@@ -1112,9 +1125,7 @@ class LayerCommunicator:
             self._mlp_input_reduce_output_and_update_and_read_residual in fusions,
         )
 
-    def _select_mlp_input_fusions(
-        self, residual_input_mode: ScatterMode
-    ) -> Tuple[Callable, ...]:
+    def _select_mlp_input_fusions(self) -> Tuple[Callable, ...]:
         """The fused kernels that complete the attention output's all-reduce
         together with the residual update and the post-attention norm, in the
         order they are tried. Each takes (hidden_states, residual, forward_batch)
@@ -1815,15 +1826,17 @@ def _select_ffn_input(
     residual: Layout,
     need: StageInput,
     force_layernorm_before_gather: bool,
+    fusions: Tuple[Callable, ...],
 ) -> Callable:
     """The steps from the attention output to the FFN input: complete the
     attention-TP sum, add the residual and normalize, and gather the rows the
-    FFN's group needs, with the residual left on the attention's rows."""
+    FFN's group needs, with the residual left on the attention's rows. The
+    fused kernels in ``fusions`` are tried first when no rows are gathered."""
     gathered = produced.layout.sharded - need.layout.sharded
     if (
         residual != produced.layout
         or not need.layout.sharded <= produced.layout.sharded
-        or gathered != {TokenAxis.ATTN_DP}
+        or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
     ):
         raise NotImplementedError(f"{produced=} {residual=} {need=}")
     # What the attention output owes decides the steps: the attention-TP sum,
@@ -1834,6 +1847,10 @@ def _select_ffn_input(
         SumGroup.ATTN_TP,
     ):
         raise NotImplementedError(f"{produced=}")
+    if not gathered:
+        if not owes_attention_tp:
+            return _mlp_input_norm
+        return partial(_mlp_input_without_dp, gathers_residual=False, fusions=fusions)
     # The partial order adds the residual on attention-TP rank 0 before the DP
     # gather's collective completes that sum, which only a plain residual add
     # allows.
