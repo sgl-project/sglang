@@ -665,8 +665,9 @@ fn request_has_non_text_content(value: &Value) -> bool {
         })
 }
 
-/// Content parts other than `text` (images, video, audio, ...) need the
-/// engine's multimodal processor, so such chats can never carry `input_ids`.
+/// Image, video, and audio content parts need the engine's multimodal
+/// processor, so such chats can never carry `input_ids`. Other non-string
+/// parts (`refusal`, `thinking`, untyped) are ordinary guard exclusions.
 fn request_has_multimodal_content(value: &Value) -> bool {
     value
         .get("messages")
@@ -676,9 +677,12 @@ fn request_has_multimodal_content(value: &Value) -> bool {
                 m.get("content")
                     .and_then(|c| c.as_array())
                     .is_some_and(|parts| {
-                        parts
-                            .iter()
-                            .any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"))
+                        parts.iter().any(|p| {
+                            matches!(
+                                p.get("type").and_then(|t| t.as_str()),
+                                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                            )
+                        })
                     })
             })
         })
@@ -870,12 +874,12 @@ mod tests {
     }
 
     #[test]
-    fn request_has_multimodal_content_detects_non_text_parts() {
+    fn request_has_multimodal_content_detects_media_parts() {
         for part in [
             json!({"type":"image_url","image_url":{"url":"x"}}),
             json!({"type":"video_url","video_url":{"url":"x"}}),
+            json!({"type":"audio_url","audio_url":{"url":"x"}}),
             json!({"type":"input_audio","input_audio":{"data":"x"}}),
-            json!({"image_url":{"url":"x"}}),
         ] {
             assert!(
                 request_has_multimodal_content(&json!({
@@ -887,11 +891,18 @@ mod tests {
         for content in [
             json!("hello"),
             json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            json!([{"type":"refusal","refusal":"no"}]),
+            json!([{"type":"thinking","thinking":"hmm"}]),
+            json!([{"text":"untyped"}]),
+            json!(["bare string"]),
             Value::Null,
         ] {
-            assert!(!request_has_multimodal_content(&json!({
-                "messages":[{"role":"user","content":content}]
-            })));
+            assert!(
+                !request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":content}]
+                })),
+                "content {content} is not multimodal"
+            );
         }
     }
 
