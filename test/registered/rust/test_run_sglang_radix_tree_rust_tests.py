@@ -22,7 +22,7 @@ register_cpu_ci(est_time=80, suite="base-a-test-cpu")
     "SGLANG_SKIP_RUST_TESTS is set (no rust/ workspace changes per CI check-changes)",
 )
 class TestSGLangRadixTreeCargo(CustomTestCase):
-    def test_sglang_radix_tree_native_tests(self):
+    def _run_cargo_test(self, label, feature_args, env=None):
         self.assertIsNotNone(
             shutil.which("cargo"),
             "cargo not found on PATH; install a Rust toolchain "
@@ -32,10 +32,6 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
             SGLANG_RADIX_TREE_MANIFEST.is_file(),
             f"sglang-radix-tree manifest not found at {SGLANG_RADIX_TREE_MANIFEST}",
         )
-        build = torch_build_configuration(
-            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_2_13_compat.h",
-            python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
-        )
         proc = subprocess.run(
             [
                 "cargo",
@@ -44,9 +40,10 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
                 str(SGLANG_RADIX_TREE_MANIFEST),
                 "--locked",
                 "--no-default-features",
+                *feature_args,
             ],
             cwd=RUST_WORKSPACE,
-            env=build.environment,
+            env=env,
             capture_output=True,
             text=True,
             timeout=BUILD_AND_RUN_TIMEOUT_S,
@@ -55,9 +52,21 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
         self.assertEqual(
             proc.returncode,
             0,
-            f"sglang-radix-tree native tests failed\n"
+            f"sglang-radix-tree {label} tests failed\n"
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
         )
+
+    def test_sglang_radix_tree_native_tests(self):
+        build = torch_build_configuration(
+            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_2_13_compat.h",
+            python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+        )
+        self._run_cargo_test("torch", ["--features", "torch"], env=build.environment)
+
+    def test_sglang_radix_tree_torch_free_tests(self):
+        # The PageValue backend needs no libtorch; this is the only place its
+        # tests run in CI.
+        self._run_cargo_test("torch-free", [])
 
 
 if __name__ == "__main__":

@@ -4,8 +4,6 @@
 
 use std::collections::HashMap;
 
-use tch::Tensor;
-
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, MAMBA};
 use crate::node::ChildKeyType;
@@ -16,6 +14,7 @@ use crate::unified_tree_core::{
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
+use crate::value::RadixValue;
 
 /// Mamba component driver; owns the Mamba device/host value slots.
 pub struct MambaComponent {
@@ -58,7 +57,7 @@ fn least_common_multiple(lhs: usize, rhs: usize) -> usize {
 
 impl MambaComponent {
     // Tier-selected mamba slot read for the lock paths; `host` picks the host slot.
-    fn has_value<K: ChildKeyType>(node: &Node<K>, host: bool) -> bool {
+    fn has_value<K: ChildKeyType, V: RadixValue>(node: &Node<K, V>, host: bool) -> bool {
         if host {
             node.has_host_value(MAMBA)
         } else {
@@ -67,10 +66,10 @@ impl MambaComponent {
     }
 
     /// Defer the path-cap eviction so it runs after the insert's BackupKV.
-    fn emit_excess_path_states_eviction_(
+    fn emit_excess_path_states_eviction_<V: RadixValue>(
         &self,
         tail_node_id: NodeId,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut Vec<CacheAction<V>>,
     ) {
         if self.mamba_max_states_per_path.is_none() {
             return;
@@ -79,12 +78,16 @@ impl MambaComponent {
     }
 }
 
-impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
+impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
     fn component_type(&self) -> ComponentType {
         MAMBA
     }
 
-    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
+    fn needs_incremental_backup(
+        &self,
+        tree_core: &UnifiedTreeCore<K, V>,
+        node_id: NodeIdx_,
+    ) -> bool {
         let node = tree_core.arena.node(node_id);
         node.has_device_value(MAMBA) && !node.has_host_value(MAMBA)
     }
@@ -94,7 +97,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// so WALKDOWN and INSERT_END are no-ops.
     fn refresh_lru(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         phase: LRURefreshPhase,
         node_id: NodeIdx_,
     ) {
@@ -112,28 +115,30 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// A per-match predicate accepting nodes that hold mamba data.
     fn create_match_validator(
         &self,
-        _tree_core: &UnifiedTreeCore<K>,
+        _tree_core: &UnifiedTreeCore<K, V>,
         match_device_only: bool,
-    ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
+    ) -> Box<dyn FnMut(&UnifiedTreeCore<K, V>, NodeIdx_) -> bool> {
         // HiCache: evicted + backuped (host_value present) is also a valid match.
-        Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
-            let node = tree_core.arena.node(node_id);
-            node.has_device_value(MAMBA) || (!match_device_only && node.has_host_value(MAMBA))
-        })
+        Box::new(
+            move |tree_core: &UnifiedTreeCore<K, V>, node_id: NodeIdx_| {
+                let node = tree_core.arena.node(node_id);
+                node.has_device_value(MAMBA) || (!match_device_only && node.has_host_value(MAMBA))
+            },
+        )
     }
 
     /// The mamba branching seqlen and the host-only hit bump.
     fn finalize_match_result_in_tree_core(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
-        mut result: MatchResult,
+        tree_core: &UnifiedTreeCore<K, V>,
+        mut result: MatchResult<V>,
         _last_device_node_idx: NodeIdx_,
         best_match_node_idx: NodeIdx_,
         _params: &MatchPrefixParams<'_, K>,
-        _value_chunks: &[Tensor],
+        _value_chunks: &[V],
         _best_value_len: usize,
-    ) -> MatchResult {
-        let mamba_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+    ) -> MatchResult<V> {
+        let mamba_boundary_len = result.device_indices.len() + result.host_hit_length;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
         // point is the last checkpoint-grid-aligned position within the Full-KV hit
@@ -155,18 +160,18 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Attach the donated mamba slot to the insert target leaf.
     fn commit_insert_component_data(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         is_new_leaf: bool,
-        params: &InsertParams<'_, K>,
-        result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        params: &InsertParams<'_, K, V>,
+        result: &mut InsertResult<V>,
+        cache_actions: &mut Vec<CacheAction<V>>,
     ) {
         let mamba_value = params
             .mamba_value
             .as_ref()
             .expect("mamba insert requires a donated mamba_value");
-        let slot_len = mamba_value.size()[0] as usize;
+        let slot_len = mamba_value.len();
 
         if is_new_leaf {
             tree_core
@@ -196,10 +201,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// and device leaves are preserved (a best-effort soft cap).
     fn evict_excess_path_states(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         tail_node_id: NodeIdx_,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
         let Some(cap) = self.mamba_max_states_per_path else {
             return;
@@ -256,7 +261,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 
     fn redistribute_on_node_split(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         new_parent_id: NodeIdx_,
         _child_id: NodeIdx_,
     ) {
@@ -275,10 +280,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Free the node's mamba slot on the targeted layer(s).
     fn evict_component(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = MAMBA;
@@ -326,7 +331,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     }
 
     /// Begin the device-eviction walk from this component's LRU cursor.
-    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
+    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K, V>, request_cnt: usize) {
         tree_core.set_evict_device_start(MAMBA, request_cnt);
         let cursor = tree_core
             .device_lru_list(MAMBA)
@@ -340,10 +345,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// pending frees and recheck allocator capacity before the next mutation.
     fn evict_device_next_node(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) -> Option<NodeIdx_> {
         let ct = MAMBA;
         assert!(
@@ -399,14 +404,14 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     }
 
     /// Clear the device-eviction walk cursor state.
-    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
+    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K, V>) {
         tree_core.set_evict_device_end(MAMBA);
     }
 
     /// Single-node mamba lock; host locks also detach from the host LRU.
     fn acquire_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         result: IncLockRefResult,
         lock_host: bool,
@@ -441,7 +446,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Single-node mamba unlock; host unlocks reinsert into the host LRU.
     fn release_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         _params: &DecLockRefParams,
         lock_host: bool,
@@ -487,16 +492,16 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Build the mamba transfer descriptors for the given phase.
     fn build_hicache_transfers(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
+        tree_core: &UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        mamba_pool_idx: Option<Tensor>,
-        host_indices: Option<Tensor>,
+        mamba_pool_idx: Option<V>,
+        host_indices: Option<V>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
         staging_tokens: usize,
         _last_hash: Option<&str>,
-    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
+    ) -> Result<Option<Vec<PoolTransfer<V>>>, TreeCoreRuntimeError> {
         Ok(match phase {
             CacheTransferPhase::BackupHost => {
                 let node = tree_core.arena.node(node_id);
@@ -534,7 +539,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
-                        device_indices: Some(mamba_pool_idx.unsqueeze(0)),
+                        device_indices: Some(mamba_pool_idx),
                         ..Default::default()
                     });
                 }
@@ -579,12 +584,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Post-transfer mamba bookkeeping for the given phase.
     fn commit_hicache_transfer(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
-        insert_result: Option<&mut InsertResult>,
+        transfers: Vec<PoolTransfer<V>>,
+        cache_actions: &mut Vec<CacheAction<V>>,
+        insert_result: Option<&mut InsertResult<V>>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
         match phase {
@@ -594,7 +599,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(MAMBA) {
-                        node.set_host_value(MAMBA, host_indices.copy());
+                        node.set_host_value(MAMBA, host_indices.copy_for_adoption());
                     }
                 }
             }
@@ -605,7 +610,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 if let Some(device_indices) = &transfer.device_indices {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
-                    tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
+                    tree_core.set_component_device_value_(
+                        node_id,
+                        MAMBA,
+                        device_indices.copy_for_adoption(),
+                    );
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.
@@ -657,7 +666,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 let host_indices = host_indices.expect("an attach target implies host indices");
                 tree_core
                     .arena
-                    .set_host_value(target, MAMBA, host_indices.copy());
+                    .set_host_value(target, MAMBA, host_indices.copy_for_adoption());
                 if !tree_core.arena.has_device_value(target, MAMBA) {
                     let host_lru = tree_core.host_lru_list_mut(MAMBA);
                     if !host_lru.in_list(Some(target)) {
@@ -675,11 +684,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// leaves evict atomically.
     fn drive_host_eviction(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         num_tokens: usize,
         tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
         let ct = MAMBA;
         let mut x = tree_core
@@ -734,6 +743,6 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "../tests/components/mamba.rs"]
 mod tests;

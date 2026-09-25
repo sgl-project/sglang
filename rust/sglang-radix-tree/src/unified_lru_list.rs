@@ -8,6 +8,7 @@ use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::{NodeIdx_, ValueSlotIdx};
+use crate::value::RadixValue;
 
 /// Index into the cell table; distinct from `NodeIdx_` so shifted and unshifted
 /// ids cannot be mixed.
@@ -168,11 +169,11 @@ impl UnifiedLRUList {
 
     /// Re-rank the `should_include` nodes from `node_id` up to its root
     /// (exclusive) as the MRU run, deepest first.
-    pub fn reset_node_and_parents_mru<K: ChildKeyType>(
+    pub fn reset_node_and_parents_mru<K: ChildKeyType, V: RadixValue>(
         &mut self,
         node_id: NodeIdx_,
-        arena: &NodeArena<K>,
-        mut should_include: impl FnMut(&Node<K>) -> bool,
+        arena: &NodeArena<K, V>,
+        mut should_include: impl FnMut(&Node<K, V>) -> bool,
     ) {
         let mut prev = HEAD;
         let mut cur = node_id;
@@ -193,12 +194,12 @@ impl UnifiedLRUList {
 
     /// Like `reset_node_and_parents_mru`, stopping once `window_size` atoms
     /// are covered; excluded ancestors consume the window too.
-    pub fn reset_node_and_window_ancestors_mru<K: ChildKeyType>(
+    pub fn reset_node_and_window_ancestors_mru<K: ChildKeyType, V: RadixValue>(
         &mut self,
         node_id: NodeIdx_,
         window_size: usize,
-        arena: &NodeArena<K>,
-        mut should_include: impl FnMut(&Node<K>) -> bool,
+        arena: &NodeArena<K, V>,
+        mut should_include: impl FnMut(&Node<K, V>) -> bool,
     ) {
         let mut prev = HEAD;
         let mut accumulated = 0;
@@ -253,16 +254,19 @@ impl UnifiedLRUList {
     }
 
     /// The least-recent member whose lock on the list's own slot is free.
-    pub fn get_lru_no_lock<K: ChildKeyType>(&self, arena: &NodeArena<K>) -> Option<NodeIdx_> {
+    pub fn get_lru_no_lock<K: ChildKeyType, V: RadixValue>(
+        &self,
+        arena: &NodeArena<K, V>,
+    ) -> Option<NodeIdx_> {
         self.get_lru_where(|id| arena.node(id).lock_ref_(self.slot) == 0)
     }
 
     /// The nearest more-recent member whose lock on the list's own slot is
     /// free, from `node_id`.
-    pub fn get_prev_no_lock<K: ChildKeyType>(
+    pub fn get_prev_no_lock<K: ChildKeyType, V: RadixValue>(
         &self,
         node_id: NodeIdx_,
-        arena: &NodeArena<K>,
+        arena: &NodeArena<K, V>,
     ) -> Option<NodeIdx_> {
         self.get_prev_where(node_id, |id| arena.node(id).lock_ref_(self.slot) == 0)
     }
@@ -409,16 +413,16 @@ impl UnifiedLRUList {
 pub struct PriorityKey(pub i64, pub i64);
 
 /// Ranks nodes for eviction; lower priority evicts first.
-pub trait EvictionStrategy<K: ChildKeyType> {
+pub trait EvictionStrategy<K: ChildKeyType, V: RadixValue> {
     /// The node's eviction priority.
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey;
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey;
 }
 
 /// Least-recently-used.
 pub struct LruStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for LruStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for LruStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(node.last_access_counter, 0)
     }
 }
@@ -426,8 +430,8 @@ impl<K: ChildKeyType> EvictionStrategy<K> for LruStrategy {
 /// Least-frequently-used; LRU within a hit count.
 pub struct LfuStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for LfuStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for LfuStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(node.hit_count, node.last_access_counter)
     }
 }
@@ -435,8 +439,8 @@ impl<K: ChildKeyType> EvictionStrategy<K> for LfuStrategy {
 /// First-in-first-out over creation order.
 pub struct FifoStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for FifoStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for FifoStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(node.creation_counter, 0)
     }
 }
@@ -444,8 +448,8 @@ impl<K: ChildKeyType> EvictionStrategy<K> for FifoStrategy {
 /// Most-recently-used first.
 pub struct MruStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for MruStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for MruStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(-node.last_access_counter, 0)
     }
 }
@@ -453,8 +457,8 @@ impl<K: ChildKeyType> EvictionStrategy<K> for MruStrategy {
 /// First-in-last-out over creation order.
 pub struct FiloStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for FiloStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for FiloStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(-node.creation_counter, 0)
     }
 }
@@ -462,8 +466,8 @@ impl<K: ChildKeyType> EvictionStrategy<K> for FiloStrategy {
 /// Priority-aware: lower node priority evicts first, LRU within a priority.
 pub struct PriorityStrategy;
 
-impl<K: ChildKeyType> EvictionStrategy<K> for PriorityStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for PriorityStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(node.priority, node.last_access_counter)
     }
 }
@@ -474,8 +478,8 @@ pub struct SlruStrategy {
     pub protected_threshold: i64,
 }
 
-impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
-    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+impl<K: ChildKeyType, V: RadixValue> EvictionStrategy<K, V> for SlruStrategy {
+    fn get_priority(&self, node: &Node<K, V>) -> PriorityKey {
         PriorityKey(
             (node.hit_count >= self.protected_threshold) as i64,
             node.last_access_counter,
@@ -484,7 +488,9 @@ impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
 }
 
 /// The strategy for an eviction-policy name.
-pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionStrategy<K> + Send> {
+pub fn get_eviction_strategy<K: ChildKeyType, V: RadixValue>(
+    policy: &str,
+) -> Box<dyn EvictionStrategy<K, V> + Send> {
     match policy.to_lowercase().as_str() {
         "lru" => Box::new(LruStrategy),
         "lfu" => Box::new(LfuStrategy),
@@ -501,6 +507,6 @@ pub fn get_eviction_strategy<K: ChildKeyType>(policy: &str) -> Box<dyn EvictionS
         ),
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "tests/unified_lru_list.rs"]
 mod tests;
