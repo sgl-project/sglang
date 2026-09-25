@@ -131,9 +131,14 @@ def unified_memory_disagg_move_gate(scheduler):
     if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
 
         def decode_gate() -> bool:
+            decode_offload_manager = scheduler.decode_offload_manager
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or (
+                    decode_offload_manager is not None
+                    and decode_offload_manager.has_inflight_device_transfer()
+                )
             )
 
         return decode_gate
@@ -349,7 +354,9 @@ class MetadataBuffers:
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
                 self.output_token_sampling_logprobs = torch.zeros(
-                    (size, 16), dtype=torch.float32, device=device
+                    (size, max_sampling_mask_tokens),
+                    dtype=torch.float32,
+                    device=device,
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -517,8 +524,10 @@ class MetadataBuffers:
             sampling_logprobs = req.output_token_sampling_logprobs
             if sampling_masks:
                 sampling_mask = sampling_masks[0]
-                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
-                if sampling_mask is not None and sampling_logprob is not None:
+                sampling_logprobs_row = (
+                    sampling_logprobs[0] if sampling_logprobs else None
+                )
+                if sampling_mask is not None and sampling_logprobs_row is not None:
                     mask_len = len(sampling_mask)
                     max_mask_len = self.output_token_sampling_mask_idx.shape[1]
                     if mask_len > max_mask_len:
@@ -540,9 +549,20 @@ class MetadataBuffers:
                                 device=self.output_token_sampling_mask_idx.device,
                             )
                         )
-                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
-                        0
-                    ] = float(sampling_logprob)
+                    if req.sampling_logprobs_mode == "support" and mask_len:
+                        self.output_token_sampling_logprobs[
+                            req.metadata_buffer_index, :mask_len
+                        ].copy_(
+                            torch.tensor(
+                                sampling_logprobs_row,
+                                dtype=torch.float32,
+                                device=self.output_token_sampling_logprobs.device,
+                            )
+                        )
+                    elif req.sampling_logprobs_mode == "selected":
+                        self.output_token_sampling_logprobs[
+                            req.metadata_buffer_index, 0
+                        ] = float(sampling_logprobs_row)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -1003,10 +1023,12 @@ def build_kv_layer_ids(
     draft_ids = _draft_entry_layer_ids(
         pool=draft_token_to_kv_pool, num_entries=num_draft_entries
     )
-    # Rank the draft's own ids by first appearance, so the band stays dense and
-    # contiguous whatever the draft config numbers its layers.
-    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+    return layer_ids + _remap_draft_layer_ids(draft_ids, num_hidden_layers)
+
+
+def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[int]:
+    band_index = {layer_id: i for i, layer_id in enumerate(dict.fromkeys(layer_ids))}
+    return [num_hidden_layers + band_index[layer_id] for layer_id in layer_ids]
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
@@ -1492,16 +1514,50 @@ def setup_state_kv_args(
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
                 )
+                qsa_layer_ids = token_to_kv_pool.get_qsa_pending_state_layer_ids()
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                compressed_layer_ids = (
+                    token_to_kv_pool.get_qsa_compressed_state_layer_ids()
+                )
+                if isinstance(draft_token_to_kv_pool, QSATokenToKVPool):
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "QSA draft state transfer requires total_kv_layers"
+                        )
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                    )
+                    draft_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    qsa_ptrs += draft_ptrs
+                    qsa_lens += draft_lens
+                    qsa_item_lens += draft_item_lens
+                    qsa_layer_ids += draft_layer_ids
+
+                    (
+                        draft_compressed_ptrs,
+                        draft_compressed_lens,
+                        draft_compressed_item_lens,
+                    ) = draft_token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    draft_compressed_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    compressed_ptrs += draft_compressed_ptrs
+                    compressed_lens += draft_compressed_lens
+                    compressed_item_lens += draft_compressed_item_lens
+                    compressed_layer_ids += draft_compressed_layer_ids
                 append_state_component(
                     kv_args,
                     StateType.QSA_PENDING,
                     qsa_ptrs,
                     qsa_lens,
                     qsa_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
-                )
-                compressed_ptrs, compressed_lens, compressed_item_lens = (
-                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    layer_ids=qsa_layer_ids,
                 )
                 append_state_component(
                     kv_args,
@@ -1509,7 +1565,7 @@ def setup_state_kv_args(
                     compressed_ptrs,
                     compressed_lens,
                     compressed_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                    layer_ids=compressed_layer_ids,
                 )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
