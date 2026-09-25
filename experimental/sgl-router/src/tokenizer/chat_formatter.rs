@@ -231,6 +231,15 @@ impl ChatFormatter {
         })
     }
 
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 is stale.
+    pub fn forwarding_scope(&self) -> super::ForwardingScope {
+        match self.deepseek {
+            Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
+            Some(super::deepseek::Encoder::V41) => super::ForwardingScope::Never,
+            None => super::ForwardingScope::Guarded,
+        }
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {

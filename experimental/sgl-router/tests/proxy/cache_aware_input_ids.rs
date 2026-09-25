@@ -102,53 +102,6 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
 }
 
 #[tokio::test]
-async fn tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode, which the
-    // router's encoder renders in the default mode only — forwarding ids would
-    // silently run the wrong mode, so the handler must omit them.
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
 async fn multimodal_request_omits_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());

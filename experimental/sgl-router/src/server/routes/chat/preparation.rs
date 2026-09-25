@@ -9,6 +9,7 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::tokenizer::ForwardingScope;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -28,7 +29,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) input_token_count: usize,
     caller_set_rid: bool,
     fans_out: bool,
-    can_forward_input_ids: bool,
+    forwarding_scope: ForwardingScope,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
@@ -44,8 +45,12 @@ impl PreparedChatRequest {
         // Validate configured sampling rules and collect missing defaults for forwarding.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let can_forward_input_ids = !ctx.config.model.disable_input_ids_forwarding
-            && ctx.tokenizers.has_chat_formatter(&model.0);
+        let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
+            ForwardingScope::Never
+        } else {
+            ctx.tokenizers.forwarding_scope(&model.0)
+        };
+        let can_forward_input_ids = forwarding_scope != ForwardingScope::Never;
         let needs_tokens = should_tokenize_request(
             can_forward_input_ids,
             policy_needs_request_tokens,
@@ -73,7 +78,7 @@ impl PreparedChatRequest {
             input_token_count,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            can_forward_input_ids,
+            forwarding_scope,
             parsed_body,
             sampling_defaults,
         })
@@ -95,7 +100,7 @@ impl PreparedChatRequest {
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
         let forwarding = input_ids_forwarding(
-            self.can_forward_input_ids,
+            self.forwarding_scope,
             self.parsed_body.as_ref(),
             self.tokens.as_ref(),
         );
@@ -564,20 +569,25 @@ fn can_forward_chat_tokens(value: &Value) -> bool {
 ///
 /// Only chats with forwarding enabled that pass the forwarding guard are
 /// eligible; an eligible chat without chat-rendered tokens is a failed offload.
-/// Multimodal chats are reported apart from other guard exclusions.
+/// Multimodal chats are reported apart from other guard exclusions;
+/// `AllText` models skip the guard.
 fn input_ids_forwarding(
-    can_forward_input_ids: bool,
+    scope: ForwardingScope,
     request_value: Option<&Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> InputIdsForwarding {
-    if !can_forward_input_ids {
+    if scope == ForwardingScope::Never {
         return InputIdsForwarding::Disabled;
     }
     if request_value.is_some_and(request_has_multimodal_content) {
         return InputIdsForwarding::IneligibleMultimodal;
     }
     let eligible = request_value.is_some_and(|v| {
-        v.get("messages").is_some_and(|m| m.is_array()) && can_forward_chat_tokens(v)
+        v.get("messages").is_some_and(|m| m.is_array())
+            && match scope {
+                ForwardingScope::AllText => !has_caller_input_ids(v),
+                _ => can_forward_chat_tokens(v),
+            }
     });
     if !eligible {
         InputIdsForwarding::Ineligible
@@ -915,7 +925,7 @@ mod tests {
         ]});
         assert!(!can_forward_chat_tokens(&value));
         assert_eq!(
-            input_ids_forwarding(true, Some(&value), None),
+            input_ids_forwarding(ForwardingScope::Guarded, Some(&value), None),
             InputIdsForwarding::Ineligible
         );
         value["messages"][1]["reasoning_content"] = Value::Null;
@@ -941,7 +951,7 @@ mod tests {
             let value = json!({"messages": messages});
             assert!(!can_forward_chat_tokens(&value), "{roles:?}");
             assert_eq!(
-                input_ids_forwarding(true, Some(&value), None),
+                input_ids_forwarding(ForwardingScope::Guarded, Some(&value), None),
                 InputIdsForwarding::Ineligible
             );
         }
@@ -1007,26 +1017,36 @@ mod tests {
         ]}]});
         let text_parts =
             json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
-        for (enabled, value, rendered, expected) in [
-            (true, Some(&chat), Some(true), Forwarded),
-            (true, Some(&chat), Some(false), TokenizeFailed),
-            (true, Some(&chat), None, TokenizeFailed),
-            (false, Some(&chat), Some(true), Disabled),
-            (true, Some(&tools), Some(true), Ineligible),
-            (true, Some(&prompt), None, Ineligible),
-            (true, None, None, Ineligible),
-            (true, Some(&image), None, IneligibleMultimodal),
-            (false, Some(&image), None, Disabled),
-            (true, Some(&text_parts), None, Ineligible),
+        let caller_ids = json!({"messages":[{"role":"user","content":"hi"}], "input_ids":[7]});
+        let (never, guarded, all) = (
+            ForwardingScope::Never,
+            ForwardingScope::Guarded,
+            ForwardingScope::AllText,
+        );
+        for (scope, value, rendered, expected) in [
+            (guarded, Some(&chat), Some(true), Forwarded),
+            (guarded, Some(&chat), Some(false), TokenizeFailed),
+            (guarded, Some(&chat), None, TokenizeFailed),
+            (never, Some(&chat), Some(true), Disabled),
+            (guarded, Some(&tools), Some(true), Ineligible),
+            (guarded, Some(&prompt), None, Ineligible),
+            (guarded, None, None, Ineligible),
+            (guarded, Some(&image), None, IneligibleMultimodal),
+            (never, Some(&image), None, Disabled),
+            (guarded, Some(&text_parts), None, Ineligible),
+            (all, Some(&tools), Some(true), Forwarded),
+            (all, Some(&text_parts), Some(true), Forwarded),
+            (all, Some(&image), None, IneligibleMultimodal),
+            (all, Some(&caller_ids), Some(false), Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],
                 rendered_from_chat,
             });
             assert_eq!(
-                input_ids_forwarding(enabled, value, tokens.as_ref()),
+                input_ids_forwarding(scope, value, tokens.as_ref()),
                 expected,
-                "enabled={enabled}, request={value:?}, rendered={rendered:?}"
+                "scope={scope:?}, request={value:?}, rendered={rendered:?}"
             );
         }
     }
