@@ -45,7 +45,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    dp_gather_slot,
+    dp_slot_in,
     set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
@@ -85,6 +85,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 
 def _build_forward_token_modalities(
@@ -152,6 +153,21 @@ def _maybe_build_forward_token_modalities(
         extend_seq_lens,
         num_tokens,
         device,
+    )
+
+
+def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
+    """Whether aiter MegaMoE needs this idle rank to carry a token anyway.
+
+    MegaMoE's dispatch is rank-synchronous: when the batch is globally a
+    prefill, a rank with nothing to do still has to enter the collective, so it
+    runs a fabricated one-token extend instead of sitting the forward out.
+    """
+    return bool(
+        _is_hip
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and batch.is_extend_in_batch
+        and batch.forward_mode.is_idle()
     )
 
 
@@ -570,6 +586,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
+    # Setwise pooling readout positions (CPU tensors, one per request)
+    token_indices_to_pool: Optional[List[torch.Tensor]] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -1158,6 +1177,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for r in batch.reqs
                 ]
 
+            # Setwise readout: pool the head AT token_indices_to_pool instead of
+            # the last token. The scheduler keeps readout batches homogeneous
+            # (get_new_batch_prefill), so build only when every request carries
+            # the field and otherwise fall back to standard pooling.
+            if batch.reqs and all(
+                r.token_indices_to_pool is not None for r in batch.reqs
+            ):
+                self.token_indices_to_pool = [
+                    torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
         ]
@@ -1178,7 +1209,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
             if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[dp_gather_slot()]
+                num_tokens_per_dp = self.global_num_tokens_cpu[
+                    dp_slot_in(self.global_num_tokens_cpu)
+                ]
             else:
                 num_tokens_per_dp = self.global_num_tokens_cpu[0]
         else:
@@ -1523,6 +1556,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
+        # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
+        mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)
+        if mega_moe_idle_materialize:
+            global_num_tokens = [1] * len(global_num_tokens)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1565,6 +1603,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN
         self.dp_padding_mode = dp_padding_mode
+        # Read once here, where dp_padding_mode is final: the idle-row branch
+        # below runs after another arm may have rewritten self.forward_mode.
+        materializes_dummy_extend = mega_moe_idle_materialize or (
+            self.is_extend_in_batch and dp_padding_mode.is_max_len()
+        )
 
         if dp_padding_mode.is_max_len():
             # when DP gather mode is all gather, we will use
@@ -1577,10 +1620,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             buffer_len = sum(global_num_tokens)
 
-        if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[dp_gather_slot()]
-        else:
-            num_tokens = global_num_tokens[0]
+        num_tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
 
         self.attn_tp_sequence_sharded = model_runner.attn_tp_sequence_sharded(
             num_tokens
@@ -1620,7 +1660,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            elif materializes_dummy_extend:
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
@@ -1721,6 +1761,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
+        if (
+            self.mm_input_embeds is not None
+            and self.mm_input_embeds.shape[0] < num_tokens
+        ):
+            # A draft reads the target's mm embeds in place of its input_ids.
+            self.mm_input_embeds = self._pad_tensor_to_size(
+                self.mm_input_embeds, num_tokens
+            )
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.req_pool_indices_cpu is not None:
             self.req_pool_indices_cpu = self._pad_tensor_to_size(

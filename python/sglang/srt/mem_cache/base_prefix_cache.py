@@ -418,18 +418,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
-    ):
-        """Dispose of a finished request's KV.
-
-        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
-        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
-        call's to account for: insert what can be keyed, release the rest.
-        Slicing the kv row by the token-id count instead strands whatever
-        lies between -- no caller releases those. ``release_kv_cache`` frees
-        everything past ``owned_kv_len``.
-        """
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
+        """Hand a finished request's KV to the tree: insert what can be keyed
+        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
+        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
+        token count instead strands the slots up to ``owned_kv_len``; the
+        caller frees everything past it."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -475,6 +469,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         pass
+
+    def unpin(self, req: Req) -> None:
+        """Drop the tree lock the request holds on ``req.last_node``; a cache
+        whose acquire returned a receipt releases with it here."""
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
+    def claim_kv_row(self, req: Req) -> bool:
+        """A streaming session keeps the request's kv row for the next turn.
+        Return True after taking the row; the caller then releases nothing."""
+        return False
+
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        """The row is freed and the lock dropped; ``inserted`` says whether the
+        KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0

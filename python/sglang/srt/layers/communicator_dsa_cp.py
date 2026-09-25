@@ -92,7 +92,6 @@ class DSACPLayerCommunicator(LayerCommunicator):
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
     ):
         super().__init__(
@@ -100,7 +99,6 @@ class DSACPLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 
@@ -231,6 +229,7 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        **kwargs,
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full

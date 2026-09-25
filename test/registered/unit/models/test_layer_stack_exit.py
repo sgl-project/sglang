@@ -16,9 +16,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MODELS_DIR = Path(sglang.__file__).resolve().parent / "srt" / "models"
-MARKER = "_sglang_needs_allreduce_fusion"
+UNREDUCED = "UnreducedOutput"
 EXIT = "finish_layer_stack"
-COMPLETE = "complete_deferred_allreduce"
+COMPLETE = "reduce_output"
 FINAL_NORMS = {"norm", "norm_f", "final_layernorm"}
 IN_PLACE = {"add_", "sub_", "mul_", "copy_"}
 
@@ -60,20 +60,10 @@ def delegates_to_super(forward):
 
 def defers(node):
     """Asks whether to leave the reduction to the next layer (directly or
-    through ffn_exit), or sets the marker itself."""
-    if any(calls(node, "ffn_exit")) or any(
-        calls(node, "should_fuse_mlp_allreduce_with_next_layer")
-    ):
-        return True
+    through ffn_exit), or wraps its output as unreduced itself."""
     return any(
-        isinstance(sub, ast.Assign)
-        and isinstance(sub.value, ast.Constant)
-        and sub.value.value is True
-        and any(
-            isinstance(target, ast.Attribute) and target.attr == MARKER
-            for target in sub.targets
-        )
-        for sub in ast.walk(node)
+        any(calls(node, name))
+        for name in ("ffn_exit", "should_fuse_mlp_allreduce_with_next_layer", UNREDUCED)
     )
 
 

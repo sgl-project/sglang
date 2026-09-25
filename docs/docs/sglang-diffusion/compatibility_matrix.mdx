@@ -5,6 +5,37 @@ description: "Browse model families and public checkpoints supported by SGLang D
 
 import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
 
+## Ming-Image integration status
+
+Native support covers `inclusionAI/Ming-Image-0.1-Design` (generation and
+single-image editing) and `inclusionAI/Ming-Image-0.1-Design-Layer` (ordered RGBA
+layers). The checkpoints are not interchangeable. No remote modeling code is
+used; checkpoint directories do not need conversion to a Diffusers layout.
+
+H200 full-checkpoint checks include 2048-square generation, 1024-square
+four-layer decomposition, and repeated 512-square HTTP generation and editing.
+The HTTP checks cover cold starts, request warmup, layerwise offload, opt-in VAE
+tiling, and one or two sequential generations per request,
+requiring identical pixels across repeated requests with fixed inputs.
+
+Two-H200 functional checks cover DiT TP2, Ulysses2, Ring2 with FlashAttention,
+CFG parallelism for Design-Layer, encoder folding, and spatial VAE decoding.
+Single-GPU checks cover DiT and encoder layerwise offload, Cache-DiT,
+SageAttention, actual breakable CUDA graph replay, and dynamic LoRA load/remove
+with a synthetic adapter. These checks do not establish quality equivalence for lossy
+optimizations or bit-identical output across parallel topologies. Quantized
+checkpoints and other GPU families remain unverified.
+
+Run the opt-in HTTP regression tests on a CUDA host with sufficient memory:
+
+```bash
+SGLANG_TEST_MING_IMAGE=1 python -m pytest -q \
+  python/sglang/multimodal_gen/test/server/test_server_ming_image.py
+```
+
+See the [Ming-Image cookbook](/cookbook/diffusion/inclusionAI/Ming-Image) for
+launch commands, request parameters, and model-specific limits.
+
 ## Qwen-Image 2.1 integration status
 
 Qwen-Image 2.1 has a separate native pipeline for text-to-image and optional

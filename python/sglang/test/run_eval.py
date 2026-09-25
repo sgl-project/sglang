@@ -12,6 +12,11 @@ import time
 import uuid
 from pathlib import Path
 
+from sglang.test.sgl_eval_utils import (
+    THINKING_MODE_CHOICES,
+    get_thinking_kwargs,
+    parse_json_object,
+)
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
     CompletionSampler,
@@ -20,30 +25,6 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
-
-
-def get_thinking_kwargs(args):
-    thinking_mode = getattr(args, "thinking_mode", None)
-    if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
-            thinking_param = "thinking"
-        else:
-            # All models other than dpsk v3/kimi_k2
-            thinking_param = "enable_thinking"
-        return {thinking_param: True}
-    return {}
-
-
-def parse_json_object(value: str) -> dict:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
-
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("must be a JSON object")
-
-    return parsed
 
 
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
@@ -267,7 +248,6 @@ def run_eval(args):
     if args.eval_name == "mmlu":
         # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
         # caller's threshold has to be measured against it, not inherited.
-        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
@@ -426,8 +406,6 @@ def run_eval(args):
         return metrics, latency
     return metrics
 
-
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
