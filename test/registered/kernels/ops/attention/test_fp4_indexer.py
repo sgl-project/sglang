@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode,
+    fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -462,6 +463,105 @@ def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
     slots.fill_(-1)
     actual = fp4_index_logits_decode(*args, PAGE_SIZE)
     assert torch.isneginf(actual).all().item()
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "ratio,width,masked",
+    [
+        (1, 193, False),
+        (2, 193, True),
+        (1, 16385, True),
+        (2, 8193, False),
+        (1, 32769, False),
+    ],
+)
+def test_fp4_paged_logits_replay(ratio, width, masked):
+    from sglang.kernels.ops.attention.dsv4.candidate_table import amax_topk_blocks
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    q, weights, slots, lens, table = _make_logits_case(6, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(6, device=q.device, dtype=torch.int32)
+    req_table = torch.full(
+        (6, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = lens.to(torch.int32)
+    candidate_mask = torch.rand(6, capacity, device=q.device) > 0.3 if masked else None
+    k = min(512, width)
+
+    def run():
+        scores = fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            candidate_mask,
+        )
+        indices = torch.empty((6, k), dtype=torch.int32, device=q.device)
+        topk_transform_paged_v2(
+            scores, lengths, None, indices, 1, plan_topk_v2(lengths)
+        )
+        return scores, indices
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores, indices = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
+        lens.copy_((visible - torch.arange(6, device=q.device)).clamp_min(0))
+        lengths.copy_(lens)
+        req.copy_(req.roll(1))
+        slots.copy_(slots.roll(step, dims=1))
+        req_table[req.long(), : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+        q.neg_()
+        # Poison the unused capacity: length-aware top-k must never select it.
+        scores.fill_(torch.inf)
+        graph.replay()
+        expected = _reference_logits(q, weights, slots, lens, table)
+        if masked:
+            expected.masked_fill_(~candidate_mask[:, :width], -torch.inf)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
+        )
+        blocks = amax_topk_blocks(scores, lengths, (lengths + 7) // 8, 2048)
+        for row, length in enumerate(lens.tolist()):
+            selected = indices[row][indices[row] >= 0].long()
+            assert selected.numel() == selected.unique().numel() == min(k, length)
+            assert not selected.numel() or selected.max().item() < length
+            torch.testing.assert_close(
+                expected[row, selected].sort().values,
+                expected[row, :length].topk(min(k, length)).values.sort().values,
+                atol=0,
+                rtol=0,
+            )
+            nblocks = (length + 7) // 8
+            chosen = blocks[row][blocks[row] >= 0].long()
+            assert chosen.numel() == chosen.unique().numel() == min(2048, nblocks)
+            if nblocks:
+                assert chosen.max().item() < nblocks
+                assert nblocks - 1 in chosen.tolist()
+                padded = torch.full((nblocks * 8,), -torch.inf, device=q.device)
+                padded[:length] = expected[row, :length]
+                maxima = padded.view(-1, 8).amax(1)
+                maxima[-1] = torch.inf
+                torch.testing.assert_close(
+                    maxima[chosen].sort().values,
+                    maxima.topk(min(2048, nblocks)).values.sort().values,
+                    atol=0,
+                    rtol=0,
+                )
 
 
 if __name__ == "__main__":
