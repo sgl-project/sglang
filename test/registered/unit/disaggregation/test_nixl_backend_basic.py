@@ -594,6 +594,106 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
 
 
+class TestNixlLayerwiseHybridTransfer(CustomTestCase):
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.pp_size = 1
+        mgr.enable_staging = False
+        mgr.enable_all_cp_ranks_for_transfer = False
+        mgr.is_dummy_cp_rank = False
+        mgr.attn_tp_size = 1
+        mgr.src_mem_kind = "VRAM"
+        mgr.transfer_source_rank = 2
+        mgr.kv_args = SimpleNamespace(
+            state_types=[StateType.MAMBA],
+            state_data_ptrs=[[100, 110, 120, 200, 210, 220]],
+            state_item_lens=[[16, 16, 16, 32, 32, 32]],
+            state_layer_ids=[[3, 7, 11, 3, 7, 11]],
+            num_draft_entries=0,
+        )
+        return mgr
+
+    def _make_dst_info(self):
+        return SimpleNamespace(
+            requires_dcp_relayout=False,
+            decode_tp_size=1,
+            dst_homogeneous_mem_kind="VRAM",
+            kv_xfer_segments=None,
+            dst_state_data_ptrs=[[310, 300, 320, 410, 400, 420]],
+            dst_state_item_lens=[[16, 16, 16, 32, 32, 32]],
+            dst_state_layer_ids=[[7, 3, 11, 7, 3, 11]],
+            gpu_id=4,
+            dst_kv_ptrs=[500, 600],
+        )
+
+    def test_state_capability_accepts_reordered_repeated_entries(self):
+        mgr = self._make_manager()
+        dst_info = self._make_dst_info()
+
+        self.assertTrue(mgr.supports_layerwise_state(dst_info))
+
+        dst_info.dst_state_item_lens[0][4] = 64
+        self.assertFalse(mgr.supports_layerwise_state(dst_info))
+
+    def test_state_subset_preserves_all_components_and_peer_order(self):
+        mgr = self._make_manager()
+        dst_info = self._make_dst_info()
+        mgr._send_mamba_state = MagicMock(return_value="state-handle")
+
+        handle = mgr.send_mamba_state_layers(
+            "decode-0",
+            src_state_index=5,
+            dst_state_index=9,
+            dst_info=dst_info,
+            notif="7_lwstate_2_0",
+            layer_slots=[0, 2],
+        )
+
+        self.assertEqual(handle, "state-handle")
+        mgr._send_mamba_state.assert_called_once_with(
+            "decode-0",
+            [5],
+            [100, 120, 200, 220],
+            [16, 16, 32, 32],
+            [300, 320, 400, 420],
+            [9],
+            4,
+            "7_lwstate_2_0",
+            src_layer_ids=[3, 11, 3, 11],
+            dst_layer_ids=[3, 11, 3, 11],
+        )
+
+    def test_submitters_use_noncanonical_progress_tags(self):
+        mgr = self._make_manager()
+        dst_info = self._make_dst_info()
+        mgr.decode_kv_args_table = {"decode-0": dst_info}
+        mgr.supports_layerwise_state = MagicMock(return_value=True)
+        mgr.supports_layerwise_kv = MagicMock(return_value=True)
+        mgr.send_mamba_state_layers = MagicMock(return_value="state-handle")
+        mgr.send_kvcache_layers = MagicMock(return_value="kv-handle")
+
+        state_job = SimpleNamespace(
+            room=7,
+            agent_name="decode-0",
+            src_state_index=5,
+            dst_state_index=9,
+        )
+        kv_job = SimpleNamespace(
+            room=7,
+            chunk_id=3,
+            agent_name="decode-0",
+            page_indices=np.array([1], dtype=np.int32),
+            dst_page_indices=np.array([4], dtype=np.int32),
+        )
+
+        self.assertEqual(mgr.submit_layerwise_state(state_job, [0, 2]), "state-handle")
+        self.assertEqual(mgr.submit_layerwise_kv(kv_job, [1, 3]), "kv-handle")
+        self.assertEqual(mgr.send_mamba_state_layers.call_args.args[4], "7_lwstate_2_0")
+        self.assertEqual(mgr.send_kvcache_layers.call_args.args[5], "7_lwkv_3_2_1")
+
+
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)

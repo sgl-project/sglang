@@ -692,6 +692,11 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Stream completed Hybrid Attention KV/state layers through NIXL while
+    # prefill compute is still running. Experimental and disabled by default.
+    SGLANG_DISAGG_LAYERWISE_NIXL = EnvBool(False)
+    SGLANG_DISAGG_LAYERWISE_KV_BATCH_SIZE = EnvInt(4)
+    SGLANG_DISAGG_LAYERWISE_STATE_BATCH_SIZE = EnvInt(6)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
