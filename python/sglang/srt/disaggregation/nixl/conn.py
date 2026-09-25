@@ -874,10 +874,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.decode_tp_rank,
                 total_kv_heads,
             )
-            # num_groups and head_group_idx are NIXL-specific, not returned by the
-            # shared helper. One group per unique head-slice, not per decode rank:
-            # replicating ranks share a slice, and over-counting addresses past the
-            # registered KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
+            # One group per UNIQUE head-slice, not per decode rank: replicating
+            # ranks share one, and over-counting addresses past the registered
+            # KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
             dst_replication = max(1, decode_tp_size // total_kv_heads)
             num_groups = decode_tp_size // prefill_tp_size // dst_replication
             head_group_idx = src_head_start // dst_heads_per_rank

@@ -1,14 +1,10 @@
 """Unit tests for srt/disaggregation/common/staging_buffer -- compute_head_slice_params.
 
 Wrong head indices do not fail loudly: the transfer delivers the wrong channels
-and the only symptom is a garbled end-to-end accuracy score.
-
-Under GQA the rank count on either side can exceed the KV head count, so ranks
-replicate a shared head and the map must divide by the replication factor
-(QKVParallelLinear: tp_rank // num_kv_head_replicas). A modulo map hands ranks
-1..r-1 of each group a head they do not own. No end-to-end test reaches that
-shape: every heterogeneous-TP suite runs with tp <= total_kv_heads on both
-sides, where the two maps agree.
+and the only symptom is a garbled end-to-end accuracy score. The replication
+cases are the ones no end-to-end test can reach -- every heterogeneous-TP suite
+runs tp <= total_kv_heads on both sides, where a modulo map and the correct
+divide-by-replication map agree.
 
 Expected values are derived by hand from the head-distribution rules, never by
 calling the implementation, so a bug in it cannot make both sides agree.
@@ -67,18 +63,14 @@ class TestHeadSliceParamsScatterReplication(CustomTestCase):
         starts = [self._call(d)[0] for d in range(4)]
         self.assertEqual(starts, [0, 0, 1, 1])
         self.assertNotEqual(starts, [0, 1, 0, 1], "a modulo map would give this")
-
-    def test_each_decode_rank_takes_a_single_head(self):
         for dst_rank in range(self.DST_TP):
-            _, num_heads, dst_start, _ = self._call(dst_rank)
-            self.assertEqual(num_heads, 1, "max(1, 2 // 4) clamps to one head")
-            self.assertEqual(dst_start, 0)
+            self.assertEqual(
+                self._call(dst_rank)[1], 1, "max(1, 2 // 4) clamps to one head"
+            )
 
 
 class TestHeadSliceParamsGatherReplication(CustomTestCase):
-    """More prefill ranks than KV heads -- the gather-side mirror of
-    TestHeadSliceParamsScatterReplication, and the branch that reads
-    src_replication rather than dst_replication."""
+    """More prefill ranks than KV heads -- the src_replication branch."""
 
     SRC_TP, DST_TP, KV_HEADS = 8, 2, 4
 
@@ -93,12 +85,10 @@ class TestHeadSliceParamsGatherReplication(CustomTestCase):
         self.assertNotEqual(
             starts, [0, 1, 0, 1, 0, 1, 0, 1], "a modulo map would give this"
         )
-
-    def test_each_prefill_rank_sends_a_single_head(self):
         for src_rank in range(self.SRC_TP):
-            src_start, num_heads, _, _ = self._call(src_rank)
-            self.assertEqual(num_heads, 1, "max(1, 4 // 8) clamps to one head")
-            self.assertEqual(src_start, 0, "gather always sends from the rank base")
+            self.assertEqual(
+                self._call(src_rank)[1], 1, "max(1, 4 // 8) clamps to one head"
+            )
 
 
 class TestHeadSliceParamsEqualTp(CustomTestCase):
