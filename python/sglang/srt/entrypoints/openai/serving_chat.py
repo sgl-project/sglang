@@ -1322,8 +1322,13 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        # A grammar reaching its terminal state ends generation regardless of
+        # `ignore_eos`, so only install it when the request allows tool calls.
+        glm_constraint = (
+            self.tool_call_parser == "glm47"
+            and bool(effective_tools)
+            and request.tool_choice != "none"
+            and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
