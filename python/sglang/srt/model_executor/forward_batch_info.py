@@ -45,8 +45,8 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    dp_gather_slot,
-    set_dp_buffer_len,
+    dp_slot_in,
+    set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
@@ -571,6 +571,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
+    # Setwise pooling readout positions (CPU tensors, one per request)
+    token_indices_to_pool: Optional[List[torch.Tensor]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -688,6 +691,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
+    # under MAX_LEN, padded to the max. None when the raw list already is.
+    global_num_tokens_padded_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1155,6 +1161,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for r in batch.reqs
                 ]
 
+            # Setwise readout: pool the head AT token_indices_to_pool instead of
+            # the last token. The scheduler keeps readout batches homogeneous
+            # (get_new_batch_prefill), so build only when every request carries
+            # the field and otherwise fall back to standard pooling.
+            if batch.reqs and all(
+                r.token_indices_to_pool is not None for r in batch.reqs
+            ):
+                self.token_indices_to_pool = [
+                    torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
         ]
@@ -1175,7 +1193,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
             if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[dp_gather_slot()]
+                num_tokens_per_dp = self.global_num_tokens_cpu[
+                    dp_slot_in(self.global_num_tokens_cpu)
+                ]
             else:
                 num_tokens_per_dp = self.global_num_tokens_cpu[0]
         else:
@@ -1574,23 +1594,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             buffer_len = sum(global_num_tokens)
 
-        if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[dp_gather_slot()]
-        else:
-            num_tokens = global_num_tokens[0]
+        num_tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
 
         self.attn_tp_sequence_sharded = model_runner.attn_tp_sequence_sharded(
             num_tokens
         )
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(
-            buffer_len,
-            num_tokens,
-            dp_padding_mode.is_max_len(),
-            global_num_tokens,
-            self.global_num_tokens_gpu,
-        )
+        self.global_num_tokens_padded_cpu = global_num_tokens
+        set_dp_buffer_len_from_batch(self)
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
@@ -1723,6 +1735,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
+        if (
+            self.mm_input_embeds is not None
+            and self.mm_input_embeds.shape[0] < num_tokens
+        ):
+            # A draft reads the target's mm embeds in place of its input_ids.
+            self.mm_input_embeds = self._pad_tensor_to_size(
+                self.mm_input_embeds, num_tokens
+            )
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.req_pool_indices_cpu is not None:
             self.req_pool_indices_cpu = self._pad_tensor_to_size(

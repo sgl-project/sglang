@@ -205,6 +205,8 @@ vsa = ["setuptools", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]

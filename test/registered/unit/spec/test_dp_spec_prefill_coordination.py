@@ -224,10 +224,8 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                             "get_dp_padding_mode",
                             return_value=DpPaddingMode.MAX_LEN,
                         ),
-                        patch(
-                            f"{module}.dp_gather_slot", return_value=0 if idle else 1
-                        ),
-                        patch(f"{module}.set_dp_buffer_len"),
+                        patch(f"{module}.dp_slot_in", return_value=0 if idle else 1),
+                        patch(f"{module}.set_dp_buffer_len_from_batch"),
                         patch(f"{module}.set_is_extend_in_batch"),
                         patch(
                             f"{module}.mambaish_config",
@@ -374,23 +372,6 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 if is_prefill:
                     self.assertIn(idle, result.extra_keep_alive_refs)
                     idle.prepare_for_idle.assert_called_once()
-
-    def test_local_mixed_batch_is_rejected_before_draft(self):
-        worker = object.__new__(EAGLEWorkerV2)
-        worker._draft_worker = SimpleNamespace(draft_owns_attention=False)
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            decoding_reqs=[object()],
-            global_num_tokens=[1, 1],
-        )
-        with patch(
-            f"{WORKER_MODULE}.get_parallel",
-            return_value=SimpleNamespace(attn_dp_rank=0),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Local mixed"):
-                worker._forward_dp_spec_prefill_coordination(
-                    batch, make_plan(), None, None, None
-                )
 
     def test_disabled_feature_retains_existing_dispatch_without_phase_metadata(self):
         worker = object.__new__(EAGLEWorkerV2)

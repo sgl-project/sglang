@@ -62,6 +62,7 @@ if _is_cuda:
         gelu_and_mul,
         gelu_tanh_and_mul,
         silu_and_mul,
+        silu_and_mul_with_activation_rounding,
     )
 elif _is_cpu and _is_cpu_amx_available:
     pass
@@ -673,6 +674,14 @@ def _fused_moe_kernel_sequence(
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
+    elif activation == "silu_rounded" and is_gated:
+        if _is_cuda:
+            silu_and_mul_with_activation_rounding(
+                intermediate_cache1.view(-1, N), intermediate_cache2
+            )
+        else:
+            gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+            intermediate_cache2.copy_(F.silu(gate) * up)
     elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)

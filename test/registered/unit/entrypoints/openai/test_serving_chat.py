@@ -2956,6 +2956,31 @@ class ServingChatTestCase(unittest.TestCase):
             chunks.append(chunk)
         return chunks
 
+    def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
+        """Each token of a multi-token streaming chunk keeps its own alternatives."""
+        content = {
+            "meta_info": {
+                "output_token_logprobs": [
+                    (-0.1, 1, "a"),
+                    (-0.2, 2, "b"),
+                    (-0.3, 3, "c"),
+                ],
+                "output_top_logprobs": [
+                    [(-0.1, 1, "a"), (-2.0, 9, "x")],
+                    [(-0.2, 2, "b"), (-3.0, 8, "y")],
+                    [(-0.3, 3, "c"), (-4.0, 7, "z")],
+                ],
+            },
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(content, 1, 3)
+        tokens = [entry.token for entry in choice_logprobs.content]
+        alternatives = [
+            [top.token for top in entry.top_logprobs]
+            for entry in choice_logprobs.content
+        ]
+        self.assertEqual(tokens, ["b", "c"])
+        self.assertEqual(alternatives, [["b", "y"], ["c", "z"]])
+
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
         self.chat.reasoning_parser = "qwen3"
@@ -4615,6 +4640,47 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+
+class TestRequestChatTemplateTrustGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}], **kwargs
+        )
+
+    def test_rejected_by_default(self):
+        for template in ("{{ messages }}", "", None):
+            with self.subTest(template=template):
+                error = self.chat._validate_request(
+                    self._request(chat_template_kwargs={"chat_template": template})
+                )
+                self.assertIn("--trust-request-chat-template", error)
+
+    def test_allowed_when_trusted(self):
+        with get_context().override_server_args(trust_request_chat_template=True):
+            self.assertIsNone(
+                self.chat._validate_request(
+                    self._request(
+                        chat_template_kwargs={"chat_template": "{{ messages }}"}
+                    )
+                )
+            )
+
+    def test_other_kwargs_unchanged(self):
+        for kwargs in (None, {}, {"enable_thinking": False}, {"chat_templates": "x"}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(
+                    self.chat._validate_request(
+                        self._request(chat_template_kwargs=kwargs)
+                    )
+                )
 
 
 if __name__ == "__main__":
