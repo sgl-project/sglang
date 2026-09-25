@@ -397,6 +397,33 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
+def _forward_with_allreduce_fusion_quant_per_token(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+):
+    """Fused AR + RMSNorm + per-token FP8 quant.
+
+    Returns ``((fp8, scale), residual)``, or ``None`` when the fused kernel
+    cannot service the request.
+    """
+    if residual is None or not _use_aiter:
+        return None
+
+    from sglang.srt.distributed import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
+    )
+
+    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+        x, residual, weight, norm_module.variance_epsilon
+    )
+    if fused_result is None:
+        return None
+    fp8_out, residual_out, scale_out = fused_result
+    return (fp8_out, scale_out), residual_out
+
+
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     """Return the per-tensor static FP8 activation scale of ``linear`` if it is
     an FP8 linear using static per-tensor activation scaling that can consume a
@@ -1292,6 +1319,16 @@ class GemmaRMSNorm(BaseFusedOp):
             group_size,
             use_attn_tp_group,
             keep_bf16,
+        )
+
+    def forward_with_allreduce_fusion_quant_per_token(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        """Fused AR + RMSNorm + per-token FP8 quant (Gemma-style: weight + 1)."""
+        return _forward_with_allreduce_fusion_quant_per_token(
+            self, x, residual, self.gemma_weight
         )
 
 

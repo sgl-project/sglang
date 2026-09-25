@@ -1338,20 +1338,32 @@ def aiter_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
-    # beats the block-fp8 GEMMs at decode-sized M
-    if input_scale is None:
+    # beats the block-fp8 GEMMs at decode-sized M. A per-token input_scale ([M, 1],
+    # from the fused AR + RMSNorm + quant) means the input is already quantized for it.
+    per_token_input = (
+        input_scale is not None
+        and input_scale.numel() == input_2d.shape[0]
+        and input_2d.shape[-1] > block_size[1]
+    )
+    if input_scale is None or per_token_input:
         ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
         ):
             out = apply_fp8_ptpc_linear(
-                input=input_2d,
+                input=(input_2d, input_scale) if per_token_input else input_2d,
                 weight=ptpc_weight,
                 weight_scale=weight._ptpc_scale,
                 bias=bias,
             )
-            return out.to(input.dtype).view(*output_shape)
+            out_dtype = torch.bfloat16 if per_token_input else input.dtype
+            return out.to(out_dtype).view(*output_shape)
+        if per_token_input:
+            raise ValueError(
+                "A per-token input_scale needs the rowwise-fp8 weight copy and "
+                f"M <= {MXFP8_DENSE_PTPC_DECODE_MAX_M}"
+            )
 
     n, k = weight.shape
 

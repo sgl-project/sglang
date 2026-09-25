@@ -40,6 +40,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
     enable_moe_dense_fully_dp,
+    layer_input_buffer,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -60,6 +61,10 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import (
+    MXFP8_DENSE_PTPC_DECODE_MAX_M,
+    aiter_w8a8_block_fp8_linear,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -237,6 +242,16 @@ class _FusedQKVIndexProj(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
+
+
+def _linear_has_ptpc_decode_copy(linear: nn.Module) -> bool:
+    """Whether ``linear`` gets the rowwise-fp8 weight copy of an MXFP8 -> block-fp8
+    converted dense linear (see ``process_weights_after_loading_block_quant``)."""
+    qm = getattr(linear, "quant_method", None)
+    return (
+        getattr(qm, "convert_mxfp8_to_block", False)
+        and qm.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+    )
 
 
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
@@ -1356,6 +1371,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
+        # The input norm hands every attention projection the same input, so a
+        # per-token (fp8, scale) pair needs the ptpc decode GEMM on each of them.
+        self.attn_input_fp8_per_token = (
+            _is_gfx95_supported
+            and _linear_has_ptpc_decode_copy(self.self_attn.qkv_proj)
+            and (
+                getattr(self.self_attn, "index_qkv_proj", None) is None
+                or _linear_has_ptpc_decode_copy(self.self_attn.index_qkv_proj)
+            )
+        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -1372,17 +1397,29 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        quant_format = (
+            "fp8_per_token"
+            if self.attn_input_fp8_per_token
+            and layer_input_buffer(hidden_states).shape[0]
+            <= MXFP8_DENSE_PTPC_DECODE_MAX_M
+            else ""
+        )
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
+                quant_format=quant_format,
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 **kwargs,
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        # A tuple is the per-token (fp8, scale) input.
+        num_tokens = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        ).shape[0]
+        if num_tokens != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,

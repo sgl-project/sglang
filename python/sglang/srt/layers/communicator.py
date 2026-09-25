@@ -603,15 +603,17 @@ def _update_and_read_residual_aiter_fp8_group(
 def _update_and_read_residual_aiter_fp8_per_token(
     norm, hidden_states, residual, post_residual_addition
 ):
+    # a Gemma-style norm scales by weight + 1, kept as gemma_weight
+    weight = getattr(norm, "gemma_weight", norm.weight.data)
     if residual is None:
         output = _fused_rmsnorm_fp8_per_token_quant(
-            hidden_states, norm.weight.data, norm.variance_epsilon
+            hidden_states, weight, norm.variance_epsilon
         )
         return output, hidden_states
     if post_residual_addition is not None:
         residual = residual + post_residual_addition
     return _fused_rmsnorm_fp8_per_token_quant(
-        hidden_states, norm.weight.data, norm.variance_epsilon, residual=residual
+        hidden_states, weight, norm.variance_epsilon, residual=residual
     )
 
 
@@ -925,7 +927,7 @@ class LayerCommunicator:
         elif residual is not None and pending:
             fused = (
                 self._reduce_output_and_update_and_read_residual(
-                    hidden_states, residual, forward_batch
+                    hidden_states, residual, forward_batch, quant_format
                 )
                 if post_residual_addition is None
                 # The fused kernel reduces over the MoE output's group.
@@ -969,14 +971,32 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        quant_format: str,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Complete the sum the previous layer left, add it to the residual and
         apply the input norm in one fused kernel; None when the kernel does not
-        take this batch. The result is not quantized for ``quant_format``."""
+        take this batch. Of the ``quant_format`` values, only ``fp8_per_token`` is
+        applied here, and only where the norm has the fused per-token kernel."""
         if (
             apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
             or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
         ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+            if (
+                quant_format == "fp8_per_token"
+                and _use_aiter
+                and hasattr(
+                    self.input_layernorm,
+                    "forward_with_allreduce_fusion_quant_per_token",
+                )
+            ):
+                # None means the fused kernel cannot service the shape.
+                quant_result = (
+                    self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
+                        hidden_states, residual
+                    )
+                )
+                if quant_result is not None:
+                    return quant_result
             if (
                 self.enable_fused_ar_quant
                 and _use_aiter
