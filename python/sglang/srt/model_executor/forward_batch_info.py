@@ -38,6 +38,7 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt import platforms
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
@@ -188,6 +189,10 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def _position_dtype() -> torch.dtype:
+    return platforms.current_platform.get_position_dtype()
 
 
 class ForwardMode(IntEnum):
@@ -519,6 +524,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Mixed prefill/decode boundary for backends that split mixed batches.
+    mix_running_indices: Optional[torch.Tensor] = None
+    mix_decode_bs: int = 0
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
@@ -952,6 +960,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
+            mix_running_indices=batch.mix_running_indices,
+            mix_decode_bs=batch.mix_decode_bs,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_prefill_track_mask_cpu=(
@@ -1048,7 +1058,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.init_mlp_sync_metadata(batch, device)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            ret.positions = torch.empty((0,), dtype=_position_dtype(), device=device)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -1075,7 +1085,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                ret.positions = clamp_position(batch.seq_lens).to(_position_dtype())
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
@@ -2125,10 +2135,14 @@ def compute_position(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    positions_dtype = _position_dtype()
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                prefix_len,
+                prefix_len + extend_len,
+                device=extend_prefix_lens.device,
+                dtype=positions_dtype,
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
         ],
@@ -2136,7 +2150,7 @@ def compute_position_torch(
     )
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc
+    return positions, extend_start_loc
 
 
 def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:

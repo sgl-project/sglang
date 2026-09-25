@@ -98,6 +98,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_mlu,
     is_npu,
 )
 
@@ -131,6 +132,7 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 
 _is_npu = is_npu()
+_is_mlu = is_mlu()
 
 
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
@@ -951,6 +953,10 @@ class KVCacheConfigurator:
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
+        elif (
+            get_exec().kernel.attention_backend == "mlu" and not self.mambaish_config
+        ):
+            unsupported_pool_family = "MLU KV pool"
         elif self.use_mla_backend and self.is_hybrid_swa:
             unsupported_pool_family = "hybrid DSA/MLA-SWA KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -1256,6 +1262,17 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif (
+            get_exec().kernel.attention_backend == "mlu" and not self.mambaish_config
+        ):
+            if self.use_mla_backend:
+                raise RuntimeError(
+                    "MLU backend currently supports MHA/GQA models only; "
+                    "MLA models are not supported."
+                )
+            token_to_kv_pool = self._build_mlu_mha_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+            )
         elif self.use_mla_backend and self.is_hybrid_swa:
             token_to_kv_pool = self._build_hybrid_mla_swa_kv_pool(
                 full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -1591,6 +1608,27 @@ class KVCacheConfigurator:
         )
 
         token_to_kv_pool = NPUMHATokenToKVPool(
+            max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+        )
+        return token_to_kv_pool
+
+    def _build_mlu_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.hardware_backend.mlu.memory_pool_mlu import (
+            MLUMHATokenToKVPool,
+        )
+
+        token_to_kv_pool = MLUMHATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1998,6 +2036,19 @@ class KVCacheConfigurator:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
+                    sizes.max_total_num_tokens,
+                    page_size=get_schedule().page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif _is_mlu and get_exec().kernel.attention_backend == "mlu":
+                from sglang.srt.hardware_backend.mlu.allocator_mlu import (
+                    MLUPagedTokenToKVPoolAllocator,
+                )
+
+                token_to_kv_pool_allocator = MLUPagedTokenToKVPoolAllocator(
                     sizes.max_total_num_tokens,
                     page_size=get_schedule().page_size,
                     dtype=self.kv_cache_dtype,
