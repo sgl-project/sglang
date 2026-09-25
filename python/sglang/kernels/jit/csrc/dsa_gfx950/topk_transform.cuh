@@ -66,9 +66,8 @@ constexpr uint32_t REF_CAP = 2048u;
 #define DSA_TOPK_RANK_CAP 256
 #endif
 constexpr uint32_t RANK_CAP = (uint32_t)DSA_TOPK_RANK_CAP;
-// The parallel rank puts one thread on one j, so it needs n <= BS as well as
-// n <= RANK_CAP; the serial rank stays the fallback above the min of the two.
-constexpr uint32_t PRANK_CAP = RANK_CAP < BS ? RANK_CAP : BS;
+// The parallel rank puts one thread on one j.
+static_assert(RANK_CAP <= BS, "the parallel rank needs a thread per candidate");
 // Per-row counters are padded to their own cache line, and the two counters a
 // block updates live in one 8-byte word, so a block reserves output space with
 // ONE returning global atomic instead of two and rows do not false-share.
@@ -187,9 +186,8 @@ __device__ __forceinline__ void find_thr(
     uint32_t want,
     uint32_t* out_thr,
     uint32_t* out_above) {
-  // NB < BS is legal: PER is then 1, threads past NB hold a zero count, and a
-  // zero bin cannot satisfy the bracket predicate below.
-  constexpr uint32_t PER = (NB >= BS) ? (NB / BS) : 1u;
+  static_assert(NB % BS == 0, "each thread owns a whole run of bins");
+  constexpr uint32_t PER = NB / BS;
   const uint32_t tx = threadIdx.x;
   const uint32_t lane = tx % WAVE;
   const uint32_t wv = tx / WAVE;
@@ -198,12 +196,7 @@ __device__ __forceinline__ void find_thr(
   uint32_t mine = 0;
 #pragma unroll
   for (uint32_t j = 0; j < PER; ++j) {
-    if constexpr (NB >= BS) {
-      local[j] = hist[tx * PER + j];
-    } else {
-      const uint32_t idx = tx * PER + j;
-      local[j] = (idx < NB) ? hist[idx] : 0u;
-    }
+    local[j] = hist[tx * PER + j];
     mine += local[j];
   }
 
@@ -262,12 +255,9 @@ __device__ __forceinline__ uint32_t
 find_thr_hier_impl(const uint32_t* __restrict__ gh, uint32_t want, uint32_t crs, uint32_t total_must_be) {
   const uint32_t lane = threadIdx.x & (WAVE - 1u);
 
-  const uint32_t c = crs;
-  const uint32_t s = wave_suffix_sum(c);
-  {
-    if (__shfl(s, 0, WAVE) != total_must_be) {
-      return HIER_BAD;
-    }
+  const uint32_t s = wave_suffix_sum(crs);
+  if (__shfl(s, 0, WAVE) != total_must_be) {
+    return HIER_BAD;
   }
   uint32_t sn = __shfl_down(s, 1, WAVE);
   if (lane == WAVE - 1u) {
@@ -431,11 +421,10 @@ __device__ __forceinline__ void refine_row(
     uint32_t* s_thr,
     uint32_t* s_above,
     uint32_t* s_emit,
-    bool have_pre = false,
-    int32_t pre_slot = 0,
-    float pre_val = 0.f,
-    uint32_t pb = 0u,
-    uint32_t PB = 1u) {
+    int32_t pre_slot,
+    float pre_val,
+    uint32_t pb,
+    uint32_t PB) {
   const uint32_t tx = threadIdx.x;
   const int32_t* __restrict__ ci = cand_idx + (size_t)row * cap;
   const float* __restrict__ cv = cand_val + (size_t)row * cap;
@@ -449,15 +438,14 @@ __device__ __forceinline__ void refine_row(
 
   const bool in_lds = (n <= REF_CAP);
   if (in_lds) {
-    // The caller may already have issued cand_idx[tx] / cand_val[tx] without
+    // The caller has already issued cand_idx[tx] / cand_val[tx] without
     // waiting for `n`, collapsing row_ends -> cursor -> candidates into one
     // round trip.
-    const uint32_t i0 = have_pre ? tx + BS : tx;
-    if (have_pre && tx < n) {
+    if (tx < n) {
       s_key[tx] = order_key32(pre_val);
       s_slot[tx] = pre_slot;
     }
-    for (uint32_t i = i0; i < n; i += BS) {
+    for (uint32_t i = tx + BS; i < n; i += BS) {
       s_key[i] = order_key32(ld_val(&cv[i]));
       s_slot[i] = ld_idx(&ci[i]);  // k_scatter already translated it
     }
@@ -466,35 +454,28 @@ __device__ __forceinline__ void refine_row(
 
   if (in_lds && n <= RANK_CAP && remain != 0 && n > remain) {
     if constexpr (PRANK) {
-      if (n <= PRANK_CAP) {
-        const uint32_t lane = tx & (WAVE - 1u);
-        const uint32_t wv = tx / WAVE;
-        const uint32_t kj = (tx < n) ? s_key[tx] : 0u;
-        for (uint32_t i = pb; i < n; i += PB) {
-          const uint32_t ki = s_key[i];  // block-uniform read
-          const bool p = (tx < n) && ((kj > ki) || (kj == ki && tx < i));
-          const uint64_t m = __ballot(p);
-          if (lane == 0) {
-            s_grp[wv] = (uint32_t)__popcll((unsigned long long)m);
-          }
-          __syncthreads();
-          uint32_t rank = 0;
-#pragma unroll
-          for (uint32_t q = 0; q < NWAVE; ++q) {
-            rank += s_grp[q];
-          }
-          if (tx == 0 && rank < remain) {
-            o[above + rank] = s_slot[i];
-          }
-          __syncthreads();  // s_grp is reused by the next i
+      const uint32_t lane = tx & (WAVE - 1u);
+      const uint32_t wv = tx / WAVE;
+      const uint32_t kj = (tx < n) ? s_key[tx] : 0u;
+      for (uint32_t i = pb; i < n; i += PB) {
+        const uint32_t ki = s_key[i];  // block-uniform read
+        const bool p = (tx < n) && ((kj > ki) || (kj == ki && tx < i));
+        const uint64_t m = __ballot(p);
+        if (lane == 0) {
+          s_grp[wv] = (uint32_t)__popcll((unsigned long long)m);
         }
-        return;
+        __syncthreads();
+        uint32_t rank = 0;
+#pragma unroll
+        for (uint32_t q = 0; q < NWAVE; ++q) {
+          rank += s_grp[q];
+        }
+        if (tx == 0 && rank < remain) {
+          o[above + rank] = s_slot[i];
+        }
+        __syncthreads();  // s_grp is reused by the next i
       }
-      // n > PRANK_CAP: one thread per j is not available.  Fall through
-      // to the serial rank, in ONE block only -- never silently skipped.
-      if (pb != 0u) {
-        return;
-      }
+      return;
     }
     for (uint32_t i = tx; i < n; i += BS) {
       const uint32_t ki = s_key[i];
@@ -605,8 +586,7 @@ __global__ __launch_bounds__(BS) void k_scatter(
   const int32_t rl_s = row_ends[row];
   // Issued before row_ends comes back: the address depends only on blockIdx.
   // Later would serialise row_ends -> coarse bins -> fine group.
-  uint32_t pre_crs = 0u;
-  pre_crs = ((const uint32_t*)ghist)[(size_t)row * GH_STRIDE + GH_CRS_OFF + (threadIdx.x & (WAVE - 1u))];
+  const uint32_t pre_crs = ((const uint32_t*)ghist)[(size_t)row * GH_STRIDE + GH_CRS_OFF + (threadIdx.x & (WAVE - 1u))];
   // row_ends is device data, so no host check can bound it.  Unclamped, an
   // oversized row reads past its page table, and under PTMODE 2 past s_pt --
   // which stays inside LDS and so returns garbage rather than faulting.
@@ -642,12 +622,11 @@ __global__ __launch_bounds__(BS) void k_scatter(
   }
 
   const uint32_t* __restrict__ gh = (const uint32_t*)ghist + (size_t)row * GH_STRIDE;
-  uint32_t thr_h = 0u;
-  bool need_flat = false;  // HIER: the flat histogram is the fallback only
   // Issued before the barrier so its two dependent loads overlap the
   // page-table window staging above.  Needs neither LDS nor a barrier.
-  thr_h = find_thr_hier_impl(gh, TOPK, pre_crs, row_len);
-  need_flat = (thr_h == HIER_BAD);  // block-uniform
+  const uint32_t thr_h = find_thr_hier_impl(gh, TOPK, pre_crs, row_len);
+  // The flat histogram is the fallback only.  Block-uniform.
+  const bool need_flat = (thr_h == HIER_BAD);
 
   if (need_flat) {
     for (uint32_t i = tx; i < HIST_BINS; i += BS) {
@@ -843,7 +822,6 @@ __global__ __launch_bounds__(BS) void k_scatter(
       &s_thr,
       &s_above,
       &s_emit,
-      true,
       pre_slot,
       pre_val,
       pidx,
@@ -928,11 +906,11 @@ struct TopKTransformKernel {
     const int64_t cap = cand_idx.size(1);
     const uint32_t G = static_cast<uint32_t>(g_per_row);
     // page_size must be 1 or a power of two; both give the identical mapping.
-    uint32_t PB = 0, PM = 0;
+    uint32_t PB = 0;
     for (int64_t ps = page_size; ps > 1; ps >>= 1) {
       ++PB;
     }
-    PM = (page_size > 1) ? static_cast<uint32_t>(page_size - 1) : 0u;
+    const uint32_t PM = (page_size > 1) ? static_cast<uint32_t>(page_size - 1) : 0u;
     RuntimeCheck(
         (page_size & (page_size - 1)) == 0 && page_size >= 1, "page_size must be a power of two, got ", page_size);
 

@@ -83,25 +83,11 @@ def modules() -> Tuple[Module, Module, Module, Module]:
 
 
 @cache_once
-def _build() -> Tuple[Optional[Tuple[Module, ...]], Optional[Exception]]:
-    """(modules, error) for the one build attempt.  Never raises."""
-    try:
-        return modules(), None
-    except Exception as e:  # noqa: BLE001 - a build failure must never be fatal
-        return None, e
-
-
-@cache_once
 def modules_or_none() -> Optional[Tuple[Module, ...]]:
     """Build once; on failure log and return None. Whether the caller falls back
     or refuses is the gate's decision, so this does not claim either."""
-    mods, error = _build()
-    if error is not None:
-        logger.warning("gfx950 fused DSA indexer unavailable, build failed: %s", error)
-    return mods
-
-
-def build_error() -> Optional[Exception]:
-    """The exception from the one build attempt, or None. Triggers the build if
-    nothing has yet, so call it after modules_or_none() rather than before."""
-    return _build()[1]
+    try:
+        return modules()
+    except Exception as e:  # noqa: BLE001 - a build failure must never be fatal
+        logger.warning("gfx950 fused DSA indexer unavailable, build failed: %s", e)
+        return None

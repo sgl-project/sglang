@@ -65,13 +65,12 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
 @lru_cache(maxsize=1)
 def gfx950_fused_indexer_runtime_ok() -> bool:
-    """Whether this runtime can serve the gfx950 fused indexer: gfx950, aiter
-    preshuffle, and an fp8 e4m3fn index cache.
+    """Whether this runtime can serve the gfx950 fused indexer: aiter with
+    preshuffled paged MQA, and kernels that build.
 
     Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
     first. Every decline here is therefore a configuration or toolchain error;
     it is logged, as a warning when the path was asked for by name."""
-    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
     from sglang.srt.runtime_context import get_exec
 
     requested = get_exec().kernel.enable_dsa_fused_indexer
@@ -94,8 +93,6 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
         return _refuse("aiter cannot use preshuffled paged MQA logits")
-    if is_fp8_fnuz():
-        return _refuse("fp8 is fnuz on this device; the kernels emit e4m3fn only")
     from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 
     # modules_or_none logged the build error; do not repeat the compiler output.
@@ -117,12 +114,6 @@ def hadamard_preserved(indexer) -> bool:
     """Whether Indexer._maybe_rotate still applies the Hadamard the fused kernels
     fold in. If not, the fused path must stay off, or prefill and decode would
     write different index-K formats."""
-    if indexer.use_dsa_indexer_fusion:
-        logger.warning(
-            "gfx950 fused DSA indexer disabled: use_dsa_indexer_fusion makes "
-            "Indexer._maybe_rotate skip the Hadamard"
-        )
-        return False
     device = indexer.k_norm.weight.device
     probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1.0

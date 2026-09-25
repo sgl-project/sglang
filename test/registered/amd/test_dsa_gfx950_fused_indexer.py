@@ -143,7 +143,6 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             logits,
             ghist,
             self.loader.LOGITS_BLOCKS_PER_ROW,
-            TOPK,
         )
         torch.cuda.synchronize()
         return logits, ghist, (q_fp8, kv, gate, seqlens, page_table_64, ctx)

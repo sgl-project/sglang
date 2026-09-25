@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -247,30 +246,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _mqa_logits_free_mem_fraction() -> float:
         return mqa_logits_free_mem_fraction()
 
-    @classmethod
-    def invalidate_mqa_logits_budget(cls) -> None:
-        """Drop the cached MQA-logits budget so the next prefill re-reads the real
-        figure. True once after an allocation, then False."""
-        Indexer._mqa_logits_budget_bytes.clear()
-
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def _layer_split_pool_cls():
-        """The KV-pool class that splits index-K cache from the main KV cache, which
-        is what the fused kernels address directly."""
-        try:
-            from sglang.srt.mem_cache.dsa_cache_layer_split import (
-                LayerSplitDSATokenToKVPool,
-            )
-
-            return LayerSplitDSATokenToKVPool
-        except ImportError:
-            logger.warning(
-                "gfx950 fused DSA indexer: cannot resolve the layer-split KV pool "
-                "class, so layer ownership cannot be checked; disabling the path"
-            )
-            return None
-
     def __init__(
         self,
         hidden_size: int,
@@ -494,13 +469,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self.use_gfx950_fused_indexer:
             from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
                 Gfx950FusedIndexer,
-                consume_fresh_allocation,
                 prealloc_workspace,
             )
 
             self._gfx950_fused = Gfx950FusedIndexer(self)
-            # Bound once: this runs per layer per decode step.
-            self._consume_fresh_allocation = consume_fresh_allocation
 
             # Take the workspace here, while weights load, so calculate_pool_sizes still
             # sees the real free memory. Deferring it left the pools sized against memory
@@ -708,9 +680,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         """Per-call half of the gate plus the four launches. Returns the (rows,
         index_topk) physical-slot tensor, or None to mean this call is not served
         here -- forward_cuda then continues into the standard path unchanged."""
-        from sglang.kernels.ops.attention.dsa.hip_gfx950 import MAX_ROWS, PAGE_SIZE
+        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            CACHE_TOK_STRIDE,
+            MAX_ROWS,
+            PAGE_SIZE,
+        )
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
 
-        if not self.use_gfx950_fused_indexer or metadata is None or in_graph:
+        if metadata is None or in_graph:
             return None
         # draft-extend-v2 rows are an extend chunk, not one query per row.
         if not (
@@ -729,7 +708,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             _decline_fused("the top-k transform is forced unfused")
             return None
         # CP gathers K outside the kernel, which this path writes itself.
-        if forward_batch.attn_cp_metadata is not None or self.dsa_enable_prefill_cp:
+        if forward_batch.attn_cp_metadata is not None:
             _decline_fused("context parallelism gathers K outside the kernel")
             return None
         # The fused GEMV takes bf16 hidden states, not the quantised tuple.
@@ -754,10 +733,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return None
         # DSA cache layer split: the standard path stores index-K per layer, and the
         # fused path addresses the same buffer directly.
-        split_cls = self._layer_split_pool_cls()
-        if split_cls is None:
-            return None
-        if isinstance(pool, split_cls):
+        if isinstance(pool, LayerSplitDSATokenToKVPool):
             # Ordering, not ownership, is what rules this out. The read buffer is
             # materialised before state.run() writes this step's K, and for a
             # split pool materialising it *is* the owner broadcast (invalidate()
@@ -800,10 +776,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             fp8_dtype=fp8_dtype,
         ):
             return None
-        if self._consume_fresh_allocation():
-            # The workspace is device memory taken after the pools were sized, so the
-            # cached MQA-logits budget is stale until the next prefill re-reads it.
-            Indexer.invalidate_mqa_logits_budget()
 
         # Draft rows share their request's table; broadcast into the
         # preallocated buffer, since no allocation is legal under capture.
@@ -827,7 +799,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_lora=q_lora,
             positions=positions[:rows],
             out_cache_loc=out_cache_loc[:rows],
-            kv_cache=kv_write.view(-1, PAGE_SIZE, 132),
+            kv_cache=kv_write.view(-1, PAGE_SIZE, CACHE_TOK_STRIDE),
             kv_cache_read=kv_read,
             seqlens_int32=seqlens,
             row_ends_int32=seqlens,

@@ -14,21 +14,21 @@ from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 
 logger = logging.getLogger(__name__)
 
-_WARNED_CAPTURE = False
 _WARNED_TOO_NARROW = False
+_WARNED_NO_WORKSPACE = False
 
-# Kernel-source constraints. Every one of these is enforced by a TORCH_CHECK or a
+# Kernel-source constraints. Every one of these is enforced by a RuntimeCheck or a
 # compile-time constant in csrc/, not by taste:
-HEAD_DIM = 128  # qk_rope_hadamard_quant.cu / paged_mqa_logits.cu
-ROPE_DIM = 64  # qk_rope_hadamard_quant.cu
+HEAD_DIM = 128  # qk_rope_hadamard_quant.cuh / paged_mqa_logits.cuh
+ROPE_DIM = 64  # qk_rope_hadamard_quant.cuh
 N_HEADS = 32  # validated shape (grid.y of the qk kernel, MFMA n of the logits kernel)
-INDEX_TOPK = 2048  # topk_transform.cu: constexpr TOPK = 2048u
-PAGE_SIZE = 64  # paged_mqa_logits.cu: PAGE_TOK
-CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cu: TOK_STRIDE (128 K bytes + 4 scale)
-Q_LORA_RANK = 2048  # dual_gemv cfg 61, Q half
-HIDDEN_SIZE = 6144  # dual_gemv cfg 61, K half
-QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
-# The only per-launch row cap among the four kernels (dual_gemv_bf16.cu).
+INDEX_TOPK = 2048  # topk_transform.cuh: constexpr TOPK = 2048u
+PAGE_SIZE = 64  # paged_mqa_logits.cuh: PAGE_TOK
+CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cuh: TOK_STRIDE (128 K bytes + 4 scale)
+Q_LORA_RANK = 2048  # dual_gemv_bf16.cuh: Kq
+HIDDEN_SIZE = 6144  # dual_gemv_bf16.cuh: Kk
+QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cuh: quant block == HEAD_DIM
+# The only per-launch row cap among the four kernels (dual_gemv_bf16.cuh).
 # Section A is chunked to it rather than capping the whole path, so larger
 # verify batches stay fused.
 DUAL_GEMV_MAX_M = 8
@@ -122,7 +122,6 @@ class _Workspace:
 # One workspace per (device, fp8 dtype), shared by all layers: the buffers are
 # scratch, so per-layer copies would multiply the footprint by 79.
 _WORKSPACES: Dict[Tuple[int, torch.dtype], _Workspace] = {}
-_FRESH_ALLOCATION = False
 
 
 def _workspace_key(device, fp8_dtype) -> Tuple[int, torch.dtype]:
@@ -135,15 +134,11 @@ def _workspace_key(device, fp8_dtype) -> Tuple[int, torch.dtype]:
 def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
     """Create the shared workspace before the server sizes its memory pools, which
     divide whatever mem_get_info reports at that moment.  Idempotent; returns
-    False if one exists or a capture is in progress."""
-    if torch.cuda.is_current_stream_capturing():
-        return False
+    False if one exists."""
     key = _workspace_key(device, fp8_dtype)
     if key in _WORKSPACES:
         return False
     _WORKSPACES[key] = _Workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
-    global _FRESH_ALLOCATION
-    _FRESH_ALLOCATION = True
     logger.info(
         "gfx950 fused DSA indexer: workspace preallocated (max_cols=%d, "
         "%.0f MiB) before pool sizing",
@@ -156,15 +151,6 @@ def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
         / (1 << 20),
     )
     return True
-
-
-def consume_fresh_allocation() -> bool:
-    """True once after a workspace was allocated, then False.  The caller uses it
-    to drop a memory budget that was computed before that allocation.
-    """
-    global _FRESH_ALLOCATION
-    fresh, _FRESH_ALLOCATION = _FRESH_ALLOCATION, False
-    return fresh
 
 
 class Gfx950FusedIndexer:
@@ -213,45 +199,36 @@ class Gfx950FusedIndexer:
         return self._const
 
     def ensure_workspace(self, *, device, max_cols: int, fp8_dtype) -> bool:
-        """Allocate the workspace if absent; False if it cannot be used.  Never
-        allocates during capture: a buffer created inside one lives in that graph's
-        private pool."""
-        key = _workspace_key(device, fp8_dtype)
-        ws = _WORKSPACES.get(key)
-        if ws is not None:
-            self.workspace = ws
-            if max_cols > ws.max_cols:
-                # Say so once. This refusal turns the whole feature off for the
-                # rest of the run while every other log line still reports it as
-                # enabled, so an A/B against it silently measures two identical arms.
-                global _WARNED_TOO_NARROW
-                if not _WARNED_TOO_NARROW:
-                    _WARNED_TOO_NARROW = True
-                    logger.warning(
-                        "gfx950 fused DSA indexer: workspace is %d columns wide "
-                        "but this call needs %d, so the standard indexer runs "
-                        "instead. The workspace must cover the decode graph's "
-                        "page-table width.",
-                        ws.max_cols,
-                        max_cols,
-                    )
-                return False
-            return True
-        if torch.cuda.is_current_stream_capturing():
-            global _WARNED_CAPTURE
-            if not _WARNED_CAPTURE:
-                _WARNED_CAPTURE = True
+        """Bind the preallocated workspace; False if there is none or it is narrower
+        than this call's page table. Never allocates: Indexer.__init__ owns that."""
+        ws = _WORKSPACES.get(_workspace_key(device, fp8_dtype))
+        if ws is None:
+            # Say so once, for the same reason as the width refusal below.
+            global _WARNED_NO_WORKSPACE
+            if not _WARNED_NO_WORKSPACE:
+                _WARNED_NO_WORKSPACE = True
                 logger.warning(
-                    "gfx950 fused DSA indexer: workspace not allocated before "
-                    "CUDA graph capture; using the standard indexer path"
+                    "gfx950 fused DSA indexer: no workspace was preallocated, so "
+                    "the standard indexer runs instead."
                 )
             return False
-        self._constants()
-        ws = _Workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
-        _WORKSPACES[key] = ws
         self.workspace = ws
-        global _FRESH_ALLOCATION
-        _FRESH_ALLOCATION = True
+        if max_cols > ws.max_cols:
+            # Say so once. This refusal turns the whole feature off for the
+            # rest of the run while every other log line still reports it as
+            # enabled, so an A/B against it silently measures two identical arms.
+            global _WARNED_TOO_NARROW
+            if not _WARNED_TOO_NARROW:
+                _WARNED_TOO_NARROW = True
+                logger.warning(
+                    "gfx950 fused DSA indexer: workspace is %d columns wide "
+                    "but this call needs %d, so the standard indexer runs "
+                    "instead. The workspace must cover the decode graph's "
+                    "page-table width.",
+                    ws.max_cols,
+                    max_cols,
+                )
+            return False
         return True
 
     # -- the four launches ---------------------------------------------------
@@ -296,8 +273,8 @@ class Gfx950FusedIndexer:
             )
 
         # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
-        # indexer_k_quant_and_cache(k) | head gate.  hadamard=True is why
-        # gfx950 has its own gate; see dsa/utils.hadamard_preserved.
+        # indexer_k_quant_and_cache(k) | head gate.  The Hadamard is inline, so
+        # the gate checks the standard path applies it too (hadamard_preserved).
         qk.indexer_qk_rope_hadamard_quant_and_cache(
             q_proj.view(rows, N_HEADS, HEAD_DIM),
             q_fp8,
@@ -312,13 +289,7 @@ class Gfx950FusedIndexer:
             cos2d,
             sin2d,
             float(self.indexer.k_norm.variance_epsilon),
-            QUANT_BLOCK,
-            self.indexer.scale_fmt,
             float(self.weights_scale),
-            True,  # preshuffle
-            False,  # is_neox
-            True,  # compute_all_q_rope
-            True,  # hadamard  <-- NOT optional on this path
         )
 
         # Allocated before node 3, not between the two: logits_hist dirties the
@@ -335,7 +306,6 @@ class Gfx950FusedIndexer:
             logits,
             ws.ghist[:rows],
             loader.LOGITS_BLOCKS_PER_ROW,
-            INDEX_TOPK,
         )
 
         # --- node 4: top-k(2048) + page transform, fused refinement ---------

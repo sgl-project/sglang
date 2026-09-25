@@ -3,10 +3,10 @@
 ``utils.gfx950_fused_indexer_runtime_ok``."""
 
 from sglang.kernels.ops.attention.dsa.hip_gfx950.fused_decode import (  # noqa: F401
+    CACHE_TOK_STRIDE,
     MAX_ROWS,
     PAGE_SIZE,
     Gfx950FusedIndexer,
-    consume_fresh_allocation,
     model_shape_supported,
     prealloc_workspace,
     supported_hardware,
