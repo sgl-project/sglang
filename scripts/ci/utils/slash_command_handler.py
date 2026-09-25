@@ -7,17 +7,17 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from github import Auth, Github
 
-# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
+# Import scripts/ci/ modules (sibling-up dir): runner_configs and the rerun partitioner.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
 
-# rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
-# non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
-_B200_DEFAULT_RUNNER = "4-gpu-b200"
+_B200_DEFAULT_RUNNER = _partition.B200_RERUN_RUNNER
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -1159,18 +1159,18 @@ def _resolve_test_spec(test_spec):
             f"selector={test_selector}, runner={runner_label}, "
             f"command='{test_command}'"
         )
-        return [
-            {
-                "spec": test_spec,
-                "test_command": test_command,
-                "mode": "multimodal_gen",
-                "runs_on": runner_label,
-                "install_script": "",
-                "install_timeout": "",
-                "rdma_devices": "",
-                "error": None,
-            }
-        ]
+        entry = {
+            "spec": test_spec,
+            "test_command": test_command,
+            "mode": "multimodal_gen",
+            "runs_on": runner_label,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "error": None,
+        }
+        err = _too_long_for_rerun(entry, resolved_path)
+        return [{"spec": test_spec, "error": err} if err else entry]
 
     test_command = resolved_path
     if test_selector:
@@ -1189,19 +1189,34 @@ def _resolve_test_spec(test_spec):
             f"rdma={info['rdma_devices']}, "
             f"command='{test_command}'"
         )
-        out.append(
-            {
-                "spec": test_spec,
-                "test_command": test_command,
-                "mode": mode,
-                "runs_on": info["runner_label"],
-                "install_script": info["install_script"],
-                "install_timeout": info["install_timeout"],
-                "rdma_devices": info["rdma_devices"],
-                "error": None,
-            }
-        )
+        entry = {
+            "spec": test_spec,
+            "test_command": test_command,
+            "mode": mode,
+            "runs_on": info["runner_label"],
+            "install_script": info["install_script"],
+            "install_timeout": info["install_timeout"],
+            "rdma_devices": info["rdma_devices"],
+            "error": None,
+        }
+        err = _too_long_for_rerun(entry, f"test/{resolved_path}")
+        out.append({"spec": test_spec, "error": err} if err else entry)
     return out
+
+
+def _too_long_for_rerun(entry, path):
+    """Error for a test estimated past the rerun-test step timeout, else None."""
+    est = _partition.estimate_seconds(
+        entry["test_command"], Path("."), entry["mode"], entry["runs_on"]
+    )
+    if est is None or est <= _partition.STEP_TIMEOUT_SECONDS:
+        return None
+    return (
+        f"`{path}` is estimated at {est:.0f}s on `{entry['runs_on']}`, longer than "
+        f"the {_partition.STEP_TIMEOUT_SECONDS // 60}-minute /rerun-test step limit, "
+        "so it can only time out there. Run it through its stage or nightly "
+        "workflow instead."
+    )
 
 
 def _dispatch_batch(
