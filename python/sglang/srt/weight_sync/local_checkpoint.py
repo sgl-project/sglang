@@ -109,13 +109,27 @@ def _version_dir(source_dir: str, version: int) -> str:
 
 def _is_delta(version_dir: str) -> bool:
     """A version is a delta iff its index metadata declares an encoding; an
-    ordinary HF checkpoint (with or without an index) is a full version."""
+    ordinary indexed or single-file HF checkpoint is a full version."""
     if not os.path.isdir(version_dir):
         raise FileNotFoundError(f"published weight version missing: {version_dir}")
     try:
         with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
             return "delta_encoding" in json.load(f).get("metadata", {})
     except FileNotFoundError:
+        # A delta's shards may become visible before its publication index.
+        # Only the standard single-file HF layout is unambiguous without one;
+        # treating an indexless sharded/empty directory as full would copy the
+        # compressed delta bytes and incorrectly mark the target as applied.
+        filenames = [
+            os.path.basename(path)
+            for path in glob.glob(os.path.join(version_dir, "*.safetensors"))
+            if os.path.isfile(path)
+        ]
+        if filenames != ["model.safetensors"]:
+            raise FileNotFoundError(
+                f"published weight index missing: {version_dir}; "
+                "an indexless full checkpoint must contain only model.safetensors"
+            ) from None
         return False
 
 
