@@ -1049,8 +1049,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    bs = batch.batch_size()
-
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.
     if batch.sampling_info.penalizer_orchestrator.is_required:
