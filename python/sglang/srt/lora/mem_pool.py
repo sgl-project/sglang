@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -281,49 +282,41 @@ class LoRAMemoryPool:
             return self.attn_tp_size
         return self.tp_size
 
-    def _dense_shard_tp(
+    def _dense_local_dim(
         self,
         module_name: str,
         base_model: torch.nn.Module,
         layer_idx: int,
         axis: str,
-    ) -> int:
-        """Shard count of a dense linear along ``axis`` ("input" or "output"), probed from the base module.
-
-        ``input_size // input_size_per_partition`` is what
-        ``RowParallelLinearWithLoRA.slice_lora_a_weights`` slices by and
-        ``output_size // output_size_per_partition`` what the column-parallel
-        ``slice_lora_b_weights`` slices by, so the buffers follow the layer's
-        real TP group, e.g. the replicated dense MLP under
-        ``--enable-dp-attention --moe-dense-tp-size 1``. Falls back to
-        ``tp_size`` when no module matches.
-        """
-        cache = self.__dict__.setdefault("_dense_shard_tp_cache", {})
-        key = (module_name, layer_idx, axis)
-        if key in cache:
-            return cache[key]
-        total_attr, part_attr = f"{axis}_size", f"{axis}_size_per_partition"
-
-        def _probe(module: torch.nn.Module) -> Optional[int]:
-            total = getattr(module, total_attr, None)
-            per_part = getattr(module, part_attr, None)
-            if total is not None and per_part:
-                return max(1, total // per_part)
-            inner = getattr(module, "base_layer", None)
-            if inner is not None and inner is not module:
-                return _probe(inner)
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
             return None
-
-        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
-        suffix = f".{module_name}"
-        shards = None
-        for name, module in base_model.named_modules():
-            if name.endswith(suffix) and any(m in name for m in layer_markers):
-                shards = _probe(module)
-                if shards is not None:
-                    break
-        cache[key] = shards if shards is not None else self.tp_size
-        return cache[key]
+        linears = getattr(self, "_dense_linears", None)
+        if linears is None:
+            linears = {}
+            for name, module in base_model.named_modules():
+                layer_id = get_layer_id(name)
+                base_layer = (
+                    module.base_layer
+                    if isinstance(module, BaseLayerWithLoRA)
+                    else module
+                )
+                if layer_id is not None and (
+                    hasattr(base_layer, "input_size_per_partition")
+                    or hasattr(base_layer, "output_partition_sizes")
+                ):
+                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+            self._dense_linears = linears
+        base_layer = linears.get((module_name, layer_idx))
+        if base_layer is None:
+            return None
+        if axis == "input":
+            return getattr(base_layer, "input_size_per_partition", None)
+        partitions = getattr(base_layer, "output_partition_sizes", None)
+        if not partitions:
+            return None
+        return sum(partitions[: get_stacked_multiply(module_name, base_model)])
 
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
@@ -455,21 +448,16 @@ class LoRAMemoryPool:
         c = get_stacked_multiply(module_name, base_model)
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            # Dense row-parallel inputs follow the base linear's real shard, not the outer tp_size.
-            if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(
-                module_name
-            ):
-                row_tp = effective_tp_size
-            else:
-                row_tp = self._dense_shard_tp(
-                    module_name, base_model, layer_idx, "input"
-                )
-            if row_tp > 1:
-                input_dim = divide(input_dim, row_tp)
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "input"
+            )
+            if local_dim is not None:
+                input_dim = local_dim
+            elif effective_tp_size > 1:
+                input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
@@ -563,22 +551,17 @@ class LoRAMemoryPool:
         # Same sharding rule as get_lora_A_shape above.
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            # Dense column-parallel outputs follow the base linear's real shard, not the outer tp_size.
-            if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(
-                module_name
-            ):
-                col_tp = effective_tp_size
-            else:
-                col_tp = self._dense_shard_tp(
-                    module_name, base_model, layer_idx, "output"
-                )
-            if col_tp > 1:
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "output"
+            )
+            if local_dim is not None:
+                output_dim = local_dim
+            elif effective_tp_size > 1:
                 output_dim = self._column_parallel_lora_b_per_rank_dim(
-                    module_name, output_dim, col_tp
+                    module_name, output_dim, effective_tp_size
                 )
 
         # Check if MoE module and return appropriate shape

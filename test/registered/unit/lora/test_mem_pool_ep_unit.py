@@ -1419,21 +1419,19 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
 
 
 class _FakeRowLinear(torch.nn.Module):
-    """RowParallelLinear stand-in exposing only the shard bookkeeping the pool probes."""
+    """RowParallelLinear stand-in exposing only the shard bookkeeping the pool reads."""
 
-    def __init__(self, input_size: int, input_size_per_partition: int):
+    def __init__(self, input_size_per_partition: int):
         super().__init__()
-        self.input_size = input_size
         self.input_size_per_partition = input_size_per_partition
 
 
 class _FakeColLinear(torch.nn.Module):
-    """ColumnParallelLinear stand-in exposing only the shard bookkeeping the pool probes."""
+    """MergedColumnParallelLinear stand-in exposing only the shard bookkeeping the pool reads."""
 
-    def __init__(self, output_size: int, output_size_per_partition: int):
+    def __init__(self, output_partition_sizes: tuple[int, ...]):
         super().__init__()
-        self.output_size = output_size
-        self.output_size_per_partition = output_size_per_partition
+        self.output_partition_sizes = list(output_partition_sizes)
 
 
 class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
@@ -1481,11 +1479,11 @@ class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
         model.model.layers = torch.nn.ModuleList()
         dense = torch.nn.Module()
         dense.mlp = torch.nn.Module()
-        dense.mlp.down_proj = _FakeRowLinear(256, dense_partition)
+        dense.mlp.down_proj = _FakeRowLinear(dense_partition)
         moe = torch.nn.Module()
         moe.mlp = torch.nn.Module()
         moe.mlp.shared_experts = torch.nn.Module()
-        moe.mlp.shared_experts.down_proj = _FakeRowLinear(32, shared_partition)
+        moe.mlp.shared_experts.down_proj = _FakeRowLinear(shared_partition)
         model.model.layers.append(dense)
         model.model.layers.append(moe)
         return model
@@ -1496,11 +1494,19 @@ class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
         self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 256))
         self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
 
-    def test_sharded_down_proj_divides_by_the_real_shard_count(self):
+    def test_sharded_down_proj_uses_the_local_input_width(self):
         model = self._model(dense_partition=256 // 8, shared_partition=32 // 8)
         pool = self._pool()
         self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 0), (1, 8, 32))
         self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 4))
+
+    def test_module_width_wins_when_the_config_disagrees(self):
+        model = self._model(dense_partition=256, shared_partition=32)
+        pool = self._pool()
+        pool.base_hf_config.first_k_dense_replace = None
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
+        pool.tp_size = 1
+        self.assertEqual(pool.get_lora_A_shape("down_proj", model, 8, 1), (1, 8, 32))
 
     def test_probe_miss_falls_back_to_tp_size(self):
         model = torch.nn.Module()
@@ -1550,34 +1556,51 @@ class TestColumnParallelLoraBShardsByBaseLinear(unittest.TestCase):
         return pool
 
     @staticmethod
-    def _model(dense_partition: int, shared_partition: int) -> torch.nn.Module:
+    def _model(
+        dense_partitions: tuple[int, ...], shared_partitions: tuple[int, ...]
+    ) -> torch.nn.Module:
         model = torch.nn.Module()
         model.model = torch.nn.Module()
         model.model.layers = torch.nn.ModuleList()
         dense = torch.nn.Module()
         dense.mlp = torch.nn.Module()
-        dense.mlp.gate_up_proj = _FakeColLinear(512, dense_partition)
+        dense.mlp.gate_up_proj = _FakeColLinear(dense_partitions)
         moe = torch.nn.Module()
         moe.mlp = torch.nn.Module()
         moe.mlp.shared_experts = torch.nn.Module()
-        moe.mlp.shared_experts.gate_up_proj = _FakeColLinear(64, shared_partition)
+        moe.mlp.shared_experts.gate_up_proj = _FakeColLinear(shared_partitions)
         model.model.layers.append(dense)
         model.model.layers.append(moe)
         return model
 
     def test_replicated_gate_up_proj_keeps_the_full_output_dim(self):
-        model = self._model(dense_partition=512, shared_partition=64)
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
         pool = self._pool()
         self.assertEqual(
             pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 512, 8)
         )
         self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
 
-    def test_sharded_gate_up_proj_divides_by_the_real_shard_count(self):
-        model = self._model(dense_partition=512 // 8, shared_partition=64 // 8)
+    def test_sharded_gate_up_proj_uses_the_local_output_width(self):
+        model = self._model(dense_partitions=(32, 32), shared_partitions=(4, 4))
         pool = self._pool()
         self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 64, 8))
         self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 8, 8))
+
+    def test_module_width_wins_when_the_config_disagrees(self):
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
+        pool = self._pool()
+        pool.base_hf_config.first_k_dense_replace = None
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
+        pool.tp_size = 1
+        self.assertEqual(pool.get_lora_B_shape("gate_up_proj", model, 8, 1), (1, 64, 8))
+
+    def test_only_lora_slices_count_toward_the_output_width(self):
+        model = self._model(dense_partitions=(256, 256, 64), shared_partitions=(32, 32))
+        pool = self._pool()
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj", model, 8, 0), (1, 512, 8)
+        )
 
     def test_probe_miss_falls_back_to_tp_size(self):
         model = torch.nn.Module()
@@ -1587,7 +1610,7 @@ class TestColumnParallelLoraBShardsByBaseLinear(unittest.TestCase):
         )
 
     def test_attention_qkv_proj_still_shards_by_attn_tp(self):
-        model = self._model(dense_partition=512, shared_partition=64)
+        model = self._model(dense_partitions=(256, 256), shared_partitions=(32, 32))
         pool = self._pool()
         pool.attn_tp_size = 4
         self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (1, 48, 8))
