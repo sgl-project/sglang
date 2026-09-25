@@ -11,10 +11,14 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_complex_rope,
     can_use_fused_layernorm_modulate,
     can_use_fused_silu_mul,
+    can_use_qknorm_complex_rope_cuda,
+    can_use_qknorm_complex_rope_pack,
     can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_layernorm_modulate,
     fused_silu_mul_bitexact,
+    qknorm_complex_rope_cuda,
+    qknorm_complex_rope_pack_,
     residual_gate_add,
     rmsnorm_preserve_reduction,
     tensors_equal,
@@ -55,6 +59,12 @@ _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
 _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE")
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
+_QK_ROPE_CUDA_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 CUDA Q/K RMSNorm + complex RoPE"
+)
+_KV_PACK_CUDA_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 CUDA Q/K RMSNorm + RoPE + KV packing"
+)
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
@@ -141,6 +151,15 @@ def apply_qk_norm(x, norm):
 
 def apply_qk_norm_rope(x, norm, rope):
     fused = None
+    if (
+        can_use_qknorm_complex_rope_cuda(x, norm.weight, rope)
+        and _QK_ROPE_CUDA_FUSION.can_attempt_once()
+    ):
+        fused = qknorm_complex_rope_cuda(x, norm.weight, rope, norm.variance_epsilon)
+        if _QK_ROPE_CUDA_FUSION.verified:
+            return fused
+        out = apply_rope(apply_qk_norm(x, norm), rope)
+        return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
     if (
         can_use_qknorm_complex_rope(x, norm.weight, rope)
         and _QK_ROPE_FUSION.can_attempt_once()
@@ -313,6 +332,38 @@ class QwenImage21Attention(nn.Module):
             v,
         )
 
+    def _pack_kv_cuda(self, q, k, v, rope, kp, vp):
+        """One CUDA launch: Q normed+roped in place, K normed+roped and V packed behind the prefix.
+
+        Returns ``(q, k_out, v_out)`` or ``None`` when the layout is unsupported. The
+        first call also runs the eager chain and keeps its result on a mismatch.
+        """
+        eps = self.norm_k.variance_epsilon
+        if self.norm_q.variance_epsilon != eps:
+            return None
+        prefix = kp.shape[1]
+        k_out = k.new_empty(k.shape[0], prefix + k.shape[1], *k.shape[2:])
+        v_out = torch.empty_like(k_out)
+        if not can_use_qknorm_complex_rope_pack(
+            q, k_out, v_out, self.norm_q.weight, self.norm_k.weight, rope, kp, vp, k, v
+        ):
+            return None
+        reference = None
+        if not _KV_PACK_CUDA_FUSION.verified:
+            reference = (
+                apply_rope(apply_qk_norm(q, self.norm_q), rope),
+                torch.cat([kp, apply_rope(apply_qk_norm(k, self.norm_k), rope)], 1),
+                torch.cat([vp, v], 1),
+            )
+        qknorm_complex_rope_pack_(
+            q, k_out, v_out, self.norm_q.weight, self.norm_k.weight, rope, kp, vp, k, v, eps
+        )
+        if reference is None:
+            return q, k_out, v_out
+        return _KV_PACK_CUDA_FUSION.accept_or_fallback(
+            (q, k_out, v_out), reference, equal=tensors_equal, logger=logger
+        )
+
     def attend_sample(self, q, k, v, rope, prefix, prefix_rope, segments, cache):
         if cache:
             kp, vp = cache["key"], cache["value"]
@@ -337,6 +388,10 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](cat_outputs(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
+        if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
+            cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp)
+            if cuda_packed is not None:
+                return self.target_attn(*cuda_packed), prefix_output
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
