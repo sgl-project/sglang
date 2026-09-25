@@ -154,6 +154,11 @@ def apply_qk_norm_rope(x, norm, rope):
     return out
 
 
+def cat_outputs(outputs, dim=0):
+    # torch.cat on a one-element list degrades to a full copy of the tensor.
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=dim)
+
+
 def apply_modulation(x, norm, scale):
     fused = None
     if (
@@ -329,7 +334,7 @@ class QwenImage21Attention(nn.Module):
                         qp[:, start:end], kp[:, :end], vp[:, :end], attn_mask=mask
                     )
                 )
-            prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
+            prefix_output = self.to_out[0](cat_outputs(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
         q = apply_qk_norm_rope(q, self.norm_q, rope)
@@ -377,7 +382,7 @@ class QwenImage21Attention(nn.Module):
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
-        return self.to_out[0](torch.cat(outputs).flatten(2))[0], prefix_outputs
+        return self.to_out[0](cat_outputs(outputs).flatten(2))[0], prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
