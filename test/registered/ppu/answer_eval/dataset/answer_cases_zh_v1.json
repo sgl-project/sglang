@@ -146,7 +146,7 @@
       "prompt": "我想去西安旅游，大概三天左右，请帮我做一份50字左右的攻略，需要包括景点钟楼和大雁塔以及其他，不需要考虑食宿。",
       "reference_facts": {"required_places": ["钟楼", "大雁塔"], "required_days": 3},
       "rules": [
-        {"type": "contains_all", "items": [["钟楼"], ["大雁塔"]], "description": "包含钟楼和大雁塔"},
+        {"type": "contains_all", "items": [["钟楼", "钟鼓楼"], ["大雁塔"]], "description": "包含钟楼和大雁塔"},
         {"type": "contains_any", "items": ["三天", "三日", "3天", "3日", "day3", "day 3"], "description": "形成三日行程"},
         {"type": "length", "min_chars": 35, "max_chars": 100, "description": "约 50 字，MVP 容许 35 至 100 个非空白字符"}
       ],
