@@ -1578,31 +1578,6 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
-_TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
-    {
-        "flashinfer_trtllm",
-        "experimental_sgl_trtllm",
-        "triton_kernel",
-        "flashinfer_mxfp4",
-    }
-)
-
-
-@register_post_process
-def _routed_experts_capture_backend_guard(view: Any) -> dict:
-    """Routed-experts capture needs a MoE runner that materializes topk ids."""
-    if not view.enable_return_routed_experts:
-        return {}
-    if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
-        return {}
-    raise ValueError(
-        f"--enable-return-routed-experts is incompatible with moe_runner_backend="
-        f"{view.moe_runner_backend!r}, which bypasses TopK and never materializes "
-        "the routed expert ids; pass a topk-materializing --moe-runner-backend "
-        "such as triton."
-    )
-
-
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
     """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
