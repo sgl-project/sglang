@@ -59,6 +59,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
+    SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -232,8 +233,14 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to return output-token sampling support and renormalized logprobs.
+    # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
+    # Return either the selected token's behavior logprob or behavior logprobs for
+    # the full sampling support. When omitted, selected mode is used if
+    # return_sampling_mask is enabled.
+    sampling_logprobs_mode: Optional[
+        Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
@@ -768,6 +775,9 @@ class GenerateReqInput:
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
         )
+        self.sampling_logprobs_mode = normalize_param(
+            self.sampling_logprobs_mode, None, "sampling_logprobs_mode"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -948,6 +958,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
+            sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
@@ -1121,8 +1132,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     kv_hints: Optional[KvHintsEnvelope] = None
 
     # Internal PP control bit, set by PP0 before forwarding the request.
-    # Keep at the end to preserve the positional Rust wire schema.
+    # Keep tail fields append-only to preserve the positional Rust wire schema.
     pp_prefetch_ticketed: bool = False
+    # Shape of output_token_sampling_logprobs for each output token. This is a
+    # defaulted tail field so older IPC senders decode as selected mode.
+    sampling_logprobs_mode: SamplingLogprobsMode = "selected"
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1218,6 +1232,12 @@ class EmbeddingReqInput:
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Token positions the pooler reads out AT (head / hidden states), instead of
+    # the default LAST/CLS pooling. Generic multi-position primitive (setwise
+    # scoring today). Unlike MIS, pooling is AT the position (no delimiter - 1).
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -1345,6 +1365,11 @@ class EmbeddingReqInput:
                     if self.multi_item_delimiter_indices is not None
                     else None
                 ),
+                token_indices_to_pool=(
+                    self.token_indices_to_pool[i]
+                    if self.token_indices_to_pool is not None
+                    else None
+                ),
             )
         else:
             sub = EmbeddingReqInput(
@@ -1376,6 +1401,11 @@ class EmbeddingReqInput:
                     if self.multi_item_delimiter_indices is not None
                     else None
                 ),
+                token_indices_to_pool=(
+                    self.token_indices_to_pool[i]
+                    if self.token_indices_to_pool is not None
+                    else None
+                ),
             )
         cache[i] = sub
         return sub
@@ -1405,7 +1435,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
-
+    # Token positions for setwise pooling readout
+    token_indices_to_pool: Optional[List[int]] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
@@ -1514,10 +1545,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Per-request chunks of output-token sampling supports. None when no request
     # in the batch asks for return_sampling_mask.
-    output_token_sampling_mask: Optional[List[List]]
-    # Per-request chunks of selected-token logprobs renormalized over the
-    # corresponding sampling supports. None when sampling masks are not returned.
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[List[List[int]]]]
+    # Per-request chunks. Each output-token entry is a selected-token scalar or
+    # a list aligned with output_token_sampling_mask, according to the request.
+    output_token_sampling_logprobs: Optional[List[List[Union[float, List[float]]]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1612,10 +1643,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
-    # None when sampling masks are not returned.
-    output_token_sampling_mask: Optional[List[List]]
-    output_token_sampling_logprobs: Optional[List[List]]
+    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*;
+    # support-mode logprobs are aligned elementwise with the token IDs.
+    output_token_sampling_mask: Optional[List[List[List[int]]]]
+    output_token_sampling_logprobs: Optional[List[List[Union[float, List[float]]]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates

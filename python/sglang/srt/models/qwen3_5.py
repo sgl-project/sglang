@@ -43,10 +43,15 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    complete_deferred_allreduce,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -172,10 +177,7 @@ def _disable_shared_experts_fusion() -> bool:
     # intent through the accessor's fallback.
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
-    return bool(
-        envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
-        or is_shared_experts_fusion_disabled()
-    )
+    return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
 
 
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
@@ -209,17 +211,17 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     return bool(
         not is_nextn
         and config.model_type == "qwen3_5_moe_text"
-        and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+        and uses_cutedsl_ar_fusion()
     )
 
 
 def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            Qwen35FlashInferLayerCommunicator,
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            CuteDSLFusionLayerCommunicator,
         )
 
-        return Qwen35FlashInferLayerCommunicator
+        return CuteDSLFusionLayerCommunicator
     return LayerCommunicator
 
 
@@ -305,22 +307,15 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    if not expect_deferred:
-        if not isinstance(hidden_states, torch.Tensor):
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
-                raise RuntimeError("unexpected deferred-finalize handoff")
+    if not expect_deferred:
+        if isinstance(hidden_states, MoeFinalizeHandoff):
+            raise RuntimeError("unexpected deferred-finalize handoff")
         hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states
 
-    from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-        Qwen35MoeFinalizeHandoff,
-    )
-
-    if not isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
+    if not isinstance(hidden_states, MoeFinalizeHandoff):
         raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
     return hidden_states
 
@@ -1199,8 +1194,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1637,8 +1631,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1825,26 +1818,20 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35FlashInferFusionService,
-                Qwen35FlashInferLayerCommunicator,
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                install_cutedsl_fusion,
             )
 
-            self.flashinfer_mnnvl_cutedsl_fusion = Qwen35FlashInferFusionService(
+            self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
+                self.layers,
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
                 rms_epsilon=config.rms_norm_eps,
-            )
-            for layer in self.layers:
-                communicator = layer.layer_communicator
-                if not isinstance(communicator, Qwen35FlashInferLayerCommunicator):
-                    raise RuntimeError(
-                        "Qwen3.5 fusion-enabled layer has the wrong communicator"
-                    )
-                communicator.fusion_service = self.flashinfer_mnnvl_cutedsl_fusion
-            logger.info(
-                "Installed one Qwen3.5 FlashInfer fusion handle for %d layers",
-                len(self.layers),
+                # Every layer was checked above.
+                can_defer_finalize=lambda layer: True,
+                # The final GemmaRMSNorm closes out the last layer's handoff.
+                final_norm_consumes_handoff=True,
+                label="Qwen3.5",
             )
 
         # Final normalization
@@ -1879,13 +1866,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
-        if self.flashinfer_mnnvl_cutedsl_fusion is None:
-            return
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            prepare_qwen35_flashinfer_fusion,
-        )
-
-        prepare_qwen35_flashinfer_fusion(self, model_runner)
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1958,9 +1938,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
@@ -1972,61 +1958,23 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         # The final layer has no successor to consume its deferred MoE tail.
-        trace_final_norm = envs.SGLANG_TRACE_QWEN35_FINAL_NORM.get()
-        use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            is_deferred_finalize = isinstance(hidden_states, Qwen35MoeFinalizeHandoff)
+            is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 
         if is_deferred_finalize:
-            if residual is None or self.flashinfer_mnnvl_cutedsl_fusion is None:
+            if residual is None:
                 raise RuntimeError("invalid final deferred MoE handoff")
             hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
-                hidden_states, residual, self.norm.gemma_weight
+                handoff=hidden_states, residual=residual, gamma=self.norm.gemma_weight
             )
         elif hidden_states.shape[0] != 0:
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM "
-                    f"stage=pre_sync_enter hidden={tuple(hidden_states.shape)} "
-                    f"hidden_stride={hidden_states.stride()} "
-                    f"hidden_dtype={hidden_states.dtype} "
-                    f"hidden_contiguous={hidden_states.is_contiguous()} "
-                    f"residual={None if residual is None else tuple(residual.shape)} "
-                    f"native={use_native_final_norm}",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=pre_sync_returned",
-                    flush=True,
-                )
             if residual is None:
-                hidden_states = (
-                    self.norm.forward_native(hidden_states)
-                    if use_native_final_norm
-                    else self.norm(hidden_states)
-                )
+                hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = (
-                    self.norm.forward_native(hidden_states, residual)
-                    if use_native_final_norm
-                    else self.norm(hidden_states, residual)
-                )
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_enter",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_returned",
-                    flush=True,
-                )
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

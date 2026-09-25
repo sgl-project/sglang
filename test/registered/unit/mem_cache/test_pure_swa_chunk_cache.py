@@ -36,12 +36,13 @@ class _FakeAllocator:
 
 def _make_req():
     return SimpleNamespace(
+        last_node=None,
         kv=ReqKvInfo(
             req_pool_idx=0,
             cache_protected_len=2,
             swa_evict_floor=3,
             swa_evicted_seqlen=6,
-        )
+        ),
     )
 
 

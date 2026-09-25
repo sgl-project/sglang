@@ -228,16 +228,16 @@ receipt proves were taken. The eventual full release must pass
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, owned_kv_len: int)`
+### `cache_finished_req(req: Req, *, owned_kv_len: int)`
 
 Cache a completed request's KV data into the tree.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `is_insert` — insert the owned range into the tree (True) or free it (False); `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache` |
+| **Inputs** | `req` — the finished request; `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache`. A request that leaves without inserting goes through `release_kv_cache(is_insert=False)` instead, which frees the row and calls `on_release(req, inserted=False)` for component cleanup |
 | **Output** | `None` |
-| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
+| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
