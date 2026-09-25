@@ -15,7 +15,7 @@
 ///
 /// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
 /// exact radix tie-break, plus an exact-key refinement when the threshold bin
-/// overflows the staging buffer (refine_and_handle_tie).
+/// overflows the staging buffer (refine_ties).
 
 #pragma once
 
@@ -91,59 +91,35 @@ SGL_DEVICE uint32_t extract_coarse_bin(float x) {
   return (b ^ (s | 0x80000000u)) >> (32 - kBits);
 }
 
-SGL_DEVICE uint16_t coarse_bin_to_bits_finite(uint32_t bin) {
-  const uint16_t ob = static_cast<uint16_t>(bin);
-  return (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
-}
-
-// Smallest fp32 `v` for which `extract_coarse_bin<kBits>(v) >= bin`, i.e. the
-// lower fp32 boundary of coarse bin `bin`. The collect pass classifies with two
-// comparisons against these instead of recomputing the fp16 bin per element, so
-// this must agree with `extract_coarse_bin` on every value -- a score sitting
-// exactly on a boundary included. Two pairs no fp32 threshold can separate are
-// left: -0.0 at the zero bin, and +inf at a NaN-key bin.
+/// fp32 bounds {lo, hi} of coarse bin `bin`: "above" iff v >= hi, "tie" iff lo <= v < hi,
+/// agreeing with extract_coarse_bin<kBits> on every non-NaN score. A zero hi moves to
+/// the smallest subnormal, since fp32 compares cannot put -0.0 below +0.0.
 template <uint32_t kBits>
-SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
+SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
   constexpr uint32_t kShift = 16 - kBits;
-  constexpr uint32_t kInfBin = 0xFC00u >> kShift;  // bin holding the +inf key
-  const uint32_t key = bin << kShift;              // ordered16 key at the low edge
-  // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
-  constexpr auto to_finite_val = [](uint32_t okey) -> float {
-    const uint16_t hb = coarse_bin_to_bits_finite(okey);
-    return cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
+  static_assert(kShift >= 1, "edge keys must be even for the rounding rule below");
+  constexpr uint32_t kNegInfBin = 0x03FFu >> kShift;  // bin holding the -inf key
+  constexpr uint32_t kInfBin = 0xFC00u >> kShift;     // bin holding the +inf key
+  // ordered16 edge keys, {lo, hi} packed in the {low, high} halves.
+  const uint32_t keys = (bin << kShift) | ((bin + 1) << (kShift + 16));
+  // ordered16 -> fp16 bits per half: ~key below 0x8000 (negative), key ^ 0x8000 above.
+  const auto to_fp32 = [](uint32_t k) {
+    const uint32_t bits = k ^ 0x80008000u ^ ((~k >> 15) & 0x00010001u) * 0x7FFFu;
+    return cast<fp32x2_t>(*reinterpret_cast<const fp16x2_t*>(&bits));
   };
-  constexpr auto step_up = [](float v) -> float {
-    const int32_t b = __float_as_int(v);
-    return __int_as_float(b >= 0 ? b + 1 : b - 1);
-  };
-  // Fast path, hoisted above the per-key special cases so both keys are
-  // range-checked at once: `key` and `key - 1` both land in the finite band
-  // [0x0401, 0xFBFF] -- every boundary a finite-score threshold produces. fp16
-  // rounds to nearest, so the boundary is the midpoint between the fp16 values
-  // at `key` and `key - 1`.
-  if (key - 0x0401u <= 0xFBFFu - 0x0401u) {
-    const float mid = 0.5f * (to_finite_val(key) + to_finite_val(key - 1));
-    // fp32 -> fp16 rounds to nearest EVEN, so on the ~half of bins whose fp16
-    // value has an odd significand the midpoint still bins as `bin - 1`.
-    return (coarse_bin_to_bits_finite(key) & 1u) ? step_up(mid) : mid;
-  }
-  // Slow path: an edge of `bin` touches the +/-inf keys or NaN key space. The
-  // ordered-key line is: [0, 0x03FF) negative-NaN space, 0x03FF = -inf,
-  // [0x0400, 0xFC00) finite, 0xFC00 = +inf, (0xFC00, 0xFFFF] positive-NaN
-  // space. The +/-inf keys stand in as +/-65536, one ideal step past fp16 max,
-  // so the midpoint lands on the +/-65520 fp32 -> fp16 overflow threshold.
-  if (bin == 0) return -infinity_value();      // every value bins at >= 0
-  if (bin > kInfBin) return infinity_value();  // NaN key space: nothing bins that high
-  const auto to_val = [&](uint32_t okey) -> float {
-    if (okey < 0x03FFu) return -infinity_value();
-    if (okey == 0x03FFu) return -65536.0f;
-    if (okey == 0xFC00u) return 65536.0f;
-    return to_finite_val(okey);
-  };
-  // The +/-65536 stand-ins are not real fp16 neighbours, so the parity rule
-  // does not apply here; test the property directly instead.
-  const float mid = 0.5f * (to_val(key) + to_val(key - 1));
-  return extract_coarse_bin<kBits>(mid) < bin ? step_up(mid) : mid;
+  const auto [v_lo, v_hi] = to_fp32(keys);
+  const auto [u_lo, u_hi] = to_fp32(keys - 0x00010001u);
+  // Exact midpoints of adjacent fp16 values; the clamp puts one against inf on the
+  // +/-65520 overflow point.
+  const auto midpoint = [](float a, float b) { return fminf(fmaxf(0.5f * (a + b), -65520.0f), 65520.0f); };
+  const int32_t lo = __float_as_int(midpoint(v_lo, u_lo));
+  const int32_t hi = __float_as_int(midpoint(v_hi, u_hi));
+  // Ties round to even and edge keys are even, so negative edges sit one ulp above
+  // the midpoint. A zero hi steps past +0.
+  const float lo_edge = __int_as_float(lo + (lo >> 31));
+  const float hi_edge = __int_as_float(hi + (hi >> 31) + (hi == 0));
+  // Edges inside the NaN key space: every score is >= lo, none is >= hi.
+  return {bin <= kNegInfBin ? -infinity_value() : lo_edge, bin >= kInfBin ? infinity_value() : hi_edge};
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
@@ -201,7 +177,7 @@ struct TopKConfig {
   // by downstream sparse attention.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
-  // Radix width of the threshold-bin refinement (refine_and_handle_tie). Wider
+  // Radix width of the threshold-bin refinement (refine_ties). Wider
   // than kRadixSize so that ceil(32 / kRefineBits) == 3 rounds cover the whole
   // key: the histogram overlays the tie staging buffer, which that path
   // re-derives anyway, so the extra bins are free. 12 is the widest that fits.
@@ -481,7 +457,7 @@ struct TopKRadixBase : TopKConfig {
     union {
       alignas(16) uint32_t histogram[kHistSize];
       struct {
-        // refine_and_handle_tie re-derives the candidates instead of trusting
+        // refine_ties re-derives the candidates instead of trusting
         // what the collect pass staged, so the buffer is free to carry that
         // path's radix histogram until its staging pass writes values back.
         union {
@@ -581,122 +557,94 @@ struct TopKRadixBase : TopKConfig {
     __syncthreads();
   }
 
-  /// Exact-key refinement of a threshold coarse bin that overflows the staging
-  /// buffer, where the collect pass kept only whichever kMaxNumTie arrived
-  /// first. Replaces the plain handle_tie call when `count_eq > kMaxNumTie`.
-  ///
-  /// Up to three radix rounds over the order-preserving key from
-  /// `extract_exact_bin`, kRefineBits wide (12 / 12 / 8). Exits once the refined
-  /// set fits the buffer, or once all 32 bits are consumed -- the key is
-  /// injective on fp32 bit patterns, so the survivors are bit-identical by then
-  /// and any subset is correct. Each round emits its own "above" set while
-  /// building the next round's histogram, so this costs at most four input
-  /// passes. Every round needs `0 < remain <= active`, which the threshold-bin
-  /// invariant gives and each round restores.
-  ///
-  /// `for_each_input` is the iteration the collect pass uses, so the two agree
-  /// on which elements exist: padding is NaN and fails both boundary compares.
-  SGL_DEVICE static void refine_and_handle_tie(  //
+  /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
+  /// rounds narrow the bin to one bucket, then a final scan emits what lies above
+  /// it and stages the bucket for the caller's handle_tie.
+  SGL_DEVICE static void refine_ties(  //
       const TopKProblem& problem,
       Smem* smem,
       const float v_lo,
       const float v_hi,
       const uint32_t count_eq) {
-    const auto tx = threadIdx.x;
+    constexpr uint32_t kRefineRounds = (32 + kRefineBits - 1) / kRefineBits;
     const auto topk = problem.topk;
+    if (smem->count_gt >= topk) [[unlikely]]
+      return;
+    const auto tx = threadIdx.x;
     const auto handle = &smem->tie_handle;
     const auto hist = smem->refine_hist;
-    const auto clear_hist = [&] {
+    // for_each_input's elements with one copy of `fn` and reversed lanes, so this
+    // cold scan shares no load address (hence no registers) with the fast path.
+    const auto scan = [&](auto&& fn) {
+      const auto seq_len = problem.seq_len;
+      const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
+      uint32_t vi = kBlockSize - 1 - tx;
+      vec_t cur;
+      if (vi < num_vec) cur.load(problem.in, vi);
+#pragma unroll 1
+      while (vi < num_vec) {
+        const auto next_vi = vi + kBlockSize;
+        vec_t next;
+        if (next_vi < num_vec) next.load(problem.in, next_vi);
 #pragma unroll
-      for (uint32_t i = 0; i < kRefineItems; ++i)
-        hist[tx * kRefineItems + i] = 0;
-      __syncthreads();
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (vi * kVecSize + j < seq_len) fn(cur[j], vi * kVecSize + j);
+        }
+        cur = next;
+        vi = next_vi;
+      }
     };
 
-    if (smem->count_gt >= topk) [[unlikely]] {
-      // Off the threshold-bin invariant: the collect pass already filled every
-      // output slot, so no candidate can be selected. refine_find_threshold has
-      // no bin to publish in that state, so stop before entering it.
-      return;
-    }
-    uint32_t cand_count = count_eq;
+    // refine_find_threshold needs 0 < remain <= active; its match rule keeps it.
     uint32_t remain = topk - smem->count_gt;
-    uint32_t prefix = 0;  // refined key bits agreed on so far
-    uint32_t mask = 0;    // which key bits `prefix` pins down
-    uint32_t width = kRefineBits;
-    uint32_t shift = 32 - kRefineBits;
+    uint32_t active = count_eq;
+    // Candidates are [bucket_lo, bucket_lo + bucket_mask]; round 0 takes the whole bin.
+    uint32_t bucket_lo = 0;
+    uint32_t bucket_mask = ~0u;
 
-    // First histogram: no preceding round to emit for, so it stands alone.
-    clear_hist();
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-      if (val >= v_lo && val < v_hi) atomicAdd(&hist[extract_exact_bin(val) >> shift], 1);
-    });
-    __syncthreads();
-
-    while (true) {
-      refine_find_threshold(hist, cand_count, remain, handle);
-      const auto match = handle->match;
-
-      // Candidate predicate for this round, pinned before `prefix`/`mask` move on.
-      const auto sel_prefix = prefix;
-      const auto sel_mask = mask;
-      const auto sel_shift = shift;
-      const auto sel_digit = (1u << width) - 1u;
-      prefix |= match.bin << sel_shift;
-      mask |= sel_digit << sel_shift;
-      remain -= match.above_count;
-      cand_count = match.equal_count;
-
-      // Stop once the survivors fit the staging buffer, the key is exhausted
-      // (they are bit-identical, so truncating them is exact), or the output is
-      // already full -- this round's "above" set still has to be emitted.
-      if (cand_count <= kMaxNumTie || sel_shift == 0 || remain == 0) {
-        if (tx == 0) smem->count_eq = 0;
-        __syncthreads();
-        // Overwrites the histogram, which refine_find_threshold has consumed.
-        for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-          if (val >= v_lo && val < v_hi) {
-            const auto key = extract_exact_bin(val);
-            if ((key & sel_mask) != sel_prefix) return;
-            const auto digit = (key >> sel_shift) & sel_digit;
-            if (digit > match.bin) {
-              const auto pos = atomicAdd(&smem->count_gt, 1);
-              if (pos < topk) [[likely]]
-                problem.emit(pos, idx);
-            } else if (digit == match.bin) {
-              const auto slot = atomicAdd(&smem->count_eq, 1);
-              if (slot < kMaxNumTie) smem->tie_values[slot] = {val, idx};
-            }
-          }
-        });
-        __syncthreads();
-        break;
+#pragma unroll
+    for (uint32_t round = 0; round < kRefineRounds; ++round) {
+      // round 0: bits [20, 32), round 1: bits [8, 20), round 2: bits [0, 8)
+      const uint32_t lo = (round + 1) * kRefineBits < 32 ? 32 - (round + 1) * kRefineBits : 0;
+#pragma unroll
+      for (uint32_t i = 0; i < kRefineItems; ++i) {
+        hist[tx * kRefineItems + i] = 0;
       }
-
-      width = min(sel_shift, kRefineBits);
-      shift = sel_shift - width;
-      clear_hist();
-      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-        if (val >= v_lo && val < v_hi) {
-          const auto key = extract_exact_bin(val);
-          if ((key & sel_mask) != sel_prefix) return;
-          const auto digit = (key >> sel_shift) & sel_digit;
-          if (digit > match.bin) {
-            const auto pos = atomicAdd(&smem->count_gt, 1);
-            if (pos < topk) [[likely]]
-              problem.emit(pos, idx);
-          } else if (digit == match.bin) {
-            atomicAdd(&hist[(key >> shift) & ((1u << width) - 1u)], 1);
-          }
-        }
+      __syncthreads();
+      // bucket_lo is aligned to the previous digit, so (key - bucket_lo) >> lo is this digit.
+      scan([&](float val, uint32_t) {
+        if (!(val >= v_lo && val < v_hi)) return;
+        const auto d = extract_exact_bin(val) - bucket_lo;
+        if (d <= bucket_mask) atomicAdd(&hist[d >> lo], 1);
       });
       __syncthreads();
+      refine_find_threshold(hist, active, remain, handle);
+      const auto match = handle->match;
+      bucket_lo |= match.bin << lo;
+      bucket_mask = (1u << lo) - 1u;
+      remain -= match.above_count;
+      active = match.equal_count;
+      if (lo == 0 || active <= kMaxNumTie) break;
     }
 
-    const auto count_gt = smem->count_gt;
-    const auto tie_count = min(smem->count_eq, kMaxNumTie);
-    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
-    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, handle);
+    // Candidates are never NaN, so keys stay <= key(+inf) and bucket_hi cannot wrap.
+    // Staging overwrites the histogram, which refine_find_threshold has consumed.
+    const auto bucket_hi = bucket_lo + bucket_mask + 1u;
+    if (tx == 0) smem->count_eq = 0;
+    __syncthreads();
+    scan([&](float val, uint32_t idx) {
+      if (!(val >= v_lo && val < v_hi)) return;
+      const auto key = extract_exact_bin(val);
+      if (key >= bucket_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
+      } else if (key >= bucket_lo) {
+        const auto slot = atomicAdd(&smem->count_eq, 1);
+        if (slot < kMaxNumTie) smem->tie_values[slot] = {val, idx};
+      }
+    });
+    __syncthreads();
   }
 };
 
@@ -762,8 +710,7 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, num_full * kVecSize, smem, [&](uint32_t threshold_bin) {
-      const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-      const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
       smem->v_hi = v_hi;
       smem->v_lo = v_lo;
     });
@@ -798,12 +745,12 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 4: Handle ties.
     __syncthreads();
+    if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+      // Buffer holds an arrival-order subset; re-stage it on the exact key.
+      refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+    }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
-    if (count_eq > kMaxNumTie) [[unlikely]] {
-      // Buffer holds an arrival-order subset; refine on the exact key first.
-      return refine_and_handle_tie(problem, smem, v_lo, v_hi, count_eq);
-    }
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
@@ -845,8 +792,7 @@ struct TopKStreaming : TopKRadixBase<12> {
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-      const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-      const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
       smem->v_hi = v_hi;
       smem->v_lo = v_lo;
     });
@@ -879,12 +825,12 @@ struct TopKStreaming : TopKRadixBase<12> {
     // "above" and "tie" sets. above_count is < topk by the threshold-bin invariant,
     // so the count_gt guard above effectively never triggers.
     __syncthreads();
+    if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+      // See the register path.
+      refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+    }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
-    if (count_eq > kMaxNumTie) [[unlikely]] {
-      // See the register path.
-      return refine_and_handle_tie(problem, smem, v_lo, v_hi, count_eq);
-    }
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
@@ -901,7 +847,7 @@ struct TopKStreaming : TopKRadixBase<12> {
 // Still truncates an overflowing threshold bin, unlike the register and
 // streaming paths: the candidate set is split across kClusterSize ranks, so
 // refining needs cluster-wide histogram and emit counters rather than the
-// block-local ones refine_and_handle_tie uses.
+// block-local ones refine_ties uses.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
@@ -1040,8 +986,9 @@ struct TopKCluster : TopKRadixBase<10> {
 
       // Phase 3. rank-0 find threshold and write to local smem for other ranks to read
       find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-        smem->v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-        smem->v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+        const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
+        smem->v_hi = v_hi;
+        smem->v_lo = v_lo;
       });
 
       barrier_cluster_arrive_release();  // bar-2 arrive: publishes v_hi / v_lo
