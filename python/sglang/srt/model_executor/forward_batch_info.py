@@ -392,6 +392,25 @@ def compute_local_num_token_non_padded_cpu(
     return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
+def _schedule_batch_num_tokens(batch) -> int:
+    """Token width of this forward for ``num_token_non_padded``.
+
+    Decode-family spec batches (EAGLE draft) reach ``ForwardBatch.init_new``
+    with ``input_ids is None``; the scheduler rebuilds tokens after. A live
+    count of 0 arms the MoE padded-region mask against every draft row
+    (``topk_ids = -1``). Fall back to ``spec_info.num_tokens_per_req``.
+    """
+    if batch.input_ids is not None:
+        return len(batch.input_ids)
+    spec_info = getattr(batch, "spec_info", None)
+    if spec_info is None:
+        return 0
+    num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", 0)
+    if num_tokens_per_req is not None and num_tokens_per_req > 0:
+        return len(batch.seq_lens) * int(num_tokens_per_req)
+    return 0
+
+
 def prefill_graph_tolerates_sum_len() -> bool:
     """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
 
@@ -1001,12 +1020,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
+        num_tokens = _schedule_batch_num_tokens(batch)
+
         ret.mm_token_modalities = _maybe_build_forward_token_modalities(
             model_runner.model_config,
             ret.mm_inputs,
             extend_prefix_lens if isinstance(extend_prefix_lens, list) else None,
             extend_seq_lens if isinstance(extend_seq_lens, list) else None,
-            len(batch.input_ids) if batch.input_ids is not None else 0,
+            num_tokens,
             device,
         )
 
@@ -1036,7 +1057,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
-        num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
             ret.global_num_token_non_padded = torch.tensor(
                 num_tokens,

@@ -223,15 +223,20 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Clamp then restore: mapping[-1] is the last table entry,
+                    # a real local expert on the last EP rank. The -1 drop
+                    # sentinel (padded-region / DP-pad mask) must not alias.
+                    topk_ids = topk_output.topk_ids
+                    topk_ids_local = self.local_expert_mapping[
+                        topk_ids.clamp(min=0)
+                    ].masked_fill(topk_ids < 0, -1)
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
                     # wasted compute (and a masked-grouped-GEMM workspace
                     # blow-up when they collide on the same top-k).  Must
-                    # run POST-translation (a pre-translation -1 aliases to
-                    # the mapping table's last entry); -1 is the drop
-                    # sentinel both the triton and deep_gemm runners honor.
+                    # run POST-translation; -1 is the drop sentinel both
+                    # the triton and deep_gemm runners honor.
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
