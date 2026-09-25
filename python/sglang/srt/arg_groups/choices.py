@@ -113,6 +113,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "intel_amx",
     "intel_xpu",
     "triton",
 ]
@@ -241,7 +242,13 @@ add_deterministic_attention_backend_choices = (
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
 )
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = [
+    "ascend",
+    "fa3",
+    "fa4",
+    "intel_amx",
+    "triton",
+]
 add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )

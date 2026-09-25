@@ -968,6 +968,7 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     None,  # bias
                     True,  # is_vnni
+                    get_exec().deterministic.enable_deterministic_inference,
                 )
             elif self.rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype

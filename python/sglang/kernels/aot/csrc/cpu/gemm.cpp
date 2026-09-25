@@ -719,7 +719,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 // out  : [*, N]
 //
 at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
+weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    bool deterministic) {
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
   bool use_fma_gemm = false;
   if (packed_w.scalar_type() == at::kFloat) {
@@ -732,7 +737,8 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   auto input_sizes = mat1.sizes().vec();
   int64_t N = use_fma_gemm ? mat2.size(1) : mat2.size(0);
   int64_t K = use_fma_gemm ? mat1.size(1) : mat2.size(1);
-  int64_t M = use_fma_gemm ? mat1.size(0) : mat1.numel() / K;
+  const int64_t original_M = use_fma_gemm ? mat1.size(0) : mat1.numel() / K;
+  int64_t M = original_M;
   CHECK_DIM(2, mat2);
   if (use_fma_gemm) {
     CHECK_DIM(2, mat1);
@@ -740,11 +746,25 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
     CHECK_EQ(mat1.size(ndim - 1), K);
   }
 
+  // The regular path switches between tiny GEMM and AMX BRGEMM at M=4.
+  // Pad to a complete, fixed AMX M tile in deterministic mode so a token is
+  // evaluated with the same microkernel when the surrounding batch changes.
+  auto mat1_for_gemm = mat1;
+  if (deterministic && !use_fma_gemm) {
+    constexpr int64_t BLOCK_M = block_size_m();
+    const int64_t padded_M = div_up(M, BLOCK_M) * BLOCK_M;
+    if (padded_M != M) {
+      mat1_for_gemm = at::zeros({padded_M, K}, mat1.options());
+      mat1_for_gemm.narrow(0, 0, M).copy_(mat1.reshape({M, K}));
+      M = padded_M;
+    }
+  }
+
   auto dispatch_type = mat1.scalar_type();
   auto out = at::empty({M, N}, mat1.options());
   // strides
   int64_t out_strideM = out.stride(0);
-  int64_t mat1_strideM = mat1.stride(-2);
+  int64_t mat1_strideM = mat1_for_gemm.stride(-2);
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
@@ -757,7 +777,7 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
     if (use_fma_gemm) {
       weight_packed_linear_kernel_impl<scalar_t>(
           out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
+          mat1_for_gemm.data_ptr<scalar_t>(),
           packed_w.data_ptr<float>(),
           bias_data,
           nullptr,
@@ -769,7 +789,7 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
     } else {
       weight_packed_linear_kernel_impl<scalar_t>(
           out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
+          mat1_for_gemm.data_ptr<scalar_t>(),
           packed_w.data_ptr<scalar_t>(),
           bias_data,
           M,
@@ -781,6 +801,9 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   });
 
   input_sizes[ndim - 1] = N;
+  if (M != original_M) {
+    out = out.narrow(0, 0, original_M);
+  }
   return out.view(input_sizes);
 }
 
