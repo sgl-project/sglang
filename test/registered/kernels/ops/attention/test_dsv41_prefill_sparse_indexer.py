@@ -224,6 +224,111 @@ class TestPrefillSparseIndexer(CustomTestCase):
             a, b = picks(full, rows - tail + r), picks(part, r)
             self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
 
+    @torch.inference_mode()
+    def test_consumer_pairwise_with_torch_oracle(self):
+        """Identical candidate tables isolate scorer rounding from publication."""
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+            PrefillCandidateBlocks,
+        )
+        from sglang.srt.layers.attention.dsv4.triton_candidate_indexer import (
+            TritonCandidateIndexer,
+        )
+
+        for rows, ctx in [(32, 20000), (16, 513)]:
+            with self.subTest(rows=rows, ctx=ctx):
+                case = make_case(rows, ctx, seed=ctx + 19)
+                table, _ = publish(self.sparse, case.inputs)
+                blocks = table.blocks.masked_fill(
+                    table.blocks == torch.iinfo(torch.int32).max, -1
+                )
+                published = PrefillCandidateBlocks(request_blocks=[blocks])
+                inputs = _torch_inputs(case.inputs)
+                triton = TritonCandidateIndexer(
+                    TOPK_BLOCKS, BLOCK, budget_bytes=32 << 20
+                )
+                results = [
+                    select(self.sparse, table, case.inputs),
+                    select(self.dense, published, case.inputs),
+                    select(triton, published, inputs),
+                    torch_reference_selection(inputs, blocks),
+                ]
+                keep = reference_blocks(case).repeat_interleave(BLOCK, dim=1)
+                for result in results:
+                    self.assertTrue((result[0] == -1).all())
+                    for row in range(1, rows):
+                        got = result[row][result[row] >= 0].long()
+                        self.assertEqual(got.unique().numel(), got.numel())
+                        self.assertTrue((got < case.lens[row]).all())
+                        self.assertTrue(keep[row, got].all())
+                for a in range(len(results)):
+                    for b in range(a + 1, len(results)):
+                        for row in range(1, rows):
+                            got, want = picks(results[a], row), picks(results[b], row)
+                            self.assertEqual(len(got), len(want))
+                            self.assertGreaterEqual(
+                                len(got & want), MIN_OVERLAP * len(want)
+                            )
+                            floor = case.dense[row, list(want)].min()
+                            self.assertTrue(
+                                (
+                                    case.dense[row, list(got)]
+                                    >= floor - floor.abs() * FLOOR_TOLERANCE
+                                ).all()
+                            )
+
+
+def _torch_inputs(inputs):
+    """Decode the exact packed operands used by the kernel cases, on device.
+
+    This is test-only decoding, independent of the engine's cache accessors.
+    No FP8 requantization or FP32 head accumulation is introduced.
+    """
+    from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+        TritonPrefillInputs,
+    )
+
+    def unpack(payload, sf):
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=payload.device,
+        )
+        codes = payload.view(torch.uint8)
+        codes = torch.stack((codes & 15, codes >> 4), dim=-1).flatten(-2)
+        exponents = sf.contiguous().view(torch.uint8).reshape(*sf.shape, 4).float()
+        scales = torch.exp2(exponents - 127).repeat_interleave(32, dim=-1)
+        return (lut[codes.long()] * scales).to(torch.bfloat16)
+
+    keys = unpack(*inputs.kv)
+    return TritonPrefillInputs(
+        q=unpack(inputs.q_fp4, inputs.q_sf),
+        weights=inputs.weights.to(torch.bfloat16),
+        compress_lens=inputs.compress_lens,
+        request_starts=inputs.request_starts,
+        lens_per_request=inputs.lens_per_request,
+        rows_per_request=inputs.rows_per_request,
+        get_keys=lambda b: keys[: inputs.lens_per_request[b]],
+    )
+
+
+def torch_reference_selection(inputs, blocks):
+    """Independent dense-and-mask Torch oracle; never calls a production scorer."""
+    scores = torch.einsum("rhd,nd->rhn", inputs.q, inputs.get_keys(0))
+    scores = (scores.relu() * inputs.weights[:, :, None]).sum(1).float()
+    keep = torch.zeros_like(scores, dtype=torch.bool)
+    for row, candidates in enumerate(blocks):
+        for block in candidates[candidates >= 0].tolist():
+            keep[row, block * BLOCK : (block + 1) * BLOCK] = True
+    columns = torch.arange(scores.shape[1], device=scores.device)
+    scores.masked_fill_(
+        ~keep | (columns[None] >= inputs.compress_lens[:, None]), -torch.inf
+    )
+    values, indices = scores.topk(min(TOPK, scores.shape[1]), dim=1)
+    out = torch.full(
+        (inputs.num_rows, TOPK), -1, dtype=torch.int32, device=scores.device
+    )
+    out[:, : indices.shape[1]] = indices.masked_fill(~torch.isfinite(values), -1).int()
+    return out
+
 
 if __name__ == "__main__":
     unittest.main()

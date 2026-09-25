@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-from sglang.srt.runtime_context import get_parallel, get_platform
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
 
 class CandidateMetadata:
@@ -34,6 +34,19 @@ class IndexerInputs:
     @property
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
+
+
+@dataclass(frozen=True)
+class TritonDecodeInputs:
+    """BF16 queries and logical-to-physical slots for the FP4 cache scorer."""
+
+    q: torch.Tensor
+    weights: torch.Tensor
+    slots: torch.Tensor  # [rows, context], physical index-K slots
+    lens: torch.Tensor  # [rows], visible logical K count
+    table: torch.Tensor  # paged FP4 payload and scales
+    page_size: int
+    topk: int
 
 
 class PrefillIndexerInputs(msgspec.Struct, frozen=True):
@@ -63,6 +76,32 @@ class PrefillIndexerInputs(msgspec.Struct, frozen=True):
     @property
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
+
+
+@dataclass(frozen=True)
+class TritonPrefillInputs:
+    """Unpacked BF16 operands; requests occupy consecutive query rows.
+
+    ``get_keys(b)`` lazily returns request b's dequantized [length, dim] K,
+    so only one request's K needs to be live. Q already has the model's RoPE
+    and FP4 rounding applied; scoring preserves the Torch BF16 arithmetic.
+    Selections use the same flattened-K coordinates as PrefillIndexerInputs.
+    """
+
+    q: torch.Tensor  # [rows, heads, dim], unpacked BF16
+    weights: torch.Tensor  # [rows, heads]
+    compress_lens: torch.Tensor  # [rows], causal lengths in compressed positions
+    request_starts: torch.Tensor  # [rows], flattened-K offsets
+    lens_per_request: List[int]
+    rows_per_request: List[int]
+    get_keys: Callable[[int], torch.Tensor]
+
+    @property
+    def num_rows(self) -> int:
+        return self.q.shape[0]
+
+
+PrefillInputs = Union[PrefillIndexerInputs, TritonPrefillInputs]
 
 
 def expand_index_page_table(
@@ -96,14 +135,21 @@ class CandidateIndexer(ABC):
     """The two-level low-ratio indexer. The candidate source publishes what its
     consumers need to select among its top candidate blocks, on the forward
     metadata; a consumer selects its top-k from that.
+    """
 
-    TODO(candidate): Hopper decode and the torch prefill path still publish and
-    consume masks inline in the backend; their decode side is not behind this
-    protocol yet."""
+    @abstractmethod
+    def publish_decode(
+        self, inputs, page_indices, raw_indices=None
+    ) -> CandidateMetadata:
+        """Write the source top-k and publish candidates for this decode/verify step."""
+
+    @abstractmethod
+    def select_decode(self, published, inputs, page_indices, raw_indices=None) -> None:
+        """Select this row's top-k from its source's candidates."""
 
     @abstractmethod
     def publish_prefill(
-        self, inputs: PrefillIndexerInputs, out_positions: torch.Tensor
+        self, inputs: PrefillInputs, out_positions: torch.Tensor
     ) -> CandidateMetadata:
         """The source layer's own top-``k`` (``k = out_positions.shape[1]``) as
         flattened-K columns, ``-1`` padded, unordered, plus its candidates for
@@ -113,7 +159,7 @@ class CandidateIndexer(ABC):
     def select_prefill(
         self,
         published: CandidateMetadata,
-        inputs: PrefillIndexerInputs,
+        inputs: PrefillInputs,
         out_positions: torch.Tensor,
     ) -> None:
         """A consumer's top-``k`` over its published candidates, in the same
@@ -130,12 +176,20 @@ class CandidateIndexer(ABC):
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
 ) -> Optional[CandidateIndexer]:
-    """DeepGEMM's paged sparse indexer on SM100, with the dense-score
-    implementation for prefill under context parallelism (a rank's local rows
-    are not the page table's rows); None on Hopper, whose decode and prefill
-    indexers select through masks inline."""
-    if topk_blocks <= 0 or get_platform().device_sm < 100:
+    """Select the candidate implementation for prefill and decode/verify.
+
+    SM100's explicit prefill override retains its normal decode/verify indexer.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsv4.triton_candidate_indexer import (
+        TritonCandidateIndexer,
+    )
+    from sglang.srt.runtime_context import get_parallel, get_platform
+
+    if topk_blocks <= 0:
         return None
+    if get_platform().device_sm < 100:
+        return TritonCandidateIndexer(topk_blocks, block_size)
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
     )
@@ -155,44 +209,29 @@ def make_candidate_indexer(
     prefill_dense = None
     if get_parallel().attn_cp_size > 1:
         prefill_dense = DenseCandidateIndexer(topk_blocks, block_size)
-    return DeepGemmCandidateIndexer(
+    indexer = DeepGemmCandidateIndexer(
         topk_blocks, block_size, prefill_dense=prefill_dense
     )
-
-
-# TODO(candidate): Hopper decode and the torch prefill path still select through
-# these masks inline in the backend.
-@dataclass
-class CandidateMasks(CandidateMetadata):
-    mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
-    request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
-
-
-def cut_request_masks(masks: CandidateMasks, tail_lens: List[int]) -> CandidateMasks:
-    """The last ``tail_lens[b]`` rows of each request's mask."""
-    assert masks.request_masks is not None, "prefill masks missing"
-    return CandidateMasks(
-        request_masks=[
-            mask[mask.shape[0] - t :] for mask, t in zip(masks.request_masks, tail_lens)
-        ]
-    )
+    if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
+        return TritonCandidateIndexer(topk_blocks, block_size, decode_indexer=indexer)
+    return indexer
 
 
 class PrefillCandidateBlocks(CandidateMetadata, msgspec.Struct):
     request_blocks: List[torch.Tensor]
 
     def tail(self, lengths: List[int]) -> PrefillCandidateBlocks:
+        if len(lengths) != len(self.request_blocks) or any(
+            length < 0 or length > blocks.shape[0]
+            for blocks, length in zip(self.request_blocks, lengths)
+        ):
+            raise ValueError("tail lengths must match and fit the published requests")
         return PrefillCandidateBlocks(
             request_blocks=[
                 blocks[blocks.shape[0] - length :]
                 for blocks, length in zip(self.request_blocks, lengths)
             ]
         )
-
-
-def published_masks(candidate) -> CandidateMasks:
-    assert isinstance(candidate, CandidateMasks), "candidate masks missing"
-    return candidate
 
 
 def mask_topk_scores(
