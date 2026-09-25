@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import torch
 
@@ -37,6 +38,20 @@ CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
 )
 
 _global_cp_decode_attn_tp_ctx: CpDecodeAttnTpContext | None = None
+
+
+@dataclass(frozen=True)
+class CpDecodeAttnTpShard:
+    """Rank-local decode shard of a linear, recorded before weight loading.
+
+    Weight post-processing that makes the tensor unsliceable along its logical
+    axes (e.g. the FP8 Marlin repack) reads this and pre-packs the shard into
+    ``linear.cp_decode_attn_tp_packed_views``.
+    """
+
+    split: Literal["output", "input"]
+    rank: int
+    size: int
 
 
 def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
@@ -68,6 +83,26 @@ class CpDecodeAttnTpContext:
     def is_enabled(self) -> bool:
         return self.decode_tp_size is not None and self.decode_tp_size > 1
 
+    def register_linears(self, linears: list) -> None:
+        """Record the decode shard of each linear the decode path will slice.
+
+        Must run at module construction, before ``process_weights_after_loading``.
+        """
+        if not self.is_enabled:
+            return
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        for linear in linears:
+            if isinstance(linear, RowParallelLinear):
+                split = "input"
+            elif isinstance(linear, ColumnParallelLinear):
+                split = "output"
+            else:
+                continue
+            linear.cp_decode_attn_tp_shard = CpDecodeAttnTpShard(
+                split=split, rank=self.decode_tp_rank, size=self.decode_tp_size
+            )
+
     def set_decode_attn_tp(self, forward_batch: ForwardBatch):
         if not self.is_enabled:
             self.use_decode_attn_tp = False
@@ -86,13 +121,28 @@ class CpDecodeAttnTpContext:
 
     # ==================== Unified activate/restore ====================
 
-    def _activate(self, obj, attr_name: str, dim: int):
-        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None."""
+    def _activate(
+        self,
+        obj,
+        attr_name: str,
+        dim: Optional[int],
+        replacement: Optional[torch.Tensor] = None,
+    ):
+        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None.
+
+        ``replacement`` swaps in a pre-packed shard instead of slicing ``dim``.
+        """
         tensor = getattr(obj, attr_name, None)
         if tensor is None:
             return
         is_param = isinstance(tensor, torch.nn.Parameter)
         raw = tensor.data if is_param else tensor
+        cache_key = (id(obj), attr_name)
+        if replacement is not None:
+            if cache_key not in self._slice_cache:
+                self._slice_cache[cache_key] = (raw, replacement, is_param)
+            self._swap_in(obj, attr_name, self._slice_cache[cache_key])
+            return
         assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
             f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
             f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
@@ -102,14 +152,16 @@ class CpDecodeAttnTpContext:
             f"not divisible by decode_tp_size={self.decode_tp_size}"
         )
 
-        cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
             cache = (raw, self._slice(raw, dim), is_param)
             self._slice_cache[cache_key] = cache
+        self._swap_in(obj, attr_name, cache)
 
+    @staticmethod
+    def _swap_in(obj, attr_name: str, cache: Tuple):
         if cache[2]:
-            tensor.data = cache[1]
+            getattr(obj, attr_name).data = cache[1]
         else:
             setattr(obj, attr_name, cache[1])
 
@@ -126,8 +178,23 @@ class CpDecodeAttnTpContext:
     # ==================== Linear helpers ====================
 
     def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
-        """Return (obj, attr_name, dim) list for a linear layer."""
+        """Return (obj, attr_name, dim, replacement) list for a linear layer."""
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        packed_views = getattr(linear_instance, "cp_decode_attn_tp_packed_views", None)
+        if packed_views is not None:
+            return [
+                (linear_instance, attr_name, None, replacement)
+                for attr_name, replacement in packed_views.items()
+            ]
+        # Marlin-packed weights are not laid out as logical [N, K]; slicing them
+        # would silently feed garbage (or mis-shaped tensors) to the GEMM.
+        assert not getattr(
+            getattr(linear_instance, "quant_method", None), "use_marlin", False
+        ), (
+            "CP decode attn TP: Marlin linear was not registered via "
+            "CpDecodeAttnTpContext.register_linears() before weight loading"
+        )
 
         if isinstance(linear_instance, RowParallelLinear):
             dim = 1
@@ -136,10 +203,10 @@ class CpDecodeAttnTpContext:
         else:
             return []
 
-        attrs = [(linear_instance, "weight", dim)]
+        attrs = [(linear_instance, "weight", dim, None)]
         for scale_name in ("weight_scale_inv", "weight_scale"):
             if getattr(linear_instance, scale_name, None) is not None:
-                attrs.append((linear_instance, scale_name, dim))
+                attrs.append((linear_instance, scale_name, dim, None))
         return attrs
 
     # ==================== Context manager ====================
@@ -171,8 +238,8 @@ class CpDecodeAttnTpContext:
         orig_tp_q_head_num = None
         try:
             for linear in modules:
-                for obj, attr_name, dim in self._get_linear_attrs(linear):
-                    self._activate(obj, attr_name, dim)
+                for obj, attr_name, dim, replacement in self._get_linear_attrs(linear):
+                    self._activate(obj, attr_name, dim, replacement)
                     all_attrs.append((obj, attr_name))
                 from sglang.srt.layers.linear import RowParallelLinear
 
