@@ -54,6 +54,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -3067,6 +3068,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
+
     _TP_STATE_PATCHED = True
     global _TP
     old_tp_group = _TP
@@ -3093,10 +3104,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
