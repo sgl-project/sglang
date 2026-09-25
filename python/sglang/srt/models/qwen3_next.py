@@ -6,7 +6,6 @@ import torch
 import triton
 from torch import nn
 
-from sglang.kernels.ops.attention import gdn_fused_prefill_aiter
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -243,28 +242,33 @@ class Qwen3GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-        # Static half of the fused GDN prefill gate: platform, opt-in, and the
-        # model shape the AITER kernel hard-codes. The per-call tensor contract
-        # is checked in the backend, which falls back rather than raising.
-        _avail = gdn_fused_prefill_aiter.available()
-        self._gdn_fused_prefill_ready = (
-            _avail
-            and self.num_v_heads == 2 * self.num_k_heads
-            and self.head_k_dim == self.head_v_dim == 128
-            and self.conv_kernel_size == 4
-        )
+        # Fused GDN prefill is AMD/AITER-only; keep it off the NVIDIA common path.
+        # Defaults hold on every platform; only HIP touches the AITER adapter.
+        # available() is the AITER-on-HIP + Triton-3.8 gate; the shape checks are
+        # the ones the kernel hard-codes; the per-call tensor contract is checked
+        # in the backend, which falls back rather than raising.
+        self._gdn_fused_prefill_ready = False
         self._gdn_fused_norm_weight = None
         self._gdn_fused_conv_bias = None
         self._gdn_out_proj_fp8 = False
-        if self._gdn_fused_prefill_ready:
-            # The kernel always applies a conv bias; models without one get zeros.
-            self._gdn_fused_conv_bias = self.conv1d.bias
-            if self._gdn_fused_conv_bias is None:
-                self._gdn_fused_conv_bias = torch.zeros(
-                    self.conv1d.weight.shape[0],
-                    device=self.conv1d.weight.device,
-                    dtype=self.conv1d.weight.dtype,
-                )
+        if _is_hip:
+            from sglang.kernels.ops.attention import gdn_fused_prefill_aiter
+
+            self._gdn_fused_prefill_ready = (
+                gdn_fused_prefill_aiter.available()
+                and self.num_v_heads == 2 * self.num_k_heads
+                and self.head_k_dim == self.head_v_dim == 128
+                and self.conv_kernel_size == 4
+            )
+            if self._gdn_fused_prefill_ready:
+                # The kernel always applies a conv bias; models without one get zeros.
+                self._gdn_fused_conv_bias = self.conv1d.bias
+                if self._gdn_fused_conv_bias is None:
+                    self._gdn_fused_conv_bias = torch.zeros(
+                        self.conv1d.weight.shape[0],
+                        device=self.conv1d.weight.device,
+                        dtype=self.conv1d.weight.dtype,
+                    )
 
     def _prepare_gdn_fused_prefill(self):
         """Publish the output-norm weight to the fused path, once, after load.

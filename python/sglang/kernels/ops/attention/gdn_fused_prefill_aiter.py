@@ -10,11 +10,12 @@ the epilogue launch -- no separate quant kernel). It is the prefill sibling of
 :mod:`gdn_fused_decode_aiter` and reaches the kernel via the same
 attempt-and-verify stash on the attention layer (see qwen3_next.py).
 
-Everything is probed, nothing is assumed: platform, opt-in env var, AITER
+Everything is probed, nothing is assumed: platform + AITER enablement, AITER
 import, Triton/Gluon toolchain, and a per-call ``covered()`` shape/dtype
 contract. Any miss leaves the stash unconsumed and the caller runs the ordinary
-unfused chain. The opt-in env var is shared with the decode adapter, so one
-switch enables both.
+unfused chain. It rides the standard AMD switch (``SGLANG_USE_AITER`` /
+``--enable-aiter``) rather than a bespoke per-kernel flag, so it is on by default
+wherever AITER is.
 
 SGLang authors no Gluon; this only consumes AITER's, and Triton >= 3.8 is probed
 rather than pinned.
@@ -23,23 +24,19 @@ rather than pinned.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
-# Shared with gdn_fused_decode_aiter: one switch enables both phases.
-_ENV_FLAG = "SGLANG_QWEN3_NEXT_GDN_FUSED_BACKEND"
-
-
-def enabled() -> bool:
-    """Opt-in. Off by default, like the other fused GDN backends."""
-    return os.environ.get(_ENV_FLAG, "").lower() == "aiter"
+# On wherever AITER is: the standard SGLANG_USE_AITER switch (--enable-aiter) on
+# HIP, not a bespoke per-kernel flag. gfx950 / Triton 3.8 specifics gate below.
+_use_aiter = bool(envs.SGLANG_USE_AITER.get()) and is_hip()
 
 
 def _ops():
@@ -55,8 +52,8 @@ def _ops():
 
 
 def available() -> bool:
-    """Platform, opt-in, import, and Gluon toolchain, in that order."""
-    if not is_hip() or not enabled() or not torch.cuda.is_available():
+    """AITER-on-HIP, import, and Gluon toolchain, in that order."""
+    if not _use_aiter or not torch.cuda.is_available():
         return False
     run, _ = _ops()
     if run is None:
