@@ -2923,6 +2923,16 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if use_mlx() and req.return_logprob and not get_device().mlx_enable_sampling:
+            error_msg = (
+                "Output logprobs on the MLX backend require --mlx-enable-sampling."
+            )
+            req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
