@@ -774,27 +774,21 @@ class LayerCommunicator:
 
     def _declared_sides(self) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN on the TP group (a dense MLP, or a MoE not
-        dispatched per DP shard), without CP, LayerNorm SP or input-scattered
-        attention, in a layer that takes the attention's rows from the layer
-        before or the embedding. None when the steps come from the scatter
-        modes."""
+        attention and an FFN, without CP, LayerNorm SP or input-scattered
+        attention, in a layer whose previous layer is known. None when the
+        steps come from the scatter modes."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
+        # A MoE dispatched per DP shard computes on this rank's local rows and
+        # hands its layer's output on there.
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
-        # A MoE dispatched per DP shard keeps its rows, and so does its output.
-        previous_on_attention_rows = modes.is_first_layer or (
-            modes.is_previous_layer_sparse is not None
-            and not (modes.is_previous_layer_sparse and moe_on_local_rows)
-        )
         if not (
             self._takes_declared_boundaries
             and parallel.attn_cp_size == 1
             and not layernorm_sp.layernorm_sp_enabled()
             and not parallel.enable_attn_tp_input_scattered
             and not enable_moe_dense_fully_dp()
-            and not (modes.is_layer_sparse and moe_on_local_rows)
-            and previous_on_attention_rows
+            and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
         return decoder_layer_sides(
@@ -803,6 +797,14 @@ class LayerCommunicator:
                 TokenAxis.ATTN_CP: parallel.attn_cp_size,
                 TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
             },
+            ffn_on_local_rows=modes.is_layer_sparse and moe_on_local_rows,
+            previous_on_local_rows=(
+                not modes.is_first_layer
+                and modes.is_previous_layer_sparse
+                and moe_on_local_rows
+            ),
+            is_last_layer=modes.is_last_layer,
+            attention_gathers_local_rows=_use_ag_after_qlora,
             ffn_group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
             leaves_for_next_layer=self.allow_deferred_ffn_reduction,
             leaves_for_reduce_scatter=self.allow_reduce_scatter,
@@ -816,36 +818,31 @@ class LayerCommunicator:
     def _select_declared_boundaries(self, sides: DecoderLayerSides) -> None:
         """Choose the three boundary sides this layer owns from the
         declarations: the attention input, the attention -> FFN steps, and the
-        FFN output's way back to the layer's rows."""
+        FFN output's way on to the rows the layer hands on."""
         self._communicate_simple_fn = _select_attention_input_move(
-            sides.layer_rows, sides.attention
-        )
-        # Neither fused kernel runs under attention DP, where the FFN input is
-        # gathered.
-        fusions = (
-            self._select_mlp_input_fusions()
-            if sides.attention_output.layout == sides.ffn.layout
-            else ()
+            sides.input_rows, sides.attention
         )
         self._mlp_input = _select_ffn_input(
             sides.attention_output,
-            residual=sides.layer_rows,
+            residual=sides.input_rows,
+            residual_to=sides.ffn_residual_rows,
             need=sides.ffn,
             force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
-            fusions=fusions,
+            fusions=self._select_mlp_input_fusions(),
         )
         self._mlp_input_may_fuse = (
-            self._mlp_input_reduce_output_and_update_and_read_residual in fusions
+            self._mlp_input_reduce_output_and_update_and_read_residual
+            in getattr(self._mlp_input, "keywords", {}).get("fusions", ())
         )
         self._ffn_output = sides.ffn_output
-        self._postprocess_scatters_to_local_tokens = _ffn_output_returns_over_dp(
-            sides.ffn_output, sides.layer_rows
+        (
+            self._postprocess_scatters_to_local_tokens,
+            postprocess,
+        ) = _select_ffn_output_move(
+            sides.ffn_output, residual=sides.ffn_residual_rows, to=sides.output_rows
         )
-        if not self._postprocess_scatters_to_local_tokens:
-            # The FFN output is already on the layer's rows.
-            self._communicate_summable_tensor_pair_fn = (
-                CommunicateSummableTensorPairFn._trivial
-            )
+        if postprocess is not None:
+            self._communicate_summable_tensor_pair_fn = postprocess
         self._ffn_sum_is_movable = sides.ffn_output.group is not None
 
     def _select_boundaries_from_scatter_modes(self) -> None:
@@ -1828,31 +1825,34 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
 
 
 def _select_attention_input_move(rows: Layout, need: StageInput) -> Callable:
-    """How the rows a layer takes become its attention's input."""
-    if rows == need.layout:
-        return CommunicateSimpleFn._trivial
-    raise NotImplementedError(f"{rows=} {need=}")
+    """How the rows a layer takes become its attention's input: as they are,
+    or gathered over attention TP from each rank's slice, unless the attention
+    gathers them itself."""
+    gathered = rows.sharded - need.layout.sharded - need.gathers_itself
+    if not need.layout.sharded <= rows.sharded or gathered not in (
+        frozenset(),
+        {TokenAxis.ATTN_TP_SCATTER},
+    ):
+        raise NotImplementedError(f"{rows=} {need=}")
+    if gathered:
+        return CommunicateSimpleFn._scattered_to_tp_attn_full
+    return CommunicateSimpleFn._trivial
 
 
 def _select_ffn_input(
     produced: StageOutput,
     *,
     residual: Layout,
+    residual_to: Layout,
     need: StageInput,
     force_layernorm_before_gather: bool,
     fusions: Tuple[Callable, ...],
 ) -> Callable:
     """The steps from the attention output to the FFN input: complete the
-    attention-TP sum, add the residual and normalize, and gather the rows the
-    FFN's group needs, with the residual left on the attention's rows. The
-    fused kernels in ``fusions`` are tried first when no rows are gathered."""
-    gathered = produced.layout.sharded - need.layout.sharded
-    if (
-        residual != produced.layout
-        or not need.layout.sharded <= produced.layout.sharded
-        or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
-    ):
-        raise NotImplementedError(f"{produced=} {residual=} {need=}")
+    attention-TP sum, move the residual to the rows it has while the FFN runs,
+    add it and normalize, and bring the rows to what the FFN's group needs: a
+    gather over attention DP, or each rank's own slice. The fused kernels in
+    ``fusions`` are tried first when nothing is gathered or sliced."""
     # What the attention output owes decides the steps: the attention-TP sum,
     # always left by the output projection, or nothing.
     owes_attention_tp = produced.group is SumGroup.ATTN_TP
@@ -1861,32 +1861,70 @@ def _select_ffn_input(
         SumGroup.ATTN_TP,
     ):
         raise NotImplementedError(f"{produced=}")
+    gathered = produced.layout.sharded - need.layout.sharded
+    sliced = need.layout.sharded - produced.layout.sharded
+    if sliced:
+        # Each attention-TP rank takes its own slice: the reduce-scatter
+        # completes the attention-TP sum and slices in one collective.
+        if (
+            sliced != {TokenAxis.ATTN_TP_SCATTER}
+            or gathered
+            or not owes_attention_tp
+            or residual_to != need.layout
+            or residual not in (produced.layout, need.layout)
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        return partial(_mlp_input_scatter, scatters_residual=residual != residual_to)
+    if (
+        residual_to != produced.layout
+        or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
+        or residual.sharded - residual_to.sharded
+        not in (frozenset(), {TokenAxis.ATTN_TP_SCATTER})
+    ):
+        raise NotImplementedError(f"{produced=} {residual=} {need=}")
+    # A residual arriving on each rank's slice is gathered back first.
+    gathers_residual = residual != residual_to
     if not gathered:
         if not owes_attention_tp:
             return _mlp_input_norm
-        return partial(_mlp_input_without_dp, gathers_residual=False, fusions=fusions)
+        return partial(
+            _mlp_input_without_dp, gathers_residual=gathers_residual, fusions=fusions
+        )
     # The partial order adds the residual on attention-TP rank 0 before the DP
     # gather's collective completes that sum, which only a plain residual add
     # allows.
     if owes_attention_tp and not force_layernorm_before_gather:
-        return partial(_mlp_input_dp_partial, gathers_residual=False)
+        return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual)
     return partial(
         _mlp_input_dp_replicate,
-        gathers_residual=False,
+        gathers_residual=gathers_residual,
         reduces_attention_tp=owes_attention_tp,
     )
 
 
-def _ffn_output_returns_over_dp(produced: StageOutput, rows: Layout) -> bool:
-    """Whether the FFN output goes back to the layer's rows by undoing the
-    attention-DP gather."""
-    returned = rows.sharded - produced.layout.sharded
-    if not produced.layout.sharded <= rows.sharded or returned not in (
-        frozenset(),
-        {TokenAxis.ATTN_DP},
+def _select_ffn_output_move(
+    produced: StageOutput, *, residual: Layout, to: Layout
+) -> Tuple[bool, Optional[Callable]]:
+    """How the FFN output reaches the rows the layer hands on: whether it goes
+    back by undoing the attention-DP gather (the FFN exit and postprocess run
+    that step), or else the postprocess that moves it, None when there is none
+    to choose here."""
+    if produced.layout == residual:
+        if to == residual:
+            return False, CommunicateSummableTensorPairFn._trivial
+        if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
+            # Each rank's slice back to the attention's rows: fold the residual
+            # into the output, then gather over attention TP.
+            return False, CommunicateSummableTensorPairFn._gather
+        raise NotImplementedError(f"{produced=} {residual=} {to=}")
+    returned = residual.sharded - produced.layout.sharded
+    if (
+        to != residual
+        or not produced.layout.sharded <= residual.sharded
+        or returned != {TokenAxis.ATTN_DP}
     ):
-        raise NotImplementedError(f"{produced=} {rows=}")
-    return bool(returned)
+        raise NotImplementedError(f"{produced=} {residual=} {to=}")
+    return True, None
 
 
 class MlpInputKind(Enum):
