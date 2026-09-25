@@ -14,6 +14,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
+from .candidate_table import CANDIDATE_BLOCK_SIZE, amax8_varlen
+from .topk import plan_topk_v2, topk_transform_paged_v2
+
 
 @triton.jit
 def _candidate_row_lens_kernel(
@@ -83,11 +86,8 @@ def amax_topk_blocks(
     maximum among its first ``seq_lens[b]`` positions, the newest block always
     included: block ids in no particular order, ``-1`` past the row's count.
     ``nblocks`` is ``ceil(seq_lens / 8)`` as int32."""
-    from .candidate_table import amax8_varlen
-    from .topk import plan_topk_v2, topk_transform_paged_v2
-
     rows = logits.shape[0]
-    block = 8
+    block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
         max_seq_len = logits.shape[1]
     # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2

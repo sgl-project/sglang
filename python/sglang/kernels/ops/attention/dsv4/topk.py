@@ -123,6 +123,31 @@ def topk_transform_paged(
         )
 
 
+def topk_transform_paged_torch(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """The torch ``topk_transform_paged``: the top-``k`` (``k = out_page_indices.shape[1]``)
+    of each row of ``scores`` within its first ``seq_lens[b]`` columns, ascending, as
+    pool slots through ``page_tables`` and, when given, as positions; ``-1`` where a
+    row has fewer than ``k`` columns."""
+    topk = out_page_indices.shape[1]
+    columns = torch.arange(scores.shape[1], device=seq_lens.device)
+    lens_c = seq_lens.unsqueeze(-1)
+    # Columns past a row's length hold garbage.
+    s = scores.masked_fill(columns[None, :] >= lens_c, -torch.inf)
+    idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+    reach = idx < lens_c
+    slots = page_tables.gather(-1, idx // page_size) * page_size + (idx % page_size)
+    out_page_indices.copy_(torch.where(reach, slots, -1).to(torch.int32))
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
+
+
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
 # rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
 _PLAN_METADATA_INTS_PER_BATCH = 2
