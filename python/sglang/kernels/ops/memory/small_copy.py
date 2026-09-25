@@ -3,28 +3,31 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
+    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
+)
 def _small_copy_kernel(
     sources,
     destinations,
-    SIZES: tl.constexpr,
-    COLS: tl.constexpr,
-    SOURCE_STRIDES: tl.constexpr,
-    DEST_STRIDES: tl.constexpr,
+    sizes,
+    cols,
+    source_strides,
+    dest_strides,
     BIT_WIDTHS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     field = tl.program_id(0)
     offsets = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    for i in tl.static_range(len(SIZES)):
+    for i in tl.static_range(len(BIT_WIDTHS)):
         if field == i:
             src_offset = (
-                offsets // COLS[i] * SOURCE_STRIDES[i][0]
-                + offsets % COLS[i] * SOURCE_STRIDES[i][1]
+                offsets // cols[i] * source_strides[i][0]
+                + offsets % cols[i] * source_strides[i][1]
             )
             dst_offset = (
-                offsets // COLS[i] * DEST_STRIDES[i][0]
-                + offsets % COLS[i] * DEST_STRIDES[i][1]
+                offsets // cols[i] * dest_strides[i][0]
+                + offsets % cols[i] * dest_strides[i][1]
             )
             src = sources[i]
             dst = destinations[i]
@@ -40,8 +43,8 @@ def _small_copy_kernel(
             elif BIT_WIDTHS[i] == 64:
                 src = src.to(tl.pointer_type(tl.uint64))
                 dst = dst.to(tl.pointer_type(tl.uint64))
-            values = tl.load(src + src_offset, offsets < SIZES[i], other=0)
-            tl.store(dst + dst_offset, values, offsets < SIZES[i])
+            values = tl.load(src + src_offset, offsets < sizes[i], other=0)
+            tl.store(dst + dst_offset, values, offsets < sizes[i])
 
 
 def try_small_copy(dsts, srcs):

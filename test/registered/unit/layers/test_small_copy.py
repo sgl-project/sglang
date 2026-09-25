@@ -5,7 +5,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 import pytest
 import torch
 
-from sglang.kernels.ops.memory.small_copy import try_small_copy
+from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
 
 
 @pytest.mark.parametrize("n", [0, 1, 8, 128, 4096])
@@ -98,3 +98,30 @@ def test_broadcast_and_negative_views():
     assert torch.equal(destinations[0], expanded)
     assert torch.equal(destinations[1], source)
     assert not try_small_copy(destinations, [expanded, source._neg_view()])
+
+
+def test_dynamic_metadata_has_bounded_specializations():
+    kernel_cache = _small_copy_kernel.device_caches[torch.cuda.current_device()][0]
+    initial_count = len(kernel_cache)
+    specialization_count = None
+    for n in [*range(1, 130), 255, 256, 511, 512, 1023, 1024, 2048, 2730]:
+        step = 1 + n % 3
+        source = torch.arange(n * step, device="cuda", dtype=torch.int64)[::step]
+        backing = torch.full((n * step,), -7, device="cuda", dtype=torch.int32)
+        destination = backing[::step]
+        matrix = torch.arange(3 * (n + 3), device="cuda", dtype=torch.int32).reshape(
+            3, n + 3
+        )[:, :n]
+        matrix_backing = torch.full((3, n + 5), -7, device="cuda", dtype=torch.int64)
+        matrix_destination = matrix_backing[:, :n]
+        assert try_small_copy([destination, matrix_destination], [source, matrix])
+        assert torch.equal(destination, source.int())
+        assert torch.equal(matrix_destination, matrix.long())
+        assert bool((matrix_backing[:, n:] == -7).all())
+        for offset in range(1, step):
+            assert bool((backing[offset::step] == -7).all())
+        if n == 48:
+            specialization_count = len(kernel_cache)
+            assert specialization_count - initial_count <= 16
+        elif n > 48:
+            assert len(kernel_cache) == specialization_count
