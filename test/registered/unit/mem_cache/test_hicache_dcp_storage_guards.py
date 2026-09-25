@@ -1,4 +1,4 @@
-"""Startup and runtime support boundaries for DCP file storage."""
+"""Startup and runtime support boundaries for DCP L3 storage."""
 
 import threading
 import unittest
@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.arg_groups.hicache_hook import (
+    handle_hicache,
     resolve_hicache_dcp_compatibility,
 )
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -25,6 +27,7 @@ def _args(**changes):
         tp_size=4,
         dcp_size=2,
         enable_hierarchical_cache=True,
+        hicache_ratio=2,
         hicache_storage_backend="file",
         hicache_mem_layout="page_first",
         hicache_io_backend="kernel",
@@ -38,6 +41,45 @@ def _args(**changes):
 
 
 class TestDcpStorageGuards(unittest.TestCase):
+    def test_mooncake_startup_preserves_dcp_layer_first(self):
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            for io in ("kernel", "direct"):
+                for backend in ("mooncake", None):
+                    with self.subTest(io=io, backend=backend):
+                        args = _args(
+                            hicache_storage_backend=backend,
+                            hicache_mem_layout="layer_first",
+                            hicache_io_backend=io,
+                        )
+                        handle_hicache(args)
+                        self.assertEqual(
+                            resolving_view(args).hicache_mem_layout, "layer_first"
+                        )
+
+    def test_other_storage_layout_defaults_are_unchanged(self):
+        for backend, dcp in (("mooncake", 1), ("npu_memcache", 2)):
+            for io, expected in (
+                ("kernel", "page_first"),
+                ("direct", "page_first_direct"),
+            ):
+                with (
+                    self.subTest(backend=backend, dcp=dcp, io=io),
+                    mock.patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=True,
+                    ),
+                ):
+                    args = _args(
+                        dcp_size=dcp,
+                        hicache_storage_backend=backend,
+                        hicache_mem_layout="layer_first",
+                        hicache_io_backend=io,
+                    )
+                    handle_hicache(args)
+                    self.assertEqual(resolving_view(args).hicache_mem_layout, expected)
+
     def test_supported_topologies(self):
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
@@ -109,8 +151,9 @@ class TestDcpStorageGuards(unittest.TestCase):
         allocator = mock.Mock()
         allocator.get_kvcache.return_value = device
         for backend, pool, message in (
-            ("mooncake", host, "requires file storage"),
+            ("hf3fs", host, "requires file or Mooncake storage"),
             ("file", object(), "requires one materialized MLA host pool"),
+            ("mooncake", object(), "requires one materialized MLA host pool"),
         ):
             entry = SimpleNamespace(host_pool=pool)
             group = SimpleNamespace(anchor_entry=entry, entries=[entry])
