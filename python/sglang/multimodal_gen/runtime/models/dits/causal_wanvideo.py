@@ -130,10 +130,11 @@ class CausalWanSelfAttention(nn.Module):
         v: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        complex_freqs: torch.Tensor | None = None,
         kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ):
         r"""
         Args:
@@ -391,11 +392,12 @@ class CausalWanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        complex_freqs: torch.Tensor | None = None,
         kv_cache: CausalSelfAttentionKVCache | None = None,
         crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # hidden_states.shape: [batch_size, seq_length, inner_dim]
         # temb.shape: [batch_size, num_frames, 6, inner_dim]
@@ -452,10 +454,10 @@ class CausalWanTransformerBlock(nn.Module):
             value,
             freqs_cis,
             block_mask,
-            complex_freqs,
             kv_cache,
             current_start,
             cache_start,
+            complex_freqs=complex_freqs,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
