@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import PlainValidator, StrictFloat, StrictInt
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
@@ -2605,8 +2605,10 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
-    server_args: Dict[str, Union[int, float]]
+    # Keep bool distinct through HTTP validation and IPC: numeric handlers must
+    # reject it, while dspark_clear_info_records is a boolean worker command.
+    # None resets dspark_force_budget_frac. Do not coerce strings into numbers.
+    server_args: Dict[str, Union[bool, StrictInt, StrictFloat, None]]
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
