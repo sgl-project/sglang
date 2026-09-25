@@ -57,6 +57,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         moe_dp_size=1,
         dwdp_size=1,
         enable_dp_attention=attn_dp > 1,
+        enable_attn_tp_input_scattered=False,
         tp_group=SimpleNamespace(name="tp"),
         attn_tp_group=SimpleNamespace(name="attn_tp"),
     )
@@ -100,6 +101,13 @@ class Norm:
             return x * 2
         s = x + residual
         return s * 2, s
+
+
+class FusableNorm(Norm):
+    """A norm with the fused all-reduce + add + norm method."""
+
+    def forward_with_allreduce_fusion(self, *args, **kwargs):
+        raise AssertionError("not run here")
 
 
 class FactsOnly:
@@ -149,7 +157,7 @@ class TestDeclarationsMatchScatterModes(CustomTestCase):
 
     def test_every_attention_dp_and_tp(self):
         for attn_dp, attn_tp, layer_id in itertools.product(
-            (2, 4, 8), (1, 2, 4), (0, 1, 3)
+            (1, 2, 4, 8), (1, 2, 4), (0, 1, 3)
         ):
             with self.subTest(attn_dp=attn_dp, attn_tp=attn_tp, layer_id=layer_id):
                 parallel = parallel_of(attn_dp=attn_dp, attn_tp=attn_tp)
@@ -202,9 +210,10 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
     declarations, or none do."""
 
     def declared(self, communicator):
-        return communicator._mlp_input.func in (
+        return getattr(communicator._mlp_input, "func", None) in (
             comm._mlp_input_dp_partial,
             comm._mlp_input_dp_replicate,
+            comm._mlp_input_without_dp,
         )
 
     def test_a_dense_model(self):
@@ -218,6 +227,38 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                     comm.CommunicateSimpleFn._trivial,
                 )
                 self.assertTrue(communicator._postprocess_scatters_to_local_tokens)
+
+    def test_plain_tp(self):
+        # Without attention DP nothing is gathered: the attention-TP sum, then
+        # add + norm, with the fused kernel first when the norm has it.
+        for norm, fuses in ((Norm, False), (FusableNorm, True)):
+            with self.subTest(norm=norm.__name__):
+                with planning(parallel_of(attn_dp=1, attn_tp=2)):
+                    communicator = LayerCommunicator(
+                        layer_scatter_modes=dense_layer_facts(1, 3),
+                        input_layernorm=norm(),
+                        post_attention_layernorm=norm(),
+                    )
+                self.assertIs(communicator._mlp_input.func, comm._mlp_input_without_dp)
+                entry = (
+                    communicator._mlp_input_reduce_output_and_update_and_read_residual
+                )
+                self.assertEqual(
+                    communicator._mlp_input.keywords["fusions"],
+                    (entry,) if fuses else (),
+                )
+                self.assertIs(communicator._mlp_input_may_fuse, fuses)
+                self.assertFalse(communicator._postprocess_scatters_to_local_tokens)
+                self.assertIs(
+                    communicator._communicate_summable_tensor_pair_fn,
+                    comm.CommunicateSummableTensorPairFn._trivial,
+                )
+        # One rank: the attention output is complete, only the norm is left.
+        one_rank = parallel_of(attn_dp=1, attn_tp=1)
+        single = build(dense_layer_facts(1, 3), one_rank)
+        with planning(one_rank):
+            self.assertIsNotNone(single._declared_sides())
+        self.assertIs(single._mlp_input, comm._mlp_input_norm)
 
     def test_the_order_follows_the_attention_output(self):
         for attn_tp, force, order in (
@@ -253,9 +294,9 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
     def test_layers_that_keep_the_scatter_modes(self):
         dp = parallel_of(attn_dp=2, attn_tp=2)
         cases = {
-            "no attention DP": (
+            "input-scattered attention": (
                 dense_layer_facts(1, 3),
-                parallel_of(attn_dp=1, attn_tp=4),
+                parallel_of(attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True),
             ),
             "attention CP": (
                 dense_layer_facts(1, 3),
@@ -321,6 +362,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             residual=sides.layer_rows,
             need=sides.ffn,
             force_layernorm_before_gather=force,
+            fusions=(),
         )
         reduced = []
         context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=0)
@@ -554,7 +596,7 @@ def running(*, reduce_scatterv):
         "get_dp_global_num_tokens": lambda: state().dp_rows,
         "should_use_dp_reduce_scatterv": lambda: reduce_scatterv,
         "can_use_dp_reduce_scatter": lambda: True,
-        "is_dp_attention_enabled": lambda: True,
+        "is_dp_attention_enabled": lambda: state().parallel.attn_dp_size > 1,
         "apply_flashinfer_allreduce_fusion": lambda n: False,
         "post_experts_output_is_complete": lambda **kw: False,
         "post_experts_reduction_group": lambda: state().parallel.tp_group,
@@ -638,6 +680,8 @@ class TestTwoDenseLayers(CustomTestCase):
             ),
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: max_len),
             global_dp_buffer_len=global_rows,
+            # Without attention DP the FFN exit counts this rank's tokens.
+            input_ids=torch.zeros(rows[0]),
         )
         states = []
         for rank in range(tp):
@@ -708,18 +752,22 @@ class TestTwoDenseLayers(CustomTestCase):
 
     def test_rows_come_back_to_each_rank(self):
         for (attn_dp, attn_tp), rows, padding, leaves in itertools.product(
-            ((2, 2), (4, 1), (2, 1)),
+            ((2, 2), (4, 1), (2, 1), (1, 2), (1, 4)),
             ("ragged", "idle"),
             ("sum_len", "max_len"),
             (False, True),
         ):
             token_rows = {
+                ("ragged", 1): [3],
+                ("idle", 1): [0],
                 ("ragged", 2): [3, 1],
                 ("idle", 2): [2, 0],
                 ("ragged", 4): [2, 3, 1, 1],
                 ("idle", 4): [2, 0, 3, 1],
             }[rows, attn_dp]
-            for reduce_scatterv in (False, True) if attn_tp == 1 else (False,):
+            for reduce_scatterv in (
+                (False, True) if attn_tp == 1 and attn_dp > 1 else (False,)
+            ):
                 with self.subTest(
                     attn_dp=attn_dp,
                     attn_tp=attn_tp,
@@ -739,9 +787,11 @@ class TestTwoDenseLayers(CustomTestCase):
                     first_layer_hands_on = results[0][2][0]
                     # A producer that may leave its sum leaves it for the next
                     # layer's input; one that may not hands on a complete value.
+                    # Without attention DP an empty batch completes its own sum.
+                    has_tokens = attn_dp > 1 or sum(token_rows) > 0
                     self.assertIs(
                         first_layer_hands_on,
-                        UnreducedOutput if leaves else torch.Tensor,
+                        UnreducedOutput if leaves and has_tokens else torch.Tensor,
                     )
 
 

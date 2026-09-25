@@ -119,12 +119,15 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
-        assert comm._select_mlp_input_fusions(ScatterMode.TP_ATTN_FULL) == (
-            cutedsl,
-            base,
+        comm.layer_scatter_modes = SimpleNamespace(
+            layer_input_mode=ScatterMode.TP_ATTN_FULL
         )
+        assert comm._select_mlp_input_fusions() == (cutedsl, base)
         # A scattered residual is gathered first, which the workspace does not do.
-        assert comm._select_mlp_input_fusions(ScatterMode.SCATTERED) == (base,)
+        comm.layer_scatter_modes = SimpleNamespace(
+            layer_input_mode=ScatterMode.SCATTERED
+        )
+        assert comm._select_mlp_input_fusions() == (base,)
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
