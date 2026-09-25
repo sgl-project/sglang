@@ -26,7 +26,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.runtime_context import get_lora, get_model, get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -437,6 +437,9 @@ class Gemma3nAttention(nn.Module):
                 ),
             )
 
+        self.q_only_rope = (
+            self.q_only and is_cuda() and not self.rotary_emb.use_fallback_kernel
+        )
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
         self.attn = RadixAttention(
@@ -509,11 +512,11 @@ class Gemma3nAttention(nn.Module):
             # Reshape k back to head format for attention
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
-            # For shared KV layers, create a dummy key for rotary embedding and discard it
-            dummy_k = torch.zeros_like(
-                q[:, : self.kv_size]
-            )  # Create dummy key with same shape as needed
-            q, _ = self.rotary_emb(positions, q, dummy_k)
+            # The CUDA RoPE kernel accepts zero K heads without allocating a dummy.
+            rope_k = (
+                q[:, :0] if self.q_only_rope else torch.zeros_like(q[:, : self.kv_size])
+            )
+            q, _ = self.rotary_emb(positions, q, rope_k)
 
         # Reshape q back to head format for attention
         q = q.unflatten(-1, (self.num_heads, self.head_dim))

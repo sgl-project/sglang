@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -156,6 +157,30 @@ class TestGemma3nQOnly(CustomTestCase):
                     attention.qkv_proj.weight, weight[:output_size]
                 )
                 torch.testing.assert_close(attention.qkv_proj.bias, bias[:output_size])
+                # The nonstandard head_dim=4 fixture uses fallback RoPE on CUDA.
+                self.assertFalse(attention.q_only_rope)
+
+    def test_zero_head_rope_requires_supported_cuda_kernel(self):
+        for cuda in (False, True):
+            for fallback in (False, True):
+                with (
+                    self.subTest(cuda=cuda, fallback=fallback),
+                    get_context().override_server_args(),
+                    get_parallel().override(tp_size=1, tp_rank=0),
+                    patch(
+                        "sglang.srt.models.gemma3n_causal.is_cuda", return_value=cuda
+                    ),
+                    patch(
+                        "sglang.srt.models.gemma3n_causal.get_rope",
+                        return_value=SimpleNamespace(use_fallback_kernel=fallback),
+                    ),
+                ):
+                    attention = Gemma3nAttention(
+                        layer_id=2,
+                        config=self._config(),
+                        max_position_embeddings=32,
+                    )
+                    self.assertEqual(attention.q_only_rope, cuda and not fallback)
 
     def test_quantized_consumers_preserve_all_checkpoint_scales(self):
         """Packed FP8 input scales include K/V even though attention reuses KV."""
