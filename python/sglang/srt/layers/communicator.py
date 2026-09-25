@@ -822,7 +822,7 @@ class LayerCommunicator:
         self._communicate_simple_fn = _select_attention_input_move(
             sides.input_rows, sides.attention
         )
-        self._mlp_input = _select_ffn_input(
+        self._mlp_input, fused = _select_ffn_input(
             sides.attention_output,
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
@@ -830,9 +830,8 @@ class LayerCommunicator:
             force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
             fusions=self._select_mlp_input_fusions(),
         )
-        self._mlp_input_may_fuse = (
-            self._mlp_input_reduce_output_and_update_and_read_residual
-            in getattr(self._mlp_input, "keywords", {}).get("fusions", ())
+        self._mlp_input_may_return_new_residual = any(
+            f.may_return_new_residual for f in fused
         )
         self._ffn_output = sides.ffn_output
         (
@@ -874,7 +873,9 @@ class LayerCommunicator:
             ScatterMode.MOE_FULL,
             ScatterMode.SCATTERED,
         )
-        self._mlp_input, self._mlp_input_may_fuse = self._select_mlp_input()
+        self._mlp_input, self._mlp_input_may_return_new_residual = (
+            self._select_mlp_input()
+        )
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -927,14 +928,14 @@ class LayerCommunicator:
         """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
         untouched, so Eagle3 aux capture can keep its reference and skip the clone.
 
-        Only the flashinfer all-reduce-fusion kernel writes a fresh
+        Of the base fused entry's kernels only flashinfer's writes a fresh
         ``residual_out`` (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter
-        fused kernel and every plain norm fold into ``residual`` in place. It runs
-        when ``prepare_mlp`` selected its fused entry and the batch is not
-        input-scattered.
+        kernel and every plain norm fold into ``residual`` in place. It runs when
+        ``prepare_mlp`` selected a fused entry that may return a new residual and
+        the batch is not input-scattered.
         """
         return (
-            self._mlp_input_may_fuse
+            self._mlp_input_may_return_new_residual
             and not get_attn_tp_context().input_scattered
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
@@ -1127,23 +1128,26 @@ class LayerCommunicator:
         )
         steps = partial(
             _mlp_input_gather,
-            order=_mlp_input_order(self._context, residual_input_mode, fusions),
+            order=_mlp_input_order(
+                self._context, residual_input_mode, tuple(f.run for f in fusions)
+            ),
         )
         if kind is MlpInputKind.GATHER_MOE_CP:
             steps = partial(_mlp_input_gather_moe_cp, gather=steps)
-        return (
-            steps,
-            self._mlp_input_reduce_output_and_update_and_read_residual in fusions,
-        )
+        return steps, any(f.may_return_new_residual for f in fusions)
 
-    def _select_mlp_input_fusions(self) -> Tuple[Callable, ...]:
-        """The fused kernels that complete the attention output's all-reduce
-        together with the residual update and the post-attention norm, in the
-        order they are tried. Each takes (hidden_states, residual, forward_batch)
-        and returns None when it does not take the batch."""
+    def _select_mlp_input_fusions(self) -> Tuple["FusedMlpInput", ...]:
+        """The fused kernels that can take the attention -> FFN steps, in the
+        order they are tried."""
         if not hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion"):
             return ()
-        return (self._mlp_input_reduce_output_and_update_and_read_residual,)
+        return (
+            FusedMlpInput(
+                completes=SumGroup.ATTN_TP,
+                run=self._mlp_input_reduce_output_and_update_and_read_residual,
+                may_return_new_residual=True,
+            ),
+        )
 
     def _mlp_input_reduce_output_and_update_and_read_residual(
         self,
@@ -1723,6 +1727,21 @@ def _reduce_and_redistribute_output_to_dp(
     return global_hidden_states
 
 
+class FusedMlpInput(msgspec.Struct, frozen=True):
+    """A kernel that completes the sum the attention output owes together with
+    the residual add and the post-attention norm, in that order.
+
+    ``run(hidden_states, residual, forward_batch)`` returns the FFN's input and
+    the residual, or None when it does not take the batch; it returns None only
+    before touching its inputs or starting a collective."""
+
+    # The group whose sum it completes.
+    completes: SumGroup
+    run: Callable[..., Optional[Tuple[torch.Tensor, torch.Tensor]]]
+    # It may hand back a new residual and leave the one it took unchanged.
+    may_return_new_residual: bool
+
+
 def _mlp_input_without_dp(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -1846,13 +1865,14 @@ def _select_ffn_input(
     residual_to: Layout,
     need: StageInput,
     force_layernorm_before_gather: bool,
-    fusions: Tuple[Callable, ...],
-) -> Callable:
-    """The steps from the attention output to the FFN input: complete the
-    attention-TP sum, move the residual to the rows it has while the FFN runs,
-    add it and normalize, and bring the rows to what the FFN's group needs: a
-    gather over attention DP, or each rank's own slice. The fused kernels in
-    ``fusions`` are tried first when nothing is gathered or sliced."""
+    fusions: Tuple[FusedMlpInput, ...],
+) -> Tuple[Callable, Tuple[FusedMlpInput, ...]]:
+    """The steps from the attention output to the FFN input, and the fused
+    kernels they try first: complete the attention-TP sum, move the residual to
+    the rows it has while the FFN runs, add it and normalize, and bring the rows
+    to what the FFN's group needs: a gather over attention DP, or each rank's
+    own slice. A kernel in ``fusions`` is tried only when nothing is gathered or
+    sliced, and only if it completes the sum the attention output owes."""
     # What the attention output owes decides the steps: the attention-TP sum,
     # always left by the output projection, or nothing.
     owes_attention_tp = produced.group is SumGroup.ATTN_TP
@@ -1874,7 +1894,10 @@ def _select_ffn_input(
             or residual not in (produced.layout, need.layout)
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
-        return partial(_mlp_input_scatter, scatters_residual=residual != residual_to)
+        return (
+            partial(_mlp_input_scatter, scatters_residual=residual != residual_to),
+            (),
+        )
     if (
         residual_to != produced.layout
         or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
@@ -1886,19 +1909,28 @@ def _select_ffn_input(
     gathers_residual = residual != residual_to
     if not gathered:
         if not owes_attention_tp:
-            return _mlp_input_norm
-        return partial(
-            _mlp_input_without_dp, gathers_residual=gathers_residual, fusions=fusions
+            return _mlp_input_norm, ()
+        fused = tuple(f for f in fusions if f.completes is produced.group)
+        return (
+            partial(
+                _mlp_input_without_dp,
+                gathers_residual=gathers_residual,
+                fusions=tuple(f.run for f in fused),
+            ),
+            fused,
         )
     # The partial order adds the residual on attention-TP rank 0 before the DP
     # gather's collective completes that sum, which only a plain residual add
     # allows.
     if owes_attention_tp and not force_layernorm_before_gather:
-        return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual)
-    return partial(
-        _mlp_input_dp_replicate,
-        gathers_residual=gathers_residual,
-        reduces_attention_tp=owes_attention_tp,
+        return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual), ()
+    return (
+        partial(
+            _mlp_input_dp_replicate,
+            gathers_residual=gathers_residual,
+            reduces_attention_tp=owes_attention_tp,
+        ),
+        (),
     )
 
 

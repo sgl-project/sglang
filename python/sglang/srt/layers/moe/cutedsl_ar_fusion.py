@@ -13,7 +13,9 @@ from typing import Callable, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.srt.layers.boundary_layout import SumGroup
 from sglang.srt.layers.communicator import (
+    FusedMlpInput,
     LayerCommunicator,
     ScatterMode,
     UnreducedOutput,
@@ -248,7 +250,11 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and _fused_norm_gamma(self.post_attention_layernorm) is not None
         ):
             return (
-                self._mlp_input_reduce_output_and_update_and_read_residual_cutedsl,
+                FusedMlpInput(
+                    completes=SumGroup.TP,
+                    run=self._mlp_input_reduce_output_and_update_and_read_residual_cutedsl,
+                    may_return_new_residual=True,
+                ),
                 *fusions,
             )
         return fusions

@@ -310,7 +310,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                     communicator._mlp_input.keywords["fusions"],
                     (entry,) if fuses else (),
                 )
-                self.assertIs(communicator._mlp_input_may_fuse, fuses)
+                self.assertIs(communicator._mlp_input_may_return_new_residual, fuses)
                 self.assertFalse(communicator._postprocess_scatters_to_local_tokens)
                 self.assertIs(
                     communicator._communicate_summable_tensor_pair_fn,
@@ -474,7 +474,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             TokenAxis.ATTN_TP_SCATTER: 2,
         }
         sides = sides_of(sizes)
-        steps = comm._select_ffn_input(
+        steps, _ = comm._select_ffn_input(
             produced,
             residual=sides.input_rows,
             residual_to=sides.ffn_residual_rows,
@@ -559,6 +559,73 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
                 self.assertRaises(NotImplementedError),
             ):
                 self.run_steps(produced)
+
+
+class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
+    """A fused kernel replaces the attention-TP sum, the residual add and the
+    norm only where those are the steps, and only if it completes the sum the
+    attention output owes."""
+
+    def fused(self, completes, may_return_new_residual):
+        return comm.FusedMlpInput(
+            completes=completes,
+            run=lambda h, r, fb: None,
+            may_return_new_residual=may_return_new_residual,
+        )
+
+    def select(self, *, attn_dp, fusions):
+        sides = sides_of(
+            {
+                TokenAxis.ATTN_DP: attn_dp,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+        return comm._select_ffn_input(
+            sides.attention_output,
+            residual=sides.input_rows,
+            residual_to=sides.ffn_residual_rows,
+            need=sides.ffn,
+            force_layernorm_before_gather=False,
+            fusions=fusions,
+        )
+
+    def test_a_kernel_over_another_group_is_not_chosen(self):
+        over_tp = self.fused(SumGroup.TP, True)
+        over_attention_tp = self.fused(SumGroup.ATTN_TP, False)
+        steps, chosen = self.select(attn_dp=1, fusions=(over_tp, over_attention_tp))
+        self.assertIs(steps.func, comm._mlp_input_without_dp)
+        self.assertEqual(steps.keywords["fusions"], (over_attention_tp.run,))
+        self.assertEqual(chosen, (over_attention_tp,))
+
+    def test_no_kernel_is_chosen_where_rows_are_gathered(self):
+        steps, chosen = self.select(
+            attn_dp=2, fusions=(self.fused(SumGroup.ATTN_TP, True),)
+        )
+        self.assertIs(steps.func, comm._mlp_input_dp_partial)
+        self.assertEqual(chosen, ())
+
+    def test_aux_capture_follows_the_chosen_kernels(self):
+        # Only a chosen kernel that may hand back a new residual lets aux capture
+        # keep its reference to the one prepare_mlp took.
+        for kernels, expected in (
+            ((self.fused(SumGroup.ATTN_TP, False),), False),
+            ((self.fused(SumGroup.ATTN_TP, True),), True),
+            ((self.fused(SumGroup.TP, True),), False),
+        ):
+            with self.subTest(kernels=kernels):
+
+                class Declaring(LayerCommunicator):
+                    def _select_mlp_input_fusions(self):
+                        return kernels
+
+                with planning(parallel_of(attn_dp=1, attn_tp=2)):
+                    communicator = Declaring(
+                        layer_scatter_modes=layer_facts(1, 3),
+                        input_layernorm=Norm(),
+                        post_attention_layernorm=Norm(),
+                    )
+                self.assertIs(communicator._mlp_input_may_return_new_residual, expected)
 
 
 # ---------------------------------------------------------------------------

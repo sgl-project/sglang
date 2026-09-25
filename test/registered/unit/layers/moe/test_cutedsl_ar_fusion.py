@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.layers.boundary_layout import SumGroup
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     ScatterMode,
@@ -122,12 +123,17 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.layer_scatter_modes = SimpleNamespace(
             layer_input_mode=ScatterMode.TP_ATTN_FULL
         )
-        assert comm._select_mlp_input_fusions() == (cutedsl, base)
+        fusions = comm._select_mlp_input_fusions()
+        assert [f.run for f in fusions] == [cutedsl, base]
+        # The workspace reduces over the TP group, which is the attention-TP
+        # group here; both kernels hand back a new residual.
+        assert [f.completes for f in fusions] == [SumGroup.TP, SumGroup.ATTN_TP]
+        assert all(f.may_return_new_residual for f in fusions)
         # A scattered residual is gathered first, which the workspace does not do.
         comm.layer_scatter_modes = SimpleNamespace(
             layer_input_mode=ScatterMode.SCATTERED
         )
-        assert comm._select_mlp_input_fusions() == (base,)
+        assert [f.run for f in comm._select_mlp_input_fusions()] == [base]
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
