@@ -138,6 +138,14 @@ class SiluAndMul(BaseFusedOp):
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
 
+    def _torch_compile_forward(self, num_tokens: int):
+        # npu_swiglu is a torch_npu operator boundary. Keep it in the outer
+        # Dynamo trace instead of replacing the NPU implementation with the
+        # generic native expression, which changes the active fused-op path.
+        if _is_npu:
+            return None
+        return super()._torch_compile_forward(num_tokens)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
