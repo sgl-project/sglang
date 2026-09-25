@@ -36,7 +36,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def global_lm_head(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.get_parallel",
-        lambda: SimpleNamespace(enable_dp_lm_head=False, attn_dp_rank=0),
+        lambda: SimpleNamespace(enable_dp_lm_head=False),
+    )
+    # These tests route as DP rank 0.
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.dp_slot_in", lambda per_rank: 0
     )
 
 
@@ -298,7 +302,7 @@ def test_local_lm_head_keeps_local_pruned_routing(
     backend.has_global_active_lora = True
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.get_parallel",
-        lambda: SimpleNamespace(enable_dp_lm_head=True, attn_dp_rank=0),
+        lambda: SimpleNamespace(enable_dp_lm_head=True),
     )
 
     gather_count = 0
