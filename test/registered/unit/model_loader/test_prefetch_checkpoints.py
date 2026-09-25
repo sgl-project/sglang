@@ -25,10 +25,11 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _InlineThread:
@@ -211,13 +212,13 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
             patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
-            patch("sglang.srt.model_loader.weight_utils.logger.info") as log_info,
+            patch("sglang.srt.model_loader.weight_utils.logger.debug") as log_debug,
         ):
             _prefetch_all_checkpoints(paths, num_threads=1)
 
         progress_pcts = [
             call.args[2]
-            for call in log_info.call_args_list
+            for call in log_debug.call_args_list
             if call.args
             and call.args[0] == "Rank %d: prefetching checkpoint files: %d%% (%d/%d)"
         ]
@@ -237,10 +238,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
-                return_value=FakeWorldGroup(),
-            ),
+            get_parallel().override(world_group=FakeWorldGroup()),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: loaded_paths.append(path),
@@ -379,13 +377,12 @@ class TestPrefetchDispatch(CustomTestCase):
         return DefaultModelLoader(load_config)
 
     def _make_source(self):
-        # model_config=None skips maybe_add_mtp_safetensors.
-        return SimpleNamespace(
+        # model_config=None skips maybe_add_mtp_safetensors. A real Source
+        # (not a stand-in) so new fields with defaults are picked up.
+        return DefaultModelLoader.Source(
             model_or_path="/dummy",
             revision=None,
             fall_back_to_pt=False,
-            model_config=None,
-            prefix="",
         )
 
     def _server_args(self, prefetch, disable_mmap=False, drop_cache=False):
@@ -427,14 +424,24 @@ class TestPrefetchDispatch(CustomTestCase):
                 "sglang.srt.model_loader.loader.safetensors_weights_iterator",
                 return_value=iter([]),
             ),
-            patch("sglang.srt.model_loader.loader.logger.warning"),
+            patch("sglang.srt.model_loader.loader.logger.debug"),
         )
+
+    @staticmethod
+    def _override_notices(mock_log):
+        """The single-thread override notice among the captured log calls."""
+        return [
+            call
+            for call in mock_log.call_args_list
+            if call.args
+            and "falling back to single-threaded weight loading" in call.args[0]
+        ]
 
     def test_prefetch_uses_single_thread_for_default_config(self):
         """Prefetch on + no explicit multithread config -> single-threaded,
-        and the opt-out warning fires once."""
+        and the opt-out notice fires once."""
         loader = self._make_loader({})
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -442,18 +449,18 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_single.assert_called_once()
         mock_buffered.assert_not_called()
-        mock_warning.assert_called_once()
+        self.assertEqual(len(self._override_notices(mock_log)), 1)
 
     def test_explicit_enable_multithread_keeps_buffered_with_prefetch(self):
         """Explicit enable_multithread_load=true is the escape hatch; the
         override and its warning must not fire."""
         loader = self._make_loader({"enable_multithread_load": True})
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -461,19 +468,19 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_buffered.assert_called_once()
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_num_threads_only_keeps_buffered_with_prefetch(self):
         """num_threads alone (relying on the enable_multithread_load=True
         default) also signals multi-thread intent, so the override must not
         fire and num_threads stays live."""
         loader = self._make_loader({"num_threads": 64})
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -481,20 +488,20 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_buffered.assert_called_once()
         # num_threads is forwarded as max_workers to the buffered iterator.
         self.assertEqual(mock_buffered.call_args.kwargs["max_workers"], 64)
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_no_prefetch_uses_multithread(self):
         """Prefetch off -> multi-threaded iterator is used (default), no
         override warning."""
         loader = self._make_loader({})
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=False
         )
         with (
@@ -502,12 +509,12 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_buffered.assert_called_once()
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_startup_prefetch_reuses_existing_background_handle(self):
         """Startup commit reuses resolved shards and the active prefetch handle."""
@@ -519,7 +526,7 @@ class TestPrefetchDispatch(CustomTestCase):
             weight_files=("f.safetensors",),
             use_safetensors=True,
         )
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=False
         )
         with (
@@ -527,7 +534,7 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             list(
                 loader._get_weights_iterator(
@@ -542,7 +549,7 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_single.assert_called_once()
         self.assertFalse(mock_single.call_args.kwargs["prefetch"])
         mock_buffered.assert_not_called()
-        mock_warning.assert_called_once()
+        self.assertEqual(len(self._override_notices(mock_log)), 1)
 
     def test_completed_startup_prefetch_restores_multithread_loader(self):
         loader = self._make_loader({})
@@ -553,7 +560,7 @@ class TestPrefetchDispatch(CustomTestCase):
             weight_files=("f.safetensors",),
             use_safetensors=True,
         )
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=False
         )
         with (
@@ -561,7 +568,7 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             list(
                 loader._get_weights_iterator(
@@ -576,7 +583,7 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_buffered.assert_called_once()
         self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_completed_startup_prefetch_is_not_started_twice(self):
         loader = self._make_loader({})
@@ -587,7 +594,7 @@ class TestPrefetchDispatch(CustomTestCase):
             weight_files=("f.safetensors",),
             use_safetensors=True,
         )
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -595,7 +602,7 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             list(
                 loader._get_weights_iterator(
@@ -609,13 +616,13 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_buffered.assert_called_once()
         self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_prefetch_does_not_override_when_mmap_disabled(self):
         """Prefetch is a no-op without mmap, so the override and its warning
         must not fire."""
         loader = self._make_loader({})
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True, disable_mmap=True
         )
         with (
@@ -623,18 +630,18 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_buffered.assert_called_once()
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_prefetch_does_not_override_for_fastsafetensors(self):
         """FASTSAFETENSORS ignores both flags; override + warning must not
         fire."""
         loader = self._make_loader({}, load_format=LoadFormat.FASTSAFETENSORS)
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -646,7 +653,7 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
-            p_warn as mock_warning,
+            p_log as mock_log,
         ):
             self._run(loader)
         mock_fast.assert_called_once_with(
@@ -656,13 +663,13 @@ class TestPrefetchDispatch(CustomTestCase):
         )
         mock_buffered.assert_not_called()
         mock_single.assert_not_called()
-        mock_warning.assert_not_called()
+        self.assertEqual(self._override_notices(mock_log), [])
 
     def test_fastsafetensors_gds_can_be_disabled(self):
         loader = self._make_loader(
             {"enable_gds": False}, load_format=LoadFormat.FASTSAFETENSORS
         )
-        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
             prefetch=False,
             drop_cache=True,
         )
@@ -675,7 +682,7 @@ class TestPrefetchDispatch(CustomTestCase):
             p_model,
             p_buffered,
             p_single,
-            p_warn,
+            p_log,
         ):
             self._run(loader)
         mock_fast.assert_called_once_with(

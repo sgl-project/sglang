@@ -135,38 +135,8 @@ ensure_httpx() {
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
-# Helper function to git clone with retries
-git_clone_with_retry() {
-  local repo_url="$1"
-  local dest_dir="${2:-}"
-  local branch_args="${3:-}"
-  local max_attempts=3
-
-  for attempt in $(seq 1 $max_attempts); do
-    echo "Git clone attempt $attempt/$max_attempts: $repo_url"
-
-    # prevent from partial clone
-    if [ -n "$dest_dir" ] && [ -d "$dest_dir" ]; then
-      rm -rf "$dest_dir"
-    fi
-
-    if git \
-      -c http.lowSpeedLimit=1000 \
-      -c http.lowSpeedTime=30 \
-      clone --depth 1 ${branch_args:+$branch_args} "$repo_url" "$dest_dir"; then
-      echo "Git clone succeeded."
-      return 0
-    fi
-
-    if [ $attempt -lt $max_attempts ]; then
-      echo "Git clone failed, retrying in 5 seconds..."
-      sleep 5
-    fi
-  done
-
-  echo "Git clone failed after $max_attempts attempts: $repo_url"
-  return 1
-}
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then

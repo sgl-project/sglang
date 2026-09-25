@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -10,6 +9,7 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
+    _RESERVED_ALIASES,
     CustomSpecAlgo,
     ServerArgsValidator,
     WorkerFactory,
@@ -37,6 +37,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
@@ -56,6 +57,8 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
+        if upper in _RESERVED_ALIASES:
+            return cls.EAGLE
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec
@@ -114,6 +117,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_uno(self) -> bool:
+        return self == SpeculativeAlgorithm.UNO
+
     def is_dspark(self) -> bool:
         return self == SpeculativeAlgorithm.DSPARK
 
@@ -128,6 +134,14 @@ class SpeculativeAlgorithm(Enum):
 
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
+
+    def supports_prefill_shared_read_done(self) -> bool:
+        """Whether target EXTEND has no later speculative shared-buffer reader.
+
+        The backend must still declare a pre-replay read end. Other algorithms
+        must stage their draft's shared reads before publishing the target event.
+        """
+        return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -204,6 +218,14 @@ class SpeculativeAlgorithm(Enum):
             return build_dspark_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        if self.is_dflash():
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_disagg_draft_input,
+            )
+
+            return build_dflash_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
@@ -220,6 +242,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_uno,
         )
 
         # Validate for every algorithm at startup: the metrics paths read the
@@ -230,6 +253,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_uno():
+            _handle_uno(server_args)
         elif self.is_dspark():
             _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
@@ -274,28 +299,14 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
-
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
 
         cfg = resolving_view(server_args)
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -303,6 +314,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_uno():
+            from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2
+
+            return UnoWorkerV2
 
         if self.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
@@ -356,6 +372,13 @@ class SpecInputType(IntEnum):
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    UNO_STATE = auto()
+    UNO_DRAFT = auto()
+    UNO_VERIFY = auto()
+    # Carried between rounds under PP: the tree the last stage drafted, which
+    # every stage rebuilds its verify input from. Neither a draft nor a verify
+    # input -- no forward ever runs on it.
+    PP_SPEC_RELAY = auto()
 
 
 class SpecInput(ABC):
@@ -372,6 +395,10 @@ class SpecInput(ABC):
     # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
+
+    # Dataclasses assign fields before __post_init__ calls this base's __init__;
+    # assigning None there would overwrite the constructor's custom_mask.
+    custom_mask: Optional[torch.Tensor] = None
 
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
@@ -393,6 +420,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.UNO_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -401,6 +429,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.UNO_VERIFY,
         }
 
 

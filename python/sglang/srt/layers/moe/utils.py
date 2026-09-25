@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
-
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
@@ -44,6 +43,7 @@ class MoeA2ABackend(Enum):
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -87,6 +87,9 @@ class MoeA2ABackend(Enum):
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -142,6 +145,9 @@ class _MoeRunnerBackendPredicates:
     def is_flashinfer_cutedsl(self):
         return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
 
+    def is_flashinfer_megamoe(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
+
     def is_flashinfer_mxfp4(self):
         return self.value == MoeRunnerBackend.FLASHINFER_MXFP4.value
 
@@ -166,9 +172,11 @@ class _MoeRunnerBackendPredicates:
     def is_aiter(self):
         return self.value == MoeRunnerBackend.AITER.value
 
+    def is_intel_xpu(self):
+        return self.value == MoeRunnerBackend.INTEL_XPU.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
-
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -180,6 +188,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
@@ -229,9 +238,6 @@ def resolve_moe_runner_backend(
             f"MoE runner backend {backend!r} is neither built in nor registered"
         ) from None
 
-    def is_intel_xpu(self):
-        return self == MoeRunnerBackend.INTEL_XPU
-
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):
     """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
@@ -241,7 +247,6 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
 
 
 class DeepEPMode(Enum):
-
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
@@ -279,6 +284,7 @@ class DispatcherOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
     """
 
@@ -286,7 +292,35 @@ class DispatcherOutputDtype(Enum):
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
+    MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
+
+
+class FlashinferA2ADispatchType(Enum):
+    BF16 = "bf16"
+    NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+
+
+def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
+    dispatch_type = get_exec().moe.flashinfer_a2a_dispatch_type
+
+    if dispatch_type is None:
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            return (
+                FlashinferA2ADispatchType.NVFP4
+                if envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+                else FlashinferA2ADispatchType.BF16
+            )
+        return FlashinferA2ADispatchType.BF16
+
+    if dispatch_type != "auto":
+        return FlashinferA2ADispatchType(dispatch_type)
+
+    raise RuntimeError(
+        "flashinfer_a2a_dispatch_type='auto' reached the published runtime "
+        "configuration; ServerArgs must resolve it before publication"
+    )
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -371,6 +405,25 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 
     # 2. Ascend dispatch defaults to BF16
     return DispatcherOutputDtype.BF16
+
+
+def get_deepep_v2_dispatcher_output_dtype(
+    experts_are_fp8: bool,
+) -> DispatcherOutputDtype:
+    """Match the dispatch dtype to the expert weights consumed by DeepGEMM."""
+    required = (
+        DispatcherOutputDtype.FP8 if experts_are_fp8 else DispatcherOutputDtype.BF16
+    )
+    requested = get_exec().moe.deepep_dispatcher_output_dtype
+    if requested != "auto" and DispatcherOutputDtype(requested) is not required:
+        raise ValueError(
+            f"--deepep-dispatcher-output-dtype {requested} contradicts this "
+            f"checkpoint: --moe-a2a-backend deepep_v2 dispatches "
+            f"{required.value} for "
+            f"{'FP8 blockwise' if experts_are_fp8 else 'BF16'} experts. Drop "
+            "the flag to let it follow the checkpoint."
+        )
+    return required
 
 
 def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
@@ -486,7 +539,6 @@ def is_shared_experts_fusion_disabled() -> bool:
         )
     moe = get_flags().moe
     if moe.disable_shared_experts_fusion is None:
-
         return get_exec().moe.disable_shared_experts_fusion
     return moe.disable_shared_experts_fusion
 
@@ -680,47 +732,130 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
-def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether to skip the post-experts all-reduce (EP or TP) because a
-    downstream component will fuse, replace, or absorb it.
+def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
+    """Whether the experts' output owes no sum over the MoE-TP group
+    (``is_tp_path=True``) or the EP group: the combine already summed it, or each
+    rank computed its own tokens in full.
 
-    Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
-        all-reduce with the next layer's residual all-reduce.
-      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
-        scatter will do reduce-scatter, which would double-reduce on top of
-        an all-reduce.
-      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
-        path replaces the all-reduce with a reduce-scatterv.
-      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
-        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
-        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
-      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
-        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
-        MoE outputs back to the source rank, so any further EP/TP all-reduce
-        would double-count and overflow BF16. Mirrors TRTLLM's
-        ``not enable_alltoall`` gate
-        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
-
-    The first two reasons come from per-layer ``ForwardFlags`` published by
-    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
-    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    This is a property of the MoE configuration. Whether the MoE block or a later
+    step runs a sum that is still owed is decided separately.
     """
-    if should_skip_mlp_all_reduce():
-        return True
     if get_parallel().dwdp_size > 1:
         return True
-    if should_use_dp_reduce_scatterv():
-        return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The combine reduce-scatters back to the local tokens.
         return True
-    if get_moe_a2a_backend().is_flashinfer():
-        return True
-    if get_moe_a2a_backend().is_pplx():
-        # pplx's AllToAll.combine already sums each token's expert outputs back
-        # to the source rank
-        return True
-    return False
+    a2a = get_moe_a2a_backend()
+    # The flashinfer and pplx combines, and the megamoe kernel's internal
+    # combine, sum each token's expert outputs back to its source rank.
+    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+
+
+def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
+    """Whether the MoE block should leave out its post-experts all-reduce: a later
+    step runs it (fused into the next norm, or as the reduce-scatter back to the
+    local tokens), or there is nothing to sum.
+
+    Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
+    """
+    return (
+        should_skip_mlp_all_reduce()
+        or should_use_dp_reduce_scatterv()
+        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    )
+
+
+def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """All-reduce a MoE block's output (routed plus shared experts) over TP,
+    unless a later step does it or there is nothing to sum."""
+    from sglang.srt.distributed.communication_op import (
+        tensor_model_parallel_all_reduce,
+    )
+
+    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ):
+        return tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
+
+
+def can_merge_post_experts_all_reduce() -> bool:
+    """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
+
+    True when moe_dp_size == 1: the two groups are an orthogonal decomposition
+    of _TP, so reducing over each in turn equals one _TP reduction.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and parallel.moe_dp_size == 1
+    )
+
+
+def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Reduce the post-experts MoE output across the EP and MoE-TP groups.
+
+    When both are live and mergeable, issues one _TP all-reduce instead of two
+    sequential ones, which also restores the invariant the fused residual+LN path
+    depends on.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    parallel = get_parallel()
+    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=False
+    )
+    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    )
+
+    if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+
+    if reduce_ep:
+        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+    if reduce_tp:
+        hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the post-experts reduction that was deferred to allreduce fusion.
+
+    Called when the fused residual+LN kernel cannot service the shape.
+    """
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager

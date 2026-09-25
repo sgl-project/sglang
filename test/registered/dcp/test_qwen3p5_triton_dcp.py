@@ -47,7 +47,6 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
             "triton",
             "--context-length",
             "1048576",
-            "--disable-radix-cache",
             "--json-model-override-args",
             (
                 '{"rope_scaling":{"rope_type":"yarn","factor":4.0,'
@@ -87,7 +86,7 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (qwen3.5-triton-dcp4)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_a_gsm8k (qwen3.5-triton-dcp4)\n{metrics["score"]=:.3f}\n'
             )
         self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)
 

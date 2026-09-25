@@ -24,6 +24,7 @@ projections run once for the batch instead of once per image.
 """
 
 import itertools
+from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -172,7 +173,6 @@ class Projector(nn.Module):
 
 
 class SiglipVisionEmbeddings(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -298,7 +298,6 @@ class SiglipVisionEmbeddings(nn.Module):
 
 
 class SigLIPRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -322,7 +321,6 @@ class SigLIPRotaryEmbedding(nn.Module):
 
 
 class SiglipMLP(nn.Module):
-
     def __init__(
         self,
         config,
@@ -360,7 +358,6 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config,
@@ -418,7 +415,6 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
-
     def __init__(
         self,
         config,
@@ -481,7 +477,6 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config,
@@ -574,7 +569,6 @@ class SiglipVisionModel(nn.Module):
 
 
 class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
-
     def __init__(self, *, config, quant_config=None, prefix: str = ""):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         config = self.config
@@ -591,7 +585,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         )
         self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

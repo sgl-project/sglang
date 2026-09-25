@@ -93,11 +93,10 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
 
 - **AMD GPUs**: Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). EAGLE speculative decoding is not currently supported on AMD for GLM-5.
 - For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
-- Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
 
-<Warning>
-**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
-</Warning>
+- **Prefill CP on CUDA**: Zigzag (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5. Use `--enable-prefill-cp --cp-strategy interleave` with `--dp 1`.
+
+- Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
 
 ## 4. Model Invocation
 
@@ -576,8 +575,13 @@ The accuracy benchmark results below are shared with GLM-5.1, as GLM-5.1 was not
 
 - Benchmark Command
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --port 30000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 - Test Result
 ```text Output
@@ -591,8 +595,12 @@ Output throughput: 642.044 token/s
 
 - Benchmark Command
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py --port 30000
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 - Test Result
 ```text Output
@@ -664,8 +672,13 @@ Average accuracy: 0.877
 - MI325/MI35x Test (GLM-5 BF16, `tp=8`, TileLang DSA backends)
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 200
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 ```text Output
 Accuracy: 0.970

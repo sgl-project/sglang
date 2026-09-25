@@ -17,11 +17,11 @@
 //! - **New key, or pinned worker unhealthy** → pick a worker via `fallback`
 //!   and record the assignment.
 //!
-//! Worker identity is the worker URL (stable across discovery events).
+//! Worker identity is the worker ID supplied by discovery.
 //!
 //! # Eviction
 //! A background sweeper (shared engine with the active-load janitor, see
-//! [`super::active_load::spawn_sweeper`]) removes assignments idle longer
+//! [`crate::state::load_monitor::router_inflight_load::spawn_sweeper`]) removes assignments idle longer
 //! than `idle`, bounding the map against unbounded routing-key cardinality.
 //! The sweeper is spawned only when constructed inside a Tokio runtime;
 //! unit tests use [`StickyPolicy::with_clock`] and drive eviction
@@ -34,49 +34,60 @@
 //! is intentionally out of scope here.
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use dashmap::DashMap;
-
-use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::{Policy, SelectionContext};
 use crate::server::metrics::{MetricsRegistry, StickyOutcome};
+use crate::state::load_monitor::router_inflight_load::JanitorHandle;
+use crate::state::AffinityStore;
 use crate::workers::Worker;
 
-/// One routing-key → worker pin, with the last time it was referenced (used
-/// by the idle-eviction sweep).
-#[derive(Debug)]
-struct Assignment {
-    worker_url: String,
-    last_seen: Instant,
-}
-
-/// Shared inner state. Held behind an `Arc` so the background sweeper can
-/// reference the same map the `select` hot path mutates.
-#[derive(Debug)]
-struct StickyState {
-    assignments: DashMap<String, Assignment>,
-    clock: Arc<dyn Clock>,
-    idle: Duration,
-    /// Metrics sink. Set once via the `Policy::attach_metrics` hook
-    /// (production) — `None` until then, in which case recording is a no-op.
+/// Sticky-session policy. See the module docs for behavior and limitations.
+pub struct StickyPolicy {
+    store: Arc<AffinityStore>,
+    /// Selector for keyless requests and for the initial pin of a new key.
+    fallback: Arc<dyn Policy>,
+    /// Set once via `Policy::attach_metrics`; recording is a no-op until then.
     metrics: OnceLock<Arc<MetricsRegistry>>,
+    /// Background idle-eviction sweeper; `None` outside a Tokio runtime.
+    _janitor: Option<JanitorHandle>,
 }
 
-impl StickyState {
-    /// Remove every assignment idle longer than `idle`. Returns the count
-    /// removed. Called on a fixed cadence by the background sweeper.
+impl StickyPolicy {
+    pub fn new(idle: Duration, eviction_interval: Duration, fallback: Arc<dyn Policy>) -> Self {
+        let store = AffinityStore::new(idle);
+        let _janitor = store.spawn_sweeper(eviction_interval);
+        Self {
+            store,
+            fallback,
+            metrics: OnceLock::new(),
+            _janitor,
+        }
+    }
+
+    /// Test constructor: injectable clock, no background sweeper.
+    #[cfg(test)]
+    fn with_clock(
+        idle: Duration,
+        fallback: Arc<dyn Policy>,
+        clock: Arc<dyn crate::state::load_monitor::router_inflight_load::Clock>,
+    ) -> Self {
+        Self {
+            store: AffinityStore::with_clock(idle, clock),
+            fallback,
+            metrics: OnceLock::new(),
+            _janitor: None,
+        }
+    }
+
+    #[cfg(test)]
     fn sweep_expired(&self) -> usize {
-        let now = self.clock.now();
-        let mut removed = 0;
-        self.assignments.retain(|_key, a| {
-            let keep = now.saturating_duration_since(a.last_seen) <= self.idle;
-            if !keep {
-                removed += 1;
-            }
-            keep
-        });
-        removed
+        self.store.sweep_expired()
+    }
+
+    #[cfg(test)]
+    fn assignment_count(&self) -> usize {
+        self.store.len()
     }
 
     fn record(&self, outcome: StickyOutcome) {
@@ -86,122 +97,21 @@ impl StickyState {
     }
 }
 
-/// Sticky-session policy. See the module docs for behavior and limitations.
-pub struct StickyPolicy {
-    state: Arc<StickyState>,
-    /// Selector for keyless requests and for the initial pin of a new key.
-    fallback: Arc<dyn Policy>,
-    /// Background idle-eviction sweeper. `None` when constructed outside a
-    /// Tokio runtime (unit tests). Dropping it cancels the task, so the
-    /// sweeper lives exactly as long as the policy.
-    _janitor: Option<JanitorHandle>,
-}
-
-impl StickyPolicy {
-    /// Production constructor: monotonic `SystemTimeClock`, with a
-    /// background eviction sweeper spawned on `eviction_interval` cadence
-    /// (only if called inside a Tokio runtime — the factory runs inside
-    /// `main`'s runtime).
-    pub fn new(idle: Duration, eviction_interval: Duration, fallback: Arc<dyn Policy>) -> Self {
-        let state = Arc::new(StickyState {
-            assignments: DashMap::new(),
-            clock: Arc::new(SystemTimeClock),
-            idle,
-            metrics: OnceLock::new(),
-        });
-        // `spawn_sweeper` needs a runtime; the factory builds policies inside
-        // `main`'s Tokio runtime. Guard so sync constructions (e.g. the
-        // factory's `build_policy_kind_only` test helper) don't panic.
-        let _janitor = if tokio::runtime::Handle::try_current().is_ok() {
-            let swept = Arc::clone(&state);
-            Some(spawn_sweeper(
-                move || swept.sweep_expired(),
-                eviction_interval,
-                "sticky-eviction",
-            ))
-        } else {
-            // Only reached by sync construction (test helpers). In production
-            // the factory builds policies inside `main`'s runtime, so the
-            // sweeper always spawns. Log it so a future off-runtime
-            // construction that silently disables eviction is greppable.
-            tracing::debug!(
-                "StickyPolicy constructed outside a Tokio runtime; idle eviction is disabled"
-            );
-            None
-        };
-        Self {
-            state,
-            fallback,
-            _janitor,
-        }
-    }
-
-    /// Test constructor: injectable clock, no background sweeper. Tests
-    /// advance a `MockClock` and call [`Self::sweep_expired`] directly for
-    /// deterministic eviction coverage.
-    #[cfg(test)]
-    fn with_clock(idle: Duration, fallback: Arc<dyn Policy>, clock: Arc<dyn Clock>) -> Self {
-        Self {
-            state: Arc::new(StickyState {
-                assignments: DashMap::new(),
-                clock,
-                idle,
-                metrics: OnceLock::new(),
-            }),
-            fallback,
-            _janitor: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn sweep_expired(&self) -> usize {
-        self.state.sweep_expired()
-    }
-
-    #[cfg(test)]
-    fn assignment_count(&self) -> usize {
-        self.state.assignments.len()
-    }
-}
-
 impl Policy for StickyPolicy {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         let Some(key) = ctx.routing_key().filter(|k| !k.is_empty()) else {
-            self.state.record(StickyOutcome::NoRoutingKey);
+            self.record(StickyOutcome::NoRoutingKey);
             return self.fallback.select(workers, ctx);
         };
-
-        // Fast path: an existing pin whose worker is still in the healthy set.
-        let mut existing = false;
-        if let Some(mut entry) = self.state.assignments.get_mut(key) {
-            existing = true;
-            if let Some(worker) = workers.iter().find(|w| w.url == entry.worker_url).cloned() {
-                entry.last_seen = self.state.clock.now();
-                drop(entry); // release the shard lock before recording
-                self.state.record(StickyOutcome::Hit);
-                return Some(worker);
-            }
-            // Pinned worker is no longer healthy — fall through to reassign.
-            drop(entry);
+        if let Some(worker) = self.store.bound(key, workers) {
+            self.record(StickyOutcome::Hit);
+            return Some(Arc::clone(worker));
         }
-
-        // Vacant key, or the pinned worker dropped out: (re)assign via the
-        // fallback. The read-miss above and this insert are intentionally NOT
-        // atomic — the shard lock is released before `fallback.select` (which
-        // may do real work, e.g. `load_based`) so it is never held across an
-        // unrelated computation. Two requests racing the *same* fresh key may
-        // therefore both assign (last-writer-wins in the map; both may record
-        // `Assigned`). The scatter is transient and self-heals: the next
-        // request for that key hits the surviving pin.
+        // Vacant key, or the pinned worker dropped out: (re)pin the fallback's choice.
+        let remap = self.store.contains(key);
         let chosen = self.fallback.select(workers, ctx)?;
-        self.state.assignments.insert(
-            key.to_string(),
-            Assignment {
-                worker_url: chosen.url.clone(),
-                last_seen: self.state.clock.now(),
-            },
-        );
-        self.state.record(if existing {
+        let chosen = Arc::clone(self.store.bind(key.to_string(), &chosen, workers));
+        self.record(if remap {
             StickyOutcome::Remap
         } else {
             StickyOutcome::Assigned
@@ -210,7 +120,15 @@ impl Policy for StickyPolicy {
     }
 
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
-        let _ = self.state.metrics.set(metrics);
+        let _ = self.metrics.set(metrics);
+    }
+
+    fn needs_load_snapshot(&self) -> bool {
+        self.fallback.needs_load_snapshot()
+    }
+
+    fn needs_dispatch_timestamps(&self) -> bool {
+        self.fallback.needs_dispatch_timestamps()
     }
 }
 
@@ -218,8 +136,7 @@ impl std::fmt::Debug for StickyPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StickyPolicy")
             .field("fallback", &self.fallback)
-            .field("idle", &self.state.idle)
-            .field("assignments", &self.state.assignments.len())
+            .field("assignments", &self.store.len())
             .finish_non_exhaustive()
     }
 }
@@ -228,6 +145,25 @@ impl std::fmt::Debug for StickyPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use std::time::Instant;
+
+    #[test]
+    fn sticky_propagates_fallback_load_snapshot_capability() {
+        let policy = StickyPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Arc::new(crate::policies::power_of_two::PowerOfTwoChoicesPolicy::new()),
+        );
+        assert!(policy.needs_load_snapshot());
+        assert!(!policy.needs_dispatch_timestamps());
+
+        let load_policy = StickyPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Arc::new(crate::policies::load_based::LoadBasedPolicy::new()),
+        );
+        assert!(load_policy.needs_dispatch_timestamps());
+    }
     use crate::policies::round_robin::RoundRobinPolicy;
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -245,7 +181,9 @@ mod tests {
     }
 
     fn policy(idle_secs: u64) -> StickyPolicy {
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         StickyPolicy::with_clock(Duration::from_secs(idle_secs), fallback(), clock)
     }
 
@@ -348,7 +286,9 @@ mod tests {
     #[test]
     fn sweep_evicts_idle_entries_keeps_fresh() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0"), worker("w1")];
 
@@ -375,7 +315,9 @@ mod tests {
     #[test]
     fn hit_refreshes_last_seen_so_active_key_is_not_evicted() {
         let model = ModelId("tiny".into());
-        let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
+        let clock = Arc::new(
+            crate::state::load_monitor::router_inflight_load::MockClock::new(Instant::now()),
+        );
         let p = StickyPolicy::with_clock(Duration::from_secs(10), fallback(), clock.clone());
         let workers = vec![worker("w0")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));

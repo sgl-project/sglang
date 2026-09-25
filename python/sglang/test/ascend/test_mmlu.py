@@ -6,7 +6,6 @@ from sglang.test.run_eval import run_eval
 
 
 class TestMMLU:
-
     mmlu_num_examples = 128
 
     def test_mmlu(self):
@@ -16,7 +15,7 @@ class TestMMLU:
             "server": getattr(
                 self, "server_cmd", subprocess.list2cmdline(map(str, self.other_args))
             ),
-            "client": "simple_eval_mmlu",
+            "client": "sgl-eval",
             "accuracy_threshold": getattr(self, "accuracy_mmlu", "N/A"),
         }
 

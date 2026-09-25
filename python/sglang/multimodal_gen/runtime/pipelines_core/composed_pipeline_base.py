@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Literal, cast
+from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     filter_modules_for_role,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
@@ -76,6 +77,8 @@ class ComposedPipelineBase(ABC):
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
+    # Exact module keys; unspecified components retain the default loader dispatch.
+    component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -260,6 +263,7 @@ class ComposedPipelineBase(ABC):
                 "Flux2KleinPipeline": {"vae"},
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImage21Pipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
                 "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
@@ -480,9 +484,9 @@ class ComposedPipelineBase(ABC):
         self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
-        assert (
-            len(model_index) > 1
-        ), "model_index.json must contain at least one pipeline module"
+        assert len(model_index) > 1, (
+            "model_index.json must contain at least one pipeline module"
+        )
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
@@ -616,6 +620,7 @@ class ComposedPipelineBase(ABC):
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=module_name,
                 component_type=load_module_name,
+                loader_cls=self.component_loaders.get(module_name),
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
@@ -1088,10 +1093,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
@@ -1121,10 +1123,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
@@ -1143,12 +1142,23 @@ class ComposedPipelineBase(ABC):
             yield self.forward(batches[0], server_args)
             return
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
         )
+
+    def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
+        """Publish the residency manager the executor dereferences unguarded.
+
+        ``PipelineExecutor`` initializes ``component_residency_manager`` to
+        ``None``, and every ``_execute_stages`` run enters
+        ``_component_residency_request``. An entry point that reaches the
+        executor without calling this raises ``AttributeError`` on ``None``, so
+        all three forward paths must install it.
+        """
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager

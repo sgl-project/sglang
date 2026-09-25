@@ -25,9 +25,6 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -38,7 +35,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -70,7 +67,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4MoE(nn.Module):
-
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
@@ -146,10 +142,7 @@ class Llama4MoE(nn.Module):
 
         out_aD = routed_out + shared_out
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            out_aD = tensor_model_parallel_all_reduce(out_aD)
+        out_aD = reduce_moe_output(out_aD)
 
         return out_aD
 
@@ -195,7 +188,6 @@ def _get_or_create_alt_stream(device_module):
 
 
 class Llama4Attention(nn.Module):
-
     def __init__(
         self,
         config: Llama4TextConfig,

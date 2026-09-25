@@ -25,6 +25,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    maybe_enhance_prompt,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -274,11 +277,14 @@ async def generations(
         else sampling_params_cls.default_image_output_format()
     )
     ext = choose_output_image_ext(output_format, request.background)
+    prompt = await maybe_enhance_prompt(
+        raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
+    )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
             request_id,
-            prompt=request.prompt,
+            prompt=prompt,
             size=request.size,
             width=request.width,
             height=request.height,
@@ -309,6 +315,7 @@ async def generations(
             attention_backend_override=_get_extra_field(
                 request, "attention_backend_override"
             ),
+            skip_softmax_params=_get_extra_field(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -382,7 +389,7 @@ async def generations(
         response_kwargs = _build_image_response_kwargs(
             save_file_path_list,
             resp_format,
-            request.prompt,
+            prompt,
             request_id,
             result,
             b64_list=b64_list,
@@ -403,6 +410,7 @@ async def edits(
     url: Optional[List[str]] = Form(None),
     url_array: Optional[List[str]] = Form(None, alias="url[]"),
     prompt: str = Form(...),
+    enhance_prompt: bool = Form(False),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
@@ -424,6 +432,7 @@ async def edits(
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
+    perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -462,6 +471,13 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
+        prompt = await maybe_enhance_prompt(
+            raw_request,
+            prompt,
+            enabled=enhance_prompt,
+            task="image_edit",
+            image_paths=input_paths,
+        )
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
@@ -484,6 +500,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            perf_dump_path=perf_dump_path,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

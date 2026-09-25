@@ -13,7 +13,7 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ModuleStub(nn.Module):
@@ -55,6 +55,7 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             o_lora_rank=8,
             rms_norm_eps=1e-6,
             compress_ratios=[compress_ratio],
+            q_head_norm=True,
             rope_theta=10_000,
             compress_rope_theta=160_000,
             max_position_embeddings=128,
