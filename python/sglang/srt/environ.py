@@ -753,7 +753,9 @@ class Envs:
     # Write-through backups are queued at insert time and executed by
     # flush_pending_backups; this caps how many queued nodes one step executes,
     # so a request-finish wave's per-node backup bookkeeping spreads over the
-    # following steps instead of landing in one GPU bubble. 0 = no cap.
+    # following steps instead of landing in one GPU bubble. 0 (default) backs
+    # each node up at insert time instead (no queue). 16 measured on
+    # Inkling/GB300, where 8 backlogged; other values untested.
     SGLANG_HICACHE_BACKUP_NODES_PER_STEP = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
