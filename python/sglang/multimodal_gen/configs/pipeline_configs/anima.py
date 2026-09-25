@@ -77,3 +77,15 @@ class AnimaPipelineConfig(ImagePipelineConfig):
 
     def post_decoding(self, frames, server_args):
         return frames.squeeze(2)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=AnimaSamplingParams,
+        pipeline_config_cls=AnimaPipelineConfig,
+        hf_model_paths=["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+        model_detectors=[lambda name: name.lower() == "animamodularpipeline"],
+    )

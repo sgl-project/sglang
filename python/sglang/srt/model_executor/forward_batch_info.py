@@ -46,7 +46,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_gather_slot,
-    set_dp_buffer_len,
+    set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
@@ -540,6 +540,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    dp_spec_prefill_coordination_applied: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -569,6 +570,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
     multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
+    # Setwise pooling readout positions (CPU tensors, one per request)
+    token_indices_to_pool: Optional[List[torch.Tensor]] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -687,6 +691,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
+    # under MAX_LEN, padded to the max. None when the raw list already is.
+    global_num_tokens_padded_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -815,11 +822,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self, batch: ScheduleBatch, device: Union[str, torch.device]
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
+        self.dp_spec_prefill_coordination_applied = (
+            batch.dp_spec_prefill_coordination_applied
+        )
         if batch.global_num_tokens is None:
             return
 
         assert batch.global_num_tokens_for_logprob is not None
-        if self.spec_info is not None:
+        if (
+            self.spec_info is not None
+            and not batch.dp_spec_prefill_coordination_applied
+        ):
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 
             global_num_tokens, global_num_tokens_for_logprob = (
@@ -1145,6 +1158,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ), "MIS batch must have delimiter indices on every request"
                 self.multi_item_delimiter_indices = [
                     torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
+            # Setwise readout: pool the head AT token_indices_to_pool instead of
+            # the last token. The scheduler keeps readout batches homogeneous
+            # (get_new_batch_prefill), so build only when every request carries
+            # the field and otherwise fall back to standard pooling.
+            if batch.reqs and all(
+                r.token_indices_to_pool is not None for r in batch.reqs
+            ):
+                self.token_indices_to_pool = [
+                    torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
                     for r in batch.reqs
                 ]
 
@@ -1551,6 +1576,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+        if self.dp_spec_prefill_coordination_applied:
+            # Preserve each rank's forward mode on coordinated steps.
+            dp_padding_mode = DpPaddingMode.SUM_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1574,13 +1602,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(
-            buffer_len,
-            num_tokens,
-            dp_padding_mode.is_max_len(),
-            global_num_tokens,
-            self.global_num_tokens_gpu,
-        )
+        self.global_num_tokens_padded_cpu = global_num_tokens
+        set_dp_buffer_len_from_batch(self)
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
