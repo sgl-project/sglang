@@ -28,8 +28,8 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
-      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
@@ -54,9 +54,13 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          list-files: json
           filters: |
+            # Baseline list below; any other changed test/registered/ file with a
+            # per-commit register_xpu_ci is also picked up by the next step.
+            registered_tests:
+              - "test/registered/**/*.py"
             main_package:
-              # Extend test/registered/ entries when adding a non-nightly register_xpu_ci.
               - "python/sglang/!(multimodal_gen|kernels|cli|test)/**/!(*.md)"
               - "python/sglang/test/*.py"
               - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
@@ -93,6 +97,13 @@ jobs:
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
               - "scripts/ci/xpu/**"
+
+      - name: Detect changed per-commit XPU tests
+        id: xpu-tests
+        if: steps.filter.outputs.registered_tests == 'true'
+        env:
+          CHANGED_FILES: ${{ steps.filter.outputs.registered_tests_files }}
+        run: echo "changed=$(python3 scripts/ci/xpu/detect_xpu_test_changes.py)" >> "$GITHUB_OUTPUT"
 
   # ==================== PR Gate ==================== #
   pr-gate:
