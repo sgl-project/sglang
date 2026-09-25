@@ -10,6 +10,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Load the real extension before installing import stubs, so the graph test
+# exercises torch_npu when it is installed and fails on a broken installation.
+try:
+    import torch_npu  # noqa: F401
+except ModuleNotFoundError as exc:
+    if exc.name != "torch_npu":
+        raise
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="base-a-test-npu")
@@ -75,6 +83,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -274,6 +283,211 @@ class TestVerifyCompressPositions(unittest.TestCase):
                 expected = torch.zeros_like(dst)
                 expected[: selected.numel()].copy_(selected)
                 self.assertEqual(dst.tolist(), expected.tolist())
+
+
+class TestNPUDecodeCompressionMetadata(CustomTestCase):
+    _fields = (
+        "c4_loc",
+        "c128_loc",
+        "positions_cmp_padding_c4",
+        "positions_cmp_padding_c128",
+        "start_pos",
+        "seqused",
+    )
+
+    @staticmethod
+    def _backend(ratios):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_unique_compress_ratios = ratios
+        backend._dsv4_has_c4 = 4 in ratios
+        backend._dsv4_has_c128 = 128 in ratios
+        return backend
+
+    @classmethod
+    def _metadata(cls, bs, device="cpu"):
+        return SimpleNamespace(
+            **{
+                key: torch.full(
+                    (bs,),
+                    -911,
+                    dtype=torch.int32
+                    if key in ("start_pos", "seqused")
+                    else torch.int64,
+                    device=device,
+                )
+                for key in cls._fields
+            }
+        )
+
+    def _refresh(
+        self,
+        values,
+        ratios,
+        *,
+        device="cpu",
+        fm=None,
+        missing=False,
+        strided=False,
+        loc_dtype=torch.int64,
+        fused=False,
+    ):
+        backend = self._backend(ratios)
+        bs = len(values)
+        fm = fm if fm is not None else self._metadata(bs, device)
+        seq = torch.tensor(values, dtype=torch.int32, device=device)
+        if strided:
+            seq = seq.repeat_interleave(2)[::2]
+        sources = {}
+        expected = {key: [-911] * bs for key in self._fields}
+        expected["start_pos"] = [max(n - 1, 0) for n in values]
+        expected["seqused"] = [int(n > 0) for n in values]
+        for ratio in (4, 128):
+            selected = [n - ratio for n in values if n > 0 and n % ratio == 0]
+            slots = [ratio * 1000 + i for i in range(len(selected))]
+            source = torch.tensor(slots, dtype=loc_dtype, device=device)
+            if strided:
+                source = source.repeat_interleave(2)[::2]
+            sources[f"out_c{ratio}_loc"] = source
+            if ratio in ratios:
+                expected[f"positions_cmp_padding_c{ratio}"] = selected + [0] * (
+                    bs - len(selected)
+                )
+                written = [] if missing else slots
+                expected[f"c{ratio}_loc"] = written + [0] * (bs - len(written))
+        bundle = None if missing else SimpleNamespace(**sources)
+        if fused:
+            backend._refresh_graph_decode_compress_1d_fused(seq, fm, bundle)
+        else:
+            backend._refresh_graph_decode_compress_1d_direct(
+                SimpleNamespace(
+                    fm=fm,
+                    live_seq_lens=seq,
+                    forward_batch=SimpleNamespace(out_cache_loc_dsv4=bundle),
+                )
+            )
+        return fm, expected
+
+    def _assert_metadata(self, fm, expected):
+        for key, values in expected.items():
+            self.assertEqual(getattr(fm, key).cpu().tolist(), values, key)
+
+    def test_reference_covers_boundaries_padding_and_absent_ratios(self):
+        for ratios in ((), (4,), (128,), (4, 128)):
+            for missing in (False, True):
+                with self.subTest(ratios=ratios, missing=missing):
+                    fm, expected = self._refresh(
+                        [0, 128, 129, 132, 256, 131072, 1],
+                        ratios,
+                        missing=missing,
+                        strided=True,
+                        loc_dtype=torch.int32,
+                    )
+                    self._assert_metadata(fm, expected)
+
+    def test_fused_wrapper_rejects_overflow_before_launch(self):
+        backend = self._backend((4, 128))
+        fm = self._metadata(2)
+        bundle = SimpleNamespace(out_c4_loc=torch.arange(3), out_c128_loc=None)
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.metadata_kernel._refresh_dsv4_decode_metadata_kernel"
+        ) as kernel:
+            with self.assertRaisesRegex(AssertionError, "overflow"):
+                backend._refresh_graph_decode_compress_1d_fused(
+                    torch.tensor([4, 8]), fm, bundle
+                )
+            kernel.__getitem__.assert_not_called()
+
+    def test_fused_empty_batch_needs_no_launch(self):
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.metadata_kernel._refresh_dsv4_decode_metadata_kernel"
+        ) as kernel:
+            self._refresh([], (4, 128), fused=True)
+            kernel.__getitem__.assert_not_called()
+
+    def test_fused_wrapper_uses_runtime_counts_and_reuses_outputs(self):
+        backend = self._backend((4, 128))
+        fm = self._metadata(4)
+        pointers = [getattr(fm, key).data_ptr() for key in self._fields]
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.metadata_kernel._refresh_dsv4_decode_metadata_kernel"
+        ) as kernel:
+            for count in (0, 1, 4, 0):
+                bundle = SimpleNamespace(
+                    out_c4_loc=torch.arange(count), out_c128_loc=None
+                )
+                backend._refresh_graph_decode_compress_1d_fused(
+                    torch.zeros(4, dtype=torch.int32), fm, bundle
+                )
+                call = kernel.__getitem__.return_value.call_args
+                self.assertEqual(call.args[-2:], (count, 0))
+                self.assertEqual(call.kwargs["BS"], 4)
+        self.assertEqual(
+            pointers, [getattr(fm, key).data_ptr() for key in self._fields]
+        )
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    def test_npu_fused_matches_reference_across_shapes_and_modes(self):
+        for bs in (1, 7, 32, 257, 1024):
+            values = ([0, 128, 129, 132, 256, 131072, 1] * (bs // 7 + 1))[:bs]
+            for ratios in ((), (4,), (128,), (4, 128)):
+                with self.subTest(bs=bs, ratios=ratios):
+                    fm, expected = self._refresh(
+                        values,
+                        ratios,
+                        device="npu",
+                        fused=True,
+                        strided=True,
+                        loc_dtype=torch.int32,
+                    )
+                    self._assert_metadata(fm, expected)
+        for missing in (False, True):
+            fm, expected = self._refresh(
+                [128, 256, 384], (4, 128), device="npu", fused=True, missing=missing
+            )
+            self._assert_metadata(fm, expected)
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    def test_npu_graph_consumes_updated_metadata_and_cleared_tails(self):
+        fm = self._metadata(5, "npu")
+        backend = self._backend((4, 128))
+        # The startup warmup aliases zero lengths and start_pos. Verify that
+        # it leaves every buffer at the original all-zero capture state.
+        for key in self._fields:
+            getattr(fm, key).zero_()
+        backend._refresh_graph_decode_compress_1d_fused(fm.start_pos, fm, None)
+        self._assert_metadata(fm, {key: [0] * 5 for key in self._fields})
+        outputs = self._metadata(5, "npu")
+        pointers = [getattr(fm, key).data_ptr() for key in self._fields]
+
+        def consume():
+            for key in self._fields:
+                getattr(outputs, key).copy_(getattr(fm, key))
+
+        for _ in range(2):
+            consume()
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, auto_dispatch_capture=True):
+            consume()
+        stream = torch.npu.Stream()
+        stream.wait_stream(torch.npu.current_stream())
+        ready = torch.npu.Event()
+        for values in ([128, 256, 384, 512, 640], [129, 132, 0, 1, 256], [0] * 5):
+            # Preparation and replay must honor the caller's stream. The
+            # default stream waits only when the test reads back results.
+            with torch.npu.stream(stream):
+                _, expected = self._refresh(values, (4, 128), device="npu", fm=fm)
+                graph.replay()
+                ready.record()
+            torch.npu.current_stream().wait_event(ready)
+            self._assert_metadata(outputs, expected)
+        self.assertEqual(
+            pointers, [getattr(fm, key).data_ptr() for key in self._fields]
+        )
 
 
 class TestMultiStepDraftCompressedLocs(unittest.TestCase):
