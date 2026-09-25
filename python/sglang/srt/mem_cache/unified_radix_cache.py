@@ -666,7 +666,71 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        # Chunked prefills can leave an entire checkpoint chain awaiting D2H.
+        # Its slots are temporarily locked, not leaked. Complete only enough
+        # submitted backups to satisfy this allocation, then retry eviction
+        # against the ORIGINAL absolute target (params are only shortfalls).
+        if mamba_target is not None:
+            while self._wait_for_mamba_write_through(mamba_target[1]):
+                retry_result = self._evict(params, available_size_targets)
+                result.num_tokens_evicted += retry_result.num_tokens_evicted
+                result.swa_num_tokens_evicted += retry_result.swa_num_tokens_evicted
+                result.mamba_num_evicted += retry_result.mamba_num_evicted
+
         return result
+
+    def _wait_for_mamba_write_through(self, target: int) -> bool:
+        """Release a submitted backup's Mamba lock under allocation pressure.
+
+        Preserve FIFO acknowledgement order and the existing TP/PP consensus.
+        Each successful call consumes at least one ack, so exhausted request-
+        owned pools still fail promptly rather than spinning. Buffer-mode
+        transfers have a different lifecycle and are deliberately excluded.
+        """
+        cc = self.cache_controller
+        if (
+            cc is None
+            or cc.write_policy != "write_through"
+            or self.buffer_pipeline is not None
+        ):
+            return False
+
+        wait_count = 0
+        for index, ack in enumerate(cc.ack_write_queue):
+            for node_id in ack.node_ids:
+                pending = self.ongoing_write_through.get(node_id)
+                if (
+                    pending is not None
+                    and pending.lock_params is not None
+                    and ComponentType.MAMBA
+                    not in pending.lock_params.skipped_lock_components
+                    and self.tree_core.get_component_device_value(
+                        pending.node_id, ComponentType.MAMBA
+                    )
+                    is not None
+                ):
+                    wait_count = index + 1
+                    break
+            if wait_count:
+                break
+
+        # Enter consensus even if this rank has space or no pending backup.
+        # A rank-local early return would strand peers in the collective.
+        state = torch.tensor(
+            [
+                int(self._component_available_size(ComponentType.MAMBA) >= target),
+                wait_count,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce(state, torch.distributed.ReduceOp.MIN)
+        enough_space, wait_count = state.tolist()
+        if enough_space or wait_count == 0:
+            return False
+
+        self.writing_check(finish_count=wait_count)
+        return True
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
