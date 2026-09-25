@@ -89,7 +89,7 @@ def test_activation_default_backend(monkeypatch, device, expect):
         ("_RMSNORM", "npu", "torch_npu"),
         ("_GEMMA_RMSNORM", "cuda", "aot"),
         ("_GEMMA_RMSNORM", "hip", "jit"),  # rocm-triton JIT pinned to HIP
-        ("_GEMMA_RMSNORM", "npu", "torch_npu"),
+        ("_GEMMA_RMSNORM", "npu", "sgl_kernel_npu"),
     ],
 )
 def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
