@@ -1240,6 +1240,13 @@
                     ]
                   },
                   {
+                    "group": "GigaChat",
+                    "pages": [
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5",
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning"
+                    ]
+                  },
+                  {
                     "group": "GLM",
                     "pages": [
                       "cookbook/autoregressive/GLM/GLM-5.3",
