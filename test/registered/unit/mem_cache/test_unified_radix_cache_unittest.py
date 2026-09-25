@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1755,7 +1755,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1816,9 +1816,7 @@ class UnifiedRadixCacheSuite:
         # cache_finished_req reads get_serving().strip_thinking_cache
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
-            cache.cache_finished_req(
-                req, is_insert=True, owned_kv_len=req.owned_kv_len()
-            )
+            cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
             start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
@@ -1849,6 +1847,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
+        req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
         req.lock_receipt = DecLockRefParams()
@@ -1860,7 +1859,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, is_insert=False, owned_kv_len=req.owned_kv_len())
+        release_kv_cache(req, cache, is_insert=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -2035,7 +2034,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -8738,7 +8737,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)

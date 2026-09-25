@@ -666,6 +666,9 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -706,6 +709,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -1555,12 +1561,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self._release_aborted_request(req)
         # Mamba insertion donates the checkpoint and clears its sequence marker.
-        release_kv_cache(
-            req,
-            self.tree_cache,
-            is_insert=not uses_write_through_cache
-            and not self.tree_cache.supports_mamba(),
+        is_insert = (
+            not uses_write_through_cache and not self.tree_cache.supports_mamba()
         )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
