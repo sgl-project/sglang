@@ -19,12 +19,26 @@ runtime topology and real tensors, while the layout is plain integers and can
 be replayed against a brute-force reference with no torch at all.
 
 **Only the query path is sharded here, not the whole attention block.** The
-slice is taken after ``fused_qkv_a_proj_with_mqa`` and the QK norm, and only
-for ``q_lora``. The KV cache write, the DCP context gather and the indexer all
-keep running at full width, so the older indexer-only query sharding
+exchange happens after ``q_b_proj`` and the absorb through ``w_kc``: the rank
+swaps "my heads for every token" for "every head for my tokens"
+(``dsa_cp_redistribute_heads``) and undoes it after attention
+(``dsa_cp_restore_tokens``), before ``w_vc``. Nothing slices ``q_lora`` -- an
+earlier version of this docstring said it did, which hid the cost below.
+
+What travels is therefore the 512-wide absorbed latent and its output, each a
+fixed linear function of the narrower tensor beside it (``q`` is 192 wide,
+the head output 128). Exchanging on the narrow side instead would move 3.4x
+fewer bytes in 2 collectives rather than 3, at the price of a full ``w_kc`` and
+``w_vc`` per rank -- W1 in ``DSA_CP_HANDOFF_2026-09-24.md``, which asks for a
+probe before any code.
+
+The KV cache write, the DCP context gather and the indexer all keep running at
+full width, so the older indexer-only query sharding
 (``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``) composes with this rather
 than conflicting: it shards the indexer and gathers the top-k back, and this
-takes its own slice of that result.
+takes its own slice of that result. Both pick the *same* rows, so that gather
+is pure overhead whenever the two run together (W2). The agreement they rely on
+is pinned by ``test/registered/dcp/test_dsa_cp_indexer_row_agreement.py``.
 
 What is given up is the saving on the K-side projections, which run full width
 today anyway. What is kept is the reason for the exercise: sparse attention is
