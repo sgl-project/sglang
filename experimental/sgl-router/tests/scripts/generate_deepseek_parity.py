@@ -68,7 +68,7 @@ def main():
         fixture_path = ROOT / (family + ".json")
         fixture = json.loads(fixture_path.read_text())
         for case in fixture["cases"]:
-            server._dsv4_reasoning_effort_profile = case["profile"]
+            server._dsv4_reasoning_effort_profile = case.get("profile")
             tok.texts.clear()
             request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
             # _convert_to_internal_request: kwargs effort replaces the request effort.
