@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import is_port_available
-from sglang.test.run_eval import run_eval as run_gsm8k_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -138,7 +138,7 @@ class TestEPLBMoriStat(CustomTestCase):
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
@@ -183,7 +183,7 @@ class TestEPLBMoriStatApprox(CustomTestCase):
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
@@ -230,7 +230,7 @@ class TestEPLBMoriMultiChunk(CustomTestCase):
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_gsm8k_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.9)
 

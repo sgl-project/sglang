@@ -1,10 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -77,7 +77,7 @@ class TestDisaggregationPiecewiseCudaGraph(PDDisaggregationServerBase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"GSM8K accuracy with piecewise cuda graph: {metrics['score']:.3f}")
 
         self.assertGreater(metrics["score"], 0.62)

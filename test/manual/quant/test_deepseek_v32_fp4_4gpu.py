@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -60,7 +60,7 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             num_examples=500,
             num_threads=500,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
@@ -126,7 +126,7 @@ class TestDeepseekV32FP4TP(CustomTestCase):
             num_examples=500,
             num_threads=500,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

@@ -5,8 +5,8 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
@@ -82,7 +82,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/server_info")

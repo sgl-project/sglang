@@ -16,11 +16,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.kits.spec_server_kits import SpecGrammarKit
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
     assert_process_healthy,
 )
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -47,7 +47,7 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.62)
@@ -206,7 +206,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
         # Expect lots of failure but the server cannot crash
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             print(f"Evaluation metrics: {metrics}")
         except Exception as e:
             print(f"Test encountered expected errors: {e}")
@@ -376,7 +376,7 @@ class TestDisaggregationMooncakeSpec(
         # correct afterwards — a leaked host slot or a damaged neighbour shows up as
         # a wrong answer rather than merely a 200.
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
-        metrics = run_eval(
+        metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=f"http://{self.base_host}:{self.lb_port}",
                 eval_name="gsm8k",
@@ -398,7 +398,7 @@ class TestDisaggregationMooncakeSpec(
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
@@ -425,7 +425,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.62)

@@ -8,7 +8,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -177,7 +177,7 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             num_examples=100,
             num_threads=64,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"GSM8K after adaptive switches: {metrics}")
         self.assertGreater(metrics["score"], 0.20)
 

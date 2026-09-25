@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -45,7 +45,7 @@ class TestDeepseekV3W4afp8(CustomTestCase):
             num_examples=1200,
             num_threads=1200,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["score"], 0.92)
@@ -98,7 +98,7 @@ class TestDeepseekV3W4Afp8Mtp(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/server_info")
@@ -165,7 +165,7 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["score"], 0.92)
@@ -233,7 +233,7 @@ class TestDeepseekV3W4Afp8DeepepAutoMtp(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
         self.assertGreater(metrics["score"], 0.92)

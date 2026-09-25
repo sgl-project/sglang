@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -36,7 +36,7 @@ class TestTorchFlexAttnBackend(CustomTestCase):
                 num_examples=100,
                 num_threads=10,
             )
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             print(f"{metrics=}")
             self.assertGreater(metrics["score"], 0.62)
         finally:

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,7 +36,7 @@ class TestUnslothPhi4(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.78)
 
@@ -69,7 +69,7 @@ class TestUnslothPhi4Bnb4bit(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.75)
 
@@ -102,7 +102,7 @@ class TestUnslothPhi4UnslothBnb4bit(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.75)
 
@@ -132,7 +132,7 @@ class TestUnslothPhi4MiniInstruct(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.65)
 
@@ -165,7 +165,7 @@ class TestUnslothPhi4MiniBnb4bit(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.6)
 
@@ -198,7 +198,7 @@ class TestUnslothPhi4MiniUnslothBnb4bit(CustomTestCase):
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.6)
 

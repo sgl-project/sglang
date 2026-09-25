@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -50,7 +50,7 @@ class TestLlama4(CustomTestCase):
                     num_examples=200,
                     num_threads=128,
                 )
-                metrics = run_eval(args)
+                metrics = run_sgl_eval(args)
                 print(f"{metrics=}")
                 self.assertGreaterEqual(metrics["score"], model.accuracy)
             except Exception as e:
