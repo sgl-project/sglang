@@ -136,6 +136,7 @@ POSITIONAL_FIELD_ORDER = (
     "served_model_name",
     "weight_version",
     "chat_template",
+    "trust_request_chat_template",
     "hf_chat_template_name",
     "completion_template",
     "file_storage_path",

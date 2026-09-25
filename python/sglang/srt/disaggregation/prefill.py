@@ -400,18 +400,19 @@ class PrefillBootstrapQueue:
 
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
-        num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
-        num_kv_indices_to_send = num_kv_indices - decode_prefix_len
-        num_pages = kv_to_page_num(
-            num_kv_indices_to_send,
-            self.scheduler.token_to_kv_pool_allocator.page_size,
-        )
+        num_pages = self._num_pages_to_send(req, decode_prefix_len)
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
         return True
+
+    def _num_pages_to_send(self, req: Req, decode_prefix_len: int) -> int:
+        return kv_to_page_num(
+            len(req.origin_input_ids) - decode_prefix_len,
+            self.scheduler.token_to_kv_pool_allocator.page_size,
+        )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         # Rejected at intake: `set_finish_with_abort` left the verdict in
@@ -665,6 +666,9 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -705,6 +709,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -1554,12 +1561,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self._release_aborted_request(req)
         # Mamba insertion donates the checkpoint and clears its sequence marker.
-        release_kv_cache(
-            req,
-            self.tree_cache,
-            is_insert=not uses_write_through_cache
-            and not self.tree_cache.supports_mamba(),
+        is_insert = (
+            not uses_write_through_cache and not self.tree_cache.supports_mamba()
         )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
