@@ -532,14 +532,10 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
-            from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-            from sglang.srt.runtime_context import get_server_args
 
-            validate_hicache_dcp_storage(
-                get_server_args(),
-                storage_backend=storage_backend,
-            )
+            if storage_backend != "file":
+                raise NotImplementedError("HiCache L3 with DCP requires file storage.")
             if (
                 not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
                 or self.storage_host_pool.kv_buffer is None

@@ -112,8 +112,6 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.hicache_storage_backend is not None:
-        validate_hicache_dcp_storage(server_args)
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 only supports DSPARK speculative "
@@ -142,17 +140,6 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
     )
-
-
-def validate_hicache_dcp_storage(server_args: Any, *, storage_backend=None):
-    """Only the MLA file path currently implements DCP shard storage."""
-    cfg = resolving_view(server_args)
-    if cfg.dcp_size <= 1:
-        return
-    if not use_mla_backend(server_args):
-        raise NotImplementedError("HiCache L3 with DCP requires MLA.")
-    if (storage_backend or cfg.hicache_storage_backend) != "file":
-        raise NotImplementedError("HiCache L3 with DCP requires file storage.")
 
 
 def resolve_layout_io_compatibility(server_args: Any):

@@ -1,13 +1,17 @@
 """Startup and runtime support boundaries for DCP file storage."""
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.arg_groups.hicache_hook import (
     resolve_hicache_dcp_compatibility,
-    validate_hicache_dcp_storage,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -85,38 +89,70 @@ class TestDcpStorageGuards(unittest.TestCase):
                 ):
                     resolve_hicache_dcp_compatibility(_args(**options))
 
-    def test_runtime_rejection_has_no_side_effects(self):
-        for attached in (False, True):
-            for mla, backend, message in (
-                (False, "file", "MLA"),
-                (True, "mooncake", "file storage"),
+    def test_keeps_existing_mla_constraint(self):
+        with (
+            mock.patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=False
+            ),
+            self.assertRaisesRegex(NotImplementedError, "only supported for MLA"),
+        ):
+            resolve_hicache_dcp_compatibility(_args())
+
+    def test_startup_and_runtime_share_controller_guards(self):
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.kv_buffer = object()
+        host.layout = "page_first"
+        host.device_pool = SimpleNamespace()
+        device = SimpleNamespace(
+            device="cpu", layer_num=1, register_layer_transfer_counter=mock.Mock()
+        )
+        allocator = mock.Mock()
+        allocator.get_kvcache.return_value = device
+        for backend, pool, message in (
+            ("mooncake", host, "requires file storage"),
+            ("file", object(), "requires one materialized MLA host pool"),
+        ):
+            entry = SimpleNamespace(host_pool=pool)
+            group = SimpleNamespace(anchor_entry=entry, entries=[entry])
+            with (
+                self.subTest(backend=backend, message=message),
+                mock.patch(
+                    "sglang.srt.managers.cache_controller.get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=2),
+                ),
+                mock.patch("sglang.srt.managers.cache_controller.LayerDoneCounter"),
+                mock.patch("sglang.srt.managers.cache_controller.L2TransferEngine"),
+                mock.patch.object(
+                    HybridCacheController, "_start_storage_threads"
+                ) as start,
+                mock.patch.object(
+                    HybridCacheController, "_stop_storage_threads"
+                ) as stop,
             ):
-                cache = SimpleNamespace(
-                    cache_controller=SimpleNamespace(), enable_storage=attached
+                # Startup reaches the same controller attach used by the API.
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    HybridCacheController(
+                        allocator,
+                        group,
+                        128,
+                        None,
+                        threading.Event(),
+                        storage_backend=backend,
+                    )
+                controller = HybridCacheController(
+                    allocator, group, 128, None, threading.Event()
                 )
-                attachment = StorageAttachment(cache)
-                attachment._apply_policies = mock.Mock()
-                with (
-                    self.subTest(attached=attached, mla=mla, backend=backend),
-                    mock.patch(
-                        "sglang.srt.runtime_context.get_parallel",
-                        return_value=SimpleNamespace(attn_dcp_size=2),
-                    ),
-                    mock.patch(
-                        "sglang.srt.runtime_context.get_server_args",
-                        return_value=_args(),
-                    ),
-                    mock.patch(
-                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
-                        return_value=mla,
-                    ),
-                ):
-                    ok, reason = attachment.attach(backend)
-                    self.assertFalse(ok)
-                    self.assertIn(message, reason)
-                    with self.assertRaisesRegex(NotImplementedError, message):
-                        validate_hicache_dcp_storage(_args(), storage_backend=backend)
-                attachment._apply_policies.assert_not_called()
+                cache = SimpleNamespace(
+                    cache_controller=controller,
+                    enable_storage=False,
+                    sliding_window_size=None,
+                )
+                ok, reason = StorageAttachment(cache).attach(backend)
+                self.assertFalse(ok)
+                self.assertIn(message, reason)
+                self.assertFalse(controller.enable_storage)
+                start.assert_not_called()
+                stop.assert_not_called()
 
     def test_runtime_policy_updates_use_existing_validation(self):
         cache = SimpleNamespace(
@@ -125,32 +161,20 @@ class TestDcpStorageGuards(unittest.TestCase):
         )
         attachment = StorageAttachment(cache)
         attachment._apply_policies = mock.Mock()
-        with (
-            mock.patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=2),
-            ),
-            mock.patch(
-                "sglang.srt.runtime_context.get_server_args", return_value=_args()
-            ),
-            mock.patch(
-                "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
-            ),
-        ):
-            for write in ("write_back", "write_through", "write_through_selective"):
-                for prefetch in ("best_effort", "timeout", "wait_complete"):
-                    with self.subTest(write=write, prefetch=prefetch):
-                        ok, reason = attachment.attach(
-                            "file",
-                            hicache_write_policy=write,
-                            hicache_storage_prefetch_policy=prefetch,
-                        )
-                        self.assertTrue(ok, reason)
-                        attachment._apply_policies.assert_called_with(prefetch, write)
-            attachment._apply_policies.reset_mock()
-            ok, _ = attachment.attach("file", hicache_write_policy="invalid")
-            self.assertFalse(ok)
-            attachment._apply_policies.assert_not_called()
+        for write in ("write_back", "write_through", "write_through_selective"):
+            for prefetch in ("best_effort", "timeout", "wait_complete"):
+                with self.subTest(write=write, prefetch=prefetch):
+                    ok, reason = attachment.attach(
+                        "file",
+                        hicache_write_policy=write,
+                        hicache_storage_prefetch_policy=prefetch,
+                    )
+                    self.assertTrue(ok, reason)
+                    attachment._apply_policies.assert_called_with(prefetch, write)
+        attachment._apply_policies.reset_mock()
+        ok, _ = attachment.attach("file", hicache_write_policy="invalid")
+        self.assertFalse(ok)
+        attachment._apply_policies.assert_not_called()
 
 
 if __name__ == "__main__":

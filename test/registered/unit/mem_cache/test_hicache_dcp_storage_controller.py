@@ -329,10 +329,6 @@ class TestDcpStorageController(CustomTestCase):
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=_parallel(0, 2),
                 ),
-                mock.patch("sglang.srt.runtime_context.get_server_args"),
-                mock.patch(
-                    "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
-                ),
                 self.assertRaises(NotImplementedError),
             ):
                 cc.attach_storage_backend("file")
@@ -352,10 +348,6 @@ class TestDcpStorageController(CustomTestCase):
                 mock.patch(
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=_parallel(0, dcp_size),
-                ),
-                mock.patch("sglang.srt.runtime_context.get_server_args"),
-                mock.patch(
-                    "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
                 ),
                 self.assertRaisesRegex(
                     NotImplementedError, "one materialized MLA host pool"
