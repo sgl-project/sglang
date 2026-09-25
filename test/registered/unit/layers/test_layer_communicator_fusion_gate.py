@@ -21,12 +21,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
-    return types.SimpleNamespace(
-        _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
-        is_last_layer=False,
-        _context=types.SimpleNamespace(tp_size=4),
-    )
+    communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator._speculative_algo = None
+    communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
+    communicator.is_last_layer = False
+    communicator._context = types.SimpleNamespace(tp_size=4)
+    return communicator
 
 
 @contextlib.contextmanager
@@ -277,6 +277,133 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 moe_ep_size=1, moe_tp_size=4, mlp_mode=ScatterMode.MOE_FULL
             )
         )
+
+
+class TestDeferFfnReduction(CustomTestCase):
+    """The FFN leaves its sum to the next layer whenever the next layer runs the
+    all-reduce the FFN would have: fused when the kernel takes the batch, and
+    otherwise the same full-precision TP all-reduce."""
+
+    def _should_defer(
+        self,
+        *,
+        fused=False,
+        dp_attention=False,
+        a2a_none=True,
+        output_complete=False,
+        quant_communications=False,
+        reduce_scatter=False,
+        is_last_layer=False,
+        batch_size=8,
+        shared_expert_tp1=False,
+        lora=False,
+        tp_group=True,
+    ):
+        communicator = _fake_communicator()
+        communicator.is_last_layer = is_last_layer
+        communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
+        forward_batch = types.SimpleNamespace(
+            input_ids=types.SimpleNamespace(shape=(batch_size,))
+        )
+        with (
+            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
+            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fused),
+            patch.object(comm, "_use_aiter", False),
+            patch.object(
+                comm,
+                "get_attn_tp_context",
+                return_value=types.SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(comm, "is_dp_attention_enabled", return_value=dp_attention),
+            patch.object(
+                comm,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
+            ),
+            patch.object(
+                comm, "post_experts_output_is_complete", return_value=output_complete
+            ),
+            patch.object(
+                comm,
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    comm=types.SimpleNamespace(
+                        enable_quant_communications=quant_communications
+                    )
+                ),
+            ),
+            patch.object(
+                comm.envs.SGLANG_SHARED_EXPERT_TP1,
+                "get",
+                return_value=shared_expert_tp1,
+            ),
+            patch.object(
+                comm,
+                "get_lora",
+                return_value=types.SimpleNamespace(enable_lora=lora),
+            ),
+            patch.object(
+                comm, "_deferred_reduction_runs_on_the_tp_group", return_value=tp_group
+            ),
+            get_parallel().override(
+                moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
+            ),
+        ):
+            return communicator.should_defer_ffn_reduction(forward_batch)
+
+    def test_defers_whether_or_not_the_fused_kernel_takes_the_batch(self):
+        self.assertTrue(self._should_defer(fused=True))
+        self.assertTrue(self._should_defer(fused=False))
+
+    def test_keeps_the_reduction_when_the_next_layer_would_run_a_different_one(
+        self,
+    ):
+        for condition in (
+            dict(dp_attention=True),
+            dict(a2a_none=False),
+            dict(output_complete=True),
+            dict(quant_communications=True),
+            dict(reduce_scatter=True),
+            dict(is_last_layer=True),
+            dict(batch_size=0),
+            dict(shared_expert_tp1=True),
+            dict(lora=True),
+            dict(tp_group=False),
+        ):
+            with self.subTest(**condition):
+                self.assertFalse(self._should_defer(**condition))
+
+
+class TestDeferredReductionGroup(CustomTestCase):
+    """The unfused completion runs on the same group object the FFN would have
+    reduced over, or the FFN keeps its reduction."""
+
+    def _runs_on_tp(
+        self, *, moe_ep_size, moe_tp_size, ep_is_tp=True, moe_tp_is_tp=True
+    ):
+        tp_group = object()
+        parallel = types.SimpleNamespace(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            tp_group=tp_group,
+            moe_ep_group=tp_group if ep_is_tp else object(),
+            moe_tp_group=tp_group if moe_tp_is_tp else object(),
+        )
+        with patch.object(comm, "get_parallel", return_value=parallel):
+            return comm._deferred_reduction_runs_on_the_tp_group()
+
+    def test_pure_tp_and_pure_ep_reduce_over_the_tp_group(self):
+        self.assertTrue(self._runs_on_tp(moe_ep_size=1, moe_tp_size=4))
+        self.assertTrue(self._runs_on_tp(moe_ep_size=4, moe_tp_size=1))
+
+    def test_a_separate_group_keeps_the_reduction_in_the_ffn(self):
+        self.assertFalse(
+            self._runs_on_tp(moe_ep_size=1, moe_tp_size=2, moe_tp_is_tp=False)
+        )
+        self.assertFalse(self._runs_on_tp(moe_ep_size=4, moe_tp_size=1, ep_is_tp=False))
+
+    def test_hybrid_ep_tp_keeps_the_reduction_in_the_ffn(self):
+        self.assertFalse(self._runs_on_tp(moe_ep_size=2, moe_tp_size=2))
 
 
 if __name__ == "__main__":

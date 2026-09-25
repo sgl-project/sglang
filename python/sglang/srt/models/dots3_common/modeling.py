@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    UnreducedOutput,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -1638,7 +1639,7 @@ class Dots3DecoderLayer(nn.Module):
         )
 
         if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(

@@ -136,13 +136,37 @@ class TestPrepareAttnSteps(CustomTestCase):
                 platform(fusion=fusion) as (_, all_reduce),
             ):
                 norm = Norm()
-                hidden_states = torch.ones(2, 4)
-                hidden_states._sglang_needs_allreduce_fusion = True
+                hidden_states = comm.UnreducedOutput(torch.ones(2, 4))
                 communicator(norm).prepare_attn(hidden_states, torch.zeros(2, 4), None)
                 self.assertEqual(all_reduce.call_count, 0 if fusion else 1)
                 self.assertEqual(
                     norm.calls, ["fused_all_reduce_norm"] if fusion else ["norm"]
                 )
+
+    def test_a_pending_sum_keeps_the_quant_format_without_fusion(self):
+        with platform(use_aiter=True) as (kernels, all_reduce):
+            norm = Norm()
+            communicator(norm).prepare_attn(
+                comm.UnreducedOutput(torch.ones(2, 4)),
+                torch.zeros(2, 4),
+                None,
+                quant_format="fp8_per_token",
+            )
+            self.assertEqual(all_reduce.call_count, 1)
+            self.assertTrue(kernels["_fused_rmsnorm_fp8_per_token_quant"].called)
+            self.assertEqual(norm.calls, [])
+
+    def test_a_post_residual_addition_bypasses_the_fused_kernel(self):
+        with platform(fusion=True) as (_, all_reduce):
+            norm = Norm()
+            communicator(norm).prepare_attn(
+                comm.UnreducedOutput(torch.ones(2, 4)),
+                torch.zeros(2, 4),
+                None,
+                post_residual_addition=torch.ones(2, 4),
+            )
+            self.assertEqual(all_reduce.call_count, 1)
+            self.assertEqual(norm.calls, ["norm"])
 
 
 if __name__ == "__main__":

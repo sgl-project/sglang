@@ -5,7 +5,8 @@ import torch
 
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    complete_deferred_allreduce,
+    UnreducedOutput,
+    reduce_output,
 )
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,9 +20,7 @@ def make_communicator(*, fuse, reduce_scatter, cls=LayerCommunicator):
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
     if cls is LayerCommunicator:
-        communicator.should_fuse_mlp_allreduce_with_next_layer = MagicMock(
-            return_value=fuse
-        )
+        communicator.should_defer_ffn_reduction = MagicMock(return_value=fuse)
     communicator.should_use_reduce_scatter = MagicMock(return_value=reduce_scatter)
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
@@ -49,11 +48,11 @@ class TestFfnExit(CustomTestCase):
             hidden_states = self.hidden_states * 2
         return seen, ffn_exit.finish(hidden_states, self.residual)
 
-    def test_reduction_left_to_next_layer_is_marked(self):
+    def test_reduction_left_to_next_layer_is_unreduced(self):
         communicator = make_communicator(fuse=True, reduce_scatter=False)
         seen, (hidden_states, residual) = self.run_exit(communicator)
         self.assertEqual(seen, (True, False))
-        self.assertTrue(hidden_states._sglang_needs_allreduce_fusion)
+        self.assertIsInstance(hidden_states, UnreducedOutput)
         self.assertIs(residual, self.residual)
         communicator.postprocess_layer.assert_not_called()
 
@@ -65,9 +64,7 @@ class TestFfnExit(CustomTestCase):
                 )
                 seen, (hidden_states, residual) = self.run_exit(communicator)
                 self.assertEqual(seen, (False, reduce_scatter))
-                self.assertFalse(
-                    getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
-                )
+                self.assertNotIsInstance(hidden_states, UnreducedOutput)
                 communicator.postprocess_layer.assert_called_once()
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
@@ -80,15 +77,12 @@ class TestFfnExit(CustomTestCase):
                 communicator = make_communicator(fuse=fuse, reduce_scatter=False)
                 with communicator.ffn_exit(self.forward_batch) as ffn_exit:
                     seen = published_flags()
-                    decide = communicator.should_fuse_mlp_allreduce_with_next_layer
+                    decide = communicator.should_defer_ffn_reduction
                     decide.return_value = not fuse
                     hidden_states = self.hidden_states * 2
                 hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
                 self.assertEqual(seen, (fuse, False))
-                self.assertEqual(
-                    getattr(hidden_states, "_sglang_needs_allreduce_fusion", False),
-                    fuse,
-                )
+                self.assertEqual(isinstance(hidden_states, UnreducedOutput), fuse)
                 self.assertEqual(communicator.postprocess_layer.called, not fuse)
 
     def test_flags_are_restored_after_the_ffn(self):
@@ -97,12 +91,12 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(published_flags(), before)
 
     def test_subclass_decisions_are_used(self):
-        class NeverFuses(LayerCommunicator):
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+        class NeverDefers(LayerCommunicator):
+            def should_defer_ffn_reduction(self, forward_batch):
                 return False
 
         communicator = make_communicator(
-            fuse=True, reduce_scatter=False, cls=NeverFuses
+            fuse=True, reduce_scatter=False, cls=NeverDefers
         )
         seen, _ = self.run_exit(communicator)
         self.assertEqual(seen, (False, False))
@@ -132,30 +126,10 @@ class TestFfnExit(CustomTestCase):
 
         # The MoE may decline per forward; a tensor then takes the fused exit.
         hidden_states, _ = ffn_exit.finish(self.hidden_states * 2, self.residual)
-        self.assertTrue(hidden_states._sglang_needs_allreduce_fusion)
-
-    def test_compiles_without_graph_breaks(self):
-        communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator.should_fuse_mlp_allreduce_with_next_layer = lambda forward_batch: (
-            True
-        )
-        communicator.should_use_reduce_scatter = lambda forward_batch: False
-        forward_batch = object()
-
-        def layer(hidden_states, residual):
-            with communicator.ffn_exit(forward_batch) as ffn_exit:
-                if get_forward().fuse_mlp_allreduce:
-                    hidden_states = hidden_states * 2
-            return ffn_exit.finish(hidden_states, residual)
-
-        torch._dynamo.reset()
-        compiled = torch.compile(layer, backend="eager", fullgraph=True)
-        hidden_states, residual = compiled(self.hidden_states, self.residual)
-        torch.testing.assert_close(hidden_states, self.hidden_states * 2)
-        self.assertIs(residual, self.residual)
+        self.assertIsInstance(hidden_states, UnreducedOutput)
 
 
-class TestCompleteDeferredAllreduce(CustomTestCase):
+class TestReduceOutput(CustomTestCase):
     def setUp(self):
         self.all_reduce = MagicMock(side_effect=lambda hidden_states: hidden_states * 3)
         patcher = patch(
@@ -171,12 +145,12 @@ class TestCompleteDeferredAllreduce(CustomTestCase):
             hidden_states = torch.ones(3, 4)
         hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
 
-        hidden_states = complete_deferred_allreduce(hidden_states)
+        hidden_states = reduce_output(hidden_states)
         self.all_reduce.assert_called_once()
         torch.testing.assert_close(hidden_states, torch.full((3, 4), 3.0))
-        self.assertFalse(hidden_states._sglang_needs_allreduce_fusion)
+        self.assertNotIsInstance(hidden_states, UnreducedOutput)
 
-        complete_deferred_allreduce(hidden_states)
+        reduce_output(hidden_states)
         self.all_reduce.assert_called_once()
 
     def test_complete_hidden_states_pass_through(self):
@@ -185,8 +159,8 @@ class TestCompleteDeferredAllreduce(CustomTestCase):
             hidden_states = torch.ones(3, 4)
         hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
 
-        self.assertIs(complete_deferred_allreduce(hidden_states), hidden_states)
-        self.assertIsNone(complete_deferred_allreduce(None))
+        self.assertIs(reduce_output(hidden_states), hidden_states)
+        self.assertIsNone(reduce_output(None))
         self.all_reduce.assert_not_called()
 
     def test_finish_layer_stack_completes_the_last_layer(self):

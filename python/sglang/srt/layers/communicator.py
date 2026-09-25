@@ -18,6 +18,7 @@ from enum import Enum, auto
 from functools import cached_property, partial
 from typing import Callable, Dict, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import (
@@ -66,6 +67,7 @@ from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
+    post_experts_output_is_complete,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -82,6 +84,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
     get_spec,
@@ -621,6 +624,68 @@ def _attn_input_update_and_read_residual(quant_format: str):
     return _update_and_read_residual_plain
 
 
+class UnreducedOutput(msgspec.Struct, frozen=True):
+    """A layer output that still owes its FFN all-reduce, left for the next
+    layer's input norm. Hand it to the next layer, or pass it through
+    reduce_output() before reading it any other way."""
+
+    partial: torch.Tensor
+
+
+def reduce_output(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, None],
+) -> Optional[torch.Tensor]:
+    """Run the all-reduce an UnreducedOutput still owes; pass anything else through."""
+    if isinstance(hidden_states, UnreducedOutput):
+        return deferred_post_experts_all_reduce(hidden_states.partial)
+    return hidden_states
+
+
+def layer_input_buffer(
+    hidden_states: Union[torch.Tensor, UnreducedOutput],
+) -> torch.Tensor:
+    """The tensor holding a layer's input, for reusing its memory without reading it."""
+    if isinstance(hidden_states, UnreducedOutput):
+        return hidden_states.partial
+    return hidden_states
+
+
+def _batch_size(forward_batch: ForwardBatch) -> int:
+    return (
+        forward_batch.input_ids.shape[0] if hasattr(forward_batch, "input_ids") else 0
+    )
+
+
+def _deferred_reduction_runs_on_the_tp_group() -> bool:
+    """Whether deferred_post_experts_all_reduce reduces over the TP group object
+    itself, the group a dense FFN and reduce_moe_output reduce over."""
+    parallel = get_parallel()
+    if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+        return False
+    group = parallel.moe_ep_group if parallel.moe_ep_size > 1 else parallel.moe_tp_group
+    return group is parallel.tp_group
+
+
+def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
+    """Whether deferred_post_experts_all_reduce is the all-reduce the FFN would
+    have run itself: one full-precision sum over the same TP group, on an output
+    that is a plain partial sum, with no attention DP layout to restore. The
+    output is not a plain partial sum when the MoE combine already summed it, a
+    replicated shared expert is added after the reduction, or LoRA-B runs on
+    the unreduced activations."""
+    return (
+        _batch_size(forward_batch) > 0
+        and not is_dp_attention_enabled()
+        and get_moe_a2a_backend().is_none()
+        and not post_experts_output_is_complete(is_tp_path=True)
+        and not get_exec().comm.enable_quant_communications
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        and not get_lora().enable_lora
+        and _deferred_reduction_runs_on_the_tp_group()
+    )
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -762,12 +827,15 @@ class LayerCommunicator:
 
     def prepare_attn(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, UnreducedOutput],
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        pending = isinstance(hidden_states, UnreducedOutput)
+        if pending:
+            hidden_states = hidden_states.partial
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
         # the next one.
@@ -793,14 +861,21 @@ class LayerCommunicator:
             )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
-        elif (
-            residual is not None
-            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-            and hidden_states._sglang_needs_allreduce_fusion
-        ):
-            hidden_states, residual = self._reduce_output_and_update_and_read_residual(
-                hidden_states, residual, forward_batch
+        elif residual is not None and pending:
+            fused = (
+                self._reduce_output_and_update_and_read_residual(
+                    hidden_states, residual, forward_batch
+                )
+                if post_residual_addition is None
+                else None
             )
+            if fused is not None:
+                hidden_states, residual = fused
+            else:
+                hidden_states = deferred_post_experts_all_reduce(hidden_states)
+                hidden_states, residual = _attn_input_update_and_read_residual(
+                    quant_format
+                )(self.input_layernorm, hidden_states, residual, post_residual_addition)
         else:
             hidden_states, residual = _attn_input_update_and_read_residual(
                 quant_format
@@ -831,12 +906,10 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Complete the sum the previous layer left, add it to the residual and
-        apply the input norm:
-        fused into one kernel when it takes this batch, else as an all-reduce
-        followed by the norm. Neither applies ``quant_format`` or
-        ``post_residual_addition``."""
+        apply the input norm in one fused kernel; None when the kernel does not
+        take this batch. The result is not quantized for ``quant_format``."""
         if (
             apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
             or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
@@ -864,8 +937,7 @@ class LayerCommunicator:
             return self.input_layernorm.forward_with_allreduce_fusion(
                 hidden_states, residual, use_attn_tp_group=False
             )
-        hidden_states = deferred_post_experts_all_reduce(hidden_states)
-        return self.input_layernorm(hidden_states, residual)
+        return None
 
     def _tp_reduce_scatter(
         self,
@@ -929,14 +1001,14 @@ class LayerCommunicator:
 
     def finish_layer_stack(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, UnreducedOutput],
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Complete what this layer left for a next layer. Call it on the last
         layer of this rank before its output reaches the final norm, the next
         pipeline rank, or any other consumer outside the layers."""
-        return complete_deferred_allreduce(hidden_states), residual
+        return reduce_output(hidden_states), residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
@@ -967,10 +1039,7 @@ class LayerCommunicator:
         """Whether the MoE may hand an unfinalized output to the next layer."""
         return False
 
-    # NOTE: This function will cause torch recompilation
-    def should_fuse_mlp_allreduce_with_next_layer(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
+    def _ffn_sum_can_move_to_next_layer(self) -> bool:
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
@@ -1003,17 +1072,17 @@ class LayerCommunicator:
         if get_attn_tp_context().input_scattered:
             return False
 
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
-
         # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
         # all-reduce, so there is nothing to fuse with the next layer.
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
-            return False
+        return self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED
 
+    # NOTE: This function will cause torch recompilation
+    def should_fuse_mlp_allreduce_with_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        if not self._ffn_sum_can_move_to_next_layer():
+            return False
+        batch_size = _batch_size(forward_batch)
         return (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
@@ -1028,6 +1097,20 @@ class LayerCommunicator:
             )
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)
+        )
+
+    def should_defer_ffn_reduction(self, forward_batch: ForwardBatch) -> bool:
+        """Whether the FFN leaves its output's all-reduce to the next layer's
+        input norm: whenever the fused kernel takes it, and otherwise when the
+        next layer would run the same all-reduce the FFN itself would have."""
+        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
+            return True
+        return (
+            self._context.tp_size > 1
+            and not self.is_last_layer
+            and self._ffn_sum_can_move_to_next_layer()
+            and _unfused_completion_matches_the_ffn(forward_batch)
+            and not self.should_use_reduce_scatter(forward_batch)
         )
 
 
@@ -1079,7 +1162,7 @@ class FfnExit:
         # Deferring implies fusing: a handoff skips the post-experts all-reduce.
         self.fuse_mlp_allreduce = (
             self.defer_moe_finalize
-            or communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            or communicator.should_defer_ffn_reduction(forward_batch)
         )
         self.mlp_reduce_scatter = communicator.should_use_reduce_scatter(forward_batch)
         self._scope = get_forward().scoped(
@@ -1097,29 +1180,17 @@ class FfnExit:
 
     def finish(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
         """Leave the reduction to the next layer's input norm, or postprocess."""
         if not isinstance(hidden_states, torch.Tensor):
             # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         if self.fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-            return hidden_states, residual
+            return UnreducedOutput(hidden_states), residual
         return self.communicator.postprocess_layer(
             hidden_states, residual, self.forward_batch
         )
-
-
-def complete_deferred_allreduce(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Run the all-reduce a layer left for the next layer's input norm."""
-    if (
-        hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-        and hidden_states._sglang_needs_allreduce_fusion
-    ):
-        hidden_states = deferred_post_experts_all_reduce(hidden_states)
-        hidden_states._sglang_needs_allreduce_fusion = False
-    return hidden_states
 
 
 @dataclass

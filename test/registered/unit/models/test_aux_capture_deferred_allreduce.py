@@ -45,6 +45,7 @@ class DeferringLayer(nn.Module):
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )
+        self.layer_communicator.should_defer_ffn_reduction = lambda batch: defer
         self.layer_communicator.should_use_reduce_scatter = lambda batch: False
         self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
             all_reduce(hidden),
@@ -60,7 +61,7 @@ class DeferringLayer(nn.Module):
         *args,
         **kwargs,
     ):
-        hidden_states = comm.complete_deferred_allreduce(hidden_states)
+        hidden_states = comm.reduce_output(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:

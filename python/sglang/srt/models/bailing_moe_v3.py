@@ -31,8 +31,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
+    layer_input_buffer,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -1385,9 +1386,9 @@ class BailingMoELinearModel(nn.Module):
                 if (
                     capture_aux
                     and i in self.layers_to_capture
-                    and hidden_states.shape[0] != 0
+                    and layer_input_buffer(hidden_states).shape[0] != 0
                 ):
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     if residual is None:
                         dspark_aux_hidden_states.append(hidden_states)
                     else:

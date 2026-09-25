@@ -558,6 +558,9 @@ class MHCLayerCommunicator(LayerCommunicator):
     def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
         return False
 
+    def should_defer_ffn_reduction(self, forward_batch):
+        return False
+
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False

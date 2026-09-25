@@ -14,6 +14,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    UnreducedOutput,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -641,7 +642,7 @@ class Step3p5DecoderLayer(nn.Module):
             fuse_mlp_allreduce = False
 
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
