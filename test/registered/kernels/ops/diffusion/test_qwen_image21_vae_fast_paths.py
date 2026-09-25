@@ -72,14 +72,21 @@ def test_decode_is_bit_identical_and_paths_verify(monkeypatch):
     optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
     bias_gate = vae_opt.BitExactFusionGate("test bias + residual")
     monkeypatch.setattr(vae_opt, "_BIAS_RESIDUAL_FUSION", bias_gate)
-    calls = {"bias_residual": 0}
-    real_bias_residual = vae_opt.bias_residual_add
+    up_gate = vae_opt.BitExactFusionGate("test upsampler bias")
+    monkeypatch.setattr(vae_opt, "_UPSAMPLE_BIAS_FUSION", up_gate)
+    calls = {"bias_residual": 0, "dup_bias": 0}
+    real_bias_residual, real_dup = vae_opt.bias_residual_add, vae_opt.dup_up3d_add
 
     def counting(y, bias, h):
         calls["bias_residual"] += 1
         return real_bias_residual(y, bias, h)
 
+    def counting_dup(*args, **kwargs):
+        calls["dup_bias"] += len(args) > 6 or "bias" in kwargs
+        return real_dup(*args, **kwargs)
+
     monkeypatch.setattr(vae_opt, "bias_residual_add", counting)
+    monkeypatch.setattr(vae_opt, "dup_up3d_add", counting_dup)
     assert set(optimized.state_dict().keys()) == set(reference.state_dict().keys())
     for key, value in optimized.state_dict().items():
         assert torch.equal(value, reference.state_dict()[key])
@@ -91,6 +98,8 @@ def test_decode_is_bit_identical_and_paths_verify(monkeypatch):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     assert all(gate.verified and not gate.disabled for gate in installed)
     assert bias_gate.verified and not bias_gate.disabled
+    assert up_gate.verified and not up_gate.disabled
+    assert calls["dup_bias"] == 4  # one fused shortcut add per upsampling block
     # one fused bias + residual add per residual block
     assert calls["bias_residual"] == sum(
         1 for m in optimized.modules() if type(m).__name__ == "QwenImage21ResidualBlock"
@@ -133,6 +142,9 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     monkeypatch.setattr(
         vae_opt, "_BIAS_RESIDUAL_FUSION", vae_opt.BitExactFusionGate("test bias")
     )
+    monkeypatch.setattr(
+        vae_opt, "_UPSAMPLE_BIAS_FUSION", vae_opt.BitExactFusionGate("test up bias")
+    )
     calls = {"nhwc": 0, "nhwc_bias": 0, "gather": 0, "conv_transpose": 0}
     real_nhwc, real_gather, real_conv_t = (
         vae_opt.channel_rmsnorm_silu_nhwc,
@@ -160,6 +172,9 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     z = torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
     expected = reference.decode(z)
     with use_vae_fast_path(optimized, True):
+        optimized.decode(z)  # first-sight compares run their eager references once
+        for key in calls:
+            calls[key] = 0
         fast = optimized.decode(z)
     assert fast.shape == expected.shape
     assert calls["nhwc"] > 0 and calls["conv_transpose"] == 4

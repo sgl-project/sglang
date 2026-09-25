@@ -212,6 +212,7 @@ def _dup_up3d_add_kernel(
     main_ptr,
     src_ptr,
     out_ptr,
+    bias_ptr,
     total,
     C_out,
     out_t,
@@ -237,6 +238,7 @@ def _dup_up3d_add_kernel(
     FS: tl.constexpr,
     REPEATS: tl.constexpr,
     CHANNELS_INNER: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     IDX64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -289,6 +291,11 @@ def _dup_up3d_add_kernel(
     o_off = ob * sob + oc * soc + o_t * sot + oh * soh + ow * sow
     m = tl.load(main_ptr + m_off, mask=mask, other=0.0)
     s = tl.load(src_ptr + s_off, mask=mask, other=0.0)
+    if HAS_BIAS:
+        # The conv bias ``main`` skipped: aten's ``add_(bias)`` rounds to the
+        # storage dtype before the residual add does.
+        b = tl.load(bias_ptr + oc, mask=mask, other=0.0)
+        m = (m.to(tl.float32) + b.to(tl.float32)).to(m.dtype)
     # Accumulate in fp32 and round once on store, matching aten's opmath
     # behaviour for half-precision adds.
     vals = m.to(tl.float32) + s.to(tl.float32)
@@ -302,15 +309,26 @@ def dup_up3d_add(
     factor_s: int,
     repeats: int,
     drop_first_frames: bool,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """``main + DupUp3D(src)`` in one pass (output layout follows ``main``).
+    """``(main + bias) + DupUp3D(src)`` in one pass (output layout follows ``main``).
 
     ``src`` is the DupUp3D input ``(B, C_in, T, H, W)``; ``main`` must match
     the DupUp3D output shape. ``drop_first_frames`` mirrors the
-    ``first_chunk`` slicing (``x[:, :, factor_t - 1 :]``). Returns ``None``
-    when unsupported so callers can fall back.
+    ``first_chunk`` slicing (``x[:, :, factor_t - 1 :]``). ``bias`` is the
+    per-channel bias of the conv that produced ``main`` when that conv ran
+    without it; it is added with aten's rounding before the residual add.
+    Returns ``None`` when unsupported so callers can fall back.
     """
     if main.dim() != 5 or src.dim() != 5:
+        return None
+    if bias is not None and not (
+        bias.dim() == 1
+        and bias.numel() == main.shape[1]
+        and bias.dtype == main.dtype
+        and bias.device == main.device
+        and bias.is_contiguous()
+    ):
         return None
     # Power-of-two factors keep the constexpr pixel-shuffle math on the
     # shift/mask path (all Wan-family VAEs use ft in {1, 2}, fs = 2).
@@ -355,6 +373,7 @@ def dup_up3d_add(
             main,
             src,
             out,
+            main if bias is None else bias,
             total,
             exp_shape[1],
             exp_shape[2],
@@ -380,6 +399,7 @@ def dup_up3d_add(
             FS=factor_s,
             REPEATS=repeats,
             CHANNELS_INNER=out.stride(1) == 1 and exp_shape[1] > 1,
+            HAS_BIAS=bias is not None,
             IDX64=total >= _MAX_INT32,
             BLOCK=BLOCK,
         )

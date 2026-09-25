@@ -13,7 +13,8 @@ first sight and disabled on a mismatch:
   kept only where the result is identical.
 - Each residual block's second conv runs without its bias and ``bias_residual_add``
   applies bias and residual in one pass with aten's per-op bf16 rounding, so the
-  separate bias pass over the conv output disappears.
+  separate bias pass over the conv output disappears. The upsampler conv does the
+  same through ``dup_up3d_add``'s bias input on the up block's shortcut add.
 
 Quality-gated (``quality="extra-high"`` / ``"high"``, decode-scoped through
 :class:`VaeFastPathGate`; changes rounding, so never on the lossless path):
@@ -51,6 +52,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_nearest_upsample_nhwc,
     channel_rmsnorm_finish_silu,
     channel_rmsnorm_silu_nhwc,
+    dup_up3d_add,
     nearest_upsample_nhwc,
 )
 from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
@@ -65,6 +67,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 _BIAS_RESIDUAL_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 VAE conv bias + residual add"
+)
+_UPSAMPLE_BIAS_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 VAE upsampler bias + DupUp3D shortcut add"
 )
 
 
@@ -226,9 +231,27 @@ class FusedUpsample2xConv(nn.Sequential):
         self._sgl_folded = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self._sgl_gate.enabled or x.dim() != 4 or torch.compiler.is_compiling():
-            return super().forward(x)
+        return self._run(x, with_bias=True)
+
+    def forward_no_bias(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample + conv without the conv bias; the caller adds it in a later fused op."""
+        return self._run(x, with_bias=False)
+
+    def _run(self, x: torch.Tensor, with_bias: bool) -> torch.Tensor:
         conv = self[1]
+        bias = conv.bias if with_bias else None
+        if not self._sgl_gate.enabled or x.dim() != 4 or torch.compiler.is_compiling():
+            if with_bias:
+                return super().forward(x)
+            return F.conv2d(
+                self[0](x),
+                conv.weight,
+                None,
+                conv.stride,
+                conv.padding,
+                conv.dilation,
+                conv.groups,
+            )
         folded = self._sgl_folded
         if (
             folded is None
@@ -237,7 +260,7 @@ class FusedUpsample2xConv(nn.Sequential):
         ):
             folded = fold_upsample2x_conv2d_weight(conv)
             self._sgl_folded = folded
-        return F.conv_transpose2d(x, folded, conv.bias, stride=2, padding=1)
+        return F.conv_transpose2d(x, folded, bias, stride=2, padding=1)
 
 
 def _foldable_resample(module, upsample_cls) -> bool:
@@ -297,6 +320,69 @@ def _residual_block_forward(self, x, feat_cache=None, feat_idx=None):
         y = norm2(conv1(y))
     y = self.dropout(self.nonlinearity(y))
     return _conv_bias_residual_add(self.conv2, y, h)
+
+
+def _resample_no_bias(resample, x):
+    """``QwenImage21Resample.forward`` with the conv bias left out (batch and time merged, as the original)."""
+    b, c, t, h, w = x.size()
+    y = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    y = resample.resample.forward_no_bias(y)
+    return y.view(b, t, y.size(1), y.size(2), y.size(3)).permute(0, 2, 1, 3, 4)
+
+
+def _residual_up_block_forward(
+    self, x, feat_cache=None, feat_idx=None, first_chunk=False
+):
+    """``QwenImage21ResidualUpBlock.forward`` with the upsampler's bias folded into the shortcut add."""
+    x_copy = x
+    for resnet in self.resnets:
+        x = resnet(x)
+    upsampler, shortcut = self.upsampler, self.avg_shortcut
+    if upsampler is None:
+        return x
+    fusable = (
+        shortcut is not None
+        and type(upsampler.resample) is FusedUpsample2xConv
+        and upsampler.resample[1].bias is not None
+        and x.is_cuda
+        and not torch.compiler.is_compiling()
+        and _UPSAMPLE_BIAS_FUSION.can_attempt_once()
+    )
+    if not fusable:
+        x = upsampler(x)
+        if shortcut is not None:
+            fused = dup_up3d_add(
+                x,
+                x_copy,
+                shortcut.factor_t,
+                shortcut.factor_s,
+                shortcut.repeats,
+                first_chunk,
+            )
+            x = (
+                fused
+                if fused is not None
+                else x + shortcut(x_copy, first_chunk=first_chunk)
+            )
+        return x
+    bias = upsampler.resample[1].bias
+    y = _resample_no_bias(upsampler, x)
+    fused = dup_up3d_add(
+        y,
+        x_copy,
+        shortcut.factor_t,
+        shortcut.factor_s,
+        shortcut.repeats,
+        first_chunk,
+        bias,
+    )
+    if fused is None:
+        y = y + bias.view(1, -1, 1, 1, 1)
+        return y + shortcut(x_copy, first_chunk=first_chunk)
+    if _UPSAMPLE_BIAS_FUSION.verified:
+        return fused
+    reference = upsampler(x) + shortcut(x_copy, first_chunk=first_chunk)
+    return _UPSAMPLE_BIAS_FUSION.accept_or_fallback(fused, reference, logger=logger)
 
 
 def _decoder_layout_forward(self, x, *args, **kwargs):
@@ -360,6 +446,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
         QwenImage21Decoder3d,
         QwenImage21Resample,
         QwenImage21ResidualBlock,
+        QwenImage21ResidualUpBlock,
         QwenImage21RMS_norm,
         QwenImage21Upsample,
     )
@@ -392,6 +479,9 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
         ):
             module.resample = FusedUpsample2xConv(module.resample, gate)
             n_fold += 1
+    for module in decoder.modules():
+        if type(module) is QwenImage21ResidualUpBlock:
+            module.forward = MethodType(_residual_up_block_forward, module)
     decoder._sgl_gate = gate
     decoder._sgl_channels_last = False
     decoder.forward = MethodType(_decoder_layout_forward, decoder)
