@@ -927,6 +927,11 @@ class UnifiedRadixCache(BasePrefixCache):
         receipt its acquire returned, so it never drops a lock it never took."""
         self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
+    def unpin(self, req: Req) -> None:
+        # Synthetic profiling requests may own KV without locking a tree node.
+        if req.last_node is not None:
+            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -949,10 +954,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
-    ) -> None:
+    def claim_kv_row(self, req: Req) -> bool:
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -960,11 +962,19 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
+        return self.session.try_cache_finished_req(req)
 
+    @rank_consensus(same_params=["req.rid", "inserted"])
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        if inserted:
+            return
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(req, is_finished=True)
+
+    @rank_consensus(same_params=["req.rid", "owned_kv_len"])
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
         if self.disable:
-            self.free_kv_row(req.kv, [(0, owned_kv_len)])
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -974,118 +984,101 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, :owned_kv_len
         ]
 
-        result = None
-        insert_params = None
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            priority=req.priority or 0,
+            session_id=req.session_id,
+            rotation_base=req.kv_rotation_base,
+        )
 
-        if is_insert:
-            insert_params = InsertParams(
-                prev_prefix_len=req.kv.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
-                session_id=req.session_id,
-                rotation_base=req.kv_rotation_base,
+        # components prepare insert data + return effective cache_len
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cl = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=True,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        for comp in self._components_tuple:
+            effective_cache_len = comp.floor_cache_len(effective_cache_len)
+
+        # Truncate if needed; the tail free is deferred and batched with
+        # the unaligned tail below so a shared boundary page is emitted once.
+        kv_indices_full = kv_indices
+        tail_free_start = None
+        if effective_cache_len < len(token_ids):
+            tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
+            token_ids = token_ids[:effective_cache_len]
+            kv_indices = kv_indices[:effective_cache_len]
+
+        radix_key = RadixKey(
+            token_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        page_aligned_len = len(radix_key)
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+
+        insert_params.key = radix_key
+        insert_params.value = values
+        result = self.insert(insert_params)
+
+        # Split the leaf at the prompt boundary so eviction can drop the output
+        # KV without the prompt. prev_prefix_len keeps the overlapping indices
+        # from being freed as duplicates; skipped after a declined rotation,
+        # whose rows are freed below.
+        prompt_key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if (
+            not result.rotation_tail_declined
+            and len(self._components_tuple) == 1
+            and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
+            and 0 < len(prompt_key) < len(radix_key)
+        ):
+            self.insert(
+                replace(
+                    insert_params,
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    prev_prefix_len=len(prompt_key),
+                    priority=insert_params.priority + 1,
+                    # The request created these nodes moments ago; another
+                    # hit_count bump would promote every prompt node.
+                    chunked=True,
+                )
             )
 
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
-            for comp in self._components_tuple:
-                effective_cache_len = comp.floor_cache_len(effective_cache_len)
+        # Free the unaligned tail and the deferred truncation tail; after a
+        # rotation decline nothing was inserted, so everything past the
+        # protected prefix goes.
+        free_from = (
+            # min(): the protected prefix can already run past a truncated
+            # cache_len, and free_kv_row takes ascending ranges only.
+            min(req.kv.cache_protected_len, len(kv_indices))
+            if result.rotation_tail_declined
+            else page_aligned_len
+        )
+        ranges = [(free_from, len(kv_indices))]
+        if tail_free_start is not None:
+            if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
+                # The two halves touch at the truncation boundary and share
+                # that page; free the union as one range.
+                ranges[0] = (free_from, len(kv_indices_full))
+            else:
+                ranges.append((tail_free_start, len(kv_indices_full)))
+        self.free_kv_row(req.kv, ranges)
 
-            # Truncate if needed; the tail free is deferred and batched with
-            # the unaligned tail below so a shared boundary page is emitted once.
-            kv_indices_full = kv_indices
-            tail_free_start = None
-            if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
-                token_ids = token_ids[:effective_cache_len]
-                kv_indices = kv_indices[:effective_cache_len]
+        self.unpin(req)
 
-            radix_key = RadixKey(
-                token_ids,
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            page_aligned_len = len(radix_key)
-            values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-
-            insert_params.key = radix_key
-            insert_params.value = values
-            result = self.insert(insert_params)
-
-            # Keep the prompt as an independent radix node. Finished requests
-            # append a short, request-specific output to a much longer prompt;
-            # without this split the prompt and output form one leaf and are
-            # evicted together. Re-inserting the prompt only changes topology:
-            # prev_prefix_len prevents the overlapping KV indices from being
-            # treated as duplicate allocations and freed. A declined rotation
-            # tail releases everything past the protected prefix below, so the
-            # split is skipped there rather than handing the tree rows that
-            # are about to be freed.
-            prompt_key = RadixKey(
-                req.origin_input_ids,
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            if (
-                not result.rotation_tail_declined
-                and len(self._components_tuple) == 1
-                and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
-                and 0 < len(prompt_key) < len(radix_key)
-            ):
-                self.insert(
-                    replace(
-                        insert_params,
-                        key=prompt_key,
-                        value=values[: len(prompt_key)],
-                        prev_prefix_len=len(prompt_key),
-                        priority=insert_params.priority + 1,
-                        # Topology-only re-insert: the request itself created
-                        # these nodes moments ago, so counting it as a hit is
-                        # the same self-referencing inflation `chunked` exists
-                        # to suppress. hit_count drives eviction order, so an
-                        # extra bump here would silently promote every prompt
-                        # node into the protected segment.
-                        chunked=True,
-                    )
-                )
-
-            # Free unaligned tail (+ deferred truncation tail). A rotation
-            # decline inserted nothing, so the whole span past the protected
-            # prefix stayed request-owned and is released here instead.
-            free_from = (
-                # min(): the protected prefix can already run past a truncated
-                # cache_len, and free_kv_row takes ascending ranges only.
-                min(req.kv.cache_protected_len, len(kv_indices))
-                if result.rotation_tail_declined
-                else page_aligned_len
-            )
-            ranges = [(free_from, len(kv_indices))]
-            if tail_free_start is not None:
-                if free_from < len(kv_indices) and tail_free_start <= len(kv_indices):
-                    # The two halves touch at the truncation boundary and share
-                    # that page; free the union as one range.
-                    ranges[0] = (free_from, len(kv_indices_full))
-                else:
-                    ranges.append((tail_free_start, len(kv_indices_full)))
-            self.free_kv_row(req.kv, ranges)
-        else:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-
-        # Synthetic profiling requests may own KV without locking a tree node.
-        if req.last_node is not None:
-            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
-
-        if is_insert and result is not None and result.last_device_node is not None:
+        if result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
 
         # cleanup
@@ -1112,7 +1105,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
@@ -1164,7 +1157,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1474,21 +1467,14 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
-
-        resolved = self.host_pool_group.resolve_host_transfers(
+        allocation = self.cache_controller.allocate_host_transfers(
+            device_indices,
             extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
+            reclaim=self._reclaim_retraction_host,
         )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
+        if allocation is None:
             return None
+        host_indices, resolved = allocation
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1575,6 +1561,10 @@ class UnifiedRadixCache(BasePrefixCache):
         loop runs for leaves, reusable by component evictors ahead of an
         internal-state tombstone. Returns True once the backup is committed.
         """
+        # An auxiliary backup may already cover this node under another ack.
+        # Finish it before building a new transfer and claiming ack ownership.
+        if self.ongoing_write_through:
+            self.writing_check(write_back=True)
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
@@ -1642,11 +1632,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.

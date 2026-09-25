@@ -2661,6 +2661,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        # gfx950 accepts --moe-runner-backend aiter for MXFP8 only with aiter enabled
+        with (
+            override_platform(is_hip=True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+        ):
+            aiter_view = dict(quantization="mxfp8", moe_runner_backend="aiter")
+            with envs.SGLANG_USE_AITER.override(True):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)), {}
+                )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)),
+                    {"moe_runner_backend": "triton"},
+                )
         with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
