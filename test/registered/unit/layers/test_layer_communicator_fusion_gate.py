@@ -349,6 +349,7 @@ class TestDeferFfnReduction(CustomTestCase):
         communicator.is_last_layer = is_last_layer
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
         communicator._sp_steps = sp_region_steps() if sp_active else None
+        communicator._input_scattered_steps = None
         communicator._ffn_output = StageOutput(
             Layout(frozenset()),
             group=SumGroup.MOE_OUTPUT,

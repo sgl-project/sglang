@@ -71,6 +71,7 @@ def make_communicator(
     )
     communicator.is_last_layer = False
     communicator._sp_steps = None
+    communicator._input_scattered_steps = None
     communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
@@ -304,6 +305,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.is_last_layer = is_last_layer
         communicator._sp_steps = sp_region_steps() if sp_region else None
+        communicator._input_scattered_steps = None
         communicator._postprocess_scatters_to_local_tokens = scatters
         communicator._ffn_output = StageOutput(
             Layout(frozenset()),

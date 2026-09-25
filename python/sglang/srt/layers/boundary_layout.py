@@ -100,6 +100,11 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     ffn_residual_rows: Layout
     # The rows the layer hands on.
     output_rows: Layout
+    # The group the layer's input arrives as a partial sum over, if any.
+    input_owes: Optional[SumGroup] = None
+    # Whether the residual is added into one rank's share of the attention
+    # output's sum before that sum completes, instead of after it.
+    residual_joins_attention_sum: bool = False
 
 
 def sequence_parallel_layer_sides(
@@ -130,6 +135,40 @@ def sequence_parallel_layer_sides(
         ffn_output=StageOutput(local),
         ffn_residual_rows=local,
         output_rows=local,
+    )
+
+
+def input_scattered_layer_sides(
+    *,
+    axis_sizes: Mapping[TokenAxis, int],
+    ffn_group: SumGroup,
+    hands_on_partial: bool,
+) -> DecoderLayerSides:
+    """A decoder layer on a batch whose attention input is scattered over
+    attention TP. Each layer's input is a partial sum over TP on the full rows:
+    the embedding and every FFN before it leave that sum, and a reduce-scatter
+    completes it onto each rank's slice, which the attention gathers itself.
+    The residual comes back to the full rows inside the attention output's sum."""
+    attention = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
+    )
+    return DecoderLayerSides(
+        input_rows=attention,
+        attention=StageInput(
+            attention, gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER})
+        ),
+        attention_output=StageOutput(
+            attention, group=SumGroup.ATTN_TP, always_leaves=True
+        ),
+        ffn=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
+        # The next layer's input completes the sum; the last layer's FFN does.
+        ffn_output=StageOutput(
+            attention, group=ffn_group, leaves_for_reduce_scatter=hands_on_partial
+        ),
+        ffn_residual_rows=attention,
+        output_rows=attention,
+        input_owes=SumGroup.TP,
+        residual_joins_attention_sum=True,
     )
 
 
