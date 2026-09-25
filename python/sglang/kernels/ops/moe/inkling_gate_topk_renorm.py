@@ -2,7 +2,7 @@
 
 Three families, all specialized for the Inkling gate layout (logits
 ``[tokens, 258]`` fp32 = 256 routed + 2 shared experts, top-6 selection by
-``sigmoid(logit) + bias``, logsigmoid renorm over selected ++ shared):
+``sigmoid(logit) + bias``, stable sigmoid renorm over selected ++ shared):
 
 - ``inkling_gate_topk_renorm``      -- v1 warp-per-row gate (int64 indices).
 - ``inkling_gate_topk_renorm_v2``   -- v2 gate: wide vector loads, int32
