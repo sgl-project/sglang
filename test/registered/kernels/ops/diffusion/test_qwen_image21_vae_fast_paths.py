@@ -67,9 +67,19 @@ def gates(vae):
 
 
 @torch.no_grad()
-def test_decode_is_bit_identical_and_paths_verify():
+def test_decode_is_bit_identical_and_paths_verify(monkeypatch):
     reference = make_vae()
     optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    bias_gate = vae_opt.BitExactFusionGate("test bias + residual")
+    monkeypatch.setattr(vae_opt, "_BIAS_RESIDUAL_FUSION", bias_gate)
+    calls = {"bias_residual": 0}
+    real_bias_residual = vae_opt.bias_residual_add
+
+    def counting(y, bias, h):
+        calls["bias_residual"] += 1
+        return real_bias_residual(y, bias, h)
+
+    monkeypatch.setattr(vae_opt, "bias_residual_add", counting)
     assert set(optimized.state_dict().keys()) == set(reference.state_dict().keys())
     for key, value in optimized.state_dict().items():
         assert torch.equal(value, reference.state_dict()[key])
@@ -80,6 +90,11 @@ def test_decode_is_bit_identical_and_paths_verify():
     actual = optimized.decode(z)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     assert all(gate.verified and not gate.disabled for gate in installed)
+    assert bias_gate.verified and not bias_gate.disabled
+    # one fused bias + residual add per residual block
+    assert calls["bias_residual"] == sum(
+        1 for m in optimized.modules() if type(m).__name__ == "QwenImage21ResidualBlock"
+    )
     z.normal_()
     assert torch.equal(optimized.decode(z), reference.decode(z))
 
@@ -93,6 +108,11 @@ def test_mismatch_disables_the_norm_fast_path(monkeypatch):
         "channel_rmsnorm_finish_silu",
         lambda x, norm, gamma, scale: torch.zeros_like(x),
     )
+    bias_gate = vae_opt.BitExactFusionGate("test mismatched bias + residual")
+    monkeypatch.setattr(vae_opt, "_BIAS_RESIDUAL_FUSION", bias_gate)
+    monkeypatch.setattr(
+        vae_opt, "bias_residual_add", lambda y, bias, h: torch.zeros_like(y)
+    )
     z = torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(optimized.decode(z), reference.decode(z))
     norm_gates = [
@@ -103,13 +123,17 @@ def test_mismatch_disables_the_norm_fast_path(monkeypatch):
     assert norm_gates and all(
         gate.disabled and not gate.verified for gate in norm_gates
     )
+    assert bias_gate.disabled and not bias_gate.verified
 
 
 @torch.no_grad()
 def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     reference = make_vae()
     optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
-    calls = {"nhwc": 0, "gather": 0, "conv_transpose": 0}
+    monkeypatch.setattr(
+        vae_opt, "_BIAS_RESIDUAL_FUSION", vae_opt.BitExactFusionGate("test bias")
+    )
+    calls = {"nhwc": 0, "nhwc_bias": 0, "gather": 0, "conv_transpose": 0}
     real_nhwc, real_gather, real_conv_t = (
         vae_opt.channel_rmsnorm_silu_nhwc,
         vae_opt.nearest_upsample_nhwc,
@@ -122,9 +146,10 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
 
     monkeypatch.setattr(vae_opt.F, "conv_transpose2d", counting_conv_t)
 
-    def counting_nhwc(x, gamma, scale):
+    def counting_nhwc(x, gamma, scale, bias=None):
         calls["nhwc"] += 1
-        return real_nhwc(x, gamma, scale)
+        calls["nhwc_bias"] += bias is not None
+        return real_nhwc(x, gamma, scale, bias)
 
     def counting_gather(x, scale_factor):
         calls["gather"] += 1
@@ -138,6 +163,10 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
         fast = optimized.decode(z)
     assert fast.shape == expected.shape
     assert calls["nhwc"] > 0 and calls["conv_transpose"] == 4
+    # every residual block's first conv hands its bias to the norm kernel
+    assert calls["nhwc_bias"] == sum(
+        1 for m in optimized.modules() if type(m).__name__ == "QwenImage21ResidualBlock"
+    )
     # every upsampler is folded, so the nearest gather no longer runs
     assert calls["gather"] == 0
     assert all(

@@ -386,6 +386,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Channels-last channel RMSNorm + SiLU with an in-warp reduction (Qwen-Image 2.1 VAE, quality-gated), CUDA.",
     ),
     (
+        "diffusion.bias_residual_add",
+        KernelBackend.JIT,
+        "elementwise.bias_residual_add_jit:bias_residual_add",
+        _CUDA,
+        "Bit-exact conv bias + residual add in one pass for channels_last or NCHW bf16 tensors, CUDA.",
+    ),
+    (
         "diffusion.vdn_delta_factors",
         KernelBackend.JIT,
         "attention.vdn_delta_factors_jit:vdn_delta_factors",
@@ -596,6 +603,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "is_channels_last_dense": "norm.channel_rmsnorm_silu_nhwc_jit",
+    "bias_residual_add": "elementwise.bias_residual_add_jit",
+    "can_use_bias_residual_add": "elementwise.bias_residual_add_jit",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",

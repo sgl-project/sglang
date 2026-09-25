@@ -11,14 +11,18 @@ first sight and disabled on a mismatch:
   conv into the convolution's own padding. cuDNN may pick another algorithm for
   the new descriptor, so the folded conv is compared per input signature and
   kept only where the result is identical.
+- Each residual block's second conv runs without its bias and ``bias_residual_add``
+  applies bias and residual in one pass with aten's per-op bf16 rounding, so the
+  separate bias pass over the conv output disappears.
 
 Quality-gated (``quality="extra-high"`` / ``"high"``, decode-scoped through
 :class:`VaeFastPathGate`; changes rounding, so never on the lossless path):
 
 - The decoder runs in ``channels_last`` so the cuDNN NHWC conv kernels no
   longer wrap every 3x3 conv in NCHW/NHWC transposes.
-- ``FusedChannelRMSNormSiLU`` then reduces each pixel's channels in one warp
-  (``channel_rmsnorm_silu_nhwc``) instead of the NCHW aten reduction.
+- ``FusedChannelRMSNormSiLU`` then reduces each pixel's channels in a lane
+  group (``channel_rmsnorm_silu_nhwc``) instead of the NCHW aten reduction, and
+  takes the first conv's bias as an input so that conv skips its bias pass too.
 - ``ChannelsLastNearestUpsample`` re-expresses the merged-batch view with
   canonical NHWC strides and runs the bit-exact Triton nearest gather, which
   is several times faster than aten's NHWC nearest kernel.
@@ -40,6 +44,8 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    bias_residual_add,
+    can_use_bias_residual_add,
     can_use_channel_rmsnorm_finish_silu,
     can_use_channel_rmsnorm_silu_nhwc,
     can_use_nearest_upsample_nhwc,
@@ -57,6 +63,9 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_BIAS_RESIDUAL_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 VAE conv bias + residual add"
+)
 
 
 class FusedChannelRMSNormSiLU(nn.Module):
@@ -74,15 +83,21 @@ class FusedChannelRMSNormSiLU(nn.Module):
             "Qwen-Image 2.1 VAE channel RMSNorm + SiLU"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``bias`` is the preceding conv's bias when that conv ran without it."""
         norm = self._norm
         plain = norm.channel_first and isinstance(norm.bias, float) and norm.bias == 0.0
         if (
             plain
             and self._sgl_gate.enabled
-            and can_use_channel_rmsnorm_silu_nhwc(x, self.gamma)
+            and can_use_channel_rmsnorm_silu_nhwc(x, self.gamma, bias)
         ):
-            return channel_rmsnorm_silu_nhwc(x, self.gamma, self.scale)
+            return channel_rmsnorm_silu_nhwc(x, self.gamma, self.scale, bias)
+        if bias is not None:
+            # the conv's own bias pass, same aten rounding
+            x = x + bias
         fused = None
         if (
             plain
@@ -122,6 +137,22 @@ class FoldedPadConv2d(nn.Module):
         }
 
     def forward(self, x: torch.Tensor, cache_x=None) -> torch.Tensor:
+        return self._run(x, cache_x, with_bias=True)
+
+    def forward_no_bias(self, x: torch.Tensor) -> torch.Tensor:
+        """The conv without its bias; the caller adds the bias in a later fused op."""
+        return self._run(x, None, with_bias=False)
+
+    def _reference(self, x: torch.Tensor, cache_x, with_bias: bool) -> torch.Tensor:
+        conv = self._conv
+        if with_bias:
+            return conv(x, cache_x)
+        padded = F.pad(x.squeeze(2), list(conv._padding))
+        return F.conv2d(
+            padded, self.weight, None, conv.stride, 0, conv.dilation, conv.groups
+        ).unsqueeze(2)
+
+    def _run(self, x: torch.Tensor, cache_x, with_bias: bool) -> torch.Tensor:
         conv = self._conv
         if not (
             self._symmetric
@@ -129,18 +160,18 @@ class FoldedPadConv2d(nn.Module):
             and x.is_cuda
             and not torch.compiler.is_compiling()
         ):
-            return conv(x, cache_x)
+            return self._reference(x, cache_x, with_bias)
         gate = self._gates["nhwc" if x.stride(1) == 1 and x.shape[1] > 1 else "nchw"]
         if gate.disabled:
-            return conv(x, cache_x)
-        sig = (x.dtype, tuple(x.shape), tuple(x.stride()))
+            return self._reference(x, cache_x, with_bias)
+        sig = (x.dtype, tuple(x.shape), tuple(x.stride()), with_bias)
         verified = gate.is_verified(sig)
         if not verified and torch.cuda.is_current_stream_capturing():
-            return conv(x, cache_x)
+            return self._reference(x, cache_x, with_bias)
         folded = F.conv2d(
             x.squeeze(2),
             self.weight,
-            self.bias,
+            self.bias if with_bias else None,
             conv.stride,
             self._padding,
             conv.dilation,
@@ -148,7 +179,9 @@ class FoldedPadConv2d(nn.Module):
         ).unsqueeze(2)
         if verified:
             return folded
-        return gate.accept_or_fallback(folded, conv(x, cache_x), sig=sig, logger=logger)
+        return gate.accept_or_fallback(
+            folded, self._reference(x, cache_x, with_bias), sig=sig, logger=logger
+        )
 
 
 class ChannelsLastNearestUpsample(nn.Module):
@@ -231,6 +264,41 @@ def _foldable_resample(module, upsample_cls) -> bool:
     )
 
 
+def _conv_bias_residual_add(conv, x, h):
+    """``conv(x) + h`` with the conv's bias applied inside the residual add when the fused kernel fits."""
+    if not (
+        type(conv) is FoldedPadConv2d
+        and conv.bias is not None
+        and _BIAS_RESIDUAL_FUSION.can_attempt_once()
+    ):
+        return conv(x) + h
+    y = conv.forward_no_bias(x)
+    if not can_use_bias_residual_add(y, conv.bias, h):
+        return (y + conv.bias.view(1, -1, *([1] * (y.ndim - 2)))) + h
+    fused = bias_residual_add(y, conv.bias, h)
+    if _BIAS_RESIDUAL_FUSION.verified:
+        return fused
+    return _BIAS_RESIDUAL_FUSION.accept_or_fallback(fused, conv(x) + h, logger=logger)
+
+
+def _residual_block_forward(self, x, feat_cache=None, feat_idx=None):
+    """``QwenImage21ResidualBlock.forward`` with the two conv bias passes fused away."""
+    h = self.conv_shortcut(x)
+    y = self.nonlinearity(self.norm1(x))
+    conv1, norm2 = self.conv1, self.norm2
+    if (
+        type(conv1) is FoldedPadConv2d
+        and conv1.bias is not None
+        and type(norm2) is FusedChannelRMSNormSiLU
+        and norm2._sgl_gate.enabled
+    ):
+        y = norm2(conv1.forward_no_bias(y), conv1.bias.view(norm2.gamma.shape))
+    else:
+        y = norm2(conv1(y))
+    y = self.dropout(self.nonlinearity(y))
+    return _conv_bias_residual_add(self.conv2, y, h)
+
+
 def _decoder_layout_forward(self, x, *args, **kwargs):
     want_channels_last = self._sgl_gate.enabled
     if want_channels_last != self._sgl_channels_last:
@@ -308,6 +376,9 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
         decoder, gate, QwenImage21ResidualBlock, QwenImage21RMS_norm
     )
     n_conv = _replace_children(decoder, QwenImage21CausalConv3d, FoldedPadConv2d)
+    for module in decoder.modules():
+        if type(module) is QwenImage21ResidualBlock:
+            module.forward = MethodType(_residual_block_forward, module)
     if type(vae.post_quant_conv) is QwenImage21CausalConv3d:
         vae.post_quant_conv = FoldedPadConv2d(vae.post_quant_conv)
         n_conv += 1
