@@ -407,6 +407,10 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="transformer_blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    "MingImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
     "QwenImage21Transformer2DModel": CustomBlockAdapterSpec(
         blocks_attr="transformer_blocks",
         forward_pattern=ForwardPattern.Pattern_3,

@@ -9,6 +9,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/CircleStone/Anima",
     },
     {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
