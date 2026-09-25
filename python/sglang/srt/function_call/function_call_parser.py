@@ -252,7 +252,7 @@ class FunctionCallParser:
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
-        parallel_tool_calls: bool = True,
+        parallel_tool_calls: Optional[bool] = True,
         thinking_mode: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
@@ -261,11 +261,15 @@ class FunctionCallParser:
 
         Args:
             tool_choice: The tool choice setting from the request
+            parallel_tool_calls: Whether multiple calls are allowed; None defaults to True.
 
         Returns:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
+        if parallel_tool_calls is None:
+            parallel_tool_calls = True
+
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)

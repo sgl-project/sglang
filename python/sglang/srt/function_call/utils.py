@@ -432,18 +432,21 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 def get_json_schema_constraint(
     tools: List[Tool],
     tool_choice: Union[ToolChoice, Literal["required"]],
-    parallel_tool_calls: bool = True,
+    parallel_tool_calls: Optional[bool] = True,
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
 
     Args:
         tool_choice: The tool choice specification
-        parallel_tool_calls: If False, constrain to exactly one tool call (maxItems=1)
+        parallel_tool_calls: If False, constrain to exactly one tool call (maxItems=1).
+            None defaults to True.
 
     Returns:
         JSON schema dict, or None if no valid tools found
     """
+    if parallel_tool_calls is None:
+        parallel_tool_calls = True
 
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
