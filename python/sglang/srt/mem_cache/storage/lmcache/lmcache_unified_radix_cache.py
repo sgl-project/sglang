@@ -252,24 +252,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._retire_loaded_flow(req.rid)
         self._submit_store(req, req.get_fill_ids())
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
-    ) -> None:
-        if not is_insert:
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        super().on_release(req, inserted=inserted)
+        if not inserted:
             self.release_aborted_request(req.cache_request_handle)
-        else:
-            self._publish_external_loaded_prefix(req, token_ids_len=owned_kv_len)
-        super().cache_finished_req(
-            req,
-            is_insert=is_insert,
-            owned_kv_len=owned_kv_len,
-            **kwargs,
-        )
+
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
+        self._publish_external_loaded_prefix(req, token_ids_len=owned_kv_len)
+        super().cache_finished_req(req, owned_kv_len=owned_kv_len, **kwargs)
         self._retire_loaded_flow(req.rid)
-        if is_insert:
-            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-            self._submit_store(req, token_ids)
-            self._request_session_finish(req.rid)
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+        self._submit_store(req, token_ids)
+        self._request_session_finish(req.rid)
 
     def check_hicache_events(self) -> None:
         """Poll LMCache retrieve/store futures at the scheduler safe point."""
