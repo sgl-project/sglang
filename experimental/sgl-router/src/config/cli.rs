@@ -3,7 +3,7 @@
 
 //! Grouped CLI options and conversion into a validated [`Config`].
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
@@ -66,9 +66,13 @@ pub struct ModelArgs {
     pub tokenizer_path: Option<String>,
 
     /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
-    /// Use for worker-only thinking defaults, parser/template overrides, or template stop strings.
+    /// Use for worker parser/template overrides or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
+
+    /// Same as SGLang's --default-chat-template-kwargs; must match the workers.
+    #[arg(long, value_name = "JSON")]
+    pub default_chat_template_kwargs: Option<String>,
 
     /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
@@ -383,6 +387,14 @@ impl Cli {
             })
             .transpose()?
             .unwrap_or_default();
+        let default_chat_template_kwargs = self
+            .model
+            .default_chat_template_kwargs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("--default-chat-template-kwargs must be a JSON object")?
+            .unwrap_or_default();
 
         let config = Config {
             server: ServerConfig {
@@ -412,6 +424,7 @@ impl Cli {
                 fused,
                 eligibility,
                 sampling_overrides,
+                default_chat_template_kwargs,
             },
             discovery,
             proxy: ProxyConfig {
