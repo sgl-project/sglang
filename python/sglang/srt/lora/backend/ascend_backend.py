@@ -104,7 +104,7 @@ class AscendLoRABackend(BaseLoRABackend):
             output_tensor = base_output
 
         torch.ops.npu.sgemmv_expand(
-            x,
+            x.to(dtype=torch.float),
             weights,
             self.batch_info.weight_indices,
             self.batch_info.seg_lens,
@@ -152,6 +152,7 @@ class AscendLoRABackend(BaseLoRABackend):
             self.batch_info.lora_ranks,
             self.batch_info.scalings,
             lora_a_output,
+            n_slices,
         )
 
         torch.ops.npu.sgemmv_expand(
@@ -182,6 +183,7 @@ class AscendLoRABackend(BaseLoRABackend):
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = gate_up_lora_a.shape
         _, weight_out_dim, _ = gate_up_lora_b.shape
+        n_slices = 2
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -202,6 +204,7 @@ class AscendLoRABackend(BaseLoRABackend):
             self.batch_info.lora_ranks,
             self.batch_info.scalings,
             lora_a_output,
+            n_slices,
         )
 
         torch.ops.npu.sgemmv_expand(
