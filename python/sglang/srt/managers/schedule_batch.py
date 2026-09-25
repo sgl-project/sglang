@@ -1025,6 +1025,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
@@ -1056,6 +1057,7 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.token_indices_to_pool = token_indices_to_pool
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -2446,6 +2448,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Full-DP metadata from the existing scheduler gather.
+    dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_coordination_applied: bool = False
+
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
@@ -3297,17 +3303,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # The retraction host pool could not hold the backup and the
-                # device KV is already freed, so the request cannot resume.
-                req.to_finish = FINISH_ABORT(
-                    "Retraction host KV pool exhausted. Aborting the request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                # No backup exists and the device KV is already freed, so the
+                # request cannot resume.
+                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                    message = (
+                        "Retracted under decode memory pressure without a KV "
+                        "backup. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                else:
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
                 logger.warning(
-                    "retract_decode: aborted request %s, retraction host pool "
-                    "exhausted",
-                    req.rid,
+                    "retract_decode: aborted request %s: %s", req.rid, message
                 )
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -3791,6 +3801,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,

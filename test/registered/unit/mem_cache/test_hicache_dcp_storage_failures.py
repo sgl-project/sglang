@@ -18,10 +18,12 @@ from test_hicache_dcp_storage_controller import _controller
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,6 +71,17 @@ def _worker(rank, directory):
             base = _controller(rank)
             cc = HybridCacheController.__new__(HybridCacheController)
             cc.__dict__.update(base.__dict__)
+            cc.mem_pool_host = HostPoolGroup(
+                [
+                    PoolEntry(
+                        name=PoolName.KV,
+                        host_pool=cc.storage_host_pool,
+                        device_pool=cc.mem_pool_device,
+                        layer_mapper=lambda layer: layer,
+                        is_primary_index_anchor=True,
+                    )
+                ]
+            )
             cc.storage_backend._evictor._eviction_enabled = False
             cc.storage_backend._evictor._eviction_configured = False
             cc.page_get_func = cc._generic_page_get
@@ -92,7 +105,7 @@ def _worker(rank, directory):
                 + cc.prefetch_completion_sync_groups
             )
             cc.enable_storage = True
-            pool = cc.mem_pool_host
+            pool = cc.storage_host_pool
             cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
             cache.cache_controller = cc
             cache.host_memory_mode = "cache"

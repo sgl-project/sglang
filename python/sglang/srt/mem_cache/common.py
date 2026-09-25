@@ -220,13 +220,15 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Returns False when no backup can be taken ('none' backend, or the host
+    pool cannot hold it); the caller aborts the request."""
     if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
         # Drain the in-flight verify before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
+    if backend == "none":
+        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True

@@ -22,7 +22,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     args = parser.parse_args()
 
-    test = runpy.run_path(str(Path(__file__).with_name("test_kimi_k3_kda_decode.py")))
+    test = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[2]
+            / "ops/attention/kda_flydsl/test_kimi_k3_kda_decode.py"
+        )
+    )
     f_a, f_b_weight, inputs = test["_make_fb_inputs"](args.batch)
     out = torch.empty((1, args.batch, 12, 128), dtype=torch.bfloat16, device="cuda")
     kwargs = dict(

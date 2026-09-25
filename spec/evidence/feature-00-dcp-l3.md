@@ -202,3 +202,26 @@ All successful cases produced `[280, 1319, 2135, 13, 338, 8959, 481, 16074]`. Se
 ## Boundaries
 
 These results cover the first-stage dense MLA/file contract with matching topology. They do not establish GQA DCP storage, topology conversion, other storage backends, or performance targets.
+
+## Main synchronization before PR publication
+
+Merged main at `2f2f9d12f8485629e162c8fba0e44057fa5d8f97`.
+Kept upstream's host-layout lease around storage reads and writes, with the
+DCP shard-writer selection inside it. Updated the distributed test fixture to
+use the real `HostPoolGroup`, matching the production controller.
+
+Re-ran the focused CPU command above: **64 passed, 65 subtests** in 27.90s.
+The first attempt exposed the old fixture's missing layout-lease wrapper; the
+fixture was corrected before this passing run. See
+[CPU output](feature-00-dcp-l3-main-sync-cpu.txt).
+
+Re-ran the complete H200 command above with
+`DCP_L3_OUTPUT_DIR=.dev/pr-merge-h200`, default topologies, and concurrency
+enabled: **1 passed** in 547.51s. All three topologies restored 1,024 tokens
+per rank with identical output IDs, the missing-shard case restored 128 per
+rank, and the concurrent-writer case left 16 objects. See
+[full matrix results](feature-00-dcp-l3-main-sync.json).
+
+The unified-cache storage/prefetch command also passed after synchronization:
+**89 passed, 137 skipped, 2543 deselected**. Ruff lint/format, import sorting,
+registered-test validation, and whitespace checks passed.
