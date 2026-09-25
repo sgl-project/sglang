@@ -111,11 +111,10 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 def _run_sgl_eval(eval_name, args) -> dict:
     # Returns a metrics dict (score, latency, output_throughput) so the
     # existing write_results_to_json + threshold gate keep working.
+    from sglang.test.sgl_eval import api_base_url
     from sglang.test.test_utils import dump_metric
 
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
+    base_url = api_base_url(args)
     out_parent = Path(
         getattr(args, "sgl_eval_out_dir", None)
         or (Path.home() / ".sgl_eval" / "sglang_run_eval" / uuid.uuid4().hex)
@@ -260,9 +259,9 @@ def run_eval(args):
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
+    from sglang.test.sgl_eval import api_base_url
+
+    base_url = api_base_url(args)
 
     if args.eval_name == "mmlu":
         # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
@@ -302,12 +301,13 @@ def run_eval(args):
         return _run_sgl_eval("aime26", args)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
-            # Only the nightly correctness eval opts into sgl-eval (zero-shot
-            # chat, \boxed{}, math_verify). Every other gsm8k caller — spec
-            # decoding perf/accuracy, disaggregation, quant, model e2e — uses
-            # the 5-shot completion last-number scorer and relies on
-            # max_tokens/throughput behavior sgl-eval cannot provide.
-            return _run_sgl_eval("gsm8k", args)
+            # Opt-in sgl-eval scoring (zero-shot chat, \boxed{}, math_verify).
+            # Callers without it still use the 5-shot completion scorer below.
+            if getattr(args, "load_preset_from_model_id", None):
+                return _run_sgl_eval("gsm8k", args)
+            from sglang.test.sgl_eval import run_sgl_eval
+
+            return run_sgl_eval(args)
         from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(

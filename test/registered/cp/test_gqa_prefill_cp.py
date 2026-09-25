@@ -59,7 +59,7 @@ class TestGQACP2TP2EP2(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
+            api="sgl_eval",
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -117,7 +117,7 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
+            api="sgl_eval",
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -177,7 +177,7 @@ class TestGQACPCP4EP4(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
+            api="sgl_eval",
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
