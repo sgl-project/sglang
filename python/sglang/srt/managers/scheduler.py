@@ -1605,6 +1605,13 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # result_queue must exist before any is_fully_idle() check. The
+        # engine-snapshot startup barrier calls release_memory_occupation()
+        # (which asserts is_fully_idle()) before the event loop runs, so
+        # initialize result_queue here rather than inside the event loop.
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1641,7 +1648,6 @@ class Scheduler(
             # MLX uses its own overlap loop and does not create CUDA streams,
             # but the normal non-overlap scheduler path still relays decode
             # input IDs through FutureMap.
-            self.result_queue: Deque = deque()
             return
 
         # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
@@ -1931,9 +1937,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
-        ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch
@@ -6061,6 +6064,14 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        if envs.SGLANG_SNAPSHOT_ENGINE.get():
+            from sglang.srt.engine_snapshot.startup import (
+                active_artifact_path,
+                scheduler_barrier,
+            )
+
+            if artifact_path := active_artifact_path():
+                scheduler_barrier(scheduler, artifact_path)
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 

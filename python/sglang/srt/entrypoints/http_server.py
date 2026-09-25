@@ -185,6 +185,7 @@ from sglang.srt.utils.json_response import (
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -2210,9 +2211,27 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _serving_url(server_args: ServerArgs) -> str:
+    """The URL this process serves on, taken from the resolved config.
+
+    The listener binds the resolved serving config, and a restore that
+    redirects the listen address changes nothing else: ``ServerArgs.url()``
+    keeps reading the pristine startup record, so a probe built from the
+    record can miss the very server it is probing.
+    """
+    scheme = "https" if server_args.ssl_certfile else "http"
+    serving = get_serving()
+    host = serving.host or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host in ("::", "[::]"):
+        host = "::1"
+    return NetworkAddress(host, serving.port).to_url(scheme)
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
-    url = server_args.url()
+    url = _serving_url(server_args)
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
     if envs.SGLANG_RUST_SERVER.get():
@@ -2394,7 +2413,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
     try:
         res = requests.post(
-            server_args.url() + "/freeze_gc",
+            _serving_url(server_args) + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
             verify=ssl_verify_of(server_args),
@@ -2861,6 +2880,15 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+
+    if envs.SGLANG_SNAPSHOT_ENGINE.get():
+        from sglang.srt.engine_snapshot.startup import (
+            active_artifact_path,
+            server_barrier,
+        )
+
+        if artifact_path := active_artifact_path():
+            server_barrier(server_args, artifact_path)
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
