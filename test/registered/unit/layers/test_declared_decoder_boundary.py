@@ -1,5 +1,5 @@
-"""The boundaries of an attention and a dense MLP on the TP group under attention
-DP, chosen from both sides' declarations.
+"""The boundaries of an attention and an FFN on the TP group (a dense MLP, or a
+MoE not dispatched per DP shard), chosen from both sides' declarations.
 
 The numeric checks run every rank of a DP x attention-TP world as a thread over
 fake collectives that wait for all members of their group, build the layers'
@@ -21,7 +21,7 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
-    dense_decoder_layer_sides,
+    decoder_layer_sides,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -66,7 +66,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
 
 
 @contextmanager
-def planning(parallel, *, sp=False):
+def planning(parallel, *, sp=False, a2a=False):
     """What layer planning and communicator construction read, without the
     process-wide parallel state. ``parallel`` may be a callable, for a
     per-thread parallel state."""
@@ -81,8 +81,11 @@ def planning(parallel, *, sp=False):
             comm, "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
         ),
         patch.object(
-            comm, "get_moe_a2a_backend", lambda: SimpleNamespace(is_none=lambda: True)
+            comm,
+            "get_moe_a2a_backend",
+            lambda: SimpleNamespace(is_none=lambda: not a2a),
         ),
+        patch.object(comm, "is_moe_input_scattered_across_dp_ranks", lambda: a2a),
         patch.object(
             comm, "should_use_flashinfer_cutlass_moe_fp4_allgather", lambda: False
         ),
@@ -121,17 +124,27 @@ class FactsOnly:
         raise AssertionError(f"read scatter mode {name!r}")
 
 
-def dense_layer_facts(layer_id, num_layers, *, previous_sparse=False):
+def layer_facts(layer_id, num_layers, *, sparse=False, previous_sparse=False):
     return FactsOnly(
-        is_layer_sparse=False,
+        is_layer_sparse=sparse,
         is_first_layer=layer_id == 0,
         is_last_layer=layer_id == num_layers - 1,
         is_previous_layer_sparse=None if layer_id == 0 else previous_sparse,
     )
 
 
-def build(modes, parallel, *, cls=LayerCommunicator, sp=False, **kwargs):
-    with planning(parallel, sp=sp):
+def sides_of(axis_sizes, *, sparse=False, leaves_next=False, leaves_rs=False):
+    return decoder_layer_sides(
+        axis_sizes=axis_sizes,
+        ffn_group=SumGroup.MOE_OUTPUT if sparse else SumGroup.TP,
+        leaves_for_next_layer=leaves_next,
+        leaves_for_reduce_scatter=leaves_rs,
+        leaves_for_reduce_scatterv=leaves_rs or sparse,
+    )
+
+
+def build(modes, parallel, *, cls=LayerCommunicator, sp=False, a2a=False, **kwargs):
+    with planning(parallel, sp=sp, a2a=a2a):
         return cls(
             layer_scatter_modes=modes,
             input_layernorm=Norm(),
@@ -140,8 +153,10 @@ def build(modes, parallel, *, cls=LayerCommunicator, sp=False, **kwargs):
         )
 
 
-def planned_modes(layer_id, num_layers, *, sparse, previous_sparse, parallel):
-    with planning(parallel):
+def planned_modes(
+    layer_id, num_layers, *, sparse, previous_sparse, parallel, a2a=False
+):
+    with planning(parallel, a2a=a2a):
         return LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=num_layers,
@@ -156,13 +171,23 @@ class TestDeclarationsMatchScatterModes(CustomTestCase):
     layouts of the modes layer planning gives the same layers."""
 
     def test_every_attention_dp_and_tp(self):
-        for attn_dp, attn_tp, layer_id in itertools.product(
-            (1, 2, 4, 8), (1, 2, 4), (0, 1, 3)
+        for attn_dp, attn_tp, layer_id, sparse, previous_sparse in itertools.product(
+            (1, 2, 4, 8), (1, 2, 4), (0, 1, 3), (False, True), (False, True)
         ):
-            with self.subTest(attn_dp=attn_dp, attn_tp=attn_tp, layer_id=layer_id):
+            with self.subTest(
+                attn_dp=attn_dp,
+                attn_tp=attn_tp,
+                layer_id=layer_id,
+                sparse=sparse,
+                previous_sparse=previous_sparse,
+            ):
                 parallel = parallel_of(attn_dp=attn_dp, attn_tp=attn_tp)
                 modes = planned_modes(
-                    layer_id, 4, sparse=False, previous_sparse=False, parallel=parallel
+                    layer_id,
+                    4,
+                    sparse=sparse,
+                    previous_sparse=previous_sparse,
+                    parallel=parallel,
                 )
                 sizes = {
                     TokenAxis.ATTN_DP: attn_dp,
@@ -172,11 +197,7 @@ class TestDeclarationsMatchScatterModes(CustomTestCase):
                 layouts = scatter_mode_layouts(
                     attn_dp_size=attn_dp, attn_cp_size=1, attn_tp_size=attn_tp
                 )
-                sides = dense_decoder_layer_sides(
-                    axis_sizes=sizes,
-                    leaves_for_next_layer=True,
-                    leaves_for_reduce_scatter=True,
-                )
+                sides = sides_of(sizes, sparse=sparse, leaves_next=True, leaves_rs=True)
                 self.assertEqual(sides.layer_rows, layouts[modes.layer_input_mode])
                 self.assertEqual(sides.layer_rows, layouts[modes.middle_residual_mode])
                 self.assertEqual(sides.layer_rows, layouts[modes.layer_output_mode])
@@ -187,14 +208,12 @@ class TestDeclarationsMatchScatterModes(CustomTestCase):
 
     def test_the_attention_output_owes_the_attention_tp_sum(self):
         for attn_tp in (1, 2):
-            sides = dense_decoder_layer_sides(
-                axis_sizes={
+            sides = sides_of(
+                {
                     TokenAxis.ATTN_DP: 2,
                     TokenAxis.ATTN_CP: 1,
                     TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                },
-                leaves_for_next_layer=False,
-                leaves_for_reduce_scatter=False,
+                }
             )
             owed = attn_tp > 1
             self.assertIs(
@@ -220,7 +239,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         for layer_id in range(3):
             with self.subTest(layer_id=layer_id):
-                communicator = build(dense_layer_facts(layer_id, 3), parallel)
+                communicator = build(layer_facts(layer_id, 3), parallel)
                 self.assertTrue(self.declared(communicator))
                 self.assertIs(
                     communicator._communicate_simple_fn,
@@ -235,7 +254,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             with self.subTest(norm=norm.__name__):
                 with planning(parallel_of(attn_dp=1, attn_tp=2)):
                     communicator = LayerCommunicator(
-                        layer_scatter_modes=dense_layer_facts(1, 3),
+                        layer_scatter_modes=layer_facts(1, 3),
                         input_layernorm=norm(),
                         post_attention_layernorm=norm(),
                     )
@@ -255,7 +274,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 )
         # One rank: the attention output is complete, only the norm is left.
         one_rank = parallel_of(attn_dp=1, attn_tp=1)
-        single = build(dense_layer_facts(1, 3), one_rank)
+        single = build(layer_facts(1, 3), one_rank)
         with planning(one_rank):
             self.assertIsNotNone(single._declared_sides())
         self.assertIs(single._mlp_input, comm._mlp_input_norm)
@@ -268,45 +287,61 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         ):
             with self.subTest(attn_tp=attn_tp, force=force):
                 communicator = build(
-                    dense_layer_facts(1, 3),
+                    layer_facts(1, 3),
                     parallel_of(attn_dp=2, attn_tp=attn_tp),
                     force_layernorm_before_dp_gather=force,
                 )
                 self.assertIs(communicator._mlp_input.func, order)
 
     def test_a_dense_first_layer_before_sparse_ones(self):
-        # DeepSeek-V2-Lite: layer 0 is dense, the rest sparse.
+        # DeepSeek-V2-Lite: layer 0 is dense, the rest sparse. Without a2a every
+        # layer takes the declared path; with a2a the sparse layers keep their
+        # rows, so they and any dense layer after them keep the scatter modes.
         parallel = parallel_of(attn_dp=2, attn_tp=2)
-        first = build(
-            planned_modes(0, 3, sparse=False, previous_sparse=False, parallel=parallel),
-            parallel,
-            allow_reduce_scatter=True,
-        )
-        second = build(
-            planned_modes(1, 3, sparse=True, previous_sparse=False, parallel=parallel),
-            parallel,
-            allow_reduce_scatter=True,
-        )
-        self.assertTrue(self.declared(first))
-        self.assertFalse(self.declared(second))
-        self.assertIs(second._mlp_input.func, comm._mlp_input_gather)
+        for a2a in (False, True):
+            with self.subTest(a2a=a2a):
+                layers = [
+                    build(
+                        planned_modes(
+                            i,
+                            4,
+                            sparse=sparse,
+                            previous_sparse=previous,
+                            parallel=parallel,
+                            a2a=a2a,
+                        ),
+                        parallel,
+                        a2a=a2a,
+                        allow_reduce_scatter=True,
+                    )
+                    for i, (sparse, previous) in enumerate(
+                        ((False, False), (True, False), (True, True), (False, True))
+                    )
+                ]
+                self.assertEqual(
+                    [self.declared(layer) for layer in layers],
+                    [True, False, False, False] if a2a else [True, True, True, True],
+                )
+                if not a2a:
+                    moe = layers[1]._ffn_output
+                    self.assertIs(moe.group, SumGroup.MOE_OUTPUT)
+                    self.assertTrue(moe.leaves_for_reduce_scatterv)
 
     def test_layers_that_keep_the_scatter_modes(self):
         dp = parallel_of(attn_dp=2, attn_tp=2)
         cases = {
             "input-scattered attention": (
-                dense_layer_facts(1, 3),
+                layer_facts(1, 3),
                 parallel_of(attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True),
             ),
             "attention CP": (
-                dense_layer_facts(1, 3),
+                layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
             ),
             "dense MLP fully DP": (
-                dense_layer_facts(1, 3),
+                layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1),
             ),
-            "after a sparse layer": (dense_layer_facts(1, 3, previous_sparse=True), dp),
         }
         for name, (facts, parallel) in cases.items():
             with self.subTest(name):
@@ -328,8 +363,19 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         self.assertFalse(self.declared(build(direct, dp)))
         with planning(dp, sp=True):
             communicator = LayerCommunicator.__new__(LayerCommunicator)
-            communicator.layer_scatter_modes = dense_layer_facts(1, 3)
+            communicator.layer_scatter_modes = layer_facts(1, 3)
             self.assertIsNone(communicator._declared_sides())
+        # A MoE dispatched per DP shard, and the layer after it.
+        for facts in (
+            layer_facts(1, 3, sparse=True),
+            layer_facts(1, 3, previous_sparse=True),
+        ):
+            with planning(dp, a2a=True):
+                communicator = LayerCommunicator.__new__(LayerCommunicator)
+                communicator.layer_scatter_modes = facts
+                communicator.allow_deferred_ffn_reduction = True
+                communicator.allow_reduce_scatter = False
+                self.assertIsNone(communicator._declared_sides())
 
     def test_subclasses_that_pick_their_own_steps(self):
         for cls in (
@@ -352,11 +398,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             TokenAxis.ATTN_CP: 1,
             TokenAxis.ATTN_TP_SCATTER: 2,
         }
-        sides = dense_decoder_layer_sides(
-            axis_sizes=sizes,
-            leaves_for_next_layer=False,
-            leaves_for_reduce_scatter=False,
-        )
+        sides = sides_of(sizes)
         steps = comm._select_ffn_input(
             produced,
             residual=sides.layer_rows,
@@ -391,14 +433,12 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
         return len(reduced), hidden, residual
 
     def test_a_complete_output_is_not_summed_again(self):
-        layout = dense_decoder_layer_sides(
-            axis_sizes={
+        layout = sides_of(
+            {
                 TokenAxis.ATTN_DP: 2,
                 TokenAxis.ATTN_CP: 1,
                 TokenAxis.ATTN_TP_SCATTER: 2,
-            },
-            leaves_for_next_layer=False,
-            leaves_for_reduce_scatter=False,
+            }
         ).layer_rows
         complete = comm.StageOutput(layout)
         for force in (False, True):
@@ -409,14 +449,12 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
                 torch.testing.assert_close(hidden, torch.full((1, HIDDEN), 20.0))
 
     def test_an_owed_output_is_summed_once(self):
-        layout = dense_decoder_layer_sides(
-            axis_sizes={
+        layout = sides_of(
+            {
                 TokenAxis.ATTN_DP: 2,
                 TokenAxis.ATTN_CP: 1,
                 TokenAxis.ATTN_TP_SCATTER: 2,
-            },
-            leaves_for_next_layer=False,
-            leaves_for_reduce_scatter=False,
+            }
         ).layer_rows
         owed = comm.StageOutput(layout, group=SumGroup.ATTN_TP, always_leaves=True)
         reductions, hidden, residual = self.run_steps(owed, force=True)
@@ -425,14 +463,12 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
         torch.testing.assert_close(residual, torch.full((1, HIDDEN), 17.0))
 
     def test_declarations_the_steps_cannot_run_are_rejected(self):
-        layout = dense_decoder_layer_sides(
-            axis_sizes={
+        layout = sides_of(
+            {
                 TokenAxis.ATTN_DP: 2,
                 TokenAxis.ATTN_CP: 1,
                 TokenAxis.ATTN_TP_SCATTER: 2,
-            },
-            leaves_for_next_layer=False,
-            leaves_for_reduce_scatter=False,
+            }
         ).layer_rows
         for produced in (
             # Leaves the attention-TP sum only when asked, like a mixer exit.
@@ -450,7 +486,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Two consecutive dense layers, rank by rank.
+# Two consecutive layers, rank by rank.
 
 
 class World:
@@ -635,8 +671,22 @@ def dense_mlp(x, state):
     return state.parallel.tp_group.all_reduce(partial_sum)
 
 
+def moe(x, state):
+    """A MoE block not dispatched per DP shard: 5 * x, reduced over the MoE
+    output's group unless a published flag asks it to leave the sum, or the
+    attention-DP reduce_scatterv takes it, as the MoE blocks do."""
+    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
+    if (
+        state.flags.fuse_mlp_allreduce
+        or state.flags.mlp_reduce_scatter
+        or comm.should_use_dp_reduce_scatterv()
+    ):
+        return partial_sum
+    return comm.post_experts_reduction_group().all_reduce(partial_sum)
+
+
 def reference(x):
-    """(hidden, residual) after two layers of Norm / attention / dense MLP."""
+    """(hidden, residual) after two layers of Norm / attention / FFN."""
     residual = x
     for _ in range(2):
         hidden = 2 * residual
@@ -647,8 +697,18 @@ def reference(x):
     return ffn, residual - ffn
 
 
-class TestTwoDenseLayers(CustomTestCase):
-    def run_world(self, *, attn_dp, attn_tp, rows, padding, reduce_scatterv, leaves):
+class TestTwoLayers(CustomTestCase):
+    def run_world(
+        self,
+        *,
+        attn_dp,
+        attn_tp,
+        rows,
+        padding,
+        reduce_scatterv,
+        leaves,
+        sparse=(False, False),
+    ):
         tp = attn_dp * attn_tp
         world = World(tp)
         WORLD[0] = world
@@ -712,7 +772,12 @@ class TestTwoDenseLayers(CustomTestCase):
             s = states[rank]
             layers = [
                 LayerCommunicator(
-                    layer_scatter_modes=dense_layer_facts(i, 2),
+                    layer_scatter_modes=layer_facts(
+                        i,
+                        2,
+                        sparse=sparse[i],
+                        previous_sparse=i > 0 and sparse[i - 1],
+                    ),
                     input_layernorm=Norm(),
                     post_attention_layernorm=Norm(),
                     allow_reduce_scatter=leaves,
@@ -724,12 +789,12 @@ class TestTwoDenseLayers(CustomTestCase):
             hidden[: s.rows] = embeddings[s.dp]
             residual = None
             handed_on = []
-            for layer in layers:
+            for layer_index, layer in enumerate(layers):
                 hidden, residual = layer.prepare_attn(hidden, residual, forward_batch)
                 hidden = attention(hidden, s)
                 hidden, residual = layer.prepare_mlp(hidden, residual, forward_batch)
                 with layer.ffn_exit(forward_batch) as ffn_exit:
-                    hidden = dense_mlp(hidden, s)
+                    hidden = (moe if sparse[layer_index] else dense_mlp)(hidden, s)
                 hidden, residual = ffn_exit.finish(hidden, residual)
                 handed_on.append(type(hidden))
             hidden, residual = layers[-1].finish_layer_stack(
@@ -751,11 +816,12 @@ class TestTwoDenseLayers(CustomTestCase):
         return results
 
     def test_rows_come_back_to_each_rank(self):
-        for (attn_dp, attn_tp), rows, padding, leaves in itertools.product(
+        for (attn_dp, attn_tp), rows, padding, leaves, sparse in itertools.product(
             ((2, 2), (4, 1), (2, 1), (1, 2), (1, 4)),
             ("ragged", "idle"),
             ("sum_len", "max_len"),
             (False, True),
+            ((False, False), (False, True), (True, True)),
         ):
             token_rows = {
                 ("ragged", 1): [3],
@@ -775,6 +841,7 @@ class TestTwoDenseLayers(CustomTestCase):
                     padding=padding,
                     leaves=leaves,
                     reduce_scatterv=reduce_scatterv,
+                    sparse=sparse,
                 ):
                     results = self.run_world(
                         attn_dp=attn_dp,
@@ -783,6 +850,7 @@ class TestTwoDenseLayers(CustomTestCase):
                         padding=padding,
                         reduce_scatterv=reduce_scatterv,
                         leaves=leaves,
+                        sparse=sparse,
                     )
                     first_layer_hands_on = results[0][2][0]
                     # A producer that may leave its sum leaves it for the next

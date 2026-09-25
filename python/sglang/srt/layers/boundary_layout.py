@@ -95,19 +95,21 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     ffn_output: StageOutput
 
 
-def dense_decoder_layer_sides(
+def decoder_layer_sides(
     *,
     axis_sizes: Mapping[TokenAxis, int],
+    ffn_group: SumGroup,
     leaves_for_next_layer: bool,
     leaves_for_reduce_scatter: bool,
+    leaves_for_reduce_scatterv: bool,
 ) -> DecoderLayerSides:
-    """An attention followed by a dense MLP on the TP group, derived from the
-    groups each computes over."""
+    """An attention followed by an FFN on the TP group (a dense MLP, or a MoE
+    not dispatched per DP shard), derived from the groups each computes over."""
     # Attention computes over the attention-TP ranks of one DP (and CP) shard.
     attention = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
     )
-    # The TP group spans every token axis, so its MLP needs every row.
+    # The TP group spans every token axis, so its FFN needs every row.
     ffn = Layout.sharded_over(axis_sizes=axis_sizes)
     attention_tp = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
     return DecoderLayerSides(
@@ -122,9 +124,9 @@ def dense_decoder_layer_sides(
         ffn=StageInput(ffn),
         ffn_output=StageOutput(
             ffn,
-            group=SumGroup.TP,
+            group=ffn_group,
             leaves_for_next_layer=leaves_for_next_layer,
             leaves_for_reduce_scatter=leaves_for_reduce_scatter,
-            leaves_for_reduce_scatterv=leaves_for_reduce_scatter,
+            leaves_for_reduce_scatterv=leaves_for_reduce_scatterv,
         ),
     )
