@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -37,6 +38,8 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+from sglang.srt.utils.json_response import dumps_json
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -451,6 +454,52 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestSamplingMaskMetaInfo(CustomTestCase):
+    def test_only_numpy_output_requests_get_numpy_rows(self):
+        """Callers other than /generate, such as Engine and OpenAI, get Python lists;
+        /generate's numpy rows write the same JSON."""
+        chunk = SamplingMaskChunk(
+            lengths=np.array([2, 1], np.int32),
+            token_ids=np.array([5, 3, 7], np.int32),
+            logprobs=np.array([-0.5, 0.1, 0.0], np.float32),
+        )
+        keys = (
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+            "output_token_sampling_mask_length",
+        )
+        sampling_meta_info = {}
+        for numpy_outputs in (False, True):
+            tm = _make_tokenizer_manager(self)
+            state = _make_req_state("sampling_mask_rid")
+            state.obj.return_sampling_mask = True
+            state.obj.sampling_logprobs_mode = "support"
+            state.obj.numpy_outputs = numpy_outputs
+            tm.rid_to_state["sampling_mask_rid"] = state
+            batch_output = _make_batch_str_output("sampling_mask_rid")
+            batch_output.output_token_sampling_mask = [chunk]
+
+            asyncio.run(tm._handle_batch_output(batch_output))
+
+            meta_info = state.out_list[-1]["meta_info"]
+            sampling_meta_info[numpy_outputs] = {key: meta_info[key] for key in keys}
+
+        self.assertEqual(
+            sampling_meta_info[False],
+            {
+                "output_token_sampling_mask": [[5, 3], [7]],
+                "output_token_sampling_logprobs": [
+                    [-0.5, float(np.float32(0.1))],
+                    [0.0],
+                ],
+                "output_token_sampling_mask_length": 2,
+            },
+        )
+        self.assertEqual(
+            dumps_json(sampling_meta_info[True]), dumps_json(sampling_meta_info[False])
+        )
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

@@ -328,6 +328,9 @@ class GenerateReqInput:
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+    # (Internal) Set by /generate, whose dumps_json writes numpy arrays as JSON
+    # lists, so outputs such as sampling masks can stay numpy arrays.
+    numpy_outputs: bool = False
     # Whether to return entropy
     return_entropy: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1014,6 +1017,7 @@ class GenerateReqInput:
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
+            numpy_outputs=self.numpy_outputs,
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
