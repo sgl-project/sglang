@@ -207,6 +207,58 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
+@pytest.mark.parametrize("num_tokens", [4096, 4097, 8192])
+def test_hopper_compensated_mhc_prefill(num_tokens):
+    from sglang.srt.environ import envs
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import is_sm90_supported
+
+    if not is_sm90_supported():
+        pytest.skip("Hopper compensated mHC dispatch")
+    torch.manual_seed(192 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    layer = SimpleNamespace(
+        input_layernorm=norm,
+        post_attention_layernorm=norm,
+        config=SimpleNamespace(model_type="deepseek_v41"),
+        hc_pre_from_prev_sublayer=True,
+        hc_attn_fn=w,
+        hc_ffn_fn=-w,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+    )
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        assert layer._hc_attn_bf16_parts is not None
+        assert layer._hc_attn_tf32_parts is None
+        actual = DeepseekV4DecoderLayer._hc_mix_stats(layer, x, w, scale, base)
+    xd = x.flatten(1).double()
+    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
+    expected_pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
+    expected_post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
+    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
+    comb = (comb - comb.amax(-1, keepdim=True)).exp()
+    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
+    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    for result, expected in zip(actual, (expected_pre, expected_post, comb)):
+        torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
+        fallback = DeepseekV4DecoderLayer._hc_mix_stats(layer, x, w, scale, base)
+        for result, expected in zip(fallback, (expected_pre, expected_post, comb)):
+            torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        assert layer._hc_attn_bf16_parts is None
+
+
 if __name__ == "__main__":
     import sys
 

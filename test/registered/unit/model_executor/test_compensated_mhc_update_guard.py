@@ -19,7 +19,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestCompensatedMhcUpdateGuard(CustomTestCase):
     def test_all_update_entries_reject_before_writes(self):
-        for field in ("_hc_attn_tf32_parts", "_hc_ffn_tf32_parts"):
+        for field in (
+            "_hc_attn_tf32_parts",
+            "_hc_ffn_tf32_parts",
+            "_hc_attn_bf16_parts",
+            "_hc_ffn_bf16_parts",
+        ):
             for method, args in (
                 ("update_weights_from_tensor", ([], "direct")),
                 ("load_weights_from_distributed", ([],)),

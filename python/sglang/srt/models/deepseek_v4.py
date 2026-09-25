@@ -2726,12 +2726,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and get_platform().is_sm100
+            and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
+            if get_platform().is_sm90:
+                from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
+
+                # The compensated BF16 projection uses ordinary tensor cores;
+                # it does not require Blackwell or DeepGEMM's prenorm kernel.
+                self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+                self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+                return
+
             from sglang.kernels.ops.layernorm.mhc import (
                 split_tf32_hc_weight,
             )
@@ -3288,12 +3297,38 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x_flat = x.flatten(1)
 
+        from sglang.srt.batch_invariant_ops import (
+            is_batch_invariant_mode_enabled,
+        )
+
+        parts = bf16_parts = None
+        if (
+            x.is_cuda
+            and x_flat.shape[0] >= 128
+            and x_flat.is_contiguous()
+            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not is_batch_invariant_mode_enabled()
+        ):
+            if hc_fn is self.hc_attn_fn:
+                parts = getattr(self, "_hc_attn_tf32_parts", None)
+                bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
+            elif hc_fn is self.hc_ffn_fn:
+                parts = getattr(self, "_hc_ffn_tf32_parts", None)
+                bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
+
         if (
             x.is_cuda
             and torch.version.cuda is not None
             and (
                 get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
+                or (
+                    get_platform().is_sm90
+                    and (
+                        x.shape[0] == 1
+                        or (bf16_parts is not None and 4096 <= x.shape[0] <= 65536)
+                    )
+                )
             )
             and x.dtype == torch.bfloat16
         ):
@@ -3306,24 +3341,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if stats_stream is not None
                 else nullcontext()
             ):
-                from sglang.srt.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
-                )
-
-                parts = bf16_parts = None
-                if (
-                    x_flat.shape[0] >= 128
-                    and x_flat.is_contiguous()
-                    and get_platform().is_sm100
-                    and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
-                    and not is_batch_invariant_mode_enabled()
-                ):
-                    if hc_fn is self.hc_attn_fn:
-                        parts = getattr(self, "_hc_attn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
-                    elif hc_fn is self.hc_ffn_fn:
-                        parts = getattr(self, "_hc_ffn_tf32_parts", None)
-                        bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
                 if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
                     from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_bf16x3,

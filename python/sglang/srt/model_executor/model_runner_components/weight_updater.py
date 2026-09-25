@@ -50,6 +50,8 @@ def _unsupported_derived_weight_cache_error(
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        or getattr(module, "_hc_attn_bf16_parts", None) is not None
+        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
         for module in model.modules()
     ):
         return (
