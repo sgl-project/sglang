@@ -72,11 +72,21 @@ class TestAutoRoundCPU(CustomTestCase):
         for model in DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST:
             with self.subTest(model=model):
                 print(f"\n[INFO] Launching server for model: {model}")
+                # Auto-sizing can size the KV cache off the full per-NUMA-node
+                # memory estimate (100+ GB) for these tiny 0.5B checkpoints;
+                # cap it explicitly regardless of SGLANG_CPU_OMP_THREADS_BIND.
+                other_args = [
+                    "--trust-remote-code",
+                    "--quantization",
+                    "auto-round",
+                    "--mem-fraction-static",
+                    "0.3",
+                ]
                 process = popen_launch_server(
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=["--trust-remote-code", "--quantization", "auto-round"],
+                    other_args=other_args,
                     device=device,
                 )
 
