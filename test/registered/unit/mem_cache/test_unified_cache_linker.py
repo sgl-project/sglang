@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -185,7 +186,7 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
@@ -611,6 +612,98 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         )
         self.assertEqual(final_match.device_indices.numel(), 4)
         self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
+        consumer.sanity_check()
+
+    def test_mamba_state_round_trips_only_at_its_checkpoint(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=2,
+            kv_size=64,
+            max_context_len=64,
+        )
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 7))
+
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        inserted = self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        # Ancestors of the chain carry no state; only the checkpoint node does.
+        *ancestors, offload = producer_linker.offload_calls
+        for transfers in ancestors:
+            self.assertEqual(
+                {transfer.name for transfer in transfers}, {PoolName.KV, PoolName.SWA}
+            )
+        offloads = {transfer.name: transfer for transfer in offload}
+        self.assertEqual(set(offloads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        mamba_offload = offloads[PoolName.MAMBA]
+        self.assertEqual(mamba_offload.keys, offloads[PoolName.KV].keys[-1:])
+        self.assertEqual(mamba_offload.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+        self.assertTrue(
+            torch.equal(
+                mamba_offload.device_indices,
+                _device_value(producer, inserted.last_device_node, ComponentType.MAMBA),
+            )
+        )
+        for _ in producer_linker.offload_calls:
+            producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+
+        # Every KV and SWA page is stored, but only the full prefix has a state.
+        short = consumer.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens[:5])),
+                req=self._make_req(consumer_req_pool),
+            )
+        )
+        self.assertEqual(short.host_hit_length, 0)
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(match.mamba_host_hit_length, 1)
+        self._apply_match_to_req(req, match)
+        loaded, loaded_node = consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual(loaded.numel(), len(tokens))
+        loads = {
+            transfer.name: transfer
+            for transfer in consumer_linker.queued_loads[req.rid]
+        }
+        self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        self.assertEqual(loads[PoolName.MAMBA].keys, mamba_offload.keys)
+        loaded_state = _device_value(consumer, loaded_node, ComponentType.MAMBA)
+        self.assertTrue(torch.equal(loads[PoolName.MAMBA].device_indices, loaded_state))
+        # The request continues from a private copy of the loaded state.
+        self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, loaded_state))
+        self.assertNotEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertEqual(
+            _device_lock_ref(consumer, loaded_node, ComponentType.MAMBA), 1
+        )
+
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        consumer_linker.complete_started_loads()
+        consumer.check_hicache_events()
+        self.assertEqual(
+            _device_lock_ref(consumer, loaded_node, ComponentType.MAMBA), 0
+        )
+        final_match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(final_match.device_indices.numel(), len(tokens))
         consumer.sanity_check()
 
 
@@ -1081,6 +1174,42 @@ def test_component_commit_keeps_only_adopted_pages():
     assert mapped_swa.tolist() == [202, 203, 206, 207]
 
 
+@pytest.mark.parametrize("mamba_exist", [False, True])
+def test_mamba_commit_copies_node_state_and_loads_only_a_new_slot(mamba_exist):
+    node_state = torch.tensor([7])
+    component = MambaComponent.__new__(MambaComponent)
+    component.tree_core = SimpleNamespace(
+        get_component_device_value=lambda node_id, component_type: node_state
+    )
+    component.cache = SimpleNamespace()
+    req = SimpleNamespace(kv=ReqKvInfo(mamba_pool_idx=torch.tensor(3)))
+    transfer = PoolTransfer(
+        name=PoolName.MAMBA, keys=["d"], device_indices=torch.tensor([9])
+    )
+
+    # The Mamba slot is never page-sliced by adopted ranges.
+    loaded = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(page_size=2), _FakeLinker()
+    )._update_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        req,
+        [(component, transfer)],
+        prefix_len=8,
+        insert_result=InsertResult(
+            prefix_len=0,
+            mamba_exist=mamba_exist,
+            adopted_ranges={},
+            last_device_node=1,
+        ),
+        canonical_full=torch.arange(8),
+    )
+
+    assert loaded == ([] if mamba_exist else [transfer])
+    assert transfer.device_indices.tolist() == [9]
+    assert req.kv.mamba_cow_src_index is node_state
+    assert int(req.kv.mamba_pool_idx) == 3
+
+
 @pytest.mark.parametrize(
     "swa_req_ring",
     [None, False, True],
@@ -1138,6 +1267,7 @@ def full_linker_component():
 
     return SimpleNamespace(
         component_type=ComponentType.FULL,
+        linker_indices_are_paged=True,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
         update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
             transfer

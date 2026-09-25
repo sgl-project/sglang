@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -155,7 +156,7 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
@@ -431,7 +432,10 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if (
+                phase == ExternalLinkerLoadPhase.COMMIT
+                and component.linker_indices_are_paged
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [

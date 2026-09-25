@@ -2230,7 +2230,7 @@ fn external_linker_hashes_new_nodes_and_triggers_offload_action() {
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL]);
-    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.set_enable_external_cache_linker(true);
 
     let result = tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let leaf = result.last_device_node_id.unwrap();
@@ -2269,7 +2269,7 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, SWA]);
-    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.set_enable_external_cache_linker(true);
     let root = tc.arena.root();
     let node = tc.add_new_node_(
         root,
@@ -2303,27 +2303,55 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_rejects_mamba_trees() {
+fn external_linker_mamba_offload_keys_the_state_by_its_end_page() {
     let params = CacheInitParams {
-        mamba_cache_chunk_size: Some(1),
+        page_size: 2,
+        mamba_cache_chunk_size: Some(2),
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
+    tc.set_enable_external_cache_linker(true);
+    let root = tc.arena.root();
+    let node = tc.add_new_node_(
+        root,
+        vec![1, 2, 3, 4],
+        &Tensor::from_slice(&[10i64, 11, 12, 13]),
+        0,
+        None,
+    );
+    let node_id = tc.arena.node(node).id;
+    let transfers = tc
+        .build_external_linker_offload_transfers(node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].name, PoolName::Kv);
+
+    tc.arena.node_mut(node).values[MAMBA.idx()].value = Some(Tensor::from_slice(&[7i64]));
+    let transfers = tc
+        .build_external_linker_offload_transfers(node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 2);
+    assert_eq!(transfers[1].name, PoolName::Mamba);
+    assert_eq!(transfers[1].hit_policy, PoolHitPolicy::TrailingPages);
+    assert!(
+        transfers[1]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[7i64]))
+    );
+    assert_eq!(
+        transfers[1].keys.as_ref().unwrap(),
+        &tc.arena.node(node).hash_value.as_ref().unwrap()[1..]
+    );
 }
 
 #[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.set_enable_external_cache_linker(true);
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
     let anchor = tc
@@ -2422,7 +2450,7 @@ fn external_linker_state_follows_load_offload_and_split_lifecycle() {
 #[test]
 fn failed_external_offload_preserves_independently_confirmed_state() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.set_enable_external_cache_linker(true);
     tc.insert(&insert_params(&vec![1], &[10]));
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let anchor = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
@@ -2591,7 +2619,7 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
 #[test]
 fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.set_enable_external_cache_linker(true);
     tc.insert(&insert_params(&vec![1], &[10]));
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
