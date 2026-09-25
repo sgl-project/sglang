@@ -103,6 +103,11 @@ class SpecTpSync:
         self._tp_group = tp_group
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
+        # Runtime broadcasts (`sync`) follow the constructor group. The memory
+        # probe can be asked to reduce over a different, larger group; keep
+        # the configured site set so that path is not disabled just because
+        # the broadcast group is a singleton.
+        self._configured_sites = sites
         self._sites = sites if tp_group.world_size > 1 else frozenset()
         if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
             logger.warning(
@@ -119,8 +124,15 @@ class SpecTpSync:
         return values
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
-        """Free GPU memory, reduced to the group minimum when ``site`` is on."""
-        distributed = self.enabled(site) and group.world_size > 1
+        """Free GPU memory, reduced to the group minimum when ``site`` is on.
+
+        ``group`` is the capture/consensus group and can be larger than the
+        constructor broadcast group. DSpark + DP attention with a DeepSeek
+        MoE draft uses attn_tp=1 for spec broadcasts but full TP for draft
+        CUDA graph capture; the probe must still min-reduce over ``group`` so
+        ranks agree on whether to enter capture.
+        """
+        distributed = site in self._configured_sites and group.world_size > 1
         return get_available_gpu_memory(
             device,
             gpu_id,
