@@ -30,7 +30,6 @@ def dense_layer(*, reduce_scatter):
     communicator = SimpleNamespace(
         prepare_attn=lambda h, r, fb, **_: (h, h if r is None else r),
         prepare_mlp=lambda h, r, fb: (h, r),
-        should_fuse_mlp_allreduce_with_next_layer=lambda fb: False,
         should_use_reduce_scatter=lambda fb: reduce_scatter,
         postprocess_layer=MagicMock(side_effect=lambda h, r, fb: (h, r)),
     )
