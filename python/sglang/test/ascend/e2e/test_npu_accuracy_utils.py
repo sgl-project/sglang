@@ -23,7 +23,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_router,
     wait_server_ready,
 )
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

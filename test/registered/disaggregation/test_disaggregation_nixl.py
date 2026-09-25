@@ -13,7 +13,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     assert_process_healthy,
     configure_nixl_pd_backend,
 )
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

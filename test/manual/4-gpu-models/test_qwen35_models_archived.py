@@ -17,7 +17,7 @@ from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

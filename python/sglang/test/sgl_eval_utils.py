@@ -1,5 +1,6 @@
 """SGLang CI transport and metric reporting for sgl-eval benchmarks."""
 
+import argparse
 import json
 import multiprocessing
 import os
@@ -9,6 +10,32 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from itertools import islice
 from pathlib import Path
+
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
+
+
+def get_thinking_kwargs(args):
+    thinking_mode = getattr(args, "thinking_mode", None)
+    if thinking_mode in THINKING_MODE_CHOICES:
+        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
+            thinking_param = "thinking"
+        else:
+            # All models other than dpsk v3/kimi_k2
+            thinking_param = "enable_thinking"
+        return {thinking_param: True}
+    return {}
+
+
+def parse_json_object(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
+
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+
+    return parsed
 
 
 def api_base_url(args):
@@ -55,7 +82,6 @@ def run_sgl_eval(args):
     from sgl_eval.registry import get
     from sgl_eval.sampler import ChatCompletionSampler
 
-    from sglang.test.run_eval import get_thinking_kwargs, parse_json_object
     from sglang.test.test_utils import dump_metric
 
     spec = get(args.eval_name)

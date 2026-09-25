@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

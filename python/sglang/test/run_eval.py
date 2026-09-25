@@ -12,6 +12,11 @@ import time
 import uuid
 from pathlib import Path
 
+from sglang.test.sgl_eval_utils import (
+    THINKING_MODE_CHOICES,
+    get_thinking_kwargs,
+    parse_json_object,
+)
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
     CompletionSampler,
@@ -20,30 +25,6 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
-
-
-def get_thinking_kwargs(args):
-    thinking_mode = getattr(args, "thinking_mode", None)
-    if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
-            thinking_param = "thinking"
-        else:
-            # All models other than dpsk v3/kimi_k2
-            thinking_param = "enable_thinking"
-        return {thinking_param: True}
-    return {}
-
-
-def parse_json_object(value: str) -> dict:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
-
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("must be a JSON object")
-
-    return parsed
 
 
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
@@ -111,7 +92,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 def _run_sgl_eval(eval_name, args) -> dict:
     # Returns a metrics dict (score, latency, output_throughput) so the
     # existing write_results_to_json + threshold gate keep working.
-    from sglang.test.sgl_eval import api_base_url
+    from sglang.test.sgl_eval_utils import api_base_url
     from sglang.test.test_utils import dump_metric
 
     base_url = api_base_url(args)
@@ -259,7 +240,7 @@ def run_eval(args):
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
-    from sglang.test.sgl_eval import api_base_url
+    from sglang.test.sgl_eval_utils import api_base_url
 
     base_url = api_base_url(args)
 
@@ -302,7 +283,7 @@ def run_eval(args):
     elif args.eval_name == "gsm8k":
         if getattr(args, "load_preset_from_model_id", None):
             return _run_sgl_eval("gsm8k", args)
-        from sglang.test.sgl_eval import run_sgl_eval
+        from sglang.test.sgl_eval_utils import run_sgl_eval
 
         return run_sgl_eval(args)
     else:
@@ -403,8 +384,6 @@ def run_eval(args):
         return metrics, latency
     return metrics
 
-
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

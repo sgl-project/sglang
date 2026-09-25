@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

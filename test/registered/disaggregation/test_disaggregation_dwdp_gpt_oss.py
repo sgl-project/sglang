@@ -5,7 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.sgl_eval import run_sgl_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 
 register_cuda_ci(est_time=170, stage="extra-b", runner_config="4-gpu-b200")
 
