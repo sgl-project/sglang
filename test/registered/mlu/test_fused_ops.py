@@ -60,6 +60,26 @@ class TestMLUFusedOps(CustomTestCase):
         self.assertEqual(actual.device.type, "mlu")
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
+    def test_rms_norm_accepts_quant_linear(self):
+        # Qwen2/2.5 and Llama pass `quant_linear` (an FP8 static-input-scale
+        # hint) through the input layernorm call. The MLU kernel performs no
+        # fused activation quant, so the hint must be accepted and ignored
+        # rather than failing dispatch with an unexpected-keyword TypeError.
+        from sglang.srt.layers.layernorm import RMSNorm
+
+        op = RMSNorm(16, eps=1e-6, weight_dtype=torch.bfloat16).to(self.device)
+        self._assert_uses_mlu_forward(op)
+        x = torch.randn(4, 16, dtype=torch.bfloat16, device=self.device)
+        quant_linear = torch.nn.Linear(16, 16, bias=False).to(
+            device=self.device, dtype=torch.bfloat16
+        )
+        cpu_op = RMSNorm(16, eps=1e-6, weight_dtype=torch.bfloat16)
+        cpu_op.load_state_dict({k: v.cpu() for k, v in op.state_dict().items()})
+        expected = cpu_op.forward_native(x.cpu()).to(self.device)
+        actual = op(x, quant_linear=quant_linear)
+        self.assertEqual(actual.device.type, "mlu")
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
     def test_layer_norm_matches_native(self):
         from sglang.srt.layers.layernorm import LayerNorm
 
