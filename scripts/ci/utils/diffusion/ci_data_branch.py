@@ -32,7 +32,7 @@ def _strip_ref(ref):
 
 def _sanitize_branch_name(name):
     """Rewrite ``name`` into a legal git branch name; may return ""."""
-    name = re.sub(r"[^A-Za-z0-9._/-]+", "-", name).replace("..", ".")
+    name = re.sub(r"\.{2,}", ".", re.sub(r"[^A-Za-z0-9._/-]+", "-", name))
     components = []
     for component in name.split("/"):
         # git check-ref-format: no component starts with "." or ends with ".lock".
