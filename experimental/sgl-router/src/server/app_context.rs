@@ -186,6 +186,7 @@ impl AppContext {
                     id: "stub-model".into(),
                     tokenizer_path: "stub".into(),
                     disable_input_ids_forwarding: false,
+                    tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
                     bucket_config: None,

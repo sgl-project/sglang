@@ -226,6 +226,7 @@ mod tests {
                 id: model_id.into(),
                 tokenizer_path: "/tmp/tok.json".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
                 bucket_config: None,
