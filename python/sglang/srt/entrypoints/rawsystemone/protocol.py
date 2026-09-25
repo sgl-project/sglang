@@ -21,7 +21,7 @@ class CandidateScore(BaseModel):
     index: int
     score: float
     logprob_sum: float
-    scored_token_count: int
+    option_token_count: int
     token_logprobs: list[TokenLogprob] | None = None
 
 
@@ -35,8 +35,8 @@ class RawSystemOneResponse(BaseModel):
     id: str
     object: Literal["rawsystemone"] = "rawsystemone"
     model: str
-    scoring: Literal["mean_logprob_full_sequence"] = "mean_logprob_full_sequence"
-    tokenization: Literal["native_text_v1"] = "native_text_v1"
+    scoring: Literal["softmax_mean_suffix_logprob"] = "softmax_mean_suffix_logprob"
+    tokenization: Literal["prefix_suffix_tokens_v1"] = "prefix_suffix_tokens_v1"
     data: list[CandidateScore]
     best_index: int
     usage: Usage

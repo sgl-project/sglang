@@ -10,6 +10,14 @@ def invalid_scores(message: str):
     return RawSystemOneError("incomplete_scores", message, 500)
 
 
+def softmax(values: list[float]) -> list[float]:
+    """Normalize finite option scores without overflowing exp for large logits."""
+    maximum = max(values)
+    weights = [math.exp(value - maximum) for value in values]
+    total = math.fsum(weights)
+    return [weight / total for weight in weights]
+
+
 @dataclass(frozen=True)
 class TokenPlan:
     sequences: tuple[tuple[int, ...], ...]
@@ -94,9 +102,10 @@ def native_rows(
 
 
 def aggregate(
-    ids: tuple[int, ...], records: tuple[TokenLogprob, ...]
+    ids: tuple[int, ...], records: tuple[TokenLogprob, ...], *, start: int = 1
 ) -> tuple[float, int]:
-    if len(ids) < 2 or len(records) != len(ids):
+    """Validate complete coverage, then sum the requested target-token span."""
+    if not 1 <= start < len(ids) or len(records) != len(ids):
         raise invalid_scores("Complete candidate scores are required.")
     for position, (token_id, record) in enumerate(zip(ids, records)):
         if record.position != position or record.token_id != token_id:
@@ -107,11 +116,11 @@ def aggregate(
         elif record.logprob is None or not math.isfinite(record.logprob):
             raise invalid_scores("Every non-initial token must have a finite score.")
     try:
-        total = math.fsum(record.logprob for record in records[1:])
+        total = math.fsum(record.logprob for record in records[start:])
     except OverflowError:
         total = math.inf
     if not math.isfinite(total):
         raise RawSystemOneError(
             "non_finite_scores", "Candidate sum is not finite.", 500
         )
-    return total, len(ids) - 1
+    return total, len(ids) - start

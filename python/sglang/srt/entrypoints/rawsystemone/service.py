@@ -21,6 +21,7 @@ from .scoring import (
     native_rows,
     partition_candidates,
     plan_tokens,
+    softmax,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,11 +292,27 @@ class RawSystemOneService:
             raise RawSystemOneError(
                 "too_many_options", f"At most {cfg.max_options} suffixes are allowed."
             )
-        sequences, _ = await self.manager._tokenize_texts(
-            [request.prefix + suffix for suffix in request.suffixes]
-        )
-        if len(sequences) != len(request.suffixes):
-            raise invalid_scores("Tokenizer returned an incomplete candidate list.")
+        # Freeze the native prompt tokens once. Appending separately tokenized
+        # options prevents a lexical merge from changing the cached prefix.
+        prefixes, _ = await self.manager._tokenize_texts([request.prefix])
+        if len(prefixes) != 1:
+            raise invalid_scores("Tokenizer returned an incomplete prefix result.")
+        prefix_ids = prefixes[0]
+        if not prefix_ids:
+            raise RawSystemOneError(
+                "no_prefix_tokens",
+                "The native prefix must contain a token to predict the first option token.",
+            )
+        options = [
+            self.manager.tokenizer.encode(suffix, add_special_tokens=False)
+            for suffix in request.suffixes
+        ]
+        option_token_counts = [len(ids) for ids in options]
+        if any(count == 0 for count in option_token_counts):
+            raise RawSystemOneError(
+                "no_option_tokens", "Every option must contain at least one token."
+            )
+        sequences = [prefix_ids + option_ids for option_ids in options]
         for ids in sequences:
             if len(ids) < 2:
                 raise RawSystemOneError(
@@ -324,15 +341,14 @@ class RawSystemOneService:
                 "token_budget_exceeded", "Cumulative candidate-token budget exceeded."
             )
         plan = plan_tokens(sequences)
+        k = len(prefix_ids)
         state.update(
             options=len(sequences),
             distinct_candidates=len(plan.sequences),
-            shared_tokens=plan.common_length,
+            shared_tokens=k,
             logical_input_tokens=logical_tokens,
         )
         shared = ()
-        shared_total, shared_count = 0.0, 0
-        k = plan.common_length
         use_shared = (
             not reference and self.cache_enabled and len(plan.sequences) > 1 and k > 1
         )
@@ -347,9 +363,7 @@ class RawSystemOneService:
             state["fallback_reason"] = "one_unique_candidate"
         else:
             state["fallback_reason"] = "short_common_span"
-        candidates = [
-            i for i, ids in enumerate(plan.sequences) if not use_shared or len(ids) > k
-        ]
+        candidates = list(range(len(plan.sequences)))
         # Plan and validate ALL batches before any GPU work, including warm-up.
         batches = partition_candidates(
             candidates,
@@ -360,10 +374,7 @@ class RawSystemOneService:
         )
         prefix_start = time.monotonic()
         if use_shared:
-            (shared,) = await self._batch(
-                [plan.sequences[0][:k]], 0, state, phase="shared_prefix"
-            )
-            shared_total, shared_count = aggregate(plan.sequences[0][:k], shared)
+            (shared,) = await self._batch([prefix_ids], 0, state, phase="shared_prefix")
         state["shared_seconds"] = time.monotonic() - prefix_start
         branch_start = time.monotonic()
         scored = await self._dispatch(
@@ -374,26 +385,32 @@ class RawSystemOneService:
         for i, ids in enumerate(plan.sequences):
             if use_shared:
                 # Drop only the verified placeholder at absolute position K-1.
-                records = shared + scored[i][1:] if i in scored else shared
+                records = shared + scored[i][1:]
             else:
                 records = scored[i]
-            if use_shared and i not in scored:
-                total, count = shared_total, shared_count
-            else:
-                # Sum the complete records with fsum so the host result does
-                # not depend on the partition into shared and tail spans.
-                total, count = aggregate(ids, records)
-            complete[i] = (total, count, records)
+            # Sum only suffix targets. This equals logP(prefix + option) minus
+            # logP(prefix), without subtracting two large, nearly equal sums.
+            total, _ = aggregate(ids, records, start=k)
+            complete[i] = (total, records)
         self._check_epoch(state["epoch"])
+        # Normalize across original options, so duplicate entries each receive
+        # their own weight. Deduplication only shares the inference work.
+        scores = softmax(
+            [
+                complete[unique][0] / option_token_counts[original]
+                for original, unique in enumerate(plan.original_to_unique)
+            ]
+        )
         data = []
         for original, unique in enumerate(plan.original_to_unique):
-            total, count, records = complete[unique]
+            total, records = complete[unique]
+            option_count = option_token_counts[original]
             data.append(
                 CandidateScore(
                     index=original,
-                    score=total / count,
+                    score=scores[original],
                     logprob_sum=total,
-                    scored_token_count=count,
+                    option_token_count=option_count,
                     token_logprobs=list(records)
                     if request.return_token_logprobs
                     else None,

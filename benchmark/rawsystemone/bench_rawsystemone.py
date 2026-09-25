@@ -1,4 +1,4 @@
-"""Compare an existing server's rawsystemone endpoint with native full scoring.
+"""Compare conditional option weights with independent native full scoring.
 
 This is a client benchmark; it never starts a server or loads model weights.
 Results are HTTP wall times, including transport and client aggregation.
@@ -49,23 +49,32 @@ async def post(client, path, payload=None):
     return result.json()
 
 
-def aggregate_full(result):
-    """Independent full-sequence oracle; no production prefix merge code."""
+def aggregate_full(result, prefix_len):
+    """Obtain a suffix mean from independent, complete native token scores."""
     rows = result["meta_info"]["input_token_logprobs"]
     if len(rows) < 2 or rows[0][0] is not None:
         raise ValueError("Invalid full-sequence reference boundary")
     values = [row[0] for row in rows[1:]]
     if any(x is None or not math.isfinite(x) for x in values):
         raise ValueError("Missing or non-finite full-sequence reference score")
-    return math.fsum(values) / len(values)
+    suffix_values = values[prefix_len - 1 :]
+    if prefix_len < 1 or not suffix_values:
+        raise ValueError("Reference requires a nonempty token prefix and option")
+    return math.fsum(suffix_values) / len(suffix_values)
 
 
-async def native_batch(client, texts):
+def normalize_options(logits):
+    weights = [math.exp(x - max(logits)) for x in logits]
+    total = math.fsum(weights)
+    return [weight / total for weight in weights]
+
+
+async def native_batch(client, sequences):
     return await post(
         client,
         "/generate",
         dict(
-            text=texts,
+            input_ids=sequences,
             sampling_params=NEUTRAL,
             return_logprob=True,
             logprob_start_len=0,
@@ -88,15 +97,15 @@ def split_batches(lengths, max_count, target_tokens):
     return batches
 
 
-async def split_reference(client, texts, batches, concurrency):
-    scores = [None] * len(texts)
+async def split_reference(client, sequences, batches, concurrency, prefix_len):
+    logits = [None] * len(sequences)
     queue = iter(batches)
 
     async def worker():
         for batch in queue:
-            result = await native_batch(client, [texts[i] for i in batch])
+            result = await native_batch(client, [sequences[i] for i in batch])
             for i, row in zip(batch, result, strict=True):
-                scores[i] = aggregate_full(row)
+                logits[i] = aggregate_full(row, prefix_len)
 
     tasks = [
         asyncio.create_task(worker()) for _ in range(min(concurrency, len(batches)))
@@ -108,7 +117,7 @@ async def split_reference(client, texts, batches, concurrency):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    return scores
+    return normalize_options(logits)
 
 
 def command_output(command):
@@ -219,9 +228,28 @@ async def run(args):
                             )
                             for i in range(count)
                         ]
-                        texts = [prefix + suffix for suffix in suffixes]
-                        base = await native_batch(client, texts)
-                        expected = [aggregate_full(row) for row in base]
+                        prefix_tokens = await post(
+                            client,
+                            "/v1/tokenize",
+                            dict(prompt=prefix, add_special_tokens=True),
+                        )
+                        option_tokens = await post(
+                            client,
+                            "/v1/tokenize",
+                            dict(prompt=suffixes, add_special_tokens=False),
+                        )
+                        prefix_ids = prefix_tokens["tokens"]
+                        option_ids = option_tokens["tokens"]
+                        if not prefix_ids or any(not ids for ids in option_ids):
+                            raise ValueError(
+                                "Benchmark needs a nonempty token prefix and options"
+                            )
+                        sequences = [prefix_ids + ids for ids in option_ids]
+                        prefix_len = len(prefix_ids)
+                        base = await native_batch(client, sequences)
+                        expected = normalize_options(
+                            [aggregate_full(row, prefix_len) for row in base]
+                        )
                         lengths = [
                             len(row["meta_info"]["input_token_logprobs"])
                             for row in base
@@ -238,6 +266,12 @@ async def run(args):
                             "/v1/rawsystemone",
                             {**payload, "return_token_logprobs": True},
                         )
+                        if [row["option_token_count"] for row in checked["data"]] != [
+                            len(ids) for ids in option_ids
+                        ]:
+                            raise AssertionError(
+                                "Option token counts differ from independent tokenization"
+                            )
                         per_token_diff = max(
                             abs(a["logprob"] - b[0])
                             for row, ref in zip(checked["data"], base, strict=True)
@@ -254,16 +288,23 @@ async def run(args):
 
                         async def sequential():
                             # Deliberately serial test oracle/control, never production.
-                            return [
-                                aggregate_full((await native_batch(client, [text]))[0])
-                                for text in texts
-                            ]
+                            return normalize_options(
+                                [
+                                    aggregate_full(
+                                        (await native_batch(client, [ids]))[0],
+                                        prefix_len,
+                                    )
+                                    for ids in sequences
+                                ]
+                            )
 
                         async def single_batch():
-                            return [
-                                aggregate_full(row)
-                                for row in await native_batch(client, texts)
-                            ]
+                            return normalize_options(
+                                [
+                                    aggregate_full(row, prefix_len)
+                                    for row in await native_batch(client, sequences)
+                                ]
+                            )
 
                         async def optimized():
                             result = await post(client, "/v1/rawsystemone", payload)
@@ -276,7 +317,7 @@ async def run(args):
                             **{
                                 f"split_reference_c{c}": (
                                     lambda c=c: split_reference(
-                                        client, texts, batches, c
+                                        client, sequences, batches, c, prefix_len
                                     )
                                 )
                                 for c in args.concurrency

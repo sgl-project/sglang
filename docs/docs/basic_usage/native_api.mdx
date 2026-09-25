@@ -15,7 +15,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/encode`(embedding model)
 - `/v1/rerank`(cross encoder rerank model)
 - `/v1/score`(decoder-only scoring)
-- `/v1/rawsystemone` (full-sequence completion likelihood)
+- `/v1/rawsystemone` (conditional completion likelihood)
 - `/classify`(reward model)
 - `/start_expert_distribution_record`
 - `/stop_expert_distribution_record`
@@ -52,11 +52,11 @@ response = requests.post(url, json=data)
 print_highlight(response.json())
 ```
 
-## Rawsystemone: full-sequence completion likelihood
+## Rawsystemone: conditional completion likelihood
 
-`POST /v1/rawsystemone` scores each exact `prefix + suffix` concatenation using
-the model already loaded in this server. It returns the mean token
-log-probability of the **entire sequence**, including all scoreable prefix tokens.
+`POST /v1/rawsystemone` scores supplied suffixes conditioned on a fixed prefix
+using the model already loaded in this server. It returns softmax weights over
+the options' mean conditional token log-probabilities.
 It does not generate an answer or apply a chat template. `/v1/score` retains its
 existing behavior.
 
@@ -74,43 +74,53 @@ Use your normal bearer authorization header when the server requires an API key.
 The only request fields are `prefix` (string), `suffixes` (nonempty list of
 strings), and optional `return_token_logprobs` (boolean, default `false`). Types
 are strict and unknown fields are rejected. Whitespace and Unicode are preserved
-before native tokenization. Empty strings are accepted when every resulting
-candidate has at least two native tokens. Duplicate suffixes retain separate
-result indices.
+before tokenization. Each suffix must encode to at least one token. An empty
+prefix is accepted only when its native tokenization supplies a token such as
+BOS, so the first suffix token has a predictor. Duplicate suffixes retain
+separate result indices and separate softmax weights.
 
-For native token IDs `x[0], ..., x[n-1]`, the score is:
+Tokenize the prefix once with the native raw-text policy, and each suffix with
+`add_special_tokens=False`. Append their token IDs without re-tokenizing the
+combined text. This keeps the prefix and its KV cache identical for every option,
+even where whole-text tokenization would merge across the boundary.
+
+For fixed prefix IDs `P` and suffix IDs `S[i]`, the score is:
 
 ```text
-logprob_sum = sum(log P(x[t] | x[:t]) for t in 1..n-1)
-scored_token_count = n - 1
-score = logprob_sum / scored_token_count
+logprob_sum[i] = log P_model(S[i] | P)
+               = log P_model(P + S[i]) - log P_model(P)
+option_token_count[i] = len(S[i])
+x[i] = logprob_sum[i] / option_token_count[i]
+score[i] = exp(x[i] - max(x)) / sum(exp(x[j] - max(x)) for j)
 ```
 
-The first native token has no predictor and is excluded. A native leading BOS
-occupies that position when the tokenizer adds one; later special tokens are
-scored normally. The handler uses the configured raw-text tokenizer policy and
-never adds its own BOS, EOS, whitespace, or separators. Zero log-probabilities
-count toward the denominator. Scores use vocabulary-wide log-softmax at
-temperature 1 and are not calibrated interpretation probabilities.
+The implementation sums suffix-token log-probabilities directly to avoid
+subtracting large totals. Prefix-token scores are excluded from both numerator
+and denominator. Every suffix token counts, including one with log-probability
+`0.0`. Token scores use vocabulary-wide log-softmax at temperature 1. Final weights
+sum to one within floating-point precision and are not calibrated correctness
+confidence. A single option has weight `1.0`; adding options changes the weights
+but leaves each existing option's conditional sum and token count unchanged.
 
 The response has `object: "rawsystemone"`, `model`,
-`scoring: "mean_logprob_full_sequence"`, `tokenization: "native_text_v1"`, an
+`scoring: "softmax_mean_suffix_logprob"`, `tokenization: "prefix_suffix_tokens_v1"`, an
 ordered `data` list, and `best_index`. Each result includes `index`, `score`,
-`logprob_sum`, and `scored_token_count`. The complete native token count is
-`scored_token_count + 1`. Higher scores win;
+`logprob_sum`, and `option_token_count`. Higher scores win;
 exact ties select the first original index. Requested `token_logprobs` contain
 every absolute `position`, `token_id`, and `logprob`, including an initial `null`.
 Without the option, token arrays are omitted. Prompts are never echoed.
 
 `usage.input_tokens` and `usage.scored_tokens` are logical totals across all
-original candidates, including duplicates and repeated prefixes.
+original candidates, including duplicates and repeated prefixes. The latter
+counts all scoreable native positions, including prefix positions, and equals
+`usage.input_tokens - len(suffixes)`; it is not the normalization denominator.
 `usage.generated_tokens` is zero. These are not physical GPU-work counters.
 
 ### Batching and limits
 
-The handler tokenizes complete concatenations, deduplicates token sequences,
-and plans their common token prefix before dividing work into batches. With a
-useful common span and radix caching enabled, it scores the common prefix once,
+The handler fixes the prefix token sequence, appends option IDs, and deduplicates
+complete token sequences before dividing work into batches. With a
+useful prefix and radix caching enabled, it prefills the prefix once,
 then submits independent tails through the existing native batch API. Batches
 start as admission slots become available; a slow batch does not impose a wave
 barrier. Cache-disabled requests use bounded full-sequence batches.
@@ -150,7 +160,7 @@ has been benchmarked as part of this patch; see the validation report below.
 
 Errors use the existing flat error envelope: `object`, `message`, `type`, `param`,
 and numeric HTTP `code`. Stable types include `invalid_request`,
-`no_scoreable_tokens`, `too_many_options`, `token_budget_exceeded`,
+`no_prefix_tokens`, `no_option_tokens`, `no_scoreable_tokens`, `too_many_options`, `token_budget_exceeded`,
 `context_length_exceeded`, `unsupported_mode`, `tokenizer_unavailable`,
 `incomplete_scores`, `non_finite_scores`, `inference_error`, `overloaded`,
 `timeout`, and `model_changed`. Weight-update activity invalidates the whole

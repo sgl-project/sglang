@@ -15,8 +15,8 @@
     "/v1/rawsystemone": {
       "post": {
         "operationId": "scoreRawSystemOne",
-        "summary": "Score complete prefix-suffix candidates",
-        "description": "Concatenate prefix + suffix independently for each candidate, tokenize the complete text with the native tokenizer, and score every token except the first. Prefix tokens contribute to both the sum and denominator. Uses the already-loaded default model; no generation, streaming, model selection, or sampling parameters. Server limits apply to the number of options, each candidate's native context length, and total logical candidate tokens (default 1,048,576, including duplicates). Internal batching and concurrency are configured by the server.",
+        "summary": "Normalize conditional suffix likelihoods",
+        "description": "Tokenize the prefix once and append each option's tokens encoded with add_special_tokens=false. Prefill the fixed prefix before parallel option evaluation when cache reuse is useful. Compute each suffix's conditional log-probability sum, divide by its option token count, and apply softmax across the original options. Prefix token scores contribute to neither numerator nor denominator. Uses the already-loaded default model; no generation, streaming, model selection, or sampling parameters. Server limits apply to the number of options, each candidate's native context length, and total logical candidate tokens (default 1,048,576, including duplicates). Internal batching and concurrency are configured by the server.",
         "security": [
           {},
           {
@@ -54,26 +54,26 @@
                   "id": "rawsystemone-example",
                   "object": "rawsystemone",
                   "model": "served-model-name",
-                  "scoring": "mean_logprob_full_sequence",
-                  "tokenization": "native_text_v1",
+                  "scoring": "softmax_mean_suffix_logprob",
+                  "tokenization": "prefix_suffix_tokens_v1",
                   "data": [
                     {
                       "index": 0,
-                      "score": -1.8,
-                      "logprob_sum": -36.0,
-                      "scored_token_count": 20
+                      "score": 0.1863237232258476,
+                      "logprob_sum": -4.0,
+                      "option_token_count": 2
                     },
                     {
                       "index": 1,
-                      "score": -1.7,
-                      "logprob_sum": -34.0,
-                      "scored_token_count": 20
+                      "score": 0.3071958857184984,
+                      "logprob_sum": -3.0,
+                      "option_token_count": 2
                     },
                     {
                       "index": 2,
-                      "score": -1.5,
-                      "logprob_sum": -30.0,
-                      "scored_token_count": 20
+                      "score": 0.506480391055654,
+                      "logprob_sum": -2.0,
+                      "option_token_count": 2
                     }
                   ],
                   "best_index": 2,
@@ -97,7 +97,7 @@
             }
           },
           "400": {
-            "description": "Invalid fields, types, JSON, or Content-Type (invalid_request); unsupported serving configuration (unsupported_mode); or candidate limits (too_many_options, no_scoreable_tokens, context_length_exceeded, token_budget_exceeded). No candidate is silently truncated. Validation uses HTTP 400, not 422.",
+            "description": "Invalid fields, types, JSON, or Content-Type (invalid_request); unsupported serving configuration (unsupported_mode); or candidate limits (too_many_options, no_prefix_tokens, no_option_tokens, no_scoreable_tokens, context_length_exceeded, token_budget_exceeded). No candidate is silently truncated. Validation uses HTTP 400, not 422.",
             "content": {
               "application/json": {
                 "schema": {
@@ -178,7 +178,7 @@
           "prefix": {
             "title": "Prefix",
             "type": "string",
-            "description": "Text prepended exactly to every suffix, without inserted whitespace, separators, or chat templates. Empty strings are allowed."
+            "description": "Prompt text tokenized once using the native raw-text policy, without inserted whitespace or a chat template. The resulting prefix must contain at least one token; an empty string is valid only when the native tokenizer supplies a token such as BOS."
           },
           "suffixes": {
             "items": {
@@ -187,7 +187,7 @@
             "minItems": 1,
             "title": "Suffixes",
             "type": "array",
-            "description": "Ordered candidate suffixes. Duplicates and empty strings are allowed. Each complete prefix + suffix must have at least two native tokens. The server-configured option limit defaults to 128; it is not a fixed schema limit."
+            "description": "Ordered candidate suffixes. Duplicates are allowed. Each suffix must tokenize to at least one token without tokenizer-added special tokens. Each complete prefix + suffix must have at least two native tokens. The server-configured option limit defaults to 128; it is not a fixed schema limit."
           },
           "return_token_logprobs": {
             "default": false,
@@ -214,24 +214,26 @@
           "score": {
             "title": "Score",
             "type": "number",
-            "description": "logprob_sum / scored_token_count. Higher is better. This is not a calibrated probability that a candidate is correct.",
-            "format": "double"
+            "description": "Normalized weight: softmax(logprob_sum / option_token_count) across all original options, including duplicates. Weights sum to one within floating-point precision. This is not calibrated correctness confidence.",
+            "format": "double",
+            "minimum": 0,
+            "maximum": 1
           },
           "logprob_sum": {
             "title": "Logprob Sum",
             "type": "number",
-            "description": "Sum of all scoreable token log-probabilities in the complete candidate, including prefix tokens. Uses natural logarithms.",
+            "description": "Natural log P(suffix | prefix): sum of suffix-token log-probabilities. Equivalent to the complete sequence log-probability minus the fixed prefix log-probability; prefix token scores are excluded.",
             "format": "double"
           },
-          "scored_token_count": {
-            "title": "Scored Token Count",
+          "option_token_count": {
+            "title": "Option Token Count",
             "type": "integer",
-            "description": "Number of native tokens in the complete prefix + suffix minus one; only the first native token is excluded. This is the score denominator.",
+            "description": "Token count of this suffix encoded alone with add_special_tokens=false, preserving its exact whitespace. This is the score denominator, independent of prefix length and shared cache span.",
             "minimum": 1
           },
           "token_logprobs": {
             "title": "Token Logprobs",
-            "description": "Present only when return_token_logprobs is true. Contains scored_token_count + 1 records in absolute position order, including position zero.",
+            "description": "Present only when return_token_logprobs is true. Contains every token in the complete prefix + suffix in absolute position order, including position zero. Its length is not the score denominator.",
             "items": {
               "$ref": "#/components/schemas/TokenLogprob"
             },
@@ -243,7 +245,7 @@
           "index",
           "score",
           "logprob_sum",
-          "scored_token_count"
+          "option_token_count"
         ],
         "title": "CandidateScore",
         "type": "object"
@@ -301,13 +303,13 @@
           "input_tokens": {
             "title": "Input Tokens",
             "type": "integer",
-            "description": "Sum of (scored_token_count + 1) across all returned candidates.",
+            "description": "Total native tokens in all complete prefix + suffix sequences, including repeated prefixes and duplicate candidates.",
             "minimum": 2
           },
           "scored_tokens": {
             "title": "Scored Tokens",
             "type": "integer",
-            "description": "Sum of scored_token_count across all returned candidates.",
+            "description": "Total scoreable tokens in all complete sequences: input_tokens minus the number of candidates. This is not the sum of option_token_count.",
             "minimum": 1
           },
           "generated_tokens": {
@@ -345,18 +347,18 @@
             "description": "The already-loaded default model's served name."
           },
           "scoring": {
-            "const": "mean_logprob_full_sequence",
-            "default": "mean_logprob_full_sequence",
+            "const": "softmax_mean_suffix_logprob",
+            "default": "softmax_mean_suffix_logprob",
             "title": "Scoring",
             "type": "string",
-            "description": "Mean log-probability of the entire concatenated sequence, including prefix tokens and excluding only the first native token."
+            "description": "For each option, divide log P(suffix | prefix) by option_token_count, then apply a numerically stable softmax across all original options."
           },
           "tokenization": {
-            "const": "native_text_v1",
-            "default": "native_text_v1",
+            "const": "prefix_suffix_tokens_v1",
+            "default": "prefix_suffix_tokens_v1",
             "title": "Tokenization",
             "type": "string",
-            "description": "Native text tokenization of each complete prefix + suffix, including the native tokenizer's special-token behavior. Prefix and suffix are not tokenized separately."
+            "description": "Tokenize the prefix once with native raw-text special-token behavior, tokenize each suffix with add_special_tokens=false, and append the token IDs. This fixes the prefix boundary and can differ from tokenizing the concatenated text."
           },
           "data": {
             "items": {

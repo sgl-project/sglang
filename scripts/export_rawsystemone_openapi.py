@@ -5,6 +5,7 @@ Requires Python 3.10+ and Pydantic 2. Run from any working directory.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -20,9 +21,12 @@ OUTPUT = ROOT / "examples/runtime/rawsystemone.openapi.json"
 
 FIELD_DESCRIPTIONS = {
     "RawSystemOneRequest": {
-        "prefix": "Text prepended exactly to every suffix, without inserted whitespace, "
-        "separators, or chat templates. Empty strings are allowed.",
-        "suffixes": "Ordered candidate suffixes. Duplicates and empty strings are allowed. "
+        "prefix": "Prompt text tokenized once using the native raw-text policy, "
+        "without inserted whitespace or a chat template. The resulting prefix "
+        "must contain at least one token; an empty string is valid only when "
+        "the native tokenizer supplies a token such as BOS.",
+        "suffixes": "Ordered candidate suffixes. Duplicates are allowed. Each suffix "
+        "must tokenize to at least one token without tokenizer-added special tokens. "
         "Each complete prefix + suffix must have at least two native tokens. The "
         "server-configured option limit defaults to 128; it is not a fixed schema limit.",
         "return_token_logprobs": "Include complete native token records for every "
@@ -31,11 +35,12 @@ FIELD_DESCRIPTIONS = {
     "RawSystemOneResponse": {
         "id": "Server-generated request identifier.",
         "model": "The already-loaded default model's served name.",
-        "scoring": "Mean log-probability of the entire concatenated sequence, including "
-        "prefix tokens and excluding only the first native token.",
-        "tokenization": "Native text tokenization of each complete prefix + suffix, "
-        "including the native tokenizer's special-token behavior. Prefix and suffix "
-        "are not tokenized separately.",
+        "scoring": "For each option, divide log P(suffix | prefix) by option_token_count, "
+        "then apply a numerically stable softmax across all original options.",
+        "tokenization": "Tokenize the prefix once with native raw-text special-token "
+        "behavior, tokenize each suffix with add_special_tokens=false, and append "
+        "the token IDs. This fixes the prefix boundary and can differ from "
+        "tokenizing the concatenated text.",
         "data": "One result per original suffix, in input order, including duplicates.",
         "best_index": "Zero-based original index with the highest score. Exact ties "
         "select the first index; scores are not rounded before selection.",
@@ -44,14 +49,18 @@ FIELD_DESCRIPTIONS = {
     },
     "CandidateScore": {
         "index": "Zero-based index in the request's suffixes array.",
-        "score": "logprob_sum / scored_token_count. Higher is better. This is not a "
-        "calibrated probability that a candidate is correct.",
-        "logprob_sum": "Sum of all scoreable token log-probabilities in the complete "
-        "candidate, including prefix tokens. Uses natural logarithms.",
-        "scored_token_count": "Number of native tokens in the complete prefix + suffix "
-        "minus one; only the first native token is excluded. This is the score denominator.",
+        "score": "Normalized weight: softmax(logprob_sum / option_token_count) "
+        "across all original options, including duplicates. Weights sum to one "
+        "within floating-point precision. This is not calibrated correctness confidence.",
+        "logprob_sum": "Natural log P(suffix | prefix): sum of suffix-token "
+        "log-probabilities. Equivalent to the complete sequence log-probability "
+        "minus the fixed prefix log-probability; prefix token scores are excluded.",
+        "option_token_count": "Token count of this suffix encoded alone with "
+        "add_special_tokens=false, preserving its exact whitespace. This is the "
+        "score denominator, independent of prefix length and shared cache span.",
         "token_logprobs": "Present only when return_token_logprobs is true. Contains "
-        "scored_token_count + 1 records in absolute position order, including position zero.",
+        "every token in the complete prefix + suffix in absolute position order, "
+        "including position zero. Its length is not the score denominator.",
     },
     "TokenLogprob": {
         "position": "Zero-based absolute position in the complete native token sequence.",
@@ -61,8 +70,10 @@ FIELD_DESCRIPTIONS = {
         "a possible 0.0. This is not a raw logit.",
     },
     "Usage": {
-        "input_tokens": "Sum of (scored_token_count + 1) across all returned candidates.",
-        "scored_tokens": "Sum of scored_token_count across all returned candidates.",
+        "input_tokens": "Total native tokens in all complete prefix + suffix sequences, "
+        "including repeated prefixes and duplicate candidates.",
+        "scored_tokens": "Total scoreable tokens in all complete sequences: input_tokens "
+        "minus the number of candidates. This is not the sum of option_token_count.",
         "generated_tokens": "Always zero; the endpoint does not generate tokens.",
     },
 }
@@ -70,7 +81,7 @@ FIELD_DESCRIPTIONS = {
 ERROR_RESPONSES = {
     "400": "Invalid fields, types, JSON, or Content-Type (invalid_request); unsupported "
     "serving configuration (unsupported_mode); or candidate limits "
-    "(too_many_options, no_scoreable_tokens, context_length_exceeded, "
+    "(too_many_options, no_prefix_tokens, no_option_tokens, no_scoreable_tokens, context_length_exceeded, "
     "token_budget_exceeded). No candidate is silently truncated. Validation uses "
     "HTTP 400, not 422.",
     "409": "Model weights changed during scoring (model_changed). Retry the whole request.",
@@ -117,7 +128,7 @@ def build_schema():
     schemas["RawSystemOneResponse"]["properties"]["data"]["minItems"] = 1
     for name, fields in {
         "RawSystemOneResponse": {"best_index": 0},
-        "CandidateScore": {"index": 0, "scored_token_count": 1},
+        "CandidateScore": {"index": 0, "option_token_count": 1},
         "TokenLogprob": {"position": 0, "token_id": 0},
         "Usage": {"input_tokens": 2, "scored_tokens": 1},
     }.items():
@@ -125,6 +136,7 @@ def build_schema():
             schemas[name]["properties"][field]["minimum"] = minimum
     for field in ("score", "logprob_sum"):
         schemas["CandidateScore"]["properties"][field]["format"] = "double"
+    schemas["CandidateScore"]["properties"]["score"].update(minimum=0, maximum=1)
     for branch in schemas["TokenLogprob"]["properties"]["logprob"]["anyOf"]:
         if branch["type"] == "number":
             branch["format"] = "double"
@@ -164,17 +176,20 @@ def build_schema():
         "example": {"error": "Unauthorized"},
     }
 
+    example_sums = (-4.0, -3.0, -2.0)
+    example_weights = [math.exp(total / 2 + 1) for total in example_sums]
+    example_total = math.fsum(example_weights)
     success = RawSystemOneResponse(
         id="rawsystemone-example",
         model="served-model-name",
         data=[
             {
                 "index": index,
-                "score": total / 20,
+                "score": example_weights[index] / example_total,
                 "logprob_sum": total,
-                "scored_token_count": 20,
+                "option_token_count": 2,
             }
-            for index, total in enumerate((-36.0, -34.0, -30.0))
+            for index, total in enumerate(example_sums)
         ],
         best_index=2,
         usage={"input_tokens": 63, "scored_tokens": 60},
@@ -229,11 +244,14 @@ def build_schema():
             "/v1/rawsystemone": {
                 "post": {
                     "operationId": "scoreRawSystemOne",
-                    "summary": "Score complete prefix-suffix candidates",
-                    "description": "Concatenate prefix + suffix independently for each "
-                    "candidate, tokenize the complete text with the native tokenizer, "
-                    "and score every token except the first. Prefix tokens contribute "
-                    "to both the sum and denominator. Uses the already-loaded default "
+                    "summary": "Normalize conditional suffix likelihoods",
+                    "description": "Tokenize the prefix once and append each option's "
+                    "tokens encoded with add_special_tokens=false. Prefill the fixed "
+                    "prefix before parallel option evaluation when cache reuse is useful. "
+                    "Compute each suffix's conditional log-probability sum, divide by "
+                    "its option token count, and apply softmax across the original "
+                    "options. Prefix token scores contribute to neither numerator nor "
+                    "denominator. Uses the already-loaded default "
                     "model; no generation, streaming, model selection, or sampling "
                     "parameters. Server limits apply to the number of options, each "
                     "candidate's native context length, and total logical candidate "

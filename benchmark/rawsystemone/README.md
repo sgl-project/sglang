@@ -49,11 +49,13 @@ RAWSYSTEMONE_URL=http://127.0.0.1:30000 \
 ```
 
 The test loads a **test-only CPU** float32 teacher-forcing model with the same
-checkpoint/revision. The server's complete native token IDs must exactly equal
-the oracle tokenizer IDs, including special tokens. It computes full-vocabulary
+checkpoint/revision. The server's complete token IDs must exactly equal the
+oracle's native prefix IDs followed by suffix IDs encoded without added special
+tokens. It computes full-vocabulary
 `log_softmax(logits[t-1])[token[t]]`, without the service's prefix bookkeeping.
-It checks lexical merge boundaries, Unicode, whitespace, first-token coverage,
-unequal lengths, duplicates, candidate independence, permutation, split batches,
+It checks the fixed boundary, Unicode, whitespace, first-token coverage,
+unequal lengths, prefix subtraction, stable softmax, duplicates, independence of
+conditional sums, permutation, split batches,
 cache flushing, schema errors, and legacy generation/chat/score endpoints.
 Set `SGLANG_API_KEY` to test an authenticated server too.
 
@@ -112,7 +114,10 @@ split full-scoring batches with concurrency 1/2/4, and the optimized endpoint
 with its current **server-configured** batch/concurrency limits. Restart with
 optimized concurrency 1/2/4 and compare result files. Client-side reference
 concurrency flags do not reconfigure the endpoint. Every configuration checks
-scores against independent full-sequence results before reporting timing.
+weights against independently scored full token sequences, slicing out suffix
+targets before computing conditional means and softmax. Reference token IDs come
+from `/v1/tokenize` with the prefix/option special-token settings above. These
+tokenization calls are outside the reference timing loop.
 
 Output includes median/p95 HTTP latency, requests/candidates per second, logical
 tokens, maximum score differences, and matching per-request server diagnostics

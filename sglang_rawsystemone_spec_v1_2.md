@@ -2,24 +2,30 @@
 
 **Implementation specification for Codex · Version 1.2 · September 24, 2026**
 
-**Status:** Proposed change, not an implemented or benchmarked server feature.
+**Status:** Implemented on the feature branch with CPU contract tests; GPU parity and performance validation remain pending.
 
-**Revision 1.2:** Require parallel suffix evaluation. Small option sets use one native batch; large option sets use separate, bounded, concurrently submitted batches. Shared-prefix scores and the full-sequence scoring formula are unchanged. This replaces the previous candidate-anchor-first execution plan.
+**Revision 1.2:** Require parallel suffix evaluation. Small option sets use one native batch; large option sets use separate, bounded, concurrently submitted batches. This replaces the previous candidate-anchor-first execution plan.
+
+**API amendment · September 25, 2026:** Fix the prefix token boundary, score each suffix conditionally on that prefix, divide by the suffix token count, then apply softmax across the original options. This supersedes the original full-sequence mean and whole-text tokenization rules.
 
 ## 1. Implementation assignment
 
 Add the `rawsystemone` completion-scoring endpoint to the **existing SGLang HTTP server**, using its already-loaded causal language model and inference scheduler. Do not introduce a second server, an HTTP proxy back into SGLang, a second copy of the model, or any model training.
 
-The primitive accepts a string `prefix` and a nonempty list of string `suffixes`. For every suffix, independently evaluate the complete concatenation and return its mean token log-probability:
+The primitive accepts a string `prefix` and a nonempty list of string `suffixes`. Tokenize the prefix once using the native raw-text policy and each suffix separately without added special tokens. Append the token IDs, preserving the same prefix for every option:
 
 ```text
-score[i] = logprob_sum(tokenize(prefix + suffixes[i]))
-           / number_of_scored_tokens(tokenize(prefix + suffixes[i]))
+P = native_tokenize(prefix)
+S[i] = tokenize(suffixes[i], add_special_tokens=False)
+L[i] = log P_model(S[i] | P)
+     = log P_model(P + S[i]) - log P_model(P)
+x[i] = L[i] / len(S[i])
+score[i] = exp(x[i] - max(x)) / sum(exp(x[j] - max(x)) for j)
 ```
 
-**Both the sum and denominator include the entire prefix and the suffix.** This includes conversation/context text placed in `prefix`; the server must not silently treat any part of it as unscored conditioning context.
+**Only suffix tokens contribute to the sum and denominator.** The prefix supplies conditioning context and shared KV state. Compute `L[i]` directly from suffix-token log-probabilities to avoid cancellation error from subtracting large full-sequence sums. `score` is a relative weight over this option list, not calibrated correctness confidence.
 
-“Logit” in the original discussion means the actual token’s **log-probability after vocabulary-wide log-softmax**, not a raw logit. Preserve this distinction in code, field names, documentation, and tests.
+Token scores are **log-probabilities after vocabulary-wide log-softmax**, not raw model logits. The option-level softmax uses the conditional mean log-probabilities `x[i]` as its inputs.
 
 **Required execution:** prepare and score the shared token prefix once, then make independent suffix branches eligible for batched/parallel evaluation through the existing scheduler. When the option count or token volume is too large for one submission batch, split it into separate batches and submit multiple batches concurrently with bounded concurrency. Do not await each option, or each batch, in a serial loop. Actual GPU execution remains under the native scheduler; no extra process, model copy, or custom GPU batching engine is required. Section 6 defines the execution contract.
 
@@ -55,7 +61,7 @@ Use `GenerateReqInput` through the in-process manager rather than calling `http:
 - Proposed handler/service: `RawSystemOneService`; request/response schemas: `RawSystemOneRequest` and `RawSystemOneResponse`.
 - Response object discriminator: `rawsystemone`.
 
-“Raw” identifies the low-level `prefix` + `suffixes` likelihood-scoring primitive. The optional LLM-to-completion compiler remains outside this endpoint; the name does not imply Jev protocol compatibility. Version 1.1 established this naming. Version 1.2 changes execution to mandatory parallel/batched suffix evaluation, not the scoring semantics or compiler boundary.
+“Raw” identifies the low-level `prefix` + `suffixes` likelihood-scoring primitive. The optional LLM-to-completion compiler remains outside this endpoint; the name does not imply Jev protocol compatibility. Version 1.1 established this naming. Version 1.2 requires parallel/batched suffix evaluation; the September 25 amendment defines conditional suffix normalization with a fixed token boundary.
 
 ### Endpoint
 
@@ -85,8 +91,8 @@ Only `prefix` and `suffixes` are required. `return_token_logprobs` defaults to `
 Contract:
 
 - `prefix` is a strict string. `suffixes` is a nonempty list of strict strings. Do not coerce numbers, objects, or nulls into strings.
-- Concatenate exactly as supplied: no inserted whitespace, trimming, Unicode normalization by the handler, separators, role markers, chat template, answer marker, or added option list.
-- Empty prefixes and empty suffixes are permitted when the resulting token sequence has at least one scoreable token. Validate every complete candidate.
+- Preserve text exactly as supplied: no inserted whitespace, trimming, Unicode normalization by the handler, separators, role markers, chat template, answer marker, or added option list. Tokenize the prefix once and append separately encoded suffix IDs; do not re-tokenize the concatenated text.
+- Every suffix must encode to at least one token without added special tokens. Empty or zero-token options return `no_option_tokens`. The native prefix must contain at least one token to predict the first suffix token; an empty prefix is allowed only when native tokenization supplies a token such as BOS. Otherwise return `no_prefix_tokens`.
 - Duplicate suffixes are permitted. Return one result per original index; internal deduplication is allowed.
 - A one-option request is valid and must not require a separate prefix warm-up.
 - Reject unknown fields. In particular, do not silently accept `temperature`, `messages`, `context`, `label_token_ids`, arbitrary sampling parameters, or a different normalization rule.
@@ -105,12 +111,12 @@ The following values are **illustrative schema examples, not measured model outp
   "id": "rawsystemone-example",
   "object": "rawsystemone",
   "model": "served-model-name",
-  "scoring": "mean_logprob_full_sequence",
-  "tokenization": "native_text_v1",
+  "scoring": "softmax_mean_suffix_logprob",
+  "tokenization": "prefix_suffix_tokens_v1",
   "data": [
-    {"index": 0, "score": -1.8, "logprob_sum": -36.0, "scored_token_count": 20},
-    {"index": 1, "score": -1.7, "logprob_sum": -34.0, "scored_token_count": 20},
-    {"index": 2, "score": -1.5, "logprob_sum": -30.0, "scored_token_count": 20}
+    {"index": 0, "score": 0.1863237232258476, "logprob_sum": -4.0, "option_token_count": 2},
+    {"index": 1, "score": 0.3071958857184984, "logprob_sum": -3.0, "option_token_count": 2},
+    {"index": 2, "score": 0.506480391055654, "logprob_sum": -2.0, "option_token_count": 2}
   ],
   "best_index": 2,
   "usage": {
@@ -123,9 +129,9 @@ The following values are **illustrative schema examples, not measured model outp
 
 `data` retains input order. Higher `score` is better. `best_index` is the first original index attaining the maximum returned score; exact ties are not resolved through another model call. Do not round scores before ranking.
 
-`scored_token_count` is the sole per-candidate token count and the denominator of `score`. The complete native token count is always `scored_token_count + 1`, so it is not returned separately.
+`option_token_count` is the sole per-candidate token count and the denominator of the conditional mean `x[i]`. `logprob_sum` is `log P_model(S[i] | P)`. `score` is the softmax weight, in `[0, 1]`; weights sum to one within floating-point precision. Expand deduplicated inputs before normalizing: each original option, including duplicates, receives a weight. One option receives `1.0`.
 
-Usage fields are **logical candidate totals**, including duplicate candidates and repeated prefixes. They do not claim to measure actual GPU computation. Report physical cache/compute statistics separately through diagnostics or metrics.
+Usage fields are **logical candidate totals**, including duplicate candidates and repeated prefixes. `input_tokens` counts complete `P + S[i]` sequences; `scored_tokens` counts all native scoreable positions, including prefix positions, and equals `input_tokens - len(suffixes)`. It is not the sum of `option_token_count`. These counters do not measure actual GPU computation. Report physical cache/compute statistics separately through diagnostics or metrics.
 
 When token details are requested, each result additionally contains:
 
@@ -140,57 +146,63 @@ When token details are requested, each result additionally contains:
 
 Positions are absolute positions in that candidate's complete token sequence. Return all positions, including the unscored initial position. Token text is unnecessary. Do not echo the prefix or suffix by default.
 
-No softmax distribution is required. A future caller may compute normalized relative weights, but these must not be named calibrated confidence or change this score definition.
+The option-level softmax is required. It produces relative weights over the supplied list, not calibrated confidence or unconditional probabilities for the option strings. Adding an option changes the normalized weights, while each existing option's conditional log-probability sum and token count remain unchanged.
 
 ## 4. Exact mathematical and tokenization semantics
 
-For candidate `i`, obtain the complete token sequence using the same raw-text tokenizer behavior as the server's native text inference path:
+First freeze the prompt using the native raw-text tokenizer policy. For candidate `i`, append the suffix IDs without adding another BOS/EOS or applying a chat template:
 
 ```text
-x_i = native_tokenize(prefix + suffixes[i])
-n_i = len(x_i)
+P = native_tokenize(prefix)
+S_i = tokenize(suffixes[i], add_special_tokens=False)
+tokens_i = P + S_i
+K = len(P)
+N_i = len(S_i)
+n_i = K + N_i
 ```
 
-Do **not** assume:
+The fixed-boundary token sequence may differ from whole-text tokenization:
 
 ```text
-tokenize(prefix + suffix) == tokenize(prefix) + tokenize(suffix)
+native_tokenize(prefix + suffixes[i]) != P + S_i
 ```
 
-The native tokenizer may add configured special tokens. Preserve that existing policy consistently; do not manually add another BOS or EOS. No chat-template application is allowed. Document the actual tokenizer/checkpoint configuration used in tests. The existing manager's raw-text path uses the configured tokenizer directly. [S4]
+That difference is intentional: appending an option cannot change the last prefix token or its KV state. Preserve the native prefix's configured special tokens, and disable automatic special tokens only for the suffix encoding. Literal special-token strings in supplied text still follow the tokenizer's policy. Document the actual tokenizer/checkpoint configuration used in tests. The existing manager's raw-text path supplies the prefix IDs. [S4]
 
 For a standard causal model, position `t` is predicted from positions before `t`:
 
 ```text
-ell_i[t] = log_softmax(model_logits_at_position(t - 1))[x_i[t]]
+ell_i[t] = log_softmax(model_logits_at_position(t - 1))[tokens_i[t]]
            for t = 1, ..., n_i - 1
 
 ell_i[0] = null
 
-L_i = sum(ell_i[1:])
-N_i = n_i - 1
-score_i = L_i / N_i
+L_i = sum(ell_i[K:])
+    = log P_model(P + S_i) - log P_model(P)
+x_i = L_i / N_i
+score_i = exp(x_i - max(x)) / sum_j exp(x_j - max(x))
 ```
 
-Thus, “all tokens” means **all scoreable tokens in the native complete sequence**. The initial token has no earlier model position and is excluded from numerator and denominator. When the tokenizer inserts a leading BOS, it normally occupies that initial position, allowing the first text token to be scored. Any tokenizer-added token at a later position is included under this native policy; the handler must not selectively remove its score.
+The prefix must contain at least one token, so every suffix token has a predictor. Position zero is the only unscored native position and belongs to the prefix. Prefix scores may be retained in optional complete token records, but they contribute to neither `L_i` nor `N_i`. Compute the suffix sum directly rather than subtracting two large totals.
 
 Rules:
 
-- Require `N_i > 0`.
+- Require `K > 0` and `N_i > 0`.
 - `0.0` is a valid log-probability and counts in the denominator. Never filter using truthiness such as `if value`.
 - Apart from the expected initial null, missing token scores are errors, not permission to reduce the denominator.
 - Reject NaN or non-finite results with a typed inference error in version 1; do not clamp or silently omit them.
 - Use vocabulary-wide log-softmax at temperature 1, without top-k/top-p renormalization, penalties, logit bias, grammar constraints, or custom logit processors.
 - Accumulate returned token scores with `math.fsum` or equivalent stable float64 host accumulation. Do not change the inference model's precision merely to perform aggregation.
-- Count each token once. Overlapping boundary scores from internal calls are bookkeeping, not extra evidence.
+- Count each suffix token once. Overlapping boundary scores from internal calls are bookkeeping, not extra evidence.
+- Use the maximum-shifted softmax and stable summation. Very small relative weights may underflow to zero; the maximum option always contributes `exp(0) = 1`, preventing a zero denominator.
 
-For unequal candidate lengths, the prefix's contribution does not generally cancel after averaging. Preserve the requested formula anyway; do not “correct” it to suffix-only likelihood, joint log-likelihood without normalization, or a different statistical objective.
+Subtracting the prefix contribution must happen **before** length normalization. Dividing full-sequence sums by different option lengths would leave a different prefix term in each score and would not compute conditional suffix means.
 
 ## 5. Correctness-first reference implementation
 
 First implement a private reference path used by tests:
 
-1. Tokenize every complete concatenation using the canonical policy.
+1. Tokenize the prefix once with the native policy, encode each suffix without added special tokens, and append the token IDs.
 2. Submit each complete token sequence with input-token log-probabilities requested from the beginning and zero requested new tokens.
 3. Convert native results into absolute token-position records.
 4. Check position coverage and token IDs, then aggregate exactly as in Section 4.
@@ -219,21 +231,20 @@ The upstream native API documents the log-probability controls; the current fron
 
 ### 6.1 Plan sharing and batching in token space
 
-Batch-tokenize the **full concatenated strings**, then deduplicate identical complete token-ID sequences. Let `K` be the longest common token-prefix length of the unique sequences. Compute it across complete sequences, not from the separately tokenized prefix.
+Tokenize the prefix once and append separately encoded suffix IDs, then deduplicate identical complete token-ID sequences. Let `K = len(P)` be the fixed prefix boundary. This boundary does not depend on the set of candidate options.
 
-This is safe even when the shared token span extends into the textual suffixes. A suffix must never see a different candidate in its causal input. Use a deterministic internal ordering, such as sequence length followed by token-ID lexicographic order, for reproducible planning. Preserve a mapping back to every original index.
+Keep `K` fixed even when different suffixes start with identical tokens: those tokens still belong to each suffix's conditional score. A suffix must never see a different candidate in its causal input. Use a deterministic internal ordering, such as sequence length followed by token-ID lexicographic order, for reproducible planning. Preserve a mapping back to every original index.
 
 Plan the common span across the **entire request before partitioning it into submission batches**. All batches reuse the same request-local shared likelihood records. Do not independently prefill or score the same shared prefix for each submission batch.
 
 ### 6.2 Score the common prefix once, then release every branch
 
-For multiple distinct candidates and a useful shared span (`K > 1`), submit the common token-ID sequence `x_0[:K]` for input-logprob scoring with zero requested new tokens. This is a prefix-only operation, not the scoring of an arbitrarily selected candidate. Pass the existing token IDs directly; do not decode and re-tokenize them or insert special tokens again.
+For multiple distinct candidates and a useful shared span (`K > 1`), submit `P` for input-logprob scoring with zero requested new tokens. This is a prefix-only operation, not the scoring of an arbitrarily selected candidate. Pass the existing token IDs directly; do not decode and re-tokenize them or insert special tokens again.
 
-Retain the common token-position scores and their aggregate in request-local state:
+Retain the prefix token-position records for complete token diagnostics. Their sum is the term excluded from the candidate score:
 
 ```text
 L_shared = sum(prefix_logprobs[t] for 1 <= t < K)
-N_shared = K - 1
 ```
 
 After that shared operation completes and its results have been validated, all nonempty independent branch tails become eligible together for the bounded batch dispatcher in Section 6.5. **No branch depends on another candidate's score or completion.** In particular, do not wait for one full candidate's suffix before admitting the other suffixes.
@@ -245,9 +256,10 @@ first_new_target = K
 L_tail_i = sum(logprobs_i[t] for K <= t < n_i)
 N_tail_i = n_i - K
 
-L_i = L_shared + L_tail_i
-N_i = N_shared + N_tail_i    # equals n_i - 1
-score_i = L_i / N_i
+L_i = L_tail_i              # prefix contribution excluded
+N_i = N_tail_i              # equals len(S_i)
+x_i = L_i / N_i
+score_i = softmax(x)[i]     # after expanding duplicates to original indices
 ```
 
 Reuse the warmed KV cache where supported, and retain the shared likelihood values separately from KV state. Section 6.3 defines the predictor-boundary handling needed for the first tail token.
@@ -255,7 +267,7 @@ Reuse the warmed KV cache where supported, and retain the shared likelihood valu
 Special cases:
 
 - **One unique complete sequence:** score it once without a separate prefix-only call, then expand the result to duplicate original indices.
-- **A candidate ends at the common span:** its complete result comes from the shared records; no branch inference is needed.
+- **A zero-token option:** reject before prefill; every accepted candidate has a suffix tail.
 - **`K <= 1`, caching disabled, or unsupported span reuse:** skip unnecessary prefix warm-up and use the full-sequence reference fallback with native batching and concurrent batch submission. Do not silently switch to a serial option loop.
 
 The prefix-only phase is an explicit dependency needed for score/cache reuse. Parallelism applies to the independent branch phase. This revision replaces the earlier full-candidate-anchor-first plan.
@@ -301,7 +313,7 @@ Required behavior:
 2. **Bound each batch.** Add documented internal limits for candidate count and token volume. A proposed initial `max_candidates_per_batch` is **32**; it is a configurable starting point, not a measured optimum. Token budgets must fit the deployment's existing context/admission limits. Account for full logical inputs and potential cache-miss work, not only an optimistic cached-tail estimate.
 3. **Bound concurrency.** A proposed initial `max_inflight_batches_per_request` is **2**. Also enforce a server-wide bound/fair admission policy across parent requests, including a bound on outstanding candidate/token work. These settings must not let many concurrent HTTP requests each flood the scheduler. They are proposed internal configuration names, not existing SGLang flags.
 4. **Keep the dispatcher work-conserving.** As soon as any in-flight batch completes and admission permits, submit the next pending batch. Do not wait for every batch in a wave to finish. Do not implement `for batch in batches: await score_batch(batch)`, and do not use an unbounded gather over all options/batches.
-5. **Preserve independent scores.** Batch membership, execution order, and the number of other candidates must not change the scoring formula. Store results by stable candidate ID, expand duplicates, and restore original input order. Rank only after every required result is valid.
+5. **Preserve independent likelihoods.** Batch membership, execution order, and other options must not change an option's conditional sum or token count. Store results by stable candidate ID, expand duplicates, restore original input order, then apply softmax across the original option list. Adding options changes the normalized weights. Rank only after every required result is valid.
 6. **Keep one shared prefix state per parent request.** All batches reuse the same prefix-logprob records and, when available, the same native cache location. Splitting the list must not create a new prefix-scoring phase for each batch.
 7. **Handle large individual candidates.** A candidate over the preferred submission token target may run as a singleton batch only if it is within the hard context, token, and admission limits. Leave chunked prefill to the existing scheduler. Never split a suffix into independent texts or truncate it to make a batch fit.
 
@@ -327,9 +339,9 @@ On disconnect, timeout, cancellation, or any child/batch failure, stop dispatchi
 
 After the cached multi-token path passes all tests, add a fast path when every candidate is the same token prefix plus exactly one token.
 
-The desired computation is one shared-prefix evaluation, followed by gathering the candidate token log-probabilities from the same next-token distribution and combining them with `L_shared`.
+The desired computation is one shared-prefix evaluation, followed by gathering the candidate token log-probabilities from the same next-token distribution. These are the conditional suffix sums; do not add `L_shared`. Apply the required option-level softmax after expanding duplicate options.
 
-Crucially, each selected token must retain its **full-vocabulary** log-probability. Renormalizing only over the candidate token set changes the specified sequence score and is prohibited.
+Each selected token must first retain its **full-vocabulary** log-probability in `logprob_sum`. The final option-level softmax normalizes the conditional means; do not overwrite the underlying token log-probabilities with that option normalization.
 
 Use this optimization only when the checked-out backend exposes the required raw selected-token scores without an answer-generation loop. Otherwise retain the general cached path. Tokenizer-added trailing tokens, unequal residual lengths, or a boundary mismatch make the one-token optimization inapplicable.
 
@@ -382,10 +394,10 @@ Publish median and p95 latency, throughput, physical cache/compute measurements,
 
 ### A. Pure unit tests
 
-1. Exact concatenation, validation, nonempty option list, and rejection of unknown fields.
-2. Score aggregation includes prefix and suffix; unequal lengths use each candidate's actual denominator.
+1. Fixed prefix tokenization, exact suffix whitespace, nonempty token prefix/options, and rejection of unknown fields.
+2. Conditional suffix aggregation excludes prefix scores; unequal lengths use each suffix's token count, followed by a stable option-level softmax.
 3. A log-probability of `0.0` counts; only the expected initial null is excluded. Other missing or non-finite values fail.
-4. Token-prefix planning with duplicates, no shared span, one option, all-identical options, and a candidate that is a token prefix of another.
+4. Token-space deduplication with one option, all-identical options, short prefixes, and shared option text that must remain inside the suffix score.
 5. Return-order preservation and exact-tie policy.
 6. Mocked native results with boundary overlap, repeated token IDs, and chunked returns map to correct absolute positions.
 7. Cancellation and partial branch failure release every child request, batch slot, and admission lease, and stop queued batches.
@@ -400,10 +412,10 @@ Publish median and p95 latency, throughput, physical cache/compute measurements,
 1. **Reference equality:** each optimized candidate matches independent full-sequence scoring on the same server configuration.
 2. **Independent oracle:** a small supported unquantized checkpoint agrees with teacher-forced causal-model log-softmax calculations using identical token IDs and special-token policy.
 3. **Permutation invariance:** shuffling options preserves each candidate's score within numerical tolerance after mapping back. Exact ties may change `best_index` by the documented input-order rule.
-4. **Candidate-set independence:** scoring a candidate alone, beside duplicates, or beside additional distractors does not semantically change its score. Allow only established floating-point execution variation.
-5. **Tokenizer boundaries:** leading spaces, trailing spaces, punctuation, split words, newline joins, Unicode, and byte-level/multibyte cases. Include a verified case where separately encoding prefix and suffix differs from encoding their concatenation.
+4. **Candidate-set independence:** conditional `logprob_sum` and `option_token_count` remain unchanged beside duplicates or distractors, within established numerical tolerance. Final softmax weights change with the option list; a single option has weight `1.0` and all-identical options share weight equally.
+5. **Tokenizer boundaries:** leading spaces, trailing spaces, punctuation, split words, newline joins, Unicode, and byte-level/multibyte cases. Verify a case where whole-text tokenization differs and confirm that inference uses the fixed prefix IDs plus separately encoded suffix IDs.
 6. **First-token coverage:** BOS and no-BOS behavior, very short sequences, and the first differing suffix token are handled correctly.
-7. **Unequal lengths:** confirm that including the prefix produces the expected full-sequence average, not suffix-only normalization.
+7. **Unequal lengths:** confirm that the prefix contribution is excluded before division by suffix length and that all final weights sum to one within floating-point precision.
 8. **Caching:** cold, warm, disabled, and eviction scenarios return equivalent scores. Confirm that cache reuse really occurs in a supported optimized case.
 9. **Batching and concurrency:** compare sequential oracle, single native batch, and separate batches at concurrency 1, 2, and 4 where supported. Test large lists, mixed lengths, singleton batches, duplicate options, and options moved between batch boundaries. All candidate scores must match within the established tolerance.
 10. **Execution modes:** chunked prefill and supported tensor-parallel configurations. Test other modes before claiming support.
@@ -493,7 +505,7 @@ Code maps the returned result index back to the original option ID. The applicat
 
 ## 13. Definition of done
 
-The feature is complete when a caller can send only a prefix and suffix list to the existing SGLang server and obtain auditable full-sequence mean log-probabilities, with proven reference parity and shared-prefix reuse on supported configurations. Small option sets use native batching; large option sets are automatically split into bounded batches submitted concurrently under available admission capacity. The implementation must prove it does not serialize independent options/batches in the handler, and must restore all results to input order.
+The feature is complete when a caller can send only a prefix and suffix list to the existing SGLang server and obtain auditable conditional suffix log-probabilities and softmax weights over their token-length-normalized values, with fixed prefix tokenization, proven reference parity, and shared-prefix reuse on supported configurations. Small option sets use native batching; large option sets are automatically split into bounded batches submitted concurrently under available admission capacity. The implementation must prove it does not serialize independent options/batches in the handler, and must restore all results to input order.
 
 The implementation must remain correct with caching unavailable, must preserve candidate independence and original result order, and must make its token-count convention explicit. No second server, answer-generation protocol, or model training is needed to use the primitive.
 

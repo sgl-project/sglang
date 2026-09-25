@@ -15,8 +15,9 @@
 
 - Native `/v1/rawsystemone` in the existing authenticated HTTP server/lifespan;
   no Engine creation, loopback inference HTTP, extra model, or compiler call.
-- Strict schemas; exact concatenation and canonical manager batch tokenization;
-  full-prefix-plus-suffix mean log-probabilities, stable host summation, complete
+- Strict schemas; native prefix tokenization once and separately encoded options
+  without added special tokens; conditional suffix means followed by stable
+  softmax over original options, stable host summation, complete
   token-position auditing, ordered duplicates and first-index ties.
 - Entire-request validation against option, cumulative token, native context,
   and scheduler KV-pool limits before GPU work; no automatic truncation.
@@ -46,23 +47,24 @@
 
 Local results:
 
-- **32 CPU tests passed**, no skips, with
+- **37 CPU tests passed**, no skips, with
   `PYTHONPATH=/tmp/rawsystemone-tools python test/registered/unit/entrypoints/test_rawsystemone.py`.
   The temporary path contains msgspec and formatting tools; normal server
   environments already provide msgspec. Tests cover native sampling defaults,
   CLI declarations/runtime initialization, isolated HTTP routing, actual native
   manager batch dispatch and logprob assembly, and mocked composite lifecycle.
+  The September 25 amendment also covers fixed prefix boundaries, conditional
+  suffix sums, unequal option lengths, stable softmax, duplicate weights, and
+  zero-token prefix/option errors.
 - `python test/manual/test_rawsystemone.py`: **4 tests skipped** because no
   `RAWSYSTEMONE_URL` was supplied. This is discovery validation, not GPU parity.
 - Ruff 0.15.1 (`F401,F821,UP037` and format), isort 7.0.0, and Python 3.10 syntax
-  parsing passed for all 15 changed/new Python files. `git diff --check` passed.
+  parsing passed for the changed Python files. `git diff --check` passed.
 - Client and benchmark `--help` commands passed. A mocked HTTP smoke run exercised
-  five benchmark modes and score comparisons; its synthetic timings are not
+  six benchmark modes and score comparisons; its synthetic timings are not
   published as performance measurements.
-- Mintlify `validate` could not run: npm returned 404 for the CLI's published
-  dependency `@mintlify/auth-edge@0.0.51`. The offline `broken-links` attempt
-  also failed on that missing dependency. Documentation build/link validation
-  remains pending a working Mintlify installation.
+- Mintlify `validate` and `broken-links` passed after installing the CLI on
+  September 25. This supersedes the earlier dependency-installation failure.
 
 **Not run:** real server startup, GPU/native-model parity, independent
 teacher-forced model inference, authenticated live endpoint regressions,

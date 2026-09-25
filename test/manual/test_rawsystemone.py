@@ -88,7 +88,7 @@ class TestRawSystemOneLive(unittest.TestCase):
             json.dumps(
                 {
                     "maximum_per_token_difference": cls.max_token_diff,
-                    "maximum_mean_score_difference": cls.max_score_diff,
+                    "maximum_suffix_mean_difference": cls.max_score_diff,
                 }
             )
         )
@@ -100,17 +100,31 @@ class TestRawSystemOneLive(unittest.TestCase):
         return response.json()
 
     def score(self, prefix, suffixes):
-        return self.post(
+        result = self.post(
             "/v1/rawsystemone",
             dict(prefix=prefix, suffixes=suffixes, return_token_logprobs=True),
         )
+        self.assertEqual(result["scoring"], "softmax_mean_suffix_logprob")
+        self.assertEqual(result["tokenization"], "prefix_suffix_tokens_v1")
+        # Check normalization separately from the native/teacher-forced token
+        # likelihood comparisons below. Each original duplicate has weight.
+        logits = [c["logprob_sum"] / c["option_token_count"] for c in result["data"]]
+        weights = [math.exp(x - max(logits)) for x in logits]
+        for candidate, weight in zip(result["data"], weights):
+            self.assertAlmostEqual(candidate["score"], weight / math.fsum(weights))
+        self.assertAlmostEqual(math.fsum(c["score"] for c in result["data"]), 1.0)
+        return result
 
     def assert_candidate(self, prefix, suffix, candidate, oracle=True):
-        # Independent reference: native raw-text path, no prefix bookkeeping.
+        # Independent full-sequence reference over the fixed prefix/option IDs.
+        prefix_ids = self.tokenizer.encode(prefix)
+        option_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+        ids = prefix_ids + option_ids
+        boundary = len(prefix_ids)
         full = self.post(
             "/generate",
             {
-                "text": prefix + suffix,
+                "input_ids": ids,
                 "return_logprob": True,
                 "logprob_start_len": 0,
                 "return_text_in_logprobs": False,
@@ -127,7 +141,6 @@ class TestRawSystemOneLive(unittest.TestCase):
             },
         )
         rows = full["meta_info"]["input_token_logprobs"]
-        ids = self.tokenizer.encode(prefix + suffix)
         self.assertEqual([r[1] for r in rows], ids)
         self.assertEqual([r["token_id"] for r in candidate["token_logprobs"]], ids)
         self.assertEqual(
@@ -137,13 +150,16 @@ class TestRawSystemOneLive(unittest.TestCase):
         self.assertIsNone(candidate["token_logprobs"][0]["logprob"])
         native = [r[0] for r in rows[1:]]
         actual = [r["logprob"] for r in candidate["token_logprobs"][1:]]
-        self.assertEqual(candidate["scored_token_count"], len(ids) - 1)
-        self.assertEqual(candidate["logprob_sum"], math.fsum(actual))
-        self.assertEqual(candidate["score"], math.fsum(actual) / len(actual))
+        actual_suffix = actual[boundary - 1 :]
+        native_suffix = native[boundary - 1 :]
+        self.assertEqual(candidate["option_token_count"], len(option_ids))
+        self.assertEqual(candidate["logprob_sum"], math.fsum(actual_suffix))
+        suffix_mean = candidate["logprob_sum"] / len(option_ids)
         for a, b in zip(actual, native):
             self.assertLessEqual(abs(a - b), SAME_BACKEND_ATOL)
         self.assertLessEqual(
-            abs(candidate["score"] - math.fsum(native) / len(native)), SAME_BACKEND_ATOL
+            abs(suffix_mean - math.fsum(native_suffix) / len(option_ids)),
+            SAME_BACKEND_ATOL,
         )
         if oracle:
             tensor = self.torch.tensor([ids])
@@ -156,7 +172,10 @@ class TestRawSystemOneLive(unittest.TestCase):
                     .tolist()
                 )
             error = max(abs(a - b) for a, b in zip(actual, expected))
-            score_error = abs(candidate["score"] - math.fsum(expected) / len(expected))
+            expected_suffix = expected[boundary - 1 :]
+            score_error = abs(
+                suffix_mean - math.fsum(expected_suffix) / len(option_ids)
+            )
             type(self).max_token_diff = max(self.max_token_diff, error)
             type(self).max_score_diff = max(self.max_score_diff, score_error)
             self.assertLessEqual(
@@ -175,9 +194,10 @@ class TestRawSystemOneLive(unittest.TestCase):
             ("inter", ["national", "pretation", "nal", "national"]),
             ("hello ", ["world", " world", "\nworld", "λ🙂 café"]),
             ("line\n", ["next", "\nnext", "next! "]),
-            ("The cat sat", ["", " down."]),
-            ("", ["The cat sat.", "café🙂"]),
+            ("The cat sat", [" down.", " still."]),
         ]
+        if self.tokenizer.encode(""):
+            cases.append(("", ["The cat sat.", "café🙂"]))
         merge_seen = False
         for prefix, suffixes in cases:
             result = self.score(prefix, suffixes)
@@ -207,8 +227,13 @@ class TestRawSystemOneLive(unittest.TestCase):
         self.assertEqual(one["data"][-1]["score"], one["data"][-2]["score"])
         for index in (0, 31, 32, 41):
             alone = self.score(prefix, [suffixes[index]])["data"][0]
+            self.assertEqual(alone["score"], 1.0)
             self.assertLessEqual(
-                abs(alone["score"] - one["data"][index]["score"]), SAME_BACKEND_ATOL
+                abs(alone["logprob_sum"] - one["data"][index]["logprob_sum"]),
+                SAME_BACKEND_ATOL * alone["option_token_count"],
+            )
+            self.assertEqual(
+                alone["option_token_count"], one["data"][index]["option_token_count"]
             )
             self.assert_candidate(
                 prefix, suffixes[index], one["data"][index], oracle=False
@@ -238,6 +263,21 @@ class TestRawSystemOneLive(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.json()["type"], "invalid_request")
             self.assertNotIn("secret", response.text)
+        for prefix, suffixes, code in [
+            ("A prompt", [""], "no_option_tokens"),
+            *(
+                []
+                if self.tokenizer.encode("")
+                else [("", ["text"], "no_prefix_tokens")]
+            ),
+        ]:
+            response = self.session.post(
+                URL + "/v1/rawsystemone",
+                json=dict(prefix=prefix, suffixes=suffixes),
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["type"], code)
         if self.key:
             import requests
 
