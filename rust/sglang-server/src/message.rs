@@ -10,5 +10,4 @@ pub mod io_struct;
 pub mod multimodal;
 pub mod request;
 pub mod response;
-pub mod sampling;
 pub mod types;

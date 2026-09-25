@@ -21,7 +21,6 @@ mod postprocessing;
 mod preprocessing;
 #[cfg(feature = "http")]
 mod runtime;
-mod types;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub(crate) use engine::{
@@ -39,8 +38,8 @@ pub use postprocessing::{
 pub(crate) use preprocessing::ChatFormatter;
 pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{
-    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
-    TextTokenizer, load_tokenizer,
+    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, TextTokenizer,
+    load_tokenizer,
 };
 pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
@@ -48,4 +47,8 @@ pub use preprocessing::{
 };
 #[cfg(feature = "http")]
 pub use runtime::{RendererRuntimeConfig, serve};
-pub use types::{OneOrMany, TokenIds};
+// Shared DTOs live in sglang-types; re-exported at the root so the renderer's
+// public API and all internal `crate::…` imports keep a single path.
+pub use sglang_types::{
+    CustomParamValue, JsonScalar, OneOrMany, OneOrManyItem, RegexPattern, SamplingParams, TokenIds,
+};

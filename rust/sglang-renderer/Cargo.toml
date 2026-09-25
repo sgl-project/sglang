@@ -26,6 +26,7 @@ required-features = ["http"]
 async-stream = { workspace = true }
 flume = "0.12.0"
 futures = { workspace = true }
+sglang-types = { path = "../sglang-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -42,7 +43,6 @@ dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 hf-hub = { version = "0.4", default-features = false }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
-regex-syntax = "=0.8.11"
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
 dynamo-tokenizers = "1.7.0"

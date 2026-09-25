@@ -7,10 +7,61 @@ use bytes::Bytes;
 use serde::Serialize;
 
 use super::request::GenerateRequest;
-use super::sampling::SamplingParams;
 use super::types::TokenIds;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
+use sglang_types::SamplingParams;
+
+/// Borrow shared parameters while encoding Python's positional sampling schema.
+#[derive(Debug)]
+pub(super) struct SchedulerSamplingParams<'a>(pub &'a SamplingParams);
+
+impl Serialize for SchedulerSamplingParams<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let params = self.0;
+        // Keep this order aligned with sampling_params.py, independently of the
+        // renderer's field declaration order. Every slot, including nil, is required.
+        let mut state = serializer.serialize_struct("SamplingParams", 32)?;
+        state.serialize_field("max_new_tokens", &params.max_new_tokens)?;
+        state.serialize_field("stop", &params.stop)?;
+        state.serialize_field("stop_token_ids", &params.stop_token_ids)?;
+        state.serialize_field("stop_regex", &params.stop_regex)?;
+        state.serialize_field("temperature", &params.temperature)?;
+        state.serialize_field("top_p", &params.top_p)?;
+        state.serialize_field("top_k", &params.top_k)?;
+        state.serialize_field("min_p", &params.min_p)?;
+        state.serialize_field("frequency_penalty", &params.frequency_penalty)?;
+        state.serialize_field("presence_penalty", &params.presence_penalty)?;
+        state.serialize_field("repetition_penalty", &params.repetition_penalty)?;
+        state.serialize_field("min_new_tokens", &params.min_new_tokens)?;
+        state.serialize_field("n", &params.n)?;
+        state.serialize_field("beam_width", &params.beam_width)?;
+        state.serialize_field("json_schema", &params.json_schema)?;
+        state.serialize_field("regex", &params.regex)?;
+        state.serialize_field("ebnf", &params.ebnf)?;
+        state.serialize_field("structural_tag", &params.structural_tag)?;
+        state.serialize_field("ignore_eos", &params.ignore_eos)?;
+        state.serialize_field("skip_special_tokens", &params.skip_special_tokens)?;
+        state.serialize_field(
+            "spaces_between_special_tokens",
+            &params.spaces_between_special_tokens,
+        )?;
+        state.serialize_field("no_stop_trim", &params.no_stop_trim)?;
+        state.serialize_field("stream_interval", &params.stream_interval)?;
+        state.serialize_field("logit_bias", &params.logit_bias)?;
+        state.serialize_field("sampling_seed", &params.sampling_seed)?;
+        state.serialize_field("custom_params", &params.custom_params)?;
+        state.serialize_field("stop_strs", &params.stop_strs)?;
+        state.serialize_field("stop_regex_strs", &params.stop_regex_strs)?;
+        state.serialize_field("stop_str_max_len", &params.stop_str_max_len)?;
+        state.serialize_field("stop_regex_max_len", &params.stop_regex_max_len)?;
+        state.serialize_field("is_normalized", &params.is_normalized)?;
+        state.serialize_field("ebnf_full_assistant", &params.ebnf_full_assistant)?;
+        state.end()
+    }
+}
 
 wire_struct! {
     /// The scheduler's `TokenizedGenerateReqInput`. Keep in lockstep with the
@@ -23,7 +74,7 @@ wire_struct! {
         input_embeds: (),
         mm_inputs: (),
         token_type_ids: (),
-        sampling_params: &'a SamplingParams,
+        sampling_params: SchedulerSamplingParams<'a>,
         return_logprob: bool,
         logprob_start_len: i64,
         top_logprobs_num: i64,
@@ -90,7 +141,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             input_embeds: (),
             mm_inputs: (),
             token_type_ids: (),
-            sampling_params: &req.sampling_params,
+            sampling_params: SchedulerSamplingParams(&req.sampling_params),
             return_logprob: req.return_logprob,
             logprob_start_len: req.logprob_start_len,
             top_logprobs_num: req.top_logprobs_num,
@@ -138,6 +189,71 @@ impl AbortReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_wire_is_positional_and_complete() {
+        use sglang_types::CustomParamValue;
+        use std::collections::BTreeMap;
+
+        let params = SamplingParams {
+            max_new_tokens: Some(11),
+            stop: None,
+            stop_token_ids: Some(vec![12]),
+            stop_regex: None,
+            temperature: 0.13,
+            top_p: 0.14,
+            top_k: 15,
+            min_p: 0.16,
+            frequency_penalty: 0.17,
+            presence_penalty: 0.18,
+            repetition_penalty: 0.19,
+            min_new_tokens: 20,
+            n: 1,
+            beam_width: Some(21),
+            json_schema: Some("22".into()),
+            regex: Some("23".into()),
+            ebnf: Some("24".into()),
+            structural_tag: Some("25".into()),
+            ignore_eos: true,
+            skip_special_tokens: false,
+            spaces_between_special_tokens: true,
+            no_stop_trim: false,
+            stream_interval: Some(30),
+            logit_bias: Some(BTreeMap::from([("7".into(), 0.4)])),
+            sampling_seed: Some(31),
+            custom_params: Some(BTreeMap::from([(
+                "key".into(),
+                CustomParamValue::Signed(32),
+            )])),
+            stop_strs: vec!["END".into()],
+            stop_regex_strs: vec!["STOP".into()],
+            stop_str_max_len: 3,
+            stop_regex_max_len: 4,
+            is_normalized: true,
+            ebnf_full_assistant: false,
+        };
+        // Literal Python declaration order, independent of the Rust serializer.
+        let expected = serde_json::json!([
+            11, null, [12], null, 0.13, 0.14, 15, 0.16, 0.17, 0.18, 0.19,
+            20, 1, 21, "22", "23", "24", "25", true, false, true, false,
+            30, {"7": 0.4}, 31, {"key": 32}, ["END"], ["STOP"], 3, 4, true, false
+        ]);
+        let bytes = rmp_serde::to_vec(&SchedulerSamplingParams(&params)).unwrap();
+        let actual: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(actual, expected);
+
+        // Unset optionals keep their slots, including an unlimited output cap.
+        let params = SamplingParams {
+            max_new_tokens: None,
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec(&SchedulerSamplingParams(&params)).unwrap();
+        let actual: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(actual.as_array().unwrap().len(), 32);
+        for index in [0, 1, 2, 3, 13, 14, 15, 16, 17, 22, 23, 24, 25] {
+            assert!(actual[index].is_null(), "slot {index}");
+        }
+    }
 
     #[test]
     fn abort_req_msgpack_shape() {

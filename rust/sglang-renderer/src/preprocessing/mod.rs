@@ -1,9 +1,7 @@
 //! Request processing from protocol-neutral inputs to token-only generation requests.
 
 mod chat;
-mod regex;
 mod request;
-mod sampling;
 mod service;
 mod template;
 mod tokenizer;
@@ -15,7 +13,6 @@ pub use request::{
     TextRequest, TokenIdsRequest,
 };
 pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
-pub use sampling::SamplingParams;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
 #[cfg(test)]

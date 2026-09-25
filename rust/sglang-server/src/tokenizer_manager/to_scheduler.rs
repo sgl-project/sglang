@@ -193,7 +193,12 @@ impl Intake {
                         match g
                             .sampling_params
                             .normalize(self.limits.skip_tokenizer_init, self.limits.vocab_size)
-                        {
+                            // `normalize` can only fail validation (the leaf error
+                            // type has no other variant), so every error maps
+                            // to a 400 with the same message as before.
+                            .map_err(|sglang_types::ValidationError::Validation(message)| {
+                                Error::Validation(message)
+                            }) {
                             Err(e) => Err(e),
                             // The Rust MM pipeline produces the final input_ids,
                             // so it wins even over a pre-tokenized prompt (which

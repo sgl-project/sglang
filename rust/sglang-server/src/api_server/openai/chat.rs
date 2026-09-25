@@ -42,8 +42,8 @@ use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkExtras, ResponseItem};
-use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use sglang_types::SamplingParams;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))

@@ -3739,12 +3739,12 @@ dependencies = [
  "futures",
  "hf-hub",
  "minijinja",
- "regex-syntax",
  "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
+ "sglang-types",
  "thiserror",
  "tokio",
  "tower 0.5.3",
@@ -3775,12 +3775,13 @@ dependencies = [
  "minijinja",
  "numpy",
  "pyo3",
- "regex-syntax",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
  "sglang-mm",
+ "sglang-renderer",
+ "sglang-types",
  "socket2 0.6.5",
  "thiserror",
  "tokio",
@@ -3789,6 +3790,16 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sglang-types"
+version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

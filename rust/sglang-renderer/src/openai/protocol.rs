@@ -13,8 +13,9 @@ use serde_json::Value;
 
 use crate::preprocessing::{GenerateRequestIdentity, TextRequestGroup};
 use crate::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
-    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds, TokenIdsRequest,
+    ChatRequest, CustomParamValue, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    ReasoningEffort, RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds,
+    TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -39,6 +40,9 @@ fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), Stri
     ))
 }
 
+/// SGLang-owned sampling fields that extend the OpenAI chat and completion
+/// request schemas. Keeping these outside Dynamo's DTO prevents dependency
+/// omissions from silently changing SGLang request behavior.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub(crate) struct SamplingParamsOverrides {
     #[serde(default)]
@@ -64,7 +68,7 @@ pub(crate) struct SamplingParamsOverrides {
     #[serde(default)]
     pub skip_special_tokens: Option<bool>,
     #[serde(default)]
-    pub custom_params: Option<serde_json::Value>,
+    pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
 }
 
 impl SamplingParamsOverrides {
@@ -387,7 +391,7 @@ impl RequestExtensions {
     }
 }
 
-fn expand_per_prompt<T: Clone>(
+fn expand_per_prompt<T: crate::OneOrManyItem + Clone>(
     name: &str,
     value: Option<OneOrMany<T>>,
     prompt_count: usize,
@@ -888,7 +892,10 @@ mod tests {
         assert!(!params.skip_special_tokens);
         assert_eq!(
             params.custom_params,
-            Some(serde_json::json!({"tenant": "a"}))
+            Some(BTreeMap::from([(
+                "tenant".into(),
+                CustomParamValue::String("a".into())
+            )]))
         );
     }
 

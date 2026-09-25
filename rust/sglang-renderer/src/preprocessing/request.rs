@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use dynamo_renderer::RenderedPrompt;
 use serde::{Deserialize, Serialize};
 
-use crate::{SamplingParams, TokenIds};
+use crate::{CustomParamValue, SamplingParams, TokenIds};
 
 /// Request-scoped metadata that must survive protocol lowering and prompt
 /// tokenization before the request is submitted to SGLang `/generate`.
@@ -246,7 +246,7 @@ pub struct GenerateSamplingParams {
     pub stream_interval: Option<i64>,
     pub logit_bias: Option<BTreeMap<String, f64>>,
     pub sampling_seed: Option<i64>,
-    pub custom_params: Option<serde_json::Value>,
+    pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
 }
 
 impl From<SamplingParams> for GenerateSamplingParams {

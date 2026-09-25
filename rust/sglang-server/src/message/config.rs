@@ -289,21 +289,28 @@ impl Default for ServerArgs {
     }
 }
 
-/// `--preferred-sampling-params`, carried verbatim: `/get_model_info` echoes
-/// whatever Python advertises, and the keys are whatever `SamplingParams`
-/// accepts, so there is no fixed field list to model as a `#[pyclass]`.
+/// Typed `--preferred-sampling-params`, parsed once at startup. Serialization
+/// preserves omitted keys and explicit nulls for `/get_model_info`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(transparent)]
-pub struct PreferredSamplingParams(pub serde_json::Value);
+pub struct PreferredSamplingParams(pub super::request::GenerateSamplingParams);
+
+impl PreferredSamplingParams {
+    fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        // Require an object rather than accepting serde's positional struct form.
+        let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)?;
+        serde_json::from_value(serde_json::Value::Object(fields)).map(Self)
+    }
+}
 
 impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     type Error = pyo3::PyErr;
 
     fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
         let text = obj.extract::<String>()?;
-        serde_json::from_str(&text).map(Self).map_err(|e| {
+        Self::from_json(&text).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "preferred_sampling_params is not valid JSON: {e}"
+                "invalid preferred_sampling_params: {e}"
             ))
         })
     }
@@ -549,10 +556,6 @@ impl ServerArgs {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
-        if let Some(preferred) = &self.preferred_sampling_params {
-            super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
-                .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
-        }
         Ok(())
     }
 
@@ -654,6 +657,26 @@ mod tests {
             ..Default::default()
         };
         assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn preferred_sampling_requires_a_valid_sampling_object() {
+        for (value, valid) in [
+            (
+                serde_json::json!({"temperature": null, "max_new_tokens": null}),
+                true,
+            ),
+            (serde_json::json!(null), false),
+            (serde_json::json!([{}]), false),
+            (serde_json::json!({"temperature": "bad"}), false),
+            (serde_json::json!({"unknown_sampling_field": 1}), false),
+        ] {
+            let parsed = PreferredSamplingParams::from_json(&value.to_string());
+            assert_eq!(parsed.is_ok(), valid, "{value}");
+            if let Ok(parsed) = parsed {
+                assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+            }
+        }
     }
 
     /// `--log-level-http` overrides `--log-level` for the access log; unset or
