@@ -1670,6 +1670,46 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 config=self.config,
             )
 
+        self._fold_attention_value_scale_into_o_proj()
+
+    def _fold_attention_value_scale_into_o_proj(self) -> None:
+        """Fold ``attention_value_scale`` into the o_proj weights.
+
+        Attention is linear in V: ``softmax(qk) @ (s*V) == s * (softmax(qk) @ V)``,
+        so scaling every o_proj weight by s reproduces the runtime
+        ``v = v * v_scale`` exactly while removing one Muls kernel per layer on
+        the NPU decode path. Only applies to floating-point (unquantized)
+        o_proj weights; quantized ones keep the runtime multiply. KV caches
+        then hold unscaled V, which stays self-consistent because every
+        consumer of V goes through this layer's (folded) o_proj.
+        """
+        v_scale = getattr(self.config, "attention_value_scale", None)
+        if v_scale is None:
+            return
+        folded = skipped = 0
+        for layer in self.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or getattr(attn, "v_scale", None) is None:
+                continue
+            weight = attn.o_proj.weight
+            if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                weight.data.mul_(v_scale)
+                attn.v_scale = None
+                folded += 1
+            else:
+                skipped += 1
+        if folded:
+            logger.info(
+                f"Folded attention_value_scale={v_scale} into {folded} o_proj "
+                "weight(s); runtime V scaling disabled for them."
+            )
+        if skipped:
+            logger.warning(
+                f"attention_value_scale={v_scale} kept as runtime multiply for "
+                f"{skipped} layer(s) with non-fp16/bf16/fp32 o_proj (cannot "
+                "fold into quantized weights)."
+            )
+
     def get_embed_and_head(self):
         assert self.model is not None and self.lm_head is not None, (
             "get_embed_and_head() is not available in encoder_only mode"
