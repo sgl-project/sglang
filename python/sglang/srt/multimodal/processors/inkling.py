@@ -52,7 +52,7 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS, download_remote_media
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +78,18 @@ def _resolve_media_item(item):
         url = getattr(item, "url")
     if not isinstance(url, str):
         return item
-    if url.startswith("data:"):
-        header, _, payload = url.partition(",")
-        return base64.b64decode(payload) if ";base64" in header else payload.encode()
-    if url.startswith(("http://", "https://")):
-        return download_remote_media(url, timeout=30)
+    if not url:
+        raise ValueError("empty image_url")
+    try:
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            return (
+                base64.b64decode(payload) if ";base64" in header else payload.encode()
+            )
+        if url.startswith(("http://", "https://")):
+            return download_remote_media(url, timeout=30)
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        raise ValueError(f"Error while resolving media {url!r}: {e}") from e
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 
