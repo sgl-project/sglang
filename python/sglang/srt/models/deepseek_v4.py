@@ -3296,6 +3296,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         stats_stream: Optional[torch.cuda.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if stats_stream is None:
+            return DeepseekV4DecoderLayer._hc_mix_stats_impl(
+                self, x, hc_fn, hc_scale, hc_base
+            )
+        main_stream = torch.cuda.current_stream()
+        x.record_stream(stats_stream)
+        with torch.cuda.stream(stats_stream):
+            coefficients = DeepseekV4DecoderLayer._hc_mix_stats_impl(
+                self, x, hc_fn, hc_scale, hc_base
+            )
+        # The producer fork is in _hc_combine; consumers join before hc_post.
+        for coefficient in coefficients:
+            coefficient.record_stream(main_stream)
+        return coefficients
+
+    def _hc_mix_stats_impl(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.layernorm.mhc import hc_mix_stats, hc_mix_stats_sinkhorn
 
         x_flat = x.flatten(1)
@@ -3337,59 +3359,47 @@ class DeepseekV4DecoderLayer(nn.Module):
             and x.dtype == torch.bfloat16
         ):
             # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
-            main_stream = torch.cuda.current_stream()
-            if stats_stream is not None:
-                x.record_stream(stats_stream)
-            with (
-                torch.cuda.stream(stats_stream)
-                if stats_stream is not None
-                else nullcontext()
+            if bf16_parts is not None and (
+                hopper_medium or 4096 <= x_flat.shape[0] <= 65536
             ):
-                if bf16_parts is not None and (
-                    hopper_medium or 4096 <= x_flat.shape[0] <= 65536
-                ):
-                    from sglang.kernels.ops.layernorm.mhc import (
-                        hc_mix_stats_sinkhorn_bf16x3,
-                    )
+                from sglang.kernels.ops.layernorm.mhc import (
+                    hc_mix_stats_sinkhorn_bf16x3,
+                )
 
-                    pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
-                        x_flat,
-                        bf16_parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                elif parts is not None:
-                    from sglang.kernels.ops.layernorm.mhc import (
-                        hc_mix_stats_sinkhorn_deepgemm,
-                    )
+                pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
+                    x_flat,
+                    bf16_parts,
+                    hc_scale,
+                    hc_base,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            elif parts is not None:
+                from sglang.kernels.ops.layernorm.mhc import (
+                    hc_mix_stats_sinkhorn_deepgemm,
+                )
 
-                    pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
-                        x_flat,
-                        parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                else:
-                    pre, post, comb = hc_mix_stats_sinkhorn(
-                        x_flat,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        self.hc_mult,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-            if stats_stream is not None:
-                # Allocated on the side stream, read on the main stream after the join.
-                for coefficient in (pre, post, comb):
-                    coefficient.record_stream(main_stream)
+                pre, post, comb = hc_mix_stats_sinkhorn_deepgemm(
+                    x_flat,
+                    parts,
+                    hc_scale,
+                    hc_base,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            else:
+                pre, post, comb = hc_mix_stats_sinkhorn(
+                    x_flat,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.hc_mult,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
             return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # cuBLAS/torch reductions can change order with num_tokens; this kernel
@@ -3462,7 +3472,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                     and hidden_states.shape[0] > 0
                 )
             )
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            and (
+                not get_platform().is_sm90
+                or hidden_states.shape[0] == 1
+                or (
+                    self.config.model_type == "deepseek_v41"
+                    and forward_batch.forward_mode.is_decode()
+                    and 1 < hidden_states.shape[0] <= 64
+                )
+            )
             else None
         )
 

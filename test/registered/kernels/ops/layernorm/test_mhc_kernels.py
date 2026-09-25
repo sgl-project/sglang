@@ -279,6 +279,66 @@ def test_hopper_combine_norm(num_tokens):
     torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=1e-5)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 64])
+def test_hopper_mhc_stats_stream_graph(num_tokens):
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import is_sm90_supported
+
+    if not is_sm90_supported():
+        pytest.skip("Hopper mHC overlap")
+    torch.manual_seed(934 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    pre = torch.rand(num_tokens, 4, device="cuda")
+    norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
+    layer = SimpleNamespace(
+        input_layernorm=norm,
+        post_attention_layernorm=norm,
+        config=SimpleNamespace(model_type="deepseek_v41"),
+        hc_pre_from_prev_sublayer=True,
+        hc_attn_fn=w,
+        hc_ffn_fn=-w,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_stats_stream=torch.cuda.Stream(),
+    )
+    DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+    stream = DeepseekV4DecoderLayer._get_hc_stats_stream(
+        layer, x, SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    )
+    assert stream is layer.hc_stats_stream
+
+    def run(stats_stream):
+        combined = DeepseekV4DecoderLayer._hc_combine(layer, x, pre, norm, stats_stream)
+        coefficients = DeepseekV4DecoderLayer._hc_mix_stats(
+            layer, x, w, scale, base, stats_stream
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        # Read on the consumer stream after the join, as hc_post does.
+        return combined.clone(), *(v.clone() for v in coefficients)
+
+    run(None)
+    run(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run(stream)
+    for _ in range(3):
+        x.normal_()
+        pre.uniform_()
+        expected = run(None)
+        graph.replay()
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
