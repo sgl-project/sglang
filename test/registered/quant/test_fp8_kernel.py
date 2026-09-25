@@ -2,10 +2,8 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    w8a8_block_fp8_matmul,
-)
+from sglang.kernels.ops.gemm.fp8_kernel import w8a8_block_fp8_matmul
+from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
