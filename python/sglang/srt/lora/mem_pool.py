@@ -925,6 +925,24 @@ class LoRAMemoryPool:
             self.get_lora_B_shape,
         )
 
+        for layer_idx in range(self.num_layer):
+            fused_moe = self._get_fused_shared_moe(base_model, layer_idx)
+            if fused_moe is None:
+                continue
+            num_experts = (
+                fused_moe.num_local_experts
+                if self.moe_use_local_expert_ids
+                else fused_moe.num_experts
+            )
+            for buffers in (self.A_buffer, self.B_buffer):
+                for name, layers in buffers.items():
+                    if self.is_moe_module(name) and not self.is_shared_moe_module(name):
+                        assert layers[layer_idx].shape[1] == num_experts, (
+                            f"layer {layer_idx} {name}: LoRA pool has "
+                            f"{layers[layer_idx].shape[1]} experts, "
+                            f"but fused MoE requires {num_experts}"
+                        )
+
     def _get_maybe_cached_weight_for_transfer(
         self,
         pinned_weight_store: Dict[str, torch.Tensor],
