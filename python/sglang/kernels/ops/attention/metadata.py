@@ -19,6 +19,7 @@ def get_num_kv_splits_triton(
     max_kv_splits,
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
+    uneven_batch_ptr=None,
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
@@ -30,6 +31,8 @@ def get_num_kv_splits_triton(
     min_seq_len = tl.min(seq_lens)
     if max_seq_len * 8 < min_seq_len * 10:
         min_seq_len = max_seq_len
+    if uneven_batch_ptr is not None:
+        tl.store(uneven_batch_ptr, (min_seq_len < max_seq_len).to(tl.int32))
     max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
     kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
