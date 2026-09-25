@@ -69,9 +69,8 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     preshuffle, and an fp8 e4m3fn index cache.
 
     Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
-    first. Every decline here is therefore a configuration or toolchain error,
-    and is fatal when the path was asked for by name rather than a silent perf
-    cliff -- the lesson of #39516."""
+    first. Every decline here is therefore a configuration or toolchain error;
+    it is logged, as a warning when the path was asked for by name."""
     from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
     from sglang.srt.runtime_context import get_exec
 
@@ -83,12 +82,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     # with the switch on and one with it off produce identical logs, and telling
     # the two apart cost a day of bisecting benchmark results.
     def _refuse(reason: str) -> bool:
-        if requested is True:
-            raise RuntimeError(
-                f"the fused DSA indexer was requested but {reason}. Unset "
-                "enable_dsa_fused_indexer to let the runtime decide."
-            )
-        logger.info("gfx950 fused DSA indexer disabled: %s", reason)
+        # Asked for by name: warn, but still start on the standard path.
+        log = logger.warning if requested is True else logger.info
+        log("gfx950 fused DSA indexer disabled: %s", reason)
         return False
 
     # No hardware term here: fused_decode.supported_hardware() is the hardware
@@ -117,18 +113,16 @@ def gfx950_model_shape_supported(**kwargs) -> bool:
     return model_shape_supported(**kwargs)
 
 
-def assert_hadamard_preserved(indexer) -> None:
-    """Prove the fused Hadamard is still applied. The fused kernel folds it in, so
-    a config that expects rotate_activation elsewhere would silently drop it."""
-    # RuntimeError, not assert: `python -O` strips assert statements, and this
-    # check exists precisely to stop a silent index-K cache format change. A
-    # guard that disappears under an interpreter flag is not a guard.
+def hadamard_preserved(indexer) -> bool:
+    """Whether Indexer._maybe_rotate still applies the Hadamard the fused kernels
+    fold in. If not, the fused path must stay off, or prefill and decode would
+    write different index-K formats."""
     if indexer.use_dsa_indexer_fusion:
-        raise RuntimeError(
-            "gfx950 fused DSA indexer requires use_dsa_indexer_fusion == False: the "
-            "fused flag makes Indexer._maybe_rotate a no-op, which deletes the "
-            "Hadamard and changes the index-K cache format"
+        logger.warning(
+            "gfx950 fused DSA indexer disabled: use_dsa_indexer_fusion makes "
+            "Indexer._maybe_rotate skip the Hadamard"
         )
+        return False
     device = indexer.k_norm.weight.device
     probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1.0
@@ -146,12 +140,12 @@ def assert_hadamard_preserved(indexer) -> None:
             atol=0.0,
         )
     ):
-        raise RuntimeError(
-            "Indexer._maybe_rotate did not apply the Hadamard rotation "
-            f"(e_0 must map to a dense vector of magnitude {expected:.6f}); "
-            "refusing to enable the gfx950 fused indexer, which assumes the "
-            "rotation is present"
+        logger.warning(
+            "gfx950 fused DSA indexer disabled: Indexer._maybe_rotate does not "
+            "apply the Hadamard rotation the fused kernels assume"
         )
+        return False
+    return True
 
 
 # Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
