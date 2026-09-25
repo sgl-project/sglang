@@ -34,8 +34,6 @@ def make_config(tp_rank=0, tp_size=4, dcp_size=2, **overrides):
         dcp_size=dcp_size,
         dcp_rank=tp_rank % dcp_size,
         logical_page_size=64 * dcp_size,
-        kv_cache_dtype=torch.bfloat16,
-        host_layout="page_first",
         extra_config={
             "enable_metadata_cache": True,
             "metadata_ttl": -1,
@@ -89,7 +87,7 @@ class TestDcpStorageIdentity(CustomTestCase):
                         1,
                     )
 
-    def test_layouts_and_topologies_cannot_alias(self):
+    def test_models_and_topologies_cannot_alias(self):
         config = make_config()
         variants = [
             config,
@@ -98,17 +96,10 @@ class TestDcpStorageIdentity(CustomTestCase):
             make_config(dcp_size=4),
             make_config(dcp_size=1),
             replace(config, logical_page_size=256),
-            replace(config, kv_cache_dtype=torch.float16),
-            replace(config, kv_cache_dtype=torch.float8_e4m3fn),
-            replace(config, kv_cache_dtype=torch.float8_e5m2),
             replace(config, pp_size=2, pp_rank=0),
             replace(config, pp_size=2, pp_rank=1),
             replace(config, attn_cp_size=2, attn_cp_rank=0),
             replace(config, attn_cp_size=2, attn_cp_rank=1),
-            replace(
-                config, host_layout="page_first_direct", is_page_first_layout=False
-            ),
-            replace(config, host_layout="layer_first", is_page_first_layout=False),
             replace(config, model_name="different/model"),
         ]
         keys = [self.backend(c)._get_suffixed_key("prefix") for c in variants]
@@ -167,8 +158,6 @@ class TestDcpStorageIdentity(CustomTestCase):
             {"logical_page_size": None},
             {"logical_page_size": 0},
             {"logical_page_size": 127},
-            {"kv_cache_dtype": None},
-            {"host_layout": None},
         ]
         for fields in invalid_fields:
             with self.subTest(fields=fields), self.assertRaises(ValueError):

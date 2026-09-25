@@ -43,8 +43,6 @@ class HiCacheStorageConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     logical_page_size: Optional[int] = None
-    kv_cache_dtype: Optional[torch.dtype] = None
-    host_layout: Optional[str] = None
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -63,13 +61,8 @@ class HiCacheStorageConfig:
             self.logical_page_size is None
             or self.logical_page_size <= 0
             or self.logical_page_size % self.dcp_size != 0
-            or self.kv_cache_dtype is None
-            or not self.host_layout
         ):
-            raise ValueError(
-                "DCP storage requires a DCP-aligned logical page size, KV dtype, "
-                "and host layout."
-            )
+            raise ValueError("DCP storage requires a DCP-aligned logical page size.")
 
     @property
     def is_storage_writer(self) -> bool:
@@ -432,6 +425,8 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
         self.config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
@@ -444,11 +439,9 @@ class HiCacheFile(HiCacheStorage):
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file. TP
             # size restricts reuse to matching topologies; TP rank is omitted.
-            dtype_name = str(storage_config.kv_cache_dtype).removeprefix("torch.")
             self.config_suffix += (
                 f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
                 f"_page{storage_config.logical_page_size}"
-                f"_{dtype_name}_{storage_config.host_layout}"
             )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:

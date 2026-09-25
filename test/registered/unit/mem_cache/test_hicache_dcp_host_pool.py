@@ -219,8 +219,14 @@ class TestDcpStoragePages(CustomTestCase):
                     else kv_dtype
                 )
                 for rank in range(dcp_size):
-                    with self.subTest(
-                        dcp_size=dcp_size, rank=rank, layout=layout, dtype=kv_dtype
+                    with (
+                        self.subTest(
+                            dcp_size=dcp_size, rank=rank, layout=layout, dtype=kv_dtype
+                        ),
+                        # File keys do not yet isolate different KV formats.
+                        envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+                            str(Path(directory) / f"{layout}-{kv_dtype}")
+                        ),
                     ):
                         source = _make_host_pool(
                             rank, dcp_size=dcp_size, layout=layout, dtype=dtype
@@ -249,8 +255,6 @@ class TestDcpStoragePages(CustomTestCase):
                                 dcp_size=dcp_size,
                                 dcp_rank=rank,
                                 logical_page_size=64 * dcp_size,
-                                kv_cache_dtype=kv_dtype,
-                                host_layout=layout,
                                 extra_config={
                                     "max_size": "0",
                                     "min_free_space": "0",
@@ -281,7 +285,7 @@ class TestDcpStoragePages(CustomTestCase):
                             )
                             self.assertTrue(backend.set(key, payload))
                             path = (
-                                Path(directory)
+                                Path(backend.file_path)
                                 / f"{backend._get_suffixed_key(key)}.bin"
                             )
                             self.assertEqual(path.stat().st_size, expected_bytes)

@@ -168,8 +168,6 @@ class TestDcpStorageController(CustomTestCase):
         for rank, cc in enumerate(controllers):
             pool = cc.mem_pool_host
             self.assertEqual(cc.storage_config.logical_page_size, 128)
-            self.assertEqual(cc.storage_config.kv_cache_dtype, torch.bfloat16)
-            self.assertEqual(cc.storage_config.host_layout, "page_first")
             pool.kv_buffer.fill_(rank % 2 + 1)
             indices = pool.alloc(128)
             indices_by_rank.append(indices)
@@ -282,18 +280,6 @@ class TestDcpStorageController(CustomTestCase):
                     self.assertEqual(
                         cc.storage_backend._evictor.is_storage_owner, not cc.backup_skip
                     )
-
-    def test_keys_use_kv_format_instead_of_host_byte_dtype(self):
-        a = _controller(0, dtype=torch.float8_e4m3fn)
-        b = _controller(0, dtype=torch.float8_e5m2)
-        self.assertEqual(a.storage_host_pool.dtype, b.storage_host_pool.dtype)
-        self.assertNotEqual(
-            a.storage_config.kv_cache_dtype, b.storage_config.kv_cache_dtype
-        )
-        self.assertNotEqual(
-            a.storage_backend._get_suffixed_key("page"),
-            b.storage_backend._get_suffixed_key("page"),
-        )
 
     def test_attention_dp_uses_local_shard_ranks(self):
         keys = []

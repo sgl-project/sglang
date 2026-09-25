@@ -777,11 +777,6 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
-            # FP8 caches use uint8 host buffers; key by the actual KV format.
-            kv_cache_dtype=(
-                self.storage_host_pool.device_pool.dtype if dcp_size > 1 else None
-            ),
-            host_layout=self.storage_host_pool.layout if dcp_size > 1 else None,
         )
 
     def reset(self):
