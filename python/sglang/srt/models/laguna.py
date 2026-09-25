@@ -39,6 +39,7 @@ from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -224,7 +225,7 @@ class LagunaMoE(nn.Module):
             final = routed_out + shared_out
 
         final = reduce_moe_output(final)
-        if self._shared_expert_tp1:
+        if self._shared_expert_tp1 and should_add_replicated_moe_output():
             final = final + shared_out
         return final
 

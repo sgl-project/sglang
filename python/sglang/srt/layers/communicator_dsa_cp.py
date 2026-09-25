@@ -231,6 +231,7 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        **kwargs,
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full

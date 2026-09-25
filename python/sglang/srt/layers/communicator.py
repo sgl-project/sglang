@@ -438,6 +438,7 @@ class LayerScatterModes:
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    is_layer_sparse: bool = False
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -448,6 +449,7 @@ class LayerScatterModes:
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
+            is_layer_sparse=context.is_layer_sparse,
         )
 
     @classmethod
@@ -917,6 +919,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
+            is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
         )
 
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
@@ -1617,6 +1620,7 @@ class CommunicateSummableTensorPairFn:
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        is_layer_sparse: bool = False,
     ):
         if get_parallel().tp_size == get_parallel().attn_dp_size:
             group = get_parallel().tp_group
@@ -1626,7 +1630,12 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(group),
             hidden_states,
         )
-        if should_use_dp_reduce_scatterv():
+        # A MoE block leaves its sum to reduce_scatterv whenever it applies
+        # (should_skip_post_experts_all_reduce); a dense MLP does only under the
+        # published mlp_reduce_scatter, which needs allow_reduce_scatter.
+        if should_use_dp_reduce_scatterv() and (
+            allow_reduce_scatter or is_layer_sparse
+        ):
             get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,

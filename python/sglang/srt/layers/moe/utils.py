@@ -779,6 +779,20 @@ def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
+
+
 def can_merge_post_experts_all_reduce() -> bool:
     """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 

@@ -115,6 +115,7 @@ from sglang.srt.layers.moe.utils import (
     is_sbo_enabled,
     is_shared_experts_fusion_disabled,
     is_tbo_enabled,
+    should_add_replicated_moe_output,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -1222,7 +1223,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1:
+        if self._shared_expert_tp1 and should_add_replicated_moe_output():
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -1378,7 +1379,11 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if shared_output is not None and self._shared_expert_tp1:
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and should_add_replicated_moe_output()
+        ):
             final_hidden_states += shared_output
         return final_hidden_states
 
