@@ -301,9 +301,13 @@ async fn input_ids_forwarding_metric_books_outcome_per_request() {
     let chat = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
     let mut tools = chat.clone();
     tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+    let mut image = chat.clone();
+    image["messages"][0]["content"] =
+        json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]);
     for (cfg, request, outcome) in [
         (config(), &chat, "forwarded"),
         (config(), &tools, "ineligible"),
+        (config(), &image, "ineligible_multimodal"),
         (
             without_forwarding(config(), PolicyKind::RoundRobin),
             &chat,

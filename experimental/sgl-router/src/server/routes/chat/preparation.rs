@@ -564,6 +564,7 @@ fn can_forward_chat_tokens(value: &Value) -> bool {
 ///
 /// Only chats with forwarding enabled that pass the forwarding guard are
 /// eligible; an eligible chat without chat-rendered tokens is a failed offload.
+/// Multimodal chats are reported apart from other guard exclusions.
 fn input_ids_forwarding(
     can_forward_input_ids: bool,
     request_value: Option<&Value>,
@@ -571,6 +572,9 @@ fn input_ids_forwarding(
 ) -> InputIdsForwarding {
     if !can_forward_input_ids {
         return InputIdsForwarding::Disabled;
+    }
+    if request_value.is_some_and(request_has_multimodal_content) {
+        return InputIdsForwarding::IneligibleMultimodal;
     }
     let eligible = request_value.is_some_and(|v| {
         v.get("messages").is_some_and(|m| m.is_array()) && can_forward_chat_tokens(v)
@@ -658,6 +662,25 @@ fn request_has_non_text_content(value: &Value) -> bool {
         .is_some_and(|msgs| {
             msgs.iter()
                 .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
+        })
+}
+
+/// Content parts other than `text` (images, video, audio, ...) need the
+/// engine's multimodal processor, so such chats can never carry `input_ids`.
+fn request_has_multimodal_content(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"))
+                    })
+            })
         })
 }
 
@@ -847,6 +870,32 @@ mod tests {
     }
 
     #[test]
+    fn request_has_multimodal_content_detects_non_text_parts() {
+        for part in [
+            json!({"type":"image_url","image_url":{"url":"x"}}),
+            json!({"type":"video_url","video_url":{"url":"x"}}),
+            json!({"type":"input_audio","input_audio":{"data":"x"}}),
+            json!({"image_url":{"url":"x"}}),
+        ] {
+            assert!(
+                request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"user","content":[part]}]
+                })),
+                "part {part} is multimodal"
+            );
+        }
+        for content in [
+            json!("hello"),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            Value::Null,
+        ] {
+            assert!(!request_has_multimodal_content(&json!({
+                "messages":[{"role":"user","content":content}]
+            })));
+        }
+    }
+
+    #[test]
     fn reasoning_history_is_an_expected_forwarding_omission() {
         let mut value = json!({"messages": [
             {"role":"user", "content":"hi"},
@@ -941,6 +990,12 @@ mod tests {
         let chat = json!({"messages":[{"role":"user","content":"hi"}]});
         let tools = json!({"messages":[{"role":"user","content":"hi"}], "tools":[{"type":"function","function":{"name":"f"}}]});
         let prompt = json!({"prompt":"hi"});
+        let image = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"x"}}
+        ]}]});
+        let text_parts =
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
         for (enabled, value, rendered, expected) in [
             (true, Some(&chat), Some(true), Forwarded),
             (true, Some(&chat), Some(false), TokenizeFailed),
@@ -949,6 +1004,9 @@ mod tests {
             (true, Some(&tools), Some(true), Ineligible),
             (true, Some(&prompt), None, Ineligible),
             (true, None, None, Ineligible),
+            (true, Some(&image), None, IneligibleMultimodal),
+            (false, Some(&image), None, Disabled),
+            (true, Some(&text_parts), None, Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],

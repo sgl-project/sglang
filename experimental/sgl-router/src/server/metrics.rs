@@ -91,8 +91,10 @@
 //! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
 //! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
 //!   or no chat formatter).
-//! - `ineligible` — the forwarding guard excluded the request shape (tools,
-//!   non-text content, caller `input_ids`, template controls, ...).
+//! - `ineligible_multimodal` — the chat carries image, video, or audio content
+//!   parts, which only the engine's multimodal processor can tokenize.
+//! - `ineligible` — the forwarding guard excluded some other request shape
+//!   (tools, non-string content, caller `input_ids`, template controls, ...).
 //! - `tokenize_failed` — eligible, but ingress rendering failed (the same
 //!   requests `sgl_router_ingress_tokenize_errors_total` counts).
 //!
@@ -391,6 +393,7 @@ pub enum InputIdsForwarding {
     Forwarded,
     Disabled,
     Ineligible,
+    IneligibleMultimodal,
     TokenizeFailed,
 }
 
@@ -400,6 +403,7 @@ impl InputIdsForwarding {
             Self::Forwarded => "forwarded",
             Self::Disabled => "disabled",
             Self::Ineligible => "ineligible",
+            Self::IneligibleMultimodal => "ineligible_multimodal",
             Self::TokenizeFailed => "tokenize_failed",
         }
     }
@@ -1349,7 +1353,7 @@ impl MetricsRegistry {
 
         // input_ids_forwarding_total
         out.push_str(
-            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible, tokenize_failed).\n",
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).\n",
         );
         out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
         let guard = self.input_ids_forwarding_total.lock();
