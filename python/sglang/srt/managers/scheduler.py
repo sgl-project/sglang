@@ -3431,6 +3431,7 @@ class Scheduler(
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+            token_indices_to_pool=recv_req.token_indices_to_pool,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
@@ -3932,6 +3933,15 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+
+            # A forward batch runs one pooling mode, so setwise readout requests
+            # (token_indices_to_pool) cannot share a batch with last-token ones.
+            # Admit only the first request's mode; the other stays queued.
+            if adder.can_run_list and (
+                (req.token_indices_to_pool is not None)
+                != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
                 continue
 
             running_bs = len(running_batch.reqs)
