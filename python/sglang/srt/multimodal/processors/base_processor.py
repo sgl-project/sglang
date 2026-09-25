@@ -213,6 +213,7 @@ def _tokenizer_of(processor):
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    mm_tokens: Optional[MultimodalSpecialTokens] = None
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
@@ -457,6 +458,52 @@ class BaseMultimodalProcessor(ABC):
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
         return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+
+    def get_input_token_ids(self, modality: Modality) -> set[int]:
+        """Placeholder IDs accepted before this processor expands supplied media.
+
+        These come from processor/model configuration, never request metadata.
+        Legacy processors without ``mm_tokens`` use the canonical HF fields.
+        """
+        token_ids = set()
+        if self.mm_tokens is not None:
+            token_id = self.mm_tokens.get_token_id_by_modality(modality)
+            if token_id is not None:
+                token_ids.add(token_id)
+        names = {
+            Modality.IMAGE: ("image_token_id", "image_token_index"),
+            Modality.VIDEO: ("video_token_id", "video_token_index"),
+            Modality.AUDIO: ("audio_token_id", "audio_token_index"),
+        }.get(modality, ())
+        for name in names:
+            # HF model schemas define different optional modality fields.
+            token_id = getattr(self.hf_config, name, None)
+            if isinstance(token_id, int):
+                token_ids.add(token_id)
+        return token_ids
+
+    def get_input_token_ids_for_data(self, modality: Modality, data) -> set[int]:
+        """Resolve placeholders using the same modalities as item collection.
+
+        A processor-output dictionary may carry video or audio features through
+        ``image_data``. Inspect its fields without materializing any features.
+        Raw inputs and precomputed embeddings retain their carrier modality.
+        """
+        token_ids = set()
+        for item in data if isinstance(data, list) else (data,):
+            if (
+                self._get_preprocessed_input_format(item)
+                == MultimodalInputFormat.PROCESSOR_OUTPUT
+            ):
+                modalities = {
+                    item_modality
+                    for item_modality, _, _ in self._iter_processor_output_fields(item)
+                }
+            else:
+                modalities = {modality}
+            for item_modality in modalities:
+                token_ids.update(self.get_input_token_ids(item_modality))
+        return token_ids
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -1569,21 +1616,10 @@ class BaseMultimodalProcessor(ABC):
             raise ValueError(f"No token id found for modality: {modality}")
         return self.get_mm_items_offset(input_ids, mm_token_id)
 
-    def collect_mm_items_from_processor_output(
+    def _iter_processor_output_fields(
         self, data_dict: dict, modality: Modality = None
-    ) -> List[MultimodalDataItem]:
-        """
-        Create mm_items from processor output.
-
-        Initially creates one item per modality; these are later split into per-image/video items by get_new_expanded_mm_items.
-
-        Note that the data_dict can be hf processor output, or passed via offline engine api
-
-        Args:
-            modality: if provided, force the data into a single MultimodalDataItem of that modality
-        """
-
-        # universal getter for data_dict
+    ) -> Iterator[Tuple[Modality, str, Any]]:
+        """Project fields to modalities for both admission and item collection."""
         get_data_value = (
             data_dict.get
             if hasattr(data_dict, "get")
@@ -1600,7 +1636,6 @@ class BaseMultimodalProcessor(ABC):
                 else Modality.from_str(str(modality_value))
             )
 
-        items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
             if attr_name in (
                 "input_ids",
@@ -1622,16 +1657,32 @@ class BaseMultimodalProcessor(ABC):
                 current_modality = current_modality or Modality.IMAGE
 
             if current_modality:
-                # Create item if needed
-                if current_modality not in items:
-                    items[current_modality] = MultimodalDataItem(
-                        modality=current_modality
-                    )
+                yield current_modality, attr_name, value
 
-                if attr_name in self.FEATURE_NAMES:
-                    attr_name = "feature"
+    def collect_mm_items_from_processor_output(
+        self, data_dict: dict, modality: Modality = None
+    ) -> List[MultimodalDataItem]:
+        """Create items from HF output or an offline processor-output dictionary.
 
-                items[current_modality].set(attr_name, value)
+        Initially creates one item per modality; these are later split by
+        ``get_new_expanded_mm_items``. An explicit modality forces one item.
+        """
+        get_data_value = (
+            data_dict.get
+            if hasattr(data_dict, "get")
+            else lambda name, default=None: getattr(data_dict, name, default)
+        )
+        items: dict[Modality, MultimodalDataItem] = {}
+        for current_modality, attr_name, value in self._iter_processor_output_fields(
+            data_dict, modality
+        ):
+            if current_modality not in items:
+                items[current_modality] = MultimodalDataItem(modality=current_modality)
+
+            if attr_name in self.FEATURE_NAMES:
+                attr_name = "feature"
+
+            items[current_modality].set(attr_name, value)
 
         # deal with metadata fields when data_dict is preprocessed input: convert from tensor to expected python types
         # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
