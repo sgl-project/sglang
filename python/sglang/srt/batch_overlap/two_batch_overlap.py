@@ -705,6 +705,7 @@ class TboForwardBatchPreparer:
 
         for key in [
             "req_pool_indices",
+            "req_pool_indices_cpu",
             "seq_lens",
             "seq_lens_cpu",
             "extend_seq_lens",
@@ -751,6 +752,7 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "dp_spec_prefill_coordination_applied",
             "return_logprob",
             "can_run_decode_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
@@ -760,6 +762,7 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
@@ -820,6 +823,9 @@ class TboForwardBatchPreparer:
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                # Children publish no per-rank list of their own; the parent
+                # published the gather sizes before it was split.
+                global_num_tokens_padded_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,

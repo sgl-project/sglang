@@ -6,12 +6,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed import (
-    get_attn_tp_group,
-    get_moe_ep_group,
-    get_moe_tp_group,
-    get_tp_group,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -53,6 +47,14 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
+    if backend == "cutedsl":
+        if not get_platform().is_sm100:
+            raise ValueError(
+                "FlashInfer allreduce fusion cutedsl backend requires a "
+                "Blackwell system."
+            )
+        return backend
+
     if backend == "auto":
         if is_multi_node:
             if get_platform().is_sm100:
@@ -76,6 +78,11 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "system, or SM90 single-node."
         )
     return backend
+
+
+def uses_cutedsl_ar_fusion() -> bool:
+    """Selected CuTe DSL owns both patterns, so the legacy workspace stands down."""
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
 
 
 def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
@@ -335,7 +342,7 @@ def _preflight_check_workspace_memory(
 
     group = cpu_group
     if group is None:
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group.world_size <= 1:
             return True
         group = tp_group.cpu_group
@@ -670,12 +677,12 @@ def resolve_fusion_group(*, use_attn_tp_group: bool):
 
     parallel = get_parallel()
     if use_attn_tp_group:
-        return parallel.attn_tp_size, parallel.attn_tp_rank, get_attn_tp_group()
+        return parallel.attn_tp_size, parallel.attn_tp_rank, parallel.attn_tp_group
     if can_merge_post_experts_all_reduce():
-        return parallel.tp_size, parallel.tp_rank, get_tp_group()
+        return parallel.tp_size, parallel.tp_rank, parallel.tp_group
     if parallel.moe_ep_size > 1:
-        return parallel.moe_ep_size, parallel.moe_ep_rank, get_moe_ep_group()
-    return parallel.moe_tp_size, parallel.moe_tp_rank, get_moe_tp_group()
+        return parallel.moe_ep_size, parallel.moe_ep_rank, parallel.moe_ep_group
+    return parallel.moe_tp_size, parallel.moe_tp_rank, parallel.moe_tp_group
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -691,7 +698,7 @@ def _sync_allreduce_unavailable_across_tp():
     try:
         import torch.distributed as dist
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group.world_size <= 1:
             return
         flag = torch.tensor(
@@ -719,7 +726,7 @@ def ensure_workspace_initialized(
     use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized."""
-    if _flashinfer_allreduce_unavailable:
+    if _flashinfer_allreduce_unavailable or uses_cutedsl_ar_fusion():
         return False
 
     if not is_flashinfer_available() or _flashinfer_comm is None:
