@@ -1265,6 +1265,32 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
+    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
+        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
+        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return 0
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+
+        padding_bytes = 0
+        for ratio in (1, 2):
+            num_layers = self.num_layers(ratio)
+            if not num_layers:
+                continue
+            # Main KV reserves a full logical page of compressed slots. Indexer
+            # size includes the compressed logical page, then its own padding page.
+            main_padding = self.page_size * self._get_paged_kv_bytes_per_token(ratio)
+            index_size = (full_tokens + self.page_size) // ratio
+            index_slots = (
+                (index_size + DSV41_INDEX_PAGE_SIZE + 1)
+                // DSV41_INDEX_PAGE_SIZE
+                * DSV41_INDEX_PAGE_SIZE
+            )
+            index_padding = (
+                index_slots - full_tokens // ratio
+            ) * self.low_ratio_index_bytes
+            padding_bytes += (main_padding + index_padding) * num_layers
+        return padding_bytes
+
     def _get_bytes_per_full_token(self) -> float:
         # Cap mode and ring mode both move the SWA pool and the c4 state that
         # follows it out of the coefficient and into fixed bytes.
@@ -1497,6 +1523,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+        full_token = full_token // page_size * page_size
+        # The coefficient excludes reserved pages. Remove the few full pages
+        # needed to cover them, including indexer rounding at this capacity.
+        while full_token > 0 and (
+            full_token * self.bytes_per_full_token
+            + self._get_low_ratio_kv_padding_bytes(full_token)
+            > available_bytes_for_tokens
+        ):
+            full_token -= page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

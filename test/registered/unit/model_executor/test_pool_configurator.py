@@ -1526,6 +1526,114 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                 self.assertEqual(planner.bytes_per_full_token * 2 * page, growth)
                 self.assertEqual(small[2], large[2])
 
+    def test_low_ratio_capacity_matches_allocated_page_boundaries(self):
+        from itertools import product
+
+        layouts = (("v4", None), ("v41", "fp8"), ("v41", "fp4"))
+        # Reused layers allocate no main/indexer storage of their own.
+        owners = (([1, 1], [0]), ([2, 2], [0]), ([2, 2, 2, 1], [0, 1, 2, 3]))
+        for (layout, option), page, index_page, (ratios, sources) in product(
+            layouts, (128, 256), (64, 128), owners
+        ):
+            with (
+                self.subTest(
+                    layout=layout,
+                    option=option,
+                    page=page,
+                    index_page=index_page,
+                    ratios=ratios,
+                ),
+                self._planner(
+                    layout, option, page, index_page, ratios, sources
+                ) as planner,
+            ):
+                for pages in (1, 2, 7):
+                    tokens = pages * page
+                    budget = sum(self._allocated_bytes(planner, tokens, layout, option))
+                    config = planner.calculate_pool_sizes(budget, page)
+                    self.assertEqual(config.max_total_num_tokens, tokens)
+                    if pages > 1:
+                        smaller = planner.calculate_pool_sizes(budget - 1, page)
+                        self.assertEqual(smaller.max_total_num_tokens, tokens - page)
+                    config.max_running_requests = 2
+                    finalized = planner.finalize_with_max_running_requests(config)
+                    self.assertEqual(finalized.max_total_num_tokens, tokens)
+                    if pages > 1:
+                        capped = planner.calculate_pool_sizes_from_max_tokens(
+                            tokens - 1, page
+                        )
+                        self.assertEqual(capped.max_total_num_tokens, tokens - page)
+
+    def test_low_ratio_reserves_main_and_index_pages_with_no_tokens(self):
+        with self._planner(
+            "v41", "fp4", 256, 128, [2, 2, 2, 1], [0, 1, 2, 3]
+        ) as planner:
+            main, index, state = self._allocated_bytes(planner, 0, "v41", "fp4")
+            self.assertGreater(main, 0)
+            self.assertGreater(index, 0)
+            self.assertGreater(state, 0)
+            self.assertEqual(planner._get_low_ratio_kv_padding_bytes(0), main + index)
+
+    def test_low_ratio_capacity_counts_only_stage_local_owners(self):
+        with self._planner(
+            "v41", "fp4", 256, 128, [2, 2, 2, 1, 1], [0, 2, 3], stage=(2, 5)
+        ) as planner:
+            self.assertEqual(planner.stage_owner_layers, {1: [3], 2: [2]})
+            budget = sum(self._allocated_bytes(planner, 512, "v41", "fp4"))
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
+            )
+
+    def test_no_low_ratio_owners_add_no_padding(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        planner = object.__new__(DSV4PoolConfigurator)
+        planner._unified = False
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+            side_effect=AssertionError(
+                "a stage without low-ratio owners needs no layout"
+            ),
+        ):
+            for owners in ({}, {4: [0], 128: [1]}):
+                planner.stage_owner_layers = owners
+                for tokens in (0, 256):
+                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(tokens), 0)
+
+    def test_other_backends_keep_existing_byte_contract(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        # Exercise sizing guards only; this does not assert these backends can
+        # serve a low-ratio model or use the FlashMLA layouts.
+        for unified, npu, backend, kv_bytes in (
+            (True, False, "flashmla", 1024),
+            (False, True, "flashmla", 584),
+            (False, False, "trtllm", 512),
+        ):
+            with self.subTest(unified=unified, npu=npu, backend=backend):
+                _publish_config(self, dsv4_attn_backend=backend)
+                planner = object.__new__(DSV4PoolConfigurator)
+                planner._unified = unified
+                planner.kv_bytes = kv_bytes
+                planner.low_ratio_index_bytes = 68
+                planner.stage_owner_layers = {1: [0], 2: [1]}
+                with (
+                    patch("sglang.srt.model_executor.pool_configurator._is_npu", npu),
+                    patch(
+                        "sglang.srt.mem_cache.deepseek_v4_memory_pool.select_dsv4_kv_layout",
+                        side_effect=AssertionError(
+                            "this backend does not use FlashMLA pages"
+                        ),
+                    ),
+                ):
+                    for ratio in (1, 2):
+                        self.assertEqual(
+                            planner._compressed_bytes_per_full_token(ratio),
+                            (kv_bytes + 68) / ratio,
+                        )
+                    self.assertEqual(planner._get_low_ratio_kv_padding_bytes(256), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
