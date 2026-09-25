@@ -131,9 +131,14 @@ def unified_memory_disagg_move_gate(scheduler):
     if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
 
         def decode_gate() -> bool:
+            decode_offload_manager = scheduler.decode_offload_manager
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or (
+                    decode_offload_manager is not None
+                    and decode_offload_manager.has_inflight_device_transfer()
+                )
             )
 
         return decode_gate
@@ -349,7 +354,9 @@ class MetadataBuffers:
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
                 self.output_token_sampling_logprobs = torch.zeros(
-                    (size, 16), dtype=torch.float32, device=device
+                    (size, max_sampling_mask_tokens),
+                    dtype=torch.float32,
+                    device=device,
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -517,8 +524,10 @@ class MetadataBuffers:
             sampling_logprobs = req.output_token_sampling_logprobs
             if sampling_masks:
                 sampling_mask = sampling_masks[0]
-                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
-                if sampling_mask is not None and sampling_logprob is not None:
+                sampling_logprobs_row = (
+                    sampling_logprobs[0] if sampling_logprobs else None
+                )
+                if sampling_mask is not None and sampling_logprobs_row is not None:
                     mask_len = len(sampling_mask)
                     max_mask_len = self.output_token_sampling_mask_idx.shape[1]
                     if mask_len > max_mask_len:
@@ -540,9 +549,20 @@ class MetadataBuffers:
                                 device=self.output_token_sampling_mask_idx.device,
                             )
                         )
-                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
-                        0
-                    ] = float(sampling_logprob)
+                    if req.sampling_logprobs_mode == "support" and mask_len:
+                        self.output_token_sampling_logprobs[
+                            req.metadata_buffer_index, :mask_len
+                        ].copy_(
+                            torch.tensor(
+                                sampling_logprobs_row,
+                                dtype=torch.float32,
+                                device=self.output_token_sampling_logprobs.device,
+                            )
+                        )
+                    elif req.sampling_logprobs_mode == "selected":
+                        self.output_token_sampling_logprobs[
+                            req.metadata_buffer_index, 0
+                        ] = float(sampling_logprobs_row)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

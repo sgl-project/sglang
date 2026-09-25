@@ -337,6 +337,24 @@ def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
     _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
 
 
+def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
+    """Publish the DP gather sizes ``forward_batch`` carries: the buffer
+    length, the per-rank token counts as padded for the gather, this rank's
+    entry, and the padding mode. Capture batches carry no separately padded
+    list, so the raw counts stand in for it."""
+    global_num_tokens = forward_batch.global_num_tokens_padded_cpu
+    if global_num_tokens is None:
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    set_dp_buffer_len(
+        forward_batch.global_dp_buffer_len,
+        global_num_tokens[dp_rank],
+        forward_batch.dp_padding_mode.is_max_len(),
+        global_num_tokens,
+        forward_batch.global_num_tokens_gpu,
+    )
+
+
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
@@ -895,6 +913,15 @@ def dp_scatter(
         )
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
+
+
+def can_use_dp_reduce_scatter() -> bool:
+    """Whether the fixed TP group tiles the current attention DP x TP layout."""
+    if not world_dp_gather_enabled():
+        return True
+
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.dp_size * parallel.attn_tp_size
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

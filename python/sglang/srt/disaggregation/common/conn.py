@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferDestination,
     KVTransferMetric,
     StateType,
 )
@@ -182,6 +183,7 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            and self.supports_deferred_decode_kv_release
         )
         self._dcp_pack_buffers = None
         self._dcp_pack_max_tokens: Optional[int] = None
@@ -1931,6 +1933,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         raise NotImplementedError
 

@@ -112,6 +112,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         tp_size=1,
         sp_size=1,
         is_compiled=False,
+        hidden_size=0,
     ):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
@@ -120,6 +121,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             tp_size=tp_size,
             sp_size=sp_size,
             is_compiled=is_compiled,
+            hidden_size=hidden_size,
         )
 
     def test_blackwell_remains_enabled(self):
@@ -137,6 +139,28 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
 
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
+
+    def test_hopper_edge_single_gpu_enabled(self):
+        self.assertTrue(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_hopper_edge_parallel_and_compiled_disabled(self):
+        for override in ({"tp_size": 2}, {"sp_size": 2}, {"is_compiled": True}):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    self._can_enable(
+                        is_hopper=True,
+                        hidden_act="relu2",
+                        hidden_size=2048,
+                        **override,
+                    )
+                )
+
+    def test_hopper_larger_dense_mlp_disabled(self):
+        self.assertFalse(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
+        )
 
     def test_hopper_tensor_parallel_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
