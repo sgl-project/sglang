@@ -55,7 +55,9 @@ def _fused_virtual_topk_ids_kernel(
     # a real virtual-expert slot belonging to another adapter and trigger OOB
     # loads in downstream LoRA kernels.
     shifted = base + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
+    # Reject an out-of-range base ID before it can alias the next adapter.
+    result = tl.where(base >= num_experts_for_weight, -1, shifted)
+    result = tl.where(base < 0, base, result)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
