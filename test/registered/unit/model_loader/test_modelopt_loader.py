@@ -215,194 +215,6 @@ class TestModelOptModelLoader(CustomTestCase):
                 # Note: We can't easily verify the exact calls due to dynamic imports,
                 # but we can verify the workflow completed successfully
 
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_quantized_checkpoint_restore(self, mock_logger, mock_auto_tokenizer):
-        """Test restoring from a quantized checkpoint."""
-
-        # Create model config with checkpoint restore path
-        config_with_restore = ModelConfig(
-            model_path=self.model_path,
-            quantization="modelopt_fp8",
-        )
-
-        # Create load config with checkpoint restore path
-        load_config_with_restore = LoadConfig(
-            modelopt_checkpoint_restore_path="/path/to/quantized/checkpoint"
-        )
-
-        loader = ModelOptModelLoader(load_config_with_restore)
-
-        # Mock tokenizer
-        mock_tokenizer = MagicMock()
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-
-        # Mock modelopt modules
-        mock_mtq = MagicMock()
-        mock_mto = MagicMock()
-
-        # Configure quantization config
-        mock_fp8_cfg = MagicMock()
-        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
-
-        # Configure model as not quantized initially
-        mock_is_quantized = MagicMock(return_value=False)
-
-        with patch.object(
-            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
-        ):
-            with patch.dict(
-                "sys.modules",
-                {
-                    "modelopt": MagicMock(),
-                    "modelopt.torch": MagicMock(),
-                    "modelopt.torch.opt": mock_mto,
-                    "modelopt.torch.quantization": mock_mtq,
-                    "modelopt.torch.quantization.utils": MagicMock(
-                        is_quantized=mock_is_quantized
-                    ),
-                },
-            ):
-                with patch.object(loader, "_setup_modelopt_quantization") as mock_setup:
-                    # Mock the _setup_modelopt_quantization to simulate checkpoint restore
-                    def mock_setup_quantization(
-                        model,
-                        tokenizer,
-                        quant_cfg,
-                        quantized_ckpt_restore_path=None,
-                        **kwargs,
-                    ):
-                        if quantized_ckpt_restore_path:
-                            mock_mto.restore(model, quantized_ckpt_restore_path)
-                            print(
-                                f"Restored quantized model from {quantized_ckpt_restore_path}"
-                            )
-                            return
-
-                    mock_setup.side_effect = mock_setup_quantization
-
-                    # Execute the load_model method
-                    result_model = loader.load_model(
-                        model_config=config_with_restore,
-                        device_config=self.device_config,
-                    )
-
-                    # Verify the setup was called with restore path
-                    mock_setup.assert_called_once()
-                    call_args = mock_setup.call_args
-                    # Check that the restore path was passed correctly
-                    self.assertIn("quantized_ckpt_restore_path", call_args[1])
-                    self.assertEqual(
-                        call_args[1]["quantized_ckpt_restore_path"],
-                        "/path/to/quantized/checkpoint",
-                    )
-
-                    # Verify restore was called
-                    mock_mto.restore.assert_called_once_with(
-                        self.mock_base_model, "/path/to/quantized/checkpoint"
-                    )
-
-                    # Verify we get the expected model back
-                    self.assertEqual(result_model, self.mock_base_model)
-
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_quantized_checkpoint_save(self, mock_logger, mock_auto_tokenizer):
-        """Test saving quantized checkpoint after calibration."""
-
-        # Create model config with checkpoint save path
-        config_with_save = ModelConfig(
-            model_path=self.model_path,
-            quantization="modelopt_fp8",
-        )
-
-        # Create load config with checkpoint save path
-        load_config_with_save = LoadConfig(
-            modelopt_checkpoint_save_path="/path/to/save/checkpoint"
-        )
-
-        loader = ModelOptModelLoader(load_config_with_save)
-
-        # Mock tokenizer
-        mock_tokenizer = MagicMock()
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-
-        # Mock modelopt modules
-        mock_mtq = MagicMock()
-        mock_mto = MagicMock()
-        mock_dataset_utils = MagicMock()
-
-        # Configure quantization config
-        mock_fp8_cfg = MagicMock()
-        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
-
-        # Configure model as not quantized initially
-        mock_is_quantized = MagicMock(return_value=False)
-
-        with patch.object(
-            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
-        ):
-            with patch.dict(
-                "sys.modules",
-                {
-                    "modelopt": MagicMock(),
-                    "modelopt.torch": MagicMock(),
-                    "modelopt.torch.opt": mock_mto,
-                    "modelopt.torch.quantization": mock_mtq,
-                    "modelopt.torch.quantization.utils": MagicMock(
-                        is_quantized=mock_is_quantized
-                    ),
-                    "modelopt.torch.utils": MagicMock(),
-                    "modelopt.torch.utils.dataset_utils": mock_dataset_utils,
-                },
-            ):
-                with patch.object(loader, "_setup_modelopt_quantization") as mock_setup:
-                    # Mock the _setup_modelopt_quantization to simulate checkpoint save
-                    def mock_setup_quantization(
-                        model,
-                        tokenizer,
-                        quant_cfg,
-                        quantized_ckpt_save_path=None,
-                        **kwargs,
-                    ):
-                        # Simulate calibration and quantization
-                        mock_mtq.quantize(model, quant_cfg, forward_loop=MagicMock())
-                        mock_mtq.print_quant_summary(model)
-
-                        # Save checkpoint if path provided
-                        if quantized_ckpt_save_path:
-                            mock_mto.save(model, quantized_ckpt_save_path)
-                            print(
-                                f"Quantized model saved to {quantized_ckpt_save_path}"
-                            )
-
-                    mock_setup.side_effect = mock_setup_quantization
-
-                    # Execute the load_model method
-                    result_model = loader.load_model(
-                        model_config=config_with_save, device_config=self.device_config
-                    )
-
-                    # Verify the setup was called with save path
-                    mock_setup.assert_called_once()
-                    call_args = mock_setup.call_args
-                    # Check that the save path was passed correctly
-                    self.assertIn("quantized_ckpt_save_path", call_args[1])
-                    self.assertEqual(
-                        call_args[1]["quantized_ckpt_save_path"],
-                        "/path/to/save/checkpoint",
-                    )
-
-                    # Verify save was called
-                    mock_mto.save.assert_called_once_with(
-                        self.mock_base_model, "/path/to/save/checkpoint"
-                    )
-
-                    # Verify we get the expected model back
-                    self.assertEqual(result_model, self.mock_base_model)
-
     def test_unified_quantization_flag_support(self):
         """Test that ModelOptModelLoader supports unified quantization flags."""
         # Test modelopt_fp8
@@ -421,6 +233,29 @@ class TestModelOptModelLoader(CustomTestCase):
         config_auto = ModelConfig(model_path=self.model_path, quantization="modelopt")
         # Should default to fp8 when no config is detected
         self.assertEqual(config_auto._get_modelopt_quant_type(), "fp8")
+
+    def test_quantize_and_serve_config_validation(self):
+        """Test that quantize_and_serve is properly disabled."""
+        # Test that quantize-and-serve mode raises NotImplementedError
+        with self.assertRaises(NotImplementedError) as context:
+            ModelConfig(
+                model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                quantization="modelopt_fp8",
+                quantize_and_serve=True,
+            )
+
+        # Verify the error message contains helpful instructions
+        error_msg = str(context.exception)
+        self.assertIn("disabled due to compatibility issues", error_msg)
+        self.assertIn("separate quantize-then-deploy workflow", error_msg)
+
+        # Test invalid configuration - no quantization
+        with self.assertRaises(ValueError) as context:
+            ModelConfig(
+                model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                quantize_and_serve=True,
+            )
+        self.assertIn("requires ModelOpt quantization", str(context.exception))
 
 
 class TestModelOptLoaderIntegration(CustomTestCase):
