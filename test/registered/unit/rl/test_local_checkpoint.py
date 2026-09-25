@@ -127,9 +127,9 @@ def _pull(stream, version):
     local_checkpoint.pull(str(local), str(base), str(source), version)
 
 
-def _assert_checkpoint(stream, tensors, version):
+def _assert_checkpoint(stream, tensors, version, filename="model.safetensors"):
     base, _, local, _, _ = stream
-    assert (local / "model.safetensors").read_bytes() == _checkpoint_bytes(tensors)
+    assert (local / filename).read_bytes() == _checkpoint_bytes(tensors)
     assert (local / "config.json").read_bytes() == (base / "config.json").read_bytes()
     assert local_checkpoint._read_applied_version(str(local)) == version
 
@@ -170,13 +170,21 @@ def test_stale_positive_target_does_not_revert_checkpoint(stream):
     _assert_checkpoint(stream, latest, 2)
 
 
-@pytest.mark.parametrize("damage", ["missing_shard", "missing_tensor"])
+@pytest.mark.parametrize(
+    "damage", ["missing_shard", "missing_tensor", "missing_index", "empty_publication"]
+)
 def test_incomplete_publication_preserves_checkpoint_and_version(stream, damage):
     _, source, _, initial, updated = stream
     _pull(stream, 0)
     _publish(source, 1, initial, updated)
     shard = source / "weight_v000001/model-00000-of-00001.safetensors"
-    if damage == "missing_shard":
+    if damage in {"missing_index", "empty_publication"}:
+        (shard.parent / "model.safetensors.index.json").unlink()
+        if damage == "empty_publication":
+            shard.unlink()
+        expected_error = FileNotFoundError
+        expected_message = "published weight index missing"
+    elif damage == "missing_shard":
         shard.unlink()
         expected_error = FileNotFoundError
         expected_message = "model-00000-of-00001.safetensors"
@@ -195,6 +203,27 @@ def test_incomplete_publication_preserves_checkpoint_and_version(stream, damage)
     with pytest.raises(expected_error, match=expected_message):
         _pull(stream, 1)
     _assert_checkpoint(stream, initial, 0)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_full_checkpoint_publication_remains_supported(stream, indexed):
+    base, source, _, _, updated = stream
+    directory = source / "weight_v000001"
+    directory.mkdir()
+    filename = "model-00000-of-00001.safetensors" if indexed else "model.safetensors"
+    (directory / filename).write_bytes(_checkpoint_bytes(updated))
+    shutil.copy2(base / "config.json", directory / "config.json")
+    if indexed:
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {name: filename for name in updated},
+                }
+            )
+        )
+    _pull(stream, 1)
+    _assert_checkpoint(stream, updated, 1, filename)
 
 
 def test_failed_xor_apply_invalidates_state_and_retry_reseeds(stream):
