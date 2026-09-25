@@ -5598,8 +5598,6 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(end.calls, [])
         self.assertEqual(end.normal_text, "")
 
-
-
     def test_finish_releases_text_withheld_for_a_partial_end_token(self):
         """Text held back for a partial end token must not be dropped at stream end.
 
@@ -5622,6 +5620,7 @@ class TestQwen25Detector(unittest.TestCase):
             (chunk.normal_text or "") + (end.normal_text or ""),
             (expected.normal_text or "").strip(),
         )
+
 
 class TestGemma4Detector(unittest.TestCase):
     def setUp(self):
