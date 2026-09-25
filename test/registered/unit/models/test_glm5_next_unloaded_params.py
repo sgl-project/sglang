@@ -3,6 +3,9 @@
 import logging
 import unittest
 
+import torch
+
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.models.glm5_next import (
     _UNLOADED_REPORT_LIMIT,
     report_unloaded_params,
@@ -59,6 +62,33 @@ class TestReportUnloadedParams(unittest.TestCase):
 
     def test_iterables_are_accepted_not_only_sets(self):
         self.assertEqual(report_unloaded_params(["a", "b"], iter(["a"])), ["b"])
+
+    def test_optional_params_are_not_reported(self):
+        # The released GLM-5.3-Flash checkpoint carries no KV-cache scales.
+        declared = {
+            "layers.11.self_attn.attn_mha.k_scale",
+            "layers.11.self_attn.attn_mha.v_scale",
+            "layers.11.self_attn.o_proj.weight",
+        }
+        optional = {n for n in declared if n.endswith(("k_scale", "v_scale"))}
+        with self.assertNoLogs("sglang.srt.models.glm5_next", level="WARNING"):
+            missing = report_unloaded_params(
+                declared,
+                {"layers.11.self_attn.o_proj.weight"},
+                optional_params=optional,
+            )
+        self.assertEqual(missing, [])
+        self.assertEqual(
+            report_unloaded_params(declared, set(), optional_params=optional),
+            ["layers.11.self_attn.o_proj.weight"],
+        )
+
+    def test_kv_cache_scales_are_marked_optional(self):
+        # load_weights passes the parameters marked _skip_weight_check as optional.
+        layer = torch.nn.Module()
+        BaseKVCacheMethod(None).create_weights(layer)
+        self.assertTrue(layer.k_scale._skip_weight_check)
+        self.assertTrue(layer.v_scale._skip_weight_check)
 
 
 if __name__ == "__main__":

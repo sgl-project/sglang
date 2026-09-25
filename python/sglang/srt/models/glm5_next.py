@@ -147,9 +147,14 @@ def report_unloaded_params(
     loaded_params: Iterable[str],
     *,
     model_label: str = "Glm5Next",
+    optional_params: Iterable[str] = (),
 ) -> List[str]:
-    """Warn about parameters ``load_weights`` never populated and return them."""
-    missing = sorted(set(param_names) - set(loaded_params))
+    """Warn about parameters ``load_weights`` never populated and return them.
+
+    ``optional_params`` may legitimately be absent from a checkpoint, such as the
+    KV-cache scales that keep their defaults, and are never reported.
+    """
+    missing = sorted(set(param_names) - set(loaded_params) - set(optional_params))
     if not missing:
         return []
     shown = ", ".join(missing[:_UNLOADED_REPORT_LIMIT])
@@ -1884,7 +1889,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
             or getattr(self, "language_only", False)
         )
         if not is_partial_load:
-            report_unloaded_params(params_dict.keys(), loaded_params)
+            report_unloaded_params(
+                params_dict.keys(),
+                loaded_params,
+                optional_params=[
+                    name
+                    for name, param in params_dict.items()
+                    if getattr(param, "_skip_weight_check", False)
+                ],
+            )
 
         if getattr(self, "encoder_only", False):
             run_post = False
