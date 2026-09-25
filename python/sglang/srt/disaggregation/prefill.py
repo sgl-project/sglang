@@ -1555,12 +1555,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self._release_aborted_request(req)
         # Mamba insertion donates the checkpoint and clears its sequence marker.
-        release_kv_cache(
-            req,
-            self.tree_cache,
-            is_insert=not uses_write_through_cache
-            and not self.tree_cache.supports_mamba(),
+        is_insert = (
+            not uses_write_through_cache and not self.tree_cache.supports_mamba()
         )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
