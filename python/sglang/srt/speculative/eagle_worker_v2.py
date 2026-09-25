@@ -1371,33 +1371,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group,
-                    owns_attention=self._draft_worker.draft_owns_attention,
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
                 ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
-                )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
 
     def forward_batch_generation(
         self,
@@ -1783,8 +1775,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # Draft overrides must end before target resources are constructed.
+            with (
+                self._draft_worker.draft_tp_context(
+                    self._draft_worker.draft_runner.tp_group,
+                    owns_attention=self._draft_worker.draft_owns_attention,
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
