@@ -56,29 +56,29 @@ class _SchedulerForTest(SchedulerVPPMixin, SchedulerPPMixin):
 
 def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
     scheduler = _SchedulerForTest()
-    scheduler.ps = SimpleNamespace(
-        pp_rank=3 if is_last_rank else 1,
-        pp_size=4,
-        tp_rank=0,
-        tp_size=2,
-    )
     scheduler.pp_group = SimpleNamespace(
         is_first_rank=is_first_rank,
         is_last_rank=is_last_rank,
+        rank_in_group=3 if is_last_rank else 1,
+        world_size=4,
     )
-    scheduler.world_group = SimpleNamespace(
-        rank_in_group=scheduler.ps.pp_rank * scheduler.ps.tp_size,
-    )
-    scheduler._pp_vpp_runtime_epoch = 17
-    scheduler._pp_vpp_control_layout_digest = "layout"
     scheduler.attn_tp_group = SimpleNamespace(
         cpu_group=object(),
         ranks=[0, 1],
+        rank_in_group=0,
+        world_size=2,
         broadcast_object=MagicMock(side_effect=lambda value, src: value),
         broadcast_tensor_dict=MagicMock(
             side_effect=lambda value, src: value or {"next_token_ids": "tokens"}
         ),
     )
+    scheduler.world_group = SimpleNamespace(
+        rank_in_group=(
+            scheduler.pp_group.rank_in_group * scheduler.attn_tp_group.world_size
+        ),
+    )
+    scheduler._pp_vpp_runtime_epoch = 17
+    scheduler._pp_vpp_control_layout_digest = "layout"
     scheduler.device = "cpu"
     scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     scheduler.pp_comm_stream_ctx = nullcontext()
@@ -110,7 +110,7 @@ def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
 class TestSchedulerVPP(unittest.TestCase):
     def test_control_digest_matches_loaded_model_partition(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
+        scheduler.pp_group.world_size = 2
         scheduler.model_config = SimpleNamespace(num_hidden_layers=40)
         for partition in ((10, 10, 10, 10), (9, 11, 11, 9)):
             with self.subTest(partition=partition):
@@ -130,7 +130,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_burst_expands_inflight_window_and_loop_slots(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
+        scheduler.pp_group.world_size = 2
 
         parallel = SimpleNamespace(
             pp_size=2,
@@ -158,7 +158,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_default_vpp_burst_keeps_physical_pipeline_depth(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
+        scheduler.pp_group.world_size = 2
 
         with patch(
             "sglang.srt.managers.scheduler_vpp_mixin.get_parallel",
@@ -173,7 +173,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_explicit_vpp_inflight_window_is_independent_of_burst(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
+        scheduler.pp_group.world_size = 2
 
         parallel = SimpleNamespace(
             pp_size=2,
@@ -267,14 +267,14 @@ class TestSchedulerVPP(unittest.TestCase):
         self, get_reverse_group
     ):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
+        scheduler.pp_group.world_size = 2
         reverse_group = SimpleNamespace(
             recv_tensor_dict_async=MagicMock(return_value=object()),
             send_tensor_dict=MagicMock(return_value=[object()]),
         )
         get_reverse_group.return_value = reverse_group
 
-        scheduler.ps.pp_rank = 0
+        scheduler.pp_group.rank_in_group = 0
         scheduler._pp_vpp_pending_recv = None
         scheduler._pp_vpp_start_receiver()
         reverse_group.recv_tensor_dict_async.assert_called_once_with(
@@ -283,7 +283,7 @@ class TestSchedulerVPP(unittest.TestCase):
             tag=1,
         )
 
-        scheduler.ps.pp_rank = 1
+        scheduler.pp_group.rank_in_group = 1
         send_work = SchedulerPPMixin._pp_send_dict_to_next_stage(
             scheduler,
             {"hidden_states": torch.arange(2)},
@@ -299,8 +299,8 @@ class TestSchedulerVPP(unittest.TestCase):
         self, get_reverse_group
     ):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_size = 2
-        scheduler.ps.pp_rank = 0
+        scheduler.pp_group.world_size = 2
+        scheduler.pp_group.rank_in_group = 0
         scheduler.pp_group.send_tensor_dict = MagicMock(return_value=[object()])
 
         SchedulerPPMixin._pp_send_dict_to_next_stage(
@@ -409,7 +409,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_receiver_routes_arrival_by_envelope_identity(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_rank = 1
+        scheduler.pp_group.rank_in_group = 1
         scheduler._pp_vpp_pending_recv = None
         scheduler._pp_vpp_ready_proxies = {}
         scheduler._pp_vpp_early_activations = {}
@@ -558,7 +558,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_receiver_quarantines_activation_until_admit(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_rank = 1
+        scheduler.pp_group.rank_in_group = 1
         scheduler._pp_vpp_pending_recv = None
         scheduler._pp_vpp_ready_proxies = {}
         scheduler._pp_vpp_early_activations = {}
@@ -664,7 +664,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_receiver_rejects_activation_for_recycled_slot(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_rank = 1
+        scheduler.pp_group.rank_in_group = 1
         scheduler._pp_vpp_ready_proxies = {}
         scheduler._pp_vpp_early_activations = {}
         scheduler._pp_vpp_slot_batch_seqs = [None, None, None, 3]
@@ -770,7 +770,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_control_tp_follower_only_consumes_tp0_broadcast(self):
         scheduler = _make_scheduler()
-        scheduler.ps.tp_rank = 1
+        scheduler.attn_tp_group.rank_in_group = 1
         envelope = PipelineControlEnvelope(
             protocol_version=1,
             runtime_epoch=17,
@@ -797,7 +797,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_control_tp_follower_does_not_use_pp_ring(self):
         scheduler = _make_scheduler()
-        scheduler.ps.tp_rank = 1
+        scheduler.attn_tp_group.rank_in_group = 1
         scheduler._pp_vpp_pending_control_recv = None
         scheduler._pp_vpp_control_outbox = deque()
         scheduler.pp_group.recv_tensor_dict_async = MagicMock()
@@ -1321,7 +1321,7 @@ class TestSchedulerVPP(unittest.TestCase):
         self, _set_time_batch, _get_parallel
     ):
         scheduler = _make_scheduler(is_last_rank=True)
-        scheduler.ps.tp_rank = 1
+        scheduler.attn_tp_group.rank_in_group = 1
         scheduler.run_batch = MagicMock(
             return_value=SimpleNamespace(
                 pp_hidden_states_proxy_tensors=None,
@@ -1376,8 +1376,8 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_tp_leader_waits_until_task_is_ready_on_every_lane(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_rank = 1
-        scheduler.ps.tp_rank = 0
+        scheduler.pp_group.rank_in_group = 1
+        scheduler.attn_tp_group.rank_in_group = 0
         scheduler._pp_vpp_all_gather_cpu_state = MagicMock(
             return_value=torch.tensor(
                 [
@@ -1412,8 +1412,8 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_tp_follower_dispatches_tensor_broadcast_action(self):
         scheduler = _make_scheduler()
-        scheduler.ps.pp_rank = 1
-        scheduler.ps.tp_rank = 1
+        scheduler.pp_group.rank_in_group = 1
+        scheduler.attn_tp_group.rank_in_group = 1
         scheduler._pp_vpp_all_gather_cpu_state = MagicMock(
             return_value=torch.tensor(
                 [
@@ -1445,7 +1445,7 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_rank_local_loop_admits_ready_work_during_next_bootstrap_round(self):
         scheduler = _make_scheduler(is_first_rank=True)
-        scheduler.ps.pp_rank = 0
+        scheduler.pp_group.rank_in_group = 0
         scheduler.world_group.rank_in_group = 0
         scheduler.world_group.broadcast_object = MagicMock(return_value=17)
         scheduler.attn_tp_group.all_gather_object = MagicMock(
@@ -1536,7 +1536,7 @@ class TestSchedulerVPP(unittest.TestCase):
                 wire = scheduler._pp_vpp_control_outbox.popleft()
                 envelope = PipelineControlEnvelope.from_dict(wire)
                 sent_kinds.append(envelope.kind)
-                while envelope.hops < scheduler.ps.pp_size:
+                while envelope.hops < scheduler.pp_group.world_size:
                     envelope = envelope.forwarded()
                 control_inbox.append((envelope, envelope.to_dict()))
 

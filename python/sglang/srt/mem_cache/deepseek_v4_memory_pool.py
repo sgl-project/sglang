@@ -90,12 +90,14 @@ def collect_sources_by_ratio(
     for ratio in (4, 128, 1, 2):
         if ratio in (1, 2):
             layers = [
-                l
-                for l in kv_source_layers
-                if l in stage and compression_ratios[l] == ratio
+                layer_id
+                for layer_id in kv_source_layers
+                if layer_id in stage and compression_ratios[layer_id] == ratio
             ]
         else:
-            layers = [l for l in stage if compression_ratios[l] == ratio]
+            layers = [
+                layer_id for layer_id in stage if compression_ratios[layer_id] == ratio
+            ]
         if layers:
             sources_by_ratio[ratio] = layers
     return sources_by_ratio
@@ -1152,11 +1154,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
-        self.sources_by_ratio = collect_sources_by_ratio(
-            self.compression_ratios,
-            self.kv_source_layers,
-            self.layer_ids,
-        )
+        self.sources_by_ratio = self._collect_sources_by_ratio()
         self._init_compressed_pools(
             stage_ratios=stage_ratios,
             page_size=page_size,
@@ -1650,7 +1648,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """The layer owning this layer's compressed storage: itself for ratios 4/128,
         the nearest preceding kv_source layer for ratios 1/2."""
         ratio = self.compression_ratios[layer_id]
-        sources = [l for l in self.sources_by_ratio[ratio] if l <= layer_id]
+        sources = [
+            source for source in self.sources_by_ratio[ratio] if source <= layer_id
+        ]
         assert sources, f"layer {layer_id} (ratio {ratio}) has no kv_source layer"
         return max(sources)
 

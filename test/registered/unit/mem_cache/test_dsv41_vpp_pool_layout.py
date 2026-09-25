@@ -32,6 +32,17 @@ class TestDeepSeekV41VPPPoolLayout(unittest.TestCase):
         pool.sources_by_ratio = sources
         self.assertEqual(pool.source_layer_of(29), 20)
 
+    def test_stage_starting_after_source_maps_to_replicated_source(self):
+        pool = self._pool(range(9, 20))
+        pool.sources_by_ratio = pool._collect_sources_by_ratio()
+        pool.kv_pools = {2: object()}
+
+        pool._init_compressed_layer_mapping()
+
+        self.assertEqual(pool.sources_by_ratio, {2: [8, 14]})
+        self.assertEqual(pool.layer_mapping[9].compress_layer_id, 0)
+        self.assertEqual(pool.layer_mapping[14].compress_layer_id, 1)
+
     def test_swa_layer_ids_map_to_dense_local_indices(self):
         pool = self._pool(tuple(range(0, 5)) + tuple(range(20, 25)))
 

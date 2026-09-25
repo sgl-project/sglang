@@ -63,8 +63,8 @@ class SchedulerVPPMixin:
             return configured
         burst_size = parallel.pp_vpp_prefill_burst_size
         if burst_size == 1:
-            return self.ps.pp_size
-        return burst_size + self.ps.pp_size
+            return self.pp_group.world_size
+        return burst_size + self.pp_group.world_size
 
     def _pp_vpp_can_queue_admit(
         self: Scheduler,
@@ -91,7 +91,7 @@ class SchedulerVPPMixin:
         if width not in buffers:
             local = torch.empty(width, dtype=torch.int64, device="cpu")
             gathered = torch.empty(
-                (self.ps.tp_size, width),
+                (self.attn_tp_group.world_size, width),
                 dtype=torch.int64,
                 device="cpu",
             )
@@ -99,7 +99,7 @@ class SchedulerVPPMixin:
         local, gathered = buffers[width]
         for index, value in enumerate(values):
             local[index] = int(value)
-        if self.ps.tp_size == 1:
+        if self.attn_tp_group.world_size == 1:
             gathered[0].copy_(local)
         else:
             torch.distributed.all_gather_into_tensor(
@@ -121,12 +121,12 @@ class SchedulerVPPMixin:
         if width not in buffers:
             buffers[width] = torch.empty(width, dtype=torch.int64, device="cpu")
         state = buffers[width]
-        if self.ps.tp_rank == src:
+        if self.attn_tp_group.rank_in_group == src:
             if values is None or len(values) != width:
                 raise RuntimeError("invalid VPP TP broadcast state")
             for index, value in enumerate(values):
                 state[index] = int(value)
-        if self.ps.tp_size > 1:
+        if self.attn_tp_group.world_size > 1:
             torch.distributed.broadcast(
                 state,
                 src=self.attn_tp_group.ranks[src],
@@ -174,14 +174,14 @@ class SchedulerVPPMixin:
         }
 
     def _pp_vpp_activation_group(self: Scheduler, source_rank: int):
-        if self.ps.pp_size == 2 and source_rank == 1:
+        if self.pp_group.world_size == 2 and source_rank == 1:
             return get_vpp_pp_reverse_group()
         return self.pp_group
 
     def _pp_vpp_start_receiver(self: Scheduler) -> None:
         if self._pp_vpp_pending_recv is not None:
             return
-        source_rank = (self.ps.pp_rank - 1) % self.ps.pp_size
+        source_rank = (self.pp_group.rank_in_group - 1) % self.pp_group.world_size
         activation_group = self._pp_vpp_activation_group(source_rank)
         self._pp_vpp_pending_recv = activation_group.recv_tensor_dict_async(
             all_gather_group=self.attn_tp_group,
@@ -222,10 +222,10 @@ class SchedulerVPPMixin:
                 f"generation={generation}, "
                 f"source_stage={source_stage_id}, stage={stage_id}"
             )
-        if stage_id % self.ps.pp_size != self.ps.pp_rank:
+        if stage_id % self.pp_group.world_size != self.pp_group.rank_in_group:
             raise RuntimeError(
                 f"VPP activation for stage {stage_id} arrived on PP rank "
-                f"{self.ps.pp_rank}"
+                f"{self.pp_group.rank_in_group}"
             )
 
         slot_id = batch_seq % len(self._pp_vpp_slot_batch_seqs)
@@ -237,7 +237,7 @@ class SchedulerVPPMixin:
             slot_batch_seq is not None
             and batch_seq == slot_batch_seq + len(self._pp_vpp_slot_batch_seqs)
             and self.pp_group.is_last_rank
-            and stage_id == self.ps.pp_rank
+            and stage_id == self.pp_group.rank_in_group
             and self.mbs[slot_id] is None
         )
         if slot_batch_seq not in (None, batch_seq) and not retiring_previous_generation:
@@ -356,7 +356,7 @@ class SchedulerVPPMixin:
                     in common_ready
                 ),
             )
-            if self.ps.tp_rank == 0
+            if self.attn_tp_group.rank_in_group == 0
             else None
         )
         identity = (
@@ -365,14 +365,14 @@ class SchedulerVPPMixin:
             else (action.tick, action.batch_seq, action.stage_id)
         )
         identity_state = self._pp_vpp_broadcast_cpu_state(
-            identity if self.ps.tp_rank == 0 else None,
+            identity if self.attn_tp_group.rank_in_group == 0 else None,
             width=3,
             src=0,
         )
         if int(identity_state[0]) < 0:
             return None
         action_tick, batch_seq, stage_id = map(int, identity_state)
-        if self.ps.tp_rank == 0:
+        if self.attn_tp_group.rank_in_group == 0:
             return action
         if not is_ready(batch_seq, stage_id):
             raise RuntimeError(
@@ -408,7 +408,7 @@ class SchedulerVPPMixin:
         return self.tp_worker.model_runner.model.model.pipeline_layout.digest
 
     def _pp_vpp_start_control_receiver(self: Scheduler) -> None:
-        if self.ps.tp_rank != 0:
+        if self.attn_tp_group.rank_in_group != 0:
             return
         if self._pp_vpp_pending_control_recv is not None:
             return
@@ -420,7 +420,7 @@ class SchedulerVPPMixin:
     def _pp_vpp_poll_control_receiver(
         self: Scheduler,
     ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
-        if self.ps.tp_rank != 0:
+        if self.attn_tp_group.rank_in_group != 0:
             raise RuntimeError("only TP0 may poll the VPP control ring")
         handle: Optional[TensorDictRecvHandle] = self._pp_vpp_pending_control_recv
         if handle is None:
@@ -444,7 +444,7 @@ class SchedulerVPPMixin:
         self: Scheduler,
     ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
         wire = None
-        if self.ps.tp_rank == 0:
+        if self.attn_tp_group.rank_in_group == 0:
             message = self._pp_vpp_poll_control_receiver()
             if message is not None:
                 wire = message[1]
@@ -465,7 +465,7 @@ class SchedulerVPPMixin:
         envelope: PipelineControlEnvelope,
         tensors: Optional[Dict[str, object]] = None,
     ) -> None:
-        if self.ps.tp_rank != 0:
+        if self.attn_tp_group.rank_in_group != 0:
             return
         wire = envelope.to_dict()
         if tensors:
@@ -484,7 +484,7 @@ class SchedulerVPPMixin:
         pending_work: deque,
         max_pending: int,
     ) -> None:
-        if self.ps.tp_rank != 0:
+        if self.attn_tp_group.rank_in_group != 0:
             return
         self._pp_vpp_reap_send_work(pending_work)
         while self._pp_vpp_control_outbox and len(pending_work) < max_pending:
@@ -514,7 +514,7 @@ class SchedulerVPPMixin:
             runtime_epoch=self._pp_vpp_runtime_epoch,
             layout_digest=self._pp_vpp_control_layout_digest,
             kind=kind,
-            source_rank=self.ps.pp_rank,
+            source_rank=self.pp_group.rank_in_group,
             batch_seq=batch_seq,
             generation=generation,
             slot_id=slot_id,
@@ -694,7 +694,7 @@ class SchedulerVPPMixin:
                 start=start,
                 end=extend_range.end,
                 required_stages=range(
-                    self.ps.pp_size * get_parallel().pp_virtual_stages
+                    self.pp_group.world_size * get_parallel().pp_virtual_stages
                 ),
             )
             if not hasattr(req, "_vpp_original_skip_radix_cache_insert"):
@@ -822,11 +822,11 @@ class SchedulerVPPMixin:
         pp_proxy_tensors = None
         if action.stage_id > 0:
             pp_proxy_tensors = self._pp_recv_vpp_proxy_tensors(
-                first_visit=action.stage_id < self.ps.pp_size,
+                first_visit=action.stage_id < self.pp_group.world_size,
                 expected_batch_seq=action.batch_seq,
                 expected_stage_id=action.stage_id,
             )
-        if self.enable_staging and action.stage_id < self.ps.pp_size:
+        if self.enable_staging and action.stage_id < self.pp_group.world_size:
             self.maybe_prefetch_staging_for_batch(batch)
         _, event, send_work = self._pp_launch_vpp_stage(
             action,
@@ -920,7 +920,7 @@ class SchedulerVPPMixin:
                     continue
                 if getattr(self, "_pp_vpp_overlap_chunks", False):
                     generation = int(getattr(req, "session_generation", None) or 0)
-                    for stage_id in range(self.ps.pp_size * 2):
+                    for stage_id in range(self.pp_group.world_size * 2):
                         self._pp_vpp_launched_prefix.pop(
                             (req.rid, generation, stage_id), None
                         )
@@ -944,8 +944,8 @@ class SchedulerVPPMixin:
         self._pp_vpp_launched_prefix = {}
         max_inflight = self._pp_vpp_max_inflight()
         rank_schedule = PipelineRankSchedule(
-            physical_rank=self.ps.pp_rank,
-            physical_size=self.ps.pp_size,
+            physical_rank=self.pp_group.rank_in_group,
+            physical_size=self.pp_group.world_size,
             virtual_stages=get_parallel().pp_virtual_stages,
             max_inflight=max_inflight,
             prefill_burst_size=get_parallel().pp_vpp_prefill_burst_size,
@@ -987,7 +987,7 @@ class SchedulerVPPMixin:
         hc_mult = int(getattr(self.model_config.hf_config, "hc_mult", 1))
         activation_high = max_inflight * token_budget * hidden_size * hc_mult * 2
         resource_gate = PipelineResourceGate(
-            ranks=range(self.ps.pp_size),
+            ranks=range(self.pp_group.world_size),
             activation_low_watermark=activation_high // 2,
             activation_high_watermark=activation_high,
             max_pending_sends=max_inflight,
@@ -1205,12 +1205,12 @@ class SchedulerVPPMixin:
             nonlocal bootstrap_round_active, transfer_round_active
             payload = envelope.payload or {}
             returned_to_source = (
-                envelope.source_rank == self.ps.pp_rank
-                and envelope.hops >= self.ps.pp_size
+                envelope.source_rank == self.pp_group.rank_in_group
+                and envelope.hops >= self.pp_group.world_size
             )
 
             if envelope.kind == PipelineControlKind.RESOURCE:
-                if self.ps.pp_rank == 0:
+                if self.pp_group.rank_in_group == 0:
                     resource_gate.update(
                         envelope.source_rank,
                         PipelineResourceSnapshot(**payload),
@@ -1378,7 +1378,7 @@ class SchedulerVPPMixin:
                 if local_manifest != expected_manifest:
                     payload.setdefault("errors", []).append(
                         (
-                            self.ps.pp_rank,
+                            self.pp_group.rank_in_group,
                             expected_manifest,
                             local_manifest,
                         )
@@ -1391,7 +1391,7 @@ class SchedulerVPPMixin:
                 return
 
             if envelope.kind == PipelineControlKind.FIRST_PASS_DONE:
-                if self.ps.pp_rank == 0:
+                if self.pp_group.rank_in_group == 0:
                     pending_first_pass[envelope.batch_seq].add(envelope.source_rank)
                 else:
                     forward_control(envelope, wire)
@@ -1485,8 +1485,8 @@ class SchedulerVPPMixin:
                     break
                 envelope, wire = control_message
                 returned_to_source = (
-                    envelope.source_rank == self.ps.pp_rank
-                    and envelope.hops >= self.ps.pp_size
+                    envelope.source_rank == self.pp_group.rank_in_group
+                    and envelope.hops >= self.pp_group.world_size
                 )
                 if (
                     envelope.kind == PipelineControlKind.ADMIT
@@ -1519,7 +1519,7 @@ class SchedulerVPPMixin:
             snapshot = self._pp_vpp_resource_snapshot(activation_send_work)
             if snapshot != last_resource_snapshot:
                 last_resource_snapshot = snapshot
-                if self.ps.pp_rank == 0:
+                if self.pp_group.rank_in_group == 0:
                     resource_gate.update(0, snapshot)
                 else:
                     self._pp_vpp_queue_control(
@@ -1689,7 +1689,7 @@ class SchedulerVPPMixin:
                 self.process_pending_chunked_abort()
 
             for batch_seq, ranks in tuple(pending_first_pass.items()):
-                if len(ranks) != self.ps.pp_size:
+                if len(ranks) != self.pp_group.world_size:
                     continue
                 batch = self.mbs[batch_seq % max_inflight]
                 req = None if batch is None else batch.chunked_req
@@ -1782,7 +1782,7 @@ class SchedulerVPPMixin:
                                 content_id=content_id,
                                 source_id=int(source_id),
                                 format_version=1,
-                                consumer_rank=self.ps.pp_rank,
+                                consumer_rank=self.pp_group.rank_in_group,
                             )
                             state = self._pp_vpp_replica_registry.get(identity)
                             generation = (
@@ -1850,7 +1850,7 @@ class SchedulerVPPMixin:
                                 )
                             )
                     if transition.first_pass_done:
-                        if self.ps.pp_rank == 0:
+                        if self.pp_group.rank_in_group == 0:
                             pending_first_pass[action.batch_seq].add(0)
                         else:
                             self._pp_vpp_queue_control(
@@ -1907,7 +1907,7 @@ class SchedulerVPPMixin:
                 or rank_schedule.inflight_count > 0
             )
             if (
-                self.ps.tp_rank == 0
+                self.attn_tp_group.rank_in_group == 0
                 and has_pending_work
                 and now - stall_last_progress_at >= 10
                 and now - stall_last_log_at >= 10
@@ -1929,7 +1929,7 @@ class SchedulerVPPMixin:
                     tick,
                     stall_last_progress_event,
                     stall_last_progress_tick,
-                    self.ps.pp_rank,
+                    self.pp_group.rank_in_group,
                     sorted(pending_admits),
                     bootstrap_round_active,
                     transfer_round_active,
@@ -2026,10 +2026,10 @@ class SchedulerVPPMixin:
     ):
         if get_parallel().pp_virtual_stages != 2:
             raise RuntimeError("the VPP scheduler currently supports VPP2 only")
-        if action.physical_rank != self.ps.pp_rank:
+        if action.physical_rank != self.pp_group.rank_in_group:
             raise RuntimeError(
                 f"wavefront action for PP rank {action.physical_rank} "
-                f"cannot run on PP rank {self.ps.pp_rank}"
+                f"cannot run on PP rank {self.pp_group.rank_in_group}"
             )
         if action.stage_id == 0:
             if pp_proxy_tensors is not None:
@@ -2044,7 +2044,7 @@ class SchedulerVPPMixin:
         with torch.profiler.record_function(stage_label):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
-                if action.stage_id < self.ps.pp_size:
+                if action.stage_id < self.pp_group.world_size:
                     set_time_batch(
                         cur_batch.reqs,
                         "set_run_batch_cpu_start_time",
@@ -2052,7 +2052,7 @@ class SchedulerVPPMixin:
                     )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 is_last_stage = action.stage_id == (
-                    self.ps.pp_size * get_parallel().pp_virtual_stages - 1
+                    self.pp_group.world_size * get_parallel().pp_virtual_stages - 1
                 )
                 if getattr(cur_batch, "return_logprob", False) or getattr(
                     cur_batch, "return_hidden_states", False
@@ -2090,7 +2090,7 @@ class SchedulerVPPMixin:
                         batch_p2p=True,
                         tag=_VPP_ACTIVATION_TAG,
                     )
-                if action.stage_id >= self.ps.pp_size:
+                if action.stage_id >= self.pp_group.world_size:
                     set_time_batch(
                         cur_batch.reqs,
                         "set_run_batch_cpu_end_time",
@@ -2104,7 +2104,7 @@ class SchedulerVPPMixin:
                 if is_last_stage:
                     output_tensors = (
                         self._pp_prepare_tensor_dict(result, cur_batch)
-                        if self.ps.tp_rank == 0
+                        if self.attn_tp_group.rank_in_group == 0
                         else None
                     )
                     output_tensors = self.attn_tp_group.broadcast_tensor_dict(

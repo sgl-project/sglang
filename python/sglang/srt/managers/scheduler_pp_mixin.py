@@ -948,7 +948,7 @@ class SchedulerPPMixin:
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
         pp_group = (
-            self._pp_vpp_activation_group(self.ps.pp_rank)
+            self._pp_vpp_activation_group(self.pp_group.rank_in_group)
             if msg_type == "vpp_proxy"
             else self.pp_group
         )
