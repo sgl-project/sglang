@@ -441,6 +441,8 @@ class MHCLayerCommunicator(LayerCommunicator):
                 context=self._context,
             )
         )
+        # MHC's own prepare_attn and postprocess run these.
+        return self._communicate_simple_fn, self._communicate_summable_tensor_pair_fn
 
     def prepare_attn(
         self,
@@ -494,14 +496,14 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual_input_mode = self.layer_scatter_modes.layer_input_mode
         fns = MHCCommunicateWithAllReduceAndLayerNormFn
         if kind is MlpInputKind.NORM:
-            return partial(fns._simple, mhc=self.mhc), False
+            return partial(fns._simple, mhc=self.mhc), ()
         if kind is MlpInputKind.GATHER:
             fn = fns._gather_hidden_states_and_residual
         elif kind is MlpInputKind.SCATTER:
             fn = fns._scatter_hidden_states_and_residual
         else:
             raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
-        return partial(fn, residual_input_mode=residual_input_mode, mhc=self.mhc), False
+        return partial(fn, residual_input_mode=residual_input_mode, mhc=self.mhc), ()
 
     def postprocess_layer(self, hidden_states, residual, forward_batch):
         hidden_states, residual = self._communicate_summable_tensor_pair_fn(

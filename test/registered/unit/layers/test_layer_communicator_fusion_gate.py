@@ -40,15 +40,32 @@ def sp_region_steps():
     )
 
 
+def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
+    return comm.BoundarySteps(
+        attention_input=comm.CommunicateSimpleFn._trivial,
+        ffn_input=comm._mlp_input_norm,
+        ffn_output=ffn_output or StageOutput(Layout(frozenset()), group=SumGroup.TP),
+        ffn_output_move=(
+            None if returns_over_dp else comm.CommunicateSummableTensorPairFn._trivial
+        ),
+        ffn_sum_is_movable=ffn_sum_is_movable,
+    )
+
+
 def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._speculative_algo = None
     communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
     # Fixed at construction by the scatter-mode path from the MLP's mode.
-    communicator._ffn_sum_is_movable = mlp_mode not in (
-        ScatterMode.MOE_FULL,
-        ScatterMode.SCATTERED,
+    communicator._steps = _steps(
+        ffn_sum_is_movable=mlp_mode
+        not in (
+            ScatterMode.MOE_FULL,
+            ScatterMode.SCATTERED,
+        )
     )
+    communicator._sp_steps = None
+    communicator._input_scattered_steps = None
     communicator.is_last_layer = False
     communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
@@ -347,14 +364,16 @@ class TestDeferFfnReduction(CustomTestCase):
     ):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
-        communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
         communicator._sp_steps = sp_region_steps() if sp_active else None
         communicator._input_scattered_steps = None
-        communicator._ffn_output = StageOutput(
-            Layout(frozenset()),
-            group=SumGroup.MOE_OUTPUT,
-            leaves_for_reduce_scatter=True,
-            leaves_for_reduce_scatterv=True,
+        communicator._steps = _steps(
+            ffn_output=StageOutput(
+                Layout(frozenset()),
+                group=SumGroup.MOE_OUTPUT,
+                leaves_for_reduce_scatter=True,
+                leaves_for_reduce_scatterv=True,
+            ),
+            returns_over_dp=scatters_to_local_tokens,
         )
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(batch_size,)),
