@@ -1195,7 +1195,6 @@ def _resolve_test_spec(test_spec):
 
 
 def _too_long_for_rerun(entry, path):
-    """Error for a test estimated past the rerun-test step timeout, else None."""
     est = _partition.estimate_seconds(
         entry["test_command"], Path("."), entry["mode"], entry["runs_on"]
     )

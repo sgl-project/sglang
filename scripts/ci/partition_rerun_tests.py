@@ -32,7 +32,6 @@ def _lpt():
 
 
 def resolve_runs_on(cfg):
-    """runs_on of a runner_configs.yml entry, with `$b200_runner` resolved."""
     runs_on = cfg.get("runs_on")
     return B200_RERUN_RUNNER if runs_on == "$b200_runner" else runs_on
 
@@ -107,7 +106,6 @@ def _multimodal_estimates(root):
 
 
 def estimate_seconds(command, root, mode, runs_on=""):
-    """Estimate one rerun command; prefer the registration that runs on `runs_on`."""
     if mode == "multimodal_gen":
         filename, _, selector = command.split()[0].partition("::")
         cases, standalone = _multimodal_estimates(root)
@@ -133,7 +131,6 @@ def estimate_seconds(command, root, mode, runs_on=""):
 
 
 def _pack(items):
-    """Split into the fewest LPT partitions that each fit PARTITION_SECONDS."""
     count = math.ceil(sum(item.est_time for item in items) / PARTITION_SECONDS)
     while True:
         partitions = _lpt().partition_items_by_lpt(items, count)
