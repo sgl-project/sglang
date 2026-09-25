@@ -77,9 +77,7 @@ def pull(
         _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
-        # Miles waits for every startup pull(0) before publishing new deltas.
-        # The host-local directory can outlive its previous trainer. Only an
-        # explicit reset may go backwards; a stale positive pull stays a no-op.
+        # Only an explicit reset may go backwards; stale positive pulls stay no-ops.
         if target_version == 0 and applied is not None and applied > 0:
             applied = None
         # Scan back from the target for the newest full version. Stop at the
@@ -116,10 +114,8 @@ def _is_delta(version_dir: str) -> bool:
         with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
             return "delta_encoding" in json.load(f).get("metadata", {})
     except FileNotFoundError:
-        # A delta's shards may become visible before its publication index.
-        # Only the standard single-file HF layout is unambiguous without one;
-        # treating an indexless sharded/empty directory as full would copy the
-        # compressed delta bytes and incorrectly mark the target as applied.
+        # Delta shards may appear before their index. Only a standard single-file
+        # checkpoint is unambiguous; copying compressed shards would corrupt the base.
         filenames = [
             os.path.basename(path)
             for path in glob.glob(os.path.join(version_dir, "*.safetensors"))
@@ -284,15 +280,22 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         )
     encoding = meta["delta_encoding"]
     algorithm = meta["checksum_format"]
+    tensors_by_file = {}
+    for name, filename in index["weight_map"].items():
+        tensors_by_file.setdefault(filename, set()).add(name)
+    if not tensors_by_file:
+        if encoding not in ("xor", "overwrite"):
+            raise NotImplementedError(f"delta encoding {encoding!r} not supported")
+        # No bytes change, so keep the valid marker until its atomic replacement.
+        _write_applied_version(local_checkpoint_dir, int(meta["version"]))
+        return
+
     locations = _tensor_locations(local_checkpoint_dir)
     open_mmaps = {}
     mismatches = []
     lock = threading.Lock()
     file_bytes = []  # keep alive: items hold zero-copy views into these
     items = []  # (name, compressed_view, path, offset, nbytes, want_checksum)
-    tensors_by_file = {}
-    for name, filename in index["weight_map"].items():
-        tensors_by_file.setdefault(filename, set()).add(name)
     try:
         # The index is the publication boundary. Globbing can silently accept
         # an incomplete object-store view as an empty or partial update, then
