@@ -25,9 +25,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -38,6 +35,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -50,7 +48,7 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -339,10 +337,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -368,10 +363,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -812,6 +804,7 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -836,6 +829,10 @@ class Glm4MoeLiteModel(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

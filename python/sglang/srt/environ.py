@@ -1001,6 +1001,9 @@ class Envs:
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
+    # since the block-scale MoE kernel lacks SwiGLU-OAI
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.

@@ -539,6 +539,86 @@ def tp_reduce_scatter(
     return output, residual
 
 
+def _update_and_read_residual_plain(
+    norm, hidden_states, residual, post_residual_addition
+):
+    if residual is None:
+        return norm(hidden_states), hidden_states
+    return norm(hidden_states, residual, post_residual_addition)
+
+
+def _update_and_read_residual_aiter_mxfp4(
+    norm, hidden_states, residual, post_residual_addition
+):
+    # post_residual_addition is not applied on this path.
+    output, *_, residual_out = fused_rms_mxfp4_quant(
+        hidden_states,
+        norm.weight,
+        norm.variance_epsilon,
+        None,
+        None,
+        None,
+        residual,
+    )
+    return output, hidden_states if residual is None else residual_out
+
+
+def _update_and_read_residual_aiter_fp8_group(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """aiter (ROCm gfx95) fused RMSNorm + FP8 group quant. Under DSA the
+    unquantized bf16 output rides along as a third element, so the DSA indexer
+    can skip dequantizing. post_residual_addition is not applied on this path."""
+    needs_bf16 = get_attn_tp_context().is_dsa
+    output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
+        hidden_states,
+        norm.weight,
+        norm.variance_epsilon,
+        inp2=None,
+        inp2_weight=None,
+        inp2_epsilon=None,
+        group_size=128,
+        dtype_quant=torch.float8_e4m3fn,
+        res1=residual,
+        output_unquantized_inp1=needs_bf16,
+        transpose_scale=False,
+    )
+    if _use_aiter_bpreshuffle_gfx95:
+        output = materialize_bpreshuffle_fp8_scale_tuple(output)
+    if needs_bf16:
+        output = (output[0], output[1], unquantized)
+    return output, hidden_states if residual is None else residual_out
+
+
+def _update_and_read_residual_aiter_fp8_per_token(
+    norm, hidden_states, residual, post_residual_addition
+):
+    if residual is None:
+        output = _fused_rmsnorm_fp8_per_token_quant(
+            hidden_states, norm.weight.data, norm.variance_epsilon
+        )
+        return output, hidden_states
+    if post_residual_addition is not None:
+        residual = residual + post_residual_addition
+    return _fused_rmsnorm_fp8_per_token_quant(
+        hidden_states, norm.weight.data, norm.variance_epsilon, residual=residual
+    )
+
+
+def _attn_input_update_and_read_residual(quant_format: str):
+    """Add the previous layer's output to the residual and read the attention
+    input from it: the input norm, fused with the quantization this format
+    wants. Without a residual (the first layer, or one already folded into
+    hidden_states) the input itself becomes the residual."""
+    if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
+        return _update_and_read_residual_aiter_mxfp4
+    if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
+        return _update_and_read_residual_aiter_fp8_group
+    if _use_aiter and quant_format == "fp8_per_token":
+        return _update_and_read_residual_aiter_fp8_per_token
+    return _update_and_read_residual_plain
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -711,158 +791,18 @@ class LayerCommunicator:
             )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
+        elif (
+            residual is not None
+            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+            and hidden_states._sglang_needs_allreduce_fusion
+        ):
+            hidden_states, residual = self._reduce_output_and_update_and_read_residual(
+                hidden_states, residual, forward_batch
+            )
         else:
-            if (
-                residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
-            ):
-                if (
-                    apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
-                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    quant_result = None
-                    if (
-                        self.enable_fused_ar_quant
-                        and _use_aiter
-                        and hasattr(
-                            self.input_layernorm,
-                            "forward_with_allreduce_fusion_quant_per_group",
-                        )
-                    ):
-                        # Try fused AR+RMSNorm+per-group-quant. Internally
-                        # falls back to AR+RMSNorm + separate quant when the
-                        # fully-fused kernel cannot service the shape.
-                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
-                            hidden_states,
-                            residual,
-                            use_attn_tp_group=False,
-                            keep_bf16=self.fused_ar_quant_keep_bf16,
-                        )
-                    if quant_result is not None:
-                        hidden_states, residual = quant_result
-                    else:
-                        hidden_states, residual = (
-                            self.input_layernorm.forward_with_allreduce_fusion(
-                                hidden_states, residual, use_attn_tp_group=False
-                            )
-                        )
-                else:
-                    # Fusion was published but this shape can't use the kernel,
-                    # so run the deferred reduction inline.
-                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
-                    hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual
-                    )
-            else:
-                if residual is None:
-                    residual = hidden_states
-
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
-                        hidden_states, *_, _ = fused_rms_mxfp4_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
-                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
-                        # When DSA is active, also preserve the unquantized bf16
-                        # output as a 3-tuple (fp8, scale, bf16) so the DSA
-                        # indexer can skip redundant FP8 dequantization.
-                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
-                        hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            inp2=None,
-                            inp2_weight=None,
-                            inp2_epsilon=None,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=_dsa_needs_bf16,
-                            transpose_scale=False,
-                        )
-                        if _use_aiter_bpreshuffle_gfx95:
-                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
-                                hidden_states
-                            )
-                        if _dsa_needs_bf16:
-                            hidden_states = (
-                                hidden_states[0],
-                                hidden_states[1],
-                                _unq_bf16,
-                            )
-
-                    elif _use_aiter and (quant_format == "fp8_per_token"):
-                        hidden_states = _fused_rmsnorm_fp8_per_token_quant(
-                            hidden_states,
-                            self.input_layernorm.weight.data,
-                            self.input_layernorm.variance_epsilon,
-                        )
-
-                    else:
-                        hidden_states = self.input_layernorm(hidden_states)
-                else:
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
-                        hidden_states, *_, residual = fused_rms_mxfp4_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            None,
-                            None,
-                            None,
-                            residual,
-                        )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
-                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
-                        # with residual addition. When DSA is active, pack
-                        # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
-                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
-                        hidden_states, _unq_bf16, _, residual = (
-                            fused_rms_fp8_group_quant(
-                                hidden_states,
-                                self.input_layernorm.weight,
-                                self.input_layernorm.variance_epsilon,
-                                inp2=None,
-                                inp2_weight=None,
-                                inp2_epsilon=None,
-                                group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
-                                res1=residual,
-                                output_unquantized_inp1=_dsa_needs_bf16,
-                                transpose_scale=False,
-                            )
-                        )
-                        if _use_aiter_bpreshuffle_gfx95:
-                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
-                                hidden_states
-                            )
-                        if _dsa_needs_bf16:
-                            hidden_states = (
-                                hidden_states[0],
-                                hidden_states[1],
-                                _unq_bf16,
-                            )
-                    elif _use_aiter and (quant_format == "fp8_per_token"):
-                        if post_residual_addition is not None:
-                            residual = residual + post_residual_addition
-                        hidden_states, residual = _fused_rmsnorm_fp8_per_token_quant(
-                            hidden_states,
-                            self.input_layernorm.weight.data,
-                            self.input_layernorm.variance_epsilon,
-                            residual=residual,
-                        )
-                    else:
-                        hidden_states, residual = self.input_layernorm(
-                            hidden_states,
-                            residual,
-                            post_residual_addition,
-                        )
+            hidden_states, residual = _attn_input_update_and_read_residual(
+                quant_format
+            )(self.input_layernorm, hidden_states, residual, post_residual_addition)
 
         return self._finish_prepare_attn(
             hidden_states=hidden_states,
@@ -883,6 +823,47 @@ class LayerCommunicator:
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
+
+    def _reduce_output_and_update_and_read_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Complete the sum the previous layer left, add it to the residual and
+        apply the input norm:
+        fused into one kernel when it takes this batch, else as an all-reduce
+        followed by the norm. Neither applies ``quant_format`` or
+        ``post_residual_addition``."""
+        if (
+            apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
+            or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+        ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+            if (
+                self.enable_fused_ar_quant
+                and _use_aiter
+                and hasattr(
+                    self.input_layernorm,
+                    "forward_with_allreduce_fusion_quant_per_group",
+                )
+            ):
+                # Falls back to AR+RMSNorm + separate quant internally when the
+                # fully-fused kernel cannot service the shape.
+                quant_result = (
+                    self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
+                        hidden_states,
+                        residual,
+                        use_attn_tp_group=False,
+                        keep_bf16=self.fused_ar_quant_keep_bf16,
+                    )
+                )
+                if quant_result is not None:
+                    return quant_result
+            return self.input_layernorm.forward_with_allreduce_fusion(
+                hidden_states, residual, use_attn_tp_group=False
+            )
+        hidden_states = deferred_post_experts_all_reduce(hidden_states)
+        return self.input_layernorm(hidden_states, residual)
 
     def _tp_reduce_scatter(
         self,
@@ -942,6 +923,17 @@ class LayerCommunicator:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call, then call ``finish``."""
         return FfnExit(self, forward_batch)
+
+    def finish_layer_stack(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Complete what this layer left for a next layer. Call it on the last
+        layer of this rank before its output reaches the final norm, the next
+        pipeline rank, or any other consumer outside the layers."""
+        return complete_deferred_allreduce(hidden_states), residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
@@ -1114,6 +1106,17 @@ class FfnExit:
         return self.communicator.postprocess_layer(
             hidden_states, residual, self.forward_batch
         )
+
+
+def complete_deferred_allreduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the all-reduce a layer left for the next layer's input norm."""
+    if (
+        hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+        and hidden_states._sglang_needs_allreduce_fusion
+    ):
+        hidden_states = deferred_post_experts_all_reduce(hidden_states)
+        hidden_states._sglang_needs_allreduce_fusion = False
+    return hidden_states
 
 
 @dataclass
