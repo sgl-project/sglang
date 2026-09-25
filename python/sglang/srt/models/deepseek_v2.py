@@ -581,6 +581,7 @@ class DeepseekV2MoE(nn.Module):
         self._deferred_finalize_max_tokens = (
             envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
         )
+        self.is_deepseek_v4 = is_deepseek_v4
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
