@@ -25,7 +25,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_lora, get_model, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -311,6 +311,23 @@ class Gemma3nAltUp(nn.Module):
         return corrected, output
 
 
+class Gemma3nQOnlyLinear(ColumnParallelLinear):
+    """Query projection with the existing packed QKV checkpoint interface."""
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[str] = None,
+    ):
+        if loaded_shard_id in ("k", "v"):
+            return
+        if loaded_shard_id is None:
+            # Fused checkpoints store Q before the unused K/V rows.
+            loaded_weight = loaded_weight.narrow(param.output_dim, 0, self.output_size)
+        super().weight_loader(param, loaded_weight)
+
+
 class Gemma3nAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -350,15 +367,35 @@ class Gemma3nAttention(nn.Module):
         # self.scaling = config.query_rescale_scalar / config.query_pre_attn_scalar
         self.scaling = 1.0
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=config.attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
         )
+        self.is_kv_shared_layer = layer_id >= first_kv_shared_layer_idx
+        # Preserve packed layouts for quantization, LoRA and direct state copies.
+        self.q_only = (
+            self.is_kv_shared_layer
+            and quant_config is None
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+            and get_model().load_format
+            not in ("sharded_state", "remote", "remote_instance")
+        )
+        if self.q_only:
+            self.qkv_proj = Gemma3nQOnlyLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=config.attention_bias,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -369,12 +406,6 @@ class Gemma3nAttention(nn.Module):
 
         # Determine if layer uses sliding window based on pattern
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
-
-        # Check if this is a KV shared layer
-        first_kv_shared_layer_idx = (
-            config.num_hidden_layers - config.num_kv_shared_layers
-        )
-        self.is_kv_shared_layer = layer_id >= first_kv_shared_layer_idx
 
         # Compute the layer index from which shared KV cache values will be retrieved
         if not self.is_kv_shared_layer:
@@ -446,9 +477,10 @@ class Gemma3nAttention(nn.Module):
     ) -> torch.Tensor:
 
         qkv, _ = self.qkv_proj(hidden_states)
-        # TODO: for first 20 layers, we use QKVParallelLinear
-        #       for others, we only calc Q.
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.q_only:
+            q, k, v = qkv, None, None
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Apply normalization to q, k, v
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
