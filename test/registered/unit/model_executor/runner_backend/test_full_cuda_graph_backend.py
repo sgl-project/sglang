@@ -194,5 +194,24 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         self.assertEqual(rf_names, [])
 
 
+class TestCleanup(CustomTestCase):
+    def test_resets_graphs_before_releasing_references(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        graphs = [mock.Mock(), mock.Mock()]
+        backend._graphs = {
+            ShapeKey(size=i + 1): graph for i, graph in enumerate(graphs)
+        }
+        backend._outputs = {ShapeKey(size=1): object()}
+        backend._pool = object()
+
+        backend.cleanup()
+
+        for graph in graphs:
+            graph.reset.assert_called_once_with()
+        self.assertEqual(backend._graphs, {})
+        self.assertEqual(backend._outputs, {})
+        self.assertIsNone(backend._pool)
+
+
 if __name__ == "__main__":
     unittest.main()

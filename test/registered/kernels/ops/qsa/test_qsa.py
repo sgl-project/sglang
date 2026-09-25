@@ -1,5 +1,5 @@
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -566,6 +566,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                 q.squeeze(1)
             ),
         )
+        indexer._forward_impl = MethodType(QSAIndexer._forward_impl, indexer)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             positions=torch.cat(
@@ -715,6 +716,7 @@ def test_qsa_indexer_rejects_shorter_source_than_request_mapping():
         get_token_to_batch_idx=lambda: torch.zeros(16, dtype=torch.int32)
     )
     indexer = SimpleNamespace()
+    indexer._forward_impl = MethodType(QSAIndexer._forward_impl, indexer)
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, positions=torch.arange(15))
     try:
         QSAIndexer.forward_cuda(
@@ -960,6 +962,9 @@ class _DispatchIndexer:
     index_n_heads = 4
     compress_ratio = 4
     _pending_ring_slots = QSAIndexer._pending_ring_slots
+    # forward_cuda (the code under test) delegates to _forward_impl; bind the
+    # real implementation so this mock indexer can be dispatched through it.
+    _forward_impl = QSAIndexer._forward_impl
 
     def __init__(self):
         self.selected = None

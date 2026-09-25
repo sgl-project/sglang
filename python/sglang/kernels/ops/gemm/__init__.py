@@ -376,7 +376,15 @@ def try_sm120_fp8_linear(
     )
 
 
+def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Shape-tuned tiny GEMM for Kimi-K3, with the existing torch fallback."""
+    from .kimi_k3 import kimi_k3_tiny_gemm as impl
+
+    return impl(x, w)
+
+
 __all__ = [
+    "kimi_k3_tiny_gemm",
     "Fp8ScaledMMOp",
     "bmm_fp8",
     "dsv3_fused_a_gemm",

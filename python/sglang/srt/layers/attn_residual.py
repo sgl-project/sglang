@@ -57,7 +57,7 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
         return False
     global _HIP_SHAPE_GATE
     if _HIP_SHAPE_GATE is None:
-        from sglang.kernels.ops.kimi_k3.attn_res_hip import supports_attn_res_hip
+        from sglang.kernels.ops.attention.attn_res_hip import supports_attn_res_hip
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
@@ -97,7 +97,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -294,7 +294,7 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
-    from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
+    from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)

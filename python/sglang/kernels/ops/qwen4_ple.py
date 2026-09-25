@@ -1,4 +1,4 @@
-"""Bitwise-exact fused kernels for decode-sized Qwen4 PLE paths."""
+"""Fused kernels for Qwen4 PLE decode and target verification."""
 
 from __future__ import annotations
 
@@ -307,3 +307,270 @@ def fused_qwen4_short_conv_state(
             num_warps=8,
         )
     return conv_input
+
+
+@triton.jit
+def _qwen4_gate_reduce_kernel(
+    key_ptr,
+    query_ptr,
+    value_ptr,
+    output_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group = tl.program_id(0)
+    hidden = tl.arange(0, BLOCK_SIZE)
+    mask = hidden < HIDDEN_SIZE
+    key = tl.load(key_ptr + group * HIDDEN_SIZE + hidden, mask, other=0).to(tl.float32)
+    query = tl.load(query_ptr + group * HIDDEN_SIZE + hidden, mask, other=0).to(
+        tl.float32
+    )
+    product = _round_bf16_to_fp32(key * query)
+    gate = _round_bf16_to_fp32(tl.sum(product, 0))
+    gate = _round_bf16_to_fp32(gate * (HIDDEN_SIZE**-0.5))
+    magnitude = _round_bf16_to_fp32(tl.maximum(tl.abs(gate), 1.0e-6))
+    root = _round_bf16_to_fp32(tl.sqrt(magnitude))
+    sign = tl.where(gate > 0, 1.0, tl.where(gate < 0, -1.0, 0.0))
+    activated = _round_bf16_to_fp32(tl.sigmoid(_round_bf16_to_fp32(root * sign)))
+    value = tl.load(
+        value_ptr + (group // HC_COUNT) * HIDDEN_SIZE + hidden, mask, other=0
+    ).to(tl.float32)
+    tl.store(output_ptr + group * HIDDEN_SIZE + hidden, activated * value, mask)
+
+
+def can_fuse_qwen4_gate_reduce(key, query, value):
+    return (
+        key.is_cuda
+        and key.dtype == torch.bfloat16
+        and key.ndim == 3
+        and key.shape[1:] == (_QWEN4_HC_COUNT, _QWEN4_HIDDEN_SIZE)
+        and key.is_contiguous()
+        and query.shape == key.shape
+        and query.dtype == key.dtype
+        and query.device == key.device
+        and query.is_contiguous()
+        and value.shape == (key.shape[0], _QWEN4_HIDDEN_SIZE)
+        and value.dtype == key.dtype
+        and value.device == key.device
+        and value.is_contiguous()
+    )
+
+
+def fused_qwen4_gate_reduce(key, query, value):
+    if not can_fuse_qwen4_gate_reduce(key, query, value):
+        raise ValueError("unsupported input for Qwen4 PLE gate reduction")
+    output = torch.empty_like(key)
+    if key.shape[0]:
+        _qwen4_gate_reduce_kernel[(key.shape[0] * _QWEN4_HC_COUNT,)](
+            key,
+            query,
+            value,
+            output,
+            HIDDEN_SIZE=_QWEN4_HIDDEN_SIZE,
+            HC_COUNT=_QWEN4_HC_COUNT,
+            BLOCK_SIZE=triton.next_power_of_2(_QWEN4_HIDDEN_SIZE),
+            enable_fp_fusion=False,
+        )
+    return output
+
+
+@triton.jit
+def _qwen4_verify_conv_prepare_kernel(
+    x_ptr,
+    state_ptr,
+    indices_ptr,
+    valid_ptr,
+    conv_ptr,
+    intermediate_ptr,
+    state_stride0,
+    state_stride1,
+    state_stride2,
+    index_stride,
+    cache_stride0,
+    cache_stride1,
+    cache_stride2,
+    cache_stride3,
+    CHANNELS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    HAS_INTERMEDIATE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    slot = tl.load(indices_ptr + req * index_stride)
+    channel = offsets // (STATE_LEN + WIDTH)
+    col = offsets % (STATE_LEN + WIDTH)
+    mask = channel < CHANNELS
+    state = tl.load(
+        state_ptr
+        + slot * state_stride0
+        + channel * state_stride1
+        + col * state_stride2,
+        mask & (col < STATE_LEN),
+        other=0,
+    ).to(x_ptr.dtype.element_ty)
+    x = tl.load(
+        x_ptr + (req * WIDTH + col - STATE_LEN) * CHANNELS + channel,
+        mask & (col >= STATE_LEN),
+        other=0,
+    )
+    tl.store(
+        conv_ptr + req * CHANNELS * (STATE_LEN + WIDTH) + offsets,
+        tl.where(col < STATE_LEN, state, x),
+        mask,
+    )
+    if HAS_INTERMEDIATE and STATE_LEN > 0:
+        step = offsets // (CHANNELS * STATE_LEN)
+        channel = (offsets // STATE_LEN) % CHANNELS
+        state_col = offsets % STATE_LEN
+        col = step + 1 + state_col
+        mask = step < WIDTH
+        valid = tl.load(valid_ptr + req * WIDTH + step, mask, other=0)
+        state = tl.load(
+            state_ptr
+            + slot * state_stride0
+            + channel * state_stride1
+            + col * state_stride2,
+            mask & (col < STATE_LEN),
+            other=0,
+        ).to(x_ptr.dtype.element_ty)
+        x = tl.load(
+            x_ptr + (req * WIDTH + col - STATE_LEN) * CHANNELS + channel,
+            mask & (col >= STATE_LEN),
+            other=0,
+        )
+        value = tl.where(valid, tl.where(col < STATE_LEN, state, x), 0)
+        tl.store(
+            intermediate_ptr
+            + req * cache_stride0
+            + step * cache_stride1
+            + channel * cache_stride2
+            + state_col * cache_stride3,
+            value,
+            mask,
+        )
+
+
+@triton.jit
+def _qwen4_verify_conv_finish_kernel(
+    conv_ptr,
+    residual_ptr,
+    valid_ptr,
+    output_ptr,
+    num_elements,
+    CHANNELS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_elements
+    token = offsets // CHANNELS
+    channel = offsets % CHANNELS
+    req = token // WIDTH
+    step = token % WIDTH
+    conv = tl.load(
+        conv_ptr + (req * CHANNELS + channel) * WIDTH + step, mask, other=0
+    ).to(tl.float32)
+    activated = _round_bf16_to_fp32(conv * tl.sigmoid(conv))
+    residual = tl.load(residual_ptr + offsets, mask, other=0).to(tl.float32)
+    valid = tl.load(valid_ptr + token, mask, other=0)
+    tl.store(output_ptr + offsets, tl.where(valid, activated + residual, 0), mask)
+
+
+def can_fuse_qwen4_verify_conv(
+    x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+):
+    return (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x.is_contiguous()
+        and residual.shape == x.shape
+        and residual.dtype == x.dtype
+        and residual.device == x.device
+        and residual.is_contiguous()
+        and 0 < width <= 32
+        and x.shape[0] == state_indices.numel() * width
+        and state_indices.ndim == 1
+        and state_indices.dtype in (torch.int32, torch.int64)
+        and state_indices.device == x.device
+        and valid.shape == (x.shape[0],)
+        and valid.dtype == torch.bool
+        and valid.device == x.device
+        and valid.is_contiguous()
+        and state.ndim == 3
+        and state.shape[1] == x.shape[1]
+        and state.device == x.device
+        and state.dtype in (torch.bfloat16, torch.float32)
+        and 0 <= state.shape[2] <= _QWEN4_MAX_SHORT_CONV_STATE_LEN
+        and weight.ndim == 3
+        and weight.shape[:2] == (x.shape[1], 1)
+        and weight.device == x.device
+        and weight.dtype == x.dtype
+        and dilation > 0
+        and state.shape[2] == (weight.shape[2] - 1) * dilation
+        and (
+            intermediate is None
+            or (
+                intermediate.ndim == 4
+                and intermediate.shape[0] >= state_indices.numel()
+                and intermediate.shape[1] >= width
+                and intermediate.shape[2:] == state.shape[1:]
+                and intermediate.device == x.device
+                and intermediate.dtype in (torch.bfloat16, torch.float32)
+            )
+        )
+    )
+
+
+def fused_qwen4_verify_conv(
+    x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+):
+    if not can_fuse_qwen4_verify_conv(
+        x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+    ):
+        raise ValueError("unsupported input for Qwen4 PLE verify convolution")
+    output = torch.empty_like(x)
+    if x.shape[0] == 0:
+        return output
+    requests = state_indices.numel()
+    channels, state_len = state.shape[1:]
+    conv_input = torch.empty(
+        (requests, channels, state_len + width), dtype=x.dtype, device=x.device
+    )
+    work = channels * max(
+        state_len + width, width * state_len if intermediate is not None else 0
+    )
+    _qwen4_verify_conv_prepare_kernel[(requests, triton.cdiv(work, 256))](
+        x,
+        state,
+        state_indices,
+        valid,
+        conv_input,
+        intermediate if intermediate is not None else x,
+        *state.stride(),
+        state_indices.stride(0),
+        *(intermediate.stride() if intermediate is not None else (0, 0, 0, 0)),
+        CHANNELS=channels,
+        WIDTH=width,
+        STATE_LEN=state_len,
+        HAS_INTERMEDIATE=intermediate is not None,
+        BLOCK=256,
+    )
+    conv = torch.nn.functional.conv1d(
+        conv_input, weight, dilation=dilation, groups=channels
+    )
+    _qwen4_verify_conv_finish_kernel[(triton.cdiv(x.numel(), 256),)](
+        conv,
+        residual,
+        valid,
+        output,
+        x.numel(),
+        CHANNELS=channels,
+        WIDTH=width,
+        BLOCK=256,
+        enable_fp_fusion=False,
+    )
+    return output

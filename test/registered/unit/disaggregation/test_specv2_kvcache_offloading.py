@@ -107,6 +107,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
+    manager.kv_cache = MagicMock()
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
@@ -287,6 +288,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -409,6 +411,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -441,6 +444,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(8, 12, dtype=torch.int64),
             [14, 15, 16, 17],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -486,7 +490,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 processor = SimpleNamespace(decode_offload_manager=manager)
                 if inflight:
                     manager.offload_inflight[req] = 1
-                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0)
+                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])
                     manager.cache_controller = MagicMock()
                     manager.cache_controller.ack_write_queue = [
                         HiCacheAck(None, _FinishedEvent(), [1])

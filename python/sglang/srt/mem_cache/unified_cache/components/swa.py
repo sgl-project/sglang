@@ -751,6 +751,8 @@ class SWAComponent(TreeComponent):
             return x.id
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the SWA KV to host before the internal tombstone.
+        self._maybe_backup_node_before_swa_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -764,6 +766,45 @@ class SWAComponent(TreeComponent):
         )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
+
+    def _maybe_backup_node_before_swa_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's SWA KV to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator treats an unbacked tombstone as a window reset,
+        so a dropped internal SWA segment caps the match frontier until a
+        full sliding window re-accumulates below it, leaving up to one
+        window of still-resident KV unservable. The leaf backup walk covers
+        ancestors only within one window of the evicted leaf, so an
+        internal node whose child spans the window arrives here unbacked.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or not self.tree_core.has_swa_host_pool
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # in the SWA host pool the way the PREFETCH hook does.
+        needed = sum(
+            len(n.component_data[self.component_type].value)
+            for n in self._collect_unbacked_swa_nodes(node)
+        )
+        if needed == 0:
+            return
+        if (
+            self._swa_kv_pool_host is not None
+            and self._swa_kv_pool_host.available_size() < needed
+        ):
+            cache.evict_host(needed, self.component_type)
+        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""

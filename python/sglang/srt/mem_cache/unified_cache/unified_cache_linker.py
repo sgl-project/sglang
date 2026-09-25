@@ -363,7 +363,7 @@ class UnifiedCacheLinkerWrapper:
                     req.kv.swa_evicted_seqlen if req.kv is not None else 0
                 ),
                 chunked=True,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
                 track_adopted_ranges=True,
             )
         )

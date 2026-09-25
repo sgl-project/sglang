@@ -32,10 +32,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -146,14 +142,6 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
-
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,
@@ -200,21 +188,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
-    def _deserialize_own_rank(self, serialized_named_tensors):
+    def deserialize_own_rank(self, serialized_named_tensors):
         """Each rank deserializes only its own payload (index tp_rank);
         deserializing another rank's copy would break producer-side CUDA-IPC
         refcounting."""
@@ -222,20 +196,6 @@ class BaseTpWorker(ABC):
         return MultiprocessingSerializer.deserialize(
             serialized_named_tensors[self.model_runner.tp_rank]
         )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.weight_updater.update_weights_from_ipc(
-            recv_req
-        )
-        return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.weight_exporter.get_weights_by_name(
@@ -256,7 +216,7 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
         if recv_req.load_format == "flattened_bucket":
             bucket = FlattenedTensorBucket(
                 flattened_tensor=data["flattened_tensor"],
@@ -562,6 +522,10 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; the target worker owns one."""
+        return [("target", self._model_runner)]
+
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
@@ -626,6 +590,10 @@ class TpModelWorker(BaseTpWorker):
             dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+    def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
+        if self.model_runner._elastic_cuda_graph_enabled():
+            self.model_runner.maybe_join_ep_ranks()
 
     def forward_batch_generation(
         self,
@@ -707,6 +675,7 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -734,6 +703,7 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -766,6 +736,7 @@ class TpModelWorker(BaseTpWorker):
             )
         else:
             next_token_ids = None
+        self._maybe_finalize_elastic_cuda_graph_scale()
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

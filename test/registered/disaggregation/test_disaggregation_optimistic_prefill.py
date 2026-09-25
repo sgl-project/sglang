@@ -105,6 +105,9 @@ class TestOptimisticPrefill(
             "3",
             "--chunked-prefill-size",
             "128",
+            "--enable-hierarchical-cache",
+            "--hicache-write-policy",
+            "write_through",
             "--enable-metrics",
             "--enable-request-time-stats-logging",
         ]
@@ -187,6 +190,9 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
             "3",
             "--chunked-prefill-size",
             "128",
+            "--enable-hierarchical-cache",
+            "--hicache-write-policy",
+            "write_through",
             "--enable-metrics",
             "--enable-request-time-stats-logging",
             "--load-format",
@@ -345,13 +351,13 @@ class TestOptimisticPrefillMambaAdmission(CustomTestCase):
         server_args = self._make_args(pp_size=2, **self.BASE)
         self.assertEqual(self._resolved_attempts(server_args), 0)
 
-    def test_hicache_write_policy_restriction_retained(self):
+    def test_l2_write_through_allowed(self):
         server_args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_write_policy="write_through",
             **self.BASE,
         )
-        self.assertEqual(self._resolved_attempts(server_args), 0)
+        self.assertEqual(self._resolved_attempts(server_args), 3)
 
 
 class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):

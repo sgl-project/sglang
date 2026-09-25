@@ -10,7 +10,6 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -20,7 +19,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe import (
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
@@ -372,15 +371,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
         return output.reshape(original_shape)
 
 
-def _mobius_reduce_combined_output(combined: torch.Tensor) -> torch.Tensor:
-    """Apply the one ordinary TP reduction unless the scoped runtime owns it."""
-    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
-    ):
-        return tensor_model_parallel_all_reduce(combined)
-    return combined
-
-
 def _get_mobius_routed_bank(meta_mlp: nn.ModuleList, layer_id: int) -> nn.Module:
     if not meta_mlp:
         raise ValueError(
@@ -421,7 +411,7 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return _mobius_reduce_combined_output(routed + shared)
+        return reduce_moe_output(routed + shared)
 
     def _forward_after_attention(
         self,

@@ -501,7 +501,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         moe_hidden_states = hidden_states.clone()
-        moe_residual = residual.clone()
+        # The final gather adds its residual; the dense branch already carries it.
+        moe_residual = torch.zeros_like(residual)
         moe_hidden_states = self.mlp(moe_hidden_states)
         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
             moe_hidden_states, moe_residual, forward_batch

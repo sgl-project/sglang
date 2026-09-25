@@ -264,9 +264,7 @@ class StreamingSession(BasePrefixCache):
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def try_cache_finished_req(
-        self, req: Req, is_insert: bool = True, **kwargs
-    ) -> bool:
+    def try_cache_finished_req(self, req: Req) -> bool:
         """Handles a streaming-session finish (save slot / mid-abort nuke).
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
@@ -354,15 +352,22 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
-        self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
+    def claim_kv_row(self, req: Req) -> bool:
+        return self.try_cache_finished_req(req)
+
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        self.inner.on_release(req, inserted=inserted)
+
+    def cache_finished_req(self, req: Req, **kwargs):
+        self.inner.cache_finished_req(req, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if self.try_cache_unfinished_req(req, **kwargs):
             return
         self.inner.cache_unfinished_req(req, **kwargs)
+
+    def unpin(self, req: Req) -> None:
+        self.inner.unpin(req)
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         self.inner.finish(handle, outcome)

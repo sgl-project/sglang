@@ -43,10 +43,15 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    complete_deferred_allreduce,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -172,10 +177,7 @@ def _disable_shared_experts_fusion() -> bool:
     # intent through the accessor's fallback.
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
-    return bool(
-        envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
-        or is_shared_experts_fusion_disabled()
-    )
+    return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
 
 
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
@@ -209,17 +211,17 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     return bool(
         not is_nextn
         and config.model_type == "qwen3_5_moe_text"
-        and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+        and uses_cutedsl_ar_fusion()
     )
 
 
 def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            Qwen35FlashInferLayerCommunicator,
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            CuteDSLFusionLayerCommunicator,
         )
 
-        return Qwen35FlashInferLayerCommunicator
+        return CuteDSLFusionLayerCommunicator
     return LayerCommunicator
 
 
@@ -305,22 +307,15 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    if not expect_deferred:
-        if not isinstance(hidden_states, torch.Tensor):
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
-                raise RuntimeError("unexpected deferred-finalize handoff")
+    if not expect_deferred:
+        if isinstance(hidden_states, MoeFinalizeHandoff):
+            raise RuntimeError("unexpected deferred-finalize handoff")
         hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states
 
-    from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-        Qwen35MoeFinalizeHandoff,
-    )
-
-    if not isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
+    if not isinstance(hidden_states, MoeFinalizeHandoff):
         raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
     return hidden_states
 
@@ -1199,8 +1194,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1637,8 +1631,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and hasattr(self.layer_communicator, "should_use_finalize")
-            and self.layer_communicator.should_use_finalize(
+            and self.layer_communicator.should_defer_moe_finalize(
                 forward_batch, int(hidden_states.shape[0])
             )
         )
@@ -1825,26 +1818,20 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35FlashInferFusionService,
-                Qwen35FlashInferLayerCommunicator,
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                install_cutedsl_fusion,
             )
 
-            self.flashinfer_mnnvl_cutedsl_fusion = Qwen35FlashInferFusionService(
+            self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
+                self.layers,
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
                 rms_epsilon=config.rms_norm_eps,
-            )
-            for layer in self.layers:
-                communicator = layer.layer_communicator
-                if not isinstance(communicator, Qwen35FlashInferLayerCommunicator):
-                    raise RuntimeError(
-                        "Qwen3.5 fusion-enabled layer has the wrong communicator"
-                    )
-                communicator.fusion_service = self.flashinfer_mnnvl_cutedsl_fusion
-            logger.info(
-                "Installed one Qwen3.5 FlashInfer fusion handle for %d layers",
-                len(self.layers),
+                # Every layer was checked above.
+                can_defer_finalize=lambda layer: True,
+                # The final GemmaRMSNorm closes out the last layer's handoff.
+                final_norm_consumes_handoff=True,
+                label="Qwen3.5",
             )
 
         # Final normalization
@@ -1879,13 +1866,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
-        if self.flashinfer_mnnvl_cutedsl_fusion is None:
-            return
-        from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-            prepare_qwen35_flashinfer_fusion,
-        )
-
-        prepare_qwen35_flashinfer_fusion(self, model_runner)
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1958,9 +1938,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
@@ -1972,61 +1958,23 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         # The final layer has no successor to consume its deferred MoE tail.
-        trace_final_norm = envs.SGLANG_TRACE_QWEN35_FINAL_NORM.get()
-        use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            is_deferred_finalize = isinstance(hidden_states, Qwen35MoeFinalizeHandoff)
+            is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 
         if is_deferred_finalize:
-            if residual is None or self.flashinfer_mnnvl_cutedsl_fusion is None:
+            if residual is None:
                 raise RuntimeError("invalid final deferred MoE handoff")
             hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
-                hidden_states, residual, self.norm.gemma_weight
+                handoff=hidden_states, residual=residual, gamma=self.norm.gemma_weight
             )
         elif hidden_states.shape[0] != 0:
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM "
-                    f"stage=pre_sync_enter hidden={tuple(hidden_states.shape)} "
-                    f"hidden_stride={hidden_states.stride()} "
-                    f"hidden_dtype={hidden_states.dtype} "
-                    f"hidden_contiguous={hidden_states.is_contiguous()} "
-                    f"residual={None if residual is None else tuple(residual.shape)} "
-                    f"native={use_native_final_norm}",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=pre_sync_returned",
-                    flush=True,
-                )
             if residual is None:
-                hidden_states = (
-                    self.norm.forward_native(hidden_states)
-                    if use_native_final_norm
-                    else self.norm(hidden_states)
-                )
+                hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = (
-                    self.norm.forward_native(hidden_states, residual)
-                    if use_native_final_norm
-                    else self.norm(hidden_states, residual)
-                )
-            if trace_final_norm:
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_enter",
-                    flush=True,
-                )
-                torch.cuda.synchronize()
-                print(
-                    "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_returned",
-                    flush=True,
-                )
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -2121,6 +2069,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        # When aiter shared-expert fusion is on, the shared expert is served as an
+        # extra fused MoE slot (index == num_experts). load_weights must then remap
+        # the checkpoint's mlp.shared_expert.* onto that slot; otherwise the shared
+        # expert weights are silently dropped and accuracy collapses.
+        self.num_fused_shared_experts = 0
+        if _use_aiter and not _disable_shared_experts_fusion():
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def _get_num_fused_shared_experts(self) -> int:
+        # This is a backbone-style module (holds self.layers directly), and under
+        # PP the non-local slots are PPMissingLayer (no .mlp), so scan for the
+        # first real MoE layer instead of assuming layers[0].
+        for layer in self.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "num_fused_shared_experts"):
+                return layer.mlp.num_fused_shared_experts
+        return 0
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
@@ -2138,13 +2103,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        num_experts = self.config.num_experts
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                num_experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
+            ),
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -2167,7 +2138,37 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        num_experts = self.config.num_experts
+        if self.enable_shared_expert_fusion:
+            # When shared experts are fused, map them to the extra routed slot:
+            #   mlp.shared_expert.gate_up_proj -> experts.{num_experts}.gate_up_proj -> w13, expert_id=num_experts
+            #   mlp.shared_expert.down_proj    -> experts.{num_experts}.down_proj    -> w2,  expert_id=num_experts
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
+                    "w2",
+                ),
+                ## shared experts may contain gate_proj and up_proj instead of gate_up_proj
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
+                ),
+            ]
 
         def load_fused_expert_weights(
             name: str,
@@ -2215,6 +2216,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                # Firstly map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
@@ -2257,7 +2265,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
+                        # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:
+                            # experts.gate_up_proj contains all routed experts, excluding shared experts
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
@@ -2273,7 +2283,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 "w3",
                                 num_experts,
                             )
-                        else:
+                        elif "experts.down_proj" in name:
+                            # experts.down_proj contains all routed experts, excluding shared experts
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -2281,6 +2292,41 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 shard_id,
                                 num_experts,
                             )
+                        elif self.enable_shared_expert_fusion:
+                            # shared experts should be loaded to experts.w13_weight and experts.w2_weight
+                            param = params_dict[name_mapped]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            if f"{num_experts}.gate_up_proj" in name:
+                                # split into w1 and w3
+                                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                # load to experts.w13_weight, shard_id = w1, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[0],
+                                    name_mapped,
+                                    "w1",
+                                    expert_id,
+                                )
+                                # load to experts.w13_weight, shard_id = w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[1],
+                                    name_mapped,
+                                    "w3",
+                                    expert_id,
+                                )
+                            else:
+                                # load down_proj to experts.w2_weight, shard_id = w2, expert_id = num_experts
+                                # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name_mapped,
+                                    shard_id,
+                                    expert_id,
+                                )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (

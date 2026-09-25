@@ -82,6 +82,14 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
+    def test_request_chat_template_requires_explicit_opt_in(self):
+        for flags, expected in (([], False), (["--trust-request-chat-template"], True)):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).trust_request_chat_template, expected
+                )
+
     def test_prefill_max_context_accepts_human_readable_values(self):
         for option in (
             "--cuda-graph-prefill-max-context",

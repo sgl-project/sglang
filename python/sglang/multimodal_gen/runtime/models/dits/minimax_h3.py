@@ -18,6 +18,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
@@ -429,13 +430,16 @@ def _modulate_gate(
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
-        reuse_input
-        and hidden.is_cuda
+        hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
         and hidden.is_contiguous()
         and hidden.shape[-1] % 16 == 0
     ):
-        return silu_and_mul_with_activation_rounding_(hidden)
+        if reuse_input:
+            return silu_and_mul_with_activation_rounding_(hidden)
+        # Quantized fc2 needs contiguous rows, so keep the fused result out of
+        # the packed fc1 buffer while preserving the eager BF16 SiLU rounding.
+        return silu_and_mul_with_activation_rounding(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
 

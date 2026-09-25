@@ -54,6 +54,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -267,7 +268,7 @@ class GroupCoordinator:
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
-    use_pymscclpp: bool  # a hint of whether to use PyMsccl
+    use_mscclpp: bool  # a hint of whether to use MSCCL++
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
@@ -287,7 +288,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_pynccl: bool,
-        use_pymscclpp: bool,
+        use_mscclpp: bool,
         use_custom_allreduce: bool,
         use_torch_symm_mem_all_reduce: bool,
         use_hpu_communicator: bool,
@@ -424,7 +425,7 @@ class GroupCoordinator:
 
         # Import communicators
         self.use_pynccl = use_pynccl
-        self.use_pymscclpp = use_pymscclpp
+        self.use_mscclpp = use_mscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
@@ -471,10 +472,11 @@ class GroupCoordinator:
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
-        if use_pymscclpp and self.world_size > 1:
+        if use_mscclpp and self.world_size > 1:
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                group_name=group_name,
             )
 
         self.ca_comm: Optional[Any] = None
@@ -1285,6 +1287,13 @@ class GroupCoordinator:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
 
+        pymscclpp_comm = self.pymscclpp_comm
+        if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
+            output, input
+        ):
+            pymscclpp_comm.all_gather(output, input)
+            return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -2087,7 +2096,7 @@ def init_world_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=False,
-        use_pymscclpp=False,
+        use_mscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
@@ -2107,7 +2116,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
-    use_mscclpp_allreduce: Optional[bool] = None,
+    use_mscclpp: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2115,8 +2124,8 @@ def init_model_parallel_group(
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-    if use_mscclpp_allreduce is None:
-        use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
+    if use_mscclpp is None:
+        use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     return GroupCoordinator(
@@ -2128,7 +2137,7 @@ def init_model_parallel_group(
             if use_pynccl is None
             else use_pynccl
         ),
-        use_pymscclpp=use_mscclpp_allreduce,
+        use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
@@ -2270,7 +2279,7 @@ def graph_capture(stream=None):
 logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
-_ENABLE_MSCCLPP_ALL_REDUCE = False
+_ENABLE_MSCCLPP = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 _ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
@@ -2280,9 +2289,9 @@ def set_custom_all_reduce(enable: bool):
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
 
-def set_mscclpp_all_reduce(enable: bool):
-    global _ENABLE_MSCCLPP_ALL_REDUCE
-    _ENABLE_MSCCLPP_ALL_REDUCE = enable
+def set_mscclpp(enable: bool):
+    global _ENABLE_MSCCLPP
+    _ENABLE_MSCCLPP = enable
 
 
 def set_torch_symm_mem_all_reduce(enable: bool):
@@ -3059,6 +3068,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
+
     _TP_STATE_PATCHED = True
     global _TP
     old_tp_group = _TP
@@ -3085,10 +3104,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 

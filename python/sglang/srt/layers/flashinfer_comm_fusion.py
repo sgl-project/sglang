@@ -47,6 +47,14 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
+    if backend == "cutedsl":
+        if not get_platform().is_sm100:
+            raise ValueError(
+                "FlashInfer allreduce fusion cutedsl backend requires a "
+                "Blackwell system."
+            )
+        return backend
+
     if backend == "auto":
         if is_multi_node:
             if get_platform().is_sm100:
@@ -70,6 +78,11 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             "system, or SM90 single-node."
         )
     return backend
+
+
+def uses_cutedsl_ar_fusion() -> bool:
+    """Selected CuTe DSL owns both patterns, so the legacy workspace stands down."""
+    return get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
 
 
 def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
@@ -713,7 +726,7 @@ def ensure_workspace_initialized(
     use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized."""
-    if _flashinfer_allreduce_unavailable:
+    if _flashinfer_allreduce_unavailable or uses_cutedsl_ar_fusion():
         return False
 
     if not is_flashinfer_available() or _flashinfer_comm is None:

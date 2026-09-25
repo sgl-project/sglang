@@ -252,6 +252,10 @@ class TestDisaggregationMooncakeSpec(
             *spec_args,
             "--disaggregation-decode-retraction-backup",
             "host_pool",
+            # Pin the ratio: auto-sizing floors the pool at one max-length request,
+            # which no single request can overflow.
+            "--hicache-ratio",
+            str(BACKUP_ONLY_HICACHE_RATIO),
         ]
         cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()

@@ -406,18 +406,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_root(self, node: Any) -> bool:
-        """Whether the node is a tree root."""
-        return node is self.root_node
-
-    def get_last_hash_value(self, node: Any) -> Optional[str]:
-        """The node's last page hash, or None when it was never hashed."""
-        return node.get_last_hash_value()
-
-    def get_prefix_hash_values(self, node: Any) -> list[str]:
-        """The hash chain of the node's ancestors, in root-to-parent order."""
-        return node.get_prefix_hash_values(node.parent)
-
     def rotation_base_of(self, node: Any) -> Optional[int]:
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
@@ -430,18 +418,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
-    ):
-        """Dispose of a finished request's KV.
-
-        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
-        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
-        call's to account for: insert what can be keyed, release the rest.
-        Slicing the kv row by the token-id count instead strands whatever
-        lies between -- no caller releases those. ``release_kv_cache`` frees
-        everything past ``owned_kv_len``.
-        """
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
+        """Hand a finished request's KV to the tree: insert what can be keyed
+        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
+        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
+        token count instead strands the slots up to ``owned_kv_len``; the
+        caller frees everything past it."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -453,13 +435,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
+        allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
-            self.token_to_kv_pool_allocator,
+            allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
     @abstractmethod
@@ -485,6 +469,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         pass
+
+    def unpin(self, req: Req) -> None:
+        """Drop the tree lock the request holds on ``req.last_node``; a cache
+        whose acquire returned a receipt releases with it here."""
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
+
+    def claim_kv_row(self, req: Req) -> bool:
+        """A streaming session keeps the request's kv row for the next turn.
+        Return True after taking the row; the caller then releases nothing."""
+        return False
+
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        """The row is freed and the lock dropped; ``inserted`` says whether the
+        KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0

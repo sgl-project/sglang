@@ -438,17 +438,15 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ) -> None:
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        if not inserted and self._mode is LMCacheMode.MP:
+            self._mp_load_back_markers.pop(req.rid, None)
+            self.lmcache_connector.end_session(req.rid)
+
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
-        if not is_insert:
-            if self._mode is LMCacheMode.MP:
-                self._mp_load_back_markers.pop(req.rid, None)
-                self.lmcache_connector.end_session(req.rid)
-            return
+        super().cache_finished_req(req, owned_kv_len=owned_kv_len)
 
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1

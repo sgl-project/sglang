@@ -1033,6 +1033,9 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+        # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
+        self.swa_attention_layer_ids: Optional[List[int]] = None
+        self.full_attention_layer_ids: Optional[List[int]] = None
 
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
@@ -2393,6 +2396,20 @@ _cross_encoding_pooler_archs = [
 
 def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
     return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
+
+
+# SequenceClassification models whose forward routes the head through
+# score_and_pool (per-position pooling); only these support setwise readout
+# (token_indices_to_pool). Keep in sync with callers of layers.pooler.score_and_pool.
+_score_and_pool_archs = [
+    "LlamaForSequenceClassification",
+    "Qwen2ForSequenceClassification",
+    "Qwen3ForSequenceClassification",
+]
+
+
+def is_score_and_pool_model(model_architectures: List[str]) -> bool:
+    return any(arch in _score_and_pool_archs for arch in model_architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

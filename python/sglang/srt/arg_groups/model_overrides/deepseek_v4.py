@@ -1,7 +1,4 @@
-"""Config-time override declarations for deepseek_v4.
-
-Architectures: DeepseekV4ForCausalLM.
-"""
+"""Config-time override declarations for deepseek_v4."""
 
 import logging
 from typing import Any, Dict

@@ -2170,7 +2170,7 @@ class TestLazyCompaction(unittest.TestCase):
 
 
 class TestO3FusedAllocBind(unittest.TestCase):
-    """Fused take_physical_pages + bind_pages via `_alloc_bind_fast_or_slow`.
+    """Fused take_physical_pages + bind via `_alloc_bind_fast_or_slow`.
     GPU-only: the fused kernel is Triton."""
 
     def setUp(self):
