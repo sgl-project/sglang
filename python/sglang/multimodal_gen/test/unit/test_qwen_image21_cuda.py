@@ -371,3 +371,126 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+@pytest.fixture
+def bf16_model_hd128(model):
+    # head_dim 128 is what the CUDA Q/K norm + RoPE + KV packing kernel addresses;
+    # the shared fixture's head_dim 32 never reaches it.
+    config = QwenImage21DitConfig(
+        arch_config=QwenImage21ArchConfig(
+            in_channels=4,
+            out_channels=4,
+            num_layers=2,
+            num_attention_heads=2,
+            attention_head_dim=128,
+            context_in_dim=16,
+            mlp_ratio=2,
+            axes_dims_rope=(16, 56, 56),
+        )
+    )
+    torch.manual_seed(7)
+    result = QwenImage21Transformer2DModel(config, {}).cuda().bfloat16().eval()
+    for name, param in result.named_parameters():
+        torch.nn.init.normal_(param, std=0.02)
+        if name.endswith(("norm_q.weight", "norm_k.weight")):
+            torch.nn.init.normal_(param, mean=1.0, std=0.1)
+    return result
+
+
+def inputs_hd128(seed, edit):
+    torch.manual_seed(seed)
+    slots = [False] * 3 + ([True, False, False] if edit else [])
+    shapes = ([(1, 2, 4)] if edit else []) + [(1, 4, 4)]
+    kwargs = dict(
+        hidden_states=torch.randn(1, 16, 4, device="cuda"),
+        encoder_hidden_states=torch.randn(1, len(slots), 16, device="cuda"),
+        condition_latents=torch.randn(1, 8, 4, device="cuda") if edit else None,
+        layouts=[build_layout(slots, shapes, (16, 56, 56), "cuda")],
+        prefix_caches=[[{} for _ in range(2)]],
+        timestep=torch.tensor([700.0], device="cuda"),
+    )
+    for key in ("hidden_states", "encoder_hidden_states", "condition_latents", "timestep"):
+        if kwargs[key] is not None:
+            kwargs[key] = kwargs[key].bfloat16()
+    return kwargs
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
+    bf16_model_hd128, edit, monkeypatch
+):
+    # The CUDA Q/K norm + RoPE + KV packing path must reproduce the Triton/eager
+    # chain bit for bit on the prefill step, on cached steps and under BCG replay.
+    actual_model = bf16_model_hd128
+    kwargs = inputs_hd128(11, edit)
+    reference_kwargs = deepcopy(kwargs)
+    expected = []
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    with monkeypatch.context() as reference, set_forward_context(None, None):
+        reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PROJECT_INTO_FUSION", disabled)
+        for timestep in (700, 300, 10):
+            reference_kwargs["timestep"].fill_(timestep)
+            expected.append(actual_model(**reference_kwargs))
+
+    qk_gate = BitExactFusionGate("test CUDA Q/K norm + RoPE")
+    kv_gate = BitExactFusionGate("test CUDA KV packing")
+    project_gate = BitExactFusionGate("test K/V projection into buffers")
+    monkeypatch.setattr(model_module, "_QK_ROPE_CUDA_FUSION", qk_gate)
+    monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", kv_gate)
+    monkeypatch.setattr(model_module, "_KV_PROJECT_INTO_FUSION", project_gate)
+    with set_forward_context(None, None):
+        for timestep, output in zip((700, 300, 10), expected, strict=True):
+            kwargs["timestep"].fill_(timestep)
+            torch.testing.assert_close(actual_model(**kwargs), output, atol=0, rtol=0)
+    for gate in (qk_gate, kv_gate, project_gate):
+        assert gate.verified and not gate.disabled, gate.name
+    for actual, reference in zip(
+        kwargs["prefix_caches"][0], reference_kwargs["prefix_caches"][0], strict=True
+    ):
+        for key in ("key", "value"):
+            torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+            assert (
+                actual[key].untyped_storage().nbytes()
+                == actual[key].numel() * actual[key].element_size()
+            )
+
+    runner = DiffusionBreakableCudaGraphRunner(actual_model, torch.device("cuda"))
+    try:
+        with set_forward_context(None, None):
+            assert runner.capture(**kwargs)
+            kwargs["hidden_states"].add_(0.1)
+            expected = actual_model(**kwargs)
+            torch.testing.assert_close(runner(**kwargs), expected, atol=0, rtol=0)
+    finally:
+        runner.reset()
+
+
+@torch.no_grad()
+def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch):
+    # A kernel that disagrees with the reference must disable itself and leave
+    # the model output on the Triton/eager chain.
+    kwargs = inputs_hd128(12, False)
+    reference_kwargs = deepcopy(kwargs)
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    with monkeypatch.context() as reference, set_forward_context(None, None):
+        reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+        expected = bf16_model_hd128(**reference_kwargs)
+
+    kv_gate = BitExactFusionGate("test mismatched KV packing")
+    monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", kv_gate)
+    monkeypatch.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+
+    def corrupt(q, k_out, v_out, *args):
+        v_out.zero_()
+
+    monkeypatch.setattr(model_module, "qknorm_complex_rope_pack_", corrupt)
+    with set_forward_context(None, None):
+        torch.testing.assert_close(bf16_model_hd128(**kwargs), expected, atol=0, rtol=0)
+    assert kv_gate.disabled and not kv_gate.verified
