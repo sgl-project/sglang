@@ -14,27 +14,39 @@
 
 <p align="center">
 <a href="https://www.sglang.io/"><b>🌐 Website</b></a> |
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
+<a href="https://www.sglang.io/events"><b>Events</b></a> |
+<a href="https://www.sglang.io/blog"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |
 <a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
 <a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
 <a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
+<a href="https://drive.google.com/drive/folders/18ybvDAmtEaj3IdqsVrwJUsxasyg9kC4V"><b>Slides</b></a>
+</p>
+
+<p align="center">
+Meet the SGLang community at upcoming <a href="https://www.sglang.io/events">meetups, talks, and workshops</a>.
 </p>
 
 ## News
+- [2026/09] RLinf × SGLang: Cosmos3 fine-tuning and efficient parallel evaluation ([blog](https://www.sglang.io/blog/rlinf-sglang-cosmos3)).
+- [2026/09] DeepSeek-V4.1 Flash on SGLang: from 35 to 873 tokens/s ([blog](https://www.sglang.io/blog/deepseek-v4.1-flash-kernel-optimization)).
+- [2026/09] SGLang and Miles add day-0 support for DeepSeek-V4.1 ([blog](https://www.sglang.io/blog/deepseek-v4.1-day0-support)).
+- [2026/08] Breakable CUDA Graph in SGLang: 5× faster graph builds, 1.93× faster prefill ([blog](https://www.sglang.io/blog/breakable-cuda-graph)).
+- [2026/08] Kimi K3: architecture and SGLang day-0 support ([blog](https://www.sglang.io/blog/kimi-k3-day0-support)).
 - [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
 - [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
 - [2026/07] Serving GLM5.2 NVFP4 agentic workloads with SGLang: Reaching 500 TPS in two weeks ([blog](https://lmsys.org/blog/2026-07-13-glm52-optimization/)).
+
+Read more on the [SGLang Blog](https://www.sglang.io/blog) ([also on LMSYS](https://lmsys.org/blog/)).
+
+<details>
+<summary>More</summary>
+
 - [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
 - [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
 - [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
 - [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
 - [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-
-<details>
-<summary>More</summary>
-
 - [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
 - [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
 - [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
