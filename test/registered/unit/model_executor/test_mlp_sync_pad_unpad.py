@@ -11,15 +11,19 @@ Pure dataclass logic — CPU only.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -228,6 +232,82 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+
+class TestDraftScopeMlpSync(CustomTestCase):
+    SLOT = 2
+    HIDDEN = 8
+
+    def setUp(self):
+        override = get_context().override_server_args(
+            tp_size=4,
+            dp_size=4,
+            enable_dp_attention=True,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _sync_in_draft_scope(self, global_num_tokens):
+        num_tokens = global_num_tokens[self.SLOT]
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(num_tokens),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([num_tokens]),
+            out_cache_loc=torch.arange(num_tokens),
+            seq_lens_sum=num_tokens,
+            positions=torch.arange(num_tokens),
+            seq_lens_cpu=torch.tensor([num_tokens]),
+            mm_input_embeds=torch.ones(num_tokens, self.HIDDEN),
+            is_extend_in_batch=True,
+            global_num_tokens_cpu=list(global_num_tokens),
+            global_num_tokens_for_logprob_cpu=list(global_num_tokens),
+            global_num_tokens_gpu=torch.zeros(
+                len(global_num_tokens), dtype=torch.int32
+            ),
+        )
+        runner = _mock_model_runner()
+        runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+        runner.is_draft_worker = True
+        runner.attn_tp_sequence_sharded.return_value = False
+        draft_group = GroupCoordinator.__new__(GroupCoordinator)
+        draft_group.world_size = 1
+        draft_group.rank_in_group = 0
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(
+                tp_rank=self.SLOT, attn_tp_rank=0, attn_dp_rank=self.SLOT
+            ),
+            patch.object(parallel_state, "_TP", draft_group),
+            # CPU runners have no driver to pin the synced token counts with.
+            patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
+            parallel_state.patch_tensor_parallel_group(
+                draft_group, owns_attention=True
+            ),
+        ):
+            fb.prepare_mlp_sync_batch(runner)
+        return fb
+
+    def _assert_token_rows(self, fb, rows):
+        self.assertEqual(fb.input_ids.shape[0], rows)
+        self.assertEqual(fb.positions.shape[0], rows)
+        self.assertEqual(tuple(fb.mm_input_embeds.shape), (rows, self.HIDDEN))
+
+    def test_extend_keeps_its_own_rank_count(self):
+        """A draft extend pads to its own DP rank's token count, not rank 0's."""
+        fb = self._sync_in_draft_scope([9, 5, 6, 4])
+        self.assertEqual(fb.global_num_tokens_cpu, [9, 5, 6, 4])
+        self._assert_token_rows(fb, rows=6)
+
+    def test_max_len_extend_pads_mm_input_embeds(self):
+        """A MAX_LEN-padded extend pads mm_input_embeds along with input_ids."""
+        with get_flags().dp.override(max_len_with_idle=True):
+            fb = self._sync_in_draft_scope([9, 0, 6, 4])
+        self.assertEqual(fb.global_num_tokens_cpu, [9, 9, 9, 9])
+        self._assert_token_rows(fb, rows=9)
+        torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
 
 
 if __name__ == "__main__":
