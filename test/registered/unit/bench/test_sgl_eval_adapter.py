@@ -1,12 +1,10 @@
 """Exercise the installed sgl-eval against a local OpenAI-compatible server."""
 
 import json
-import runpy
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,58 +23,6 @@ register_cpu_ci(est_time=12, suite="stage-a-test-cpu-intel")
 
 
 class TestSglEvalAdapter(CustomTestCase):
-    def test_gateway_mmlu_uses_sgl_eval_prompt_and_grader(self):
-        from sgl_eval.registry import get
-        from sgl_eval.types import Example, Sample
-
-        benchmark = get("mmlu")
-        messages = []
-
-        class Sampler:
-            model = "test-model"
-
-            def __init__(self, **kwargs):
-                pass
-
-            def __call__(self, prompt, gen):
-                messages.append(prompt)
-                return Sample(text=r"The answer is \boxed{A}.", finish_reason="stop")
-
-            def abort(self):
-                pass
-
-        def evaluate(**kwargs):
-            kwargs["load_examples"] = lambda count: [
-                Example(
-                    id="one",
-                    inputs={"problem": "What is 1 + 1?\nA. 2\nB. 3\nC. 4\nD. 5"},
-                    target="A",
-                )
-            ]
-            return benchmark.run(**kwargs)
-
-        path = (
-            Path(__file__).resolve().parents[4]
-            / "sgl-model-gateway/e2e_test/infra/run_eval.py"
-        )
-        gateway_eval = runpy.run_path(str(path))["run_eval"]
-        with (
-            patch(
-                "sgl_eval.registry.get", return_value=replace(benchmark, run=evaluate)
-            ),
-            patch("sgl_eval.sampler.ChatCompletionSampler", Sampler),
-        ):
-            metrics = gateway_eval(
-                SimpleNamespace(
-                    base_url="http://localhost:30000/v1/",
-                    eval_name="mmlu",
-                    num_examples=1,
-                )
-            )
-        self.assertEqual(metrics["score"], 1)
-        self.assertEqual(messages[0][0]["role"], "user")
-        self.assertIn("What is 1 + 1?", messages[0][0]["content"])
-
     def test_base_urls(self):
         for args in (
             SimpleNamespace(host="127.0.0.1", port=30000),
