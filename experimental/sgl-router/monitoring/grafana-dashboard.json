@@ -1691,7 +1691,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(sgl_router_input_ids_forwarding_total[$__rate_interval])) / scalar(sum(rate(sgl_router_input_ids_forwarding_total[$__rate_interval])))",
+          "expr": "sum by (outcome) (rate(sgl_router_input_ids_forwarding_total{model_id=~\"$model_id\"}[$__rate_interval])) / scalar(sum(rate(sgl_router_input_ids_forwarding_total{model_id=~\"$model_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{outcome}}",
