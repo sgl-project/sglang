@@ -140,8 +140,6 @@ class Qwen25Detector(BaseFormatDetector):
                 break
             if result.calls:
                 calls.extend(result.calls)
-            if result.normal_text:
-                normal_parts.append(result.normal_text)
 
         if self._normal_text_buffer:
             pending, self._normal_text_buffer = self._normal_text_buffer, ""
