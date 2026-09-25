@@ -1025,6 +1025,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
@@ -1056,6 +1057,7 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.token_indices_to_pool = token_indices_to_pool
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -3011,18 +3013,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        # Pick the depth on the absolute checkpoint grid: a chunk boundary can leave
-        # the prefix off the (DCP-widened) tree page, and a prefix-relative depth then
-        # names a position no page can hold. Donate only where an h snapshot exists.
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
-        # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-        # mamba radix cache to track which seqlen this mamba state should store at.
-        mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
-        mask = (
-            mamba_track_seqlen_aligned > prefix_len
-            and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
-        )
+        if get_parallel().dcp_enabled:
+            # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
+            # absolute page depth only when the kernel produced an h snapshot.
+            mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
+            mask = (
+                mamba_track_seqlen_aligned > prefix_len
+                and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
+            )
+        else:
+            # Chunked prefill can leave an active request off the absolute
+            # checkpoint grid. Without DCP, keep tracking snapshots relative to
+            # that request prefix so later chunks can continue donating states.
+            mask = req.extend_range.length >= checkpoint_grid
+            mamba_track_seqlen_aligned = (
+                prefix_len
+                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
+            )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -3301,17 +3310,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # The retraction host pool could not hold the backup and the
-                # device KV is already freed, so the request cannot resume.
-                req.to_finish = FINISH_ABORT(
-                    "Retraction host KV pool exhausted. Aborting the request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                # No backup exists and the device KV is already freed, so the
+                # request cannot resume.
+                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                    message = (
+                        "Retracted under decode memory pressure without a KV "
+                        "backup. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                else:
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
                 logger.warning(
-                    "retract_decode: aborted request %s, retraction host pool "
-                    "exhausted",
-                    req.rid,
+                    "retract_decode: aborted request %s: %s", req.rid, message
                 )
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(

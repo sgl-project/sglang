@@ -8,9 +8,14 @@ from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ming_image import MingImageDitConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
+    MingImageLayerPipelineConfig,
     MingImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.ming_image import MingImageLayerSamplingParams
+from sglang.multimodal_gen.configs.sample.ming_image import (
+    MingImageLayerSamplingParams,
+    MingImageSamplingParams,
+)
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -26,7 +31,10 @@ from sglang.multimodal_gen.runtime.models.dits.ming_image import (
     MingSiluAndMul,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
-from sglang.multimodal_gen.runtime.pipelines.ming_image_pipeline import prepare_mu
+from sglang.multimodal_gen.runtime.pipelines.ming_image_pipeline import (
+    MingImagePipeline,
+    prepare_mu,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
     MingImageReferenceStage,
     ming_reference_size,
@@ -35,6 +43,34 @@ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.runtime_context import get_context
+
+
+@pytest.mark.parametrize(
+    "checkpoint,config_cls,sampling_cls",
+    [
+        ("Design", MingImagePipelineConfig, MingImageSamplingParams),
+        ("Design-Layer", MingImageLayerPipelineConfig, MingImageLayerSamplingParams),
+    ],
+)
+@pytest.mark.parametrize(
+    "path_template",
+    [
+        "inclusionAI/Ming-Image-0.1-{}",
+        "/models/Ming-Image-0.1-{}",
+        "/cache/models--inclusionAI--Ming-Image-0.1-{}/snapshots/revision",
+    ],
+)
+def test_registry_resolves_both_checkpoints(
+    checkpoint, config_cls, sampling_cls, path_template, monkeypatch
+):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.registry.maybe_download_model_index",
+        lambda _: pytest.fail("Ming checkpoints do not have a model_index.json"),
+    )
+    info = get_model_info(path_template.format(checkpoint), backend="sglang")
+    assert info.pipeline_cls is MingImagePipeline
+    assert info.pipeline_config_cls is config_cls
+    assert info.sampling_param_cls is sampling_cls
 
 
 @pytest.mark.parametrize("mode,multi", [("zero_masked", False), ("learned", True)])

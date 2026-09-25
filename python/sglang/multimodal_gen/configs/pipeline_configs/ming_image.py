@@ -92,3 +92,29 @@ class MingImagePipelineConfig(ImagePipelineConfig):
 @dataclass
 class MingImageLayerPipelineConfig(MingImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2I
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ming_image import (
+        MingImageLayerSamplingParams,
+        MingImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MingImageLayerSamplingParams,
+        pipeline_config_cls=MingImageLayerPipelineConfig,
+        hf_model_paths=["inclusionAI/Ming-Image-0.1-Design-Layer"],
+        model_detectors=[lambda model: "ming-image-0.1-design-layer" in model.lower()],
+    )
+    register_configs(
+        sampling_param_cls=MingImageSamplingParams,
+        pipeline_config_cls=MingImagePipelineConfig,
+        hf_model_paths=["inclusionAI/Ming-Image-0.1-Design"],
+        model_detectors=[
+            lambda model: (
+                "ming-image-0.1-design" in model.lower()
+                and "design-layer" not in model.lower()
+            )
+        ],
+    )
