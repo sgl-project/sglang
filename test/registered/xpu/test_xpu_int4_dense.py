@@ -9,7 +9,7 @@ from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
 
 DEV = "xpu"
 
@@ -55,6 +55,20 @@ def _gptq_pack_qzeros(zc: torch.Tensor) -> torch.Tensor:
     packed = torch.zeros(ng, n // 8, dtype=torch.int32, device=zc.device)
     for j in range(8):
         packed |= zc[:, :, j].to(torch.int32) << (4 * j)
+    return packed
+
+
+def _ct_pack_qweight(codes: torch.Tensor) -> torch.Tensor:
+    """``[N, K]`` codes (0..15) -> ``[N, K // 8]`` int32 packed along K.
+
+    compressed-tensors uses natural nibble order; validated against the library's
+    own ``pack_to_int32`` in ``test_unpack_matches_compressed_tensors_packer``.
+    """
+    n, k = codes.shape
+    codes = codes.reshape(n, k // 8, 8)
+    packed = torch.zeros(n, k // 8, dtype=torch.int32, device=codes.device)
+    for i in range(8):
+        packed |= codes[:, :, i].to(torch.int32) << (4 * i)
     return packed
 
 
@@ -237,6 +251,120 @@ class TestXPUInt4DenseKernel(CustomTestCase):
                 for k, n, gs in SHAPES:
                     with self.subTest(dtype=dtype, desc_act=desc_act, K=k, N=n, gs=gs):
                         self._run_gptq(8, k, n, gs, dtype, desc_act, "", tp_size=2)
+
+
+@unittest.skipIf(not is_xpu(), "XPU int4 dense UT requires an Intel XPU")
+class TestXPUCompressedTensorsWNA16Kernel(CustomTestCase):
+    """compressed-tensors WNA16 int4pack kernel numerics vs a pure-torch dequant."""
+
+    def test_unpack_matches_compressed_tensors_packer(self):
+        # Pin the format against the library that writes it, so the unpacker and
+        # this file's packer cannot be self-consistently wrong together.
+        try:
+            from compressed_tensors.compressors.pack_quantized.helpers import (
+                pack_to_int32,
+            )
+        except ImportError as exc:  # pragma: no cover - depends on installed version
+            self.skipTest(f"compressed_tensors pack_to_int32 unavailable: {exc}")
+
+        from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
+            unpack_compressed_tensors_qweight,
+        )
+
+        torch.manual_seed(0)
+        n, k = 64, 256
+        w_int = torch.randint(-8, 8, (n, k), dtype=torch.int8)
+        ref_packed = pack_to_int32(w_int, num_bits=4, packed_dim=1)
+        self.assertEqual(tuple(ref_packed.shape), (n, k // 8))
+
+        # uint4b8 stores every signed code biased by +8.
+        biased = w_int.to(torch.int32) + 8
+        codes = unpack_compressed_tensors_qweight(ref_packed.to(DEV))
+        self.assertTrue(torch.equal(codes.cpu(), biased))
+        self.assertTrue(
+            torch.equal(_ct_pack_qweight(biased), ref_packed.to(torch.int32))
+        )
+
+    def test_wna16_numeric(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for m in M_VALUES:
+                for k, n, gs in SHAPES:
+                    with self.subTest(dtype=dtype, M=m, K=k, N=n, gs=gs):
+                        self._run_wna16(m, k, n, gs, dtype)
+
+    def test_wna16_bias(self):
+        # xpu_int4pack_mm adds bias outside the GEMM; keep that path covered.
+        for dtype in (torch.float16, torch.bfloat16):
+            for k, n, gs in SHAPES:
+                with self.subTest(dtype=dtype, K=k, N=n, gs=gs):
+                    self._run_wna16(8, k, n, gs, dtype, with_bias=True)
+
+    def _run_wna16(self, m, k, n, gs, dtype, with_bias=False):
+        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_kernels import (
+            CompressedTensorsWNA16XPULinearKernel,
+        )
+
+        torch.manual_seed(0)
+        codes = torch.randint(0, 16, (n, k), device=DEV)  # [N, K] uint4b8 codes
+        scales = torch.rand(n, k // gs, device=DEV, dtype=dtype) * 0.05 + 0.005
+
+        w_ref = (codes.to(dtype) - 8) * scales.repeat_interleave(gs, dim=1)
+        x = torch.randn(m, k, device=DEV, dtype=dtype)
+        bias = torch.randn(n, device=DEV, dtype=dtype) if with_bias else None
+        ref = x @ w_ref.t()
+        if bias is not None:
+            ref = ref + bias
+
+        layer = _make_layer()
+        layer.weight_packed = torch.nn.Parameter(
+            _ct_pack_qweight(codes), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+
+        kernel = CompressedTensorsWNA16XPULinearKernel(
+            group_size=gs, symmetric=True, has_g_idx=False
+        )
+        kernel.process_weights_after_loading(layer)
+        out = kernel.apply(layer, x, bias)
+
+        self.assertEqual(tuple(out.shape), (m, n))
+        self.assertTrue(torch.isfinite(out).all())
+        rel = (out - ref).abs().max().item() / ref.abs().max().item()
+        self.assertLess(rel, REL_TOL[dtype], f"rel={rel:.2e}")
+
+    def test_wna16_rejects_unsupported_configs(self):
+        # The native XPU op cannot express these; fail loudly instead of
+        # producing silently wrong weights.
+        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_kernels import (
+            CompressedTensorsWNA16XPULinearKernel,
+        )
+
+        k, n, gs = 128, 64, 32
+        # Only the config is under test; the checks fire before any weight is
+        # replaced, so one layer is safe to reuse.
+        layer = _make_layer()
+        layer.weight_packed = torch.nn.Parameter(
+            torch.zeros(n, k // 8, dtype=torch.int32, device=DEV), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.ones(n, k // gs, device=DEV, dtype=torch.float16),
+            requires_grad=False,
+        )
+
+        cases = (
+            (dict(group_size=48, symmetric=True, has_g_idx=False), r"group_size"),
+            (dict(group_size=-1, symmetric=True, has_g_idx=False), r"group_size"),
+            (dict(group_size=gs, symmetric=False, has_g_idx=False), r"symmetric"),
+            (
+                dict(group_size=gs, symmetric=True, has_g_idx=True),
+                r"activation reordering",
+            ),
+        )
+        for kwargs, pattern in cases:
+            with self.subTest(**kwargs):
+                kernel = CompressedTensorsWNA16XPULinearKernel(**kwargs)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    kernel.process_weights_after_loading(layer)
 
 
 if __name__ == "__main__":
