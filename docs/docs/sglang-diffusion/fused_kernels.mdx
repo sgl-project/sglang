@@ -234,7 +234,8 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=extra-high` or `quality=high` |
-| Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
+| Cosmos3 | QK-norm + RoPE + KV packing; rounded T2I fusion also supports Hopper TP2/SP1 Super-Text2Image with the 5120-wide SwiGLU architecture |
+| Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
 | FLUX.2 VAE / HunyuanVAE / latent upsampler | GroupNorm + SiLU (channels-last two-pass for FLUX.2) |
 
 ## Inspecting what is registered

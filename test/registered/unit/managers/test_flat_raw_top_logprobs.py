@@ -636,7 +636,6 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=None,
         output_token_sampling_mask=None,
-        output_token_sampling_logprobs=None,
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,

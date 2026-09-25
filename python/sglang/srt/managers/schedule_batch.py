@@ -17,6 +17,7 @@ from sglang.srt.utils.common import (
     Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
+    is_hip,
     is_pin_memory_available,
 )
 from sglang.srt.utils.weight_versions import (
@@ -140,6 +141,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
@@ -162,6 +164,8 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -1217,7 +1221,6 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
-        self.send_output_sampling_mask_offset: int = 0
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -1253,12 +1256,9 @@ class Req(ReqDllmMixin):
             # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
             self.logprob.output_token_ids_logprobs_val = []
             self.logprob.output_token_ids_logprobs_idx = []
-        if return_sampling_mask:
-            self.output_token_sampling_mask = []
-            self.output_token_sampling_logprobs = []
-        else:
-            self.output_token_sampling_mask = None
-            self.output_token_sampling_logprobs = None
+        self.sampling_mask_rows: Optional[SamplingMaskRows] = (
+            SamplingMaskRows() if return_sampling_mask else None
+        )
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
@@ -2508,6 +2508,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
+    # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
@@ -3839,6 +3841,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
+    def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
+        """Pick this forward's per-request SWA eviction trigger.
+
+        Default: evict only once >= eviction_interval tokens have slid out of
+        the window, amortizing eviction work while keeping each request's
+        overshoot within the interval the pool budget reserves. Gating on
+        accumulated tokens rather than an iteration-counter phase cannot
+        starve, because seqlen progress is monotonic per KV handle.
+
+        Aiter MegaMoE DSV4 keeps the older forward-interval cadence instead:
+        per-request token gating synchronizes SWA pressure across DP ranks and
+        triggers a retraction / re-prefill storm at high concurrency.
+        """
+        if _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return lambda req: due_this_forward
+        return lambda req: (
+            req.seqlen - 1 - sliding_window_size
+            >= req.kv.swa_evicted_seqlen + eviction_interval
+        )
+
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
@@ -3849,22 +3872,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            swa_evict_due = self._swa_eviction_trigger(
+                sliding_window_size, eviction_interval
+            )
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict only once >= eviction_interval tokens have slid
-                    # out of the window, amortizing eviction work while keeping
-                    # each request's overshoot within the interval the pool
-                    # budget reserves. Gating on accumulated tokens (rather
-                    # than an iteration-counter phase) cannot starve because
-                    # seqlen progress is monotonic per KV handle.
+                    # In overlap scheduler, we cannot evict swa when
+                    # req.decode_batch_idx == 0 since the prev extend batch is
+                    # still running. `_swa_eviction_trigger` owns the rest.
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
-                        and req.seqlen - 1 - sliding_window_size
-                        >= req.kv.swa_evicted_seqlen + eviction_interval
+                        and swa_evict_due(req)
                     ):
                         self._evict_swa(req, req.seqlen - 1)
 
