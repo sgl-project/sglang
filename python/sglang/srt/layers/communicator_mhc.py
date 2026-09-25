@@ -29,6 +29,7 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
+    FfnCompletion,
     LayerCommunicator,
     LayerScatterModes,
     MlpInputKind,
@@ -512,11 +513,19 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         return hidden_states, residual
 
-    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-        return False
-
-    def should_defer_ffn_reduction(self, forward_batch):
-        return False
+    def _select_ffn_completion(self, forward_batch: ForwardBatch) -> FfnCompletion:
+        """An MHC layer's own postprocess completes its FFN output, combining the
+        hyper-connection streams; nothing is left to the next layer."""
+        return FfnCompletion(
+            defer_moe_finalize=False,
+            fuse_mlp_allreduce=False,
+            mlp_reduce_scatter=self.should_use_reduce_scatter(forward_batch),
+            complete=partial(
+                self._complete_ffn_output_now,
+                forward_batch=forward_batch,
+                dp_step=None,
+            ),
+        )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:

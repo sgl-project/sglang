@@ -49,11 +49,13 @@ class DeferringLayer(nn.Module):
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )
-        self.layer_communicator.should_defer_ffn_reduction = lambda batch: defer
+        self.layer_communicator._ffn_sum_moves_to_next_layer = lambda batch, **_: defer
         self.layer_communicator.is_last_layer = False
         self.layer_communicator._postprocess_scatters_to_local_tokens = False
         self.layer_communicator.ffn_reduction_group = lambda: GROUP
-        self.layer_communicator.should_use_reduce_scatter = lambda batch: False
+        self.layer_communicator._ffn_leaves_sum_to_reduce_scatter = (
+            lambda batch, dp_step: False
+        )
         self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
             all_reduce(hidden),
             residual,
