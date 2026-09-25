@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly Miles ROCm7.2 (AMD)
+name: Release Docker Images Nightly Miles ROCm7.2.4 (AMD)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         variant:
-          - rocm720-mi35x
+          - rocm724-mi35x
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4

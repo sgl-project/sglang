@@ -1414,6 +1414,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
+            # the aiter MXFP8 MoE quant info is built only when aiter is enabled
+            if envs.SGLANG_USE_AITER.get():
+                allowed.append("aiter")
 
         if view.moe_a2a_backend == "flashinfer_megamoe":
             mxfp8_default = "flashinfer_megamoe"
