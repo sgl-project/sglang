@@ -656,7 +656,14 @@ class RMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # `quant_linear` is a fused FP8 static-input-scale hint used only by the
+        # CUDA/FlashInfer path. torch_mlu_ops has no equivalent fused activation
+        # quant, so the hint is accepted and ignored (matching forward_npu).
+        # Models such as Qwen2/2.5 and Llama thread it through the input
+        # layernorm call, so accepting it keeps them on the MLU fused kernel
+        # instead of failing dispatch with a TypeError.
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
