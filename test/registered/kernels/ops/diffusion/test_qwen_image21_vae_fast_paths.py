@@ -109,11 +109,18 @@ def test_mismatch_disables_the_norm_fast_path(monkeypatch):
 def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     reference = make_vae()
     optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
-    calls = {"nhwc": 0, "gather": 0}
-    real_nhwc, real_gather = (
+    calls = {"nhwc": 0, "gather": 0, "conv_transpose": 0}
+    real_nhwc, real_gather, real_conv_t = (
         vae_opt.channel_rmsnorm_silu_nhwc,
         vae_opt.nearest_upsample_nhwc,
+        vae_opt.F.conv_transpose2d,
     )
+
+    def counting_conv_t(*args, **kwargs):
+        calls["conv_transpose"] += 1
+        return real_conv_t(*args, **kwargs)
+
+    monkeypatch.setattr(vae_opt.F, "conv_transpose2d", counting_conv_t)
 
     def counting_nhwc(x, gamma, scale):
         calls["nhwc"] += 1
@@ -130,7 +137,14 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     with use_vae_fast_path(optimized, True):
         fast = optimized.decode(z)
     assert fast.shape == expected.shape
-    assert calls["nhwc"] > 0 and calls["gather"] > 0
+    assert calls["nhwc"] > 0 and calls["conv_transpose"] == 4
+    # every upsampler is folded, so the nearest gather no longer runs
+    assert calls["gather"] == 0
+    assert all(
+        isinstance(m.resample, vae_opt.FusedUpsample2xConv)
+        for m in optimized.modules()
+        if type(m).__name__ == "QwenImage21Resample"
+    )
     torch.testing.assert_close(fast.float(), expected.float(), atol=0.05, rtol=0)
     assert (
         not torch.equal(fast, expected) or True

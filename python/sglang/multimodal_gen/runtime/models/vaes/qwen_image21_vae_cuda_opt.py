@@ -22,6 +22,9 @@ Quality-gated (``quality="extra-high"`` / ``"high"``, decode-scoped through
 - ``ChannelsLastNearestUpsample`` re-expresses the merged-batch view with
   canonical NHWC strides and runs the bit-exact Triton nearest gather, which
   is several times faster than aten's NHWC nearest kernel.
+- ``FusedUpsample2xConv`` replaces each upsampler's nearest 2x + conv3x3 with
+  one ConvTranspose2d(k4, s2, p1) whose kernel is the fp32 sum of the taps each
+  output phase touches: 2.25x fewer MACs and no 4x-sized intermediate.
 
 Parameter names are preserved (``...norm1.gamma``, ``...conv1.weight``), so
 checkpoint loading and weight transfer are unaffected.
@@ -43,6 +46,9 @@ from sglang.kernels.ops.diffusion import (
     channel_rmsnorm_finish_silu,
     channel_rmsnorm_silu_nhwc,
     nearest_upsample_nhwc,
+)
+from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
+    fold_upsample2x_conv2d_weight,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
@@ -174,6 +180,57 @@ class ChannelsLastNearestUpsample(nn.Module):
         return up(x)
 
 
+class FusedUpsample2xConv(nn.Sequential):
+    """``Resample.resample`` (nearest 2x, conv3x3 p1) as one ConvTranspose2d(k4, s2, p1) under the quality gate.
+
+    The children keep their indices (``0`` upsample, ``1`` conv), so parameter
+    names are unchanged. Gate off runs the original two-module chain.
+    """
+
+    def __init__(self, resample: nn.Sequential, gate: VaeFastPathGate) -> None:
+        super().__init__(*resample.children())
+        self._sgl_gate = gate
+        self._sgl_folded = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._sgl_gate.enabled or x.dim() != 4 or torch.compiler.is_compiling():
+            return super().forward(x)
+        conv = self[1]
+        folded = self._sgl_folded
+        if (
+            folded is None
+            or folded.dtype is not conv.weight.dtype
+            or folded.device != conv.weight.device
+        ):
+            folded = fold_upsample2x_conv2d_weight(conv)
+            self._sgl_folded = folded
+        return F.conv_transpose2d(x, folded, conv.bias, stride=2, padding=1)
+
+
+def _foldable_resample(module, upsample_cls) -> bool:
+    chain = module.resample
+    if module.mode not in ("upsample2d", "upsample3d"):
+        return False
+    if type(chain) is not nn.Sequential or len(chain) != 2:
+        return False
+    up, conv = chain[0], chain[1]
+    if type(up) is ChannelsLastNearestUpsample:
+        up = up._sgl_upsample
+    return (
+        type(up) is upsample_cls
+        and up.size is None
+        and up.mode == "nearest-exact"
+        and tuple(up.scale_factor) == (2.0, 2.0)
+        and type(conv) is nn.Conv2d
+        and conv.kernel_size == (3, 3)
+        and conv.stride == (1, 1)
+        and conv.padding == (1, 1)
+        and conv.dilation == (1, 1)
+        and conv.groups == 1
+        and conv.padding_mode == "zeros"
+    )
+
+
 def _decoder_layout_forward(self, x, *args, **kwargs):
     want_channels_last = self._sgl_gate.enabled
     if want_channels_last != self._sgl_channels_last:
@@ -233,6 +290,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
         AutoencoderKLQwenImage21,
         QwenImage21CausalConv3d,
         QwenImage21Decoder3d,
+        QwenImage21Resample,
         QwenImage21ResidualBlock,
         QwenImage21RMS_norm,
         QwenImage21Upsample,
@@ -256,16 +314,25 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
     n_up = _replace_children(
         decoder, QwenImage21Upsample, lambda up: ChannelsLastNearestUpsample(up, gate)
     )
+    n_fold = 0
+    for module in decoder.modules():
+        if type(module) is QwenImage21Resample and _foldable_resample(
+            module, QwenImage21Upsample
+        ):
+            module.resample = FusedUpsample2xConv(module.resample, gate)
+            n_fold += 1
     decoder._sgl_gate = gate
     decoder._sgl_channels_last = False
     decoder.forward = MethodType(_decoder_layout_forward, decoder)
     register_vae_fast_path_gate(vae, gate)
     logger.info(
         "Qwen-Image 2.1 VAE: %d fused RMSNorm+SiLU sites, %d convs with folded padding, "
-        "%d channels_last upsamplers (channels_last decode at quality extra-high/high).",
+        "%d channels_last upsamplers, %d folded upsample+conv pairs "
+        "(channels_last decode and the fold at quality extra-high/high).",
         n_norm,
         n_conv,
         n_up,
+        n_fold,
     )
     return vae
 
@@ -273,6 +340,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
 __all__ = [
     "ChannelsLastNearestUpsample",
     "FoldedPadConv2d",
+    "FusedUpsample2xConv",
     "FusedChannelRMSNormSiLU",
     "maybe_optimize_qwen_image21_vae",
 ]
