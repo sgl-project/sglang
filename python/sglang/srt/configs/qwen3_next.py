@@ -297,8 +297,15 @@ class Qwen3NextConfig(PretrainedConfig):
         # decode with different attn_tp_size (see _send_mamba_state_slice).
         key_dim = self.linear_key_head_dim * self.linear_num_key_heads
         value_dim = self.linear_value_head_dim * self.linear_num_value_heads
+        parallel = get_parallel()
         shape = Mamba2StateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            # Linear attention keeps its TP head partition; under collocated
+            # prefill CP that is the whole TP group (attention TP width is 1).
+            tp_world_size=(
+                parallel.tp_size
+                if parallel.enable_collocated_cp
+                else parallel.attn_tp_size
+            ),
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
