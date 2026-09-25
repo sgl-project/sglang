@@ -1316,6 +1316,11 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Bit-identical top-p / top-k renorm. Unset: auto -- on for the sampler when
+    # attn_tp_size > 1 (nothing else keeps its ranks in agreement), off for
+    # speculative verify (rank 0 broadcasts the decision) and on a single rank.
+    # Set to 1 / 0 to force both paths; --enable-deterministic-inference forces on.
+    SGLANG_RENORM_DETERMINISTIC = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

@@ -42,20 +42,26 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 
 if is_cuda():
-    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
+    )
+    from sglang.srt.layers.sampling_renorm import (
+        spec_top_k_renorm_prob as top_k_renorm_prob,
+    )
+    from sglang.srt.layers.sampling_renorm import (
+        spec_top_p_renorm_prob as top_p_renorm_prob,
     )
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 elif is_musa():
     try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
+        from sgl_kernel import tree_speculative_sampling_target_only
+
+        from sglang.srt.layers.sampling_renorm import (
+            spec_top_k_renorm_prob as top_k_renorm_prob,
+        )
+        from sglang.srt.layers.sampling_renorm import (
+            spec_top_p_renorm_prob as top_p_renorm_prob,
         )
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
