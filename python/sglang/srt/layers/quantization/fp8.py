@@ -410,10 +410,11 @@ class Fp8Config(QuantizationConfig):
                 return NPUMXFP8OnlineMoEMethod(self)
 
             fp8_method = Fp8MoEMethod(self)
+            moe_runner_backend = get_moe_runner_backend()
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert get_moe_runner_backend().is_auto(), (
-                    f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                assert moe_runner_backend.is_auto(), (
+                    f"{moe_runner_backend} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 )
                 return fp8_method
 
@@ -431,23 +432,35 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+            if self.is_fp4_experts and moe_runner_backend.is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_humming():
+            if self.is_fp4_experts and moe_runner_backend.is_humming():
                 from sglang.srt.layers.quantization.mxfp4_humming_moe import (
                     Mxfp4HummingMoEMethod,
                 )
 
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+            if self.is_fp4_experts and (
+                moe_runner_backend.is_flashinfer_mxfp4()
+                or (
+                    moe_runner_backend.is_flashinfer_megamoe()
+                    and get_moe_a2a_backend().is_megamoe()
+                )
+            ):
+                platform = get_platform()
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
-                if get_platform().is_sm90 or get_platform().is_sm120:
+                if moe_runner_backend.is_flashinfer_megamoe() and not platform.is_sm120:
+                    raise NotImplementedError(
+                        "flashinfer_megamoe currently requires SM120."
+                    )
+
+                if platform.is_sm90 or platform.is_sm120:
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
