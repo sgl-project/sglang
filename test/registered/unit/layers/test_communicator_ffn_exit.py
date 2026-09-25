@@ -39,6 +39,7 @@ def make_communicator(
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
     communicator.allow_deferred_ffn_reduction = allow_deferred
+    communicator.next_takes_attention_partial = False
     if cls is LayerCommunicator:
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
     else:
@@ -281,6 +282,7 @@ class TestSelectFfnCompletion(CustomTestCase):
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.allow_deferred_ffn_reduction = True
+        communicator.next_takes_attention_partial = False
         communicator.is_last_layer = is_last_layer
         communicator._sp_variant = sp_variant
         communicator._postprocess_scatters_to_local_tokens = scatters
@@ -370,8 +372,9 @@ class TestSelectFfnCompletion(CustomTestCase):
 
 
 SRT_DIR = Path(sglang.__file__).resolve().parent / "srt"
-# Attributes a decoder layer holds its FFN, or parts of it, in.
-FFN_ATTRS = {"mlp", "moe", "shared_expert", "shared_experts", "share_expert"}
+# Attributes a decoder layer holds its FFN, or parts of it, in. A hybrid stack's
+# FFN stage holds it in ``mixer``.
+FFN_ATTRS = {"mlp", "moe", "shared_expert", "shared_experts", "share_expert", "mixer"}
 
 
 def can_be_true(value, params):
@@ -442,6 +445,27 @@ def attention_tp_reductions(cls):
     return found
 
 
+def ffn_exit_classes(tree, source):
+    """Classes in a module that call ffn_exit, and the classes there that inherit
+    from them (whose constructors build the FFN the inherited forward runs)."""
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    users = {
+        cls.name
+        for cls in classes
+        if ".ffn_exit(" in ast.get_source_segment(source, cls)
+    }
+    grew = True
+    while grew:
+        grew = False
+        for cls in classes:
+            if cls.name not in users and any(
+                getattr(base, "id", None) in users for base in cls.bases
+            ):
+                users.add(cls.name)
+                grew = True
+    return [cls for cls in classes if cls.name in users]
+
+
 class TestFfnExitUsersOweATpSum(CustomTestCase):
     """Under attention DP the next layer's input completes a deferred FFN sum
     with an all-reduce over TP. An FFN whose linear layers reduce over the
@@ -458,11 +482,7 @@ class TestFfnExitUsersOweATpSum(CustomTestCase):
                 or ".ffn_exit(" not in source
             ):
                 continue
-            for cls in index.tree(module).body:
-                if not isinstance(cls, ast.ClassDef):
-                    continue
-                if ".ffn_exit(" not in ast.get_source_segment(source, cls):
-                    continue
+            for cls in ffn_exit_classes(index.tree(module), source):
                 layers.append(f"{module}.{cls.name}")
                 todo = []
                 for attr, name, call in submodule_constructions(cls):
@@ -490,6 +510,9 @@ class TestFfnExitUsersOweATpSum(CustomTestCase):
                     ]
                     todo += [(where, n) for _, n, _ in submodule_constructions(ffn)]
         self.assertTrue(layers and ffn_classes, "no FFN behind ffn_exit found")
+        # A hybrid stack's FFN stages, whose ffn_exit is in a base class.
+        for name in ("NemotronHMLP", "NemotronHMoE"):
+            self.assertIn(("sglang.srt.models.nemotron_h", name), ffn_classes)
         self.assertEqual(sorted(set(offenders)), [])
 
 

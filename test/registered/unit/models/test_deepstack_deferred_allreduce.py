@@ -39,6 +39,7 @@ class DeferringLayer(nn.Module):
         self.is_last_layer = is_last_layer
         # The model ends its layers at this communicator's finish_layer_stack.
         self.layer_communicator = LayerCommunicator.__new__(LayerCommunicator)
+        self.layer_communicator.next_takes_attention_partial = False
 
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_

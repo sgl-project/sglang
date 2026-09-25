@@ -24,8 +24,9 @@ class _Norm(nn.Module):
 
 class TestNemotronMTPReduction(CustomTestCase):
     def test_attention_partial_is_reduced_once(self):
-        """Under DP attention, the MTP MoE layer sums the attention output over the
-        attention TP group exactly once before the residual add."""
+        """Under DP attention, the MTP MoE layer sums the attention partial the
+        MTP attention layer left over the attention TP group exactly once before
+        the residual add."""
         for tp in (1, 2):
             with self.subTest(tp=tp):
                 reduce = Mock(side_effect=lambda x: x * tp)
@@ -79,7 +80,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                     expected = partial * tp + residual
                     hidden, output_residual = layer(
                         inputs_embeds=torch.zeros_like(partial),
-                        hidden_states=partial,
+                        hidden_states=comm.UnreducedOutput(partial, group=group),
                         residual=residual,
                         forward_batch=SimpleNamespace(
                             forward_mode=ForwardMode.DECODE,

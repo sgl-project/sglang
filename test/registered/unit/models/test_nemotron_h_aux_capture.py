@@ -41,6 +41,26 @@ class _Mixer(nn.Module):
         return partial if should_skip_mlp_all_reduce() else partial * self.tp
 
 
+class _Stack:
+    """Enter several context managers as one."""
+
+    def __init__(self, *managers):
+        self.managers = managers
+
+    def __enter__(self):
+        for manager in self.managers:
+            manager.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        for manager in reversed(self.managers):
+            manager.__exit__(*exc_info)
+
+
+def _comms(layers):
+    return [layer.layer_communicator for layer in layers]
+
+
 def _build(pattern, tp, capture):
     config = SimpleNamespace(hybrid_override_pattern=pattern)
     instance = model.NemotronHModel.__new__(model.NemotronHModel)
@@ -61,7 +81,7 @@ def _build(pattern, tp, capture):
             layer.mixer = _Mixer(0.5, tp)
         else:
             layer._init_layer_communicator(config, i, is_sparse=False)
-            layer.mixer = _Mixer(0.25)
+            layer.mixer = _Mixer(0.25, tp)
         if kind == "M":
             layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)
         layers.append(layer)
@@ -72,30 +92,55 @@ def _build(pattern, tp, capture):
 class TestNemotronAuxCapture(CustomTestCase):
     def test_capture_reduces_only_its_snapshot(self):
         """Each auxiliary snapshot equals the full hidden state at its boundary,
-        also under DP attention and after later norms update the residual in place."""
-        for pattern in ("*-", "M-", "**-", "*", "*--", "-*"):
+        and the output equals the reference, so every stage's sum is completed
+        exactly once, whichever stage completes it; also under DP attention and
+        after later norms update the residual in place."""
+        patterns = ("*-", "M-", "**-", "*", "*--", "-*", "M*-", "-", "M", "--")
+        for pattern in patterns + ("*M-*", "-M-", "E*E"):
             for dp_enabled, tp in ((True, 2), (True, 1), (False, 2)):
                 with self.subTest(pattern=pattern, dp_enabled=dp_enabled, tp=tp):
                     self._check(pattern, dp_enabled, tp)
 
-    def _check(self, pattern, dp_enabled, tp):
-        def reduce_in_place(x):
-            return x.mul_(tp)
-
-        group = SimpleNamespace(all_reduce=reduce_in_place)
-        batch = SimpleNamespace(
-            input_ids=torch.zeros(2, dtype=torch.long),
-            forward_mode=ForwardMode.DECODE,
-            global_num_token_non_padded_cpu=2,
+    def test_each_stage_declares_its_side_from_the_pattern(self):
+        with self._context(dp_enabled=False, tp=2):
+            layers = _build("M-*E-", 2, False).layers
+        mixer_before_ffn = [c.next_takes_attention_partial for c in _comms(layers)]
+        self.assertEqual(mixer_before_ffn, [True, False, True, False, False])
+        self.assertEqual(
+            [c.standalone_ffn for c in _comms(layers)],
+            [False, True, False, True, True],
         )
-        inputs = torch.tensor([[0.3, -0.5, 0.7, 1.1], [-0.4, 0.9, 0.2, -0.6]])
-        with (
+        self.assertEqual(
+            [c.previous_leaves_attention_partial for c in _comms(layers)],
+            [False, True, False, True, False],
+        )
+        self.assertEqual(
+            [c.allow_deferred_ffn_reduction for c in _comms(layers)],
+            [True, True, True, False, True],
+        )
+        self.assertEqual(
+            [c.is_last_layer for c in _comms(layers)], [False] * 4 + [True]
+        )
+        for layer, c in zip(layers, _comms(layers)):
+            if c.standalone_ffn:
+                self.assertIsNone(c.input_layernorm)
+                self.assertIs(c.post_attention_layernorm, layer.norm)
+            else:
+                self.assertIs(c.input_layernorm, layer.norm)
+                self.assertIsNone(c.post_attention_layernorm)
+
+    def _context(self, *, dp_enabled, tp, group=None):
+        group = group or SimpleNamespace(all_reduce=lambda x: x.mul_(tp))
+        return _Stack(
             get_context().override_server_args(
                 tp_size=tp, enable_dp_attention=dp_enabled
             ),
             get_flags().dp.override(enabled=dp_enabled),
             get_parallel().override(
+                # Attention TP and MoE TP are TP here, so the same group object.
                 attn_tp_group=group,
+                tp_group=group,
+                moe_tp_group=group,
                 launch_world_rank=0,
                 tp_rank=0,
                 tp_size=tp,
@@ -115,7 +160,16 @@ class TestNemotronAuxCapture(CustomTestCase):
             patch.object(comm, "get_moe_cp_size", return_value=1),
             patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=False),
             patch.object(comm, "apply_aiter_all_reduce_fusion", return_value=False),
-        ):
+        )
+
+    def _check(self, pattern, dp_enabled, tp):
+        batch = SimpleNamespace(
+            input_ids=torch.zeros(2, dtype=torch.long),
+            forward_mode=ForwardMode.DECODE,
+            global_num_token_non_padded_cpu=2,
+        )
+        inputs = torch.tensor([[0.3, -0.5, 0.7, 1.1], [-0.4, 0.9, 0.2, -0.6]])
+        with self._context(dp_enabled=dp_enabled, tp=tp):
             baseline = _build(pattern, tp, False)(
                 batch.input_ids, torch.arange(2), batch, inputs_embeds=inputs.clone()
             )
@@ -127,6 +181,7 @@ class TestNemotronAuxCapture(CustomTestCase):
         for kind in pattern:
             value = expected[-1]
             expected.append(value + _rms(value) * (0.5 if kind in "M*" else 0.25))
+        torch.testing.assert_close(output, _rms(expected[-1]))
         for i in (*range(1, len(expected)), 0):
             torch.testing.assert_close(snapshots[i], expected[i], msg=f"Boundary {i}")
 

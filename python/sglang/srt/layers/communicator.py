@@ -652,6 +652,22 @@ def reduce_output(
     return hidden_states
 
 
+def reduce_output_copy(
+    hidden_states: Union[torch.Tensor, UnreducedOutput],
+) -> torch.Tensor:
+    """A completed copy of a layer output, leaving the output and what it owes
+    to its consumer."""
+    if isinstance(hidden_states, UnreducedOutput):
+        return reduce_output(
+            UnreducedOutput(
+                hidden_states.partial.clone(),
+                group=hidden_states.group,
+                reduce_and_redistribute=hidden_states.reduce_and_redistribute,
+            )
+        )
+    return hidden_states.clone()
+
+
 def layer_input_buffer(
     hidden_states: Union[torch.Tensor, UnreducedOutput],
 ) -> torch.Tensor:
@@ -705,8 +721,10 @@ class LayerCommunicator:
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
-        input_layernorm: torch.nn.Module,
-        post_attention_layernorm: torch.nn.Module,
+        # A layer that is one stage of a hybrid stack (only a mixer, or only an
+        # FFN) passes None for the norm of the side it does not have.
+        input_layernorm: Optional[torch.nn.Module],
+        post_attention_layernorm: Optional[torch.nn.Module],
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
         qkv_latent_func: Optional[Callable] = None,
@@ -715,6 +733,14 @@ class LayerCommunicator:
         fused_ar_quant_keep_bf16: bool = False,
         # False for a layer whose FFN always completes its own reduction.
         allow_deferred_ffn_reduction: bool = True,
+        # True for an FFN that is a stage of its own: its input is the previous
+        # stage's output, not an attention partial sum (see _ffn_stage_input).
+        standalone_ffn: bool = False,
+        # True for a mixer (Mamba / attention) stage followed by an FFN stage,
+        # which completes the mixer's attention partial sum itself.
+        next_takes_attention_partial: bool = False,
+        # True for that FFN stage (see start_layer_stack).
+        previous_leaves_attention_partial: bool = False,
         _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
@@ -727,6 +753,9 @@ class LayerCommunicator:
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
         self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
+        self.standalone_ffn = standalone_ffn
+        self.next_takes_attention_partial = next_takes_attention_partial
+        self.previous_leaves_attention_partial = previous_leaves_attention_partial
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -741,6 +770,8 @@ class LayerCommunicator:
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         )
         self._mlp_input, self._mlp_input_may_fuse = self._select_mlp_input()
+        if standalone_ffn:
+            self._mlp_input = partial(_ffn_stage_input, steps=self._mlp_input)
         self._attn_input_fusions = self._select_attn_input_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -768,6 +799,9 @@ class LayerCommunicator:
                 enable_fused_ar_quant=enable_fused_ar_quant,
                 fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
                 allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
+                standalone_ffn=standalone_ffn,
+                next_takes_attention_partial=next_takes_attention_partial,
+                previous_leaves_attention_partial=previous_leaves_attention_partial,
                 _is_sp_variant=True,
             )
 
@@ -1221,6 +1255,33 @@ class LayerCommunicator:
             )
         return self.postprocess_layer(hidden_states, residual, forward_batch)
 
+    def mixer_exit(self, forward_batch: ForwardBatch) -> "MixerExit":
+        """Decide once whether this stage's mixer (Mamba / attention) leaves its
+        output all-reduce to the next layer's input. Use the result as a
+        context manager around the mixer, then call ``finish``."""
+        return MixerExit(self, forward_batch)
+
+    def _mixer_sum_moves_to_next_layer(self, forward_batch: ForwardBatch) -> bool:
+        """Whether the mixer skips its output all-reduce: always before an FFN
+        stage; when the fused kernel takes the sum into the next input norm; and
+        when the next input would run the same all-reduce over the same group."""
+        if self.next_takes_attention_partial:
+            return True
+        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
+            return True
+        # Without attention DP or CP the attention-TP group is the TP group the
+        # mixer reduces over. A quantized all-reduce, or LoRA adding after the
+        # reduction, is not the full-precision sum the next input would run.
+        return (
+            not self.is_last_layer
+            and self._context.tp_size > 1
+            and self._context.attn_tp_size == self._context.tp_size
+            and not is_dp_attention_enabled()
+            and not get_exec().comm.enable_quant_communications
+            and not get_lora().enable_lora
+            and not get_attn_tp_context().input_scattered
+        )
+
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call, then call ``finish``."""
@@ -1234,8 +1295,23 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Complete what this layer left for a next layer. Call it on the last
         layer of this rank before its output reaches the final norm, the next
-        pipeline rank, or any other consumer outside the layers."""
+        pipeline rank, or any other consumer outside the layers. A mixer before
+        an FFN stage hands on its attention partial sum instead: that stage, on
+        the next rank, completes it (see start_layer_stack)."""
+        if self.next_takes_attention_partial and isinstance(
+            hidden_states, UnreducedOutput
+        ):
+            return hidden_states.partial, residual
         return reduce_output(hidden_states), residual
+
+    def start_layer_stack(
+        self, hidden_states: torch.Tensor
+    ) -> Union[torch.Tensor, UnreducedOutput]:
+        """The input the previous pipeline rank sent, as this layer takes it. Call
+        it on the first layer of every rank but the first."""
+        if self.previous_leaves_attention_partial:
+            return UnreducedOutput(hidden_states, group=get_parallel().attn_tp_group)
+        return hidden_states
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         """Whether the FFN leaves its sum to a reduce-scatter, for layers that run
@@ -1428,6 +1504,35 @@ class FfnExit:
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         return self._complete(hidden_states, residual)
+
+
+class MixerExit:
+    """The scope that publishes a mixer's decision while it runs: inside the
+    ``with`` block ``fuse_mlp_allreduce`` on ``get_forward()`` tells its
+    row-parallel output projection to skip the all-reduce."""
+
+    __slots__ = ("skips_reduction", "_scope")
+
+    def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
+        self.skips_reduction = communicator._mixer_sum_moves_to_next_layer(
+            forward_batch
+        )
+        self._scope = get_forward().scoped(fuse_mlp_allreduce=self.skips_reduction)
+
+    def __enter__(self) -> "MixerExit":
+        self._scope.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._scope.__exit__(*exc_info)
+
+    def finish(
+        self, hidden_states: torch.Tensor
+    ) -> Union[torch.Tensor, UnreducedOutput]:
+        """The mixer output: complete, or the attention-TP partial sum it left."""
+        if not self.skips_reduction:
+            return hidden_states
+        return UnreducedOutput(hidden_states, group=get_parallel().attn_tp_group)
 
 
 @dataclass
@@ -1769,6 +1874,32 @@ def mlp_input_kind(
             return MlpInputKind.ATTN_TP_ALL_REDUCE
     raise NotImplementedError(
         f"{hidden_in=} {residual_in=} {hidden_out=} {residual_out=}"
+    )
+
+
+def _ffn_stage_input(
+    hidden_states: Union[torch.Tensor, UnreducedOutput],
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
+    context: CommunicateContext,
+    *,
+    steps: Callable,
+):
+    """prepare_mlp's input for an FFN that is a stage of its own. A mixer's
+    attention-TP partial sum takes the standard steps, which complete it. Any
+    other input is complete once what it owes is done: it is folded into the
+    residual and the steps get a zero update."""
+    if (
+        isinstance(hidden_states, UnreducedOutput)
+        and hidden_states.reduce_and_redistribute is None
+        and hidden_states.group is get_parallel().attn_tp_group
+    ):
+        return steps(hidden_states.partial, residual, forward_batch, layernorm, context)
+    hidden_states = reduce_output(hidden_states)
+    residual = hidden_states if residual is None else hidden_states + residual
+    return steps(
+        torch.zeros_like(hidden_states), residual, forward_batch, layernorm, context
     )
 
 

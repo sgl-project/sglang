@@ -1,7 +1,5 @@
 """Layer-communication helpers for the Nemotron-H model."""
 
-from torch import nn
-
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -21,6 +19,16 @@ def is_attn_layer(layer_type: str) -> bool:
 def feeds_mlp_layer(pattern: str, layer_idx: int) -> bool:
     next_idx = layer_idx + 1
     return next_idx < len(pattern) and not is_attn_layer(pattern[next_idx])
+
+
+def takes_attention_partial(pattern: str, layer_idx: int) -> bool:
+    """Whether this layer is an FFN stage right after a mixer, whose attention
+    partial sum it completes itself."""
+    return (
+        layer_idx > 0
+        and is_attn_layer(pattern[layer_idx - 1])
+        and (feeds_mlp_layer(pattern, layer_idx - 1))
+    )
 
 
 def _build_layer_scatter_modes(
@@ -49,13 +57,22 @@ def make_layer_communicator(
     allow_reduce_scatter: bool = False,
     is_sparse: bool = False,
     is_last_layer: bool = False,
+    next_takes_attention_partial: bool = False,
+    previous_leaves_attention_partial: bool = False,
+    allow_deferred_ffn_reduction: bool = True,
 ) -> LayerCommunicator:
+    """The communicator of one stage: a mixer (Mamba / attention) normalizes its
+    input with ``layer_norm``, an FFN stage normalizes its own."""
     return LayerCommunicator(
         layer_scatter_modes=_build_layer_scatter_modes(is_sparse, is_last_layer),
-        input_layernorm=layer_norm if for_attn else nn.Identity(),
-        post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
+        input_layernorm=layer_norm if for_attn else None,
+        post_attention_layernorm=None if for_attn else layer_norm,
         # With attention TP > 1, the default gather adds the residual to one
         # rank's partial in bf16 before the cross-rank sum.
         force_layernorm_before_dp_gather=True,
         allow_reduce_scatter=allow_reduce_scatter,
+        allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
+        standalone_ffn=not for_attn,
+        next_takes_attention_partial=next_takes_attention_partial,
+        previous_leaves_attention_partial=previous_leaves_attention_partial,
     )
