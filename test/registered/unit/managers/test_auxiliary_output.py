@@ -131,6 +131,7 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
         lengths=torch.tensor([2], dtype=torch.int32),
         selected_logprobs=torch.tensor([-0.5]),
+        support_logprobs=torch.tensor([[-0.5, -1.0]]),
         statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
     )
     result = GenerationBatchResult(
@@ -148,8 +149,10 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
     ) as copy_tensor:
         result.copy_to_cpu(return_logprob=False)
 
-    assert copy_tensor.call_count == 5
+    assert copy_tensor.call_count == 6
     assert sampling_output.token_ids.tolist() == [[3, 5]]
+    assert sampling_output.selected_logprobs.tolist() == [-0.5]
+    assert sampling_output.support_logprobs.tolist() == [[-0.5, -1.0]]
     assert sampling_output.lengths.tolist() == [2]
     assert sampling_output.statuses.tolist() == [SamplingMaskStatus.OK]
     assert result.copy_done.record_count == 1
@@ -160,6 +163,7 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
         lengths=torch.tensor([2], dtype=torch.int32),
         selected_logprobs=torch.tensor([-0.5]),
+        support_logprobs=torch.tensor([[-0.5, -1.0]]),
         statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
     )
     result = GenerationBatchResult(
@@ -172,7 +176,13 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         object.__new__(Scheduler), result, SimpleNamespace(return_logprob=False)
     )
     output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
-    for name in ("token_ids", "lengths", "selected_logprobs", "statuses"):
+    for name in (
+        "token_ids",
+        "lengths",
+        "selected_logprobs",
+        "support_logprobs",
+        "statuses",
+    ):
         torch.testing.assert_close(
             getattr(output.sampling_mask_output, name), getattr(sampling_output, name)
         )
@@ -597,19 +607,20 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
         disagg_prefill_inflight_queue=[],
+        cache_unfinished_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
-    with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
-        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
-            scheduler,
-            batch,
-            result,
-        )
+    SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
 
     assert req.output_ids == [7]
+    scheduler.cache_unfinished_disagg_prefill.assert_called_once_with(req)
     snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
         batch,

@@ -14,8 +14,8 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["9.0.0"]
-        device_type: ["910b", "a3"]
+        cann_version: ["9.1.0"]
+        device_type: ["a3", "950"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
