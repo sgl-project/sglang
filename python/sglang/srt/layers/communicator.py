@@ -443,6 +443,8 @@ class LayerScatterModes:
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
     is_layer_sparse: bool = False
+    # The model's last layer: its output goes to the final norm, not a next layer.
+    is_last_layer: bool = False
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -454,6 +456,7 @@ class LayerScatterModes:
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
             is_layer_sparse=context.is_layer_sparse,
+            is_last_layer=context.layer_id == context.num_layers - 1,
         )
 
     @classmethod
@@ -705,7 +708,6 @@ class LayerCommunicator:
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
@@ -716,7 +718,7 @@ class LayerCommunicator:
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
-        self.is_last_layer = is_last_layer
+        self.is_last_layer = layer_scatter_modes.is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
@@ -743,11 +745,11 @@ class LayerCommunicator:
                     mlp_mode=ScatterMode.SCATTERED,
                     middle_residual_mode=ScatterMode.SCATTERED,
                     layer_output_mode=ScatterMode.SCATTERED,
+                    is_last_layer=layer_scatter_modes.is_last_layer,
                 ),
                 input_layernorm=input_layernorm,
                 post_attention_layernorm=post_attention_layernorm,
                 allow_reduce_scatter=allow_reduce_scatter,
-                is_last_layer=is_last_layer,
                 qkv_latent_func=qkv_latent_func,
                 force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
                 enable_fused_ar_quant=enable_fused_ar_quant,
