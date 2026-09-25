@@ -869,6 +869,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and get_disagg().disaggregation_decode_workload_balancing
+        ):
+            from sglang.srt.managers.decode_workload_routing import (
+                validate_prefill_routing,
+            )
+
+            # Reject malformed PD requests at the HTTP boundary, before creating
+            # request state or sending anything to the DP controller.
+            validate_prefill_routing(obj)
+
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
             if dp_size <= 1 and obj.routed_dp_rank == 0:

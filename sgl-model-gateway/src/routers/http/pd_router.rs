@@ -1056,6 +1056,41 @@ impl PDRouter {
         Ok((prefill, decode))
     }
 
+    fn resolve_ctx_url_target(
+        workers: &[Arc<dyn Worker>],
+        headers: Option<&HeaderMap>,
+    ) -> Result<Arc<dyn Worker>, String> {
+        let headers = headers.ok_or_else(|| "Missing canonical CTX URL target".to_string())?;
+        if headers.get_all("x-smg-target-worker").iter().count() != 1 {
+            return Err("Exactly one canonical CTX URL target is required".to_string());
+        }
+        let target = header_utils::extract_target_worker(Some(headers))
+            .filter(|target| target.starts_with("http://") || target.starts_with("https://"))
+            .ok_or_else(|| "Malformed canonical CTX URL target".to_string())?;
+        let mut matches = workers.iter().filter(|worker| worker.url() == target);
+        let worker = matches
+            .next()
+            .ok_or_else(|| "Requested CTX URL is not registered; no fallback".to_string())?;
+        if matches.next().is_some() {
+            return Err("Ambiguous registered CTX URL; no fallback".to_string());
+        }
+        if !worker.is_available() {
+            ::metrics::counter!("smg_ctx_url_target_requests_total", "result" => "unavailable")
+                .increment(1);
+            warn!(
+                target_url = target,
+                matched_url = worker.url(),
+                healthy = worker.is_healthy(),
+                "CTX URL target unavailable; no affinity fallback"
+            );
+            return Err("Requested CTX URL is unavailable; no affinity fallback".to_string());
+        }
+        ::metrics::counter!("smg_ctx_url_target_requests_total", "result" => "selected",
+            "worker" => target.to_string())
+        .increment(1);
+        Ok(worker.clone())
+    }
+
     async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
@@ -1069,6 +1104,24 @@ impl PDRouter {
                 "No {} workers available. Please check if {} servers are configured and healthy.",
                 worker_type, worker_type
             ));
+        }
+
+        // Additive strict CTX URL mode: resolve registered identity BEFORE
+        // availability compaction. No numeric/hash fallback is allowed in this
+        // opt-in mode; legacy configurations and GEN selection are unchanged.
+        static REQUIRE_CTX_URL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            matches!(
+                std::env::var("SGLANG_ROUTER_REQUIRE_CTX_URL_TARGET").as_deref(),
+                Ok("1") | Ok("true")
+            )
+        });
+        if worker_type == "prefill" && policy.name() == "consistent_hashing" {
+            let url_target = header_utils::extract_target_worker(headers).is_some_and(|target| {
+                target.starts_with("http://") || target.starts_with("https://")
+            });
+            if *REQUIRE_CTX_URL || url_target {
+                return Self::resolve_ctx_url_target(workers, headers);
+            }
         }
 
         let available_workers: Vec<Arc<dyn Worker>> = workers
@@ -1789,6 +1842,106 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn test_ctx_url_target_survives_unrelated_health_change() {
+        let policy = crate::policies::ConsistentHashingPolicy::new();
+        let a: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://ctx-a@0".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let b: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://ctx-b@1".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let workers = vec![a.clone(), b.clone()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "http://ctx-b@1".parse().unwrap());
+        for healthy in [true, false, true] {
+            a.set_healthy(healthy);
+            let chosen = PDRouter::pick_worker_by_policy_arc(
+                &workers,
+                &policy,
+                None,
+                Some(&headers),
+                None,
+                "prefill",
+            )
+            .await
+            .unwrap();
+            assert_eq!(chosen.url(), b.url());
+        }
+        b.set_healthy(false);
+        assert!(PDRouter::pick_worker_by_policy_arc(
+            &workers,
+            &policy,
+            None,
+            Some(&headers),
+            None,
+            "prefill"
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ctx_url_target_never_falls_back_to_other_worker() {
+        let policy = crate::policies::ConsistentHashingPolicy::new();
+        let worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://ctx-a@0".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-smg-target-worker",
+            "http://not-registered@0".parse().unwrap(),
+        );
+        assert!(PDRouter::pick_worker_by_policy_arc(
+            &[worker],
+            &policy,
+            None,
+            Some(&headers),
+            None,
+            "prefill"
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn test_ctx_url_target_rejects_missing_malformed_and_duplicates() {
+        let worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://ctx-a@0".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        assert!(PDRouter::resolve_ctx_url_target(&[worker.clone()], None).is_err());
+        for target in ["", "1", "ftp://ctx-a@0", "http://unknown@0"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", target.parse().unwrap());
+            assert!(PDRouter::resolve_ctx_url_target(&[worker.clone()], Some(&headers)).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "http://ctx-a@0".parse().unwrap());
+        assert!(PDRouter::resolve_ctx_url_target(
+            &[worker.clone(), worker.clone()],
+            Some(&headers)
+        )
+        .is_err());
+        headers.append("x-smg-target-worker", "http://ctx-a@0".parse().unwrap());
+        assert!(PDRouter::resolve_ctx_url_target(&[worker], Some(&headers)).is_err());
     }
 
     #[test]

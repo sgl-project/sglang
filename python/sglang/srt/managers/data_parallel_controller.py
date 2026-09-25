@@ -28,6 +28,7 @@ import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.decode_workload_routing import is_fake_bootstrap_request
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -119,13 +120,29 @@ class DPBudget:
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        *,
+        eligible_ranks=None,
+    ):
+        # Existing callers retain the full-rank budget. Opt-in PD routing can
+        # restrict selection without duplicating selection or reservations.
+        ranks = range(self.dp_size)
+        if eligible_ranks is not None:
+            ranks = tuple(eligible_ranks)
+            if not ranks or len(set(ranks)) != len(ranks):
+                raise ValueError("Expected distinct eligible DP ranks")
+            if any(i < 0 or i >= self.dp_size for i in ranks) or estimated_tokens < 0:
+                raise ValueError("Invalid eligible DP rank or token workload")
+            ranks = sorted(ranks)
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            target_rank = min(ranks, key=lambda i: self.total_requests[i])
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.dp_size),
+                ranks,
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -152,6 +169,14 @@ class DataParallelController:
         self.load_balance_method = LoadBalanceMethod.from_str(
             get_parallel().load_balance_method
         )
+        self.decode_workload_balancing = (
+            get_disagg().disaggregation_decode_workload_balancing
+        )
+        if self.decode_workload_balancing:
+            logger.info(
+                "Decode DP routing: central total_tokens workload; external GEN "
+                "rank hints overridden, explicit prefill DP affinity preserved"
+            )
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
@@ -782,12 +807,28 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
-        if self.maybe_external_dp_rank_routing(req):
+        override_gen_hint = (
+            self.decode_workload_balancing and not is_fake_bootstrap_request(req)
+        )
+        if not override_gen_hint and self.maybe_external_dp_rank_routing(req):
             return
+        eligible_ranks = None
+        if override_gen_hint:
+            eligible_ranks = [
+                i
+                for i in self._active_workers
+                if self.status[i] and self.workers[i] is not None
+            ]
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+            LoadBalanceMethod.TOTAL_TOKENS,
+            estimated_tokens=estimated_tokens,
+            eligible_ranks=eligible_ranks,
         )
+        if override_gen_hint:
+            # Only replace the GEN hint; CTX rank and bootstrap identity remain
+            # intact. Selection and reservations use the existing scheduler.
+            req.routed_dp_rank = target_worker
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
