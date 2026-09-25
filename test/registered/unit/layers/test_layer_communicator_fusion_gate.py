@@ -323,7 +323,7 @@ class TestDeferFfnReduction(CustomTestCase):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
-        communicator._sp_variant = object() if sp_active else None
+        communicator._sp_region = sp_active
         communicator.allow_reduce_scatter = True
         communicator.layer_scatter_modes.is_layer_sparse = True
         forward_batch = types.SimpleNamespace(

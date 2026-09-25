@@ -49,7 +49,7 @@ def make_communicator(
         return_value=reduce_scatter
     )
     communicator.is_last_layer = False
-    communicator._sp_variant = None
+    communicator._sp_region = False
     communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
@@ -278,13 +278,13 @@ class TestSelectFfnCompletion(CustomTestCase):
     the FFN runs."""
 
     def communicator(
-        self, *, fuse=False, is_last_layer=False, scatters=True, sp_variant=None
+        self, *, fuse=False, is_last_layer=False, scatters=True, sp_region=False
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.allow_deferred_ffn_reduction = True
         communicator.next_takes_attention_partial = False
         communicator.is_last_layer = is_last_layer
-        communicator._sp_variant = sp_variant
+        communicator._sp_region = sp_region
         communicator._postprocess_scatters_to_local_tokens = scatters
         communicator.allow_reduce_scatter = True
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
@@ -328,7 +328,7 @@ class TestSelectFfnCompletion(CustomTestCase):
                 self.assertIsNone(self.left(communicator, step))
 
     def test_postprocess_keeps_an_active_layernorm_sp_region(self):
-        communicator = self.communicator(sp_variant=object())
+        communicator = self.communicator(sp_region=True)
         with get_forward().scoped(sp_active=True):
             self.assertIsNone(
                 self.left(communicator, comm._reduce_and_redistribute_output_varlen)

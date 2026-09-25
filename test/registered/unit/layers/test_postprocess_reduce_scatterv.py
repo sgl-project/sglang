@@ -140,7 +140,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
     def test_postprocess_passes_the_layer_sparsity(self):
         seen = {}
         communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._sp_variant = None
+        communicator._sp_region = False
         communicator._context = None
         communicator.allow_reduce_scatter = False
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
