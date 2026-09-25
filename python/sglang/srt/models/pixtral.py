@@ -100,6 +100,14 @@ class PixtralForConditionalGeneration(nn.Module):
             config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
             config_dict["rope_scaling"] = config_dict["rope_parameters"]
             config_dict.pop("rope_parameters")
+        # Restore to original values if padded
+        # since VisionTransformers defined in this file does not apply TP
+        original_num_heads = config_dict.get("original_num_attention_heads")
+        if original_num_heads:
+            config_dict["num_attention_heads"] = original_num_heads
+        original_intermediate_size = config_dict.get("original_intermediate_size")
+        if original_intermediate_size:
+            config_dict["intermediate_size"] = original_intermediate_size
         vision_args = {
             key: value for key, value in config_dict.items() if key in dataclass_fields
         }
@@ -535,16 +543,28 @@ class PixtralHFTransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(config.hidden_size, eps=1e-5)
 
+        num_attention_heads = config.num_attention_heads
+        num_dummy_heads = 0
+        projection_size = config.hidden_size
+        # Update input params if padded
+        if hasattr(config, "original_num_attention_heads"):
+            num_attention_heads = config.original_num_attention_heads
+            num_dummy_heads = config.num_attention_heads - num_attention_heads
+            projection_size = (
+                projection_size // num_attention_heads * config.num_attention_heads
+            )
+
         # Use SGLang's VisionAttention instead of vLLM's PixtralHFAttention
         self.attention = VisionAttention(
             embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            projection_size=config.hidden_size,
+            num_heads=num_attention_heads,
+            projection_size=projection_size,
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=0.0,
             use_context_forward=False,
             flatten_batch=False,
+            num_dummy_heads=num_dummy_heads,
             qkv_bias=False,
             proj_bias=False,
             prefix=f"{prefix}.attention",

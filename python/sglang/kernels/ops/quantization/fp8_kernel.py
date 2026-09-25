@@ -61,6 +61,10 @@ if _is_cuda:
     )
 elif _is_xpu:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+elif _is_cpu:
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8_native as sgl_per_tensor_quant_fp8,
+    )
 
 if _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
