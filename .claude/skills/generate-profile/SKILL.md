@@ -46,13 +46,11 @@ Typical startup time: 30-90 seconds depending on model size and whether CUDA gra
 ### Step 3: Validate accuracy (sanity check)
 
 ```bash
-python3 -m sglang.test.run_eval --host 127.0.0.1 --port <port> --eval-name gsm8k --num-examples 20
+sgl-eval run gsm8k --base-url http://127.0.0.1:<port>/v1 --num-examples 20
 ```
 
 - Expected accuracy: **> 0.8** for capable models (Qwen3-8B, Llama-3.1-8B-Instruct, etc.)
 - This is a quick sanity check, not a rigorous benchmark.
-- GSM8K and MMLU always use `sgl-eval`; `run_eval` delegates to it.
-- Do not reintroduce a raw completion evaluator for GSM8K or MMLU.
 - If accuracy is unexpectedly low, something is wrong — do not proceed to profiling.
 
 ### Step 4: Generate the profile
