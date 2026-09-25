@@ -338,6 +338,7 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy,
                 decode_policy: Default::default(),
                 bucket_config: None,
