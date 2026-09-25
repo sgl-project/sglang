@@ -15,7 +15,7 @@ pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
 
-from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
+from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
     flydsl_kimi_k3_kda_decode,
     flydsl_kimi_k3_kda_decode_with_f_b,
@@ -349,7 +349,7 @@ def _run_with_f_b(
 
 
 def test_public_api_and_support_predicate() -> None:
-    import sglang.kernels.ops.kimi_k3.flydsl as flydsl_ops
+    import sglang.kernels.ops.attention.kda_flydsl as flydsl_ops
 
     assert flydsl_ops.flydsl_kimi_k3_kda_decode is flydsl_kimi_k3_kda_decode
     assert (
@@ -361,7 +361,7 @@ def test_public_api_and_support_predicate() -> None:
 
 
 def test_f_b_public_api() -> None:
-    import sglang.kernels.ops.kimi_k3.flydsl as flydsl_ops
+    import sglang.kernels.ops.attention.kda_flydsl as flydsl_ops
 
     assert (
         flydsl_ops.flydsl_kimi_k3_kda_decode_with_f_b
