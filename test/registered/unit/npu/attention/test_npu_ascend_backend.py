@@ -36,6 +36,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -760,6 +761,116 @@ class TestCommonTemplate(unittest.TestCase):
         backend.common_template(forward_batch, call_fn)
         for call in call_fn.call_args_list:
             self.assertIs(call.args[1], forward_batch)
+
+
+class _DeviceTensorGuard:
+    """Stands in for a device-resident tensor in init_forward_metadata.
+
+    On NPU, ``.max()`` and ``.cpu()`` on the device tensor are blocking D2H
+    syncs; the dLLM path exists to avoid them. The guard counts those calls and
+    can forbid them outright, while every other attribute delegates to the
+    wrapped CPU tensor so the rest of the function runs unchanged.
+    """
+
+    def __init__(self, tensor, forbid_max=False, forbid_cpu=False):
+        self._tensor = tensor
+        self.max_calls = 0
+        self.cpu_calls = 0
+        self._forbid_max = forbid_max
+        self._forbid_cpu = forbid_cpu
+
+    def max(self):
+        self.max_calls += 1
+        if self._forbid_max:
+            raise AssertionError("device seq_lens.max() called (blocking D2H sync)")
+        return self._tensor.max()
+
+    def cpu(self):
+        self.cpu_calls += 1
+        if self._forbid_cpu:
+            raise AssertionError("device .cpu() called (blocking D2H sync)")
+        return self._tensor.cpu()
+
+    def __getattr__(self, name):
+        return getattr(self._tensor, name)
+
+
+class TestInitForwardMetadataSeqLensSource(unittest.TestCase):
+    """DLLM_EXTEND must take seq_lens_max from the host mirror.
+
+    A rebase once re-introduced a trailing ``else: seq_lens_max =
+    forward_batch.seq_lens.max()`` after the dLLM assignment, turning the host
+    read into a dead store and silently restoring the per-step D2H sync. These
+    tests pin the source: dLLM never touches the device reduction, decode
+    still does.
+    """
+
+    PAGE_SIZE = 2
+
+    def _make_backend(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(4 * 16, dtype=torch.int32).reshape(4, 16)
+        )
+        backend.page_size = self.PAGE_SIZE
+        backend.is_hybrid_swa = False
+        backend.use_mla = False
+        backend.use_sliding_window_kv_pool = False
+        backend.device = "cpu"
+        return backend
+
+    def _make_batch(self, forward_mode, seq_lens, extend_seq_lens):
+        return SimpleNamespace(
+            forward_mode=forward_mode,
+            spec_info=None,
+            seq_lens=seq_lens,
+            seq_lens_cpu=torch.tensor([3, 5, 4], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1, 2]),
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=[3, 5, 4],
+        )
+
+    def test_dllm_extend_never_reads_device_reduction(self):
+        backend = self._make_backend()
+        seq_lens = _DeviceTensorGuard(
+            torch.tensor([3, 5, 4], dtype=torch.int32), forbid_max=True
+        )
+        extend_seq_lens = _DeviceTensorGuard(
+            torch.tensor([3, 5, 4], dtype=torch.int32), forbid_cpu=True
+        )
+        forward_batch = self._make_batch(
+            ForwardMode.DLLM_EXTEND, seq_lens, extend_seq_lens
+        )
+
+        backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(seq_lens.max_calls, 0)
+        self.assertEqual(extend_seq_lens.cpu_calls, 0)
+        # The block-table width proves seq_lens_max came from the host mirror:
+        # host max 5 sliced with page_size 2 keeps token columns 0, 2, 4.
+        expected = (
+            backend.req_to_token_pool.req_to_token[torch.tensor([0, 1, 2]), :5][
+                :, :: self.PAGE_SIZE
+            ]
+            // self.PAGE_SIZE
+        )
+        self.assertTrue(torch.equal(backend.forward_metadata.block_tables, expected))
+        self.assertTrue(
+            torch.equal(
+                backend.forward_metadata.extend_seq_lens_cpu_int,
+                torch.tensor([3, 5, 4], dtype=torch.int32),
+            )
+        )
+
+    def test_decode_still_reads_device_max(self):
+        """The host-mirror path is dLLM-only; decode keeps the device source."""
+        backend = self._make_backend()
+        seq_lens = _DeviceTensorGuard(torch.tensor([3, 5, 4], dtype=torch.int32))
+        forward_batch = self._make_batch(ForwardMode.DECODE, seq_lens, None)
+
+        backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(seq_lens.max_calls, 1)
 
 
 if __name__ == "__main__":

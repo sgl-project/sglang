@@ -373,6 +373,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
+            # Prefer the host mirror kept by batch prep over re-reading the
+            # device tensor: .cpu() here is a blocking D2H behind whatever is
+            # already queued on the stream, once per replay.
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu()
+            )
             if forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
@@ -394,14 +402,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     # Wrapper backends (e.g. hybrid linear attention) keep
                     # forward_metadata only on their children, so it stays
                     # None here; fall back to the pre-DFlash computation.
-                    seq_lens_cpu = (
-                        forward_batch.seq_lens.cpu() + self.captured_req_width
-                    )
-                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                    seq_lens = (seq_lens_cpu + self.captured_req_width).tolist() + [
+                        0
+                    ] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

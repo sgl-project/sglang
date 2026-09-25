@@ -561,6 +561,10 @@ class Envs:
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
+    # Minimum dLLM FDFO reuse rows for gathering the retained KV blocks with one
+    # flat index op instead of a slice per row. Unset takes the backend default
+    # (Ascend only); -1 disables the batched path.
+    SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS = EnvInt(None)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
