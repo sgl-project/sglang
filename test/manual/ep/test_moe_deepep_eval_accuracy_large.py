@@ -1,13 +1,7 @@
-"""
-Usage:
-python -m unittest test_moe_deepep_eval_accuracy_large.TestMoEDeepEPEvalAccuracyLarge.test_mmlu
-"""
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
@@ -65,7 +59,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Eval accuracy of MMLU: {metrics=}")
         self.assertGreater(metrics["score"], 0.87)
 
