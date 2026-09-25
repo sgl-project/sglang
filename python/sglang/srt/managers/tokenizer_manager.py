@@ -1460,8 +1460,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        # Callers that already hold int64 token ids (e.g. an Engine fed from a
+        # binary buffer) must not pay for a second copy; a typecode mismatch or a
+        # list still goes through the converting constructor.
         input_ids_arr: Optional[array[int]] = (
-            array("q", input_ids) if input_ids is not None else None
+            input_ids
+            if isinstance(input_ids, array) and input_ids.typecode == "q"
+            else array("q", input_ids)
+            if input_ids is not None
+            else None
         )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
