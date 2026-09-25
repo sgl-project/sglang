@@ -84,6 +84,9 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
+
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:

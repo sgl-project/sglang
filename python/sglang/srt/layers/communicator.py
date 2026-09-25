@@ -37,7 +37,15 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
-from sglang.srt.layers.boundary_layout import Layout, TokenAxis
+from sglang.srt.layers.boundary_layout import (
+    DecoderLayerSides,
+    Layout,
+    StageInput,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+    dense_decoder_layer_sides,
+)
 from sglang.srt.layers.cp.utils import (
     is_mla_cp_active,
     is_mla_cp_enabled,
@@ -448,6 +456,9 @@ class LayerScatterModes:
     is_first_layer: bool = False
     # The model's last layer: its output goes to the final norm, not a next layer.
     is_last_layer: bool = False
+    # Whether the layer before this one has a sparse MLP; None when the modes
+    # were given directly, not planned from the layer sequence.
+    is_previous_layer_sparse: Optional[bool] = None
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -461,6 +472,7 @@ class LayerScatterModes:
             is_layer_sparse=context.is_layer_sparse,
             is_first_layer=context.layer_id == 0,
             is_last_layer=context.layer_id == context.num_layers - 1,
+            is_previous_layer_sparse=context.is_previous_layer_sparse,
         )
 
     @classmethod
@@ -708,6 +720,9 @@ def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
 class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA layout.
     _publish_lora_layout: bool = False
+    # Whether this class's boundary steps may be chosen from both sides'
+    # declarations; a subclass that picks its own steps says no.
+    _takes_declared_boundaries = True
 
     def __init__(
         self,
@@ -738,15 +753,11 @@ class LayerCommunicator:
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
         )
-        self._post_init_communicate()
-        # Under attention DP, the base postprocess scatters the FFN output back
-        # to this rank's tokens, which the next layer's input can run instead;
-        # the MHC and DSA-CP postprocess do more, so theirs stays here.
-        self._postprocess_scatters_to_local_tokens = (
-            self._communicate_summable_tensor_pair_fn
-            is CommunicateSummableTensorPairFn._scatter_hidden_states
-        )
-        self._mlp_input, self._mlp_input_may_fuse = self._select_mlp_input()
+        sides = self._declared_sides()
+        if sides is not None:
+            self._select_declared_boundaries(sides)
+        else:
+            self._select_boundaries_from_scatter_modes()
         self._attn_input_fusions = self._select_attn_input_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -759,6 +770,85 @@ class LayerCommunicator:
         # Under LayerNorm SP the residual and norms run on this rank's sequence
         # shard with no collectives while the region is active.
         self._sp_region = layernorm_sp.layernorm_sp_enabled()
+
+    def _declared_sides(self) -> Optional[DecoderLayerSides]:
+        """The declarations this layer's boundaries are chosen from: an
+        attention and a dense MLP on the TP group under attention DP, without CP
+        or LayerNorm SP, in a layer that takes the rows a dense layer or the
+        embedding hands on. None when the steps come from the scatter modes."""
+        modes = self.layer_scatter_modes
+        parallel = get_parallel()
+        if not (
+            self._takes_declared_boundaries
+            and parallel.attn_dp_size > 1
+            and parallel.attn_cp_size == 1
+            and not layernorm_sp.layernorm_sp_enabled()
+            and not modes.is_layer_sparse
+            and not enable_moe_dense_fully_dp()
+            and (modes.is_first_layer or modes.is_previous_layer_sparse is False)
+        ):
+            return None
+        return dense_decoder_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: parallel.attn_dp_size,
+                TokenAxis.ATTN_CP: parallel.attn_cp_size,
+                TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
+            },
+            leaves_for_next_layer=self.allow_deferred_ffn_reduction,
+            leaves_for_reduce_scatter=self.allow_reduce_scatter,
+        )
+
+    def _select_declared_boundaries(self, sides: DecoderLayerSides) -> None:
+        """Choose the three boundary sides this layer owns from the
+        declarations: the attention input, the attention -> FFN steps, and the
+        FFN output's way back to the layer's rows."""
+        self._communicate_simple_fn = _select_attention_input_move(
+            sides.layer_rows, sides.attention
+        )
+        self._mlp_input = _select_ffn_input(
+            sides.attention_output,
+            residual=sides.layer_rows,
+            need=sides.ffn,
+            force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
+        )
+        # Neither fused kernel runs under attention DP.
+        self._mlp_input_may_fuse = False
+        self._ffn_output = sides.ffn_output
+        self._postprocess_scatters_to_local_tokens = _ffn_output_returns_over_dp(
+            sides.ffn_output, sides.layer_rows
+        )
+        self._ffn_sum_is_movable = sides.ffn_output.group is not None
+
+    def _select_boundaries_from_scatter_modes(self) -> None:
+        self._post_init_communicate()
+        # Under attention DP, the base postprocess scatters the FFN output back
+        # to this rank's tokens, which the next layer's input can run instead;
+        # the MHC and DSA-CP postprocess do more, so theirs stays here.
+        self._postprocess_scatters_to_local_tokens = (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states
+        )
+        modes = self.layer_scatter_modes
+        self._ffn_output = StageOutput(
+            self._context.layouts[modes.mlp_mode],
+            group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
+            leaves_for_next_layer=self.allow_deferred_ffn_reduction,
+            leaves_for_reduce_scatter=self.allow_reduce_scatter,
+            # A MoE block leaves its sum to reduce_scatterv whenever it applies
+            # (should_skip_post_experts_all_reduce); a dense MLP does only under
+            # the published mlp_reduce_scatter.
+            leaves_for_reduce_scatterv=(
+                self.allow_reduce_scatter or modes.is_layer_sparse
+            ),
+        )
+        # Whether the FFN sum is one the next layer's input can take: not when
+        # the way back is the MoE-CP scatter, nor when a SCATTERED FFN computes
+        # whole tokens with nothing left to sum.
+        self._ffn_sum_is_movable = modes.mlp_mode not in (
+            ScatterMode.MOE_FULL,
+            ScatterMode.SCATTERED,
+        )
+        self._mlp_input, self._mlp_input_may_fuse = self._select_mlp_input()
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -1092,6 +1182,9 @@ class LayerCommunicator:
     ):
         if self._in_sp_region():
             return hidden_states, residual
+        if self._postprocess_scatters_to_local_tokens:
+            step = self._postprocess_dp_step(forward_batch) or _redistribute_output
+            return _to_local_tokens(step, forward_batch, hidden_states), residual
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -1117,8 +1210,8 @@ class LayerCommunicator:
             return None
         return _reduce_and_redistribute_output_step(
             forward_batch,
-            allow_reduce_scatter=self.allow_reduce_scatter,
-            is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+            leaves_for_reduce_scatter=self._ffn_output.leaves_for_reduce_scatter,
+            leaves_for_reduce_scatterv=self._ffn_output.leaves_for_reduce_scatterv,
         )
 
     def _ffn_leaves_sum_to_reduce_scatter(
@@ -1127,7 +1220,7 @@ class LayerCommunicator:
         """Whether the FFN leaves its sum out because a reduce-scatter completes
         it: the attention-DP one ``dp_step`` names, or the CP / input-scattered
         one."""
-        if not self.allow_reduce_scatter:
+        if not self._ffn_output.leaves_for_reduce_scatter:
             return False
         if dp_step is not None:
             return True
@@ -1141,9 +1234,7 @@ class LayerCommunicator:
     def ffn_reduction_group(self) -> GroupCoordinator:
         """The group this layer's FFN output owes its sum over: the MoE output's
         group on a sparse layer, the TP group a dense MLP reduces over."""
-        if self.layer_scatter_modes.is_layer_sparse:
-            return post_experts_reduction_group()
-        return get_parallel().tp_group
+        return _sum_group(self._ffn_output.group)
 
     def _select_ffn_completion(self, forward_batch: ForwardBatch) -> "FfnCompletion":
         """Decide once, before the FFN runs, what it skips and what completes its
@@ -1157,7 +1248,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             dp_step=dp_step,
         )
-        if not self.allow_deferred_ffn_reduction:
+        if not self._ffn_output.leaves_for_next_layer:
             return FfnCompletion(
                 defer_moe_finalize=False,
                 fuse_mlp_allreduce=False,
@@ -1255,14 +1346,9 @@ class LayerCommunicator:
         return False
 
     def _ffn_sum_can_move_to_next_layer(self) -> bool:
-        # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
-        # the fusion path skips postprocess_layer which contains the moe_cp scatter.
-        # Without scatter, hidden_states remain at MOE_FULL size while residual is at
-        # TP_ATTN_FULL size, causing a shape mismatch.
-        if (
-            is_enable_moe_cp_allgather()
-            or self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL
-        ):
+        # Under the MoE-CP all-gather the fusion path would skip postprocess_layer
+        # and its MoE-CP scatter, leaving hidden_states longer than the residual.
+        if is_enable_moe_cp_allgather() or not self._ffn_sum_is_movable:
             return False
 
         # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
@@ -1284,12 +1370,7 @@ class LayerCommunicator:
         ):
             return False
 
-        if get_attn_tp_context().input_scattered:
-            return False
-
-        # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
-        # all-reduce, so there is nothing to fuse with the next layer.
-        return self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED
+        return not get_attn_tp_context().input_scattered
 
     # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
@@ -1650,12 +1731,14 @@ def _mlp_input_dp_replicate(
     context: CommunicateContext,
     *,
     gathers_residual: bool,
+    reduces_attention_tp: bool,
 ):
-    """Attention DP: reduce, add and normalize locally, then gather."""
+    """Attention DP: complete the attention-TP sum if it is owed, add and
+    normalize locally, then gather."""
     if gathers_residual:
         residual = _redistribute_from_attn_tp_shards(residual)
     if hidden_states.shape[0] != 0:
-        if context.attn_tp_size > 1:
+        if reduces_attention_tp:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
         with use_symmetric_memory(
             get_parallel().tp_group,
@@ -1702,8 +1785,77 @@ def _mlp_input_order(
             _mlp_input_without_dp, gathers_residual=gathers_residual, fusions=fusions
         )
     if context.force_layernorm_before_dp_gather or context.attn_tp_size == 1:
-        return partial(_mlp_input_dp_replicate, gathers_residual=gathers_residual)
+        return partial(
+            _mlp_input_dp_replicate,
+            gathers_residual=gathers_residual,
+            reduces_attention_tp=context.attn_tp_size > 1,
+        )
     return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual)
+
+
+def _sum_group(group: SumGroup) -> GroupCoordinator:
+    parallel = get_parallel()
+    if group is SumGroup.ATTN_TP:
+        return parallel.attn_tp_group
+    if group is SumGroup.TP:
+        return parallel.tp_group
+    return post_experts_reduction_group()
+
+
+def _select_attention_input_move(rows: Layout, need: StageInput) -> Callable:
+    """How the rows a layer takes become its attention's input."""
+    if rows == need.layout:
+        return CommunicateSimpleFn._trivial
+    raise NotImplementedError(f"{rows=} {need=}")
+
+
+def _select_ffn_input(
+    produced: StageOutput,
+    *,
+    residual: Layout,
+    need: StageInput,
+    force_layernorm_before_gather: bool,
+) -> Callable:
+    """The steps from the attention output to the FFN input: complete the
+    attention-TP sum, add the residual and normalize, and gather the rows the
+    FFN's group needs, with the residual left on the attention's rows."""
+    gathered = produced.layout.sharded - need.layout.sharded
+    if (
+        residual != produced.layout
+        or not need.layout.sharded <= produced.layout.sharded
+        or gathered != {TokenAxis.ATTN_DP}
+    ):
+        raise NotImplementedError(f"{produced=} {residual=} {need=}")
+    # What the attention output owes decides the steps: the attention-TP sum,
+    # always left by the output projection, or nothing.
+    owes_attention_tp = produced.group is SumGroup.ATTN_TP
+    if owes_attention_tp != produced.always_leaves or produced.group not in (
+        None,
+        SumGroup.ATTN_TP,
+    ):
+        raise NotImplementedError(f"{produced=}")
+    # The partial order adds the residual on attention-TP rank 0 before the DP
+    # gather's collective completes that sum, which only a plain residual add
+    # allows.
+    if owes_attention_tp and not force_layernorm_before_gather:
+        return partial(_mlp_input_dp_partial, gathers_residual=False)
+    return partial(
+        _mlp_input_dp_replicate,
+        gathers_residual=False,
+        reduces_attention_tp=owes_attention_tp,
+    )
+
+
+def _ffn_output_returns_over_dp(produced: StageOutput, rows: Layout) -> bool:
+    """Whether the FFN output goes back to the layer's rows by undoing the
+    attention-DP gather."""
+    returned = rows.sharded - produced.layout.sharded
+    if not produced.layout.sharded <= rows.sharded or returned not in (
+        frozenset(),
+        {TokenAxis.ATTN_DP},
+    ):
+        raise NotImplementedError(f"{produced=} {rows=}")
+    return bool(returned)
 
 
 class MlpInputKind(Enum):
@@ -1950,18 +2102,19 @@ def _redistribute_output_from_moe_cp(
 
 
 def _reduce_and_redistribute_output_step(
-    forward_batch: ForwardBatch, *, allow_reduce_scatter: bool, is_layer_sparse: bool
+    forward_batch: ForwardBatch,
+    *,
+    leaves_for_reduce_scatter: bool,
+    leaves_for_reduce_scatterv: bool,
 ) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
-    """The reduce-scatter that brings a FULL-layout layer output back to this
-    rank's tokens under attention DP when the FFN left its sum to it; None when
-    the FFN reduced the output and only a scatter remains."""
-    # A MoE block leaves its sum to reduce_scatterv whenever it applies
-    # (should_skip_post_experts_all_reduce); a dense MLP does only under the
-    # published mlp_reduce_scatter, which needs allow_reduce_scatter.
-    if should_use_dp_reduce_scatterv() and (allow_reduce_scatter or is_layer_sparse):
+    """The reduce-scatter that brings an FFN output gathered over attention
+    DP back to this rank's tokens when the FFN leaves its sum to it (see
+    StageOutput); None when the FFN reduces the output and only a scatter
+    remains."""
+    if should_use_dp_reduce_scatterv() and leaves_for_reduce_scatterv:
         return _reduce_and_redistribute_output_varlen
     if (
-        allow_reduce_scatter
+        leaves_for_reduce_scatter
         and forward_batch.dp_padding_mode.is_max_len()
         and can_use_dp_reduce_scatter()
     ):
@@ -2053,8 +2206,10 @@ class CommunicateSummableTensorPairFn:
         step = (
             _reduce_and_redistribute_output_step(
                 forward_batch,
-                allow_reduce_scatter=allow_reduce_scatter,
-                is_layer_sparse=is_layer_sparse,
+                leaves_for_reduce_scatter=allow_reduce_scatter,
+                # A MoE block leaves its sum to reduce_scatterv whenever it
+                # applies (should_skip_post_experts_all_reduce).
+                leaves_for_reduce_scatterv=allow_reduce_scatter or is_layer_sparse,
             )
             or _redistribute_output
         )

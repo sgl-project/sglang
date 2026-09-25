@@ -176,6 +176,9 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
+
     fusion_service: CuteDSLFusionService | None = None
 
     # The runner can defer and a successor or the final norm consumes the handoff.

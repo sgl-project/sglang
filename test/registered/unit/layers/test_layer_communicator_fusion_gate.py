@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -24,6 +25,11 @@ def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._speculative_algo = None
     communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
+    # Fixed at construction by the scatter-mode path from the MLP's mode.
+    communicator._ffn_sum_is_movable = mlp_mode not in (
+        ScatterMode.MOE_FULL,
+        ScatterMode.SCATTERED,
+    )
     communicator.is_last_layer = False
     communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
@@ -324,8 +330,12 @@ class TestDeferFfnReduction(CustomTestCase):
         communicator.is_last_layer = is_last_layer
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
         communicator._sp_region = sp_active
-        communicator.allow_reduce_scatter = True
-        communicator.layer_scatter_modes.is_layer_sparse = True
+        communicator._ffn_output = StageOutput(
+            Layout(frozenset()),
+            group=SumGroup.MOE_OUTPUT,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        )
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(batch_size,)),
             global_dp_buffer_len=global_tokens,
