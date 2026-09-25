@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
+from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 
 from .nixl_registry import NixlRegistry
@@ -118,6 +120,15 @@ class HiCacheNixl(HiCacheStorage):
         self.is_zero_copy = False
         self.storage_config = storage_config
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
+        self.enable_storage_metrics = storage_config.enable_storage_metrics
+
+        # Drained by get_stats() on the scheduler thread and appended by the
+        # prefetch/backup workers; the lock keeps each (pgs, bandwidth) pair together.
+        self._stats_lock = threading.Lock()
+        self._prefetch_pgs: List[int] = []
+        self._backup_pgs: List[int] = []
+        self._prefetch_bandwidth: List[float] = []
+        self._backup_bandwidth: List[float] = []
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
         self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
@@ -920,9 +931,13 @@ class HiCacheNixl(HiCacheStorage):
         buffer_sizes: List[int],
         elapsed_ms: float,
         results: List[bool],
+        *,
+        is_read: bool,
     ) -> None:
         requested_bytes = sum(s for s in buffer_sizes if s is not None)
-        # _batch_xfer is one NIXL request per batch, so it completes all or nothing.
+        # _batch_xfer is one NIXL request per batch, so it completes all or nothing:
+        # results is [success] * n. num_keys counts logical pages, not the expanded
+        # per-component key_strs, so it is the page count to record.
         succeeded = all(results)
         transferred_bytes = requested_bytes if succeeded else 0
         bw = (
@@ -936,6 +951,32 @@ class HiCacheNixl(HiCacheStorage):
             f"{transferred_bytes} of {requested_bytes} bytes transferred, "
             f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw:.2f} MB/s"
         )
+        if not self.enable_storage_metrics or not succeeded:
+            return
+        # sglang:{prefetch,backup}_bandwidth buckets are GB/s; bw above is MB/s.
+        bw_gb_s = bw / 1024
+        with self._stats_lock:
+            if is_read:
+                self._prefetch_pgs.append(num_keys)
+                self._prefetch_bandwidth.append(bw_gb_s)
+            else:
+                self._backup_pgs.append(num_keys)
+                self._backup_bandwidth.append(bw_gb_s)
+
+    def get_stats(self) -> StorageMetrics:
+        # Swap under the lock: a worker appending mid-drain would otherwise lose its
+        # sample or split it across two intervals, biasing the bandwidth histogram.
+        with self._stats_lock:
+            prefetch_pgs, self._prefetch_pgs = self._prefetch_pgs, []
+            backup_pgs, self._backup_pgs = self._backup_pgs, []
+            prefetch_bandwidth, self._prefetch_bandwidth = self._prefetch_bandwidth, []
+            backup_bandwidth, self._backup_bandwidth = self._backup_bandwidth, []
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_pgs.extend(prefetch_pgs)
+        storage_metrics.backup_pgs.extend(backup_pgs)
+        storage_metrics.prefetch_bandwidth.extend(prefetch_bandwidth)
+        storage_metrics.backup_bandwidth.extend(backup_bandwidth)
+        return storage_metrics
 
     def batch_get_v1(
         self,
@@ -963,6 +1004,7 @@ class HiCacheNixl(HiCacheStorage):
             [s for _, s in host_buffers],
             elapsed_ms,
             results,
+            is_read=True,
         )
 
         return self._batch_get_postprocess(host_indices, results)
@@ -1000,6 +1042,7 @@ class HiCacheNixl(HiCacheStorage):
             [s for _, s in host_buffers],
             elapsed_ms,
             results,
+            is_read=False,
         )
 
         return results
@@ -1093,6 +1136,7 @@ class HiCacheNixl(HiCacheStorage):
                 [size for _, size in host_buffers],
                 elapsed_ms,
                 transfer_results,
+                is_read=True,
             )
             ctx = self._hybrid_pool_ctx[transfer.name]
             page_results = self._page_results(transfer_results, key_multiplier)
@@ -1134,6 +1178,7 @@ class HiCacheNixl(HiCacheStorage):
                 [size for _, size in host_buffers],
                 elapsed_ms,
                 transfer_results,
+                is_read=False,
             )
             results[transfer.name] = self._page_results(
                 transfer_results, key_multiplier

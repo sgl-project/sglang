@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -1751,6 +1752,188 @@ class TestNixlFileLayout(CustomTestCase):
         fm.clear()
 
         self.assertFalse(os.path.exists(file_path))
+
+
+class TestNixlStorageMetrics(CustomTestCase):
+    """get_stats() feeds sglang:{prefetch,backup}_bandwidth for the NIXL L3 tier."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_metrics_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        self.hicache = self._make_hicache(enable_storage_metrics=True)
+
+    def _make_hicache(self, enable_storage_metrics: bool) -> HiCacheNixl:
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            enable_storage_metrics=enable_storage_metrics,
+            extra_config={
+                "plugin": {"posix": {"active": True}},
+                "use_direct_io": False,
+            },
+        )
+        try:
+            return HiCacheNixl(storage_config=storage_config, file_path=self.test_dir)
+        except ImportError:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
+    def _run_batch_set_v1(self, hicache, xfer_results: list) -> str:
+        mock_host = MockMemPoolHost(is_zero_copy_mode=False)
+        hicache.register_mem_pool_host(mock_host)
+        hicache._batch_xfer = lambda keys, key_strs, host_buffers, direction: list(
+            xfer_results
+        )
+        keys = [f"metrics_k{i}" for i in range(len(xfer_results))]
+        host_indices = torch.arange(len(keys) * mock_host.page_size, dtype=torch.int64)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixl.hicache_nixl", level="DEBUG"
+        ) as logs:
+            hicache.batch_set_v1(keys, host_indices)
+        return "\n".join(logs.output)
+
+    def test_recorded_bandwidth_is_gb_per_second_not_mb_per_second(self):
+        """The histogram buckets are GB/s (max 100); recording the debug line's MB/s
+        figure would put every sample in the overflow bucket."""
+        log = self._run_batch_set_v1(self.hicache, [True, True])
+
+        logged_mb_s = float(log.split("effective bandwidth: ")[1].split(" MB/s")[0])
+        stats = self.hicache.get_stats()
+
+        self.assertEqual(len(stats.backup_bandwidth), 1)
+        self.assertAlmostEqual(stats.backup_bandwidth[0], logged_mb_s / 1024, places=4)
+
+    def test_failed_batch_records_no_bandwidth_sample(self):
+        """Bytes moved are unknown unless every entry succeeded, so a failed batch
+        must not reach the histogram."""
+        self._run_batch_set_v1(self.hicache, [True, False])
+
+        stats = self.hicache.get_stats()
+
+        self.assertEqual(stats.backup_bandwidth, [])
+        self.assertEqual(stats.backup_pgs, [])
+
+    def test_reads_and_writes_route_to_prefetch_and_backup_respectively(self):
+        """Each of the four transfer paths passes its own is_read, so a flipped flag
+        at one call site swaps that path's tier without failing anything else.
+        """
+        mock_host = MockMemPoolHost(is_zero_copy_mode=False)
+        self.hicache.register_mem_pool_host(mock_host)
+        self.hicache.register_mem_host_pool_v2(MockHybridPool(), PoolName.MAMBA)
+        self.hicache._batch_xfer = lambda keys, key_strs, host_buffers, direction: (
+            [True] * len(key_strs)
+        )
+        keys = ["metrics_k0", "metrics_k1"]
+        host_indices = torch.arange(len(keys) * mock_host.page_size, dtype=torch.int64)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=keys,
+                host_indices=torch.arange(len(keys), dtype=torch.int64),
+            )
+        ]
+        ops = [
+            ("prefetch", lambda: self.hicache.batch_get_v1(keys, host_indices)),
+            ("prefetch", lambda: self.hicache.batch_get_v2(transfers)),
+            ("backup", lambda: self.hicache.batch_set_v1(keys, host_indices)),
+            ("backup", lambda: self.hicache.batch_set_v2(transfers)),
+        ]
+        for expected_tier, run in ops:
+            with self.subTest(tier=expected_tier):
+                run()
+                stats = self.hicache.get_stats()
+
+                if expected_tier == "prefetch":
+                    self.assertEqual(len(stats.prefetch_bandwidth), 1)
+                    self.assertEqual(stats.backup_bandwidth, [])
+                else:
+                    self.assertEqual(len(stats.backup_bandwidth), 1)
+                    self.assertEqual(stats.prefetch_bandwidth, [])
+
+    def test_hybrid_transfers_count_pages_not_component_keys(self):
+        """A mamba page moves as one key per component (temporal + conv), so the
+        page counters must record logical pages, not the expanded NIXL keys."""
+        pool = MockHybridPool()
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+        self.hicache._batch_xfer = lambda keys, key_strs, host_buffers, direction: (
+            [True] * len(key_strs)
+        )
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["metrics_p0", "metrics_p1", "metrics_p2"],
+            host_indices=torch.arange(3, dtype=torch.int64),
+        )
+        self.assertGreater(
+            self.hicache._get_hybrid_key_multiplier(PoolName.MAMBA, pool), 1
+        )
+
+        self.hicache.batch_set_v2([transfer])
+        self.hicache.batch_get_v2([transfer])
+        stats = self.hicache.get_stats()
+
+        self.assertEqual(stats.backup_pgs, [3])
+        self.assertEqual(stats.prefetch_pgs, [3])
+
+    def test_get_stats_never_splits_a_sample_being_recorded(self):
+        """A worker records a page count and a bandwidth as two appends; a drain on
+        the scheduler thread between them must not report one without the other."""
+        paused, resume = threading.Event(), threading.Event()
+
+        class PausingList(list):
+            def append(self, item):
+                super().append(item)
+                paused.set()
+                resume.wait(timeout=10)
+
+        self.hicache._prefetch_pgs = PausingList()
+        worker = threading.Thread(
+            target=self.hicache._log_xfer_stats,
+            args=("batch_get_v1", 2, torch.arange(2), [4096], 1.0, [True]),
+            kwargs={"is_read": True},
+        )
+        worker.start()
+        self.assertTrue(paused.wait(timeout=10))
+        drained = []
+        drain = threading.Thread(
+            target=lambda: drained.append(self.hicache.get_stats())
+        )
+        drain.start()
+        # Without the lock the drain finishes inside the worker's pause.
+        drain.join(timeout=1)
+        resume.set()
+        worker.join(timeout=10)
+        drain.join(timeout=10)
+
+        stats = [drained[0], self.hicache.get_stats()]
+        self.assertEqual(sum(len(s.prefetch_pgs) for s in stats), 1)
+        for s in stats:
+            self.assertEqual(len(s.prefetch_pgs), len(s.prefetch_bandwidth))
+
+    def test_get_stats_drains_so_samples_are_not_double_counted(self):
+        """The collector observes every returned sample, so a drain that only copies
+        would replay the whole history into the histogram on each scrape.
+        """
+        self._run_batch_set_v1(self.hicache, [True, True])
+
+        self.assertEqual(len(self.hicache.get_stats().backup_bandwidth), 1)
+        self.assertEqual(self.hicache.get_stats().backup_bandwidth, [])
+
+    def test_disabled_storage_metrics_accumulates_nothing(self):
+        """Nothing calls get_stats() when metrics are off, so recording anyway grows
+        the sample lists for the lifetime of the process.
+        """
+        hicache = self._make_hicache(enable_storage_metrics=False)
+
+        self._run_batch_set_v1(hicache, [True, True])
+
+        self.assertEqual(hicache._backup_bandwidth, [])
+        self.assertEqual(hicache._backup_pgs, [])
 
 
 if __name__ == "__main__":
