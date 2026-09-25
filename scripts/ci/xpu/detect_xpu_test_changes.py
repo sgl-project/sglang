@@ -29,7 +29,7 @@ def xpu_per_commit_files(paths):
         try:
             registries, _ = ut_parse_one_file(str(path))
         except (SyntaxError, ValueError) as e:
-            # Unparseable test file: run XPU CI so run_suite surfaces the error.
+            # Unparsable test file: run XPU CI so run_suite surfaces the error.
             print(f"::warning::{rel}: {e}", file=sys.stderr)
             hits.append(rel)
             continue
