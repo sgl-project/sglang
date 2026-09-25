@@ -40,6 +40,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
     enable_moe_dense_fully_dp,
+    layer_input_buffer,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -60,7 +61,10 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import aiter_w8a8_block_fp8_linear
+from sglang.srt.layers.quantization.fp8_utils import (
+    MXFP8_DENSE_PTPC_DECODE_MAX_M,
+    aiter_w8a8_block_fp8_linear,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -1367,9 +1371,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        # The input norm hands every attention projection the per-token (fp8, scale)
-        # pair, so each must run the ptpc decode GEMM that consumes it.
-        enable_fused_ar_quant_per_token = (
+        # The input norm hands every attention projection the same input, so a
+        # per-token (fp8, scale) pair needs the ptpc decode GEMM on each of them.
+        self.attn_input_fp8_per_token = (
             _is_gfx95_supported
             and _linear_has_ptpc_decode_copy(self.self_attn.qkv_proj)
             and (
@@ -1382,7 +1386,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            enable_fused_ar_quant_per_token=enable_fused_ar_quant_per_token,
         )
 
     def forward(
@@ -1394,17 +1397,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        quant_format = (
+            "fp8_per_token"
+            if self.attn_input_fp8_per_token
+            and layer_input_buffer(hidden_states).shape[0]
+            <= MXFP8_DENSE_PTPC_DECODE_MAX_M
+            else ""
+        )
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
+                quant_format=quant_format,
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 **kwargs,
             )
         )
 
-        # A tuple is the (fp8, scale) pair from the fused AR + norm + quant path.
+        # A tuple is the per-token (fp8, scale) input.
         num_tokens = (
             hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         ).shape[0]

@@ -47,7 +47,6 @@ def communicator(norm):
     c._context = None
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
-    c.enable_fused_ar_quant_per_token = False
     c._communicate_simple_fn = lambda hidden_states, **_: hidden_states
     return c
 
