@@ -160,7 +160,7 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if req.skip_radix_cache_insert:
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
@@ -220,13 +220,15 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Returns False when no backup can be taken ('none' backend, or the host
+    pool cannot hold it); the caller aborts the request."""
     if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
         # Drain the in-flight verify before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
+    if backend == "none":
+        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -278,6 +280,8 @@ def discard_kv_cache_backup(
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+    what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -291,22 +295,23 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.kv.mamba_pool_idx = None
         return
-
-    owned_kv_len = req.owned_kv_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        owned_kv_len=owned_kv_len,
-    )
-
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # internally, then sets req_pool_idx = None.
-    assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    if not req.kv.holds_kv:
+    if tree_cache.claim_kv_row(req):
+        # A streaming session detached the kv record to keep the row.
+        assert not req.kv.holds_kv
         return
 
-    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    owned_kv_len = req.owned_kv_len()
+    is_insert = is_insert and not req.skip_radix_cache_insert
+    if is_insert:
+        tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
+    else:
+        # The protected prefix is not this req's to free.
+        tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        tree_cache.unpin(req)
+    _release_overallocated_kv_indices(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    tree_cache.on_release(req, inserted=is_insert)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
