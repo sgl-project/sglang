@@ -1,0 +1,2458 @@
+diff --git a/projects/clr/hipamd/src/hip_graph_internal.cpp b/projects/clr/hipamd/src/hip_graph_internal.cpp
+index 9ae951248e..02e6a8e06b 100644
+--- a/projects/clr/hipamd/src/hip_graph_internal.cpp
++++ b/projects/clr/hipamd/src/hip_graph_internal.cpp
+@@ -2861,7 +2861,8 @@ bool Graph::RunOneNode(Node node) {
+     // Process child graph separately, since there is no connection
+     auto child = reinterpret_cast<hip::ChildGraphNode*>(node)->GetChildGraph();
+     if (!reinterpret_cast<hip::ChildGraphNode*>(node)->GetGraphCaptureStatus()) {
+-      child->RunNodes(node->stream_id_, &streams_, &waitList);
++      child->RunNodes(node->stream_id_, &streams_, &waitList,
++                      cross_stream_producers_.count(node) != 0);
+       // Store the child graph's completion command so that downstream
+       // dependency handling can use node->GetCommands() directly,
+       // instead of querying getLastQueuedCommand at dependency time
+@@ -2888,6 +2889,12 @@ bool Graph::RunOneNode(Node node) {
+       LogPrintfError("Command creation for node id(%d) failed!", current_id_ + 1);
+       return false;
+     }
++    // All of them, before enqueue: a consumer waits on all of them.  A command with no
++    // completion signal is covered instead by the marker Event::notifyCmdQueue() adds.
++    const bool cross_stream = cross_stream_producers_.count(node) != 0;
++    for (auto command : node->GetCommands()) {
++      command->setCrossStreamProducer(cross_stream);
++    }
+     // If a wait was requested, then process the list
+     if (node->GetWait() && !waitList.empty()) {
+       node->UpdateEventWaitLists(waitList);
+@@ -2938,12 +2945,41 @@ bool Graph::RunOneNode(Node node) {
+   return true;
+ }
+ 
++// The nodes whose completion another stream waits on.  A hint: a missing entry costs a host
++// resident wait, an extra one costs a barrier packet.  Known before a producer is enqueued,
++// because by the time a consumer discovers the edge its producer has been submitted.
++void Graph::FindCrossStreamProducers(int32_t base_stream) {
++  cross_stream_producers_.clear();
++  for (auto node : vertices_) {
++    // A dependency that crosses a stream id.  The command a consumer of a child graph waits on
++    // is the last one the child queued, which is on the child graph node's own stream.
++    for (auto dep : node->GetDependencies()) {
++      if (dep->stream_id_ != node->stream_id_) {
++        cross_stream_producers_.insert(dep);
++      }
++    }
++    // The join at the bottom of RunNodes() waits on each other stream's last leaf.  Which leaf
++    // that is depends on traversal order, so mark every leaf off the base stream.
++    if (node->GetEdges().empty() && node->stream_id_ != base_stream) {
++      cross_stream_producers_.insert(node);
++    }
++  }
++}
++
+ // ================================================================================================
+ bool Graph::RunNodes(int32_t base_stream, const std::vector<hip::Stream*>* parallel_streams,
+-                     const amd::Command::EventWaitList* parent_waitlist) {
++                     const amd::Command::EventWaitList* parent_waitlist,
++                     bool waited_cross_stream) {
+   if (parallel_streams != nullptr) {
+     streams_ = *parallel_streams;
+   }
++  // Computed once per base stream: rebuilding it per launch would put a container
++  // clear/insert on a path that takes no lock.  Safe only because a graph has one pending
++  // launch at a time.
++  if (cross_stream_base_ != base_stream) {
++    FindCrossStreamProducers(base_stream);
++    cross_stream_base_ = base_stream;
++  }
+ 
+   // childgraph node has dependencies on parent graph nodes from other streams
+   if (parent_waitlist != nullptr) {
+@@ -3006,6 +3042,9 @@ bool Graph::RunNodes(int32_t base_stream, const std::vector<hip::Stream*>* paral
+   // Wait for leafs in the graph's app stream
+   if (wait_list.size() > 0) {
+     auto end_marker = new amd::Marker(*streams_[base_stream], true, wait_list);
++    // The last command this graph queues.  RunOneNode() collects it only after the child has
++    // been enqueued, so the parent cannot mark it; the flag comes down from there instead.
++    end_marker->setCrossStreamProducer(waited_cross_stream);
+     end_marker->enqueue();
+     end_marker->release();
+     for (auto command : wait_list) {
+diff --git a/projects/clr/hipamd/src/hip_graph_internal.hpp b/projects/clr/hipamd/src/hip_graph_internal.hpp
+index 34067876e9..ab9b94d48d 100644
+--- a/projects/clr/hipamd/src/hip_graph_internal.hpp
++++ b/projects/clr/hipamd/src/hip_graph_internal.hpp
+@@ -769,11 +769,15 @@ class Graph {
+   //! Runs one node on the assigned stream
+   bool RunOneNode(Node node);  //!< Node for the execution on GPU
+ 
++  //! Fills cross_stream_producers_ for the current stream assignment
++  void FindCrossStreamProducers(int32_t base_stream);
++
+   //! Runs all nodes from the execution graph on the assigned streams
+   bool RunNodes(
+       int32_t base_stream = 0,                             //!< The base stream to run the graph on
+       const std::vector<hip::Stream*>* streams = nullptr,  //!< Streams to run the graph
+-      const amd::Command::EventWaitList* parent_waitlist = nullptr  //!< Parent Graph waitlist
++      const amd::Command::EventWaitList* parent_waitlist = nullptr,  //!< Parent Graph waitlist
++      bool waited_cross_stream = false  //!< Something on another stream waits on the last command
+   );
+ 
+   //! Schedules nodes into batches for optimized execution
+@@ -989,6 +993,9 @@ class Graph {
+   //!< Used as a temporary storage for the waiting nodes
+   //!< to reduce the stack pressure in recursion
+   std::vector<Node> wait_order_;
++  //!< Nodes whose completion is waited on from another stream
++  std::unordered_set<Node> cross_stream_producers_;
++  int32_t cross_stream_base_ = -1;     //!< base_stream cross_stream_producers_ was built for
+   std::vector<hip::Stream*> streams_;  //!< The list of streams, used in the execution
+   int32_t current_id_ = 0;             //!< The current node ID in the graph execution sequence
+   hip::Device* device_;                //!< HIP device object
+diff --git a/projects/clr/rocclr/device/rocm/rocdevice.cpp b/projects/clr/rocclr/device/rocm/rocdevice.cpp
+index 82c0856354..47e1340f22 100644
+--- a/projects/clr/rocclr/device/rocm/rocdevice.cpp
++++ b/projects/clr/rocclr/device/rocm/rocdevice.cpp
+@@ -268,6 +268,18 @@ Device::~Device() {
+ 
+   delete[] p2p_agents_list_;
+ 
++  // After every hardware queue above, so no command processor can still be polling a slot.
++  // No wait: a slot still armed here means a ProfilingSignal outlived its device, which is a
++  // defect elsewhere, and spinning on an uncached word during teardown would hide it.
++  for (auto& signal : edge_signals_) {
++    if (Hsa::signal_load_relaxed(signal) != 0) {
++      LogWarning("Ordering edge signal still armed at device teardown");
++    }
++    Hsa::signal_destroy(signal);
++  }
++  edge_signals_.clear();
++  edge_free_.clear();
++
+   if (0 != prefetch_signal_.handle) {
+     Hsa::signal_destroy(prefetch_signal_);
+   }
+@@ -747,6 +759,85 @@ bool Device::create() {
+     return false;
+   }
+ 
++  // Can this agent hold the value word of a cross queue ordering edge?  Two independent
++  // negatives, both keeping today's behaviour silently: the entry point can be absent on a
++  // runtime that predates the feature, and the agent can answer that it cannot host the
++  // word.  The symbol is tested rather than inferred from the info query - one runtime's
++  // answer should not have to imply another's.  Only symbol-present AND SUCCESS-and-true
++  // enables the path.  The attribute is bool, one byte.
++  if (Hsa::amd_signal_create_v2_available()) {
++    bool supported = false;
++    if (HSA_STATUS_SUCCESS ==
++        Hsa::agent_get_info(
++            bkendDevice_,
++            static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED),
++            &supported)) {
++      ordering_edge_signals_ = supported;
++    }
++  }
++
++  // The revert switch, and the only way to turn this off.  A runtime dropped into somebody
++  // else's stack has to be revertible without swapping libraries: the sibling feature,
++  // device memory AQL ring buffers, needed exactly that when its placement turned out to
++  // fail inside some containers, and DEBUG_CLR_AQL_DEV_QUEUE is what it is reverted with.
++  // With the switch set nothing is created or named and the ROCr entry point is never called.
++  const char* edge_state = "unavailable";
++  if (ordering_edge_signals_ && DEBUG_CLR_DISABLE_ORDERING_EDGE) {
++    ordering_edge_signals_ = false;
++    edge_state = "disabled by DEBUG_CLR_DISABLE_ORDERING_EDGE";
++  } else if (ordering_edge_signals_) {
++    edge_state = "enabled";
++  }
++
++  // A fixed pool of device resident signals for use as cross queue ordering edges, created
++  // once for the lifetime of the device and then recycled.  These never enter a queue's
++  // signal_list_ and never become a command's HwEvent; their only role is an AQL barrier
++  // packet's dep_signal[] on this same device.  The pool never grows and nothing outside
++  // this block creates one: each slot costs a GPUVM mapping, and hsa_amd_signal_create_v2
++  // must not be driven at dispatch rate.
++  //
++  // One batched call, which is what the descriptor form is for.  On partial failure ROCr
++  // leaves a zero handle in the descriptors that failed, so counting non zero handles gives
++  // both the pool and the denominator the state line reports, with no status to thread
++  // through.  A short pool is not fatal: the events it cannot cover keep today's host
++  // resident dependency.
++  if (ordering_edge_signals_ && (ROC_EDGE_SIGNAL_POOL_SIZE > 0)) {
++    hsa_agent_t agent = bkendDevice_;
++    // Value initialised by the vector, which is what zeroes version's reserved neighbours -
++    // the descriptor rejects a non zero reserved field rather than ignoring it.
++    std::vector<hsa_amd_signal_create_desc_t> descs(ROC_EDGE_SIGNAL_POOL_SIZE);
++    for (auto& desc : descs) {
++      desc.version = HSA_AMD_SIGNAL_CREATE_DESC_VERSION;
++      desc.flags = static_cast<uint16_t>(HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD);
++      desc.initial_value = 0;
++      // Accepted and inert on this placement - ROCr builds the same mailbox free signal
++      // either way - but it is the attribute clr sets on every other GPU only signal it
++      // creates, and it says what this object is.
++      desc.attributes = HSA_AMD_SIGNAL_AMD_GPU_ONLY;
++      desc.num_consumers = 1;
++      desc.consumers = &agent;
++    }
++    Hsa::amd_signal_create_v2(descs.data(), static_cast<uint32_t>(descs.size()));
++    edge_signals_.reserve(descs.size());
++    edge_free_.reserve(descs.size());
++    for (const auto& desc : descs) {
++      if (desc.signal.handle != 0) {
++        edge_free_.push_back(static_cast<uint32_t>(edge_signals_.size()));
++        edge_signals_.push_back(desc.signal);
++      }
++    }
++    if (edge_signals_.size() != descs.size()) {
++      LogWarning("Ordering edge signal creation failed; the pool will be short");
++    }
++  }
++  // Report the slot count and not the capability bit: an agent that answers the query true,
++  // in a process where every create failed, has the feature compiled in, on, and doing
++  // nothing, and a boolean cannot say that.  Name the flag when the revert switch is what
++  // turned it off - a reverted process that cannot be told apart from a patched one turns
++  // one support case into a week.
++  ClPrint(amd::LOG_INFO, amd::LOG_INIT, "Ordering edge signals: %s, %zu of %u slots created",
++          edge_state, edge_signals_.size(), ROC_EDGE_SIGNAL_POOL_SIZE);
++
+   if (AMD_LOG_LEVEL >= LOG_EXTRA_EXTRA_DEBUG) {
+     uint8_t logMask[8] = {0};
+     hsa_flag_set64(logMask, HSA_AMD_LOG_FLAG_AQL);
+@@ -3992,11 +4083,58 @@ void Device::RetainGlobalSignal(void* signal) const {
+ // ================================================================================================
+ bool Device::CreateHwEvents(int count, std::vector<void*>& hw_events) const {
+   hw_events.resize(count, nullptr);
++
++  // A segmented graph's cross stream dependency is the object
++  // VirtualGPU::PublishOrderingEdge() names on the eager path - one command processor waits on
++  // a word another decrements - so it gets the same device resident placement, under the same
++  // orderingEdgeSignals() switch.  Placed at creation because a cross stream segment gets one
++  // ProfilingSignal that serves as both the producer's completion signal and the consumer's
++  // dependency; splitting the roles would need a second signal and a packet to decrement it.
++  // The completion role's host accesses - the re-arm in ResetHwEvents(), the satisfied test in
++  // HwQueueTracker::WaitingSignal(), the profiling timestamp read - are loads and plain stores,
++  // which this placement supports.  The read-modify-writes it does not are on tracker signals.
++  std::vector<hsa_signal_t> edges;
++  if (ordering_edge_signals_ && (count > 0)) {
++    hsa_agent_t agent = bkendDevice_;
++    // Value initialised by the vector; the descriptor rejects a non zero reserved field.
++    std::vector<hsa_amd_signal_create_desc_t> descs(count);
++    for (auto& desc : descs) {
++      desc.version = HSA_AMD_SIGNAL_CREATE_DESC_VERSION;
++      desc.flags = static_cast<uint16_t>(HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD);
++      desc.initial_value = kInitSignalValueOne;  // armed, as the host resident create below is
++      desc.attributes = HSA_AMD_SIGNAL_AMD_GPU_ONLY;
++      desc.num_consumers = 1;
++      desc.consumers = &agent;
++    }
++    Hsa::amd_signal_create_v2(descs.data(), static_cast<uint32_t>(descs.size()));
++    // On partial failure ROCr leaves a zero handle in the descriptors it refused; those slots
++    // fall back to the host resident create below.
++    edges.reserve(descs.size());
++    size_t created = 0;
++    for (const auto& desc : descs) {
++      edges.push_back(desc.signal);
++      created += (desc.signal.handle != 0) ? 1 : 0;
++    }
++    if (created != descs.size()) {
++      LogWarning("Ordering edge signal creation failed; graph dependencies stay host resident");
++    }
++  }
++
+   for (int i = 0; i < count; ++i) {
+     ProfilingSignal* ps = new ProfilingSignal();
+-    if (HSA_STATUS_SUCCESS !=
++    if (!edges.empty() && (edges[i].handle != 0)) {
++      ps->signal_ = edges[i];
++      // Re-arm through the fenced store; ROCr's create-time store is a plain one.
++      Hsa::signal_silent_store_relaxed(ps->signal_, kInitSignalValueOne);
++    } else if (HSA_STATUS_SUCCESS !=
+         Hsa::signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &ps->signal_)) {
+       delete ps;
++      // Nothing owns the edges past this index yet; the ones already taken are released below.
++      for (int j = i + 1; j < count; ++j) {
++        if (!edges.empty() && (edges[j].handle != 0)) {
++          Hsa::signal_destroy(edges[j]);
++        }
++      }
+       for (int j = 0; j < i; ++j) {
+         reinterpret_cast<ProfilingSignal*>(hw_events[j])->release();
+         hw_events[j] = nullptr;
+@@ -4344,8 +4482,50 @@ void Device::RemoveKernel(Kernel& gpuKernel) const {
+   }
+ }
+ 
++// ================================================================================================
++hsa_signal_t Device::AcquireOrderingEdge(uint32_t* slot) const {
++  amd::ScopedLock lock(edge_pool_lock_);
++  if (edge_free_.empty()) {
++    return hsa_signal_t{};
++  }
++  const uint32_t idx = edge_free_.back();
++  // A slot reaches the free list when the ProfilingSignal that published it is recycled or
++  // destroyed, which is after that signal itself read zero - but the edge barrier sits one
++  // packet behind it in the same queue, so confirm the decrement landed before re-arming.
++  // Never waits: a slot that is not ready is left on the list and the caller falls back.
++  //
++  // This read and the arming store below are what publishing an edge costs the producer, and
++  // they are the bulk of that cost: both are uncached accesses to device memory and the read
++  // is the larger half.  Do not add a third.
++  if (Hsa::signal_load_relaxed(edge_signals_[idx]) != 0) {
++    return hsa_signal_t{};
++  }
++  edge_free_.pop_back();
++  Hsa::signal_silent_store_relaxed(edge_signals_[idx], kInitSignalValueOne);
++  *slot = idx;
++  return edge_signals_[idx];
++}
++
++// ================================================================================================
++void Device::ReleaseOrderingEdge(uint32_t slot) const {
++  amd::ScopedLock lock(edge_pool_lock_);
++  if (slot < edge_signals_.size()) {
++    edge_free_.push_back(slot);
++  }
++}
++
++// ================================================================================================
++void ProfilingSignal::ReleaseOrderingEdge() {
++  if (edge_handle_.load(std::memory_order_relaxed) != 0) {
++    edge_owner_->ReleaseOrderingEdge(edge_slot_);
++    edge_owner_ = nullptr;
++    edge_handle_.store(0, std::memory_order_relaxed);
++  }
++}
++
+ // ================================================================================================
+ ProfilingSignal::~ProfilingSignal() {
++  ReleaseOrderingEdge();
+   if (signal_.handle != 0) {
+     if (Hsa::signal_load_relaxed(signal_) > 0
+         && !(HIP_SKIP_ABORT_ON_GPU_ERROR && amd::Device::IsGPUInError())) {
+diff --git a/projects/clr/rocclr/device/rocm/rocdevice.hpp b/projects/clr/rocclr/device/rocm/rocdevice.hpp
+index d06619dec9..810e625876 100644
+--- a/projects/clr/rocclr/device/rocm/rocdevice.hpp
++++ b/projects/clr/rocclr/device/rocm/rocdevice.hpp
+@@ -84,6 +84,22 @@ class ProfilingSignal : public amd::ReferenceCountedObject {
+ 
+   Flags flags_;
+ 
++  //! Handle of a device resident twin of signal_, published by the producing command so
++  //! another queue can name it in barrier_packet_.dep_signal[] instead of signal_; zero when
++  //! none was published.  The consumer reads it without this object's lock: the release store
++  //! in VirtualGPU::PublishOrderingEdge() publishes edge_owner_ and edge_slot_ with it, and
++  //! orders it after the arming store on the slot.
++  std::atomic<uint64_t> edge_handle_{0};
++  const Device* edge_owner_ = nullptr;  //!< Device whose pool owns edge_slot_
++  uint32_t edge_slot_ = 0;              //!< Index of that slot inside the pool
++
++  //! Returns a published edge slot to its owner's free list.  Called from the destructor and
++  //! from the point in ActiveSignal() where this object is about to be re-armed - the two
++  //! places clr already knows no command holds it.  That is the property slot reuse needs: a
++  //! consumer's barrier packet can only name a slot while the command that waits still holds
++  //! the producing command, and that command holds this object.
++  void ReleaseOrderingEdge();
++
+   //! Cached timing data - populated when signal completes, avoids repeated HSA calls
+   struct CachedTiming {
+     uint64_t start_ = 0;   //!< Cached start timestamp from HSA
+@@ -667,6 +683,18 @@ class Device : public NullDevice {
+   void HiddenHeapAlloc(const VirtualGPU& gpu);
+   //! Init hidden heap for device memory allocations
+   void HiddenHeapInit(const VirtualGPU& gpu);
++
++  //! True if this agent can host the value word of an ordering edge signal.  Answered once,
++  //! at create() time, by HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED.
++  bool orderingEdgeSignals() const { return ordering_edge_signals_; }
++
++  //! Takes a free ordering edge slot, arms it and returns its handle, or {0} if none is
++  //! available.  Never blocks, never allocates and never grows the pool: a caller that
++  //! cannot get a slot keeps today's host resident dependency for that one event.
++  hsa_signal_t AcquireOrderingEdge(uint32_t* slot) const;
++
++  //! Returns a slot taken by AcquireOrderingEdge() to the free list.
++  void ReleaseOrderingEdge(uint32_t slot) const;
+   bool isXgmi() const override { return isXgmi_; }
+ 
+   //! SDMA engine allocation for per-stream affinity
+@@ -828,6 +856,13 @@ class Device : public NullDevice {
+   uint32_t maxSdmaReadMask_;
+   uint32_t maxSdmaWriteMask_;
+   bool isXgmi_;  //!< Flag to indicate if there is XGMI between CPU<->GPU
++  bool ordering_edge_signals_ = false;  //!< Agent can host an ordering edge signal value word
++  //! Device resident ordering edge signals.  Owned by the device, not by a queue, so that
++  //! they outlive every command processor that can name one and so that their number does
++  //! not scale with the number of streams an application creates.
++  std::vector<hsa_signal_t> edge_signals_;
++  mutable std::vector<uint32_t> edge_free_;  //!< Indices of the slots nobody holds
++  mutable amd::Monitor edge_pool_lock_;      //!< Serialises the two lines above
+   bool pm4_emulation_ = false;  //!< Flag to indicate if PM4 emulation is enabled
+   uint32_t numHwPipes_;  //!< Number of hardware pipes
+ 
+diff --git a/projects/clr/rocclr/device/rocm/rocrctx.cpp b/projects/clr/rocclr/device/rocm/rocrctx.cpp
+index a43a1a33b3..43a563903e 100644
+--- a/projects/clr/rocclr/device/rocm/rocrctx.cpp
++++ b/projects/clr/rocclr/device/rocm/rocrctx.cpp
+@@ -94,6 +94,7 @@ bool Hsa::LoadLib() {
+   GET_ROCR_SYMBOL(hsa_amd_ipc_signal_create)
+   GET_ROCR_SYMBOL(hsa_amd_ipc_signal_attach)
+   GET_ROCR_SYMBOL(hsa_amd_signal_create)
++  GET_ROCR_OPTIONAL_SYMBOL(hsa_amd_signal_create_v2)
+   GET_ROCR_SYMBOL(hsa_amd_register_system_event_handler)
+   GET_ROCR_SYMBOL(hsa_amd_queue_set_priority)
+   GET_ROCR_OPTIONAL_SYMBOL(hsa_amd_queue_create)
+diff --git a/projects/clr/rocclr/device/rocm/rocrctx.hpp b/projects/clr/rocclr/device/rocm/rocrctx.hpp
+index c7eaf7fce5..e6258777fc 100644
+--- a/projects/clr/rocclr/device/rocm/rocrctx.hpp
++++ b/projects/clr/rocclr/device/rocm/rocrctx.hpp
+@@ -28,6 +28,9 @@
+ typedef hsa_status_t HSA_API hsa_amd_queue_create_fn(
+     hsa_agent_t agent, hsa_amd_queue_create_desc_t* descs, uint32_t num_descs);
+ 
++typedef hsa_status_t HSA_API hsa_amd_signal_create_v2_fn(
++    hsa_amd_signal_create_desc_t* descs, uint32_t num_descs);
++
+ namespace amd {
+ namespace roc {
+ 
+@@ -106,6 +109,10 @@ struct RocrEntryPoints {
+   decltype(hsa_amd_ipc_signal_create)* hsa_amd_ipc_signal_create_;
+   decltype(hsa_amd_ipc_signal_attach)* hsa_amd_ipc_signal_attach_;
+   decltype(hsa_amd_signal_create)* hsa_amd_signal_create_;
++  //! Optional: absent on a runtime that predates the descriptor based signal create.  Loaded
++  //! with GET_ROCR_OPTIONAL_SYMBOL and reached only through amd_signal_create_v2(), which
++  //! null checks it, so an older ROCr simply keeps today's host resident dependencies.
++  hsa_amd_signal_create_v2_fn* hsa_amd_signal_create_v2_;
+   decltype(hsa_amd_register_system_event_handler)* hsa_amd_register_system_event_handler_;
+   decltype(hsa_amd_queue_set_priority)* hsa_amd_queue_set_priority_;
+   hsa_amd_queue_create_fn* hsa_amd_queue_create_;
+@@ -444,6 +451,25 @@ class Hsa : public amd::AllStatic {
+     return ROCR_DYN(hsa_amd_signal_create)(initial_value, num_consumers, consumers, attributes,
+                                            signal);
+   }
++  static bool amd_signal_create_v2_available() {
++#ifdef ROCR_DYN_DLL
++    return ROCR_DYN(hsa_amd_signal_create_v2) != nullptr;
++#else
++    return true;
++#endif
++  }
++  static hsa_status_t amd_signal_create_v2(hsa_amd_signal_create_desc_t* descs,
++                                           uint32_t num_descs) {
++#ifdef ROCR_DYN_DLL
++    auto fn = ROCR_DYN(hsa_amd_signal_create_v2);
++    if (fn == nullptr) {
++      return HSA_STATUS_ERROR;
++    }
++    return fn(descs, num_descs);
++#else
++    return hsa_amd_signal_create_v2(descs, num_descs);
++#endif
++  }
+   static hsa_status_t register_system_event_handler(hsa_amd_system_event_callback_t callback,
+     void* data) {
+     return ROCR_DYN(hsa_amd_register_system_event_handler)(callback, data);
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.cpp b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+index 77afcab4d4..d04e4e4b0c 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.cpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.cpp
+@@ -68,6 +68,15 @@ namespace amd::roc {
+ 
+ static constexpr uint16_t kInvalidAql = (HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE);
+ 
++// Passed to WaitingSignal() by the three call sites whose result goes straight into an AQL
++// packet executed by this queue's own command processor - a barrier's dep_signal[], or the
++// signal a barrier-value packet watches.  Every other caller hands the same
++// list to ROCr as dep_signals[] of an async copy, an SVM prefetch or an SVM discard, where
++// the runtime reads the value word on the host - the one role in which a device resident
++// word is a pessimisation.  Opting in per call site rather than keying on HwQueueEngine
++// keeps that set greppable and stops it growing silently when a caller is added.
++static constexpr bool kAqlBarrierDep = true;
++
+ static constexpr uint16_t kBarrierPacketHeader =
+     (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE) | (1 << HSA_PACKET_HEADER_BARRIER) |
+     (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE) |
+@@ -807,6 +816,7 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
+   prof_signal->flags_.done_ = false;
+   prof_signal->engine_ = engine_;
+   prof_signal->flags_.isPacketDispatch_ = false;
++  prof_signal->ReleaseOrderingEdge();
+   prof_signal->ResetCachedTiming();
+   prof_signal->queue_index_ = gpu_.index();
+ 
+@@ -854,7 +864,8 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(hsa_signal_value_t init_va
+ }
+ 
+ // ================================================================================================
+-std::vector<hsa_signal_t>& VirtualGPU::HwQueueTracker::WaitingSignal(HwQueueEngine engine) {
++std::vector<hsa_signal_t>& VirtualGPU::HwQueueTracker::WaitingSignal(HwQueueEngine engine,
++                                                                     bool aql_barrier_dep) {
+   bool explicit_wait = false;
+   // Reset all current waiting signals
+   waiting_signals_.clear();
+@@ -903,8 +914,21 @@ std::vector<hsa_signal_t>& VirtualGPU::HwQueueTracker::WaitingSignal(HwQueueEngi
+         // Wait on CPU for completion if requested
+         CpuWaitForSignal(external_signals_[i]);
+       } else {
+-        // Add HSA signal for tracking on GPU
+-        waiting_signals_.push_back(external_signals_[i]->signal_);
++        // Add HSA signal for tracking on GPU.  If the producer published a device resident
++        // twin, and this list goes into an AQL packet on the twin's own device, name the
++        // twin.  Both conditions are load bearing:
++        //   - aql_barrier_dep excludes the copy, prefetch and discard callers, which hand
++        //     this list to ROCr as dep_signals[] and have its value word host-polled.
++        //   - the owner test excludes a consumer on another device.  The word is mapped
++        //     into one agent's page tables; a foreign CP would take a memory violation.
++        // The satisfied test above stays on signal_, so this site adds no host bus read.
++        const ProfilingSignal* prof_signal = external_signals_[i];
++        const uint64_t edge = prof_signal->edge_handle_.load(std::memory_order_acquire);
++        hsa_signal_t dep = prof_signal->signal_;
++        if (aql_barrier_dep && (edge != 0) && (prof_signal->edge_owner_ == &gpu_.dev())) {
++          dep.handle = edge;
++        }
++        waiting_signals_.push_back(dep);
+       }
+     }
+   }
+@@ -1532,7 +1556,7 @@ void VirtualGPU::adjustHeader(uint16_t& header) {
+ 
+ // ================================================================================================
+ void VirtualGPU::dispatchBlockingWait(hsa_kernel_dispatch_packet_t* packet) {
+-  auto wait_signals = Barriers().WaitingSignal();
++  auto wait_signals = Barriers().WaitingSignal(HwQueueEngine::Compute, kAqlBarrierDep);
+   if (dev().settings().ext_dispatch_packet_ && wait_signals.size() == 1 && packet != nullptr) {
+       // The Ext Dispatch Packet supports only one dependent signal
+       auto ext_packet = reinterpret_cast<hsa_amd_ext_kernel_dispatch_packet_t*>(packet);
+@@ -1951,17 +1975,22 @@ bool VirtualGPU::dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>&
+ 
+   TrackQueueProgress(*finalLastSlot, startIndex + numPackets - 1, pre_patched);
+ 
++  // submitAccumulate() takes a fresh HwEvent for the segment, and that is the one a consumer
++  // reads; an edge published here would name the signal it is about to stop pointing at.
++  constexpr bool kKeepHwEvent = false;
++  constexpr bool kPublishOrderingEdge = false;
++
+   if (blocking) {
+     LogInfo("Running serialized as blocking is requested");
+     if (!Barriers().WaitCurrent()) {
+       LogPrintfError("Failed blocking queue wait with signal [0x%lx]",
+                      finalLastSlot->completion_signal.handle);
+-      profilingEnd();
++      profilingEnd(kKeepHwEvent, kPublishOrderingEdge);
+       return false;
+     }
+   }
+ 
+-  profilingEnd();
++  profilingEnd(kKeepHwEvent, kPublishOrderingEdge);
+   return true;
+ }
+ 
+@@ -1999,7 +2028,7 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
+ 
+   if (!skipSignal) {
+     // Make sure the wait is issued before queue index reservation
+-    auto wait_signals = Barriers().WaitingSignal();
++    auto wait_signals = Barriers().WaitingSignal(HwQueueEngine::Compute, kAqlBarrierDep);
+     for (uint32_t i = 0; i < wait_signals.size(); ++i) {
+       uint32_t j = i % 5;
+       barrier_packet_.dep_signal[j] = wait_signals[i];
+@@ -2070,7 +2099,7 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
+   // Dependent signal and external signal cant be true at the same time
+   assert((resolveDepSignal && (signal.handle != 0)) == false);
+   if (resolveDepSignal) {
+-    auto wait_signals = Barriers().WaitingSignal();
++    auto wait_signals = Barriers().WaitingSignal(HwQueueEngine::Compute, kAqlBarrierDep);
+     if (wait_signals.size() > 0) {
+       barrier_value_packet_.signal = wait_signals[0];
+       barrier_value_packet_.value = kInitSignalValueOne;
+@@ -2682,7 +2711,16 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
+  * created for whatever command we are running and calls end() to get the
+  * current host timestamp if no signal is available.
+  */
+-void VirtualGPU::profilingEnd(bool clearHwEvent) {
++void VirtualGPU::profilingEnd(bool clearHwEvent, bool publishOrderingEdge) {
++  // Here rather than in each submit method: this is the one point every command passes on
++  // its way out, with its packets already in the ring and its HwEvent still set.  The edge
++  // is a separate packet, so it has to sit behind the point it denotes.
++  // Not when clearHwEvent is set: the block below releases the HwEvent, and that is the only
++  // route a consumer has to the edge, so one published here could never be named.
++  if (publishOrderingEdge && !clearHwEvent && command_->isCrossStreamProducer()) {
++    PublishOrderingEdge();
++  }
++
+   if (!command_->getPktCapturingState() && command_->profilingInfo().enabled_) {
+     if (timestamp_ != nullptr) {
+       if (timestamp_->HwProfiling() == false) {
+@@ -5051,6 +5089,63 @@ void VirtualGPU::submitKernel(amd::NDRangeKernelCommand& vcmd) {
+ // ================================================================================================
+ void VirtualGPU::submitNativeFn(amd::NativeFnCommand& cmd) {}
+ 
++// ================================================================================================
++// Publish a device resident twin of the current command's completion signal, so that a queue
++// which later waits on this event names a value word in its own local memory.
++//
++// Eligibility is decided by the caller, because the two producer shapes are recognised by
++// unrelated tests: an eager hipEventRecord marker by marker_ts_, and a command an enqueuer
++// marked with setCrossStreamProducer() by that bit.  Markers from hipStreamWaitEvent carry
++// marker_ts_ == false and are the consuming side.
++//
++// Cost is one barrier-AND packet with no dependencies and no cache operation, appended after
++// the command's own packet, plus the read and the arming store in AcquireOrderingEdge().  The
++// ordinary completion signal keeps every other role - HwEvent, host waits, profiling
++// timestamps, async handlers - none of which an ordering edge signal may take.
++void VirtualGPU::PublishOrderingEdge() {
++  if (!dev().orderingEdgeSignals()) {
++    return;
++  }
++  auto* hw_event = reinterpret_cast<ProfilingSignal*>(command_->HwEvent());
++  if (hw_event == nullptr) {
++    return;
++  }
++  // The edge is decremented by a barrier packet on gpu_queue_ carrying no dependencies, so it
++  // can only stand in for a completion signal this queue's own command processor produces.  A
++  // command an SDMA engine retires - a copy that took the async path - is not one: its signal
++  // and the edge packet are unordered, and a consumer that named the edge would proceed while
++  // the copy was still running.
++  if (hw_event->engine_ != HwQueueEngine::Compute) {
++    return;
++  }
++  // A signal that already carries an edge is not given a second one.  That happens when a
++  // marker is coalesced onto the previous barrier's HwEvent, and the earlier edge is the
++  // right answer there: a coalesced marker denotes the same point in the stream.
++  if (hw_event->edge_handle_.load(std::memory_order_relaxed) != 0) {
++    return;
++  }
++  uint32_t slot = 0;
++  hsa_signal_t edge = dev().AcquireOrderingEdge(&slot);
++  if (edge.handle == 0) {
++    return;
++  }
++  // kNopPacketHeader carries HSA_FENCE_SCOPE_NONE on both fences, so this packet performs no
++  // cache operation - but dispatchBarrierPacket() sets the dirty flag unconditionally and
++  // only clears it for a system scope release.  Left set, it would make isFenceDirty() true
++  // after every hipEventRecord, adding a marker to hipStreamQuery, to null stream and device
++  // synchronisation and to every queue finish.  Restore it: no cache state changed.
++  const bool fence_dirty = isFenceDirty();
++  constexpr bool kSkipSignal = true;
++  dispatchBarrierPacket(kNopPacketHeader, kSkipSignal, edge);
++  setFenceDirty(fence_dirty);
++  // Published only after the packet is in the ring: a consumer that read the handle earlier
++  // would enqueue a dependency on a decrement that has not been asked for yet.  The release
++  // also publishes edge_owner_ and edge_slot_ to the consumer's acquire in WaitingSignal().
++  hw_event->edge_owner_ = &dev();
++  hw_event->edge_slot_ = slot;
++  hw_event->edge_handle_.store(edge.handle, std::memory_order_release);
++}
++
+ // ================================================================================================
+ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+   // Make sure VirtualGPU has an exclusive access to the resources
+@@ -5117,6 +5212,9 @@ void VirtualGPU::submitMarker(amd::Marker& vcmd) {
+         }
+         hasPendingDispatch_ = false;
+       }
++      if (vcmd.profilingInfo().marker_ts_) {
++        PublishOrderingEdge();
++      }
+     }
+     // A record sets the window to its own event and barrier signal; a wait/other
+     // marker has a zero coalesceEvent() and so clears it, which a wait relies on.
+diff --git a/projects/clr/rocclr/device/rocm/rocvirtual.hpp b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+index 4a0426a1fa..815989ea5f 100644
+--- a/projects/clr/rocclr/device/rocm/rocvirtual.hpp
++++ b/projects/clr/rocclr/device/rocm/rocvirtual.hpp
+@@ -282,8 +282,11 @@ class VirtualGPU : public device::VirtualDevice {
+     void SetActiveEngine(HwQueueEngine engine = HwQueueEngine::Compute) { engine_ = engine; }
+     HwQueueEngine GetActiveEngine() const { return engine_; }
+ 
+-    //! Returns the last submitted signal for a wait
+-    std::vector<hsa_signal_t>& WaitingSignal(HwQueueEngine engine = HwQueueEngine::Compute);
++    //! Returns the last submitted signals for a wait.  aql_barrier_dep says the caller will
++    //! put the result straight into an AQL packet executed by this queue's own command
++    //! processor; only such a caller is offered a device resident ordering edge.
++    std::vector<hsa_signal_t>& WaitingSignal(HwQueueEngine engine = HwQueueEngine::Compute,
++                                             bool aql_barrier_dep = false);
+ 
+     //! Resets current signal back to the previous one. It's necessary in a case of ROCr failure.
+     void ResetCurrentSignal();
+@@ -521,7 +524,7 @@ class VirtualGPU : public device::VirtualDevice {
+   const Device& dev() const { return roc_device_; }
+ 
+   void profilingBegin(amd::Command& command, bool sdmaProfiling = false);
+-  void profilingEnd(bool clearHwEvent = false);
++  void profilingEnd(bool clearHwEvent = false, bool publishOrderingEdge = true);
+ 
+   void updateCommandsState(amd::Command* list) const;
+ 
+@@ -546,6 +549,11 @@ class VirtualGPU : public device::VirtualDevice {
+       bool attach_signal = false);
+   void submitNativeFn(amd::NativeFnCommand& cmd);
+   void submitMarker(amd::Marker& cmd);
++
++  //! Appends a barrier packet whose completion signal is a device resident ordering edge,
++  //! naming a twin of the current command's completion signal.  Eligibility is tested by
++  //! the caller; see the call sites.
++  void PublishOrderingEdge();
+   void submitAccumulate(amd::AccumulateCommand& cmd);
+   void submitAcquireExtObjects(amd::AcquireExtObjectsCommand& cmd);
+   void submitReleaseExtObjects(amd::ReleaseExtObjectsCommand& cmd);
+diff --git a/projects/clr/rocclr/platform/command.cpp b/projects/clr/rocclr/platform/command.cpp
+index d648980d39..33c31464d6 100644
+--- a/projects/clr/rocclr/platform/command.cpp
++++ b/projects/clr/rocclr/platform/command.cpp
+@@ -287,7 +287,7 @@ bool Event::awaitCompletion() {
+ }
+ 
+ // ================================================================================================
+-bool Event::notifyCmdQueue(bool cpu_wait) {
++bool Event::notifyCmdQueue(bool cpu_wait, bool cross_queue) {
+   HostQueue* queue = command().queue();
+   if (AMD_DIRECT_DISPATCH) {
+     ScopedLock l(notify_lock_);
+@@ -301,6 +301,10 @@ bool Event::notifyCmdQueue(bool cpu_wait) {
+       if (command == NULL) {
+         return false;
+       }
++      // This marker stands in for an event whose own command has no hardware event, so it is
++      // the producer of any dependency taken on that event.  Decided by the first waiter and
++      // not revisited: a later cross queue waiter reuses the marker cached in notify_event_.
++      command->setCrossStreamProducer(cross_queue);
+       command->enqueue();
+       // Save notification, associated with the current event
+       notify_event_ = command;
+@@ -405,7 +409,7 @@ void Command::enqueue() {
+           return;
+         }
+       } else {
+-        event->notifyCmdQueue(!kCpuWait);
++        event->notifyCmdQueue(!kCpuWait, event->command().queue() != queue_);
+       }
+     }
+ 
+diff --git a/projects/clr/rocclr/platform/command.hpp b/projects/clr/rocclr/platform/command.hpp
+index 21eeb4a298..3ce54c2c84 100644
+--- a/projects/clr/rocclr/platform/command.hpp
++++ b/projects/clr/rocclr/platform/command.hpp
+@@ -212,7 +212,7 @@ class Event : public RuntimeObject {
+ 
+   /*! \brief Notifies current command queue about execution status
+    */
+-  bool notifyCmdQueue(bool cpu_wait = false);
++  bool notifyCmdQueue(bool cpu_wait = false, bool cross_queue = false);
+ 
+   //! RTTI internal implementation
+   virtual ObjectType objectType() const { return ObjectTypeEvent; }
+@@ -325,6 +325,8 @@ class Command : public Event {
+   std::vector<void*> data_;
+   const Event* waitingEvent_;  //!< Waiting event associated with the marker
+ 
++  //! Set by the enqueuer when another stream will wait on this command's completion
++  bool crossStreamProducer_ = false;
+   bool packetCapturing_ = false;       //!< Flag to enable/disable graph gpu packet capture
+   std::vector<uint8_t*>* gpuPackets_;  //!< GPU packets captured when graph capturing is enabled
+   std::vector<uint8_t*>* gpuMetadataPackets_ = nullptr;  //!< Metadata packets (parallel to gpuPackets_)
+@@ -375,6 +377,13 @@ class Command : public Event {
+   }
+   bool getPktCapturingState() const { return packetCapturing_; }
+ 
++  //! Declare that another stream will wait on this command's completion.  Must be set
++  //! before enqueue(): the device layer reads it while submitting.
++  void setCrossStreamProducer(bool value) { crossStreamProducer_ = value; }
++
++  //! Does another stream wait on this command's completion?
++  bool isCrossStreamProducer() const { return crossStreamProducer_; }
++
+   //! Sets AQL capture state, aql packet to capture and where to copy kernArgs.
+   //! |metadataPacket|, when non-null, also enables capturing the metadata-prefetch
+   //! packet that parallels each captured AQL packet.
+diff --git a/projects/clr/rocclr/utils/flags.hpp b/projects/clr/rocclr/utils/flags.hpp
+index 78995bdc21..153910fe31 100644
+--- a/projects/clr/rocclr/utils/flags.hpp
++++ b/projects/clr/rocclr/utils/flags.hpp
+@@ -215,6 +215,10 @@ release(uint, ROC_AQL_QUEUE_SIZE, 16384,                                      \
+         "AQL queue size in AQL packets")                                      \
+ release(uint, ROC_SIGNAL_POOL_SIZE, 64,                                       \
+         "Initial size of HSA signal pool")                                    \
++release(uint, ROC_EDGE_SIGNAL_POOL_SIZE, 16384,                               \
++        "Number of device resident ordering edge signals per device")         \
++release(bool, DEBUG_CLR_DISABLE_ORDERING_EDGE, false,                         \
++        "Revert cross queue dependencies to a host resident value word")      \
+ release(uint, DEBUG_CLR_LIMIT_BLIT_WG, 16,                                    \
+         "Limit the number of workgroups in blit operations")                  \
+ release(bool, DEBUG_CLR_BLIT_KERNARG_OPT, false,                              \
+diff --git a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/cxx/enum_string.hpp b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/cxx/enum_string.hpp
+index 609ff9e2a2..123120ae59 100644
+--- a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/cxx/enum_string.hpp
++++ b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/cxx/enum_string.hpp
+@@ -437,6 +437,9 @@ ROCPROFILER_ENUM_LABEL(ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_queue_wait_externa
+ ROCPROFILER_ENUM_LABEL(ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_image_create_v2);
+ ROCPROFILER_ENUM_LABEL(ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_interop_map_buffer_with_size);
+ #    endif
++#    if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++ROCPROFILER_ENUM_LABEL(ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_signal_create_v2);
++#    endif
+ #endif
+ 
+ #if HSA_AMD_EXT_API_TABLE_MAJOR_VERSION == 0x01
+@@ -480,6 +483,8 @@ static_assert(ROCPROFILER_HSA_AMD_EXT_API_ID_LAST == 87);
+ static_assert(ROCPROFILER_HSA_AMD_EXT_API_ID_LAST == 89);
+ #    elif HSA_AMD_EXT_API_TABLE_STEP_VERSION == 0x12
+ static_assert(ROCPROFILER_HSA_AMD_EXT_API_ID_LAST == 91);
++#    elif HSA_AMD_EXT_API_TABLE_STEP_VERSION == 0x13
++static_assert(ROCPROFILER_HSA_AMD_EXT_API_ID_LAST == 92);
+ #    else
+ #        if !defined(ROCPROFILER_UNSAFE_NO_VERSION_CHECK) &&                                       \
+             (defined(ROCPROFILER_CI) && ROCPROFILER_CI > 0)
+diff --git a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/amd_ext_api_id.h b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/amd_ext_api_id.h
+index ed21bd123c..e804c42529 100644
+--- a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/amd_ext_api_id.h
++++ b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/amd_ext_api_id.h
+@@ -160,6 +160,9 @@ typedef enum rocprofiler_hsa_amd_ext_api_id_t  // NOLINT(performance-enum-size)
+     ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_image_create_v2,
+     ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_interop_map_buffer_with_size,
+ #    endif
++#    if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++    ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_signal_create_v2,
++#    endif
+ #endif
+ 
+     ROCPROFILER_HSA_AMD_EXT_API_ID_LAST,
+diff --git a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/api_args.h b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/api_args.h
+index c0430f98ea..484b1e4cfc 100644
+--- a/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/api_args.h
++++ b/projects/rocprofiler-sdk/source/include/rocprofiler-sdk/hsa/api_args.h
+@@ -1584,6 +1584,13 @@ typedef union rocprofiler_hsa_api_args_t
+         const void** metadata;
+     } hsa_amd_interop_map_buffer_with_size;
+ #    endif
++#    if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++    struct
++    {
++        hsa_amd_signal_create_desc_t* descs;
++        uint32_t                      num_descs;
++    } hsa_amd_signal_create_v2;
++#    endif
+ #endif
+ } rocprofiler_hsa_api_args_t;
+ 
+diff --git a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/abi.cpp b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/abi.cpp
+index 306c047731..5d767edadf 100644
+--- a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/abi.cpp
++++ b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/abi.cpp
+@@ -79,6 +79,8 @@ ROCP_SDK_ENFORCE_ABI_VERSIONING(::AmdExtTable, 88);
+ ROCP_SDK_ENFORCE_ABI_VERSIONING(::AmdExtTable, 90);
+ #elif HSA_AMD_EXT_API_TABLE_STEP_VERSION == 0x12
+ ROCP_SDK_ENFORCE_ABI_VERSIONING(::AmdExtTable, 92);
++#elif HSA_AMD_EXT_API_TABLE_STEP_VERSION == 0x13
++ROCP_SDK_ENFORCE_ABI_VERSIONING(::AmdExtTable, 93);
+ #else
+ INTERNAL_CI_ROCP_SDK_ENFORCE_ABI_VERSIONING(::AmdExtTable, 0);
+ #endif
+@@ -354,6 +356,9 @@ ROCP_SDK_ENFORCE_ABI(::AmdExtTable, hsa_amd_queue_wait_external_semaphore_fn, 89
+ ROCP_SDK_ENFORCE_ABI(::AmdExtTable, hsa_amd_image_create_v2_fn, 90);
+ ROCP_SDK_ENFORCE_ABI(::AmdExtTable, hsa_amd_interop_map_buffer_with_size_fn, 91);
+ #endif
++#if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++ROCP_SDK_ENFORCE_ABI(::AmdExtTable, hsa_amd_signal_create_v2_fn, 92);
++#endif
+ 
+ ROCP_SDK_ENFORCE_ABI(::ImageExtTable, hsa_ext_image_get_capability_fn, 1);
+ ROCP_SDK_ENFORCE_ABI(::ImageExtTable, hsa_ext_image_data_get_info_fn, 2);
+diff --git a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/details/ostream.hpp b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/details/ostream.hpp
+index 92ee7a6aba..bf0e003835 100644
+--- a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/details/ostream.hpp
++++ b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/details/ostream.hpp
+@@ -1578,6 +1578,69 @@ operator<<(std::ostream& out, const hsa_amd_queue_create_desc_t& v)
+     return out;
+ }
+ #endif
++
++#if defined(HSA_AMD_EXT_API_TABLE_STEP_VERSION) && HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++inline static std::ostream&
++operator<<(std::ostream& out, const hsa_amd_signal_create_desc_t& v)
++{
++    std::operator<<(out, '{');
++    HSA_depth_max_cnt++;
++    if(HSA_depth_max == -1 || HSA_depth_max_cnt <= HSA_depth_max)
++    {
++        if(std::string_view{"hsa_amd_signal_create_desc_t::version"}.find(HSA_structs_regex) !=
++           std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "version=");
++            rocprofiler::hsa::detail::operator<<(out, v.version);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::flags"}.find(HSA_structs_regex) !=
++           std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "flags=");
++            rocprofiler::hsa::detail::operator<<(out, v.flags);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::initial_value"}.find(
++               HSA_structs_regex) != std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "initial_value=");
++            rocprofiler::hsa::detail::operator<<(out, v.initial_value);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::attributes"}.find(HSA_structs_regex) !=
++           std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "attributes=");
++            rocprofiler::hsa::detail::operator<<(out, v.attributes);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::num_consumers"}.find(
++               HSA_structs_regex) != std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "num_consumers=");
++            rocprofiler::hsa::detail::operator<<(out, v.num_consumers);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::consumers"}.find(HSA_structs_regex) !=
++           std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "consumers=");
++            rocprofiler::hsa::detail::operator<<(out, v.consumers);
++            rocprofiler::hsa::detail::operator<<(out, ", ");
++        }
++        if(std::string_view{"hsa_amd_signal_create_desc_t::signal"}.find(HSA_structs_regex) !=
++           std::string_view::npos)
++        {
++            rocprofiler::hsa::detail::operator<<(out, "signal=");
++            rocprofiler::hsa::detail::operator<<(out, v.signal);
++        }
++    };
++    HSA_depth_max_cnt--;
++    std::operator<<(out, '}');
++    return out;
++}
++#endif
+ // end ostream ops for HSA
+ }  // namespace detail
+ }  // namespace hsa
+@@ -1892,3 +1955,12 @@ operator<<(std::ostream& out, const hsa_amd_queue_create_desc_t& v)
+     return out;
+ }
+ #endif
++
++#if defined(HSA_AMD_EXT_API_TABLE_STEP_VERSION) && HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++inline static std::ostream&
++operator<<(std::ostream& out, const hsa_amd_signal_create_desc_t& v)
++{
++    rocprofiler::hsa::detail::operator<<(out, v);
++    return out;
++}
++#endif
+diff --git a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/hsa.def.cpp b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/hsa.def.cpp
+index bf7ef0d165..d58daa3b63 100644
+--- a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/hsa.def.cpp
++++ b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/hsa/hsa.def.cpp
+@@ -653,6 +653,14 @@ HSA_API_INFO_DEFINITION_V(ROCPROFILER_HSA_TABLE_ID_AmdExt,
+                           metadata_size,
+                           metadata)
+ #        endif
++#        if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++HSA_API_INFO_DEFINITION_V(ROCPROFILER_HSA_TABLE_ID_AmdExt,
++                          ROCPROFILER_HSA_AMD_EXT_API_ID_hsa_amd_signal_create_v2,
++                          hsa_amd_signal_create_v2,
++                          hsa_amd_signal_create_v2_fn,
++                          descs,
++                          num_descs)
++#        endif
+ #    endif
+ 
+ #elif defined(ROCPROFILER_LIB_ROCPROFILER_HSA_ASYNC_COPY_CPP_IMPL) &&                              \
+diff --git a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/tests/enum_string.cpp b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/tests/enum_string.cpp
+index a49f479e21..ed13712d85 100644
+--- a/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/tests/enum_string.cpp
++++ b/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk/tests/enum_string.cpp
+@@ -242,6 +242,9 @@ TEST(enum_string, hsa_api_id)
+ #    if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x10
+     TEST_API_ID_STR(ROCPROFILER_HSA_AMD_EXT_API_ID, hsa_amd_queue_create);
+ #    endif
++#    if HSA_AMD_EXT_API_TABLE_STEP_VERSION >= 0x13
++    TEST_API_ID_STR(ROCPROFILER_HSA_AMD_EXT_API_ID, hsa_amd_signal_create_v2);
++#    endif
+ #endif
+ 
+     TEST_API_ID_STR(ROCPROFILER_HSA_FINALIZE_EXT_API_ID, hsa_ext_program_create);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/common/hsa_table_interface.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/common/hsa_table_interface.cpp
+index d69952a0cd..df10fe033a 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/common/hsa_table_interface.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/common/hsa_table_interface.cpp
+@@ -1189,6 +1189,11 @@ hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial_value, uint32_t nu
+                                                signal);
+ }
+ 
++// Mirrors Amd Extension Apis
++hsa_status_t hsa_amd_signal_create_v2(hsa_amd_signal_create_desc_t* descs, uint32_t num_descs) {
++  return amdExtTable->hsa_amd_signal_create_v2_fn(descs, num_descs);
++}
++
+ // Mirrors Amd Extension Apis
+ hsa_status_t HSA_API hsa_amd_ipc_signal_create(hsa_signal_t signal, hsa_amd_ipc_signal_t* handle) {
+   return amdExtTable->hsa_amd_ipc_signal_create_fn(signal, handle);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/common/shared.h b/projects/rocr-runtime/runtime/hsa-runtime/core/common/shared.h
+index 8da86de74d..cc89264d40 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/common/shared.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/common/shared.h
+@@ -131,16 +131,25 @@ class Shared final : private BaseShared {
+       shared_object_ = PageAllocator<T>::alloc(flags);
+   }
+ 
++  /// @brief Construct naming the node the object should be placed near.  An
++  /// Allocator used with this constructor must provide
++  /// alloc(int agent_node_id, int flags), as PageAllocator<T> does.
+   explicit Shared(int agent_node_id, Allocator* pool = nullptr, int flags = 0) : pool_(pool) {
+     assert(allocate_() != nullptr && free_() != nullptr &&
+            "Shared object allocator is not set");
+ 
+     if (pool_)
+-      shared_object_ = pool_->alloc();
++      shared_object_ = pool_->alloc(agent_node_id, flags);
+     else
+       shared_object_ = PageAllocator<T>::alloc(agent_node_id, flags);
+   }
+ 
++  /// @brief Tag type selecting the constructor which allocates nothing.
++  struct NoAlloc {};
++
++  /// @brief Construct an empty container; the owner supplies the storage.
++  explicit Shared(NoAlloc) : shared_object_(nullptr), pool_(nullptr) {}
++
+   ~Shared() {
+     assert(allocate_() != nullptr && free_() != nullptr &&
+                                         "Shared object allocator is not set");
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_gpu_agent.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
+index a141d354c9..67fd65ca74 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
+@@ -471,6 +471,71 @@ class GpuAgent : public GpuAgentInt {
+   /// did not request a specific engine, rotating round-robin across all engines.
+   uint32_t NextSdmaUserQueueEngineId();
+ 
++  /// @brief Can a signal's ABI block be placed in this agent's local memory?
++  /// The agent side of hsa_amd_signal_create_v2()'s gate, and the answer
++  /// HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED reports.  The caller side
++  /// clauses -- one named consumer, no IPC -- are not agent properties and are
++  /// checked at the entry point.
++  bool SupportsOrderingEdgeSignal() const { return OrderingEdgeSignalRegion() != nullptr; }
++
++  /// @brief The device local memory region an ordering edge signal's ABI block
++  /// is allocated from, or nullptr if this agent has none.
++  ///
++  /// One definition, three callers: the allocator, the gate on
++  /// hsa_amd_signal_create_v2(), and the
++  /// HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED query.  Do not add a
++  /// second expression of this test -- one that is not the allocator's own can
++  /// report support where the allocation fails, and refuse where it would work.
++  const core::MemoryRegion* OrderingEdgeSignalRegion() const;
++
++  // ---- Ordering edge signal slab -------------------------------------------
++  // One device allocation per (process x device), carved into fixed stride slots
++  // addressed by index.
++
++  /// @brief Size of one slab block.  Not a tuning constant: KFD charges VRAM
++  /// availability in 2 MiB units per device local allocation whatever the size,
++  /// so a smaller block reserves exactly as much and holds less.
++  static constexpr size_t kOrderingEdgeBlockSize = 2 * 1024 * 1024;
++
++  /// @brief Slot stride in bytes.  128 == sizeof(SharedSignal), so the block
++  /// packs 16,384 slots with no padding -- the same geometry SharedSignalPool_t
++  /// already uses for this object in host memory (32 per 4 KiB page,
++  /// 512 * 32 = 16,384, 2 MiB).  signal.cpp asserts the three conditions any
++  /// other value must satisfy.
++  ///
++  /// The stride is this line and nothing else: no other line in this runtime,
++  /// and no line in any caller, changes with it.
++  static constexpr size_t kOrderingEdgeDefaultStride = 128;
++
++  /// @brief Take one ordering edge signal slot -- storage for one SharedSignal
++  /// ABI block -- from this agent's slab.  Returns nullptr on failure and, if
++  /// @p why is non-null, writes HSA_STATUS_ERROR_INVALID_AGENT when this agent
++  /// has no region such a block can live in (a clean opt out) or
++  /// HSA_STATUS_ERROR_OUT_OF_RESOURCES when it has one and the allocation
++  /// failed.  Distinguished here so the caller need not re-derive the region
++  /// predicate to tell them apart.
++  ///
++  /// The storage is NOT constructed; the caller placement news into it, which is
++  /// what keeps construction lazy -- a block is mapped when it is allocated, but
++  /// its slots are written only as they are handed out.
++  ///
++  /// core::SharedSignalPool_t is structurally this object and is deliberately
++  /// not reused: it is process global and cuts its blocks from BaseShared's
++  /// host allocator, so making it serve device memory means a per-agent
++  /// instance and an allocator parameter on a class every signal in the runtime
++  /// is constructed through.  Parameterising it is the right long term shape and
++  /// belongs in its own change.
++  void* AcquireOrderingEdgeSlot(hsa_status_t* why);
++
++  /// @brief Return a slot taken by AcquireOrderingEdgeSlot() to the free list.
++  /// The storage stays mapped and is reused; it is not handed back to the driver
++  /// while the agent lives, so a command processor still polling a retired value
++  /// word reads a mapped page rather than an unmapped one.  The cost is that a
++  /// stale HANDLE aliases a live slot instead of faulting -- the same trade
++  /// core::SharedSignalPool_t already makes for every host resident signal.
++  void ReleaseOrderingEdgeSlot(void* slot);
++
++
+   /// @brief Force a WC flush on PCIe devices by doing a write and then read-back
+   __forceinline void PcieWcFlush(void *ptr, size_t size) const {
+     if (!xgmi_cpu_gpu_) {
+@@ -766,6 +831,25 @@ class GpuAgent : public GpuAgentInt {
+   hsa_amd_hdp_flush_t HDP_flush_ = {nullptr, nullptr};
+ 
+  private:
++  // ---- Ordering edge signal slab -------------------------------------------
++  // A fixed stride array with a free index list, not a general purpose heap.
++  // Invariant: every index in free_slots names a slot inside blocks.
++  struct OrderingEdgeSlab {
++    std::mutex lock;
++    std::vector<char*> blocks;
++    std::vector<uint32_t> free_slots;
++  };
++  OrderingEdgeSlab edge_slab_;
++
++  // @brief Add one block to the slab and push its slots onto the free list.
++  // Caller holds edge_slab_.lock.  Returns INVALID_AGENT for "not this agent"
++  // and OUT_OF_RESOURCES for a failed allocation.
++  hsa_status_t GrowOrderingEdgeSlab();
++
++  // @brief Free every slab block.  Called from ~GpuAgent only, before this
++  // agent's memory regions are torn down.
++  void DestroyOrderingEdgeSlab();
++
+   // @brief Query the driver to get the region list owned by this agent.
+   void InitRegionList();
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/default_signal.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/default_signal.h
+index 7535fd7d12..cbb6f756f2 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/default_signal.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/default_signal.h
+@@ -63,7 +63,8 @@ class BusyWaitSignal : public Signal {
+   }
+ 
+   /// @brief See base class Signal.
+-  explicit BusyWaitSignal(SharedSignal* abi_block, bool enableIPC);
++  explicit BusyWaitSignal(SharedSignal* abi_block, bool enableIPC,
++                          bool device_resident_value = false);
+ 
+   // Below are various methods corresponding to the APIs, which load/store the
+   // signal value or modify the existing signal value automically and with
+@@ -156,6 +157,15 @@ class BusyWaitSignal : public Signal {
+  protected:
+   bool _IsA(rtti_t id) const { return id == &rtti_id(); }
+ 
++  /// @brief Guard on every host read-modify-write of the value word.
++  /// A lock-prefixed x86 RMW issued against a device memory aperture is not
++  /// promoted to a PCIe atomic transaction; it becomes a read followed by an
++  /// independent write and can silently lose a concurrent device update.
++  /// There is no correct fallback and no status return on these entry points,
++  /// so a signal whose value word is device resident fails hard here.  This
++  /// path is unconditional: it survives NDEBUG.
++  void RejectHostAtomicRmw() const;
++
+  private:
+   static __forceinline int& rtti_id() {
+     static int rtti_id_ = 0;
+@@ -176,6 +186,13 @@ class DefaultSignal : private LocalSignal, public BusyWaitSignal {
+   explicit DefaultSignal(hsa_signal_value_t initial_value, bool enableIPC = false)
+       : LocalSignal(initial_value, enableIPC), BusyWaitSignal(signal(), enableIPC) {}
+ 
++  /// @brief Same signal, with the ABI block - and so the value word - placed in
++  /// device_agent's local memory.  See LocalSignal's matching constructor and
++  /// hsa_amd_signal_create_v2() with
++  /// HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD.
++  DefaultSignal(hsa_signal_value_t initial_value, core::Agent& device_agent)
++      : LocalSignal(initial_value, device_agent), BusyWaitSignal(signal(), false, true) {}
++
+  protected:
+   bool _IsA(rtti_t id) const {
+     if (id == &rtti_id()) return true;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/hsa_ext_amd_impl.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/hsa_ext_amd_impl.h
+index c30e20060e..0cde61a370 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/hsa_ext_amd_impl.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/hsa_ext_amd_impl.h
+@@ -103,6 +103,9 @@ hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial_value, uint32_t nu
+                                            const hsa_agent_t* consumers, uint64_t attributes,
+                                            hsa_signal_t* signal);
+ 
++// Mirrors Amd Extension Apis
++hsa_status_t hsa_amd_signal_create_v2(hsa_amd_signal_create_desc_t* descs, uint32_t num_descs);
++
+ // Mirrors Amd Extension Apis
+ uint32_t hsa_amd_signal_wait_all(uint32_t signal_count, hsa_signal_t* signals,
+                                  hsa_signal_condition_t* conds, hsa_signal_value_t* values,
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/runtime.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/runtime.h
+index 7600357726..511229b4e2 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/runtime.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/runtime.h
+@@ -732,7 +732,12 @@ class Runtime {
+     }
+   };
+ 
+-  class AsyncEventsPool : private BaseShared {
++  /// @brief Block pool for AsyncEventItem.  Host-only bookkeeping -- a signal
++  /// handle, a condition, a value and two host pointers -- so ordinary host
++  /// memory rather than BaseShared's pinned, GPU-mapped kernarg allocator.
++  /// Blocks that do not belong to an agent's memory region also need not be
++  /// freed before the agents are.
++  class AsyncEventsPool {
+    public:
+     AsyncEventsPool() : block_size_(preallocblocks_ * minblock_) {}
+     ~AsyncEventsPool() { clear(); }
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/signal.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/signal.h
+index 16ec687940..4fed408338 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/signal.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/signal.h
+@@ -234,6 +234,14 @@ class SharedSignalPool_t : private BaseShared {
+   ~SharedSignalPool_t() { clear(); }
+ 
+   SharedSignal* alloc();
++
++  /// @brief Placement-aware overload, matching PageAllocator<T>::alloc().  This
++  /// pool's blocks come from BaseShared's process-global allocator, bound to one
++  /// CPU agent's fine-grain kernarg system region, so agent_node_id == 0 is the
++  /// only placement it can honour; anything else throws.  A caller needing
++  /// another placement must own the allocation itself.
++  SharedSignal* alloc(int agent_node_id, int flags);
++
+   void free(SharedSignal* ptr);
+   void clear();
+ 
+@@ -253,10 +261,32 @@ class LocalSignal {
+   }
+   LocalSignal(hsa_signal_value_t initial_value, bool exportable);
+ 
+-  SharedSignal* signal() const { return local_signal_.shared_object(); }
++  /// @brief Place the whole 128 byte ABI block in device_agent's local memory
++  /// rather than in the process-global fine grain host pool, so that a GPU
++  /// waiting on the value word reads locally instead of across the host bus.
++  /// The caller must have checked the agent can support it -- see
++  /// hsa_amd_signal_create_v2().
++  ///
++  /// The block is one slot of that agent's ordering edge slab.  It returns to
++  /// the free list on destruction and stays mapped until the agent goes away.
++  LocalSignal(hsa_signal_value_t initial_value, core::Agent& device_agent);
++
++  ~LocalSignal();
++
++  SharedSignal* signal() const {
++    return (device_block_ != nullptr) ? device_block_ : local_signal_.shared_object();
++  }
++
++  /// @brief True iff the value word of this signal is in device memory, and so
++  /// must not be the target of a host atomic read-modify-write.
++  bool device_resident_value() const { return device_block_ != nullptr; }
+ 
+  private:
+   Shared<SharedSignal, SharedSignalPool_t> local_signal_;
++  SharedSignal* device_block_ = nullptr;
++  /// @brief The agent whose slab device_block_ came from, so the destructor
++  /// returns the slot to the right free list.  Null iff device_block_ is null.
++  core::Agent* device_agent_ = nullptr;
+ };
+ 
+ /// @brief An abstract base class which helps implement the public hsa_signal_t
+@@ -266,8 +296,12 @@ class LocalSignal {
+ class Signal {
+  public:
+   /// @brief Constructor Links and publishes the signal interface object.
+-  explicit Signal(SharedSignal* abi_block, bool enableIPC = false)
+-      : signal_(abi_block->amd_signal), async_copy_agent_(NULL), refcount_(1) {
++  explicit Signal(SharedSignal* abi_block, bool enableIPC = false,
++                  bool device_resident_value = false)
++      : signal_(abi_block->amd_signal),
++        async_copy_agent_(NULL),
++        refcount_(1),
++        device_resident_value_(device_resident_value) {
+     assert(abi_block != nullptr && "Signal abi_block must not be NULL");
+ 
+     waiting_ = 0;
+@@ -281,12 +315,36 @@ class Signal {
+     }
+   }
+ 
++  /// @brief True iff the value word lives in device memory.  A host atomic
++  /// read-modify-write of such a word is not promoted to a bus atomic and can
++  /// silently lose a concurrent device update, so the runtime must not issue
++  /// one and the public RMW entry points refuse to.
++  bool IsDeviceResidentValue() const { return device_resident_value_; }
++
+   /// @brief Interface to discard a signal handle (hsa_signal_t)
+   /// Decrements signal ref count and invokes doDestroySignal() when
+   /// Signal is no longer in use.
+   void DestroySignal() {
+-    // If handle is now invalid wake any retained sleepers.
+-    if (--refcount_ == 0) CasRelaxed(0, 0);
++    // If the handle is now invalid, wake any retained sleepers.  The CAS does
++    // not change the value; the write to the value word's cache line is what
++    // breaks a monitor parked on it.
++    //
++    // Skipped on a device resident word: a host lock-prefixed read-modify-write
++    // at a device aperture is not promoted to a bus atomic (see
++    // IsDeviceResidentValue), so the "harmless" CAS is neither.  Nothing is
++    // stranded by skipping it.  The only constructor that takes an agent builds
++    // a core::DefaultSignal, whose host waiters spin in
++    // BusyWaitSignal::WaitRelaxed() and do not park in MWAITX on such a word
++    // (default_signal.cpp), so there is no monitor to break.  InterruptSignal,
++    // whose waiters sleep on an event, has no agent-taking constructor and so
++    // cannot be device resident.
++    //
++    // The assert only documents the precondition -- an ordering edge is not an
++    // object a host thread waits on.  NDEBUG erases it; the carve-out above is
++    // what release builds rely on.
++    assert((!device_resident_value_ || waiting_ == 0) &&
++           "ordering edge signal destroyed with a registered waiter");
++    if (--refcount_ == 0 && !device_resident_value_) CasRelaxed(0, 0);
+     // Release signal, last release will destroy the object.
+     Release();
+   }
+@@ -522,6 +580,10 @@ class Signal {
+   /// @variable Count of handle references and Retain() calls for this handle (see IPC APIs)
+   std::atomic<uint32_t> retained_;
+ 
++  /// @variable True iff amd_signal.value is in device memory.  Set once at
++  /// construction and never changed.
++  const bool device_resident_value_ = false;
++
+   void registerIpc();
+   bool deregisterIpc();
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+index 899c12d7af..421883c921 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -48,6 +48,7 @@
+ #include <climits>
+ #include <cstring>
+ #include <map>
++#include <mutex>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -281,6 +282,10 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
+ GpuAgent::~GpuAgent() {
+   for (auto& blit : blits_) blit.reset();
+ 
++  // Must run before any region teardown below: the slab's blocks came from one
++  // of this agent's regions and have to be returned while it is still alive.
++  DestroyOrderingEdgeSlab();
++
+   regions_.clear();
+ }
+ 
+@@ -2648,6 +2653,9 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
+       // GPU agents can participate in host memory DMA-BUF export if the system supports virtual memory APIs
+       *static_cast<bool*>(value) = core::Runtime::runtime_singleton_->VirtualMemApiSupported();
+       break;
++    case HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED:
++      *((bool*)value) = SupportsOrderingEdgeSignal();
++      break;
+     default:
+       return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+       break;
+@@ -3570,6 +3578,159 @@ void GpuAgent::InitAllocators() {
+   assert(coarsegrain_allocator_ && "GPU agent does not have a coarse-grain allocator");
+ }
+ 
++// The region an ordering edge signal's ABI block -- and so its value word -- is
++// placed in.  Named by property, never by position in regions():
++// InitRegionList() pushes up to three regions per frame buffer heap and that
++// order has already changed once (the extended scope fine grain region is
++// skipped on gfx12.0), so "the first local region" is not a stable statement
++// and a reorder would silently move every ordering edge signal.
++//
++//  IsLocalMemory()              device memory rather than host memory.
++//  IsPublic()                   FRAME_BUFFER_PUBLIC and not _PRIVATE.
++//                               IsLocalMemory() is true of both and
++//                               InitRegionList() builds them under the same
++//                               case label, so without this clause a walk can
++//                               hand out VRAM the CPU cannot see.  It is also
++//                               the portable form of the large BAR question:
++//                               it asks the topology whether the frame buffer
++//                               is host visible, instead of consulting a flag
++//                               whose meaning differs between releases.
++//  !fine_grain()                the coarse grain local region, which is what
++//  !extended_scope_fine_grain() InitAllocators() binds coarsegrain_allocator_
++//                               to.  The fine grain one is declared
++//                               NEVER_ALLOWED to a CPU by
++//                               MemoryRegion::GetAccessInfo(), is
++//                               conditionally hidden from the region list, and
++//                               is the more expensive of the two to read from
++//                               the host.
++//
++// Grain and host visibility are orthogonal: both local regions come from the
++// same HsaMemoryProperties entry and share a HeapType, so IsPublic() does not
++// discriminate grain.  Cacheability is a third axis, set on the allocation --
++// see AllocateDeviceSignalBlock() in core/runtime/signal.cpp.
++//
++// Do not add a HSA_AMD_REGION_INFO_HOST_ACCESSIBLE clause here.  That attribute
++// reads 0 for every device local region on parts where the host can in fact
++// map, read and atomically update them.
++static bool IsOrderingEdgeSignalRegion(const AMD::MemoryRegion* region) {
++  return region->IsLocalMemory() && region->IsPublic() && !region->fine_grain() &&
++      !region->extended_scope_fine_grain();
++}
++
++const core::MemoryRegion* GpuAgent::OrderingEdgeSignalRegion() const {
++  // DO NOT ADD A HsaNodeProperties::LocalMemSize CLAUSE HERE.  It is the obvious
++  // extra guard to reach for and it is WRONG in this runtime: the field is not
++  // populated for discrete GPUs.  On gfx950, KFD topology reports
++  // local_mem_size = 0 on every GPU node while the same nodes report a
++  // FRAME_BUFFER_PUBLIC bank of 309,220,868,096 bytes.  A build carrying the
++  // clause refused every agent with HSA_STATUS_ERROR_INVALID_AGENT, on hardware
++  // holding 288 GiB of local memory each.
++  //
++  // The condition it reaches for is already expressed in a field the driver
++  // does fill: IsLocalMemory() && IsPublic() selects a
++  // HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC bank, and InitRegionList() never constructs
++  // a MemoryRegion for a bank reporting SizeInBytes == 0.  So an agent with no
++  // host visible local memory has no region here to return, and the gate, the
++  // capability attribute and the allocator all answer "not this agent" together.
++  for (const auto& region : regions()) {
++    const core::MemoryRegion* r = &*region;
++    if (IsOrderingEdgeSignalRegion(static_cast<const AMD::MemoryRegion*>(r))) return r;
++  }
++  return nullptr;
++}
++
++// ---- Ordering edge signal slab ---------------------------------------------
++// One AllocateDirect | AllocateUncached allocation per (process x device),
++// carved into fixed stride slots addressed by index, with a free index list.
++
++hsa_status_t GpuAgent::GrowOrderingEdgeSlab() {
++  // Two failures, two answers.  "No region on this agent" is a clean opt out and
++  // the same answer the gate and the capability attribute give, since all three
++  // ask OrderingEdgeSignalRegion().  A bool would force the caller to re-derive
++  // the predicate to tell them apart.
++  const core::MemoryRegion* local = OrderingEdgeSignalRegion();
++  if (local == nullptr) return HSA_STATUS_ERROR_INVALID_AGENT;
++
++  void* ptr = nullptr;
++  if (core::Runtime::runtime_singleton_->AllocateMemory(
++          local, kOrderingEdgeBlockSize,
++          core::MemoryRegion::AllocateDirect | core::MemoryRegion::AllocateUncached,
++          &ptr) != HSA_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
++
++  // Deliberately NOT constructed here: the block is mapped but nothing is
++  // written to it until a slot is handed out, so the pages a process touches
++  // track the edges it uses rather than the configured pool size.
++  constexpr size_t slots = kOrderingEdgeBlockSize / kOrderingEdgeDefaultStride;
++  const size_t base_index = edge_slab_.blocks.size() * slots;
++  edge_slab_.blocks.push_back(static_cast<char*>(ptr));
++
++  edge_slab_.free_slots.reserve(edge_slab_.free_slots.size() + slots);
++  // Descending, so the first hand-outs walk the block forwards.  Nothing depends
++  // on it; it only makes a dump of a lightly used pool readable.
++  for (size_t i = slots; i-- > 0;)
++    edge_slab_.free_slots.push_back(static_cast<uint32_t>(base_index + i));
++
++  return HSA_STATUS_SUCCESS;
++}
++
++void* GpuAgent::AcquireOrderingEdgeSlot(hsa_status_t* why) {
++  std::lock_guard<std::mutex> lock(edge_slab_.lock);
++
++  if (edge_slab_.free_slots.empty()) {
++    const hsa_status_t st = GrowOrderingEdgeSlab();
++    if (st != HSA_STATUS_SUCCESS) {
++      if (why != nullptr) *why = st;
++      return nullptr;
++    }
++  }
++  if (edge_slab_.free_slots.empty()) {
++    if (why != nullptr) *why = HSA_STATUS_ERROR_OUT_OF_RESOURCES;
++    return nullptr;
++  }
++
++  const uint32_t idx = edge_slab_.free_slots.back();
++  edge_slab_.free_slots.pop_back();
++
++  constexpr size_t slots = kOrderingEdgeBlockSize / kOrderingEdgeDefaultStride;
++  char* base = edge_slab_.blocks[idx / slots];
++
++  if (why != nullptr) *why = HSA_STATUS_SUCCESS;
++  return base + (idx % slots) * kOrderingEdgeDefaultStride;
++}
++
++void GpuAgent::ReleaseOrderingEdgeSlot(void* slot) {
++  if (slot == nullptr) return;
++  std::lock_guard<std::mutex> lock(edge_slab_.lock);
++
++  constexpr size_t slots = kOrderingEdgeBlockSize / kOrderingEdgeDefaultStride;
++  char* p = static_cast<char*>(slot);
++
++  for (size_t b = 0; b < edge_slab_.blocks.size(); ++b) {
++    char* base = edge_slab_.blocks[b];
++    if (p < base || p >= base + kOrderingEdgeBlockSize) continue;
++    const size_t off = static_cast<size_t>(p - base);
++    assert((off % kOrderingEdgeDefaultStride) == 0 &&
++           "Ordering edge slot pointer is not slot aligned.");
++    edge_slab_.free_slots.push_back(
++        static_cast<uint32_t>(b * slots + off / kOrderingEdgeDefaultStride));
++    return;
++  }
++  assert(false && "Ordering edge slot released to an agent that does not own it.");
++}
++
++void GpuAgent::DestroyOrderingEdgeSlab() {
++  std::lock_guard<std::mutex> lock(edge_slab_.lock);
++
++  // Safe from ~GpuAgent's body: MemoryRegion::Free() reaches
++  // owner()->agent_memory_lock_ on the base core::Agent and owner()->driver(),
++  // which is non-virtual, and regions_ is not torn down yet.
++  for (char* base : edge_slab_.blocks)
++    core::Runtime::runtime_singleton_->FreeMemory(base);
++  edge_slab_.blocks.clear();
++  edge_slab_.free_slots.clear();
++}
++
+ core::Agent* GpuAgent::GetNearestCpuAgent() const {
+   core::Agent* nearCpu = nullptr;
+   uint32_t dist = -1u;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
+index 537bd07f66..29e21ecb66 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
+@@ -42,20 +42,41 @@
+ 
+ #include "core/inc/default_signal.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #if defined(__i386__) || defined(__x86_64__)
+ #include <mwaitxintrin.h>
++#include <xmmintrin.h>
+ #define MWAITX_ECX_TIMER_ENABLE 0x2  // BIT(1)
++// Drain the write combining buffers.  See StoreRelaxed().
++#define ROCR_WC_DRAIN() _mm_sfence()
++#else
++#define ROCR_WC_DRAIN() std::atomic_thread_fence(std::memory_order_release)
+ #endif
+ 
+ namespace rocr {
+ namespace core {
+ 
+-BusyWaitSignal::BusyWaitSignal(SharedSignal* abi_block, bool enableIPC)
+-    : Signal(abi_block, enableIPC) {
++BusyWaitSignal::BusyWaitSignal(SharedSignal* abi_block, bool enableIPC, bool device_resident_value)
++    : Signal(abi_block, enableIPC, device_resident_value) {
+   signal_.kind = AMD_SIGNAL_KIND_USER;
+   signal_.event_mailbox_ptr = uint64_t(NULL);
+ }
+ 
++void BusyWaitSignal::RejectHostAtomicRmw() const {
++  if (!IsDeviceResidentValue()) return;
++
++  // Reached only if a caller performed a read-modify-write on a signal it
++  // asked to have placed in device memory.  The API layer rejects these with
++  // HSA_STATUS_ERROR_INVALID_SIGNAL; these entry points have no status return,
++  // and completing the operation would corrupt the value word, so stop.
++  fprintf(stderr,
++          "HSA: read-modify-write on a device resident signal value word is "
++          "not supported.\n");
++  abort();
++}
++
+ hsa_signal_value_t BusyWaitSignal::LoadRelaxed() {
+   return hsa_signal_value_t(
+       atomic::Load(&signal_.value, std::memory_order_relaxed));
+@@ -68,6 +89,27 @@ hsa_signal_value_t BusyWaitSignal::LoadAcquire() {
+ 
+ void BusyWaitSignal::StoreRelaxed(hsa_signal_value_t value) {
+   atomic::Store(&signal_.value, int64_t(value), std::memory_order_relaxed);
++
++  if (IsDeviceResidentValue()) {
++    // The value word is in device memory, written through a write combining
++    // aperture.  A relaxed store can still sit in a write combining buffer when
++    // a later store to a different aperture - a queue doorbell, typically - has
++    // become visible, so the command processor can see the doorbell before the
++    // value.  Same hazard, and same fence, as the device memory ring buffer
++    // stores; unconditional here because this store is not per-dispatch, where
++    // those sites test needsPcieOrdering().
++    //
++    // Not PcieWcFlush(): its body ends in a readback, which on a device resident
++    // word is the host bus read this placement exists to remove, and it would be
++    // paid on every store.
++    //
++    // This is the ONLY host write site drained.  StoreRelease() fences BEFORE
++    // its store and emits nothing after it, and SharedSignal::CopyPrep() writes
++    // a destination block's header with plain stores; neither is reachable with
++    // a device resident target today, and a caller that makes one reachable must
++    // close it.
++    ROCR_WC_DRAIN();
++  }
+ }
+ 
+ void BusyWaitSignal::StoreRelease(hsa_signal_value_t value) {
+@@ -104,7 +146,13 @@ hsa_signal_value_t BusyWaitSignal::WaitRelaxed(hsa_signal_condition_t condition,
+ 
+     timer::CheckAbortTimeout(start_time, signal_abort_timeout);
+ 
+-    if (g_use_mwaitx) {
++    // MONITORX arms a hardware monitor on a cache line.  A device resident value
++    // word is mapped write combining, not write-back cacheable, and the
++    // architecture does not guarantee a monitor can be established on such a
++    // line - the park would degenerate into a timed sleep that the awaited write
++    // does not end.  Spin instead; the loop already re-reads the word and
++    // re-tests the condition every iteration.
++    if (g_use_mwaitx && !IsDeviceResidentValue()) {
+       // Use timer-enabled mwaitx for busy waiting
+       timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), value, 60000, true);
+     }
+@@ -121,107 +169,132 @@ hsa_signal_value_t BusyWaitSignal::WaitAcquire(hsa_signal_condition_t condition,
+ }
+ 
+ void BusyWaitSignal::AndRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::And(&signal_.value, int64_t(value), std::memory_order_relaxed);
+ }
+ 
+ void BusyWaitSignal::AndAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::And(&signal_.value, int64_t(value), std::memory_order_acquire);
+ }
+ 
+ void BusyWaitSignal::AndRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::And(&signal_.value, int64_t(value), std::memory_order_release);
+ }
+ 
+ void BusyWaitSignal::AndAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::And(&signal_.value, int64_t(value), std::memory_order_acq_rel);
+ }
+ 
+ void BusyWaitSignal::OrRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Or(&signal_.value, int64_t(value), std::memory_order_relaxed);
+ }
+ 
+ void BusyWaitSignal::OrAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Or(&signal_.value, int64_t(value), std::memory_order_acquire);
+ }
+ 
+ void BusyWaitSignal::OrRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Or(&signal_.value, int64_t(value), std::memory_order_release);
+ }
+ 
+ void BusyWaitSignal::OrAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Or(&signal_.value, int64_t(value), std::memory_order_acq_rel);
+ }
+ 
+ void BusyWaitSignal::XorRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Xor(&signal_.value, int64_t(value), std::memory_order_relaxed);
+ }
+ 
+ void BusyWaitSignal::XorAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Xor(&signal_.value, int64_t(value), std::memory_order_acquire);
+ }
+ 
+ void BusyWaitSignal::XorRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Xor(&signal_.value, int64_t(value), std::memory_order_release);
+ }
+ 
+ void BusyWaitSignal::XorAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Xor(&signal_.value, int64_t(value), std::memory_order_acq_rel);
+ }
+ 
+ void BusyWaitSignal::AddRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Add(&signal_.value, int64_t(value), std::memory_order_relaxed);
+ }
+ 
+ void BusyWaitSignal::AddAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Add(&signal_.value, int64_t(value), std::memory_order_acquire);
+ }
+ 
+ void BusyWaitSignal::AddRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Add(&signal_.value, int64_t(value), std::memory_order_release);
+ }
+ 
+ void BusyWaitSignal::AddAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Add(&signal_.value, int64_t(value), std::memory_order_acq_rel);
+ }
+ 
+ void BusyWaitSignal::SubRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Sub(&signal_.value, int64_t(value), std::memory_order_relaxed);
+ }
+ 
+ void BusyWaitSignal::SubAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Sub(&signal_.value, int64_t(value), std::memory_order_acquire);
+ }
+ 
+ void BusyWaitSignal::SubRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Sub(&signal_.value, int64_t(value), std::memory_order_release);
+ }
+ 
+ void BusyWaitSignal::SubAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   atomic::Sub(&signal_.value, int64_t(value), std::memory_order_acq_rel);
+ }
+ 
+ hsa_signal_value_t BusyWaitSignal::ExchRelaxed(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Exchange(&signal_.value, int64_t(value),
+                                              std::memory_order_relaxed));
+ }
+ 
+ hsa_signal_value_t BusyWaitSignal::ExchAcquire(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Exchange(&signal_.value, int64_t(value),
+                                              std::memory_order_acquire));
+ }
+ 
+ hsa_signal_value_t BusyWaitSignal::ExchRelease(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Exchange(&signal_.value, int64_t(value),
+                                              std::memory_order_release));
+ }
+ 
+ hsa_signal_value_t BusyWaitSignal::ExchAcqRel(hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Exchange(&signal_.value, int64_t(value),
+                                              std::memory_order_acq_rel));
+ }
+ 
+ hsa_signal_value_t BusyWaitSignal::CasRelaxed(hsa_signal_value_t expected,
+                                               hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Cas(&signal_.value, int64_t(value),
+                                         int64_t(expected),
+                                         std::memory_order_relaxed));
+@@ -229,6 +302,7 @@ hsa_signal_value_t BusyWaitSignal::CasRelaxed(hsa_signal_value_t expected,
+ 
+ hsa_signal_value_t BusyWaitSignal::CasAcquire(hsa_signal_value_t expected,
+                                               hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Cas(&signal_.value, int64_t(value),
+                                         int64_t(expected),
+                                         std::memory_order_acquire));
+@@ -236,6 +310,7 @@ hsa_signal_value_t BusyWaitSignal::CasAcquire(hsa_signal_value_t expected,
+ 
+ hsa_signal_value_t BusyWaitSignal::CasRelease(hsa_signal_value_t expected,
+                                               hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Cas(&signal_.value, int64_t(value),
+                                         int64_t(expected),
+                                         std::memory_order_release));
+@@ -243,6 +318,7 @@ hsa_signal_value_t BusyWaitSignal::CasRelease(hsa_signal_value_t expected,
+ 
+ hsa_signal_value_t BusyWaitSignal::CasAcqRel(hsa_signal_value_t expected,
+                                              hsa_signal_value_t value) {
++  RejectHostAtomicRmw();
+   return hsa_signal_value_t(atomic::Cas(&signal_.value, int64_t(value),
+                                         int64_t(expected),
+                                         std::memory_order_acq_rel));
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_api_trace.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_api_trace.cpp
+index c2d9a302c2..9a473a6eb8 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_api_trace.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_api_trace.cpp
+@@ -87,7 +87,7 @@ void HsaApiTable::Init() {
+   // they can add preprocessor macros on the new functions
+ 
+   constexpr size_t expected_core_api_table_size = 1016;
+-  constexpr size_t expected_amd_ext_table_size = 744;
++  constexpr size_t expected_amd_ext_table_size = 752;
+   constexpr size_t expected_image_ext_table_size = 128;
+   constexpr size_t expected_finalizer_ext_table_size = 64;
+   constexpr size_t expected_tools_table_size = 64;
+@@ -493,6 +493,7 @@ void HsaApiTable::UpdateAmdExts() {
+   amd_ext_api.hsa_amd_queue_create_fn = AMD::hsa_amd_queue_create;
+   amd_ext_api.hsa_amd_queue_signal_external_semaphore_fn = AMD::hsa_amd_queue_signal_external_semaphore;
+   amd_ext_api.hsa_amd_queue_wait_external_semaphore_fn   = AMD::hsa_amd_queue_wait_external_semaphore;
++  amd_ext_api.hsa_amd_signal_create_v2_fn = AMD::hsa_amd_signal_create_v2;
+ }
+ 
+ void HsaApiTable::UpdateTools() {
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_ext_amd.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_ext_amd.cpp
+index e862746638..4ae280ec90 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_ext_amd.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/hsa_ext_amd.cpp
+@@ -205,6 +205,8 @@ bool IsValidQueuePriority(hsa_amd_queue_priority_t priority) {
+ 
+ }  // namespace
+ 
++static bool IsOrderingEdgeSignal(hsa_signal_t handle);
++
+ hsa_status_t handleException() {
+   try {
+     throw;
+@@ -434,6 +436,8 @@ hsa_status_t hsa_amd_memory_async_copy(void* dst, hsa_agent_t dst_agent_handle,
+                                        uint32_t num_dep_signals, const hsa_signal_t* dep_signals,
+                                        hsa_signal_t completion_signal) {
+   TRY;
++  // An ordering edge is not a copy completion signal.
++  if (IsOrderingEdgeSignal(completion_signal)) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   IS_BAD_PTR(dst);
+   IS_BAD_PTR(src);
+ 
+@@ -479,6 +483,8 @@ hsa_status_t hsa_amd_memory_async_copy_on_engine(void* dst, hsa_agent_t dst_agen
+                                        hsa_amd_sdma_engine_id_t engine_id,
+                                        bool force_copy_on_sdma) {
+   TRY;
++  // An ordering edge is not a copy completion signal.
++  if (IsOrderingEdgeSignal(completion_signal)) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   IS_BAD_PTR(dst);
+   IS_BAD_PTR(src);
+ 
+@@ -556,6 +562,10 @@ hsa_status_t hsa_amd_memory_async_batch_copy(const hsa_amd_memory_copy_op_t* cop
+     core::Signal* sig = core::Signal::Convert(op.completion_signal);
+     IS_VALID(sig);
+ 
++    // An ordering edge is not a copy completion signal.  This path both
++    // host-RMWs the signal and enrols it with the async signal handler.
++    if (sig->IsDeviceResidentValue()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
++
+     IS_BAD_PTR(op.src);
+ 
+     core::Agent* src_agent = core::Agent::Convert(op.src_agent);
+@@ -807,6 +817,8 @@ hsa_status_t hsa_amd_memory_async_copy_rect(
+     hsa_amd_copy_direction_t dir, uint32_t num_dep_signals, const hsa_signal_t* dep_signals,
+     hsa_signal_t completion_signal) {
+   TRY;
++  // An ordering edge is not a copy completion signal.
++  if (IsOrderingEdgeSignal(completion_signal)) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   if (dst == nullptr || src == nullptr || dst_offset == nullptr || src_offset == nullptr ||
+       range == nullptr) {
+     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+@@ -1027,6 +1039,144 @@ hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial_value, uint32_t nu
+   CATCH;
+ }
+ 
++// An ordering edge signal (hsa_amd_signal_create_v2 with
++// HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD) keeps its value
++// word in device memory, where a host read-modify-write is not atomic.  Entry
++// points that hand that word to the host, or that make the runtime host-poll
++// it, refuse rather than return something the caller cannot use safely.
++static bool IsOrderingEdgeSignal(hsa_signal_t handle) {
++  if (handle.handle == 0) return false;
++  core::Signal* signal = core::Signal::Convert(handle);
++  return (signal != nullptr) && signal->IsValid() && signal->IsDeviceResidentValue();
++}
++
++// ABI of the signal create descriptor, pinned so a change is a compile error
++// rather than a silent mismatch with a caller built against another header.
++static_assert(sizeof(hsa_amd_signal_create_desc_t) == 64,
++              "hsa_amd_signal_create_desc_t ABI layout changed");
++static_assert(alignof(hsa_amd_signal_create_desc_t) == 8,
++              "hsa_amd_signal_create_desc_t alignment changed");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, version) == 0, "ABI: version");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, flags) == 2, "ABI: flags");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, initial_value) == 8, "ABI: initial_value");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, attributes) == 16, "ABI: attributes");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, num_consumers) == 24, "ABI: num_consumers");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, consumers) == 32, "ABI: consumers");
++static_assert(offsetof(hsa_amd_signal_create_desc_t, signal) == 40, "ABI: signal");
++
++// Every flag hsa_amd_signal_create_flag_t defines.  Anything outside this mask
++// is rejected rather than ignored; see the comment in the loop below.
++static constexpr uint16_t kAllSignalCreateFlags =
++    uint16_t(HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD);
++
++// Creates one device resident ordering edge signal from a validated descriptor.
++// Split out only to keep the validation loop readable; it assumes the common
++// header has already been checked.
++static hsa_status_t CreateOrderingEdgeSignal(hsa_amd_signal_create_desc_t& d) {
++  // No fall back to a host resident signal: a caller that silently received one
++  // would believe it had taken the fast path forever.  Ask the agent first with
++  // HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED, which distinguishes "not
++  // this machine" from "not this runtime" - an older runtime answers
++  // HSA_STATUS_ERROR_INVALID_ARGUMENT to the unknown enumerant.
++  if (d.attributes & HSA_AMD_SIGNAL_IPC) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
++  // HSA_AMD_SIGNAL_AMD_GPU_ONLY is accepted and INERT: this path always
++  // constructs a core::DefaultSignal with no event mailbox, set or not.  Do not
++  // make it class selective the way hsa_amd_signal_create is -
++  // Signal::DestroySignal()'s carve-out argues from the class being fixed here,
++  // and would break silently.
++  if (d.num_consumers != 1) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
++  IS_BAD_PTR(d.consumers);
++
++  core::Agent* agent = core::Agent::Convert(d.consumers[0]);
++  IS_VALID(agent);
++  if (agent->device_type() != core::Agent::DeviceType::kAmdGpuDevice)
++    return HSA_STATUS_ERROR_INVALID_AGENT;
++  if (!static_cast<AMD::GpuAgent*>(agent)->SupportsOrderingEdgeSignal())
++    return HSA_STATUS_ERROR_INVALID_AGENT;
++
++  core::Signal* ret = new core::DefaultSignal(d.initial_value, *agent);
++  if (ret == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
++
++  d.signal = core::Signal::Convert(ret);
++  return HSA_STATUS_SUCCESS;
++}
++
++hsa_status_t hsa_amd_signal_create_v2(hsa_amd_signal_create_desc_t* descs, uint32_t num_descs) {
++  TRY;
++  IS_OPEN();
++
++  if (descs == nullptr || num_descs == 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
++
++  static const uint8_t header_zeroes[sizeof(descs->reserved_header)] = {};
++  static const uint8_t zeroes[sizeof(descs->reserved)] = {};
++
++  hsa_status_t first_error = HSA_STATUS_SUCCESS;
++  auto record = [&first_error](hsa_status_t st) {
++    if (first_error == HSA_STATUS_SUCCESS) first_error = st;
++  };
++
++  for (uint32_t i = 0; i < num_descs; ++i) {
++    auto& d = descs[i];
++
++    // Clear the output first, so a caller can find the failed elements of a
++    // batch by looking for a zero handle without tracking indices itself.
++    d.signal.handle = 0;
++
++    // ---- Common header ----
++    // The version is validated by equality, not by range.  A descriptor this
++    // runtime does not recognise is refused; it is never partially honoured.
++    if (d.version != HSA_AMD_SIGNAL_CREATE_DESC_VERSION) {
++      record(HSA_STATUS_ERROR_INVALID_ARGUMENT);
++      continue;
++    }
++
++    if (d.reserved_count != 0 ||
++        memcmp(d.reserved_header, header_zeroes, sizeof(d.reserved_header)) != 0 ||
++        memcmp(d.reserved, zeroes, sizeof(d.reserved)) != 0) {
++      record(HSA_STATUS_ERROR_INVALID_ARGUMENT);
++      continue;
++    }
++
++    // Undefined flag bits are REJECTED, not ignored.  No other flag or attribute
++    // word in this header does that: hsa_amd_signal_create tests the two
++    // attribute bits it knows and validates none of the rest, and
++    // hsa_amd_queue_create validates its descriptor version by equality but lets
++    // an unknown flag bit through.  A caller that sets a placement flag this
++    // runtime predates must not receive a signal that silently lacks it.
++    if ((d.flags & ~kAllSignalCreateFlags) != 0) {
++      record(HSA_STATUS_ERROR_INVALID_ARGUMENT);
++      continue;
++    }
++
++    // Same rule for attributes.
++    if ((d.attributes & ~uint64_t(HSA_AMD_SIGNAL_AMD_GPU_ONLY | HSA_AMD_SIGNAL_IPC)) != 0) {
++      record(HSA_STATUS_ERROR_INVALID_ARGUMENT);
++      continue;
++    }
++
++    // ---- Placement ----
++    hsa_status_t st;
++    if ((d.flags & HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD) != 0) {
++      st = CreateOrderingEdgeSignal(d);
++    } else {
++      // System memory is the default placement and is exactly what
++      // hsa_amd_signal_create produces.  Call it rather than reimplementing
++      // its consumer-list and interrupt-signal selection logic, so the two
++      // entry points cannot drift apart.
++      st = AMD::hsa_amd_signal_create(d.initial_value, d.num_consumers, d.consumers, d.attributes,
++                                      &d.signal);
++    }
++
++    if (st != HSA_STATUS_SUCCESS) {
++      d.signal.handle = 0;
++      record(st);
++    }
++  }
++
++  return first_error;
++  CATCH;
++}
++
+ hsa_status_t hsa_amd_signal_value_pointer(hsa_signal_t hsa_signal,
+                                           volatile hsa_signal_value_t** value_ptr) {
+   TRY;
+@@ -1038,6 +1188,10 @@ hsa_status_t hsa_amd_signal_value_pointer(hsa_signal_t hsa_signal,
+   if(!core::BusyWaitSignal::IsType(signal))
+     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+ 
++  // The word is in device memory; the documented use of this pointer is a host
++  // atomic update, which is not atomic there.
++  if (signal->IsDeviceResidentValue()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
++
+   *value_ptr = (volatile hsa_signal_value_t*)&signal->signal_.value;
+   return HSA_STATUS_SUCCESS;
+ 
+@@ -1155,6 +1309,9 @@ hsa_status_t hsa_amd_signal_async_handler(hsa_signal_t hsa_signal, hsa_signal_co
+   if ((core::g_use_interrupt_wait && (!core::InterruptSignal::IsType(signal)) &&
+       !core::IPCSignal::IsType(signal)))
+     return HSA_STATUS_ERROR_INVALID_SIGNAL;
++
++  // The handler thread host polls the value word.
++  if (signal->IsDeviceResidentValue()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   return core::Runtime::runtime_singleton_->SetAsyncSignalHandler(
+       hsa_signal, cond, value, handler, arg);
+   CATCH;
+@@ -1769,6 +1926,9 @@ hsa_status_t hsa_amd_svm_prefetch_async(void* ptr, size_t size, hsa_agent_t agen
+                                         hsa_signal_t completion_signal) {
+   TRY;
+   IS_OPEN();
++  // The prefetch completes with a host side SubRelaxed(1) on this signal
++  // (Runtime::SvmPrefetch), which is a host read-modify-write.
++  if (IsOrderingEdgeSignal(completion_signal)) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   // Validate inputs.
+   // if (core::g_use_interrupt_wait && (!core::InterruptSignal::IsType(signal)))
+   return core::Runtime::runtime_singleton_->SvmPrefetch(ptr, size, agent, num_dep_signals,
+@@ -2180,6 +2340,9 @@ hsa_status_t HSA_API hsa_amd_svm_discard_batch_async(void** ptrs, size_t* sizes,
+                                                hsa_signal_t completion_signal) {
+   TRY;
+   IS_OPEN();
++  // The discard completes with a host side SubRelaxed(1) on this signal
++  // (Runtime::SvmBatchDiscard), which is a host read-modify-write.
++  if (IsOrderingEdgeSignal(completion_signal)) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+   IS_BAD_PTR(ptrs);
+   IS_BAD_PTR(sizes);
+   IS_ZERO(count);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+index 18d2edde10..b5e502b2f9 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -2139,26 +2139,25 @@ void Runtime::AsyncEventsPool::clear() {
+                   capacity - free_list_.size());
+   }
+ 
+-  for (auto& block : block_list_) free_()(block.first);
++  for (auto& block : block_list_) ::free(block.first);
+   block_list_.clear();
+   free_list_.clear();
+ }
+ 
+ Runtime::AsyncEventItem* Runtime::AsyncEventsPool::alloc() {
++  static_assert(__alignof(Runtime::AsyncEventItem) <= __alignof(max_align_t),
++                "AsyncEventItem needs over-aligned storage.");
+   std::lock_guard<HybridMutex> lock(lock_);
+   if (free_list_.empty()) {
+-    AsyncEventItem* block = reinterpret_cast<AsyncEventItem*>(
+-        allocate_()(block_size_ * sizeof(AsyncEventItem), __alignof(AsyncEventItem),
+-                    core::MemoryRegion::AllocateNonPaged, 0));
++    AsyncEventItem* block =
++        reinterpret_cast<AsyncEventItem*>(::malloc(block_size_ * sizeof(AsyncEventItem)));
+     if (block == nullptr) {
+       block_size_ = minblock_;
+-      block = reinterpret_cast<AsyncEventItem*>(
+-          allocate_()(block_size_ * sizeof(AsyncEventItem), __alignof(AsyncEventItem),
+-                      core::MemoryRegion::AllocateNonPaged, 0));
++      block = reinterpret_cast<AsyncEventItem*>(::malloc(block_size_ * sizeof(AsyncEventItem)));
+       if (block == nullptr) throw std::bad_alloc();
+     }
+ 
+-    MAKE_NAMED_SCOPE_GUARD(throwGuard, [&]() { free_()(block); });
++    MAKE_NAMED_SCOPE_GUARD(throwGuard, [&]() { ::free(block); });
+     block_list_.push_back(std::make_pair(block, block_size_));
+     throwGuard.Dismiss();
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
+index c6170812f1..ac24409412 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
+@@ -44,6 +44,7 @@
+ #define HSA_RUNTME_CORE_SIGNAL_CPP_
+ 
+ #include "core/inc/signal.h"
++#include "core/inc/amd_gpu_agent.h"
+ 
+ #include <algorithm>
+ #include <numeric>
+@@ -105,6 +106,15 @@ SharedSignal* SharedSignalPool_t::alloc() {
+   return ret;
+ }
+ 
++SharedSignal* SharedSignalPool_t::alloc(int agent_node_id, int flags) {
++  // Refuse rather than ignore.  Silently returning host memory for a placement
++  // request is the defect this overload exists to make impossible.
++  if (agent_node_id != 0 || flags != 0)
++    throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_ALLOCATION,
++                             "SharedSignalPool_t cannot honour a placement request.");
++  return alloc();
++}
++
+ void SharedSignalPool_t::free(SharedSignal* ptr) {
+   if (ptr == nullptr) return;
+ 
+@@ -133,6 +143,84 @@ LocalSignal::LocalSignal(hsa_signal_value_t initial_value, bool exportable)
+   local_signal_.shared_object()->amd_signal.value = initial_value;
+ }
+ 
++
++// SharedSignal's assertions above constrain offsets WITHIN the object, so a slot
++// at base + i*stride preserves them exactly when stride % 32 == 0.  The slab's
++// base is page aligned, coming from a KFD allocation.
++static_assert(AMD::GpuAgent::kOrderingEdgeDefaultStride >= sizeof(SharedSignal),
++              "Ordering edge slot stride must hold a whole SharedSignal.");
++static_assert((AMD::GpuAgent::kOrderingEdgeDefaultStride % 32) == 0,
++              "Ordering edge slot stride must preserve SharedSignal's 32 byte internal alignment.");
++static_assert((AMD::GpuAgent::kOrderingEdgeBlockSize %
++               AMD::GpuAgent::kOrderingEdgeDefaultStride) == 0,
++              "Ordering edge slot stride must divide the slab block exactly.");
++
++// Takes one SharedSignal ABI block from device_agent's ordering edge slab, which
++// is one device allocation per (process x device) carved into fixed stride slots.
++// See GpuAgent::AcquireOrderingEdgeSlot().
++static SharedSignal* AllocateDeviceSignalBlock(core::Agent& device_agent) {
++  // Both checks below say "not this agent", not "out of memory": a caller must
++  // not be invited to retry something that can never succeed here.
++  if (device_agent.device_type() != core::Agent::DeviceType::kAmdGpuDevice)
++    throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_AGENT,
++                             "Ordering edge signal consumer is not a GPU agent.");
++
++  // Ask the agent rather than repeating the selection here, so a supported
++  // answer and a successful allocation cannot disagree.
++  const core::MemoryRegion* local =
++      static_cast<AMD::GpuAgent&>(device_agent).OrderingEdgeSignalRegion();
++  if (local == nullptr)
++    throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_AGENT,
++                             "Agent has no host visible coarse grain device local memory region.");
++
++  // AllocateUncached matches what this tree does for the analogous object, the
++  // device resident AQL ring buffer, which the command processor also reads
++  // (AqlQueue::AqlQueue(), core/runtime/amd_aql_queue.cpp).  It is a GPU-side
++  // page attribute: it reaches KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED and sets MTYPE
++  // to UC in the GPU page tables, and does NOT change the host mapping -- which
++  // is why the write combining drain in default_signal.cpp is still needed.  In
++  // KfdDriver::AllocateMemory() it also clears the KMT CoarseGrain and
++  // ExtendedCoherent bits, so the allocation is uncached rather than coarse
++  // grain; the region is still chosen by the coarse grain predicate above.
++  //
++  // Do not drop it.  It was removed once and restored after GPU hangs on gfx1250
++  // with older MEC firmware, on a buffer the command processor also reads.  The
++  // flags now sit on the slab block in GpuAgent::GrowOrderingEdgeSlab() -- same
++  // two flags, same region, one call per agent instead of one per signal.
++  hsa_status_t why = HSA_STATUS_SUCCESS;
++  void* ptr = static_cast<AMD::GpuAgent&>(device_agent).AcquireOrderingEdgeSlot(&why);
++  if (ptr == nullptr) {
++    if (why == HSA_STATUS_ERROR_INVALID_AGENT)
++      throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_AGENT,
++                               "Agent has no host visible coarse grain device local memory region.");
++    throw std::bad_alloc();  // this one really is out of memory
++  }
++
++  // Constructed here, not when the block was allocated.  That is what keeps slot
++  // construction lazy, and what makes reuse correct: a recycled slot is fully
++  // reinitialised -- value word, mailbox pointer, timestamps, core_signal back
++  // pointer and Check<> id -- before its handle goes out again.
++  return new (ptr) SharedSignal();
++}
++
++LocalSignal::LocalSignal(hsa_signal_value_t initial_value, core::Agent& device_agent)
++    : local_signal_(Shared<SharedSignal, SharedSignalPool_t>::NoAlloc()),
++      device_block_(AllocateDeviceSignalBlock(device_agent)),
++      device_agent_(&device_agent) {
++  device_block_->amd_signal.value = initial_value;
++}
++
++LocalSignal::~LocalSignal() {
++  if (device_block_ != nullptr) {
++    // SharedSignal is trivially destructible (static_assert in signal.h), so
++    // only the storage goes back -- to the owning agent's slab free list, not to
++    // the driver.  See GpuAgent::ReleaseOrderingEdgeSlot().
++    static_cast<AMD::GpuAgent*>(device_agent_)->ReleaseOrderingEdgeSlot(device_block_);
++    device_block_ = nullptr;
++    device_agent_ = nullptr;
++  }
++}
++
+ void Signal::registerIpc() {
+   std::lock_guard<std::mutex> lock(ipcLock_);
+   auto handle = Convert(this);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/hsacore.dll.def b/projects/rocr-runtime/runtime/hsa-runtime/hsacore.dll.def
+index 8cc7bcab60..cf191c0a2b 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/hsacore.dll.def
++++ b/projects/rocr-runtime/runtime/hsa-runtime/hsacore.dll.def
+@@ -138,6 +138,7 @@ EXPORTS
+   hsa_amd_profiling_get_async_copy_time
+   hsa_amd_profiling_convert_tick_to_system_domain
+   hsa_amd_signal_create
++  hsa_amd_signal_create_v2
+   hsa_amd_signal_wait_any
+   hsa_amd_signal_async_handler
+   hsa_amd_async_function
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/hsacore.so.def b/projects/rocr-runtime/runtime/hsa-runtime/hsacore.so.def
+index f908e31767..8cf7b6c5e8 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/hsacore.so.def
++++ b/projects/rocr-runtime/runtime/hsa-runtime/hsacore.so.def
+@@ -175,6 +175,7 @@ global:
+ 	hsa_amd_profiling_get_async_copy_time;
+ 	hsa_amd_profiling_convert_tick_to_system_domain;
+ 	hsa_amd_signal_create;
++	hsa_amd_signal_create_v2;
+ 	hsa_amd_signal_wait_any;
+ 	hsa_amd_signal_async_handler;
+ 	hsa_amd_async_function;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace.h
+index a4bd23f1d8..755dc84002 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace.h
+@@ -288,6 +288,7 @@ struct AmdExtTable {
+   decltype(hsa_amd_queue_wait_external_semaphore)*   hsa_amd_queue_wait_external_semaphore_fn;
+   decltype(hsa_amd_image_create_v2)* hsa_amd_image_create_v2_fn;
+   decltype(hsa_amd_interop_map_buffer_with_size)* hsa_amd_interop_map_buffer_with_size_fn;
++  decltype(hsa_amd_signal_create_v2)* hsa_amd_signal_create_v2_fn;
+ };
+ 
+ // Table to export HSA Core Runtime Apis
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace_version.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace_version.h
+index 8473542af3..7375a1a522 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace_version.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_api_trace_version.h
+@@ -58,7 +58,7 @@
+ // Step Ids of the Api tables exported by Hsa Core Runtime
+ #define HSA_API_TABLE_STEP_VERSION                  0x01
+ #define HSA_CORE_API_TABLE_STEP_VERSION             0x00
+-#define HSA_AMD_EXT_API_TABLE_STEP_VERSION          0x12
++#define HSA_AMD_EXT_API_TABLE_STEP_VERSION          0x13
+ #define HSA_FINALIZER_API_TABLE_STEP_VERSION        0x00
+ #define HSA_IMAGE_API_TABLE_STEP_VERSION            0x01
+ // Rocprofiler just checks HSA_MAGE_EXT_API_TABLE_STEP_VERSION
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ext_amd.h b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ext_amd.h
+index 28b6f22c5e..5571392be9 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ext_amd.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ext_amd.h
+@@ -82,9 +82,11 @@
+  * - 1.28 - hsa_amd_agent_info_t: HSA_AMD_AGENT_INFO_HOST_ALLOC_DMABUF_SUPPORTED
+  * - 1.29 - hsa_amd_image_create_v2, hsa_amd_interop_map_buffer_with_size
+  * - 1.30 - hsa_amd_queue_get_info: engine type and SDMA engine ID
++ * - 1.31 - hsa_amd_signal_create_v2, hsa_amd_signal_create_desc_t
++ * - 1.32 - hsa_amd_agent_info_t: HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED
+  */
+ #define HSA_AMD_INTERFACE_VERSION_MAJOR 1
+-#define HSA_AMD_INTERFACE_VERSION_MINOR 30
++#define HSA_AMD_INTERFACE_VERSION_MINOR 32
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -986,6 +988,30 @@ typedef enum hsa_amd_agent_info_s {
+    * The type of this attribute is bool.
+    */
+   HSA_AMD_AGENT_INFO_HOST_ALLOC_DMABUF_SUPPORTED = 0xA124,
++  /**
++   * Can this agent be named as the single consumer of a signal created with
++   * ::hsa_amd_signal_create_v2 and
++   * ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD?  True iff the agent is a GPU
++   * that exposes a device local memory region a signal's ABI block can be
++   * placed in.  This is the same test the allocator performs, so a true answer
++   * here and a failure to allocate cannot disagree.  The caller side conditions
++   * (exactly one consumer, no IPC) are not properties of the agent and are not
++   * reflected here.  The type of this attribute is bool.
++   *
++   * A runtime that predates the feature answers this query with
++   * ::HSA_STATUS_ERROR_INVALID_ARGUMENT, which is a usable negative -- but only
++   * while this numeric value remains unallocated.  A bit in an existing
++   * properties word would not have that property, which is why this is a new
++   * enumerant.
++   *
++   * THE NUMERIC VALUE IS PROVISIONAL AND MUST BE REALLOCATED BEFORE MERGE, and
++   * re-verified immediately before merge rather than once: this range is
++   * allocated continuously, and a caller probing a value some runtime has
++   * already spent on another bool attribute receives that attribute's answer
++   * with HSA_STATUS_SUCCESS and cannot tell the difference.  The value must be
++   * identical on every branch, because a caller passes the enumerant.
++   */
++  HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED = 0xA125,
+ } hsa_amd_agent_info_t;
+ 
+ /**
+@@ -1389,6 +1415,186 @@ hsa_status_t HSA_API hsa_amd_signal_create(hsa_signal_value_t initial_value, uin
+                                            const hsa_agent_t* consumers, uint64_t attributes,
+                                            hsa_signal_t* signal);
+ 
++/**
++ * @brief Version of the ::hsa_amd_signal_create_desc_t structure.
++ */
++#define HSA_AMD_SIGNAL_CREATE_DESC_VERSION 1
++
++/**
++ * @brief Signal creation attributes.
++ *
++ * Selects where the signal's value word - the word an agent polls when it
++ * waits on the signal - is placed.  The default (0) is the placement every
++ * signal has always had, so a zero-initialised descriptor requests exactly
++ * what ::hsa_amd_signal_create would have produced.
++ */
++typedef enum {
++  /**
++   * The signal's value word is allocated in system memory (default).
++   */
++  HSA_AMD_SIGNAL_CREATE_SYSTEM_MEM = 0,
++  /**
++   * The signal's value word is allocated in the local device memory of the
++   * single GPU named in @c consumers[0], for use as a cross queue ordering
++   * edge.  Requires @c num_consumers == 1 and a GPU agent that answers true
++   * to ::HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED.  Not compatible
++   * with ::HSA_AMD_SIGNAL_IPC.  The resulting signal is restricted; see the
++   * restriction list on ::hsa_amd_signal_create_v2.
++   */
++  HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD = (1 << 0),
++} hsa_amd_signal_create_flag_t;
++
++/**
++ * @brief Describes a single signal to create within a batch.
++ *
++ * A zero-initialised descriptor with @c version set requests a signal
++ * identical to one from ::hsa_amd_signal_create with @c num_consumers 0 and
++ * no attributes, because ::HSA_AMD_SIGNAL_CREATE_SYSTEM_MEM is 0.  This keeps
++ * the descriptor backward compatible with callers that only want an ordinary
++ * signal.
++ *
++ * On success the runtime writes the created signal into the @c signal field.
++ * On failure that field is left with a zero handle, so a caller can find which
++ * elements of a batch failed without tracking indices itself.
++ *
++ * The @c version field must be set to ::HSA_AMD_SIGNAL_CREATE_DESC_VERSION.
++ * All @c reserved fields must be zero.  Undefined bits of @c flags are also
++ * rejected, which is stricter than the other flag and attribute words this
++ * header defines: see the note on ::hsa_amd_signal_create_v2.
++ */
++typedef struct hsa_amd_signal_create_desc_s {
++  /** Struct version. Must be HSA_AMD_SIGNAL_CREATE_DESC_VERSION. */
++  uint16_t version;
++  /** Value word placement flags (::hsa_amd_signal_create_flag_t).
++   *  0 = system memory. Undefined bits are rejected. */
++  uint16_t flags;
++  /** Reserved for future common fields. Must be 0. */
++  uint8_t reserved_header[4];
++  /** Initial value of the signal. */
++  hsa_signal_value_t initial_value;
++  /** Signal attributes (::hsa_amd_signal_attribute_t). Undefined bits are
++   *  rejected.  With ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD,
++   *  ::HSA_AMD_SIGNAL_IPC is rejected and ::HSA_AMD_SIGNAL_AMD_GPU_ONLY is
++   *  accepted and inert: that placement always creates a busy-wait signal
++   *  with no event mailbox, whether or not the bit is set.  The bit is
++   *  accepted so that a caller can pass one attribute set to either create
++   *  entry point. */
++  uint64_t attributes;
++  /** Size of @c consumers. 0 indicates that any agent might wait on the
++   *  signal. Must be 1 when
++   *  ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD is set. */
++  uint32_t num_consumers;
++  /** Reserved. Must be 0. */
++  uint32_t reserved_count;
++  /** List of agents that might consume (wait on) the signal. Ignored when
++   *  @c num_consumers is 0. */
++  const hsa_agent_t* consumers;
++  /** [out] On success the runtime writes the created signal here. On failure
++   *  its handle is 0. */
++  hsa_signal_t signal;
++  /** Reserved for future fields. Must be 0. */
++  uint8_t reserved[16];
++} hsa_amd_signal_create_desc_t;
++
++/**
++ * @brief Create one or more signals from an array of descriptors, with control
++ * over where each signal's value word is placed.
++ *
++ * @details This is a descriptor based form of ::hsa_amd_signal_create.  With
++ * @c flags left at ::HSA_AMD_SIGNAL_CREATE_SYSTEM_MEM it is equivalent to that
++ * call.  With ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD it places the
++ * value word in the local memory of the single GPU that will consume it, for
++ * use as a cross queue ordering edge.
++ *
++ * A barrier-AND packet whose dependency signal is not yet satisfied makes the
++ * consuming GPU's command processor poll the value word.  When the word is in
++ * host memory, as it is for every signal created by ::hsa_amd_signal_create,
++ * each poll is a read across the host bus.  With the device memory flag the
++ * word lives in @c consumers[0]'s local memory, so the poll is local.
++ *
++ * The descriptor is versioned so that later additions - further placements,
++ * further fields - do not need a further entry point.  @c version is validated
++ * strictly: a runtime that does not recognise the value rejects the descriptor
++ * with ::HSA_STATUS_ERROR_INVALID_ARGUMENT rather than silently ignoring what
++ * it does not understand.  For the same reason undefined bits of @c flags and
++ * of @c attributes are rejected rather than ignored, so a caller that sets a
++ * flag this runtime predates receives an error instead of a signal that
++ * quietly lacks the requested property.
++ *
++ * A signal created with ::HSA_AMD_SIGNAL_CREATE_DEVICE_MEM_VALUE_WORD is
++ * restricted, and the restrictions are enforced:
++ * - the host must not perform an atomic read-modify-write on the value word.
++ *   Such an operation is not atomic with respect to the consuming GPU: it is
++ *   issued as separate bus transactions and loses the command processor's
++ *   concurrent updates.  This is the same constraint this header already
++ *   documents for ::HSA_AMD_QUEUE_CREATE_DEVICE_MEM_QUEUE_DESCRIPTOR.  The
++ *   ::hsa_signal_and_relaxed family and the other read-modify-write entry
++ *   points return void, so the runtime has no channel in which to report
++ *   this: it prints a diagnostic and terminates the process.  Loads and plain
++ *   stores are supported, and are what this object is for.  Waits are
++ *   supported but always spin; see the wait restriction below before relying
++ *   on ::HSA_WAIT_STATE_BLOCKED.
++ * - it may not be the completion signal of any asynchronous copy, prefetch or
++ *   discard entry point, nor the subject of ::hsa_amd_signal_value_pointer or
++ *   ::hsa_amd_signal_async_handler.  Which of those entry points exist depends
++ *   on the runtime; each one that does returns
++ *   ::HSA_STATUS_ERROR_INVALID_SIGNAL on this object.
++ * - it may be named in a dependency list - an AQL packet's dep_signal[], or an
++ *   entry point's dep_signals[] - only by the agent given as @c consumers[0].
++ *   The runtime does not check this.  The value word is mapped into that
++ *   agent's page tables only, so another agent's engine takes a memory
++ *   violation rather than a wait.
++ * - a dependency handed to an asynchronous copy, prefetch or discard entry
++ *   point is polled by the runtime on the host rather than by an engine, which
++ *   reinstates exactly the host bus traffic this object exists to remove.  On
++ *   gfx90x parts carrying the SDMA poll workaround that is true of every SDMA
++ *   dependency.  Prefer an AQL dep_signal[].
++ * - ::hsa_signal_wait_* on this signal spins.  There is no interrupt backed
++ *   form of this object, so ::HSA_WAIT_STATE_BLOCKED does not sleep, and the
++ *   runtime's MWAITX park is suppressed on a device resident value word.  A
++ *   caller that needs to block should wait on an ordinary signal.
++ * - ::HSA_AMD_SIGNAL_IPC is not supported.
++ *
++ * This call does not fall back.  If the machine cannot support the placement
++ * the descriptor fails; query ::HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED
++ * on the intended consumer first.  On a runtime that predates this feature
++ * that query returns ::HSA_STATUS_ERROR_INVALID_ARGUMENT, which is
++ * distinguishable from a machine that is merely unsuitable.  Refusing rather
++ * than substituting a host resident signal is deliberate: a caller that
++ * silently received one would believe it had taken the fast path forever.
++ * Callers must check the returned status and the per descriptor @c signal
++ * handle.
++ *
++ * On partial failure, signals that were successfully created remain valid and
++ * are the caller's to destroy.  The caller should inspect each
++ * @c descs[i].signal handle - a zero handle indicates that descriptor failed.
++ * The return value reflects the first error encountered.
++ *
++ * @param[in,out] descs Array of signal descriptors. Each descriptor's
++ * @c signal field is an output parameter written by the runtime.
++ *
++ * @param[in] num_descs Number of elements in @p descs. Must be >= 1.
++ *
++ * @retval ::HSA_STATUS_SUCCESS All signals were created successfully.
++ *
++ * @retval ::HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been
++ * initialized.
++ *
++ * @retval ::HSA_STATUS_ERROR_OUT_OF_RESOURCES The runtime failed to allocate
++ * the required resources.
++ *
++ * @retval ::HSA_STATUS_ERROR_INVALID_ARGUMENT @p descs is NULL, @p num_descs
++ * is 0, or for some descriptor: @c version is unrecognised, a @c reserved
++ * field is non-zero, @c flags or @c attributes contains an undefined bit,
++ * @c attributes contains ::HSA_AMD_SIGNAL_IPC together with the device memory
++ * flag, or @c num_consumers is not 1 when the device memory flag is set.
++ *
++ * @retval ::HSA_STATUS_ERROR_INVALID_AGENT @p consumers[0] is not a valid GPU
++ * agent, or is a GPU agent that cannot host a signal value word - see
++ * ::HSA_AMD_AGENT_INFO_ORDERING_EDGE_SIGNAL_SUPPORTED.
++ */
++hsa_status_t HSA_API hsa_amd_signal_create_v2(hsa_amd_signal_create_desc_t* descs,
++                                              uint32_t num_descs);
+ /**
+  * @brief Returns a pointer to the value of a signal.
+  *
