@@ -60,6 +60,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import aiter_w8a8_block_fp8_linear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -237,6 +238,16 @@ class _FusedQKVIndexProj(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
+
+
+def _linear_has_ptpc_decode_copy(linear: nn.Module) -> bool:
+    """Whether ``linear`` gets the rowwise-fp8 weight copy of an MXFP8 -> block-fp8
+    converted dense linear (see ``process_weights_after_loading_block_quant``)."""
+    qm = getattr(linear, "quant_method", None)
+    return (
+        getattr(qm, "convert_mxfp8_to_block", False)
+        and qm.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+    )
 
 
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
@@ -1328,10 +1339,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, emit_fp8_qinput=_is_hip
+                config.hidden_size, eps=config.rms_norm_eps
             )
             self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, emit_fp8_qinput=_is_hip
+                config.hidden_size, eps=config.rms_norm_eps
             )
         else:
             self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1356,13 +1367,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
+        # The input norm hands every attention projection the per-token (fp8, scale)
+        # pair, so each must run the ptpc decode GEMM that consumes it.
+        enable_fused_ar_quant_per_token = (
+            _is_gfx95_supported
+            and _linear_has_ptpc_decode_copy(self.self_attn.qkv_proj)
+            and (
+                getattr(self.self_attn, "index_qkv_proj", None) is None
+                or _linear_has_ptpc_decode_copy(self.self_attn.index_qkv_proj)
+            )
+        )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
-            enable_fused_ar_quant_per_token=_is_hip,
+            enable_fused_ar_quant_per_token=enable_fused_ar_quant_per_token,
         )
 
     def forward(
@@ -1384,7 +1405,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        # A tuple is the (fp8, scale) pair from the fused AR + norm + quant path.
+        num_tokens = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        ).shape[0]
+        if num_tokens != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,

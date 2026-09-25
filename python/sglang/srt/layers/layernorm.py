@@ -39,7 +39,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -147,16 +146,6 @@ if _is_hip:
         _has_rocm_triton_gemma_rms_norm = True
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
-
-
-@lru_cache(maxsize=1)
-def _fuse_norm_fp8_max_m() -> int:
-    if not is_gfx95_supported():
-        return 0
-    from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
-
-    return MXFP8_DENSE_PTPC_DECODE_MAX_M
-
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -402,9 +391,10 @@ def _forward_with_allreduce_fusion_quant_per_token(
     residual: Optional[torch.Tensor],
     weight: torch.Tensor,
 ):
-    """Fused AR + RMSNorm + per-token FP8 quant; the bf16 output carries ``_fp8_qinput``.
+    """Fused AR + RMSNorm + per-token FP8 quant.
 
-    Returns ``None`` when the fused kernel cannot service the request.
+    Returns ``((fp8, scale), residual)``, or ``None`` when the fused kernel
+    cannot service the request.
     """
     if residual is None or not _use_aiter:
         return None
@@ -416,11 +406,10 @@ def _forward_with_allreduce_fusion_quant_per_token(
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
         x, residual, weight, norm_module.variance_epsilon
     )
-    if fused_result is None or len(fused_result) != 4:
+    if fused_result is None:
         return None
-    fp8_out, residual_out, scale_out, bf16_out = fused_result
-    bf16_out._fp8_qinput = (fp8_out, scale_out)
-    return bf16_out, residual_out
+    fp8_out, residual_out, scale_out = fused_result
+    return (fp8_out, scale_out), residual_out
 
 
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
@@ -1113,13 +1102,10 @@ class GemmaRMSNorm(BaseFusedOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
-        emit_fp8_qinput: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-        # opt-in: only models whose next linear reads _fp8_qinput should pay the fp8 write
-        self.emit_fp8_qinput = emit_fp8_qinput
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1195,12 +1181,7 @@ class GemmaRMSNorm(BaseFusedOp):
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 return rocm_triton_gemma_fused_add_rmsnorm(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    emit_fp8=self.emit_fp8_qinput
-                    and x.numel() // x.shape[-1] <= _fuse_norm_fp8_max_m(),
+                    x, residual, self.weight.data, self.variance_epsilon
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 

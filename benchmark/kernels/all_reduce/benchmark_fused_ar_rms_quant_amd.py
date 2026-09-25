@@ -12,10 +12,9 @@ Qwen3.5-FP8 style models:
     3. Fully fused AR+RMSNorm+per-group-quant (1 kernel):
          tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group.
 
-``--quant-type per_token`` benchmarks the same three paths with per-token
-(rowwise) quant instead, the last one being
-tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token (which also
-writes the bf16 normed output).
+``--quant-type per_token`` benchmarks paths 1-3 with per-token (rowwise) quant
+instead, the fully fused one being
+tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token.
 
 Default shape sets cover the Qwen3.5-397B-A17B-FP8 layout:
   * hidden_size = 4096
@@ -38,6 +37,7 @@ Usage:
 
 import argparse
 import csv
+import itertools
 import os
 import statistics
 from typing import Dict, List, Optional, Tuple
@@ -276,9 +276,8 @@ def _fully_fused_per_token(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """1-kernel: fused AR+RMSNorm+per-token-quant, returning
-    ``(fp8, residual_out, scale, bf16)``."""
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """1-kernel: fused AR+RMSNorm+per-token-quant (fp8+scale only)."""
     return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
         x.clone(), residual.clone(), weight, eps
     )
@@ -320,12 +319,9 @@ def bench_shape_per_token(
             fused2_fn = g2.replay
         fused2_us = _measure_us(fused2_fn, warmup, iters, repeats, device)
 
-    # --- Fully fused, fp8+bf16 (1 kernel) ---
+    # --- Fully fused, fp8-only (1 kernel) ---
     probe1 = _fully_fused_per_token(x, residual, weight, eps)
-    # A 3-tuple means the aiter build predates the emit_bf16 per-token kernel.
-    fused1_available = (
-        probe1 is not None and isinstance(probe1, tuple) and len(probe1) == 4
-    )
+    fused1_available = probe1 is not None
     fused1_us: Optional[float] = None
     if fused1_available:
         fused1_fn = lambda: _fully_fused_per_token(x, residual, weight, eps)
@@ -338,25 +334,13 @@ def bench_shape_per_token(
         fused1_us = _measure_us(fused1_fn, warmup, iters, repeats, device)
 
     # --- Correctness ---
-    # fp8+scale vs the 2-kernel path (a [M, 1] scale is one group of hidden
-    # size), and the bf16 side-output vs the unquantized fused AR+RMSNorm output.
+    # fp8+scale vs the 2-kernel path; a [M, 1] scale is one group of hidden size.
     correctness = "N/A"
     if fused1_available and fused2_available:
         res1 = _fully_fused_per_token(x, residual, weight, eps)
         res2 = _fused_ar_rms_then_quant_per_token(x, residual, weight, eps)
-        ok_fp8, detail_fp8 = _check_quant_close(
-            res2[0], res2[2], res1[0], res1[2], x.shape[-1]
-        )
-        normed, _ = tensor_model_parallel_fused_allreduce_rmsnorm(
-            x.clone(), residual.clone(), weight, eps
-        )
-        bf16_diff = (res1[3].float() - normed.float()).abs().max().item()
-        if not ok_fp8:
-            correctness = f"FAIL_fp8({detail_fp8})"
-        elif bf16_diff > 0.1:
-            correctness = f"FAIL_bf16(diff={bf16_diff:.4f})"
-        else:
-            correctness = f"PASS(bf16_diff={bf16_diff:.3f})"
+        ok, detail = _check_quant_close(res2[0], res2[2], res1[0], res1[2], x.shape[-1])
+        correctness = "PASS" if ok else f"FAIL({detail})"
 
     return {
         "split_us": split_us,
@@ -364,7 +348,11 @@ def bench_shape_per_token(
         "fused2_us": fused2_us,
         "fused1_available": fused1_available,
         "fused1_us": fused1_us,
+        # Per-token has no bf16 side-output variant.
+        "fused1bf16_available": False,
+        "fused1bf16_us": None,
         "correctness": correctness,
+        "correctness_bf16": "N/A",
     }
 
 
@@ -578,17 +566,18 @@ def main() -> None:
     run_modes = ("eager", "graph") if args.mode == "both" else (args.mode,)
     csv_rows: List[Dict[str, object]] = []
 
-    per_group_modes = run_modes if args.quant_type != "per_token" else ()
-    per_token_modes = run_modes if args.quant_type != "per_group" else ()
+    quant_types = (
+        ("per_group", "per_token") if args.quant_type == "both" else (args.quant_type,)
+    )
 
-    for mode in per_group_modes:
+    for quant_type, mode in itertools.product(quant_types, run_modes):
         shapes = parse_shapes(
             args.prefill_shapes if mode == "eager" else args.decode_shapes
         )
         if rank == 0:
             phase = "prefill(eager)" if mode == "eager" else "decode(graph)"
             print(f"\n{'=' * 145}")
-            print(f"Mode: {phase}")
+            print(f"Mode: {phase}, quant: {quant_type}")
             print(
                 "| Shape | Bytes/rank | Split(3k) us | Fused2(2k) us | "
                 "Fused1(1k) us | Fused1+bf16(1k) us | Speedup(2k) | "
@@ -602,17 +591,29 @@ def main() -> None:
 
         for shape in shapes:
             x, residual, weight = _make_inputs(shape, dtype, args.seed, rank, device)
-            m = bench_shape(
-                x,
-                residual,
-                weight,
-                args.eps,
-                args.group_size,
-                args.warmup,
-                args.iters,
-                args.repeats,
-                mode,
-            )
+            if quant_type == "per_group":
+                m = bench_shape(
+                    x,
+                    residual,
+                    weight,
+                    args.eps,
+                    args.group_size,
+                    args.warmup,
+                    args.iters,
+                    args.repeats,
+                    mode,
+                )
+            else:
+                m = bench_shape_per_token(
+                    x,
+                    residual,
+                    weight,
+                    args.eps,
+                    args.warmup,
+                    args.iters,
+                    args.repeats,
+                    mode,
+                )
 
             split_us = _mean_across_ranks(m["split_us"], device)
             fused2_avail = _all_true_across_ranks(m["fused2_available"], device)
@@ -662,7 +663,7 @@ def main() -> None:
                 )
                 csv_rows.append(
                     {
-                        "quant": "per_group",
+                        "quant": quant_type,
                         "mode": mode,
                         "shape": f"{M}x{N}",
                         "m": M,
@@ -682,85 +683,10 @@ def main() -> None:
                     }
                 )
 
-    for mode in per_token_modes:
-        shapes = parse_shapes(
-            args.prefill_shapes if mode == "eager" else args.decode_shapes
-        )
-        if rank == 0:
-            phase = "prefill(eager)" if mode == "eager" else "decode(graph)"
-            print(f"\n{'=' * 145}")
-            print(f"Mode: {phase}, per-token quant")
-            print(
-                "| Shape | Bytes/rank | Split(3k) us | Fused2(2k) us | "
-                "Fused1+bf16(1k) us | Speedup(2k) | Speedup(1k) | "
-                "Speedup(1k vs 2k) | Corr |"
-            )
-            print(
-                "|:------|----------:|-----------:|------------:|-----------:|"
-                "-----------:|-----------:|-----------:|:---------|"
-            )
-
-        for shape in shapes:
-            x, residual, weight = _make_inputs(shape, dtype, args.seed, rank, device)
-            m = bench_shape_per_token(
-                x,
-                residual,
-                weight,
-                args.eps,
-                args.warmup,
-                args.iters,
-                args.repeats,
-                mode,
-            )
-
-            split_us = _mean_across_ranks(m["split_us"], device)
-            fused2_avail = _all_true_across_ranks(m["fused2_available"], device)
-            fused1_avail = _all_true_across_ranks(m["fused1_available"], device)
-            fused2_us = (
-                _mean_across_ranks(m["fused2_us"], device) if fused2_avail else None
-            )
-            fused1_us = (
-                _mean_across_ranks(m["fused1_us"], device) if fused1_avail else None
-            )
-
-            if rank == 0:
-                M, N = shape
-                nbytes = M * N * 2
-                f2_str = f"{fused2_us:.1f}" if fused2_us else "N/A"
-                f1_str = f"{fused1_us:.1f}" if fused1_us else "N/A"
-                s2 = f"{split_us / fused2_us:.2f}x" if fused2_us else "N/A"
-                s1 = f"{split_us / fused1_us:.2f}x" if fused1_us else "N/A"
-                s12 = (
-                    f"{fused2_us / fused1_us:.2f}x"
-                    if fused1_us and fused2_us
-                    else "N/A"
-                )
-                print(
-                    f"| {M}x{N} | {nbytes} | {split_us:.1f} | {f2_str} | "
-                    f"{f1_str} | {s2} | {s1} | {s12} | {m['correctness']} |"
-                )
-                csv_rows.append(
-                    {
-                        "quant": "per_token",
-                        "mode": mode,
-                        "shape": f"{M}x{N}",
-                        "m": M,
-                        "n": N,
-                        "bytes_per_rank": nbytes,
-                        "split_us": split_us,
-                        "fused2_us": fused2_us if fused2_us is not None else "",
-                        "fused1_us": fused1_us if fused1_us is not None else "",
-                        "fused1_available": fused1_avail,
-                        "fused2_available": fused2_avail,
-                        "correctness": m["correctness"],
-                    }
-                )
-
     if rank == 0 and args.csv_out and csv_rows:
         os.makedirs(os.path.dirname(args.csv_out) or ".", exist_ok=True)
-        fieldnames = list(dict.fromkeys(k for row in csv_rows for k in row))
         with open(args.csv_out, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+            w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
             w.writeheader()
             w.writerows(csv_rows)
         print(f"\nSaved CSV: {args.csv_out}")

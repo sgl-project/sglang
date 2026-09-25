@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_hip
 
 if not is_hip():
     pytest.skip(
@@ -79,25 +79,6 @@ def test_gemma_fused_add_rmsnorm_matches_reference(shape, dtype):
 
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not is_gfx95_supported(), reason="fp8 emission is gfx950-only")
-@pytest.mark.parametrize("m", [1, 128])
-@torch.inference_mode()
-def test_gemma_fused_add_rmsnorm_fp8_matches_per_token_quant_of_output(m):
-    """The fp8 pair must quantize the bf16-rounded output, as the unfused per_token_quant does."""
-    torch.manual_seed(0)
-    x = torch.randn(m, 6144, device=DEVICE, dtype=torch.bfloat16)
-    residual = torch.randn_like(x)
-    weight = torch.randn(6144, device=DEVICE, dtype=torch.bfloat16) * 0.1
-
-    got, _ = gemma_fused_add_rmsnorm(x, residual, weight, EPS, emit_fp8=True)
-    q8, scale = got._fp8_qinput
-    ref_scale = got.float().abs().amax(dim=-1, keepdim=True) / 448.0
-    ref_q8 = (got.float() / ref_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-
-    torch.testing.assert_close(scale, ref_scale, atol=0, rtol=1e-6)
-    torch.testing.assert_close(q8.float(), ref_q8.float(), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

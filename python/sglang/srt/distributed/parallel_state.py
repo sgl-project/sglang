@@ -930,10 +930,8 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Fused all-reduce + RMSNorm + per-token FP8 quant (ROCm/aiter).
 
-        Returns ``(fp8, residual_out, per_token_scale, bf16)`` -- the kernel
-        writes both the quantized and the pre-quantization normed output, so
-        consumers that cannot take FP8 keep a bf16 view for free. ``None`` when
-        the backend cannot service the request.
+        Returns ``(fp8, residual_out, per_token_scale)``, or ``None`` when the
+        backend cannot service the request.
         """
         if not is_hip():
             return None
@@ -956,7 +954,6 @@ class GroupCoordinator:
                 weight_,
                 eps,
                 use_1stage_ar,
-                emit_bf16=True,
             )
         except Exception:
             return None

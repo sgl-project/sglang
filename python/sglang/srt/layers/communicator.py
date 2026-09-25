@@ -859,8 +859,8 @@ class LayerCommunicator:
                     "forward_with_allreduce_fusion_quant_per_token",
                 )
             ):
-                # The bf16 output carries (fp8, scale) as _fp8_qinput for the ptpc
-                # decode GEMM; None means the fused kernel cannot service the shape.
+                # (fp8, per-token scale) for the ptpc decode GEMM; None means the
+                # fused kernel cannot service the shape.
                 quant_result = (
                     self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
                         hidden_states, residual
