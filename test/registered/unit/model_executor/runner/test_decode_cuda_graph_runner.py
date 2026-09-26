@@ -28,6 +28,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -244,6 +246,55 @@ class TestOriginalTraceExport(CustomTestCase):
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
                 )
+
+
+class TestRaggedReplayLayout(CustomTestCase):
+    def test_low_budget_preserves_request_capacity_and_refreshes_all_offsets(self):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = 6
+        runner.capture_num_tokens = [6, 12, 24, 48]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        with mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        ):
+            # Eight requests fit a 12-token graph; reserving six tokens per
+            # request would incorrectly reject this useful compact bucket.
+            self.assertEqual(runner._ragged_capture_slots(12), 8)
+            captured = runner._capture_ragged_verify_layout(12)
+        pointers = [
+            t.data_ptr()
+            for t in (
+                captured.verify_lens,
+                captured.qo_indptr_device,
+                captured.extend_start_loc,
+            )
+        ]
+        for lens in ([1] * 8, [6, 1], [2, 1, 0, 0, 1, 2, 0, 0]):
+            live = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=torch.tensor(lens, dtype=torch.int32), graph_num_tokens=12
+            )
+            expected = live.padded_to_bucket(padded_bs=8, cap=6)
+            runner._stage_ragged_verify_layout(live, 12)
+            for got, want, ptr in zip(
+                (
+                    captured.verify_lens,
+                    captured.qo_indptr_device,
+                    captured.extend_start_loc,
+                ),
+                (
+                    expected.verify_lens,
+                    expected.qo_indptr_device,
+                    expected.extend_start_loc,
+                ),
+                pointers,
+            ):
+                torch.testing.assert_close(got, want)
+                self.assertEqual(got.data_ptr(), ptr)
 
 
 if __name__ == "__main__":
