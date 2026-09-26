@@ -8,7 +8,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -223,34 +222,34 @@ def create_kimi_k3_kda_decode_fb_kernel(
                             T.vec(_PROJECTION_VECTOR, T.bf16)
                         )
                         for pair_index in range_constexpr(_PROJECTION_VECTOR // 2):
-                            f_a_pair = vector.from_elements(
+                            f_a_pair = mlir_vector.from_elements(
                                 vec2_bf16,
                                 [
-                                    vector.extract(
-                                        f_a_bf16,
+                                    mlir_vector.ExtractOp(
+                                        _to_raw(f_a_bf16),
                                         static_position=[pair_index * 2],
                                         dynamic_position=[],
-                                    ),
-                                    vector.extract(
-                                        f_a_bf16,
+                                    ).result,
+                                    mlir_vector.ExtractOp(
+                                        _to_raw(f_a_bf16),
                                         static_position=[pair_index * 2 + 1],
                                         dynamic_position=[],
-                                    ),
+                                    ).result,
                                 ],
                             )
-                            weight_pair = vector.from_elements(
+                            weight_pair = mlir_vector.from_elements(
                                 vec2_bf16,
                                 [
-                                    vector.extract(
-                                        weight_bf16,
+                                    mlir_vector.ExtractOp(
+                                        _to_raw(weight_bf16),
                                         static_position=[pair_index * 2],
                                         dynamic_position=[],
-                                    ),
-                                    vector.extract(
-                                        weight_bf16,
+                                    ).result,
+                                    mlir_vector.ExtractOp(
+                                        _to_raw(weight_bf16),
                                         static_position=[pair_index * 2 + 1],
                                         dynamic_position=[],
-                                    ),
+                                    ).result,
                                 ],
                             )
                             local_dot = ArithValue(
@@ -278,7 +277,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                 else:
                     projected = mlir_vector.ReductionOp(
                         T.f32,
-                        vector.CombiningKind.ADD,
+                        mlir_vector.CombiningKind.ADD,
                         accum,
                     ).dest
                 fx.ptr_store(
@@ -397,7 +396,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                     sum_q_partial
                     + mlir_vector.ReductionOp(
                         T.f32,
-                        vector.CombiningKind.ADD,
+                        mlir_vector.CombiningKind.ADD,
                         sum_q_vec,
                     ).dest
                 )
@@ -405,7 +404,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                     sum_k_partial
                     + mlir_vector.ReductionOp(
                         T.f32,
-                        vector.CombiningKind.ADD,
+                        mlir_vector.CombiningKind.ADD,
                         sum_k_vec,
                     ).dest
                 )
@@ -478,7 +477,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                 ).result
             dot_kq = mlir_vector.ReductionOp(
                 T.f32,
-                vector.CombiningKind.ADD,
+                mlir_vector.CombiningKind.ADD,
                 dot_kq_vec,
             ).dest
             for offset in (1, 2, 4):
@@ -520,12 +519,12 @@ def create_kimi_k3_kda_decode_fb_kernel(
 
                 sum_hk = mlir_vector.ReductionOp(
                     T.f32,
-                    vector.CombiningKind.ADD,
+                    mlir_vector.CombiningKind.ADD,
                     sum_hk_vec,
                 ).dest
                 sum_hq = mlir_vector.ReductionOp(
                     T.f32,
-                    vector.CombiningKind.ADD,
+                    mlir_vector.CombiningKind.ADD,
                     sum_hq_vec,
                 ).dest
                 for offset in (1, 2, 4):
