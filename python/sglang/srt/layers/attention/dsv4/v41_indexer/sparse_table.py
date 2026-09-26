@@ -231,6 +231,9 @@ class SparseTableBackend:
                 data.q_fp4.dtype,
                 self._get_request_ids(inputs, data.q_fp4.shape[0], blocks.device),
             )
+            # consume_decode reads these on the main stream
+            for t in (blocks, schedule, phys_blocks, row_valid_lens):
+                t.record_stream(main_stream)
             ready = torch.cuda.Event()
             ready.record(self.alt_stream)
             return _SparseTable(
