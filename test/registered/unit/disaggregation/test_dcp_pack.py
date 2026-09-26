@@ -271,7 +271,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     scheduler, req, last_chunk=True
                 )
                 calls = mgr.add_transfer_request.call_args_list
-                token_counts = [c.args[7] for c in calls]
+                token_counts = [c.kwargs["num_kv_tokens"] for c in calls]
                 if peer == "dcp":
                     self.assertLessEqual(max(token_counts), limit)
                 else:
@@ -291,8 +291,10 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.assertEqual(
                     [c.args[3] for c in calls], [False] * (len(calls) - 1) + [True]
                 )
-                self.assertTrue(all(c.args[6] is None for c in calls[:-1]))
-                self.assertEqual(int(calls[-1].args[6][0][0]), 17)
+                self.assertTrue(
+                    all(c.kwargs["state_indices"] is None for c in calls[:-1])
+                )
+                self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):
