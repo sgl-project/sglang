@@ -13,9 +13,9 @@ scores zero. Measured in one job that ran three 64-question evals back to back
 on the same server image (run 36119287477, 2026-09-26): Triton MoE with the
 default fused sgl-kernel top-k scored 0/64 at 2048+ tokens per sequence,
 Triton MoE with #36607's portable Torch top-k also scored 0/64 at 2048+ tokens
-per sequence, and the AITER MoE runner scored 63/64 = 0.984 at 151 tokens per
-sequence. The DSA top-k backend makes no difference, so the fault is the Triton
-MoE runner itself, and the cookbook's MI300X MoE recommendation is stale.
+per sequence, and the AITER MoE runner scored 63/64 at 151 tokens per sequence.
+The DSA top-k backend makes no difference, so the fault is the Triton MoE
+runner itself, and the cookbook's MI300X MoE recommendation is stale.
 
 gfx942 is not redundant with gfx950 for this model. It runs the generic mHC
 path, since AITER mHC is gfx95-only, and nothing else gives that path nightly
@@ -24,16 +24,20 @@ coverage for this model. That path reaches gfx942 only with the HIP guard in
 the fused mHC post/pre kernel and decode graph capture dies with "Unresolved
 call Op(tl.get_lane_idx)" (run 36092686822).
 
+Measured on current main: 0.9750 (1286/1319) on the rocm10 image, with a
+2769 s weight load, a 1391 s eval and 4419 s of wall clock (run 36232707853).
+That is bit-identical to the gfx950 score in test_glm53_flash_eval_mi35x.py,
+which is the strongest evidence available that the two arches run the same
+model. It requires both HIP fixes in #41136.
+
 Threshold: 0.92 follows this repo's `measured - 0.05` convention for sgl-eval
 gsm8k thresholds and matches the gfx950 gate, so the two arches stay directly
-comparable. The 0.984 above is a 64-question sample; gfx950 scored 0.9750
-(1286/1319) on the full split with the same eval.
+comparable.
 
-Runtime: the 328 GB checkpoint has taken 3606-4143 s to load from this pool's
-shared cache, and a full-split eval at the AITER MoE throughput measured above
-adds roughly 900 s. The workflow allows 18000 s. If that ever proves tight,
-prefer raising it over trimming the eval: a full-split score is what makes this
-arch's number comparable to the gfx950 one.
+Runtime: the 328 GB checkpoint has taken 2769-4143 s to load from this pool's
+shared cache, on top of the eval above. The workflow allows 18000 s. If that
+ever proves tight, prefer raising it over trimming the eval: a full-split score
+is what makes this arch's number comparable to the gfx950 one.
 
 Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
 scorer, because GLM-5.3-Flash thinks by default and the completion scorer reads
