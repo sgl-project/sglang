@@ -141,11 +141,19 @@ inline bool try_copy_page_first_pages_batch(
     if (tensor_id == 0) {
       first_page_bytes = src_page_bytes;
     }
+    // cudaMemcpyBatchAsync takes pointer-to-pointer copies, so every entry must be
+    // an address the device can use. Registered host memory can live at a device
+    // address different from its host VA (ROCm, and any CUDA platform reporting
+    // cudaDevAttrCanUseHostPointerForRegisteredMem == 0 — for example WSL2's
+    // GPU-PV memory model), and the destination here is the registered host pool.
+    // The per-page fallback below does not need this because cudaMemcpyAsync
+    // translates host pointers itself.
+    char* dst_base = static_cast<char*>(host::runtime::try_get_device_accessible_ptr(dst_ptrs[tensor_id]));
     for (const auto page_offset : host::irange(num_pages)) {
       char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
-      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
+      char* dst_ptr =
+          dst_base + static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
       batch_srcs.push_back(src_ptr);
       batch_dsts.push_back(dst_ptr);
       batch_sizes.push_back(src_page_bytes);
