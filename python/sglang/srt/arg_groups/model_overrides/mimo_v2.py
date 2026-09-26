@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    model_config_of,
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
@@ -31,4 +32,16 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         overrides["moe_runner_backend"] = "flashinfer_trtllm"
         logger.info("MiMoV2 FP8 on SM100: moe_runner_backend=flashinfer_trtllm.")
+
+    if (
+        get_platform().is_sm120
+        and cfg.device == "cuda"
+        and cfg.moe_runner_backend == "auto"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        model_config = model_config_of(server_args)
+        if model_config.quantization == "fp8" and model_config.is_fp4_experts:
+            # The default FP8 Triton runner cannot consume packed MXFP4 experts.
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+            logger.info("MiMoV2 MXFP4 on SM120: moe_runner_backend=flashinfer_mxfp4.")
     return overrides
