@@ -25,6 +25,12 @@ use crate::utils::{error::Error, fsm::Event};
 pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<TokenIds, Error>;
 
+    /// The configured BOS, which need not be auto-added by `encode`.
+    /// Only continuation encoding needs it; tokenizers without a BOS return None.
+    fn bos_token_id(&self) -> Result<Option<i32>, Error> {
+        Ok(None)
+    }
+
     /// The special tokens this tokenizer auto-prepends on every `encode` —
     /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
     /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
@@ -108,15 +114,70 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
     inner: dynamo_tokenizers::Tokenizer,
+    bos_token_id: Result<Option<i32>, Error>,
 }
 
 impl DynamoTokenizer {
-    pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
-        Self { inner }
+    pub fn new(inner: dynamo_tokenizers::Tokenizer, config_file: Option<&str>) -> Self {
+        // Keep a resolution error local to continuations: ordinary text
+        // requests do not need BOS metadata and retain their existing behavior.
+        let bos_token_id = resolve_bos_token_id(&inner, config_file);
+        Self {
+            inner,
+            bos_token_id,
+        }
     }
 }
 
+fn resolve_bos_token_id(
+    tokenizer: &dynamo_tokenizers::Tokenizer,
+    config_file: Option<&str>,
+) -> Result<Option<i32>, Error> {
+    let Some(config_file) = config_file else {
+        return Ok(None);
+    };
+    let error = |message| Error::Tokenize(format!("cannot resolve continuation BOS: {message}"));
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_file).map_err(|e| error(e.to_string()))?)
+            .map_err(|e| error(e.to_string()))?;
+    let Some(value) = config.get("bos_token").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let bos = value
+        .as_str()
+        .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| error("bos_token must be a string or token object".into()))?;
+    // Dynamo exposes encoding but not token_to_id. A configured special token
+    // contributes exactly one ID between the same post-processor specials as
+    // encode(""). Verify that insertion and its decoded content; never infer BOS
+    // from the first auto-added token, which may instead be EOS.
+    let encoded = tokenizer.encode(bos).map_err(|e| error(e.to_string()))?;
+    let empty = tokenizer.encode("").map_err(|e| error(e.to_string()))?;
+    let ids = encoded.token_ids();
+    let specials = empty.token_ids();
+    let prefix_len = ids.iter().zip(specials).take_while(|(a, b)| a == b).count();
+    if ids.len() != specials.len() + 1 || ids[prefix_len + 1..] != specials[prefix_len..] {
+        return Err(error(
+            "configured bos_token does not encode as one special token".into(),
+        ));
+    }
+    let id = ids[prefix_len];
+    let decoded = tokenizer
+        .decode(&[id], false)
+        .map_err(|e| error(e.to_string()))?;
+    if decoded.as_str() != bos {
+        return Err(error(
+            "configured bos_token does not resolve to its declared content".into(),
+        ));
+    }
+    Ok(Some(id as i32))
+}
+
 impl TextTokenizer for DynamoTokenizer {
+    fn bos_token_id(&self) -> Result<Option<i32>, Error> {
+        self.bos_token_id.clone()
+    }
+
     fn encode(&self, text: &str) -> Result<TokenIds, Error> {
         if text.is_empty() {
             // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
@@ -148,6 +209,16 @@ impl TextTokenizer for DynamoTokenizer {
 fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
     if ids.starts_with(auto_specials) {
         ids.drain(..auto_specials.len());
+    }
+    ids
+}
+
+/// Python appends a continuation prefix from a fresh tokenizer encode and
+/// removes only its configured leading BOS. An automatically appended EOS and
+/// explicit later BOS tokens remain observable.
+fn strip_bos(mut ids: Vec<i32>, bos_token_id: Option<i32>) -> Vec<i32> {
+    if bos_token_id.is_some_and(|bos| ids.first() == Some(&bos)) {
+        ids.remove(0);
     }
     ids
 }
@@ -206,13 +277,23 @@ impl Runnable for TokenizerWorker {
                 if let Some(n) = stop_tokens {
                     g.sampling_params.stop_str_max_len = n;
                 }
-                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
+                match self
+                    .tokenizer
+                    .encode(g.text.as_deref().unwrap_or(""))
+                    .and_then(|mut ids| {
+                        if g.skip_special_tokens {
+                            ids = strip_auto_specials(ids, &self.auto_specials);
+                        }
+                        if let Some(prefix) = g.append_text.as_deref() {
+                            ids.extend(strip_bos(
+                                self.tokenizer.encode(prefix)?,
+                                self.tokenizer.bos_token_id()?,
+                            ));
+                        }
+                        Ok(ids)
+                    }) {
                     Ok(ids) => {
-                        g.input_ids = Some(if g.skip_special_tokens {
-                            strip_auto_specials(ids, &self.auto_specials)
-                        } else {
-                            ids
-                        });
+                        g.input_ids = Some(ids);
                         Event::TokenizeDone
                     }
                     Err(err) => Event::Error(err),
@@ -304,10 +385,22 @@ mod tests {
         assert_eq!(strip_auto_specials(vec![0], &[0, 9]), vec![0]);
     }
 
+    #[test]
+    fn strip_bos_keeps_other_specials() {
+        assert_eq!(strip_bos(vec![0, 9, 1], Some(0)), vec![9, 1]);
+        assert_eq!(strip_bos(vec![0, 0, 1, 9], Some(0)), vec![0, 1, 9]);
+        assert_eq!(strip_bos(vec![1], Some(0)), vec![1]);
+        assert_eq!(strip_bos(vec![9, 1], None), vec![9, 1]);
+    }
+
     /// Word tokens plus a prepended BOS marker (id 0) — like an HF tokenizer
     /// whose post-processor adds specials.
     struct MarkedTokenizer;
     impl TextTokenizer for MarkedTokenizer {
+        fn bos_token_id(&self) -> Result<Option<i32>, Error> {
+            Ok(Some(0))
+        }
+
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
             Ok(vec![0, text.len() as i32])
         }
@@ -349,5 +442,241 @@ mod tests {
         };
         assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+    }
+
+    #[test]
+    fn tokenizing_appends_a_continuation_prefix_once_without_bos() {
+        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        req_tx
+            .send(Request {
+                rid: "1".into(),
+                state: RequestState::Tokenizing,
+                sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
+                kind: RequestKind::Generate(Box::new(GenerateRequest {
+                    rid: "1".into(),
+                    text: Some("prompt".into()),
+                    append_text: Some("prefix".into()),
+                    skip_special_tokens: true,
+                    ..Default::default()
+                })),
+            })
+            .expect("send");
+        drop(req_tx);
+        TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+        let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Tokenized");
+        };
+        let RequestKind::Generate(g) = &req.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(g.input_ids, Some(vec![6, 6]));
+    }
+
+    fn tokenize_continuation(tokenizer: Arc<dyn TextTokenizer>) -> Request {
+        let (req_tx, req_rx) = flume::unbounded();
+        let (tm_tx, tm_rx) = flume::unbounded();
+        req_tx
+            .send(Request {
+                rid: "continuation".into(),
+                state: RequestState::Tokenizing,
+                sink: ResponseSink::Local(mpsc::channel(4).0),
+                kind: RequestKind::Generate(Box::new(GenerateRequest {
+                    text: Some("prompt".into()),
+                    append_text: Some("prefix".into()),
+                    skip_special_tokens: true,
+                    ..Default::default()
+                })),
+            })
+            .unwrap();
+        drop(req_tx);
+        TokenizerWorker::new(req_rx, tm_tx, tokenizer).run();
+        let TmEvent::Tokenized(request) = tm_rx.try_recv().unwrap() else {
+            panic!("expected Tokenized");
+        };
+        assert!(tm_rx.try_recv().is_err(), "one submission returns once");
+        request
+    }
+
+    struct EosOnlyTokenizer;
+
+    impl TextTokenizer for EosOnlyTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            // The prefix starts with an explicit EOS, and every encode adds
+            // a trailing EOS. An empty encode therefore yields EOS, not BOS.
+            Ok(if text == "prefix" {
+                vec![9, 2, 9]
+            } else {
+                vec![1, 9]
+            })
+        }
+
+        fn auto_specials(&self) -> Vec<i32> {
+            vec![9]
+        }
+    }
+
+    #[test]
+    fn continuation_preserves_eos_when_tokenizer_has_no_bos() {
+        let request = tokenize_continuation(Arc::new(EosOnlyTokenizer));
+        assert!(matches!(request.state, RequestState::PreSendValidating));
+        let RequestKind::Generate(g) = request.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(g.input_ids, Some(vec![1, 9, 9, 2, 9]));
+    }
+
+    struct ExplicitBosTokenizer;
+
+    impl TextTokenizer for ExplicitBosTokenizer {
+        fn bos_token_id(&self) -> Result<Option<i32>, Error> {
+            Ok(Some(0))
+        }
+
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            Ok(if text == "prefix" {
+                vec![0, 2, 0, 9]
+            } else {
+                vec![1]
+            })
+        }
+    }
+
+    #[test]
+    fn continuation_strips_only_the_leading_bos_even_when_not_auto_added() {
+        let request = tokenize_continuation(Arc::new(ExplicitBosTokenizer));
+        assert!(matches!(request.state, RequestState::PreSendValidating));
+        let RequestKind::Generate(g) = request.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(g.input_ids, Some(vec![1, 2, 0, 9]));
+    }
+
+    struct FailingPrefixTokenizer;
+
+    impl TextTokenizer for FailingPrefixTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            if text == "prefix" {
+                Err(Error::Tokenize("invalid prefix".into()))
+            } else {
+                Ok(vec![1])
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_encode_error_does_not_return_partial_prompt_ids() {
+        let request = tokenize_continuation(Arc::new(FailingPrefixTokenizer));
+        assert!(matches!(
+            request.state,
+            RequestState::Failed(Error::Tokenize(ref message)) if message == "invalid prefix"
+        ));
+        let RequestKind::Generate(g) = request.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(g.input_ids, None);
+    }
+
+    fn real_tokenizer(auto_bos: bool, auto_eos: bool, bos: serde_json::Value) -> DynamoTokenizer {
+        use serde_json::json;
+
+        let mut single = Vec::new();
+        if auto_bos {
+            single.push(json!({"SpecialToken": {"id": "<bos>", "type_id": 0}}));
+        }
+        single.push(json!({"Sequence": {"id": "A", "type_id": 0}}));
+        let mut pair = single.clone();
+        pair.push(json!({"Sequence": {"id": "B", "type_id": 0}}));
+        if auto_eos {
+            let eos = json!({"SpecialToken": {"id": "<eos>", "type_id": 0}});
+            single.push(eos.clone());
+            pair.push(eos);
+        }
+        let tokenizer_json = json!({
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 3, "content": "<bos>", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false},
+                {"id": 4, "content": "<eos>", "special": true, "single_word": false,
+                 "lstrip": false, "rstrip": false, "normalized": false}
+            ],
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": {
+                "type": "TemplateProcessing", "single": single, "pair": pair,
+                "special_tokens": {
+                    "<bos>": {"id": "<bos>", "ids": [3], "tokens": ["<bos>"]},
+                    "<eos>": {"id": "<eos>", "ids": [4], "tokens": ["<eos>"]}
+                }
+            },
+            "model": {"type": "WordLevel", "unk_token": "<unk>",
+                "vocab": {"<unk>": 0, "prompt": 1, "prefix": 2, "<bos>": 3, "<eos>": 4}}
+        });
+        let dir =
+            std::env::temp_dir().join(format!("sglang-continuation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), tokenizer_json.to_string()).unwrap();
+        let config = dir.join("tokenizer_config.json");
+        std::fs::write(&config, json!({"bos_token": bos}).to_string()).unwrap();
+        let inner = load_tokenizer(dir.to_str(), None, false).unwrap().unwrap();
+        let tokenizer = DynamoTokenizer::new(inner, config.to_str());
+        std::fs::remove_dir_all(dir).unwrap();
+        tokenizer
+    }
+
+    #[test]
+    fn continuation_bos_resolution_uses_configured_token_with_any_postprocessor() {
+        for (auto_bos, auto_eos, bos) in [
+            (true, true, serde_json::json!("<bos>")),
+            (false, true, serde_json::json!({"content": "<bos>"})),
+            (false, false, serde_json::json!("<bos>")),
+        ] {
+            let tokenizer = real_tokenizer(auto_bos, auto_eos, bos);
+            let bos_id = tokenizer.bos_token_id().unwrap();
+            assert_eq!(bos_id, Some(3));
+            let mut expected = vec![2];
+            if auto_eos {
+                expected.push(4);
+            }
+            assert_eq!(
+                strip_bos(tokenizer.encode("prefix").unwrap(), bos_id),
+                expected
+            );
+            if auto_bos {
+                expected.insert(0, 3);
+            }
+            assert_eq!(
+                strip_bos(tokenizer.encode("<bos>prefix").unwrap(), bos_id),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_real_tokenizer_without_bos_preserves_leading_eos() {
+        let tokenizer = real_tokenizer(false, true, serde_json::Value::Null);
+        assert_eq!(tokenizer.bos_token_id().unwrap(), None);
+        assert_eq!(
+            strip_bos(
+                tokenizer.encode("<eos>prefix").unwrap(),
+                tokenizer.bos_token_id().unwrap()
+            ),
+            vec![4, 2, 4]
+        );
+    }
+
+    #[test]
+    fn continuation_unresolvable_bos_errors_without_disabling_ordinary_encoding() {
+        let tokenizer = real_tokenizer(false, true, serde_json::json!("<missing>"));
+        assert!(tokenizer.bos_token_id().is_err());
+        assert_eq!(tokenizer.encode("prompt").unwrap(), vec![1, 4]);
+        let request = tokenize_continuation(Arc::new(tokenizer));
+        assert!(matches!(
+            request.state,
+            RequestState::Failed(Error::Tokenize(_))
+        ));
+        let RequestKind::Generate(g) = request.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(g.input_ids, None);
     }
 }

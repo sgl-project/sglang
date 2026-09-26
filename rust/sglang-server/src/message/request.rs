@@ -539,6 +539,7 @@ impl GenerateBody {
             )| GenerateRequest {
                 rid,
                 text,
+                append_text: None,
                 input_ids,
                 // Plain text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
@@ -735,6 +736,10 @@ pub struct GenerateRequest {
     /// detok sink, which is now unrepresentable.
     pub rid: Rid,
     pub text: Option<String>,
+    /// Endpoint-local text that must be tokenized separately and appended to
+    /// the rendered prompt ids. This stays in-process and never reaches the
+    /// scheduler wire, preserving token boundaries for chat continuation.
+    pub append_text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
     /// Template-rendered prompts (chat) already contain their role/special
