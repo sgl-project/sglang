@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 
 import pytest
 import torch
@@ -93,3 +94,7 @@ def test_begin_is_rejected_by_cpp():
     begin = torch.zeros(1, dtype=torch.int32, device=input.device)
     with pytest.raises(RuntimeError, match="`begin` is not supported"):
         topk(input, 8, begin=begin)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
