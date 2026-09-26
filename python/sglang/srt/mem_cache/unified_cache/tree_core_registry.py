@@ -1,9 +1,9 @@
 """Registry for pluggable TreeCore implementations.
 
 The unified cache constructs its TreeCore through `create_tree_core`, selected
-by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "rust"). Rust selections use
-centralized compatibility fallbacks. To plug in a custom implementation, register it via
-`register_tree_core_backend(name, factory)`.
+by its per-cache override or SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default
+"rust"). Rust selections use centralized compatibility fallbacks. To plug in a
+custom implementation, register it via `register_tree_core_backend(name, factory)`.
 """
 
 from __future__ import annotations
@@ -122,10 +122,13 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
 
 
 def select_tree_core_backend(params: CacheInitParams) -> str:
-    """Resolve the configured TreeCore backend using the shared fallback policy."""
-    return resolve_tree_core_backend(
-        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), params
+    """Resolve the instance override or default through the shared fallback policy."""
+    name = (
+        params.tree_core_backend
+        if params.tree_core_backend is not None
+        else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
     )
+    return resolve_tree_core_backend(name, params)
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:

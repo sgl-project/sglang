@@ -18,9 +18,9 @@ Python in these cases:
 
 This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
-The adapter converts unexpected native panics into `RuntimeError` so Python's
-crash handlers can report them and coordinate shutdown. The original panic is
-preserved as the exception cause; a poisoned core remains unusable.
+The Rust bindings report unexpected native panics as `RuntimeError` so Python's
+crash handlers can report them and coordinate shutdown. A panic during a core
+operation poisons its mutex, and subsequent calls refuse to reuse that state.
 
 T-LRU supports integer and floating-point `threshold` and `next_prompt_estimate`
 parameters. Integer configurations retain exact arithmetic; floating-point

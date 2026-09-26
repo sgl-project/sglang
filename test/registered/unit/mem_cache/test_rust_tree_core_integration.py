@@ -130,10 +130,14 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_indices.numel() == 0
 
 
-def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch):
+@pytest.mark.parametrize("instance_backend", [None, "rust"])
+def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_backend):
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    monkeypatch.delenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", raising=False)
+    if instance_backend is None:
+        monkeypatch.delenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,
@@ -141,6 +145,7 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch):
             token_to_kv_pool_allocator=None,
             page_size=1,
             tree_components=(ComponentType.FULL,),
+            tree_core_backend=instance_backend,
         )
     )
     assert cache._tree_core_backend == "rust"
@@ -1124,16 +1129,13 @@ def test_poisoned_binding_refuses_to_reuse_the_core():
 
     # Reading a backup spec from the value-less root deliberately trips a native
     # invariant while the binding owns the mutex.
-    with pytest.raises(BaseException) as initial_panic:
+    with pytest.raises(RuntimeError, match="Rust TreeCore panicked"):
         binding.build_backup_spec(root)
-    assert initial_panic.type.__name__ == "PanicException"
 
-    # The guard must fail closed instead of handing potentially partial state to
-    # the next operation through PoisonError::into_inner().
-    with pytest.raises(BaseException) as poisoned:
+    # The binding must fail closed instead of handing potentially partial state
+    # to the next operation through PoisonError::into_inner().
+    with pytest.raises(RuntimeError, match="Rust TreeCore mutex poisoned"):
         binding.root_node_handle()
-    assert poisoned.type.__name__ == "PanicException"
-    assert "Rust TreeCore mutex poisoned" in str(poisoned.value)
 
 
 def test_extra_key_isolates_namespaces():
@@ -1448,7 +1450,7 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
         params.component_host_lock_uuids.clear()
         with pytest.raises(RuntimeError, match="no entry found for key") as error:
             core.dec_host_lock_ref(leaf, params)
-        assert type(error.value.__cause__).__name__ == "PanicException"
+        assert error.value.__cause__ is None
         return  # A Rust ownership violation poisons the core.
     core.dec_host_lock_ref(leaf, params)
     if swa:
@@ -4032,7 +4034,7 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():
     core = _mamba_tree_core(is_eagle=True)
     assert core.is_eagle is False
-    assert type(core._binding._inner) is mem_cache.RustUnifiedTreeCoreBinding
+    assert type(core._binding) is mem_cache.RustUnifiedTreeCoreBinding
 
 
 def test_mamba_prefetch_commit_round_trips_through_the_adapter():
@@ -4288,13 +4290,102 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
             missing.skipped_lock_components = (ComponentType.SWA,)
         with pytest.raises(RuntimeError, match="no entry found for key") as error:
             release(leaf, missing)
-        assert type(error.value.__cause__).__name__ == "PanicException"
+        assert error.value.__cause__ is None
         return  # A Rust ownership violation poisons the core.
     release(leaf, result.to_dec_params())
     assert core.swa_protected_size() == 0
     if swa_only:
         core.dec_lock_ref(leaf, DecLockRefParams(node_id=leaf), skip_swa=True)
     core.sanity_check([], [])
+
+
+def _window_lock_api_case(backend, mamba=True):
+    cache, allocator = (
+        _swa_mamba_cache(backend, window=2)
+        if mamba
+        else _swa_cache(window=2, backend=backend)
+    )
+    assert cache._tree_core_backend == backend
+    node = cache.insert(
+        InsertParams(
+            key=_key([1, 2, 3]),
+            value=allocator.alloc(3),
+            mamba_value=torch.tensor([201]) if mamba else None,
+        )
+    ).last_device_node
+    return cache.tree_core, node
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("mamba", [False, True])
+def test_component_window_release_preserves_other_locks(backend, mamba):
+    core, node = _window_lock_api_case(backend, mamba)
+    components = (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+    assert [core.component_protected_size(ct) for ct in components] == [0, 0, 0]
+    receipt = core.inc_lock_ref(node).to_dec_params()
+    assert [core.component_protected_size(ct) for ct in components] == [
+        3,
+        2,
+        int(mamba),
+    ]
+
+    result = core.dec_window_lock_only(node, ComponentType.SWA, receipt)
+
+    assert not result.device_frees and not result.host_frees
+    assert [core.component_protected_size(ct) for ct in components] == [
+        3,
+        0,
+        int(mamba),
+    ]
+    assert core.get_component_device_value(node, ComponentType.SWA) is not None
+    # Only this component was released; the final receipt still releases Mamba.
+    receipt.skipped_lock_components = (ComponentType.SWA,)
+    core.dec_lock_ref(node, receipt)
+    assert [core.component_protected_size(ct) for ct in components] == [0, 0, 0]
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("noop", ["root", "skipped"])
+def test_component_window_release_noop_needs_no_uuid(backend, noop):
+    core, node = _window_lock_api_case(backend)
+    skipped = (ComponentType.SWA,) if noop == "skipped" else ()
+    receipt = core.inc_lock_ref(node, skip_lock_components=skipped).to_dec_params()
+    protected = [
+        core.component_protected_size(ct)
+        for ct in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+    ]
+    if noop == "root":
+        target = core.root_node_handle()
+        release = DecLockRefParams(node_id=target)
+    else:
+        target, release = node, receipt
+    assert ComponentType.SWA not in release.component_lock_uuids
+
+    result = core.dec_window_lock_only(target, ComponentType.SWA, release)
+
+    assert not result.device_frees and not result.host_frees
+    assert [
+        core.component_protected_size(ct)
+        for ct in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+    ] == protected
+    core.dec_lock_ref(node, receipt)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("skipped", [False, True])
+def test_component_window_release_checks_anchor_before_noop(backend, skipped):
+    core, node = _window_lock_api_case(backend)
+    receipt = core.inc_lock_ref(
+        node, skip_lock_components=(ComponentType.SWA,) if skipped else ()
+    ).to_dec_params()
+    error = AssertionError if backend == "python" else RuntimeError
+    with pytest.raises(error, match="lock receipt anchored"):
+        core.dec_window_lock_only(core.root_node_handle(), ComponentType.SWA, receipt)
+    if backend == "python":
+        core.dec_lock_ref(node, receipt)
+        core.sanity_check([], [])
 
 
 def test_dec_swa_lock_only_frees_flow_after_the_full_release():

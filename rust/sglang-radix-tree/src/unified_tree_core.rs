@@ -1015,6 +1015,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(DecLockRefResult::default())
     }
 
+    /// Release one window's lock without releasing other components.
+    pub fn dec_window_lock_only(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: &DecLockRefParams,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+    ) -> Result<(), NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        self.assert_receipt_anchor_(node_idx, params);
+        if self.arena.node(node_idx).is_root()
+            || params.skipped_lock_components.contains(component_type)
+        {
+            return Ok(());
+        }
+        self.component_by_type_(component_type).release_window_lock(
+            self,
+            node_idx,
+            params,
+            device_frees,
+            host_frees,
+        );
+        Ok(())
+    }
+
     /// Early-release the SWA portion of a request's tree lock, plus any
     /// strictly-lower-priority locks (e.g. Mamba) co-located on the node.
     pub fn dec_swa_lock_only(

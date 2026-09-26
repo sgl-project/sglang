@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import sys
 from array import array
-from functools import wraps
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -72,37 +71,6 @@ if TYPE_CHECKING:
         ComponentAction,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
-
-
-class _PanicGuard:
-    """Let Python crash handlers catch native panics without recovering the core."""
-
-    def __init__(self, binding_class, panic_exception, *args, **kwargs):
-        self._panic_exception = panic_exception
-        try:
-            self._inner = binding_class(*args, **kwargs)
-        except panic_exception as exc:
-            raise RuntimeError(f"Rust TreeCore panicked: {exc}") from exc
-
-    def __getattr__(self, name):
-        value = getattr(self._inner, name)
-        if not callable(value):
-            return value
-        panic_exception = self._panic_exception
-
-        @wraps(value)
-        def guarded(*args, **kwargs):
-            try:
-                return value(*args, **kwargs)
-            except panic_exception as exc:
-                raise RuntimeError(f"Rust TreeCore panicked: {exc}") from exc
-
-        # Native methods are stable; avoid rebuilding wrappers on every call.
-        setattr(self, name, guarded)
-        return guarded
-
-    def __dir__(self):
-        return sorted(set(self.__dict__) | set(dir(self._inner)))
 
 
 def _tlru_float_config(native_bindings, threshold, next_prompt_estimate):
@@ -425,9 +393,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
 
-        self._binding = _PanicGuard(
-            self._binding_class(),
-            self._bindings.PanicException,
+        self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
                 eviction_policy=params.eviction_policy,
                 slru_protected_threshold=getattr(
@@ -540,6 +506,24 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return DecLockRefResult()
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        result = DecSwaLockOnlyResult()
+        new_device_frees, new_host_frees = self._binding.dec_window_lock_only(
+            node_id,
+            int(component_type),
+            _dec_lock_ref_params_to_binding(self._bindings, params),
+        )
+        for component, tensors in new_device_frees.items():
+            result.device_frees[ComponentType(component)].extend(tensors)
+        for component, tensors in new_host_frees.items():
+            result.host_frees[ComponentType(component)].extend(tensors)
+        return result
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -638,6 +622,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def component_evictable_size(self, component_type: ComponentType) -> int:
         return self._binding.component_evictable_size(int(component_type))
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        return self._binding.component_protected_size(int(component_type))
 
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()
@@ -971,9 +958,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 # SWA may have holes between resident nodes, or reload while
                 # FULL stays resident. Preserve the SWA transfer's node order.
                 transfer.anchor_index_parts = [
-                    full_load_slices[nid]
-                    if nid in full_load_slices
-                    else self.get_component_device_value(nid, ComponentType.FULL)
+                    (
+                        full_load_slices[nid]
+                        if nid in full_load_slices
+                        else self.get_component_device_value(nid, ComponentType.FULL)
+                    )
                     for nid in transfer.nodes_to_load or ()
                 ]
         return kv_xfer, comp_xfers

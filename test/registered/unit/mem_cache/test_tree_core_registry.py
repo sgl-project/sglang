@@ -517,6 +517,21 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             self.assertEqual(select_tree_core_backend(params), "python")
         self.assertEqual(resolve_tree_core_backend("rust", params), "python")
 
+    def test_instance_rust_override_uses_the_same_compatibility_fallback(self):
+        for session_enabled, expected in ((False, "rust"), (True, "python")):
+            with (
+                self.subTest(session_enabled=session_enabled),
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"),
+            ):
+                params = _cache_init_params(
+                    tree_core_backend="rust",
+                    enable_session_radix_cache=session_enabled,
+                )
+                self.assertEqual(select_tree_core_backend(params), expected)
+                self.assertEqual(
+                    envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
+                )
+
     def test_numeric_tlru_uses_rust_and_preserves_policy_configuration(self):
         for config in (
             {"threshold": 4096, "next_prompt_estimate": 1024},

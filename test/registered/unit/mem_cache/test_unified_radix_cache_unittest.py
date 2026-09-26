@@ -10586,14 +10586,10 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             node_id = children[0]
 
     def _assert_protocol_violation(self, fn, fragment):
-        """The Python core asserts; the Rust core panics (a BaseException
-        subclass at the PyO3 boundary). Either way the message names the
-        violation and the operation never completes silently."""
+        """Both cores report ownership violations as ordinary Python exceptions."""
         try:
             fn()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as exc:  # pyo3 PanicException derives from BaseException
+        except (AssertionError, RuntimeError) as exc:
             self.assertIn(fragment, str(exc))
         else:
             self.fail(f"protocol violation went unreported: {fragment}")

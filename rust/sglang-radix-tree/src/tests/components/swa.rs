@@ -2533,6 +2533,77 @@ fn inc_then_dec_lock_ref_roundtrips_with_dec_params() {
 }
 
 #[test]
+fn dec_window_lock_only_preserves_full_and_mamba_locks() {
+    let (mut tc, [_, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::EMPTY).unwrap();
+    let idx = tc.arena.resolve(leaf).unwrap();
+    let mut params = receipt.to_dec_params();
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    assert_eq!(tc.component_protected_size(SWA), 2);
+    tc.dec_window_lock_only(leaf, SWA, &params, &mut device_frees, &mut host_frees)
+        .unwrap();
+    assert_eq!(tc.arena.device_lock_ref(idx, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(idx, FULL), 1);
+    assert_eq!(tc.arena.device_lock_ref(idx, MAMBA), 1);
+    assert_eq!(tc.component_protected_size(SWA), 0);
+    assert_eq!(tc.component_protected_size(FULL), 3);
+    assert_eq!(tc.component_protected_size(MAMBA), 1);
+    assert!(device_frees.is_empty());
+    assert!(host_frees.is_empty());
+
+    // The later receipt skips only the window already released; Mamba must
+    // still be released together with Full.
+    params.skipped_lock_components.insert(SWA);
+    tc.dec_lock_ref(leaf, &params, false).unwrap();
+    assert_eq!(tc.component_protected_size(FULL), 0);
+    assert_eq!(tc.component_protected_size(MAMBA), 0);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn dec_window_lock_only_ignores_root_and_skipped_window() {
+    let (mut tc, [_, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    tc.dec_window_lock_only(
+        tc.arena.node(tc.arena.root()).id,
+        SWA,
+        &DecLockRefParams::default(),
+        &mut device_frees,
+        &mut host_frees,
+    )
+    .unwrap();
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::of(SWA)).unwrap();
+    let params = receipt.to_dec_params();
+    assert!(!params.component_lock_uuids.contains_key(&(SWA.idx() as u8)));
+    tc.dec_window_lock_only(leaf, SWA, &params, &mut device_frees, &mut host_frees)
+        .unwrap();
+    assert_eq!(tc.component_protected_size(FULL), 3);
+    assert_eq!(tc.component_protected_size(MAMBA), 1);
+    assert_eq!(tc.component_protected_size(SWA), 0);
+    assert!(device_frees.is_empty());
+    assert!(host_frees.is_empty());
+    tc.dec_lock_ref(leaf, &params, false).unwrap();
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_window_lock_only_checks_receipt_anchor_before_skipping() {
+    let (mut tc, [other, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::of(SWA)).unwrap();
+    tc.dec_window_lock_only(
+        other,
+        SWA,
+        &receipt.to_dec_params(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+    )
+    .unwrap();
+}
+
+#[test]
 fn dec_swa_lock_only_releases_swa_while_full_stays_locked() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = chain(&mut tc);
