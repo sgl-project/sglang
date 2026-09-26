@@ -122,7 +122,7 @@ def _jit_deep_select_module(
         for config in configs
     ]
     classes = make_cpp_args(*classes)
-    root = (KERNEL_PATH / "csrc" / "deepselect" / "vendor").resolve()
+    root = (KERNEL_PATH / "csrc" / "deep_select" / "vendor").resolve()
     return load_jit(
         "deep_select_topk",
         # cache only distinct key for better readability
@@ -135,8 +135,8 @@ def _jit_deep_select_module(
             max_topk,
             cluster_size,
         ),
-        cuda_files=["deepselect/entry.cuh"],
-        cuda_wrappers=[("topk", f"deepselect::{host_dispatch}<{classes}>::topk")],
+        cuda_files=["deep_select/entry.cuh"],
+        cuda_wrappers=[("topk", f"deep_select::{host_dispatch}<{classes}>::topk")],
         extra_include_paths=[
             str(root),
             str(root / "3rdparty" / "kerutils" / "include"),
@@ -171,7 +171,7 @@ def get_deepselect_supported_architectures() -> Tuple[int, ...]:
     return tuple(major * 10 + minor for major, minor in _SUPPORTED_CAPABILITIES)
 
 
-def is_deepselect_supported(device=None) -> bool:
+def is_deep_select_supported(device=None) -> bool:
     """Return whether DeepSelect JIT supports a CUDA device."""
     if torch.version.cuda is None or not torch.cuda.is_available():
         return False

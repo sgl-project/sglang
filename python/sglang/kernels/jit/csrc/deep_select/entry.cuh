@@ -30,7 +30,7 @@ namespace sglang {
  * arguments picked by the Python module factory, which leaves exactly one
  * decision for C++: which of a bucket's two tunings the launch shape wants.
  */
-namespace deepselect {
+namespace deep_select {
 
 namespace details {
 
@@ -289,6 +289,6 @@ struct TopkCluster {
   }
 };
 
-}  // namespace deepselect
+}  // namespace deep_select
 
 }  // namespace sglang

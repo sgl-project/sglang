@@ -8,13 +8,13 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deep_select import is_deepselect_supported, topk
+from sglang.kernels.ops.attention.deep_select import is_deep_select_supported, topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
-    not is_deepselect_supported(), reason="requires CUDA SM90, SM100, or SM103"
+    not is_deep_select_supported(), reason="requires CUDA SM90, SM100, or SM103"
 )
 
 
