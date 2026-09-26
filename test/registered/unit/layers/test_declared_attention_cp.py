@@ -127,6 +127,12 @@ class TestAttentionCpBoundary(CustomTestCase):
                     lambda: moe_group or parallel.tp_group,
                 ),
                 (
+                    (comm, "get_exec"),
+                    lambda: SimpleNamespace(
+                        overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                    ),
+                ),
+                (
                     (comm, "get_spec"),
                     lambda: SimpleNamespace(speculative_algorithm=None),
                 ),
@@ -159,6 +165,7 @@ class TestAttentionCpBoundary(CustomTestCase):
                 is_last_layer=False,
                 is_layer_sparse=True,
                 is_previous_layer_sparse=False,
+                is_next_layer_sparse=False,
             ),
             input_layernorm=layernorm,
             post_attention_layernorm=layernorm,
