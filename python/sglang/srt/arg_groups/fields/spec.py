@@ -218,7 +218,8 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_adaptive_config: A[
         Optional[str],
-        "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+        "Path to a JSON config file for adaptive speculative decoding tuning knobs. "
+        "Set its top-level 'strategy' to 'ema' or 'throughput_aware' (defaults to 'ema').",
     ] = None
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."

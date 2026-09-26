@@ -45,6 +45,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    with_phase,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -71,7 +72,6 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -1329,12 +1329,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive and self._hosts_draft:
-            self.adaptive_controller = AdaptiveController(
+            self.adaptive_controller = AdaptiveController.from_config(
                 self,
-                AdaptiveSpeculativeParams(
-                    initial_steps=self.speculative_num_steps,
-                    cfg_path=get_spec().speculative_adaptive_config,
-                ),
+                initial_steps=self.speculative_num_steps,
+                config_path=get_spec().speculative_adaptive_config,
             )
 
         # Some dummy tensors
@@ -1353,6 +1351,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self._draft_worker is None:
             return self._target_worker.model_runner
         return self._draft_worker.draft_runner
+
+    @property
+    def model_config(self):
+        return self._target_worker.model_runner.model_config
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1391,11 +1393,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
+                decode_graph_config = get_exec().graph.cuda_graph_config.decode
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=(
                         None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
+                        if decode_graph_config.backend == Backend.DISABLED
+                        else decode_graph_config.bs
                     ),
                 )
 
@@ -1755,11 +1758,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        num_steps: int | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req, batch_size=batch_size, num_steps=num_steps
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
@@ -1893,6 +1899,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
 
+    def run_startup_spec_profiling(
+        self, tree_cache, *, max_running_requests: int
+    ) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.run_profiling(
+                tree_cache,
+                max_running_requests=max_running_requests,
+            )
+
     @contextlib.contextmanager
     def _override_worker_state(
         self,
@@ -1915,8 +1930,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             get_spec().speculative_num_steps,
             get_spec().speculative_num_draft_tokens,
-            get_exec().graph.cuda_graph_bs_decode,
-            get_exec().graph.disable_cuda_graph,
+            get_exec().graph.cuda_graph_config,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -1933,10 +1947,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
             # are not affected.
+            decode_changes = {"bs": cuda_graph_bs}
+            if not cuda_graph_bs:
+                decode_changes["backend"] = Backend.DISABLED
             get_context().override(
                 "adaptive_spec.capture_override",
-                cuda_graph_bs_decode=cuda_graph_bs,
-                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+                cuda_graph_config=with_phase(
+                    get_exec().graph.cuda_graph_config,
+                    Phase.DECODE,
+                    **decode_changes,
+                ),
             )
         dw._rebuild_topk1_chain_buffers()
 
@@ -1959,8 +1979,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "adaptive_spec.capture_restore",
                 speculative_num_steps=backup[10],
                 speculative_num_draft_tokens=backup[11],
-                cuda_graph_bs_decode=backup[12],
-                disable_cuda_graph=backup[13],
+                cuda_graph_config=backup[12],
             )
             dw._rebuild_topk1_chain_buffers()
 
