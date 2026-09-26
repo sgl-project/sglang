@@ -55,6 +55,7 @@ def communicator(norm):
     c._steps = comm.BoundarySteps(
         attention_input=lambda hidden_states, **_: hidden_states,
         ffn_input=comm._mlp_input_norm,
+        ffn_input_rows=comm.Layout(frozenset()),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=False,
