@@ -41,6 +41,39 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
 )
 
 
+def check_prefill_interleaving(cfg: Any) -> None:
+    enabled = (
+        cfg.schedule_policy == "shortest-prefill-first"
+        if cfg.prefill_interleaving is None
+        else cfg.prefill_interleaving
+    )
+    minimum = cfg.prefill_interleaving_min_continuation_tokens
+    if minimum is not None:
+        if not enabled:
+            raise ValueError(
+                "--prefill-interleaving-min-continuation-tokens requires prefill interleaving."
+            )
+        if minimum <= 0 or minimum % cfg.page_size:
+            raise ValueError(
+                "--prefill-interleaving-min-continuation-tokens must be a positive multiple of page_size."
+            )
+    if cfg.prefill_interleaving or minimum is not None:
+        if cfg.schedule_policy not in ("hrrn", "shortest-prefill-first"):
+            raise ValueError(
+                "Prefill interleaving requires hrrn or shortest-prefill-first."
+            )
+        if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+            raise ValueError("Prefill interleaving requires chunked prefill.")
+        if cfg.disable_radix_cache or cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "Prefill interleaving requires radix caching and autoregressive prefill."
+            )
+        if minimum is not None and minimum >= cfg.chunked_prefill_size:
+            raise ValueError(
+                "--prefill-interleaving-min-continuation-tokens must be less than chunked_prefill_size."
+            )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -187,6 +220,8 @@ def check_server_args(server_args: Any):
         assert cfg.chunked_prefill_size % cfg.page_size == 0, (
             "chunked_prefill_size must be divisible by page_size"
         )
+
+    check_prefill_interleaving(cfg)
 
     # Check pdmux
     if cfg.enable_pdmux:

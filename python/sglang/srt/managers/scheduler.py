@@ -1379,6 +1379,8 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            prefill_interleaving=get_schedule().prefill_interleaving,
+            prefill_interleaving_min_continuation_tokens=get_schedule().prefill_interleaving_min_continuation_tokens,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -3786,6 +3788,20 @@ class Scheduler(
 
         return res
 
+    def _max_interleaved_waiting_reqs(self, running_batch: ScheduleBatch) -> int:
+        """Waiting requests the admission loop can add next to the chunked request."""
+        if running_batch.batch_is_full:
+            return 0
+        # The chunked request takes one of the slots the admission loop counts.
+        slots = self.get_num_allocatable_reqs(
+            len(running_batch.reqs), running_batch=running_batch
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            slots = min(slots, self.req_to_token_pool.available_size())
+        if (prefill_max_requests := get_schedule().prefill_max_requests) is not None:
+            slots = min(slots, prefill_max_requests)
+        return slots - 1
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3906,15 +3922,17 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_interleaving=self.policy.prefill_interleaving,
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.policy.prefill_interleaving_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                max_reqs=self._max_interleaved_waiting_reqs(running_batch),
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 

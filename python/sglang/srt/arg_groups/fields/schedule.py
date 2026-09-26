@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import (
     List,
     Optional,
@@ -52,6 +53,17 @@ class Schedule(msgspec.Struct):
     chunked_prefill_size: A[
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+    ] = None
+    prefill_interleaving: A[
+        Optional[bool],
+        Arg(
+            help="Allow fitting waiting requests to share a pass with a continuing prefill. Supported with hrrn and shortest-prefill-first. Unset enables it for shortest-prefill-first only; use --no-prefill-interleaving to disable that default.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
+    prefill_interleaving_min_continuation_tokens: A[
+        Optional[int],
+        "Minimum tokens reserved for the continuing request when interleaving prefills. Defaults to one KV page for shortest-prefill-first, or half the current chunk budget rounded up to a KV page for hrrn. Explicit values must be positive multiples of page_size. Without fitting waiters, the continuation uses the normal chunk budget.",
     ] = None
     prefill_decode_interval: A[
         Optional[int],
