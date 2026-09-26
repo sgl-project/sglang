@@ -7,6 +7,7 @@ worker, posting helpers, barrier, descriptor cleanup, and status messages run.
 import threading
 import unittest
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -362,65 +363,20 @@ class TestPeerRecovery(CustomTestCase):
 
     def test_duplicate_registration_does_not_block_bootstrap_thread(self):
         mgr = self.manager()
-        completed = threading.Event()
-        errors = []
-
-        def register():
-            try:
-                mgr._add_remote_peer(SimpleNamespace(agent_name="bad"))
-            except Exception as exc:
-                errors.append(exc)
-            finally:
-                completed.set()
-
-        try:
+        with ThreadPoolExecutor(max_workers=1) as worker:
             with mgr._peer_recovery.lock("bad"):
-                thread = threading.Thread(target=register)
-                thread.start()
-                self.assertTrue(completed.wait(5), "bootstrap waited for peer recovery")
-        finally:
-            thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, [])
+                worker.submit(
+                    mgr._add_remote_peer, SimpleNamespace(agent_name="bad")
+                ).result(timeout=5)
 
     def test_peer_wait_does_not_block_healthy_peer(self):
         """A held peer lock must not become a global transport lock."""
         mgr = self.manager()
-        ready = threading.Event()
-        done = threading.Event()
-
-        def hold_bad():
-            mgr._peer_recovery.begin(["bad"])
-            ready.set()
-            done.wait()
-            mgr._peer_recovery.end()
-
-        t = threading.Thread(target=hold_bad)
-        t.start()
-        healthy = None
-        try:
-            self.assertTrue(ready.wait(5))
-            healthy_done = threading.Event()
-            chunk = self.chunk(mgr, 3, ("healthy",))
-
-            def run_healthy():
-                try:
-                    self.run_chunks(mgr, [chunk])
-                finally:
-                    healthy_done.set()
-
-            healthy = threading.Thread(target=run_healthy)
-            healthy.start()
-            self.assertTrue(
-                healthy_done.wait(5), "healthy peer waited for the broken peer lock"
-            )
-            self.assertEqual(mgr.request_status[3], KVPoll.Success)
-        finally:
-            done.set()
-            t.join(5)
-            if healthy is not None:
-                healthy.join(5)
-        self.assertFalse(t.is_alive())
+        chunk = self.chunk(mgr, 3, ("healthy",))
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with mgr._peer_recovery.lock("bad"):
+                worker.submit(self.run_chunks, mgr, [chunk]).result(timeout=5)
+        self.assertEqual(mgr.request_status[3], KVPoll.Success)
 
 
 if __name__ == "__main__":
