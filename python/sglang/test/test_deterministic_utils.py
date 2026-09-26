@@ -1,5 +1,7 @@
 import unittest
 
+import requests
+
 from sglang.test.test_deterministic import BenchArgs, test_deterministic
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -71,6 +73,27 @@ class TestDeterministicBase(CustomTestCase):
         args.n_trials = 10
         args.temperature = 0.5  # test for deterministic sampling
         args.return_logprob = True  # Enable logprobs comparison
+        results = test_deterministic(args)
+        for result in results:
+            assert result == 1
+
+    def test_radix_cache(self):
+        """A radix cache hit must not change the logprobs of a prefill."""
+        url = DEFAULT_URL_FOR_TEST
+        response = requests.get(f"{url}/server_info", timeout=30)
+        response.raise_for_status()
+        server_info = response.json()
+
+        # Resolved from RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.
+        if server_info["disable_radix_cache"]:
+            self.skipTest(
+                "radix cache is disabled under deterministic inference for the "
+                f"{server_info['attention_backend']} attention backend"
+            )
+
+        args = BenchArgs()
+        args.host, args.port = self._extract_host_and_port(url)
+        args.test_mode = "radix_cache"
         results = test_deterministic(args)
         for result in results:
             assert result == 1
