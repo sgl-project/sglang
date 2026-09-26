@@ -38,7 +38,7 @@ to keep. The layout is specified in
 Two groups sit outside that stack:
 
 - **Radix cache** is its own axis. The per-model variants (`radix_cache.py`,
-  `hiradix_cache.py`, `chunk_cache.py`)
+  `chunk_cache.py`)
   are converging onto the **Unified Radix Cache** (`unified_cache/`,
   [#20415](https://github.com/sgl-project/sglang/issues/20415)), whose Full/SWA/Mamba
   component model is documented in

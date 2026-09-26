@@ -90,9 +90,8 @@ If your code changes model output, run an accuracy evaluation appropriate for th
 sglang serve --model-path Qwen/Qwen3-8B
 
 # Evaluate
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k \
-  --port 30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --num-examples 200
 ```
 
@@ -146,6 +145,21 @@ If a command isn't recognized, the handler reacts 😕 instead, and replies with
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
 If you don’t have permission and you’re not the PR author, please ask maintainers to trigger CI for you.
+
+### CI control labels
+
+Four labels change how a PR's CI runs. Label before you trigger:
+`max-concurrency` fixes the shard fan-out when the run is created.
+
+| Label | Effect |
+| --- | --- |
+| `bypass-fail-fast` | A job failing no longer aborts its siblings; the run continues instead of stopping at the first root-cause failure. A failing `lint` still stops everything. |
+| `parallel-stages` | Stages stop waiting on each other. `base-a`, `base-b` and `base-c` dispatch together, the way a scheduled run does. |
+| `max-concurrency` | A suite fans out to all of its shards at once rather than a third of them. |
+| `highest-priority` | All three of the above, and the PR is also skipped by the batch-cancel workflow, sorted first in the active-runs report, and never closed as stale. |
+
+Each spends extra runner capacity, so they unblock a specific PR rather than
+serve as a default.
 
 ### CI rate limits
 

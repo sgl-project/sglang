@@ -22,7 +22,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.configs.moe_model_registry import model_supports_deepep_v2
+from sglang.srt.configs.moe_model_registry import (
+    model_deepep_v2_prefill_dispatch_tokens,
+    model_supports_deepep_v2,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -202,6 +205,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "Qwen2MoeForCausalLM",
@@ -545,6 +549,27 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         )
 
 
+def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
+    """Largest prefill dispatch on one rank, after topology and model sharding."""
+    view = resolved_view(server_args)
+    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=view.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=view.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    scatter_ranks = max(1, view.tp_size // attn_dp_size)
+    tokens = -(-tokens // scatter_ranks)
+    return model_deepep_v2_prefill_dispatch_tokens(
+        hf_config=model_config_of(server_args).hf_config,
+        cfg=view,
+        default_tokens=tokens,
+    )
+
+
 def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     """Check the configured prefill and decode-graph buffer bounds."""
     view = resolved_view(server_args)
@@ -553,20 +578,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
-        prefill_tokens = max_prefill_buffer_tokens(server_args) or (
-            view.max_prefill_tokens or 0
-        )
-        # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
-        # dispatch (CP shard at the model input, then attn-TP reduce-scatter), so
-        # that is the per-EP-rank divisor.
-        attn_dp_size, _ = derive_attention_widths(
-            tp_size=view.tp_size,
-            attn_cp_size=view.attn_cp_size,
-            dp_size=view.dp_size,
-            enable_dp_attention=view.enable_dp_attention,
-        )
-        scatter_ranks = max(1, view.tp_size // attn_dp_size)
-        prefill_tokens = -(-prefill_tokens // scatter_ranks)
+        prefill_tokens = required_deepep_v2_prefill_tokens_per_rank(server_args)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "

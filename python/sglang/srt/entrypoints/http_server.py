@@ -58,6 +58,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -88,6 +89,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
+    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -100,6 +102,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -111,12 +114,15 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
+from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -124,6 +130,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -321,6 +328,9 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
+    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
+        fast_api_app.state.openai_serving_chat
+    )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -339,6 +349,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
+        fast_api_app.state.openai_serving_chat
+    )
+
+    # Initialize System One compatible decision handler
+    fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
 
@@ -601,14 +616,28 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
-    use the legacy ErrorResponse shape.
+    never reach the client. For /v1/responses, keep OpenAI-style. For
+    /v1/systemone, keep the 422 detail list that the System One API documents.
+    Otherwise use the legacy ErrorResponse shape.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
+        )
+
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path == "/v1/systemone":
+        # The System One API documents FastAPI's default 422 detail list. The
+        # optional input echo is left out, since it can be any client value.
+        detail = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return ORJSONResponse(
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
+            content={"detail": jsonable_encoder(detail)},
         )
 
     exc_str = str(exc)
@@ -799,16 +828,6 @@ async def model_info():
     return msgspec_to_builtins(result)
 
 
-@app.get("/get_weight_version")
-@app.get("/weight_version")
-async def weight_version():
-    """Get the current weight version."""
-    raise HTTPException(
-        status_code=404,
-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
-    )
-
-
 @app.get("/get_server_info")
 async def get_server_info():
     """Get the server information (deprecated - use /server_info instead)."""
@@ -846,39 +865,13 @@ async def server_info():
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
+            "frontend": "python",
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
-
-
-@app.get("/get_load")
-async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead).
-
-    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
-    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
-    num_pending_tokens, ts_tic) so existing clients keep working.
-    """
-    logger.warning(
-        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
-        "Please use '/v1/loads' instead."
-    )
-    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
-    ts = time.perf_counter()
-    return [
-        {
-            "dp_rank": r.dp_rank,
-            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
-            "num_waiting_reqs": r.num_waiting_reqs,
-            "num_tokens": r.num_total_tokens,
-            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
-            "ts_tic": ts,
-        }
-        for r in load_results
-    ]
 
 
 # example usage:
@@ -1067,22 +1060,8 @@ async def list_external_corpora():
     )
 
 
-@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend_deprecated():
-    """Deprecated: use POST /hicache/storage-backend/clear."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
-    return Response(
-        content=(
-            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
-            "Hierarchical cache storage backend cleared.\n"
-        ),
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
-
-
 # example usage:
-# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
+# curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
@@ -1415,6 +1394,36 @@ async def update_weights_from_tensor(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/begin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_weight_update(
+    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
+):
+    """Open a weight-update session so in-place-quantized weights become loadable."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/end_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_weight_update(
+    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
+):
+    """Close the weight-update session and finalize quantized weights."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -1951,6 +1960,14 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
+async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
+        request, raw_request
+    )
+
+
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
@@ -2061,6 +2078,15 @@ async def anthropic_v1_count_tokens(
 ):
     """Anthropic-compatible token counting endpoint."""
     return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+        request, raw_request
+    )
+
+
+## System One compatible decision API
+@app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
+async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
+    """System One compatible decisions, answered by candidate scoring without generation."""
+    return await raw_request.app.state.systemone_serving.handle_request(
         request, raw_request
     )
 
@@ -2827,6 +2853,7 @@ def _start_native_grpc_server_for_runtime(
         port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=get_serving().grpc_worker_threads,
+        response_timeout_secs=get_serving().grpc_response_timeout_secs,
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
@@ -2878,6 +2905,10 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+
+    if get_parallel().node_rank >= 1:
+        # _launch_subprocesses already blocked until the schedulers exited.
+        return
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the

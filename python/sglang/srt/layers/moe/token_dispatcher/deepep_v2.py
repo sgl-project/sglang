@@ -24,7 +24,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_resources,
 )
 
@@ -120,9 +119,9 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # Multi-node forces hybrid; direct + multi-node is rejected in server-args
-    # validation, so this stays a plain predicate.
-    return get_exec().moe.deepep_v2_mode == "hybrid" or get_parallel().nnodes > 1
+    # Multi-node is rejected with direct in server-args validation, so a hybrid
+    # mode here already covers every multi-node run.
+    return get_exec().moe.deepep_v2_mode == "hybrid"
 
 
 def _quantize_for_deepep_v2_dispatch(
@@ -375,6 +374,13 @@ class _DeepEPv2Impl:
         if use_expand_layout:
             # Expanded combine uses handle metadata instead of recv_topk_idx.
             local_topk_ids = None
+            if not use_masked and recv_topk_weights.shape != (
+                recv_hidden_states.shape[0],
+            ):
+                raise ValueError(
+                    "DeepEP v2 expanded activations and router weights must "
+                    "have the same receive capacity"
+                )
         else:
             num_recv_tokens = int(
                 handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()

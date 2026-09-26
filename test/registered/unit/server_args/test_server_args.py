@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
@@ -120,6 +121,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
@@ -201,22 +221,33 @@ class TestPrepareServerArgs(CustomTestCase):
                 args.resolve_once()
 
     def test_megamoe_requires_sm90_or_sm100(self):
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+        # is_hip is pinned as well: override_platform only replaces the facts it is
+        # given, so on a ROCm host these would otherwise describe a machine that is
+        # both CUDA and HIP, and megamoe's ROCm arm would answer instead.
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "SM90"):
                 args.resolve_once()
-        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+        with override_platform(
+            is_cuda=False, is_sm90=False, is_sm100=False, is_hip=False
+        ):
             args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 args.resolve_once()
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
 
     def test_megamoe_token_budget_must_cover_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
 
-        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
             args = ServerArgs(
                 model_path="dummy",
                 moe_a2a_backend="megamoe",
@@ -544,34 +575,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
-
-    @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
-        )
-
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
-            handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
     def test_explicit_cpu_overrides_legacy_environment(self):
@@ -1994,7 +1997,34 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
 
-class TestHiCacheArgs(unittest.TestCase):
+class TestHiCacheArgs(CustomTestCase):
+    def test_host_receive_speculative_uses_shared_retraction_pool(self):
+        """Speculation must still resolve host receive to the shared host pool."""
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_host_receive_threshold=0.8,
+                    speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(args)
+                self.assertEqual(
+                    resolution_result(args, "disaggregation_decode_retraction_backup"),
+                    "host_pool",
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),
@@ -2068,7 +2098,7 @@ class TestHiCacheArgs(unittest.TestCase):
                 },
                 3,
             ),
-            ({"hicache_write_policy": "write_through"}, 0),
+            ({"hicache_write_policy": "write_through"}, 3),
             (
                 {
                     "hicache_storage_backend": "file",
@@ -2557,6 +2587,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ):
             with self.subTest(architecture=architecture):
                 check_pipeline_parallel_compat(
@@ -3612,6 +3643,25 @@ class TestGrpcServerArgs(CustomTestCase):
             with self.assertRaises(ValueError):
                 handle_deprecated_args(sa)
 
+    def test_grpc_response_timeout(self):
+        parser = self._sidecar_parser()
+        for value in (300, 1800, 0, -1):
+            with self.subTest(timeout=value):
+                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                if value != 300:
+                    argv += ["--grpc-response-timeout-secs", str(value)]
+                sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+                if value <= 0:
+                    with self.assertRaisesRegex(
+                        ValueError, "grpc-response-timeout-secs"
+                    ):
+                        handle_deprecated_args(sa)
+                else:
+                    handle_deprecated_args(sa)
+                    self.assertEqual(
+                        resolution_result(sa, "grpc_response_timeout_secs"), value
+                    )
+
     def test_start_server_call_site_matches_native_signature(self):
         """Regression for the startup blocker: the native start_server binding
         only accepts (host, port, runtime_handle, worker_threads, ...). The
@@ -3623,7 +3673,10 @@ class TestGrpcServerArgs(CustomTestCase):
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
         override = get_context().override_server_args(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+            host="127.0.0.1",
+            grpc_port=50051,
+            grpc_worker_threads=4,
+            grpc_response_timeout_secs=1800,
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3648,9 +3701,17 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
@@ -4030,6 +4091,73 @@ class TestDcpCommBackendDefault(CustomTestCase):
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
             )
+
+
+class TestParserChoices(CustomTestCase):
+    """The choices come from dependency-free name lists, but `cli/serve.py`
+    loads plugins before parsing, so a plugin's parser must still be accepted."""
+
+    def test_a_plugin_registered_parser_is_accepted(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        ReasoningParser.DetectorMap["plugin-reasoning"] = object
+        FunctionCallParser.ToolCallParserEnum["plugin-toolcall"] = object
+        try:
+            parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args = parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy-model",
+                    "--reasoning-parser",
+                    "plugin-reasoning",
+                    "--tool-call-parser",
+                    "plugin-toolcall",
+                ]
+            )
+        finally:
+            del ReasoningParser.DetectorMap["plugin-reasoning"]
+            del FunctionCallParser.ToolCallParserEnum["plugin-toolcall"]
+        self.assertEqual(args.reasoning_parser, "plugin-reasoning")
+        self.assertEqual(args.tool_call_parser, "plugin-toolcall")
+
+    def test_name_lists_are_used_when_the_registries_are_not_imported(self):
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        with patch.dict(server_args_module.sys.modules):
+            server_args_module.sys.modules.pop(
+                "sglang.srt.parser.reasoning_parser", None
+            )
+            server_args_module.sys.modules.pop(
+                "sglang.srt.function_call.function_call_parser", None
+            )
+            self.assertEqual(
+                server_args_module._reasoning_parser_choices(),
+                list(REASONING_PARSER_NAMES),
+            )
+            self.assertEqual(
+                server_args_module._tool_call_parser_choices(),
+                list(TOOL_CALL_PARSER_NAMES),
+            )
+
+
+class TestLazyReexports(CustomTestCase):
+    def test_the_names_that_lost_their_eager_import_are_still_attributes(self):
+        # Out-of-tree code reaches these through `sglang.srt.server_args`; they
+        # now resolve through the module __getattr__ instead of a top import.
+        from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        self.assertIs(server_args_module.FunctionCallParser, FunctionCallParser)
+        self.assertIs(server_args_module.ReasoningParser, ReasoningParser)
+        self.assertIs(server_args_module.RealKvHashMode, RealKvHashMode)
+
+    def test_an_unknown_attribute_still_raises(self):
+        with self.assertRaises(AttributeError):
+            server_args_module.NotAThing
 
 
 if __name__ == "__main__":

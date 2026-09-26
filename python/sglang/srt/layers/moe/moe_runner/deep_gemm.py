@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4 import (
+from sglang.kernels.ops.moe.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_masked_post_quant,
 )
@@ -398,7 +398,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -590,11 +590,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
-        deepep_v2_expanded = running_state.get("deepep_v2_expanded", False)
+        # Masked (decode) path never expands rows, so weight folding must not run.
+        deepep_v2_expanded = running_state.get(
+            "deepep_v2_expanded", False
+        ) and not running_state.get("deepep_v2_masked", False)
         # Folding the row weight into down_input_scale needs a non-power-of-two
         # scale; ue8m0 is a power of two, so it weights down_output before combine.
+        # no_combine asks for raw rows, so the fold must not pre-apply the weight.
         fuse_weight_into_scale = (
             deepep_v2_expanded
+            and not self.config.no_combine
             and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and running_state.get("topk_weights") is not None
         )
@@ -645,7 +650,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-
         hidden_states = runner_input.hidden_states
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
@@ -1507,7 +1511,7 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.kimi_k3 import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2
@@ -1875,7 +1879,8 @@ def post_permute_deep_gemm_to_deepep_v2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if running_state.get("deepep_v2_masked", False):
-            # Expanded combine does not consume top-k weights.
+            # A routewise finalizer must run before router weighting. Preserve
+            # one raw row per route and carry its 1-D weight to that finalizer.
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             output_capacity = running_state["deepep_v2_total_expanded"]
@@ -1890,7 +1895,18 @@ def post_permute_deep_gemm_to_deepep_v2(
                 running_state["deepep_v2_expert_alignment"],
                 topk_weights=None if return_unweighted_routes else topk_weights,
             )
-            return DeepEPv2CombineInput(hidden_states, None)
+            if not return_unweighted_routes:
+                return DeepEPv2CombineInput(hidden_states, None)
+            # Match the communication-capacity weights to the output slab.
+            return DeepEPv2CombineInput(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights[: hidden_states.shape[0]],
+                routewise_layout=RoutewiseLayout.EXPANDED,
+            )
+        if return_unweighted_routes:
+            return DeepEPv2CombineInput(
+                hidden_states, topk_weights, RoutewiseLayout.EXPANDED
+            )
         if topk_weights is not None and not running_state.get(
             "deepep_v2_weight_prefused", False
         ):
