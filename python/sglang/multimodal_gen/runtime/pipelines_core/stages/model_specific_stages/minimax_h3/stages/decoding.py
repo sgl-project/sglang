@@ -403,7 +403,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 with set_forward_context(current_timestep=0, attn_metadata=None):
                     visual_frames = video_decode(visual_decode_latent)
                 visual_frames = selected_video_vae.processor.revert_tensor(
-                    visual_frames
+                    visual_frames, runtime_owned=True
                 )
                 visual_frames = _required_tensor(
                     visual_frames,
