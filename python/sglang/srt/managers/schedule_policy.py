@@ -1057,6 +1057,15 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def can_share_extend_batch(self, req: Req) -> bool:
+        # Token embedding overrides embed the batch's raw input_ids before the
+        # model runs, and that lookup cannot index multimodal placeholder hash IDs.
+        if req.positional_embed_overrides is not None:
+            return all(r.multimodal_inputs is None for r in self.can_run_list)
+        if req.multimodal_inputs is not None:
+            return all(r.positional_embed_overrides is None for r in self.can_run_list)
+        return True
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)

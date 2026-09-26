@@ -29,6 +29,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
+from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v41_features
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
@@ -45,6 +46,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.model_hook import handle_model_specific_adjustments
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -4061,6 +4063,81 @@ class TestDcpCommBackendDefault(CustomTestCase):
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
             )
+
+
+class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
+    def _args(
+        self,
+        *,
+        vision_n_layers=2,
+        prefill_backend=Backend.DISABLED,
+        lock_prefill_backend=False,
+        **overrides,
+    ):
+        fields = dict(
+            model_path="dummy",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=2,
+        )
+        fields.update(overrides)
+        server_args = ServerArgs(**fields)
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                model_type="deepseek_v41",
+                vision_n_layers=vision_n_layers,
+            ),
+            nvfp4_moe_meta=None,
+            is_fp4_experts=False,
+        )
+        # The dummy path does not initialize phase configs.
+        server_args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=prefill_backend, max_bs=512),
+        )
+        server_args._resolved_overrides = []
+        server_args._cuda_graph_config_locked = (
+            {(Phase.PREFILL, "backend")} if lock_prefill_backend else set()
+        )
+        return server_args
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_guard_matrix_in_model_hook_order(self):
+        for overrides, error in (
+            (
+                dict(enable_encoder_swa_bounded_replay=True),
+                "encoder-swa-bounded-replay does not support context parallelism",
+            ),
+            (dict(cp_strategy="zigzag"), "requires --cp-strategy interleave"),
+            (
+                dict(prefill_backend=Backend.BREAKABLE, lock_prefill_backend=True),
+                "runs eager prefill",
+            ),
+            (
+                dict(
+                    speculative_algorithm="DSPARK",
+                    enable_decoder_swa_bounded_replay=True,
+                ),
+                "DSpark.*decoder-swa-bounded-replay",
+            ),
+        ):
+            args = self._args(
+                max_running_requests=4, chunked_prefill_size=128, **overrides
+            )
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                handle_model_specific_adjustments(args)
+
+    def test_text_zigzag_and_default_prefill_graph_are_accepted(self):
+        validate_deepseek_v41_features(
+            self._args(cp_strategy="zigzag", vision_n_layers=0)
+        )
+        args = self._args(prefill_backend=Backend.BREAKABLE)
+        validate_deepseek_v41_features(args)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.DISABLED,
+        )
 
 
 class TestParserChoices(CustomTestCase):

@@ -1285,6 +1285,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay cannot return cached prompt logprobs"
                 )
+        requests_embed_overrides = obj.positional_embed_overrides is not None or (
+            isinstance(obj, EmbeddingReqInput)
+            and obj.embed_overrides is not None
+            and obj.embed_override_token_id is not None
+        )
+        if requests_embed_overrides and obj.contains_mm_input():
+            raise ValueError(
+                "embedding overrides cannot be combined with image, video, or audio "
+                "inputs"
+            )
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens

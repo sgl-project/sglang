@@ -3939,6 +3939,8 @@ class Scheduler(
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
+            if not adder.can_share_extend_batch(req):
+                break
 
             # A forward batch runs one pooling mode, so setwise readout requests
             # (token_indices_to_pool) cannot share a batch with last-token ones.
