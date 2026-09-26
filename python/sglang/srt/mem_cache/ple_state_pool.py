@@ -103,8 +103,9 @@ class ShortConvPool:
         return self.intermediate_conv_state[self.layer_map[layer_id]]
 
     def clear(self):
-        if self.conv_state is not None:
-            self.conv_state.zero_()
+        # Deliberate no-op: flush_cache() can run while GPU_MEMORY_TYPE_KV_CACHE is
+        # paused, and conv_state lives under that tag; reset_slots owns per-slot init.
+        pass
 
     # SlotIndexedState: slot is dim 1, behind the layer dim.
 
@@ -209,8 +210,9 @@ class NGramPool:
             )
 
     def clear(self):
-        if self.context is not None:
-            self.context.fill_(self.eos_token_id)
+        # Deliberate no-op: see ShortConvPool.clear(). reset_slots restores the EOS
+        # fill per slot.
+        pass
 
     # SlotIndexedState: slot is dim 0, no layer dim.
 
