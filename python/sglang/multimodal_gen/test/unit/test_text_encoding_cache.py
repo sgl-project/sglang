@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -377,3 +380,49 @@ def test_batch_dp_keeps_gathering_on_rank_local_encoder_hits(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_cache_hit_releases_weights_retained_after_warmup(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.managers.memory_managers."
+        "component_residency_strategies.get_local_torch_device",
+        lambda: torch.device("cuda"),
+    )
+    encoder = FullHiddenStateEncoder().eval()
+    config = make_text_config()
+    config.supports_auto_residency = False
+    args = make_server_args(
+        pipeline_config=config,
+        component_precisions={},
+        enable_layerwise_nvtx_marker=False,
+    )
+    with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+        stage = TextEncodingStage([encoder], [object()])
+    stage._text_encode_dp_group = Mock(return_value=None)
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": encoder},
+        _stage_name_mapping={"text": stage},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    strategy = ComponentOffloadStrategy()
+    manager.strategy_for = Mock(return_value=strategy)
+    stage.set_component_residency_manager(manager)
+    cache = ConditioningCache(4096)
+    for warmup in [True, False]:
+        batch = make_req(is_warmup=warmup)
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        with cache.scope(refresh=warmup):
+            result = stage.encode_text(
+                "hello", args, device="cuda", return_attention_mask=True
+            )
+        manager.end_stage()
+        manager.finish_request()
+        assert encoder.weight.device.type == ("cuda" if warmup else "cpu")
+        assert result[0][0].device.type == "cuda"
+    assert encoder.calls == 1
+    assert cache.hits == 1

@@ -91,7 +91,7 @@ class QwenImage21EncodingStage(PipelineStage):
         cache_group = self.text_encoder._encoder_tp_group
         if cache_group is None and model_parallel_is_initialized():
             cache_group = get_tp_group()
-        return cached_encoder_call(
+        conditioning = cached_encoder_call(
             self.text_encoder,
             (prompt, images),
             {"device": str(device)},
@@ -99,6 +99,10 @@ class QwenImage21EncodingStage(PipelineStage):
             cache_group,
             namespace=self,
         )
+        self.finish_unused_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        )
+        return conditioning
 
     def _encode_prompt(self, prompt, images, device):
         prefix = " ".join(

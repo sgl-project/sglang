@@ -766,6 +766,11 @@ class TextEncodingStage(ConditionEncodingStage):
                 # Batch-DP keeps caching inside each encoder copy so every rank
                 # still enters the output gather, including on a cache hit.
                 conditioning = encode_conditioning()
+            # a hit can leave weights retained by warmup or the previous request
+            self.finish_unused_declared_component(
+                component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
+                module=text_encoder,
+            )
             prompt_embeds, mask, pooled_output, embeds_mask, seq_lens = conditioning
             embeds_list.append(prompt_embeds)
             if pooled_output is not None:
