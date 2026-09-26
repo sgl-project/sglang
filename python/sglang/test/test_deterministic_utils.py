@@ -10,18 +10,18 @@ from sglang.test.test_utils import (
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
-COMMON_SERVER_ARGS = [
+COMMON_SERVER_ARGS = (
     "--trust-remote-code",
     "--cuda-graph-max-bs-decode",
     "32",
     "--enable-deterministic-inference",
-]
+)
 
 
 class TestDeterministicBase(CustomTestCase):
     @classmethod
     def get_server_args(cls):
-        return COMMON_SERVER_ARGS
+        return list(COMMON_SERVER_ARGS)
 
     @classmethod
     def get_model(cls):
@@ -36,16 +36,18 @@ class TestDeterministicBase(CustomTestCase):
         if cls is TestDeterministicBase:
             raise unittest.SkipTest("Skip the base test class")
 
+        server_args = cls.get_server_args()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
+            other_args=server_args,
         )
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _extract_host_and_port(self, url):
         return url.split("://")[-1].split(":")[0], int(url.split(":")[-1])
@@ -57,8 +59,8 @@ class TestDeterministicBase(CustomTestCase):
         args.test_mode = "single"
         args.n_start = 10
         args.n_trials = 20
-        results = test_deterministic(args)
         args.temperature = 0.5  # test for deterministic sampling
+        results = test_deterministic(args)
         for result in results:
             assert result == 1
 
