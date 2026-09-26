@@ -1477,6 +1477,8 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "MXFP8 quantization requires a contiguous 2D tensor."
     _, k = x.shape
     assert k % 32 == 0, f"{k=} must be divisible by 32"
+    if x.device.type == "cpu":
+        return torch.ops.sgl_kernel.mxfp8_group_quantize_cpu(x)
     if _is_hip and _is_gfx95_supported:
         from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
             mxfp8_e4m3_quantize,

@@ -813,6 +813,26 @@ def sglang_per_token_quant_fp8(
 
 if _is_cuda:
     per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+elif _is_cpu:
+
+    def per_token_group_quant_fp8(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-10,
+        dtype: torch.dtype = fp8_dtype,
+        column_major_scales: bool = False,
+        scale_tma_aligned: bool = False,
+        scale_ue8m0: bool = False,
+        fuse_silu_and_mul: bool = False,
+        masked_m: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert dtype == torch.float8_e4m3fn
+        assert not column_major_scales
+        assert not scale_tma_aligned
+        assert not scale_ue8m0
+        assert not fuse_silu_and_mul
+        assert masked_m is None
+        return torch.ops.sgl_kernel.per_token_group_quant_fp8_cpu(x, group_size, eps)
 else:
     per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
@@ -890,6 +910,12 @@ def static_quant_fp8(
     """
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
+
+    if _is_cpu:
+        x_q, scale = torch.ops.sgl_kernel.scaled_fp8_quant_cpu(x, x_s, 0, False)
+        if repeat_scale:
+            scale = scale.repeat(x.numel() // x.shape[-1]).view(-1, 1)
+        return x_q, scale
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
@@ -2084,6 +2110,14 @@ else:
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        if _is_cpu:
+            return torch.ops.sgl_kernel.scaled_fp8_quant_cpu(
+                input,
+                scale,
+                0 if num_token_padding is None else num_token_padding,
+                use_per_token_if_dynamic,
+            )
+
         shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
