@@ -920,11 +920,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
         )
+        # Triton-family kernels return bare output unless intermediate states
+        # were requested; FlashKDA and CuTe DSL always wrap as (output, h).
+        if isinstance(core_attn_out, tuple):
+            core_attn_out, h = core_attn_out
+        else:
+            h = None
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
                 forward_batch,
                 h,
