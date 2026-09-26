@@ -46,7 +46,11 @@ class DeferringLayer(nn.Module):
         super().__init__()
         self.return_topk = return_topk
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        self.layer_communicator.allow_deferred_ffn_reduction = True
+        self.layer_communicator._ffn_output = comm.StageOutput(
+            comm.Layout(frozenset()),
+            group=comm.SumGroup.TP,
+            leaves_for_next_layer=True,
+        )
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )

@@ -202,6 +202,7 @@ class TestMlpInputOrder(CustomTestCase):
             comm._mlp_input_order(make_context(dp=2), TP_ATTN_FULL, fusions),
             comm._mlp_input_dp_replicate,
             gathers_residual=False,
+            reduces_attention_tp=False,
         )
         dp_tp = make_context(dp=2, tp=2)
         self.assert_order(
@@ -214,6 +215,7 @@ class TestMlpInputOrder(CustomTestCase):
             comm._mlp_input_order(dp_tp, SCATTERED, fusions),
             comm._mlp_input_dp_replicate,
             gathers_residual=True,
+            reduces_attention_tp=True,
         )
 
     def test_a_gather_runs_the_order_chosen_at_construction(self):

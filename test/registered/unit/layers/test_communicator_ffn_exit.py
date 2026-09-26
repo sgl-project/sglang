@@ -8,6 +8,7 @@ import torch
 
 import sglang
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     UnreducedOutput,
@@ -38,7 +39,9 @@ def make_communicator(
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
-    communicator.allow_deferred_ffn_reduction = allow_deferred
+    communicator._ffn_output = StageOutput(
+        Layout(frozenset()), group=SumGroup.TP, leaves_for_next_layer=allow_deferred
+    )
     if cls is LayerCommunicator:
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
     else:
@@ -280,12 +283,16 @@ class TestSelectFfnCompletion(CustomTestCase):
         self, *, fuse=False, is_last_layer=False, scatters=True, sp_region=False
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator.allow_deferred_ffn_reduction = True
         communicator.is_last_layer = is_last_layer
         communicator._sp_region = sp_region
         communicator._postprocess_scatters_to_local_tokens = scatters
-        communicator.allow_reduce_scatter = True
-        communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
+        communicator._ffn_output = StageOutput(
+            Layout(frozenset()),
+            group=SumGroup.MOE_OUTPUT,
+            leaves_for_next_layer=True,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        )
         communicator._ffn_sum_moves_to_next_layer = lambda forward_batch, **_: fuse
         communicator._ffn_leaves_sum_to_reduce_scatter = lambda forward_batch, dp_step: (
             not fuse

@@ -384,6 +384,9 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
 
 class MHCLayerCommunicator(LayerCommunicator):
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
+
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
