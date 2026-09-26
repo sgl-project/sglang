@@ -298,6 +298,20 @@ impl<'de> Deserialize<'de> for SamplingParamsInput {
     }
 }
 
+/// Merge endpoint adapter fields over operator defaults before applying serde defaults.
+pub(crate) fn merge_sampling_params(
+    preferred: Option<&serde_json::Value>,
+    request: serde_json::Map<String, serde_json::Value>,
+) -> Result<SamplingParams, String> {
+    let mut merged = match preferred {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        Some(_) => return Err("preferred_sampling_params must be a JSON object".into()),
+    };
+    merged.extend(request);
+    sampling_params_from_value(serde_json::Value::Object(merged))
+}
+
 fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
     let explicit_fields = value
         .as_object()
@@ -680,6 +694,45 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn preferred_params_are_shallow_defaults() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+            "custom_params": {"preferred": true, "shared": "preferred"},
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "temperature": 0.8,
+            "custom_params": {"request": true},
+        }))
+        .unwrap();
+
+        let sampling = merge_sampling_params(Some(&preferred), request).unwrap();
+        assert_eq!(sampling.temperature, 0.8);
+        assert_eq!(sampling.max_new_tokens, Some(64));
+        assert_eq!(
+            serde_json::to_value(sampling.custom_params).unwrap(),
+            serde_json::json!({"request": true})
+        );
+    }
+
+    #[test]
+    fn explicit_null_overrides_preferred() {
+        let preferred = serde_json::json!({
+            "temperature": 0.2,
+            "max_new_tokens": 64,
+        });
+        let request = serde_json::from_value(serde_json::json!({
+            "temperature": null,
+            "max_new_tokens": null,
+        }))
+        .unwrap();
+
+        let sampling = merge_sampling_params(Some(&preferred), request).unwrap();
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.max_new_tokens, None);
+    }
 
     /// Vocab size for tests that aren't about the vocab bound at all. It is
     /// mandatory now (`ServerArgs::validate_mandatory` rejects a boot without
