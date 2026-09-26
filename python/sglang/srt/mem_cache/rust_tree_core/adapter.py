@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import cache_salt_extra_keys
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -88,6 +89,14 @@ def _kv_event_from_tagged(event: tuple):
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
+            lora_name=None,
+            # Rust has already coalesced these blocks. Its existing tuple
+            # carries the parent and salt needed to recover per-block extras.
+            extra_keys=cache_salt_extra_keys(
+                parent_block_hash=event[2],
+                cache_salt=event[6],
+                num_blocks=len(event[1]),
+            ),
             cache_salt=event[6],
             session_id=event[7],
         )

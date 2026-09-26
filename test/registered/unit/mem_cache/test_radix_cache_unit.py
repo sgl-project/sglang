@@ -71,6 +71,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
             token_ids=[block_hash, block_hash + 1][:block_size],
             block_size=block_size,
             lora_id=lora_id,
+            lora_name=None,
             medium=medium,
             cache_salt=cache_salt,
             session_id=session_id,
@@ -704,6 +705,7 @@ class TestRadixCache(CustomTestCase):
 
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored[0].cache_salt, "tenant-a")
+        self.assertEqual(stored[0].extra_keys, [("tenant-a",), None])
         self.assertEqual(stored[0].parent_block_hash, None)
         self.assertEqual(len(stored[0].block_hashes), 2)
         self.assertEqual(removed[0].block_hashes, stored[0].block_hashes)

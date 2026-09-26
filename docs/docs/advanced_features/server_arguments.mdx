@@ -1031,6 +1031,20 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </tbody>
 </table>
 
+### KV event metadata
+
+When you enable `--kv-events-config`, `BlockStored` events include `medium` and
+`lora_name` even when their value is `null`. `BlockRemoved` events also include
+`medium` when it is `null`. SGLang currently emits `lora_id: null` and
+`lora_name: null`; these fields do not identify a LoRA adapter.
+
+For a request with a cache salt, `extra_keys` carries that salt on the first block
+of the full prefix. Its entries align with `block_hashes`: a two-block root event
+has `extra_keys: [["tenant-a"], null]`, while a continuation event omits
+`extra_keys`. Unsalted events omit it as well. The named `cache_salt` and
+`session_id` fields remain available when set. This metadata is emitted by both
+the Python and Rust tree cores; block hashes and transport framing are unchanged.
+
 ## RequestMetricsExporter configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
