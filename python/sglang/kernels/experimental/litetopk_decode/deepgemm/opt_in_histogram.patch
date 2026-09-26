@@ -1,0 +1,331 @@
+diff --git a/csrc/apis/attention.hpp b/csrc/apis/attention.hpp
+index 4da2570..35e3b0e 100644
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -225,7 +225,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+                                               const int& max_context_len,
+                                               const bool& clean_logits,
+                                               const at::ScalarType& logits_dtype,
+-                                              const std::optional<torch::Tensor>& indices) {
++                                              const std::optional<torch::Tensor>& indices,
++                                              const std::optional<torch::Tensor>& histogram = std::nullopt) {
+     const auto [q_fp, q_sf] = q;
+     const auto qk_dtype = q_fp.scalar_type();
+     const bool is_fp4 = qk_dtype == kPackedFP4;
+@@ -322,6 +323,15 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+     DG_HOST_ASSERT(context_lens.is_contiguous());
+     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
+ 
++    // Check optional coarse histogram: live non-NaN FP32 scores accumulate into zero-at-entry int32[B, 1024]
++    if (histogram.has_value()) {
++        DG_HOST_ASSERT(arch_major == 10 and not is_mx_sf and next_n == 1 and num_heads == 32 and head_dim == 128);
++        DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat and logits_dtype == torch::kFloat32 and not clean_logits);
++        DG_HOST_ASSERT(histogram->is_cuda() and histogram->device() == q_fp.device() and histogram->is_contiguous());
++        DG_HOST_ASSERT(histogram->scalar_type() == torch::kInt and histogram->dim() == 2);
++        DG_HOST_ASSERT(histogram->size(0) == batch_size and histogram->size(1) == 1024);
++    }
++
+     // Allocate output
+     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
+     constexpr int split_kv = 256;
+@@ -339,7 +349,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+         sm100_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
+                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk,
+-                               is_mx_sf, qk_dtype);
++                               is_mx_sf, qk_dtype, histogram ? histogram->data_ptr<int>() : nullptr);
+     } else if (arch_major == 9) {
+         DG_HOST_ASSERT(not is_mx_sf);
+         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+@@ -411,7 +421,8 @@ static void register_apis(pybind11::module_& m) {
+           py::arg("max_context_len"),
+           py::arg("clean_logits") = false,
+           py::arg("logits_dtype") = torch::kFloat32,
+-          py::arg("indices") = std::nullopt);
++          py::arg("indices") = std::nullopt,
++          py::arg("histogram") = std::nullopt);
+     // Legacy API
+     m.def("fp8_mqa_logits", &fp8_mqa_logits,
+           py::arg("q"), py::arg("kv"), py::arg("weights"),
+diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
+index c594d2b..9a8cdab 100644
+--- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
+@@ -85,12 +85,13 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+ // Sizes `MQALogitsSharedStorage` for a runtime (is_mx_sf, qk_dtype, num_heads, head_dim)
+ // BLOCK_Q = 128 / num_heads keeps UMMA_N = 128 for all supported head counts
+ static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
+-                                    const bool& is_mx_sf, const at::ScalarType& qk_dtype) {
++                                    const bool& is_mx_sf, const at::ScalarType& qk_dtype, const bool& is_q1 = false) {
+     const auto get_smem_size = [&]<typename qk_dtype_t>(auto is_mx_sf_c, auto h, auto d) {
+         constexpr bool kIsMXSF = decltype(is_mx_sf_c)::value;
+         constexpr int H = decltype(h)::value, D = decltype(d)::value;
+         constexpr int kNumKVStages = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t> ? 10 : 5;
+-        return static_cast<int>(sizeof(layout::MQALogitsSharedStorage<H, D, kIsMXSF, 128 / H, 256, 3, kNumKVStages, 3, qk_dtype_t>));
++        return static_cast<int>(is_q1 ? sizeof(layout::MQALogitsSharedStorage<H, D, kIsMXSF, 1, 256, 3, kNumKVStages, 3, qk_dtype_t>)
++                                      : sizeof(layout::MQALogitsSharedStorage<H, D, kIsMXSF, 128 / H, 256, 3, kNumKVStages, 3, qk_dtype_t>));
+     };
+     const auto dispatch_heads = [&](auto&& fn) {
+         switch (num_heads) {
+@@ -320,6 +321,7 @@ public:
+         int* block_table;
+         int* indices;
+         int* schedule_meta;
++        int* histogram;
+ 
+         CUtensorMap tensor_map_q;
+         CUtensorMap tensor_map_sf_q;
+@@ -350,7 +352,7 @@ static void __instantiate_kernel() {{
+         {}, {},
+         {}, {},
+         {}, {},
+-        {}, {}, {}
++        {}, {}, {}{}
+     >);
+ }};
+ )", args.tokens_per_request, args.num_heads,
+@@ -362,7 +364,8 @@ static void __instantiate_kernel() {{
+     args.num_specialized_threads, args.num_math_threads,
+     args.qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+     to_string(args.logits_dtype),
+-    args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
++    args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float",
++    args.histogram ? ", true" : "");
+     }
+ 
+     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+@@ -373,7 +376,7 @@ static void __instantiate_kernel() {{
+             args.block_table, args.indices, args.schedule_meta,
+             args.tensor_map_q, args.tensor_map_sf_q,
+             args.tensor_map_kv, args.tensor_map_sf_kv,
+-            args.tensor_map_weights
++            args.tensor_map_weights, args.histogram
+         ));
+     }
+ };
+@@ -401,7 +404,8 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+                                    const int& split_kv,
+                                    const int& splits_per_chunk,
+                                    const bool& is_mx_sf,
+-                                   const at::ScalarType& qk_dtype) {
++                                   const at::ScalarType& qk_dtype,
++                                   int* histogram = nullptr) {
+     const bool is_fp4 = qk_dtype == kPackedFP4;
+ 
+     const int num_specialized_threads = 128;
+@@ -412,8 +416,10 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+     // Match contiguous-KV pipeline depth.
+     const int num_kv_stages = is_fp4 ? 10 : 5;
+     // BLOCK_Q = 128 / num_heads; a Q-block holds up to BLOCK_Q request tokens
++    // The opt-in histogram variant uses a one-token Q tile unless `indices` groups tokens
+     DG_HOST_ASSERT(128 % num_heads == 0);
+-    const int block_q = 128 / num_heads;
++    const bool is_q1 = histogram != nullptr and not is_varlen;
++    const int block_q = is_q1 ? 1 : 128 / num_heads;
+ 
+     // MX SF formats consume `sf_q`; FP8 fills that descriptor slot with KV scales
+     CUtensorMap tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv;
+@@ -446,7 +452,10 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+                                                      num_heads, block_q,
+                                                      static_cast<int>(weights.stride(0)), 0);
+ 
+-    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype);
++    // The histogram variant appends 1024 int32 bins after the shared storage
++    const int smem_size = get_mqa_logits_smem_size(num_heads, head_dim, is_mx_sf, qk_dtype, is_q1) +
++                          (histogram ? 1024 * static_cast<int>(sizeof(int)) : 0);
++    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+ 
+     const SM100PagedMQALogitsRuntime::Args args = {
+         .num_q_tokens_total = num_q_tokens_total,
+@@ -468,6 +477,7 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+         .block_table = block_table.data_ptr<int>(),
+         .indices = is_varlen ? indices.data_ptr<int>() : nullptr,
+         .schedule_meta = schedule_meta.data_ptr<int>(),
++        .histogram = histogram,
+         .tensor_map_q = tensor_map_q,
+         .tensor_map_sf_q = tensor_map_sf_q,
+         .tensor_map_kv = tensor_map_kv,
+diff --git a/deep_gemm/include/deep_gemm/epilogue/coarse_histogram.cuh b/deep_gemm/include/deep_gemm/epilogue/coarse_histogram.cuh
+new file mode 100644
+index 0000000..3610b55
+--- /dev/null
++++ b/deep_gemm/include/deep_gemm/epilogue/coarse_histogram.cuh
+@@ -0,0 +1,75 @@
++#pragma once
++
++#include <cuda_fp16.h>
++#include <cutlass/arch/barrier.h>
++
++namespace deep_gemm::epilogue {
++
++// Empty default policy: no storage, initialization, cleanup or runtime branch.
++struct NoHistogram {
++    static constexpr bool kEnabled = false;
++};
++
++template <uint32_t kBins, uint32_t kMathThreads>
++__device__ __noinline__ void flush_coarse_histogram(int* local, int* global, int row) {
++    cutlass::arch::NamedBarrier(kMathThreads, 1).sync();
++    if (row >= 0) {
++        for (uint32_t bin = threadIdx.x; bin < kBins; bin += kMathThreads) {
++            const int count = local[bin];
++            if (count != 0) {
++                atomicAdd(global + static_cast<uint64_t>(row) * kBins + bin, count);
++                local[bin] = 0;
++            }
++        }
++    }
++    cutlass::arch::NamedBarrier(kMathThreads, 1).sync();
++}
++
++// Counts only live non-NaN scores. Caller owns zero-at-entry/consumer-reset of global bins.
++template <uint32_t kBins, uint32_t kMathThreads>
++struct CoarseHistogram {
++    static constexpr bool kEnabled = true;
++    static_assert(kBins == 1024);
++    int* global;
++    const uint32_t* lengths;
++    uint32_t logits_stride;
++    int* local = nullptr;
++    int current_row = -1;
++    uint32_t current_length = 0;
++
++    CUTLASS_DEVICE void initialize(int* scratch, uint32_t math_thread_idx) {
++        local = scratch;
++        for (uint32_t bin = math_thread_idx; bin < kBins; bin += kMathThreads)
++            local[bin] = 0;
++        cutlass::arch::NamedBarrier(kMathThreads, 1).sync();
++    }
++
++    CUTLASS_DEVICE void observe(uint32_t row, uint32_t column, float score) {
++        // All math threads visit the same row, including masked tail lanes.
++        if (static_cast<int>(row) != current_row) {
++            flush_coarse_histogram<kBins, kMathThreads>(local, global, current_row);
++            current_row = static_cast<int>(row);
++            current_length = lengths[row];
++        }
++        if (column < current_length && column < logits_stride && !isnan(score)) {
++            // Preserve exact FP16-RN bins below the boundary near 16.
++            // Code 304 joins that boundary to 17; later bins have width one.
++            const uint32_t bits = __float_as_uint(score);
++            uint32_t magnitude = bits & 0x7fffffffu;
++            const bool negative = (bits >> 31) && magnitude != 0;
++            int code = (__half_as_ushort(__float2half_rn(score)) & 0x7fffu) >> 6;
++            if (code >= 304) {
++                magnitude -= negative;  // lower-inclusive negative unit bins
++                const float bounded = __uint_as_float(min(magnitude, 0x435f0000u));
++                code = max(304, __float2int_rd(bounded) + 288);
++            }
++            atomicAdd(local + (negative ? 512 + code : 511 - code), 1);
++        }
++    }
++
++    CUTLASS_DEVICE void finish() {
++        flush_coarse_histogram<kBins, kMathThreads>(local, global, current_row);
++    }
++};
++
++}  // namespace deep_gemm::epilogue
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+index 969e6df..bb925d0 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+@@ -8,6 +8,7 @@
+ #include <deep_gemm/common/cute_tie.cuh>
+ #include <deep_gemm/common/tma_copy.cuh>
+ #include <deep_gemm/common/utils.cuh>
++#include <deep_gemm/epilogue/coarse_histogram.cuh>
+ #include <deep_gemm/layout/mqa_logits.cuh>
+ #include <deep_gemm/mma/sm100.cuh>
+ #include <deep_gemm/ptx/ld_st.cuh>
+@@ -57,7 +58,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
+           uint32_t kNumSMs,
+           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+           typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
+-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
++          uint32_t kNumMathWarpGroups = kNumMathThreads / 128, typename Histogram = epilogue::NoHistogram>
+ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+                                                logits_dtype_t* logits,
+                                                const cute::TmaDescriptor& tensor_map_q,
+@@ -65,7 +66,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+                                                const cute::TmaDescriptor& tensor_map_kv,
+                                                const cute::TmaDescriptor& tensor_map_sf_kv,
+                                                const cute::TmaDescriptor& tensor_map_weights,
+-                                               const MakeScheduler& make_scheduler) {
++                                               const MakeScheduler& make_scheduler, Histogram histogram = {}) {
+     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
+ 
+     const auto sm_idx = blockIdx.x;
+@@ -352,6 +353,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+ 
+         const auto math_warpgroup_idx = warpgroup_idx;
+         const auto math_thread_idx = warp_idx * 32 + lane_idx;
++        if constexpr (Histogram::kEnabled)
++            histogram.initialize(reinterpret_cast<int*>(smem_buffer + sizeof(SharedStorage)), math_thread_idx);
+         DG_STATIC_ASSERT(kNumMathWarpGroups <= kNumTmemStages, "Math warp groups exceed TMEM stages");
+         tmem_pipeline.advance(math_warpgroup_idx);
+ 
+@@ -487,6 +490,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+                             reduced = (sum.x + sum.y) / 2;
+                         }
+                         auto result = static_cast<logits_dtype_t>(kIsMXSF ? reduced : reduced * scale_kv);
++                        if constexpr (Histogram::kEnabled)
++                            histogram.observe(scheduler.get_logits_row(q_block_idx, i), kv_offset, static_cast<float>(result));
+                         const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
+                         if constexpr (kIsCompressedLogits) {
+                             const uint32_t rel_kv = kv_offset - seq_k_start[i];
+@@ -508,6 +513,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+             smem.empty_q_barriers[q_stage_idx].arrive();
+         }
+ 
++        if constexpr (Histogram::kEnabled)
++            histogram.finish();
+         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
+         if (warp_idx == 0)
+             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+@@ -556,7 +563,7 @@ template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
+           uint32_t kNumQStages, uint32_t kNumKVStages,
+           uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
+           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+-          typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t = float,
++          typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t = float, bool kWithHistogram = false,
+           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
+ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
+@@ -568,8 +575,10 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
+-                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+-    static constexpr uint32_t BLOCK_Q = 128 / kNumHeads;
++                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights,
++                            int* histogram) {
++    // The opt-in histogram variant uses a one-token Q tile unless `indices` groups tokens
++    static constexpr uint32_t BLOCK_Q = kWithHistogram and not kIsVarlen ? 1 : 128 / kNumHeads;
+     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
+     DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
+ 
+@@ -580,14 +589,21 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
+             block_table, block_table_stride, num_q_tokens_total);
+     };
+ 
++    DG_STATIC_ASSERT(not kWithHistogram or (not kIsMXSF and kTokensPerRequest == 1 and kNumHeads == 32 and kHeadDim == 128 and
++                     cute::is_same_v<logits_dtype_t, float>), "Histogram variant needs FP8 Q1/H32/D128 and FP32 logits");
++    using Histogram = cute::conditional_t<kWithHistogram, epilogue::CoarseHistogram<1024, kNumMathThreads>, epilogue::NoHistogram>;
++    Histogram emit{};
++    if constexpr (kWithHistogram)
++        emit = {histogram, context_lens, logits_stride};
++
+     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
+     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, BLOCK_Q, SPLIT_KV,
+                                kNumQStages, kNumKVStages, 0,
+                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
+-                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
++                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups, Histogram>(
+         logits_stride, logits,
+         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
+-        make_scheduler);
++        make_scheduler, emit);
+ }
+ 
+ } // namespace deep_gemm
