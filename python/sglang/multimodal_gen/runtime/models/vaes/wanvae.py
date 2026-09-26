@@ -76,6 +76,7 @@ def _channels_last_3d_supported_by_platform() -> bool:
     return hasattr(torch, "channels_last_3d") and (
         current_platform.is_cuda()
         or current_platform.is_rocm()
+        or current_platform.is_cpu()
         or current_platform.is_xpu()
     )
 

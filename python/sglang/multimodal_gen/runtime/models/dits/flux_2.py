@@ -1531,6 +1531,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.AMX_ATTN,
     }
 
     def post_load_weights(self) -> None:
