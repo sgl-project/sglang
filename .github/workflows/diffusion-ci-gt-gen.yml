@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Git ref to checkout'
+        description: 'Git ref to checkout and generate GT from. The publish scripts under scripts/ci/utils always run from the commit this workflow is dispatched from, so to test a change to them, dispatch from that branch.'
         required: false
         default: ''
         type: string
@@ -53,6 +53,11 @@ on:
         required: false
         default: true
         type: boolean
+      ci_data_branch:
+        description: "sgl-project/ci-data-diffusion branch to publish to; required unless the source ref (ref, or the dispatching branch when ref is empty) is main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or an explicit gt/<name>."
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
@@ -68,6 +73,11 @@ env:
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
   SGLANG_DIFFUSION_GT_PER_PLATFORM: "1"
+  # Recorded in ci-data commits and used to resolve the ci-data branch.
+  GT_SOURCE_REF: ${{ inputs.ref || github.ref }}
+  # Publish tooling runs from this workflow's own commit, so a ref that predates
+  # it still publishes where this workflow says.
+  GT_TOOLS_DIR: gt-publish-tools
 
 jobs:
   compute-official-gt-matrix:
@@ -76,7 +86,24 @@ jobs:
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
       case-count: ${{ steps.compute.outputs.case-count }}
+      ci-data-branch: ${{ steps.ci-data-branch.outputs.ci-data-branch }}
     steps:
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
+
+      - name: Resolve ci-data-diffusion branch
+        id: ci-data-branch
+        if: ${{ inputs.publish }}
+        env:
+          CI_DATA_BRANCH_CHOICE: ${{ inputs.ci_data_branch }}
+        run: |
+          python3 "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/ci_data_branch.py" \
+            --choice "$CI_DATA_BRANCH_CHOICE"
+
       - name: Verify write access to sgl-project/ci-data-diffusion
         if: ${{ inputs.publish }}
         env:
@@ -174,11 +201,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-official-gt-matrix.outputs.matrix) }}
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-official-gt-matrix.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Checkout ci-data-diffusion repro scripts
         uses: actions/checkout@v4
@@ -315,7 +351,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
@@ -325,7 +361,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
@@ -342,16 +378,33 @@ jobs:
       plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
       plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
       plan-b200: ${{ steps.compute.outputs.plan-b200 }}
+      ci-data-branch: ${{ steps.ci-data-branch.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Resolve ci-data-diffusion branch
+        id: ci-data-branch
+        if: ${{ inputs.publish }}
+        env:
+          CI_DATA_BRANCH_CHOICE: ${{ inputs.ci_data_branch }}
+        run: |
+          python3 "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/ci_data_branch.py" \
+            --choice "$CI_DATA_BRANCH_CHOICE"
 
       - name: Verify write access to sgl-project/ci-data-diffusion
         if: ${{ inputs.publish }}
@@ -385,11 +438,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     timeout-minutes: 150
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -437,7 +499,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
@@ -447,7 +509,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
@@ -461,11 +523,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     timeout-minutes: 150
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -515,7 +586,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
@@ -525,7 +596,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
@@ -539,11 +610,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-b200) }}
     timeout-minutes: 240
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -591,7 +671,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
@@ -601,7 +681,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
@@ -612,11 +692,20 @@ jobs:
     if: needs.compute-diffusion-partitions.result == 'success'
     runs-on: 1-gpu-5090
     timeout-minutes: 150
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -661,7 +750,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
             --check-only
@@ -671,6 +760,51 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+
+  report-ci-data-head:
+    # Every publishing job commits to the same branch; its head after all of them
+    # finish is the one SHA that holds this run's complete GT.
+    needs:
+      - compute-official-gt-matrix
+      - official-gt-hopper
+      - compute-diffusion-partitions
+      - multimodal-diffusion-gen-1gpu
+      - multimodal-diffusion-gen-2gpu
+      - multimodal-diffusion-gen-b200
+      - multimodal-diffusion-gen-5090
+    if: always() && github.repository == 'sgl-project/sglang' && inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report ci-data-diffusion branch head
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch || needs.compute-official-gt-matrix.outputs.ci-data-branch }}
+          ANY_JOB_FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ -z "$CI_DATA_BRANCH" ]; then
+            echo "No ci-data-diffusion branch was resolved; nothing was published."
+            exit 0
+          fi
+          if ! head=$(gh api "repos/sgl-project/ci-data-diffusion/git/ref/heads/$CI_DATA_BRANCH" --jq .object.sha) || [ -z "$head" ]; then
+            echo "::warning::Could not read ci-data-diffusion branch $CI_DATA_BRANCH: either no GT changed so it was never created, or the API call above failed."
+            exit 0
+          fi
+          {
+            echo "## ci-data-diffusion GT"
+            echo
+            echo "Branch \`$CI_DATA_BRANCH\` head: \`$head\`"
+            echo
+            echo "To use this GT, set the CUDA pin (the first \`SGL_TEST_FILES_CI_DATA_REVISION\` assignment, not the \`is_npu()\` one) in \`python/sglang/multimodal_gen/test/test_utils.py\` to \`$head\`."
+            if [ "$CI_DATA_BRANCH" != main ]; then
+              echo
+              echo "This is an isolated branch: it is forked from main once and not refreshed, and later pin bumps from main will not include it. Merge it into ci-data-diffusion main when the PR that pins it lands, and do not delete it while any pin points at it."
+            fi
+            if [ "$ANY_JOB_FAILED" = true ]; then
+              echo
+              echo "**Warning:** at least one generation job failed or was cancelled, so this head is missing some of this run's GT."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
