@@ -17,7 +17,6 @@ from .scoring import (
     DeepGEMMPrefillData,
     decode_scores,
     get_deep_gemm_prefill_data,
-    get_flat_index_k,
     prefill_requests,
     score_tiles,
     write_decode,
@@ -85,7 +84,12 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published, out)
 
     def publish_decode(self, inputs: DecodeInputs, out: Selection):
-        d = self._decode_scores(inputs, out)
+        d = decode_scores(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        )
         if d is None:
             return None
         published = BlockIds(
@@ -107,7 +111,12 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
         out: Selection,
     ) -> None:
-        d = self._decode_scores(inputs, out)
+        d = decode_scores(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
@@ -126,7 +135,9 @@ class DenseBlocksBackend:
             return None
         selected, blocks = _publish_prefill_blocks(
             data=data,
-            kv=self._get_flat_index_k(inputs, data),
+            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
+            ),
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
@@ -147,23 +158,25 @@ class DenseBlocksBackend:
         assert published is not None
         selected = _consume_prefill_blocks(
             data=data,
-            kv=self._get_flat_index_k(inputs, data),
+            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
+            ),
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,
             block_size=self.block_size,
         )
         data.write_selection(selected=selected, out=out)
 
-    def _get_flat_index_k(self, inputs: PrefillInputs, data: DeepGEMMPrefillData):
-        return get_flat_index_k(
-            data=data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
-        )
-
     # ---------- torch: per-request scores ----------
 
     def _torch_publish_prefill(self, inputs: PrefillInputs, out: Selection):
         picked = []  # (query rows, their block ids) per scored chunk
-        for request, chunks in self._prefill_requests(inputs, out):
+        for request, chunks in prefill_requests(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        ):
             for chunk in chunks:
                 picked.append(
                     (
@@ -196,7 +209,12 @@ class DenseBlocksBackend:
         out: Selection,
     ) -> None:
         assert published is not None
-        for request, chunks in self._prefill_requests(inputs, out):
+        for request, chunks in prefill_requests(
+            inputs=inputs,
+            out=out,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        ):
             for chunk in chunks:
                 idx = topk_among_blocks(
                     chunk.scores,
@@ -206,22 +224,6 @@ class DenseBlocksBackend:
                     block_size=self.block_size,
                 )
                 write_prefill(out, request, chunk, idx.masked_fill(idx < 0, request.lc))
-
-    def _prefill_requests(self, inputs: PrefillInputs, out: Selection):
-        return prefill_requests(
-            inputs=inputs,
-            out=out,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-        )
-
-    def _decode_scores(self, inputs: DecodeInputs, out: Selection):
-        return decode_scores(
-            inputs=inputs,
-            out=out,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-        )
 
 
 def _publish_prefill_blocks(

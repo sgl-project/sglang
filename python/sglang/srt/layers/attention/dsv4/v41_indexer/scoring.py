@@ -94,15 +94,6 @@ def get_index_k_cache(
     return k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
 
-def get_flat_index_k(
-    *,
-    data: DeepGEMMPrefillData,
-    token_to_kv_pool: DeepSeekV4TokenToKVPool,
-    layer_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return token_to_kv_pool.get_low_ratio_index_k_fp4(layer_id, data.k_slots)
-
-
 def get_deep_gemm_decode_data(
     inputs: DecodeInputs, token_to_kv_pool: DeepSeekV4TokenToKVPool
 ) -> DeepGEMMDecodeData:

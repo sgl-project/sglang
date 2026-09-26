@@ -36,7 +36,6 @@ from .scoring import (
     DeepGEMMPrefillData,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
-    get_flat_index_k,
     get_index_k_cache,
     score_tiles,
 )
@@ -123,7 +122,7 @@ class SparseTableBackend:
 
     def publish_prefill(self, inputs: PrefillInputs, out: Selection):
         out.reset()
-        data = self._get_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
         selected = data.empty_selection(inputs.indexer.index_topk)
@@ -132,10 +131,8 @@ class SparseTableBackend:
         )
         table = publish_prefill_table(
             data=data,
-            kv=get_flat_index_k(
-                data=data,
-                token_to_kv_pool=self.token_to_kv_pool,
-                layer_id=inputs.layer_id,
+            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
             ),
             index_page_table=expand_index_page_table(
                 inputs.kv_page_table[: data.num_rows],
@@ -157,7 +154,7 @@ class SparseTableBackend:
         out: Selection,
     ) -> None:
         out.reset()
-        data = self._get_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
         assert published is not None
@@ -326,9 +323,6 @@ class SparseTableBackend:
         topk_transform_sparse(
             logits, published.valid_lens, published.phys_blocks, out.page_indices
         )
-
-    def _get_prefill_data(self, inputs: PrefillInputs) -> Optional[DeepGEMMPrefillData]:
-        return get_deep_gemm_prefill_data(inputs, self.req_to_token)
 
     def _get_request_ids(self, inputs: DecodeInputs, rows: int, device: torch.device):
         if inputs.is_verify:

@@ -18,7 +18,6 @@ from .scoring import (
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
-    get_flat_index_k,
     get_index_k_cache,
     prefill_requests,
     quantize_index_q,
@@ -70,8 +69,8 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
-        kv = get_flat_index_k(
-            data=data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
+        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+            inputs.layer_id, data.k_slots
         )
         selected = dense_prefill_topk(data, kv, topk=inputs.indexer.index_topk)
         data.write_selection(selected=selected, out=out)
