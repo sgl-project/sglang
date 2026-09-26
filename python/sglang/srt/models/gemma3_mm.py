@@ -48,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_xpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -220,7 +220,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(get_attn_backend(), TritonAttnBackend):
+        backend = get_attn_backend()
+        if isinstance(backend, TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -271,6 +272,44 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 get_attn_backend().forward_metadata.custom_mask = (
                     bidirectional_attn_masks
                 )
+        elif is_xpu():
+            # XPU takes a per extend-token image-block id (image index, -1 for
+            # text); the sgl-kernel-xpu FMHA prefill turns it into bidirectional
+            # image attention (see xpu_backend.forward_extend). Import lazily so
+            # non-XPU builds are unaffected.
+            from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+            if isinstance(backend, XPUAttentionBackend):
+                assert forward_batch.forward_mode == ForwardMode.EXTEND
+                backend.bidirectional_block_ids = self._build_xpu_image_block_ids(
+                    forward_batch, input_ids.device
+                )
+
+    def _build_xpu_image_block_ids(self, forward_batch: ForwardBatch, device):
+        # Reads the image spans out of the sglang-specific ForwardBatch /
+        # MultimodalInputs, then delegates the framework-agnostic tensor build to
+        # sgl-kernel-xpu. This extraction stays in the model on purpose: it is
+        # sglang layout (batch fields, per-item mm offsets) and must not leak into
+        # the kernel package, which cannot import sglang types; the reusable
+        # constructor lives there as build_bidirectional_block_ids.
+        # Unique id per image span, -1 for text. The kernel indexes extend tokens
+        # only, so require full prefill (no cached prefix); return None (no mask)
+        # when a prefix is present or there are no images.
+        from sgl_kernel.flash_attn import build_bidirectional_block_ids
+
+        seq_lens, block_spans = [], []
+        for i in range(forward_batch.batch_size):
+            if int(forward_batch.extend_prefix_lens[i]) != 0:
+                return None
+            seq_lens.append(int(forward_batch.extend_seq_lens[i]))
+            spans = []
+            mm_inputs = forward_batch.mm_inputs[i]
+            if mm_inputs is not None:
+                for mm_item in mm_inputs.mm_items:
+                    if mm_item.is_image():
+                        spans.extend(mm_item.offsets)
+            block_spans.append(spans)
+        return build_bidirectional_block_ids(seq_lens, block_spans, device)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
