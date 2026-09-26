@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -7,6 +8,9 @@ from gguf import GGMLQuantizationType
 from sglang.srt.layers.quantization.awq.awq import AWQMarlinConfig
 from sglang.srt.layers.quantization.awq.schemes.awq_cpu import (
     AWQIntelAMXLinearScheme,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
@@ -125,6 +129,35 @@ class TestCPUQuantOps(CustomTestCase):
                 params_dtype=torch.bfloat16,
                 weight_loader=lambda *args, **kwargs: None,
             )
+
+    def test_compressed_tensors_wna16_cpu_apply(self):
+        x = torch.rand(2, 4096, dtype=torch.bfloat16)
+        qweight = torch.randint(-128, 128, (512, 4096), dtype=torch.int32)
+        qzeros = torch.randint(0, 10, (32, 512), dtype=torch.int32)
+        scales = torch.rand(32, 4096, dtype=torch.bfloat16) / 10
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                qweight, qzeros, scales, 1
+            )
+        )
+        layer = SimpleNamespace(
+            qweight=packed_weight,
+            qzeros=packed_zero,
+            scales=packed_scales,
+        )
+        scheme = CompressedTensorsWNA16(
+            strategy="group",
+            num_bits=4,
+            group_size=128,
+            symmetric=False,
+        )
+
+        out = scheme.apply_weights(layer, x, None)
+        ref = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x, packed_weight, packed_zero, packed_scales, None
+        )
+
+        torch.testing.assert_close(out, ref)
 
 
 if __name__ == "__main__":
