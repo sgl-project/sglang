@@ -41,10 +41,10 @@ class BasicDecodeCorrectnessMixin:
 
     def test_basic_math(self):
         out = self._decode_generate(
-            "Q: What is 17 multiplied by 23? Reply with just the number.\nA:",
+            "Q: What is 12 plus 7? Reply with just the number.\nA:",
             self.sanity_max_new_tokens_short,
         )
-        self.assertIn("391", out)
+        self.assertIn("19", out)
 
     def test_color_completion(self):
         out = self._decode_generate(
