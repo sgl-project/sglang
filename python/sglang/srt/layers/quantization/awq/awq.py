@@ -42,12 +42,13 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 if not (_is_cuda or _is_hip or _is_xpu or _is_npu):
     warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
@@ -279,9 +280,10 @@ class AWQMarlinConfig(QuantizationConfig):
 
         self.quant_type = self.TYPE_MAP[self.weight_bits]
 
-        verify_marlin_supported(
-            self.quant_type, group_size=self.group_size, has_zp=self.zero_point
-        )
+        if not _is_cpu:
+            verify_marlin_supported(
+                self.quant_type, group_size=self.group_size, has_zp=self.zero_point
+            )
 
     def __repr__(self) -> str:
         return (
@@ -393,9 +395,13 @@ class AWQMarlinConfig(QuantizationConfig):
         return None
 
     def get_linear_scheme(self, layer: torch.nn.Module):
+        if _is_cpu:
+            return AWQIntelAMXLinearScheme(self)
         return AWQMarlinLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
+        if _is_cpu:
+            return AWQIntelAMXMoEScheme(self)
         return AWQMoEScheme(self)
 
     @classmethod

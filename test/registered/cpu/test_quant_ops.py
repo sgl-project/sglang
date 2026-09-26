@@ -4,7 +4,15 @@ import sgl_kernel  # noqa: F401
 import torch
 from gguf import GGMLQuantizationType
 
+from sglang.srt.layers.quantization.awq.awq import AWQMarlinConfig
+from sglang.srt.layers.quantization.awq.schemes.awq_cpu import (
+    AWQIntelAMXLinearScheme,
+)
 from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq.schemes.gptq_cpu import (
+    GPTQIntelAMXLinearScheme,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,6 +75,56 @@ class TestCPUQuantOps(CustomTestCase):
         out = fused_mul_mat_gguf(x, qweight, GGMLQuantizationType.Q4_0)
 
         torch.testing.assert_close(out, x @ weight.T, atol=0.3, rtol=0.3)
+
+    def test_marlin_configs_select_cpu_int4_schemes(self):
+        gptq_config = GPTQMarlinConfig(
+            weight_bits=4,
+            group_size=32,
+            desc_act=False,
+            is_sym=True,
+            lm_head_quantized=False,
+            dynamic={},
+            full_config={},
+        )
+        awq_config = AWQMarlinConfig(
+            weight_bits=4,
+            group_size=32,
+            zero_point=True,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        )
+
+        self.assertIsInstance(
+            gptq_config.get_linear_scheme(object()), GPTQIntelAMXLinearScheme
+        )
+        self.assertIsInstance(
+            awq_config.get_linear_scheme(object()), AWQIntelAMXLinearScheme
+        )
+
+    def test_gptq_marlin_cpu_rejects_unsupported_desc_act(self):
+        gptq_config = GPTQMarlinConfig(
+            weight_bits=4,
+            group_size=32,
+            desc_act=True,
+            is_sym=True,
+            lm_head_quantized=False,
+            dynamic={},
+            full_config={},
+        )
+        scheme = GPTQIntelAMXLinearScheme(gptq_config)
+        layer = torch.nn.Module()
+
+        with self.assertRaisesRegex(ValueError, "desc_act"):
+            scheme.create_weights(
+                layer=layer,
+                input_size_per_partition=64,
+                output_partition_sizes=[64],
+                input_size=64,
+                output_size=64,
+                params_dtype=torch.bfloat16,
+                weight_loader=lambda *args, **kwargs: None,
+            )
 
 
 if __name__ == "__main__":
