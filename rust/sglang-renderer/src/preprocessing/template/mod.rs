@@ -530,23 +530,23 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
 
 /// A legacy conversation template, mirroring Python's `Conversation` fields.
 #[derive(Debug, Clone)]
-pub(super) struct LegacySpec {
+pub struct LegacySpec {
     /// Python `Conversation.name` — drives the CHATGLM round-offset quirk.
-    pub(super) name: String,
-    pub(super) system_template: String,
-    pub(super) system_message: String,
+    pub name: String,
+    pub system_template: String,
+    pub system_message: String,
     /// `(user_role, assistant_role)` — Python `Conversation.roles`.
-    pub(super) roles: (String, String),
-    pub(super) style: String,
-    pub(super) sep: String,
+    pub roles: (String, String),
+    pub style: String,
+    pub sep: String,
     /// `None` = Python's `Conversation.sep2` default. Styles that alternate
     /// seps (`seps[i % 2]`) need it set; Python crashes on `None` there and we
     /// error deliberately.
-    pub(super) sep2: Option<String>,
+    pub sep2: Option<String>,
     /// Python `Conversation.stop_str` (`str | list[str] | None`).
-    pub(super) stop_str: Option<OneOrMany<String>>,
-    pub(super) image_token: String,
-    pub(super) audio_token: String,
+    pub stop_str: Option<OneOrMany<String>>,
+    pub image_token: String,
+    pub audio_token: String,
 }
 
 impl Default for LegacySpec {
@@ -571,11 +571,11 @@ impl Default for LegacySpec {
 /// order, optionally append the assistant opening, then render per `sep_style`.
 #[derive(Clone)]
 pub struct LegacyFormatter {
-    pub(super) spec: LegacySpec,
+    pub spec: LegacySpec,
 }
 
 impl LegacyFormatter {
-    pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
+    pub fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
         let mut system_message = self.spec.system_message.clone();
         let mut messages: Vec<(String, String)> = Vec::new();
         let typed_messages = request
@@ -1125,7 +1125,7 @@ fn extract_assistant_text(
 }
 
 #[derive(Debug, Error)]
-pub(super) enum TemplateError {
+pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
     Read {
         kind: &'static str,
@@ -1277,7 +1277,7 @@ pub(super) fn load_chat_formatter(
 /// built-in template from the model path, optionally consulting the model's
 /// `config.json` `model_type`. `None` when nothing matches — the HF template
 /// is the fallback then, as in Python.
-fn infer_legacy_template_from_model_path(model_path: &str) -> Option<LegacySpec> {
+pub fn infer_legacy_template_from_model_path(model_path: &str) -> Option<LegacySpec> {
     let lower = model_path.to_lowercase();
     // Regexes without regex: every Python pattern here is a plain substring or
     // a `prefix.*suffix` pair, both on a lowercased path.
@@ -1439,7 +1439,7 @@ pub(super) fn test_hugging_face_formatter_from_config(config: Value) -> ChatForm
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`
 /// exactly (missing `sep2`/`image_token`/`audio_token` stay at Python defaults).
-fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, TemplateError> {
+pub fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, TemplateError> {
     let object = value
         .as_object()
         .ok_or_else(|| TemplateError::LegacyNotObject {
@@ -1520,7 +1520,7 @@ fn parse_legacy_template(value: &Value, path: &Path) -> Result<LegacySpec, Templ
     })
 }
 
-pub(crate) fn builtin_template(name: &str) -> Option<LegacySpec> {
+pub fn builtin_template(name: &str) -> Option<LegacySpec> {
     let spec = match name {
         "llama-2" => LegacySpec {
             name: name.into(),
