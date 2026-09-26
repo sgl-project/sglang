@@ -41,7 +41,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
-
+    
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
@@ -83,7 +83,9 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "(uniform-FP8 KV pool, decode + sparse prefill)."
         )
 
-    if cfg.max_running_requests is None:
+    # Leave the field unset under speculative decoding so the speculative hook,
+    # a later writer, can apply its own default of 48 (see #33199).
+    if cfg.max_running_requests is None and cfg.speculative_algorithm is None:
         declare_resolution(
             server_args,
             "apply_deepseek_v4_defaults",
