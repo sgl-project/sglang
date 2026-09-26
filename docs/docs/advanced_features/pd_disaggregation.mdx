@@ -379,6 +379,16 @@ pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 ```
 
 
+Prefill reconnects disconnected peers by default with UCX and NIXL >= 1.4.1.
+Set `SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT=0` to disable recovery.
+Older NIXL versions and other backends keep their existing behavior.
+
+Affected requests fail. Prefill drains their transfers, rebuilds the peer's
+metadata and destination descriptors, then resumes new transfers. Draining has
+a five-second timeout; inability to inspect or retire transfers shuts down
+prefill. Run under a supervisor that replaces failed workers. Failed registration
+is retried on later requests; there is no overall reconnect deadline.
+
 ### Usage
 
 ### Llama Single Node
