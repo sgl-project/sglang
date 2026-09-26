@@ -143,6 +143,18 @@ def amax_topk_blocks(
     return blocks
 
 
+def candidate_block_mask(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """Materialize a source's block IDs once for Hopper paged-score consumers."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
