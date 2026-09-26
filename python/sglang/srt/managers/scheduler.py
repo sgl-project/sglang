@@ -359,6 +359,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.stale_shm_cleanup import cleanup_stale_shm
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
@@ -6046,6 +6047,13 @@ def run_scheduler_process(
         display_moe_ep_rank=display_moe_ep_rank,
     )
     parent_process = psutil.Process().parent()
+
+    # Reclaim /dev/shm segments leaked by a previous SIGKILLed run before any
+    # component can die on a full tmpfs (load snapshot mmap SIGBUS, NCCL
+    # proxy shm ENOSPC). Pid-stamped rule only: orphan families (nccl-* etc.)
+    # are never unconditionally unlinked here — a concurrent live server on
+    # the same machine may own them.
+    cleanup_stale_shm(include_orphans=False)
 
     # Set up tracing
     if get_observability().enable_trace:
