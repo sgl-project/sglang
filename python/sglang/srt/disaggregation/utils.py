@@ -1468,6 +1468,21 @@ def setup_state_kv_args(
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                # The NextN draft's index cache rides behind the target's entries,
+                # as in the plain DSATokenToKVPool branch below: the draft pool
+                # shares the target's token ids, so the same page indices address
+                # it, and a peer without a draft (target-only prefill) registers
+                # fewer entries, which pair with the leading ones.
+                draft_dsa_pool = (
+                    draft_token_to_kv_pool
+                    if isinstance(draft_token_to_kv_pool, DSATokenToKVPool)
+                    else None
+                )
+                if draft_dsa_pool is not None:
+                    d_ptrs, d_lens, d_item_lens = draft_dsa_pool.get_state_buf_infos()
+                    dsa_ptrs = list(dsa_ptrs) + list(d_ptrs)
+                    dsa_lens = list(dsa_lens) + list(d_lens)
+                    dsa_item_lens = list(dsa_item_lens) + list(d_item_lens)
                 append_state_component(
                     kv_args,
                     StateType.DSA,
@@ -1476,6 +1491,12 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+                # The draft's kpool tail gets its own component: tail pointer lists
+                # are split into key/score halves when the peers' lists differ in
+                # length, so appending it to the target's list would misalign a
+                # target-only peer.
+                if draft_dsa_pool is not None:
+                    append_dsa_tail(draft_dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
