@@ -6,6 +6,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+from sglang.srt.runtime_context import get_platform
 
 INDEX_HEAD_DIM = 128
 # One index-K slot: 64 packed e2m1 bytes and four ue8m0 block exponents.
@@ -133,6 +134,56 @@ def _quantize_fp4_indexer_kernel(
 
 
 @triton.jit
+def _quantize_fp4_indexer_rows(
+    x,
+    x_fp4,
+    x_sf,
+    M,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N == 128 and GROUP_N == 32)
+    # Each reduction covers one scale group. Keep its values for packing,
+    # avoiding four masked full-row reductions and a second input load.
+    group = tl.program_id(0) * BLOCK_M * 4 + tl.arange(0, BLOCK_M * 4)
+    offs = tl.arange(0, GROUP_N)
+    values = tl.load(
+        x + group[:, None].to(tl.int64) * GROUP_N + offs[None, :],
+        group[:, None] < M * 4,
+        0,
+    ).to(tl.float32)
+    amax = tl.max(tl.abs(values), axis=1)
+    exp = _ceil_ue8m0_exp(tl.maximum(amax / 6.0, 1.0e-4))
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    v0, v1 = tl.split(
+        tl.reshape(values / scale[:, None], (BLOCK_M * 4, GROUP_N // 2, 2))
+    )
+    if RNE:
+        code0 = _fp4_e2m1_code_rne(v0)
+        code1 = _fp4_e2m1_code_rne(v1)
+    else:
+        code0 = _fp4_e2m1_code(v0)
+        code1 = _fp4_e2m1_code(v1)
+    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    tl.store(
+        x_fp4
+        + group[:, None].to(tl.int64) * (GROUP_N // 2)
+        + tl.arange(0, GROUP_N // 2)[None, :],
+        packed,
+        group[:, None] < M * 4,
+    )
+    # The four exponents occupy disjoint bytes, so integer sum packs them.
+    shifts = tl.arange(0, 4) * 8
+    packed_sf = tl.sum(
+        tl.reshape(exp.to(tl.uint32), (BLOCK_M, 4)) << shifts[None, :], axis=1
+    )
+    token_id = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    tl.store(x_sf + token_id, packed_sf.to(tl.int32), token_id < M)
+
+
+@triton.jit
 def _store_fp4_index_k_cache_kernel(
     k_fp4,
     k_sf,
@@ -169,7 +220,20 @@ def quantize_fp4_indexer_tensor(
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
     x_sf = torch.empty((x.shape[0],), device=x.device, dtype=torch.int32)
-    if x.shape[0] > 0:
+    if x.shape[0] >= 4096 and get_platform().is_blackwell:
+        # Independent rows share a CTA to avoid one block per 128 values.
+        _quantize_fp4_indexer_rows[(triton.cdiv(x.shape[0], 8),)](
+            x,
+            x_fp4,
+            x_sf,
+            x.shape[0],
+            8,
+            BLOCK_N=128,
+            GROUP_N=32,
+            RNE=rne,
+            num_warps=4,
+        )
+    elif x.shape[0] > 0:
         _quantize_fp4_indexer_kernel[(x.shape[0],)](
             x,
             x_fp4,
@@ -360,6 +424,11 @@ def _fp4_index_logits_kernel(
     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
     BLOCK_L: tl.constexpr,
 ):
+    # The caller returns for L == 0 and makes q contiguous. Exclude singleton
+    # heads, whose stride is not constrained by PyTorch contiguity.
+    tl.assume(L > 0)
+    if H > 1:
+        tl.assume(stride_qh == HALF_D * 2)
     b = tl.program_id(0)
     lb = tl.program_id(1)
     offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)
@@ -369,56 +438,68 @@ def _fp4_index_logits_kernel(
     )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
 
     n_vis = tl.load(lens_ptr + b)
-    valid = offs_l < tl.minimum(n_vis, L)
-    slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(tl.int64)
-    page = slot // page_size
-    off = slot % page_size
-    row_base = page * row_stride
+    # Graph replay keeps the capacity-sized grid even for short live contexts.
+    # Skip whole invisible tiles using the current device-side length; masking
+    # only the K loads would still run dequantization, dot products and reduction.
+    if lb * BLOCK_L >= n_vis:
+        tl.store(out_ptr + b * L + offs_l, float("-inf"), mask=offs_l < L)
+    else:
+        valid = offs_l < tl.minimum(n_vis, L)
+        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
+            tl.int64
+        )
+        page = slot // page_size
+        off = slot % page_size
+        row_base = page * row_stride
 
-    # K payload: [BLOCK_L, HALF_D] uint8
-    pay = tl.load(
-        table_ptr
-        + row_base[:, None]
-        + off[:, None] * INDEX_K_PAYLOAD_BYTES
-        + offs_i[None, :],
-        mask=valid[:, None],
-        other=0,
-    )
-    low = _e2m1_decode(pay & 0x0F)
-    high = _e2m1_decode((pay >> 4) & 0x0F)
-    # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
-    sc_idx = offs_i // 16
-    exps = tl.load(
-        table_ptr
-        + row_base[:, None]
-        + page_size * INDEX_K_PAYLOAD_BYTES
-        + off[:, None] * INDEX_K_SCALE_BYTES
-        + sc_idx[None, :],
-        mask=valid[:, None],
-        other=127,
-    )
-    scale = tl.exp2(exps.to(tl.float32) - 127.0)
-    k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
-    k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
+        # K payload: [BLOCK_L, HALF_D] uint8
+        pay = tl.load(
+            table_ptr
+            + row_base[:, None]
+            + off[:, None] * INDEX_K_PAYLOAD_BYTES
+            + offs_i[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+        low = _e2m1_decode(pay & 0x0F)
+        high = _e2m1_decode((pay >> 4) & 0x0F)
+        # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
+        sc_idx = offs_i // 16
+        exps = tl.load(
+            table_ptr
+            + row_base[:, None]
+            + page_size * INDEX_K_PAYLOAD_BYTES
+            + off[:, None] * INDEX_K_SCALE_BYTES
+            + sc_idx[None, :],
+            mask=valid[:, None],
+            other=127,
+        )
+        scale = tl.exp2(exps.to(tl.float32) - 127.0)
+        k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
+        k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
 
-    # queries: even / odd elements, [H, HALF_D] bf16
-    q_even = tl.load(
-        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
-    )
-    q_odd = tl.load(
-        q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :] + 1
-    )
+        # queries: even / odd elements, [H, HALF_D] bf16
+        q_even = tl.load(
+            q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
+        )
+        q_odd = tl.load(
+            q_ptr
+            + b * stride_qb
+            + offs_h[:, None] * stride_qh
+            + 2 * offs_i[None, :]
+            + 1
+        )
 
-    acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
-    acc += tl.dot(q_odd, tl.trans(k_high))
-    # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
-    s = acc.to(tl.bfloat16).to(tl.float32)
-    s = tl.maximum(s, 0.0)
-    w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
-    s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
-    logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
-    logit = tl.where(valid, logit, float("-inf"))
-    tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
+        acc = tl.dot(q_even, tl.trans(k_low))  # [H, BLOCK_L] fp32
+        acc += tl.dot(q_odd, tl.trans(k_high))
+        # reference rounding points: bf16 dot -> relu -> * bf16 weight -> bf16 -> sum -> bf16
+        s = acc.to(tl.bfloat16).to(tl.float32)
+        s = tl.maximum(s, 0.0)
+        w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
+        s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+        logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
+        logit = tl.where(valid, logit, float("-inf"))
+        tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
 
 
 def fp4_index_logits_decode(

@@ -77,6 +77,9 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
+    def load_condition_image(self, image):
+        return load_image(image)
+
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
     ) -> Iterator[Req]:
@@ -87,13 +90,15 @@ class InputValidationStage(PipelineStage):
         if num_outputs == 1:
             return iter((batch,))
 
-        return iter(
-            expand_request_outputs(
-                batch,
-                reuse_parent_trace_ctx=True,
-                preserve_parent_metrics=True,
-            )
+        outputs = expand_request_outputs(
+            batch,
+            reuse_parent_trace_ctx=True,
+            preserve_parent_metrics=True,
         )
+        # expansion resets generators after this stage has already validated them
+        for output in outputs:
+            self._generate_seeds(output, server_args)
+        return iter(outputs)
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -429,7 +434,7 @@ class InputValidationStage(PipelineStage):
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = self.load_condition_image(path)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -443,7 +448,7 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,

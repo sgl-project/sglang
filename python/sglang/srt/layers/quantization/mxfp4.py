@@ -253,6 +253,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
         k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
         scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
+        # No scale layout carries the warp count below Hopper, and the tile
+        # formula gives the batch-1 decode tile a single warp.
+        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -677,9 +681,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # (keeping both layouts OOMs: 92 layers double the experts).
                 from deep_gemm import transform_weights_for_mega_moe
 
-                from sglang.srt.layers.moe.mega_moe import _mega_moe_mma_type
+                from sglang.srt.layers.moe.mega_moe import (
+                    _mega_moe_mma_type,
+                    check_mega_moe_shapes,
+                )
 
                 mma_type = _mega_moe_mma_type()
+                check_mega_moe_shapes(
+                    hidden=layer.w13_weight.shape[2] * 2,
+                    intermediate=layer.w13_weight.shape[1] // 2,
+                    mma_type=mma_type,
+                )
                 l1_pair, l2_pair = transform_weights_for_mega_moe(
                     (layer.w13_weight.data, layer.w13_weight_scale.data),
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
