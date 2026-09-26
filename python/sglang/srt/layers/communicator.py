@@ -999,8 +999,9 @@ class LayerCommunicator:
         ffn_input, fused = self._select_mlp_input()
         modes = self.layer_scatter_modes
         ops = self._residual_ops
+        ffn_rows = self._context.layouts[modes.mlp_mode]
         ffn_output = StageOutput(
-            self._context.layouts[modes.mlp_mode],
+            ffn_rows,
             group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
             leaves_for_next_layer=self.allow_deferred_ffn_reduction,
             leaves_for_reduce_scatter=self.allow_reduce_scatter,
@@ -1014,6 +1015,7 @@ class LayerCommunicator:
         return BoundarySteps(
             attention_input=attention_input,
             ffn_input=ffn_input,
+            ffn_input_rows=ffn_rows,
             ffn_output=ffn_output,
             # Under attention DP the base postprocess scatters the FFN output
             # back to this rank's tokens, which the next layer's input can run
@@ -1145,15 +1147,16 @@ class LayerCommunicator:
         if self._publish_lora_layout:
             get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
 
-    def publish_mlp_lora_layout(self) -> None:
-        """The MLP consumes the TP-global batch only after a FULL DP gather."""
+    def publish_mlp_lora_layout(self, steps: "BoundarySteps") -> None:
+        """The MLP consumes the TP-global batch only when the batch's FFN input
+        is gathered over attention DP."""
         if self._publish_lora_layout:
             get_forward().set(
                 "lora_batch_layout",
                 (
-                    LoRABatchLayout.TP_GLOBAL
-                    if self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
-                    else LoRABatchLayout.DP_LOCAL
+                    LoRABatchLayout.DP_LOCAL
+                    if TokenAxis.ATTN_DP in steps.ffn_input_rows.sharded
+                    else LoRABatchLayout.TP_GLOBAL
                 ),
             )
 
@@ -1397,11 +1400,12 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
-        self.publish_mlp_lora_layout()
+        steps = self._batch_steps(forward_batch)
+        self.publish_mlp_lora_layout(steps)
         if cache is not None:
             self._context.cache = cache
 
-        return self._batch_steps(forward_batch).ffn_input(
+        return steps.ffn_input(
             hidden_states,
             residual,
             forward_batch,
@@ -2285,6 +2289,8 @@ class BoundarySteps(msgspec.Struct, frozen=True):
 
     attention_input: Callable
     ffn_input: Callable
+    # The rows ffn_input hands the FFN.
+    ffn_input_rows: Layout
     # What the FFN exit reads: the FFN output's group and what it may leave.
     ffn_output: StageOutput
     # The postprocess that moves the FFN output on; None when it goes back over
@@ -2353,6 +2359,11 @@ def _select_boundary_steps(
     return BoundarySteps(
         attention_input=_select_attention_input_move(rows, sides.attention),
         ffn_input=ffn_input,
+        # What the FFN needs, still sharded over the axes it gathers itself.
+        ffn_input_rows=Layout(
+            sides.ffn.layout.sharded
+            | (sides.attention_output.layout.sharded & sides.ffn.gathers_itself)
+        ),
         ffn_output=sides.ffn_output,
         ffn_output_move=None if returns_over_dp else ffn_output_move,
         ffn_output_move_completes_sum=completes_sum,

@@ -188,6 +188,7 @@ class TestSpRegionSteps(CustomTestCase):
         return comm.BoundarySteps(
             attention_input=attention_input,
             ffn_input=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
+            ffn_input_rows=Layout(frozenset()),
             ffn_output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
             ffn_output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
             ffn_sum_is_movable=True,

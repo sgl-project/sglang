@@ -39,6 +39,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusionLayerCommunicator
+from sglang.srt.runtime_context import LoRABatchLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -923,6 +924,108 @@ class TestTwoBatchOverlap(CustomTestCase):
         )
 
 
+class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
+    """Under attention DP, LoRA routes the FFN's rows TP-global exactly when the
+    batch's FFN input step gathers them over attention DP."""
+
+    def build(self, modes, parallel, *, a2a, two_batch_overlap, declared):
+        overlap = SimpleNamespace(
+            overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap)
+        )
+        with (
+            planning(parallel, a2a=a2a),
+            patch.object(comm, "get_exec", lambda: overlap),
+            # Otherwise the scatter-mode steps, which the subclasses that pick
+            # their own steps run.
+            patch.object(LayerCommunicator, "_takes_declared_boundaries", declared),
+        ):
+            communicator = LayerCommunicator(
+                layer_scatter_modes=modes,
+                input_layernorm=Norm(),
+                post_attention_layernorm=Norm(),
+            )
+        communicator._publish_lora_layout = True
+        return communicator
+
+    def test_the_rows_are_the_mlp_mode_layout(self):
+        for (
+            attn_dp,
+            attn_tp,
+            layer_id,
+            sparse,
+            previous_sparse,
+            a2a,
+            dense_fully_dp,
+            two_batch_overlap,
+            declared,
+        ) in itertools.product(
+            (1, 2, 4),
+            (1, 2),
+            (0, 1, 3),
+            (False, True),
+            (False, True),
+            (False, True),
+            (False, True),
+            (False, True),
+            (True, False),
+        ):
+            if two_batch_overlap and attn_dp == 1:
+                continue
+            with self.subTest(
+                attn_dp=attn_dp,
+                attn_tp=attn_tp,
+                layer_id=layer_id,
+                sparse=sparse,
+                previous_sparse=previous_sparse,
+                a2a=a2a,
+                dense_fully_dp=dense_fully_dp,
+                two_batch_overlap=two_batch_overlap,
+                declared=declared,
+            ):
+                parallel = parallel_of(
+                    attn_dp=attn_dp,
+                    attn_tp=attn_tp,
+                    moe_dense_tp_size=1 if dense_fully_dp else None,
+                )
+                modes = planned_modes(
+                    layer_id,
+                    4,
+                    sparse=sparse,
+                    previous_sparse=previous_sparse,
+                    parallel=parallel,
+                    a2a=a2a,
+                )
+                communicator = self.build(
+                    modes,
+                    parallel,
+                    a2a=a2a,
+                    two_batch_overlap=two_batch_overlap,
+                    declared=declared,
+                )
+                steps = communicator._steps
+                self.assertEqual(
+                    steps.ffn_input_rows, communicator._context.layouts[modes.mlp_mode]
+                )
+                published = {}
+                with patch.object(
+                    comm,
+                    "get_forward",
+                    lambda: SimpleNamespace(set=published.__setitem__),
+                ):
+                    communicator.publish_mlp_lora_layout(steps)
+                # LoRA admits attention DP only with attention TP 1, where the
+                # gather over attention DP is the FULL mode.
+                if attn_dp > 1 and attn_tp == 1:
+                    self.assertIs(
+                        published["lora_batch_layout"],
+                        (
+                            LoRABatchLayout.TP_GLOBAL
+                            if modes.mlp_mode is ScatterMode.FULL
+                            else LoRABatchLayout.DP_LOCAL
+                        ),
+                    )
+
+
 class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
     """prepare_mlp completes the attention-TP sum exactly when the attention
     output's declaration says it is owed, whatever the attention-TP size."""
@@ -1103,6 +1206,8 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     SP_STEPS = comm.BoundarySteps(
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
+        # The linears gather each rank's slice themselves.
+        ffn_input_rows=comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})),
         ffn_output=sequence_parallel_layer_sides(axis_sizes=SIZES).ffn_output,
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=False,

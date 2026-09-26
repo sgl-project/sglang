@@ -35,6 +35,7 @@ def steps(*, ffn_output_move):
     return comm.BoundarySteps(
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
+        ffn_input_rows=comm.Layout(frozenset()),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=ffn_output_move,
         ffn_sum_is_movable=False,

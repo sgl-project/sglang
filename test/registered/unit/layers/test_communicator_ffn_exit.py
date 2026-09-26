@@ -51,6 +51,7 @@ def ordinary_steps(ffn_output, *, returns_over_dp=False):
     return comm.BoundarySteps(
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
+        ffn_input_rows=Layout(frozenset()),
         ffn_output=ffn_output,
         ffn_output_move=(
             None if returns_over_dp else comm.CommunicateSummableTensorPairFn._trivial

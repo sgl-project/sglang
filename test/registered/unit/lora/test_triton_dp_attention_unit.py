@@ -8,7 +8,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.boundary_layout import Layout, TokenAxis
+from sglang.srt.layers.communicator import LayerCommunicator
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -197,11 +198,11 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
         )
 
 
-@pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])
+@pytest.mark.parametrize("gathered_over_dp", [True, False])
 @pytest.mark.parametrize("num_tokens", [0, 2])
 @pytest.mark.parametrize("publish_lora_layout", [False, True])
 def test_communicator_publishes_layout_at_each_transition(
-    monkeypatch, mlp_mode, num_tokens, publish_lora_layout
+    monkeypatch, gathered_over_dp, num_tokens, publish_lora_layout
 ):
     monkeypatch.setattr(
         "sglang.srt.layers.communicator.get_parallel",
@@ -210,9 +211,7 @@ def test_communicator_publishes_layout_at_each_transition(
     # Start from TP_GLOBAL so an unpublished transition is distinguishable.
     initial = LoRABatchLayout.TP_GLOBAL
     expected_mlp = (
-        LoRABatchLayout.TP_GLOBAL
-        if mlp_mode is ScatterMode.FULL
-        else LoRABatchLayout.DP_LOCAL
+        LoRABatchLayout.TP_GLOBAL if gathered_over_dp else LoRABatchLayout.DP_LOCAL
     )
     expected_attn = LoRABatchLayout.DP_LOCAL
     if not publish_lora_layout:
@@ -220,27 +219,26 @@ def test_communicator_publishes_layout_at_each_transition(
         expected_mlp = expected_attn = initial
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_scatter_modes = SimpleNamespace(
-        mlp_mode=mlp_mode, is_first_layer=False
-    )
+    communicator.layer_scatter_modes = SimpleNamespace(is_first_layer=False)
     communicator._context = SimpleNamespace()
     communicator._sp_steps = None
-    communicator._input_scattered_steps = None
-    communicator._cp_steps = None
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None
+    communicator._attn_input_fusions = ()
+    gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
+    # The rows of the steps the batch runs decide, not the ordinary steps'.
     communicator._steps = SimpleNamespace(
+        ffn_input_rows=local if gathered_over_dp else gathered
+    )
+    selected = SimpleNamespace(
         attention_input=lambda hidden_states, **kwargs: hidden_states,
         layer_input=None,
         attention_handoff=lambda hidden_states, *args: hidden_states,
         ffn_input=lambda hidden_states, residual, *args: (hidden_states, residual),
+        ffn_input_rows=gathered if gathered_over_dp else local,
     )
-    communicator._attn_input_fusions = ()
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_attn_tp_context",
-        lambda: SimpleNamespace(input_scattered=False),
-    )
+    communicator._batch_steps = lambda forward_batch: selected
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
