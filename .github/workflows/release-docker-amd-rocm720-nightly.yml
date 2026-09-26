@@ -21,6 +21,14 @@ on:
           - gfx950-rocm724
           - gfx942-rocm720
           - gfx950-rocm720
+      runner:
+        description: 'Runner to build on. x64-docker-build-node is the shared NVIDIA image builder; use it only while amd-docker-scale is unavailable.'
+        required: false
+        type: choice
+        default: 'amd-docker-scale'
+        options:
+          - amd-docker-scale
+          - x64-docker-build-node
   schedule:
     - cron: '0 12 * * *'
 
@@ -35,7 +43,9 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
-    runs-on: amd-docker-scale
+    runs-on: ${{ inputs.runner || 'amd-docker-scale' }}
+    # Builds take 2-3h on amd-docker-scale; allow the shared fallback node more than the 6h default.
+    timeout-minutes: ${{ inputs.runner == 'x64-docker-build-node' && 720 || 360 }}
     environment: 'prod'
     strategy:
       fail-fast: false
@@ -140,6 +150,14 @@ jobs:
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+
+      # x64-docker-build-node is persistent and shared with the NVIDIA image
+      # builds, so don't leave this job's image and build cache behind.
+      - name: Remove local image and build cache
+        if: always() && inputs.runner == 'x64-docker-build-node'
+        run: |
+          docker image rm "rocm/sgl-dev:${{ env.IMAGE_TAG }}" "lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}" || true
+          docker builder prune -f || true
 
   # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
   # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
