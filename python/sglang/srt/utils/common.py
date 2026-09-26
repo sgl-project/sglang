@@ -485,7 +485,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
+        total_free_memory = get_free_cpu_memory()
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -820,35 +820,49 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_instance_memory_status(cgroup_file: str) -> Optional[int]:
+    try:
+        with open(cgroup_file, "r") as f:
+            content = f.read().strip()
+            # "max" or other non memory size content will be skipped
+            if not content.isdigit():
+                raise ValueError
+
+            return int(content)
+    except (PermissionError, FileNotFoundError, ValueError):
+        return None
+
+
+def get_free_cpu_memory() -> int:
+    free_cpu_memory = psutil.virtual_memory().available
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    instance_current_cpu_memory = get_instance_memory_status(
+        "/sys/fs/cgroup/memory.current"
+    )
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
+        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
+
+    return free_cpu_memory
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
         return None
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+        # Avoid ZeroDivisionError in case NUMA config cannot be determined
+        n_numa_node = 1
+    total_cpu_memory = psutil.virtual_memory().total
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    if instance_max_cpu_memory is not None:
+        total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
+    per_numa_mem = total_cpu_memory / n_numa_node
+    # Retrieved value in Byte, need MB
+    return float(per_numa_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():

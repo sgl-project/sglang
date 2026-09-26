@@ -22,7 +22,6 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import tqdm
 
@@ -48,6 +47,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     empty_context,
+    get_free_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -741,7 +741,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
+                avail_mem = get_free_cpu_memory() / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
