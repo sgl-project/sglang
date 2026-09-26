@@ -197,6 +197,90 @@ def _get_feat_extract_output_lengths(input_lengths):
     return output_lengths
 
 
+def _pack_audio_features(
+    items: List[MultimodalDataItem],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack request-local padded audio features into one ragged batch.
+
+    Audio preprocessing pads each request independently, so items collected
+    from different requests may have different time dimensions. Compact every
+    sample with its own attention mask before concatenating the valid frames.
+    """
+    if not items:
+        raise ValueError("Expected at least one audio item")
+
+    features_per_item = []
+    masks_per_item = []
+    num_mel_bins = None
+    common_time_dim = None
+    has_common_time_dim = True
+
+    for item_idx, item in enumerate(items):
+        features = item.feature
+        attention_mask = getattr(item, "feature_attention_mask", None)
+
+        if not isinstance(features, torch.Tensor) or features.ndim != 3:
+            shape = getattr(features, "shape", None)
+            raise ValueError(
+                f"Audio item {item_idx} features must have shape "
+                f"[batch, mel, time], got {shape}"
+            )
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            shape = getattr(attention_mask, "shape", None)
+            raise ValueError(
+                f"Audio item {item_idx} attention mask must have shape "
+                f"[batch, time], got {shape}"
+            )
+        if features.shape[0] != attention_mask.shape[0]:
+            raise ValueError(
+                f"Audio item {item_idx} batch size mismatch: features have "
+                f"{features.shape[0]} samples, mask has {attention_mask.shape[0]}"
+            )
+        if features.shape[2] != attention_mask.shape[1]:
+            raise ValueError(
+                f"Audio item {item_idx} time dimension mismatch: features have "
+                f"{features.shape[2]} frames, mask has {attention_mask.shape[1]}"
+            )
+        if num_mel_bins is None:
+            num_mel_bins = features.shape[1]
+        elif features.shape[1] != num_mel_bins:
+            raise ValueError(
+                f"Audio item {item_idx} mel dimension mismatch: expected "
+                f"{num_mel_bins}, got {features.shape[1]}"
+            )
+
+        if common_time_dim is None:
+            common_time_dim = features.shape[2]
+        elif features.shape[2] != common_time_dim:
+            has_common_time_dim = False
+        features_per_item.append(features)
+        masks_per_item.append(attention_mask)
+
+    if has_common_time_dim:
+        features = torch.cat(features_per_item, dim=0).to(device=device, dtype=dtype)
+        attention_mask = torch.cat(masks_per_item, dim=0).to(
+            device=device, dtype=torch.bool
+        )
+        feature_lens = attention_mask.sum(dim=1, dtype=torch.long)
+        packed_features = features.permute(0, 2, 1)[attention_mask].transpose(0, 1)
+        return packed_features, feature_lens
+
+    packed_features = []
+    feature_lens = []
+    for features, attention_mask in zip(features_per_item, masks_per_item):
+        features = features.to(device=device, dtype=dtype)
+        attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+        feature_lens.append(attention_mask.sum(dim=1, dtype=torch.long))
+        packed_features.append(
+            features.permute(0, 2, 1)[attention_mask].transpose(0, 1)
+        )
+
+    return torch.cat(packed_features, dim=1), torch.cat(feature_lens, dim=0)
+
+
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
@@ -506,28 +590,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
         device = next(self.audio_tower.parameters()).device
-        feature_attention_mask = (
-            torch.cat([item.feature_attention_mask for item in items], dim=0)
-            .type(torch.long)
-            .to(device)
-        )
-        input_features = (
-            torch.cat([item.feature for item in items])
-            .type(self.audio_tower.dtype)
-            .to(next(self.audio_tower.parameters()).device)
-        )
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
-        else:
-            audio_feature_lengths = None
-
-        feature_lens = (
-            audio_feature_lengths
-            if audio_feature_lengths is not None
-            else feature_attention_mask.sum(-1)
+        input_features, feature_lens = _pack_audio_features(
+            items,
+            device=device,
+            dtype=self.audio_tower.dtype,
         )
         audio_outputs = self.audio_tower(
             input_features,
