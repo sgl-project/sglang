@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
 import os
 from typing import Optional, Tuple
 
@@ -18,12 +19,43 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils import is_hip
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+
+_CHUNK_H_BV_CANDIDATES = (64, 32, 16)
+
+
+@functools.lru_cache(maxsize=None)
+def _num_compute_units(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_chunk_h_config(
+    N: int, H: int, V: int, NT: int, is_varlen: bool, device_index: int
+) -> tuple[int, int]:
+    """Select the ROCm GDN launch geometry."""
+    bv_env = os.getenv("SGLANG_GDN_CHUNK_H_BV")
+    if bv_env is None:
+        target = _num_compute_units(device_index)
+        candidates = [bv for bv in _CHUNK_H_BV_CANDIDATES if bv <= V] or [16]
+        BV = next(
+            (bv for bv in candidates if triton.cdiv(V, bv) * N * H >= target),
+            candidates[-1],
+        )
+    else:
+        BV = int(bv_env)
+    stages_env = os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES")
+    if stages_env is None:
+        chunks_per_seq = NT // max(N, 1) if is_varlen else NT
+        num_stages = 3 if chunks_per_seq >= 32 else 2
+    else:
+        num_stages = int(stages_env)
+    return BV, num_stages
 
 
 @triton.autotune(
@@ -397,10 +429,23 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
+    if is_hip() and g is not None:
+        BV, num_stages = _select_chunk_h_config(
+            N, H, V, NT, cu_seqlens is not None, k.device.index
+        )
+        kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64.fn
+        launch_kwargs = dict(
+            BV=BV,
+            num_warps=GDN_CHUNK_H_NUM_WARPS,
+            num_stages=num_stages,
+        )
+    else:
+        kernel, launch_kwargs = chunk_gated_delta_rule_fwd_kernel_h_blockdim64, {}
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    kernel[grid](
         k=k,
         v=u,
         w=w,
@@ -433,5 +478,6 @@ def chunk_gated_delta_rule_fwd_h(
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
+        **launch_kwargs,
     )
     return h, v_new
