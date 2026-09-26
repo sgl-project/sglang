@@ -35,9 +35,7 @@ class TestAmdCiLatestReleaseTag(CustomTestCase):
 
     def test_remote_tags_are_listed_without_transferring_objects(self):
         ls_remote_output = (
-            "aaa\trefs/tags/v0.5.9\n"
-            "bbb\trefs/tags/v0.5.10\n"
-            "ccc\trefs/heads/main\n"
+            "aaa\trefs/tags/v0.5.9\nbbb\trefs/tags/v0.5.10\nccc\trefs/heads/main\n"
         )
 
         with patch.object(
