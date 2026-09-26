@@ -9,7 +9,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers.communicator import ScatterMode, UnreducedOutput
+from sglang.srt.layers.boundary_layout import Layout
+from sglang.srt.layers.communicator import UnreducedOutput
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,8 +59,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 operations_strategy=SimpleNamespace(
                     deep_gemm_num_sms=None, operations=[], tbo_delta_stages=0
                 ),
-                input_data_scatter_mode=ScatterMode.TP_ATTN_FULL,
-                layer_input_scatter_mode=ScatterMode.TP_ATTN_FULL,
+                layer_input_rows=Layout(frozenset()),
             )
 
         self.assertIs(seen["split"], reduced)

@@ -33,7 +33,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
@@ -1153,7 +1152,6 @@ class MiniMaxM2Model(nn.Module):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,

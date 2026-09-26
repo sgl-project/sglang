@@ -467,6 +467,8 @@ class LayerScatterModes:
     # Whether the layer before this one has a sparse MLP; None when the modes
     # were given directly, not planned from the layer sequence.
     is_previous_layer_sparse: Optional[bool] = None
+    # Whether the layer after this one has a sparse MLP; None likewise.
+    is_next_layer_sparse: Optional[bool] = None
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -481,6 +483,7 @@ class LayerScatterModes:
             is_first_layer=context.layer_id == 0,
             is_last_layer=context.layer_id == context.num_layers - 1,
             is_previous_layer_sparse=context.is_previous_layer_sparse,
+            is_next_layer_sparse=context.is_next_layer_sparse,
         )
 
     @classmethod
@@ -854,6 +857,7 @@ class LayerCommunicator:
         )
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
+        self._declared = sides
         self._steps = (
             self._steps_from_declarations(
                 sides,
@@ -903,6 +907,14 @@ class LayerCommunicator:
             else None
         )
 
+    @property
+    def input_rows(self) -> Layout:
+        """The rows the layer's input and residual arrive on in a batch that
+        runs its ordinary steps."""
+        if self._declared is not None:
+            return self._declared.input_rows
+        return self._context.layouts[self.layer_scatter_modes.layer_input_mode]
+
     def _input_can_be_scattered(self) -> bool:
         """Whether a batch may run this layer with input-scattered attention:
         configured, on pure TP without an a2a backend or a dense MLP on every
@@ -938,6 +950,17 @@ class LayerCommunicator:
         def on_local_rows(sparse: bool) -> bool:
             return moe_on_local_rows if sparse else dense_on_local_rows
 
+        def gathers_for_tbo(sparse: bool, next_sparse: Optional[bool]) -> bool:
+            # Under two-batch overlap a dense layer on local rows hands the
+            # sparse layer after it, where the split happens, the attention's
+            # rows.
+            return (
+                dense_on_local_rows
+                and get_exec().overlap.enable_two_batch_overlap
+                and not sparse
+                and bool(next_sparse)
+            )
+
         if not (
             self._takes_declared_boundaries
             and (parallel.attn_cp_size == 1 or _cp_on_declarations())
@@ -948,14 +971,6 @@ class LayerCommunicator:
                 and parallel.attn_dp_size > 1
                 and modes.is_layer_sparse
                 and not _gathers_over_attention_cp()
-            )
-            # Under two-batch overlap a dense layer before a sparse one gathers
-            # its output over attention TP for the split; those layers keep the
-            # scatter-mode steps.
-            and not (
-                dense_on_local_rows
-                and parallel.attn_tp_size > 1
-                and get_exec().overlap.enable_two_batch_overlap
             )
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
@@ -976,8 +991,14 @@ class LayerCommunicator:
             previous_on_local_rows=(
                 not modes.is_first_layer
                 and on_local_rows(modes.is_previous_layer_sparse)
+                and not gathers_for_tbo(
+                    modes.is_previous_layer_sparse, modes.is_layer_sparse
+                )
             ),
             is_last_layer=modes.is_last_layer,
+            hands_on_attention_rows=gathers_for_tbo(
+                modes.is_layer_sparse, modes.is_next_layer_sparse
+            ),
             attention_gathers_local_rows=_use_ag_after_qlora,
             ffn_group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
             leaves_for_next_layer=self.allow_deferred_ffn_reduction and may_leave,
@@ -2149,6 +2170,23 @@ def _token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
         TokenAxis.ATTN_CP: parallel.attn_cp_size if cp_active else 1,
         TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
     }
+
+
+def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
+    """The moves around the two-batch-overlap split, which cuts the attention's
+    rows: from the rows the first overlapped layer takes to the attention's,
+    and back again for each half."""
+    attention = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=_token_axis_sizes()
+    )
+    pair = CommunicateSummableTensorPairFn
+    if layer_input_rows == attention:
+        return pair._trivial, pair._trivial
+    if layer_input_rows.sharded - attention.sharded == {TokenAxis.ATTN_TP_SCATTER}:
+        # Each rank's slice: write the residual in and gather over attention
+        # TP, then take the slice of each half.
+        return pair._gather, pair._scatter
+    raise NotImplementedError(f"{layer_input_rows=}")
 
 
 def _cp_on_declarations() -> bool:

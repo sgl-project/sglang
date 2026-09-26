@@ -154,12 +154,15 @@ class FactsOnly:
         raise AssertionError(f"read scatter mode {name!r}")
 
 
-def layer_facts(layer_id, num_layers, *, sparse=False, previous_sparse=False):
+def layer_facts(
+    layer_id, num_layers, *, sparse=False, previous_sparse=False, next_sparse=False
+):
     return FactsOnly(
         is_layer_sparse=sparse,
         is_first_layer=layer_id == 0,
         is_last_layer=layer_id == num_layers - 1,
         is_previous_layer_sparse=None if layer_id == 0 else previous_sparse,
+        is_next_layer_sparse=next_sparse,
     )
 
 
@@ -511,11 +514,6 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
             ),
-            # The layer before a sparse one gathers its output for the split.
-            "dense MLP fully DP under two-batch overlap": (
-                layer_facts(1, 3),
-                parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1),
-            ),
         }
         two_batch_overlap = SimpleNamespace(
             overlap=SimpleNamespace(enable_two_batch_overlap=True)
@@ -766,24 +764,21 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     comm.CommunicateSummableTensorPairFn._trivial,
                 )
 
-    def test_two_batch_overlap_keeps_the_scatter_modes(self):
-        # A dense layer before a sparse one gathers its output for the split,
-        # so dense layers on every rank keep their scatter-mode steps.
+    def test_two_batch_overlap_gathers_on_the_declarations(self):
+        # The dense layer before a sparse one hands the split the attention's
+        # rows: MHC writes its output into the streams, then gathers them.
         parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
-        modes = planned_modes(
-            1, 3, sparse=False, previous_sparse=False, parallel=parallel
+        communicator = build_mhc(
+            layer_facts(1, 3, next_sparse=True), parallel, two_batch_overlap=True
         )
-        declared = build_mhc(modes, parallel)
-        kept = build_mhc(modes, parallel, two_batch_overlap=True)
-        # Both run the shared slice onto each rank's rows with MHC's residual.
-        for communicator in (declared, kept):
-            self.assert_step(
-                communicator._steps.ffn_input, comm._mlp_input_scatter, communicator
-            )
-        # The declared layer never reads a scatter mode; the kept one does.
-        build_mhc(layer_facts(1, 3), parallel)
-        with self.assertRaises(AssertionError):
-            build_mhc(layer_facts(1, 3), parallel, two_batch_overlap=True)
+        self.assert_step(
+            communicator._steps.ffn_input, comm._mlp_input_scatter, communicator
+        )
+        self.assert_step(
+            communicator._steps.ffn_output_move,
+            comm.CommunicateSummableTensorPairFn._gather,
+            communicator,
+        )
 
     def test_the_postprocess_writes_the_output_into_the_streams(self):
         # The last layer also contracts the streams into the hidden states.
@@ -832,6 +827,99 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             1, 3, sparse=False, previous_sparse=False, parallel=parallel, dsa_cp=True
         )
         build_mhc(modes, parallel, dsa_cp=True, allow_reduce_scatter=True)
+
+
+class TestTwoBatchOverlap(CustomTestCase):
+    """Two-batch overlap splits the attention's rows. A dense MLP on every rank
+    hands the sparse layer after it those rows, and the split moves the input
+    from the rows the first overlapped layer takes."""
+
+    def layers(self, *, tbo):
+        parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        overlap = SimpleNamespace(overlap=SimpleNamespace(enable_two_batch_overlap=tbo))
+        layers = []
+        with planning(parallel), patch.object(comm, "get_exec", lambda: overlap):
+            # Two dense layers, then two sparse ones.
+            for i, sparse in enumerate((False, False, True, True)):
+                modes = LayerScatterModes.init_new(
+                    layer_id=i,
+                    num_layers=4,
+                    is_layer_sparse=sparse,
+                    is_previous_layer_sparse=i > 2,
+                    is_next_layer_sparse=i >= 1,
+                )
+                layers.append(
+                    LayerCommunicator(
+                        layer_scatter_modes=modes,
+                        input_layernorm=Norm(),
+                        post_attention_layernorm=Norm(),
+                    )
+                )
+        return layers
+
+    def test_the_dense_layer_before_the_split_hands_on_the_attention_rows(self):
+        pair = comm.CommunicateSummableTensorPairFn
+        attention = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
+        local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER}))
+        for tbo, gathered in ((True, True), (False, False)):
+            with self.subTest(two_batch_overlap=tbo):
+                first, before, after, last = self.layers(tbo=tbo)
+                # Every layer takes the declared entry.
+                for layer in (first, before, after, last):
+                    self.assertIsNotNone(layer._declared)
+                self.assertIs(first._steps.ffn_output_move, pair._trivial)
+                if gathered:
+                    self.assertIs(before._steps.ffn_output_move.func, pair._gather)
+                    self.assertEqual(after.input_rows, attention)
+                    self.assertIs(
+                        after._steps.attention_input, comm.CommunicateSimpleFn._trivial
+                    )
+                else:
+                    self.assertIs(before._steps.ffn_output_move, pair._trivial)
+                    self.assertEqual(after.input_rows, local)
+                    self.assertIs(
+                        after._steps.attention_input,
+                        comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
+                    )
+                # The declarations give the rows the scatter modes planned.
+                for layer in (first, before, after, last):
+                    layouts = layer._context.layouts
+                    modes = layer.layer_scatter_modes
+                    self.assertEqual(layer.input_rows, layouts[modes.layer_input_mode])
+                    self.assertEqual(
+                        layer._declared.output_rows, layouts[modes.layer_output_mode]
+                    )
+
+    def test_the_split_moves_from_the_first_layer_s_rows(self):
+        pair = comm.CommunicateSummableTensorPairFn
+        parallel = parallel_of(attn_dp=2, attn_tp=2)
+        dp = frozenset({TokenAxis.ATTN_DP})
+        with planning(parallel):
+            self.assertEqual(
+                comm.tbo_split_moves(comm.Layout(dp)), (pair._trivial, pair._trivial)
+            )
+            self.assertEqual(
+                comm.tbo_split_moves(comm.Layout(dp | {TokenAxis.ATTN_TP_SCATTER})),
+                (pair._gather, pair._scatter),
+            )
+            with self.assertRaises(NotImplementedError):
+                comm.tbo_split_moves(comm.Layout(frozenset()))
+
+    def test_a_layer_off_the_declarations_takes_its_rows_from_its_modes(self):
+        dp = parallel_of(attn_dp=2, attn_tp=2)
+        direct = LayerScatterModes(
+            layer_input_mode=ScatterMode.SCATTERED,
+            attn_mode=ScatterMode.TP_ATTN_FULL,
+            mlp_mode=ScatterMode.FULL,
+            middle_residual_mode=ScatterMode.TP_ATTN_FULL,
+            layer_output_mode=ScatterMode.TP_ATTN_FULL,
+        )
+        communicator = build(direct, dp)
+        self.assertIsNone(communicator._declared)
+        self.assertEqual(
+            communicator.input_rows,
+            comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER})),
+        )
 
 
 class TestTheAttentionOutputDecidesItsSum(CustomTestCase):

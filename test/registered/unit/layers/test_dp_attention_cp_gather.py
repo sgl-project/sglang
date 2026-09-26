@@ -245,6 +245,7 @@ class TestDpCpGather(CustomTestCase):
                         is_last_layer=False,
                         is_layer_sparse=False,
                         is_previous_layer_sparse=False,
+                        is_next_layer_sparse=False,
                     ),
                     input_layernorm=norm,
                     post_attention_layernorm=norm,
