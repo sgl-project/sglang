@@ -24,8 +24,14 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.boundary_layout import (
+    DecoderLayerSides,
+    SumGroup,
+    TokenAxis,
+)
 from sglang.srt.layers.communicator import (
     AttentionInputs,
+    BoundarySteps,
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
@@ -34,6 +40,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     MlpInputKind,
     ScatterMode,
+    _select_attention_input_move,
     get_attn_tp_context,
     mlp_input_kind,
     tp_reduce_scatter,
@@ -63,6 +70,61 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
     get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
 
     return output
+
+
+def _select_mhc_ffn_input(sides: DecoderLayerSides, mhc: "MHCState") -> Callable:
+    """MHC's steps from the attention output to the FFN input, for the rows
+    the declarations call for. The residual is written back with hc_post,
+    which is not a plain add, so a DP gather always runs after it (the
+    replicate order)."""
+    produced, need = sides.attention_output, sides.ffn
+    residual, residual_to = sides.input_rows, sides.ffn_residual_rows
+    fns = MHCCommunicateWithAllReduceAndLayerNormFn
+    gathered = produced.layout.sharded - need.layout.sharded - need.gathers_itself
+    sliced = need.layout.sharded - produced.layout.sharded
+    if sliced:
+        # Each attention-TP rank takes its own slice.
+        if (
+            sliced != {TokenAxis.ATTN_TP_SCATTER}
+            or gathered
+            or produced.group is not SumGroup.ATTN_TP
+        ):
+            raise NotImplementedError(f"{produced=} {need=}")
+        return partial(
+            fns._scatter_hidden_states_and_residual,
+            scatters_residual=residual != residual_to,
+            mhc=mhc,
+        )
+    if gathered - {TokenAxis.ATTN_DP}:
+        raise NotImplementedError(f"{produced=} {need=}")
+    if gathered or produced.group is SumGroup.ATTN_TP:
+        return partial(
+            fns._gather_hidden_states_and_residual,
+            residual_on_slice=TokenAxis.ATTN_TP_SCATTER in residual.sharded,
+            mhc=mhc,
+        )
+    return partial(fns._simple, mhc=mhc)
+
+
+def _select_mhc_ffn_output_move(sides: DecoderLayerSides) -> Optional[Callable]:
+    """MHC's move of the FFN output to the rows the layer hands on; None when
+    it goes back over attention DP, which MHC's postprocess runs itself."""
+    produced, residual, to = (
+        sides.ffn_output,
+        sides.ffn_residual_rows,
+        sides.output_rows,
+    )
+    fns = MHCCommunicateSummableTensorPairFn
+    if produced.layout == residual:
+        if to == residual:
+            return fns._trivial
+        if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
+            return fns._gather
+    elif to == residual and residual.sharded - produced.layout.sharded == {
+        TokenAxis.ATTN_DP
+    }:
+        return None
+    raise NotImplementedError(f"{produced=} {residual=} {to=}")
 
 
 @dataclass
@@ -141,7 +203,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
         layernorm: torch.nn.Module,
         context: CommunicateContext,
         *,
-        residual_input_mode,
+        scatters_residual: bool,
         mhc: MHCState,
     ):
         input_hidden_states = hidden_states
@@ -149,7 +211,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
             context.attn_tp_rank
         ]
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+        if scatters_residual:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
             mhc.h_res = mhc.h_res.tensor_split(context.attn_tp_size)[
                 context.attn_tp_rank
@@ -209,7 +271,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
         layernorm: torch.nn.Module,
         context: CommunicateContext,
         *,
-        residual_input_mode,
+        residual_on_slice: bool,
         mhc: MHCState,
     ):
         if get_attn_tp_context().input_scattered:
@@ -221,7 +283,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
                 mhc=mhc,
             )
 
-        if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
+        if residual_on_slice:
             raise NotImplementedError(
                 "Unsupported: h_res/h_post allgather not implemented."
             )
@@ -384,9 +446,6 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
 
 class MHCLayerCommunicator(LayerCommunicator):
-    # Chooses its own boundary steps, not from the declarations.
-    _takes_declared_boundaries = False
-
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
@@ -411,13 +470,40 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_ffn_post_pre=hc_ffn_post_pre,
         )
 
+        # The postprocess combines the hyper-connection streams, so the FFN's
+        # sum never waits for the next layer.
         super().__init__(
             layer_scatter_modes,
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
             qkv_latent_func,
+            allow_deferred_ffn_reduction=False,
         )
+
+    def _steps_from_declarations(
+        self, sides: DecoderLayerSides, **kwargs
+    ) -> BoundarySteps:
+        """MHC's own implementation of each step the declarations call for."""
+        return BoundarySteps(
+            attention_input=_select_attention_input_move(
+                sides.input_rows, sides.attention
+            ),
+            ffn_input=_select_mhc_ffn_input(sides, self.mhc),
+            ffn_output=sides.ffn_output,
+            ffn_output_move=_select_mhc_ffn_output_move(sides),
+            ffn_sum_is_movable=sides.ffn_output.group is not None,
+        )
+
+    def _input_can_be_scattered(self) -> bool:
+        # MHC's steps handle input-scattered attention themselves.
+        return False
+
+    def _local_token_move_can_go_to_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        # MHC's move back to this rank's tokens also combines the streams.
+        return False
 
     def _post_init_communicate(self):
         # Base MOE_FULL callables do not accept ``mhc``, so reject this
@@ -428,21 +514,22 @@ class MHCLayerCommunicator(LayerCommunicator):
                 "(moe_dp_size < attention_context_parallel_size). Increase "
                 "moe_dp_size to match attention_context_parallel_size."
             )
-        self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
+        attention_input = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
-        self._communicate_summable_tensor_pair_fn = (
-            MHCCommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
-                residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
-                output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._context,
-            )
+        postprocess = MHCCommunicateSummableTensorPairFn.get_fn(
+            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
+            residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
+            output_mode=self.layer_scatter_modes.layer_output_mode,
+            context=self._context,
         )
-        # MHC's own prepare_attn and postprocess run these.
-        return self._communicate_simple_fn, self._communicate_summable_tensor_pair_fn
+        # MHC's own prepare_attn and postprocess run these; its move back over
+        # attention DP is the empty move, as on the declarations.
+        if postprocess is MHCCommunicateSummableTensorPairFn._scatter_hidden_states:
+            postprocess = None
+        return attention_input, postprocess
 
     def prepare_attn(
         self,
@@ -464,7 +551,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hidden_states, out_norm=self.input_layernorm
         )
 
-        hidden_states = self._communicate_simple_fn(
+        hidden_states = self._batch_steps(forward_batch).attention_input(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             context=self._context,
@@ -498,15 +585,32 @@ class MHCLayerCommunicator(LayerCommunicator):
         if kind is MlpInputKind.NORM:
             return partial(fns._simple, mhc=self.mhc), ()
         if kind is MlpInputKind.GATHER:
-            fn = fns._gather_hidden_states_and_residual
-        elif kind is MlpInputKind.SCATTER:
-            fn = fns._scatter_hidden_states_and_residual
-        else:
-            raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
-        return partial(fn, residual_input_mode=residual_input_mode, mhc=self.mhc), ()
+            return (
+                partial(
+                    fns._gather_hidden_states_and_residual,
+                    residual_on_slice=residual_input_mode == ScatterMode.SCATTERED
+                    and self._context.attn_tp_size > 1,
+                    mhc=self.mhc,
+                ),
+                (),
+            )
+        if kind is MlpInputKind.SCATTER:
+            return (
+                partial(
+                    fns._scatter_hidden_states_and_residual,
+                    scatters_residual=residual_input_mode == ScatterMode.TP_ATTN_FULL,
+                    mhc=self.mhc,
+                ),
+                (),
+            )
+        raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
 
     def postprocess_layer(self, hidden_states, residual, forward_batch):
-        hidden_states, residual = self._communicate_summable_tensor_pair_fn(
+        move = self._batch_steps(forward_batch).ffn_output_move
+        if move is None:
+            # Back over attention DP, combining the streams on this rank's rows.
+            move = MHCCommunicateSummableTensorPairFn._scatter_hidden_states
+        hidden_states, residual = move(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
@@ -536,10 +640,7 @@ class MHCLayerCommunicator(LayerCommunicator):
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
-        if (
-            self._communicate_summable_tensor_pair_fn
-            is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
-        ):
+        if self._batch_steps(forward_batch).returns_over_dp:
             # reduce_scatterv already combines expert outputs; returning False
             # would make RowParallelLinear perform an extra all-reduce.
             if should_use_dp_reduce_scatterv():

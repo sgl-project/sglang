@@ -284,11 +284,16 @@ class TestMlpInputOrder(CustomTestCase):
         )
 
         mhc = object()
-        for layout, func in (
-            (GATHER_LAYOUT, MHC._gather_hidden_states_and_residual),
+        for layout, func, residual_keyword in (
+            (
+                GATHER_LAYOUT,
+                MHC._gather_hidden_states_and_residual,
+                dict(residual_on_slice=False),
+            ),
             (
                 (TP_ATTN_FULL, TP_ATTN_FULL, SCATTERED, SCATTERED),
                 MHC._scatter_hidden_states_and_residual,
+                dict(scatters_residual=True),
             ),
         ):
             with self.subTest(func=func.__name__):
@@ -298,9 +303,7 @@ class TestMlpInputOrder(CustomTestCase):
                 c._context = make_context(tp=2)
                 c.post_attention_layernorm = Fusable()
                 steps, fused = c._select_mlp_input()
-                self.assert_order(
-                    steps, func, residual_input_mode=TP_ATTN_FULL, mhc=mhc
-                )
+                self.assert_order(steps, func, **residual_keyword, mhc=mhc)
                 self.assertEqual(fused, ())
 
 
