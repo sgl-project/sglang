@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.boundary_layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     ADD_AND_NORM,
+    FfnExitFusion,
     LayerCommunicator,
     UnreducedOutput,
     _attention_input_step,
@@ -93,12 +94,16 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
     unreduced output reaches the final norm; it must not skip its own."""
     last = _communicator()
-    last.successor_absorbs_all_reduce = False
-    last.fusion_service = SimpleNamespace(
-        all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
-            local_contribution + 1,
-            residual + 1,
-        )
+    last.install(
+        SimpleNamespace(
+            all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
+                local_contribution + 1,
+                residual + 1,
+            )
+        ),
+        hands_off_finalize=False,
+        next_input_absorbs=False,
+        output_is_replicated=False,
     )
     hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
@@ -119,7 +124,7 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
         out_hidden, _ = last.prepare_attn(hidden_states, torch.zeros(8, 8), _DECODE)
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
-    assert last._can_absorb_post_moe_all_reduce(_DECODE, 8) is False
+    assert last._ffn_exit_fusions == (last._next_input_norm_takes_ffn_sum,)
 
 
 def test_cutedsl_entries_come_before_the_base_fused_kernel():
@@ -183,6 +188,21 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
             assert comm._common_eligible(_DECODE, 8) is eligible
 
 
+def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel():
+    comm = _communicator()
+    comm.install(
+        SimpleNamespace(),
+        hands_off_finalize=True,
+        next_input_absorbs=True,
+        output_is_replicated=False,
+    )
+    assert comm._ffn_exit_fusions == (
+        comm._defer_moe_finalize_cutedsl,
+        comm._absorb_all_reduce_cutedsl,
+        comm._next_input_norm_takes_ffn_sum,
+    )
+
+
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
     """A TP1 shared expert (or TP1 dense MLP) is not partial; handing its layer's
     reduction onward would scale the replicated output by tp_size."""
@@ -193,13 +213,19 @@ def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
     _install(layers, requires_local_reduction=lambda layer: layer.replicated)
     replicated, plain = (layer.layer_communicator for layer in layers[:2])
 
+    def exit_fusion(communicator):
+        return next(
+            filter(None, (fused(_DECODE) for fused in communicator._ffn_exit_fusions)),
+            None,
+        )
+
     with patch.object(
         LayerCommunicator,
         "should_fuse_mlp_allreduce_with_next_layer",
         return_value=False,
     ):
-        assert replicated.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is False
-        assert plain.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is True
+        assert exit_fusion(replicated) is None
+        assert exit_fusion(plain) is FfnExitFusion.NEXT_INPUT
     # Consuming what a predecessor skipped stays independently eligible.
     assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
 

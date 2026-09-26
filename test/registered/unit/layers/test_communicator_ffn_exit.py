@@ -92,8 +92,10 @@ def make_communicator(
     if cls is LayerCommunicator:
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
     else:
-        # A subclass decides through its own hooks; no TP left to defer over.
+        # A subclass decides through its own fused kernels; no TP left to defer
+        # over otherwise.
         communicator._context = types.SimpleNamespace(tp_size=1)
+        communicator._ffn_exit_fusions = communicator._select_ffn_exit_fusions()
     communicator._ffn_leaves_sum_to_reduce_scatter = MagicMock(
         return_value=reduce_scatter
     )
@@ -219,6 +221,23 @@ class TestFfnExit(CustomTestCase):
         self.run_exit(make_communicator(fuse=True, reduce_scatter=True))
         self.assertEqual(published_flags(), before)
 
+    def test_the_next_input_s_fused_kernel_is_tried_first(self):
+        """The base exit asks the next layer's AR + add + norm before the
+        unfused condition, and leaves the sum to it when it takes the batch."""
+        for takes in (False, True):
+            with self.subTest(takes=takes):
+                communicator = make_communicator(fuse=False, reduce_scatter=False)
+                communicator.should_fuse_mlp_allreduce_with_next_layer = MagicMock(
+                    return_value=takes
+                )
+                communicator._ffn_exit_fusions = communicator._select_ffn_exit_fusions()
+                seen, _ = self.run_exit(communicator)
+                self.assertEqual(seen, (takes, False))
+                communicator.should_fuse_mlp_allreduce_with_next_layer.assert_called_once()
+                self.assertEqual(
+                    communicator._ffn_sum_moves_to_next_layer.called, not takes
+                )
+
     def test_subclass_decisions_are_used(self):
         class NeverDefers(LayerCommunicator):
             def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
@@ -236,8 +255,8 @@ class TestFfnExit(CustomTestCase):
         handoff leaves finish() untouched for the next layer's input norm."""
 
         class Defers(LayerCommunicator):
-            def should_defer_moe_finalize(self, forward_batch, m=None):
-                return True
+            def _select_ffn_exit_fusions(self):
+                return (lambda forward_batch: comm.FfnExitFusion.DEFER_MOE_FINALIZE,)
 
             def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
                 return False

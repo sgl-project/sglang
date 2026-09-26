@@ -816,8 +816,10 @@ def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
 
 
 class LayerCommunicator:
-    # Communicators built without __init__ (e.g. test doubles) publish no LoRA layout.
+    # Communicators built without __init__ (e.g. test doubles) publish no LoRA
+    # layout and try no fused kernel at the FFN exit.
     _publish_lora_layout: bool = False
+    _ffn_exit_fusions: Tuple[Callable, ...] = ()
     # A plain residual unless the layer is built with its own.
     _residual_ops: ResidualOps = ADD_AND_NORM
 
@@ -858,6 +860,8 @@ class LayerCommunicator:
         )
         # The fused kernels every batch's attention input tries first.
         self._attn_input_fusions = self._select_attn_input_fusions()
+        # The fused kernels of the next layer's input the FFN exit tries first.
+        self._ffn_exit_fusions = self._select_ffn_exit_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -1551,9 +1555,14 @@ class LayerCommunicator:
                 mlp_reduce_scatter=mlp_reduce_scatter,
                 complete=complete_now,
             )
-        defer_moe_finalize = self.should_defer_moe_finalize(forward_batch)
-        # Deferring implies fusing: a handoff skips the post-experts all-reduce.
-        fuse_mlp_allreduce = defer_moe_finalize or self._ffn_sum_moves_to_next_layer(
+        fusion = next(
+            filter(None, (fused(forward_batch) for fused in self._ffn_exit_fusions)),
+            None,
+        )
+        defer_moe_finalize = fusion is FfnExitFusion.DEFER_MOE_FINALIZE
+        # A fused kernel that takes the sum, a handoff included, skips the
+        # post-experts all-reduce.
+        fuse_mlp_allreduce = fusion is not None or self._ffn_sum_moves_to_next_layer(
             forward_batch, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
         )
         if fuse_mlp_allreduce:
@@ -1658,11 +1667,21 @@ class LayerCommunicator:
             forward_batch, self._postprocess_dp_step(forward_batch)
         )
 
-    def should_defer_moe_finalize(
-        self, forward_batch: ForwardBatch, m: int | None = None
-    ) -> bool:
-        """Whether the MoE may hand an unfinalized output to the next layer."""
-        return False
+    def _select_ffn_exit_fusions(
+        self,
+    ) -> Tuple[Callable[[ForwardBatch], Optional["FfnExitFusion"]], ...]:
+        """The fused kernels of the next layer's input that may take this layer's
+        FFN sum, in the order they are tried. Each returns what the exit does
+        when its kernel takes this batch, or None."""
+        return (self._next_input_norm_takes_ffn_sum,)
+
+    def _next_input_norm_takes_ffn_sum(
+        self, forward_batch: ForwardBatch
+    ) -> Optional["FfnExitFusion"]:
+        """The aiter / flashinfer AR + add + norm of the next layer's input."""
+        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
+            return FfnExitFusion.NEXT_INPUT
+        return None
 
     def _ffn_sum_can_move_to_next_layer(self, forward_batch: ForwardBatch) -> bool:
         # Under the MoE-CP all-gather the fusion path would skip postprocess_layer
@@ -1725,10 +1744,8 @@ class LayerCommunicator:
         dp_step: Optional[Callable],
     ) -> bool:
         """Whether the FFN leaves its output's all-reduce to the next layer's
-        input norm: whenever the fused kernel takes it, and otherwise when the
-        next layer would run the same all-reduce the FFN itself would have."""
-        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
-            return True
+        input when no fused kernel takes it: when the next layer would run the
+        same all-reduce the FFN itself would have."""
         return (
             self._context.tp_size > 1
             and not self.is_last_layer
@@ -1772,6 +1789,16 @@ def scatter_mode_layouts(
         mode: Layout.sharded_over(*axes, axis_sizes=axis_sizes)
         for mode, axes in _SCATTER_MODE_SHARDED_AXES.items()
     }
+
+
+class FfnExitFusion(Enum):
+    """What an FFN exit does when a fused kernel of the next layer's input takes
+    its sum."""
+
+    # The MoE hands its unfinalized output on; the next input finalizes it.
+    DEFER_MOE_FINALIZE = auto()
+    # The FFN leaves its all-reduce to the next input norm.
+    NEXT_INPUT = auto()
 
 
 class FfnCompletion(msgspec.Struct, frozen=True):
