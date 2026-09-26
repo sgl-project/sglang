@@ -72,6 +72,7 @@ class MHCState:
     hc_attn_pre: Callable
     hc_ffn_pre: Callable
     hc_post: Callable
+    hc_ffn_post_pre: Optional[Callable] = None
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
@@ -94,9 +95,26 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
+            # Returns None when it declines -- no fused kernel for this platform
+            # or shape, or a shape the fusion is slower at -- and the chain runs.
+            fused = self.hc_ffn_post_pre(
+                hidden_states=hidden_states,
+                residual=residual,
+                h_res=self.h_res,
+                h_post=self.h_post,
+                out_norm_weight=out_norm_weight,
+                out_norm_eps=out_norm_eps,
+            )
+            if fused is not None:
+                hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                if out_norm is not None and not norm_fused:
+                    hidden_states = out_norm(hidden_states)
+                return hidden_states, residual
+
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -398,7 +416,6 @@ class MHCLayerCommunicator(LayerCommunicator):
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         *,
         is_first_layer: bool,
@@ -406,6 +423,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        hc_ffn_post_pre: Optional[Callable] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -413,6 +431,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            hc_ffn_post_pre=hc_ffn_post_pre,
         )
 
         super().__init__(
@@ -420,7 +439,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 
@@ -462,6 +480,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        self.publish_attn_lora_layout()
         if self.is_first_layer:
             if get_attn_tp_context().input_scattered:
                 hidden_states, _ = tp_reduce_scatter(
@@ -507,6 +526,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        self.publish_mlp_lora_layout()
         if cache is not None:
             self._context.cache = cache
 
@@ -536,6 +556,9 @@ class MHCLayerCommunicator(LayerCommunicator):
         return hidden_states, residual
 
     def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+        return False
+
+    def should_defer_ffn_reduction(self, forward_batch):
         return False
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):

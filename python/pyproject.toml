@@ -97,7 +97,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.7",
   "xxhash",
   "zstandard",
 ]
@@ -187,7 +187,7 @@ test = [
   # Pinned: a bump moves scoring for every eval test at once, so re-baseline
   # MODEL_SCORE_THRESHOLDS in test/registered/eval/test_text_models_gsm8k_eval.py
   # and the mmlu thresholds of run_eval's other callers before changing it.
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
   "sglang[fastokens]",
   "tabulate",
 ]
@@ -206,6 +206,8 @@ vsa = ["setuptools", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]

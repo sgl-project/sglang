@@ -5,15 +5,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import torch
-
-from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
-    EvictResult,
-    InsertParams,
-)
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -52,8 +47,8 @@ class PureSWARadixCache(RadixCache):
         return 0
 
     def sanity_check(self):
-        """No-op: PureSWARadixCache uses RadixCache's simple tree structure
-        which doesn't need the dual-LRU sanity checks of SWARadixCache."""
+        """No-op: an all-SWA model has no full tier, so there is no full/SWA
+        split to cross-check."""
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -62,77 +57,22 @@ class PureSWARadixCache(RadixCache):
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ):
-        """Cache request when it finishes.
-
-        Only inserts the prefill portion [0, evict_floor) into the radix tree.
-        The window portion [swa_evicted_seqlen, committed_len) is freed back
-        to the allocator. The range [evict_floor, swa_evicted_seqlen) was already
-        freed by _evict_swa during decode — we skip it to avoid double-free.
-        """
-        if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :owned_kv_len
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
-        ]
-
-        radix_key = RadixKey(
-            token_ids,
-            req.extra_key,
-            is_bigram=self.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        keys_len = len(radix_key)
-
-        old_prefix_len = req.kv.cache_protected_len
-        swa_evict_floor = req.kv.swa_evict_floor
-        swa_evicted_seqlen = req.kv.swa_evicted_seqlen
-
-        if self.page_size > 1 and swa_evict_floor > 0:
-            swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size
-
-        if swa_evict_floor > 0:
-            insert_end = min(swa_evict_floor, keys_len)
-        else:
-            insert_end = keys_len
-
-        if is_insert and insert_end > 0:
-            insert_values = kv_indices[:insert_end].to(dtype=torch.int64, copy=True)
-            result = self.insert(
-                InsertParams(key=radix_key[:insert_end], value=insert_values)
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
+        """Insert only the prefill portion [0, evict_floor); free_kv_row skips
+        the span _evict_swa already freed during decode."""
+        if not self.disable:
+            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+            swa_evict_floor = req.kv.swa_evict_floor
+            key_limit = (
+                ceil_align(swa_evict_floor, self.page_size)
+                if swa_evict_floor > 0
+                else None
             )
-            new_prefix_len = result.prefix_len
-            if new_prefix_len > old_prefix_len:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[old_prefix_len:new_prefix_len]
-                )
-            alive_start = max(swa_evicted_seqlen, insert_end)
-            if alive_start < keys_len:
-                self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
-        else:
-            free_end = (
-                min(swa_evict_floor, keys_len) if swa_evict_floor > 0 else keys_len
-            )
-            if free_end > old_prefix_len:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[old_prefix_len:free_end]
-                )
-            alive_start = max(swa_evicted_seqlen, free_end)
-            if alive_start < keys_len:
-                self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
-
-        self.token_to_kv_pool_allocator.free(kv_indices[keys_len:])
-
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+            radix_key, _, _ = self._adopt(req, token_ids, key_limit=key_limit)
+            req.kv.cache_protected_len = len(radix_key)
+        # The protected prefix is not this req's to free.
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        self.unpin(req)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
