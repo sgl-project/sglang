@@ -396,5 +396,143 @@ def test_fused_moe_lora_kernel(
     torch.testing.assert_close(output, output2, atol=1e-2, rtol=1e-2)
 
 
+def _run_with_expert_id(
+    expert_id_value,
+    lora_a_stacked,
+    lora_b_stacked,
+    hidden_states,
+    topk_weights,
+    max_loras,
+    num_blocks,
+    num_tokens,
+    top_k_num,
+    max_lora_rank,
+    N,
+    dtype,
+    device,
+):
+    """Run the kernel with adapter 0's blocks routed to `expert_id_value`.
+
+    Only adapter 0 is enabled. Enabling the last adapter as well would make the
+    result depend on whatever lies past the end of the weight tensor, which is
+    undefined and varies with allocator layout.
+    """
+    sorted_token_ids = (
+        torch.arange(num_tokens, dtype=torch.int32, device=device)
+        .repeat(max_loras, 1)
+        .contiguous()
+    )
+    expert_ids = torch.full(
+        (max_loras, num_blocks), expert_id_value, dtype=torch.int32, device=device
+    )
+    num_tokens_post_padded = torch.full(
+        (max_loras,), num_tokens, dtype=torch.int32, device=device
+    )
+    lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
+    adapter_enabled = torch.zeros(max_loras + 1, dtype=torch.int32, device=device)
+    adapter_enabled[0] = 1
+
+    output = torch.zeros((num_tokens, top_k_num, N), dtype=dtype, device=device)
+
+    fused_moe_lora(
+        output,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        max_lora_rank,
+        top_k_num,
+        lora_ids,
+        adapter_enabled,
+        16,  # shrink BLOCK_SIZE_M
+        32,  # shrink BLOCK_SIZE_N
+        64,  # shrink BLOCK_SIZE_K
+        1,  # shrink GROUP_SIZE_M
+        4,  # shrink num_warps
+        3,  # shrink num_stages
+        1,  # shrink SPLIT_K
+        16,  # expand BLOCK_SIZE_M
+        32,  # expand BLOCK_SIZE_N
+        64,  # expand BLOCK_SIZE_K
+        1,  # expand GROUP_SIZE_M
+        4,  # expand num_warps
+        3,  # expand num_stages
+        1,  # expand SPLIT_K
+        False,  # mul_routed_weight
+    )
+    return output
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("seed", SEED)
+def test_fused_moe_lora_kernel_expert_id_out_of_range(dtype, device, seed):
+    """Routed experts past the end of the LoRA stack must contribute nothing.
+
+    Shared-experts fusion appends the shared expert to the routed set, so
+    expert_ids can hold an index equal to num_experts while the LoRA stacks
+    only cover 0..num_experts-1. Because stride_bl == num_experts * stride_be,
+    the address for (lora_id, num_experts) is exactly the address for
+    (lora_id + 1, expert 0), so an unbounded expert_id makes one adapter read
+    the next adapter's weights.
+
+    Such experts must be skipped, exactly like the -1 sentinel.
+    """
+    torch.set_default_device(device)
+    set_random_seed(seed)
+
+    max_loras = 2
+    num_experts = 4
+    max_lora_rank = 16
+    N = 32
+    K = 64
+    top_k_num = 2
+    num_tokens = 16
+    num_blocks = 1
+
+    lora_a_stacked = [
+        torch.rand(
+            (max_loras, num_experts, max_lora_rank, K), dtype=dtype, device=device
+        )
+    ]
+    lora_b_stacked = [
+        torch.rand(
+            (max_loras, num_experts, N, max_lora_rank), dtype=dtype, device=device
+        )
+    ]
+    hidden_states = torch.rand((num_tokens, K), dtype=dtype, device=device)
+    topk_weights = torch.rand((num_tokens, top_k_num), dtype=dtype, device=device)
+
+    common = dict(
+        lora_a_stacked=lora_a_stacked,
+        lora_b_stacked=lora_b_stacked,
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        max_loras=max_loras,
+        num_blocks=num_blocks,
+        num_tokens=num_tokens,
+        top_k_num=top_k_num,
+        max_lora_rank=max_lora_rank,
+        N=N,
+        dtype=dtype,
+        device=device,
+    )
+
+    # Expert 0 is valid, so this run must produce a non-trivial result. It
+    # guards the assertion below from passing vacuously on an inert harness.
+    in_range = _run_with_expert_id(0, **common)
+    assert in_range.abs().max() > 0, "in-range expert produced no output"
+
+    # num_experts is one past the last valid index (0..num_experts-1).
+    out_of_range = _run_with_expert_id(num_experts, **common)
+    # -1 is the kernel's existing "no expert for this block" sentinel.
+    skipped = _run_with_expert_id(-1, **common)
+
+    torch.testing.assert_close(out_of_range, skipped, atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
