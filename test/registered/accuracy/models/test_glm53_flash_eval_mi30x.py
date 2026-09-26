@@ -2,26 +2,36 @@
 
 Tests zai-org/GLM-5.3-Flash on MI30x (gfx942) with the AMD FP8 recipe from the
 GLM-5.3-Flash cookbook refresh (#36712): TP8 + EP8, BF16 KV cache, TileLang DSA
-prefill+decode, Triton linear attention, Triton MoE runner, SGLANG_USE_AITER=1,
-full decode graphs at batch sizes 1 and 32. Same eval and threshold as the
-gfx950 gate in test_glm53_flash_eval_mi35x.py.
+prefill+decode, Triton linear attention, SGLANG_USE_AITER=1, full decode graphs
+at batch sizes 1 and 32. Same eval and threshold as the gfx950 gate in
+test_glm53_flash_eval_mi35x.py.
 
-gfx942 is not redundant with gfx950 for this model. It takes the Triton MoE
-runner and the generic mHC path (AITER mHC is gfx95-only), and neither has any
-other nightly coverage for this model. It also resolves `dsa_topk_backend` to
-the default fused `sgl-kernel` top-k on main, whereas the support-branch runs
-behind #36607's numbers forced the portable Torch top-k on non-gfx95 ROCm.
+MoE runner: this deviates from the cookbook cell, which names the Triton runner
+for MI300X. On current main the Triton MoE runner makes this model generate
+without ever stopping on gfx942: every sequence runs to the token cap and
+scores zero. Measured in one job that ran three 64-question evals back to back
+on the same server image (run 36119287477, 2026-09-26): Triton MoE with the
+default fused sgl-kernel top-k scored 0/64 at 2048+ tokens per sequence,
+Triton MoE with #36607's portable Torch top-k also scored 0/64 at 2048+ tokens
+per sequence, and the AITER MoE runner scored 63/64 = 0.984 at 151 tokens per
+sequence. The DSA top-k backend makes no difference, so the fault is the Triton
+MoE runner itself, and the cookbook's MI300X MoE recommendation is stale.
 
-Threshold: #36607 measured the full 1319-question GSM8K split at
-1284/1319 = 97.35% on MI300X, and the cookbook's MI300X cell for this exact
-TP8 + EP8 command measured 1280/1319 = 97.04%, both on the GLM-5.3-Flash
-support branch. 0.92 follows this repo's `measured - 0.05` convention for
-sgl-eval gsm8k thresholds and matches the gfx950 gate, so the two arches stay
-directly comparable.
+gfx942 is not redundant with gfx950 for this model. It runs the generic mHC
+path, since AITER mHC is gfx95-only, and nothing else gives that path nightly
+coverage for this model. That path reaches gfx942 only with the HIP guard in
+#41136: without it, TileLang's HIP codegen cannot lower the tl.get_lane_idx in
+the fused mHC post/pre kernel and decode graph capture dies with "Unresolved
+call Op(tl.get_lane_idx)" (run 36092686822).
 
-Runtime: budget this job generously. gfx942 gets none of the gfx95 fast paths,
-and this runner pool's shared model cache has taken over an hour to load the
-328 GB checkpoint. The workflow allows 18000 s. If that ever proves tight,
+Threshold: 0.92 follows this repo's `measured - 0.05` convention for sgl-eval
+gsm8k thresholds and matches the gfx950 gate, so the two arches stay directly
+comparable. The 0.984 above is a 64-question sample; gfx950 scored 0.9750
+(1286/1319) on the full split with the same eval.
+
+Runtime: the 328 GB checkpoint has taken 3606-4143 s to load from this pool's
+shared cache, and a full-split eval at the AITER MoE throughput measured above
+adds roughly 900 s. The workflow allows 18000 s. If that ever proves tight,
 prefer raising it over trimming the eval: a full-split score is what makes this
 arch's number comparable to the gfx950 one.
 
@@ -40,11 +50,12 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. Measured 12259 s
-# on rocm720 and 5164 s on rocm724; 13000 s covers the slower image plus
-# a cold-cache load of the 328 GB checkpoint.
+# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. A cold-cache load
+# of the 328 GB checkpoint has measured up to 4143 s and the full-split eval
+# adds roughly 900 s on the AITER MoE runner; 9000 s leaves room for a slower
+# image on top of that.
 register_amd_ci(
-    est_time=13000,
+    est_time=9000,
     suite="nightly-amd-accuracy-8-gpu-glm53-flash",
     nightly=True,
 )
@@ -68,7 +79,8 @@ class TestGLM53FlashEvalMI30x(unittest.TestCase):
             "--dsa-decode-backend=tilelang",
             "--linear-attn-backend=triton",
             "--kv-cache-dtype=bfloat16",
-            "--moe-runner-backend=triton",
+            # Not the cookbook's Triton runner; see the MoE runner note above.
+            "--moe-runner-backend=aiter",
             "--cuda-graph-backend-decode=full",
             "--cuda-graph-backend-prefill=disabled",
             "--cuda-graph-bs-decode",
