@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     ConditioningCache,
     cached_conditioning,
+    cached_encoder_call,
     cached_vae_encode,
     invalidate_conditioning_caches,
     prefer_conditioning_cache,
@@ -343,6 +344,51 @@ def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank):
         nprocs=2,
         join=True,
     )
+
+
+@torch.no_grad()
+def test_stage_conditioning_owns_output_but_preserves_vision_cache():
+    model = VisionLanguageEncoder().eval()
+    namespace = Encoder()
+    cache = ConditioningCache(4096)
+    pixels = torch.ones(4)
+    hooks = []
+    model.register_forward_hook(lambda *args: hooks.append(1))
+
+    def stage(text):
+        return cached_encoder_call(
+            model,
+            (text, pixels),
+            {},
+            lambda: model(text, pixels)[:1],
+            namespace=namespace,
+        )
+
+    with cache.scope():
+        first = stage(torch.ones(4))
+        # one vision entry and one consumed output, without a full encoder copy
+        assert cache.bytes == 20
+        assert cache.stats()["entries"] == 2
+        first.zero_()
+        assert stage(torch.ones(4)).item() == 3
+        assert model.calls == model.vision_calls == len(hooks) == 1
+        assert stage(torch.full((4,), 2.0)).item() == 4
+        assert model.calls == len(hooks) == 2
+        assert model.vision_calls == 1
+        with cache.scope(refresh=True):
+            stage(torch.ones(4))
+        assert model.calls == len(hooks) == 3
+        assert model.vision_calls == 2
+
+        def fail():
+            raise RuntimeError("encoding failed")
+
+        with pytest.raises(RuntimeError, match="encoding failed"):
+            cached_encoder_call(model, ("failure",), {}, fail, namespace=namespace)
+        # the temporary stage owner must not bypass later encoder caching
+        model(torch.ones(4), pixels)
+        model(torch.ones(4), pixels)
+        assert model.calls == 4
 
 
 if __name__ == "__main__":

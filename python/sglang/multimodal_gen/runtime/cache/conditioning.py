@@ -33,6 +33,7 @@ _refresh_cache: ContextVar[bool] = ContextVar(
     "refresh_conditioning_cache", default=False
 )
 _prefer_cache: ContextVar[bool] = ContextVar("prefer_conditioning_cache", default=False)
+_stage_encoder: ContextVar[object | None] = ContextVar("stage_encoder", default=None)
 _container_types: set[type] = {DiagonalGaussianDistribution}
 _live_caches = weakref.WeakSet()
 _weights_epoch = 0
@@ -403,16 +404,26 @@ def cached_encoder_call(
     cache = _inference_cache(model)
     if (
         cache is None
+        or model is _stage_encoder.get()
         or kwargs.get("use_cache")
         or kwargs.get("past_key_values") is not None
     ):
         return compute()
+
+    def compute_conditioning():
+        # a stage owns the consumed output; preserve nested vision-method caches
+        token = _stage_encoder.set(model)
+        try:
+            return compute()
+        finally:
+            _stage_encoder.reset(token)
+
     return cache.run(
         model,
         "forward",
         args,
         kwargs,
-        compute,
+        compute_conditioning if namespace is not None else compute,
         group,
         nested=nested,
         namespace=namespace,
