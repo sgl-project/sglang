@@ -140,6 +140,130 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
+_UNLOADED_REPORT_LIMIT = 12
+
+
+def report_unloaded_params(
+    param_names: Iterable[str],
+    loaded_params: Iterable[str],
+    *,
+    model_label: str = "Glm5Next",
+    optional_params: Iterable[str] = (),
+) -> List[str]:
+    """Warn about parameters ``load_weights`` never populated and return them.
+
+    ``optional_params`` may legitimately be absent from a checkpoint, such as the
+    KV-cache scales that keep their defaults, and are never reported.
+    """
+    missing = sorted(set(param_names) - set(loaded_params) - set(optional_params))
+    if not missing:
+        return []
+    shown = ", ".join(missing[:_UNLOADED_REPORT_LIMIT])
+    if len(missing) > _UNLOADED_REPORT_LIMIT:
+        shown += f", ... (+{len(missing) - _UNLOADED_REPORT_LIMIT} more)"
+    logger.warning(
+        "%s: %d of %d parameters were not initialized from the checkpoint and "
+        "keep their initial values; the model will run but its output is not "
+        "meaningful. This usually means the checkpoint uses tensor names this "
+        "loader does not expect. Missing: %s",
+        model_label,
+        len(missing),
+        len(set(param_names)),
+        shown,
+    )
+    return missing
+
+
+# transformers renames these on load (conversion_mapping.py, "glm5_next") and
+# saves under the new names, so save_pretrained output needs them mapped back.
+_HF_NATIVE_RENAMES = (
+    (".self_attn.forget_gate.", ".self_attn."),
+    (".attn_hc.fn", ".hc_attn_fn"),
+    (".attn_hc.base", ".hc_attn_base"),
+    (".attn_hc.scale", ".hc_attn_scale"),
+    (".ffn_hc.fn", ".hc_ffn_fn"),
+    (".ffn_hc.base", ".hc_ffn_base"),
+    (".ffn_hc.scale", ".hc_ffn_scale"),
+)
+
+_HF_PACKED_GATE_UP = ".mlp.experts.gate_up_proj"
+_HF_PACKED_DOWN = ".mlp.experts.down_proj"
+_HF_PACKED_CONV1D = ".self_attn.conv1d.weight"
+
+
+def _split_hf_packed_gate_up(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`experts.gate_up_proj` [E, 2I, H] -> per-expert `gate_proj` / `up_proj`."""
+    if weight.dim() != 3:
+        raise ValueError(f"{name}: expected a 3-D packed tensor, got {weight.shape}")
+    n_experts, gate_and_up, _ = weight.shape
+    if gate_and_up % 2:
+        raise ValueError(f"{name}: dim 1 is {gate_and_up}, which is not two halves")
+    inter = gate_and_up // 2
+    prefix = name[: -len("gate_up_proj")]
+    for expert in range(n_experts):
+        yield f"{prefix}{expert}.gate_proj.weight", weight[expert, :inter]
+        yield f"{prefix}{expert}.up_proj.weight", weight[expert, inter:]
+
+
+def _split_hf_packed_down(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`experts.down_proj` [E, H, I] -> per-expert `down_proj`."""
+    if weight.dim() != 3:
+        raise ValueError(f"{name}: expected a 3-D packed tensor, got {weight.shape}")
+    prefix = name[: -len("down_proj")]
+    for expert in range(weight.shape[0]):
+        yield f"{prefix}{expert}.down_proj.weight", weight[expert]
+
+
+def _split_hf_packed_conv1d(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`self_attn.conv1d.weight` [3P, 1, K] -> `q/k/v_conv1d` [P, 1, K]."""
+    if weight.shape[0] % 3:
+        raise ValueError(
+            f"{name}: dim 0 is {weight.shape[0]}, which is not three parts"
+        )
+    prefix = name[: -len("conv1d.weight")]
+    for shard, chunk in zip("qkv", weight.chunk(3, dim=0)):
+        yield f"{prefix}{shard}_conv1d.weight", chunk
+
+
+def convert_hf_native_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Yield weights under the released names; released checkpoints pass unchanged."""
+    announced = False
+    for name, loaded_weight in weights:
+        for source, target in _HF_NATIVE_RENAMES:
+            if source in name:
+                name = name.replace(source, target)
+                converted = True
+                break
+        else:
+            converted = name.endswith(
+                (_HF_PACKED_GATE_UP, _HF_PACKED_DOWN, _HF_PACKED_CONV1D)
+            )
+        if converted and not announced:
+            announced = True
+            log_info_on_rank0(
+                logger,
+                "glm5_next: checkpoint uses transformers module names; "
+                "mapping them back to the released layout",
+            )
+
+        if name.endswith(_HF_PACKED_GATE_UP):
+            yield from _split_hf_packed_gate_up(name, loaded_weight)
+        elif name.endswith(_HF_PACKED_DOWN):
+            yield from _split_hf_packed_down(name, loaded_weight)
+        elif name.endswith(_HF_PACKED_CONV1D):
+            yield from _split_hf_packed_conv1d(name, loaded_weight)
+        else:
+            yield name, loaded_weight
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -1566,7 +1690,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return name
 
         weight_names = []
-        for name, loaded_weight in weights:
+        loaded_params: set[str] = set()
+        for name, loaded_weight in convert_hf_native_weights(weights):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
@@ -1649,6 +1774,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 is_expert_weight = False
@@ -1670,6 +1796,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    loaded_params.add(name)
                     break
                 else:
                     if is_expert_weight:
@@ -1717,6 +1844,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 weight_loader(param, fused_weight)
+                                loaded_params.add(target)
                             cached_a_proj.pop(q_a_proj_name, None)
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
@@ -1733,6 +1861,23 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+
+        is_partial_load = (
+            is_nextn
+            or getattr(self, "encoder_only", False)
+            or getattr(self, "language_only", False)
+        )
+        if not is_partial_load:
+            report_unloaded_params(
+                params_dict.keys(),
+                loaded_params,
+                optional_params=[
+                    name
+                    for name, param in params_dict.items()
+                    if getattr(param, "_skip_weight_check", False)
+                ],
+            )
 
         if getattr(self, "encoder_only", False):
             run_post = False
