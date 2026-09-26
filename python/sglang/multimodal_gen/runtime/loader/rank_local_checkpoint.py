@@ -15,8 +15,10 @@ from torch.distributed.fsdp import FSDPModule
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import _scan_safetensors_files
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -55,6 +57,15 @@ class LocalFSDPShard:
 @dataclass(frozen=True)
 class LocalTPShard:
     tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _TPReadPlan:
+    shard_dim: int | None
+    # Logical output matrices packed into a single checkpoint tensor.
+    packed_sizes: tuple[int, ...] = ()
+    # Custom loaders may opt in to transforming the LOCAL checkpoint slice.
+    transform: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
 def get_param_for_weight_loading(
@@ -312,13 +323,99 @@ def tp_local_shape(
     return tuple(local_shape)
 
 
+def _tp_read_plan(
+    param: torch.nn.Parameter | None,
+    sources: list[SafetensorsSource],
+    tp_size: int,
+) -> _TPReadPlan | None:
+    if param is None:
+        return _TPReadPlan(None)
+    # This path bypasses weight_loader. Do not bypass subclass/quantization or
+    # metadata handling merely because the checkpoint has a floating dtype.
+    if (
+        type(param) is not torch.nn.Parameter
+        or any(
+            param.__dict__.get(flag, False)
+            for flag in ("is_metadata", "is_sharded_weight", "needs_scalar_to_array")
+        )
+        or param.__dict__.get("packed_dim") is not None
+    ):
+        return None
+
+    transform = param.__dict__.get("rank_local_tp_weight_transform")
+    if transform is not None:
+        # Explicit model contract: slice one unmerged source first, then apply
+        # a shape/dtype-preserving local transform. FSDP's full-weight transform
+        # is intentionally not reused: its ordering is different.
+        dim = param.__dict__.get("rank_local_tp_shard_dim")
+        if (
+            not callable(transform)
+            or type(dim) is not int
+            or dim < 0
+            or len(sources) != 1
+            or sources[0].merge_index is not None
+        ):
+            return None
+        return _TPReadPlan(dim, transform=transform)
+
+    supported, dim = _resolve_tp_shard_dim(param)
+    if not supported:
+        return None
+    loader = param.__dict__.get("weight_loader")
+    if loader is None:
+        return _TPReadPlan(dim)
+    owner = loader.__self__
+    if not isinstance(owner.quant_method, UnquantizedLinearMethod):
+        return None
+    # Subclasses with different loaders (e.g. GQA QKV replication) need their
+    # own explicit layout contract; inheriting ColumnParallelLinear is not one.
+    if loader.__func__ not in (
+        ReplicatedLinear.weight_loader,
+        ColumnParallelLinear.weight_loader,
+        MergedColumnParallelLinear.weight_loader,
+        RowParallelLinear.weight_loader,
+    ):
+        return None
+    if isinstance(owner, MergedColumnParallelLinear) and dim is not None:
+        sizes = tuple(owner.output_sizes)
+        if dim != 0 or any(size <= 0 or size % tp_size for size in sizes):
+            return None
+        if len(sources) == 1 and sources[0].merge_index is None:
+            if not sources[0].shape or sources[0].shape[0] != sum(sizes):
+                return None
+            return _TPReadPlan(dim, packed_sizes=sizes)
+        if (
+            len(sources) != len(sizes)
+            or {source.merge_index for source in sources} != set(range(len(sizes)))
+            or any(
+                not source.shape or source.shape[0] != sizes[source.merge_index]
+                for source in sources
+            )
+        ):
+            return None
+    return _TPReadPlan(dim)
+
+
 def read_tp_local_tensor(
     sources: list[SafetensorsSource],
     handles: dict[str, Any],
     shard_dim: int | None,
     tp_rank: int,
     tp_size: int,
+    packed_sizes: tuple[int, ...] = (),
 ) -> torch.Tensor:
+    if packed_sizes:
+        # Fused MLP/QKV matrices must each be split, not the concatenated tensor.
+        source = sources[0]
+        view = handles[source.file_path].get_slice(source.param_name)
+        offset = 0
+        parts = []
+        for size in packed_sizes:
+            local_size = size // tp_size
+            start = offset + tp_rank * local_size
+            parts.append(view[start : start + local_size].contiguous())
+            offset += size
+        return torch.cat(parts, dim=0)
     if shard_dim is None:
         assembled_shape = assembled_source_shape(sources)
         if assembled_shape is None:
@@ -379,7 +476,7 @@ def try_load_rank_local_tp_state_dict(
         return None
     sources_by_target, reverse_param_names_mapping = checkpoint_sources
 
-    shard_dims: dict[str, int | None] = {}
+    read_plans: dict[str, _TPReadPlan] = {}
     for target_param_name, sources in sources_by_target.items():
         meta_param = meta_sd.get(target_param_name)
         if meta_param is None or isinstance(meta_param, dist_tensor.DTensor):
@@ -394,15 +491,17 @@ def try_load_rank_local_tp_state_dict(
             param_dict,
             target_param_name,
         )
-        if actual_param is None:
-            supported, shard_dim = True, None
-        else:
-            supported, shard_dim = _resolve_tp_shard_dim(actual_param)
-        if not supported:
+        plan = _tp_read_plan(actual_param, sources, tp_size)
+        if plan is None:
+            logger.debug(
+                "Falling back from rank-local TP checkpoint loading for "
+                "unsupported parameter layout: %s",
+                target_param_name,
+            )
             return None
-        if tp_local_shape(sources, shard_dim, tp_size) != tuple(meta_param.shape):
+        if tp_local_shape(sources, plan.shard_dim, tp_size) != tuple(meta_param.shape):
             return None
-        shard_dims[target_param_name] = shard_dim
+        read_plans[target_param_name] = plan
 
     local_param_sd: dict[str, LocalTPShard] = {}
     local_bytes = 0
@@ -415,13 +514,27 @@ def try_load_rank_local_tp_state_dict(
             for file_path in weight_files
         }
         for target_param_name in sorted(sources_by_target):
+            plan = read_plans[target_param_name]
             tensor = read_tp_local_tensor(
                 sources_by_target[target_param_name],
                 handles,
-                shard_dims[target_param_name],
+                plan.shard_dim,
                 tp_rank,
                 tp_size,
+                packed_sizes=plan.packed_sizes,
             )
+            if plan.transform is not None:
+                transformed = plan.transform(tensor)
+                if (
+                    transformed.shape != tensor.shape
+                    or transformed.dtype != tensor.dtype
+                    or transformed.device != tensor.device
+                ):
+                    raise RuntimeError(
+                        "Rank-local TP transform must preserve shape, dtype and "
+                        f"device: {target_param_name}"
+                    )
+                tensor = transformed.contiguous()
             local_param_sd[target_param_name] = LocalTPShard(tensor)
             local_bytes += tensor.numel() * tensor.element_size()
 
