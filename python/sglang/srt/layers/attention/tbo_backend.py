@@ -18,6 +18,8 @@ class TboAttnBackend(AttentionBackend):
     def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
         super().__init__()
         self.primary = primary
+        self.dcp_size = primary.dcp_size
+        self.dcp_rank = primary.dcp_rank
         self.children = children
         # Dispatcher aliases the primary's pool refs so get_attn_backend()
         # reads through TboAttnBackend resolve to the underlying pool.

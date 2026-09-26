@@ -50,7 +50,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import (
-    get_parallel,
     get_resources,
     max_speculative_num_draft_tokens,
 )
@@ -85,9 +84,6 @@ def _get_tokenspeed_workspace(
     max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
 ) -> torch.Tensor:
 
-    # DCP target verification gathers Q to the full head count before launching
-    # TokenSpeed; size for that launch shape, not the rank-local head count.
-    num_heads *= get_parallel().attn_dcp_size
     max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)
@@ -139,7 +135,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
                 self.device,
-                self.num_q_heads,
+                self.num_decode_q_heads,
                 self.kv_lora_rank,
                 max_q_len=(max_speculative_num_draft_tokens() or 1),
             )
@@ -362,11 +358,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        parallel = get_parallel()
-        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+        if self.dcp_size > 1 and get_in_autotune_dummy_run():
             return self._dummy_dcp_decode_for_autotune(q, layer)
 
-        if not parallel.dcp_enabled:
+        if self.dcp_size == 1:
             return super().forward_decode(
                 q,
                 k,
@@ -434,8 +429,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
             causal_seqs=global_seq_lens,
-            cp_world=parallel.dcp_size,
-            cp_rank=parallel.dcp_rank,
+            cp_world=self.dcp_size,
+            cp_rank=self.dcp_rank,
             return_lse=True,
         )
 

@@ -1011,6 +1011,18 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=draft_tokens,
         )
 
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if (
+        cfg.dcp_size > 1
+        and cfg.speculative_eagle_topk > 1
+        and is_deepseek_dsa(model_config_of(server_args).hf_config)
+    ):
+        raise ValueError(
+            "DSA DCP with EAGLE-family speculative decoding requires "
+            "--speculative-eagle-topk 1; tree drafting is not supported."
+        )
+
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if cfg.speculative_eagle_topk > 1:
             raise ValueError(
