@@ -42,6 +42,9 @@ dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 hf-hub = { version = "0.4", default-features = false }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
+# Pinned EXACTLY: this crate's accepted grammar defines the
+# "anything Rust admits, Python can compile" invariant in `sglang-server::message::sampling`.
+# A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
