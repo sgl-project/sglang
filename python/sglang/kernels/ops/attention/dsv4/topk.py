@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_xpu
 
+from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
 
 
@@ -324,4 +325,19 @@ def topk_transform_packed_v2(
         out_page_indices,
         page_size,
         row_to_batch,
+    )
+
+
+def topk_transform_sparse(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    phys_blocks: torch.Tensor,
+    page_indices: torch.Tensor,
+) -> None:
+    """Top-``k`` (``k = page_indices.shape[1]``) of each row of the bf16 sparse
+    ``logits`` within its first ``valid_lens[b]`` columns, as pool slots through
+    ``phys_blocks`` (the published blocks as pool slots / 8); ``-1`` padded,
+    unordered."""
+    topk_transform_bf16_small(
+        logits, valid_lens, phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
     )

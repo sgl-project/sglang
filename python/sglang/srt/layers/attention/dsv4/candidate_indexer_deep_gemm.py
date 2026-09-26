@@ -6,22 +6,25 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    amax8_varlen,
     amax_topk_blocks,
     candidate_row_lens,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
     CANDIDATE_BLOCK_SIZE,
-    amax8_varlen,
     build_sparse_indexer_schedule,
     sort_candidate_blocks,
-    sparse_logits,
-    topk_transform_sparse,
 )
-from sglang.kernels.ops.attention.dsv4.dense_prefill import score_tiles
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
+    flat_index_logits_tiles,
+    sparse_logits,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_bf16_small,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
+    topk_transform_sparse,
 )
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateIndexer,
@@ -35,7 +38,6 @@ from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
     DenseCandidateIndexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
-    deep_gemm_fp4_paged_mqa_logits,
     topk_transform_paged_from_metadata,
 )
 
@@ -293,7 +295,7 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
         nblocks, valid_lens = candidate_row_lens(inputs.compress_lens, self.topk_blocks)
         blocks = torch.empty(rows, self.topk_blocks, dtype=torch.int32, device=device)
         # the block keys read the score rows through 32-byte vectors
-        for tile, logits in score_tiles(
+        for tile, logits in flat_index_logits_tiles(
             q=(inputs.q_fp4, inputs.q_sf),
             kv=inputs.kv,
             weights=inputs.weights,

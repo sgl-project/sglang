@@ -34,6 +34,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -83,7 +86,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    deep_gemm_fp4_paged_mqa_logits,
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
