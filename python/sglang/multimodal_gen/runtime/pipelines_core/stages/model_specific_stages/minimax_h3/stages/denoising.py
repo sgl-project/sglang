@@ -494,7 +494,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 super()._maybe_enable_cache_dit(num_inference_steps, batch)
             return
 
-        # H3 is monolithic-only, and the scheduler executes one worker batch at
+        # Each H3 denoiser executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
         # makes the process-wide hook transition safe at this batch boundary.
         if self._cache_dit_enabled and current_mode != desired_mode:
