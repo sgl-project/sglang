@@ -949,6 +949,7 @@ class ReqKvInfo:
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    mamba_ping_pong_track_buffer_mask: Optional[int] = None  # None: all slots valid
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -957,6 +958,24 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+
+    def mamba_ping_pong_slots(self, exclude_idx: Optional[int] = None) -> torch.Tensor:
+        buf = self.mamba_ping_pong_track_buffer
+        assert buf is not None
+        mask = self.mamba_ping_pong_track_buffer_mask
+        if mask is None:
+            mask = (1 << buf.numel()) - 1
+        if exclude_idx is not None:
+            assert 0 <= exclude_idx < buf.numel()
+            mask &= ~(1 << exclude_idx)
+        if mask == 0:
+            return buf[:0]
+        if mask == 1:
+            return buf[:1]
+        if mask == 2:
+            return buf[1:2]
+        assert mask == 3
+        return buf
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1986,6 +2005,7 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_ping_pong_track_buffer_mask = None
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None

@@ -1033,6 +1033,7 @@ class TestTriFactorySizing(unittest.TestCase):
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer_lazy=False,
             disable_overlap_schedule=True,
             need_sort=False,
         )
