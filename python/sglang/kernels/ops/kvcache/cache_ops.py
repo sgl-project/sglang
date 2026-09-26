@@ -168,6 +168,7 @@ def reshape_and_cache_flash(
     num_heads,
     head_size,
     block_size,
+    reserved_skip_index,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
@@ -205,6 +206,7 @@ def reshape_and_cache_flash(
         num_heads: Number of attention heads.
         head_size: Hidden dimension per head.
         block_size: Number of slots per cache block.
+        reserved_skip_index: Slot whose writes are skipped; -1 skips none.
         HEAD_BLOCK: Number of heads processed per program.
         BLOCK_D: Vectorized dimension size (power-of-2 padded).
         HAS_SWA: Enable SWA remapping.
@@ -227,7 +229,7 @@ def reshape_and_cache_flash(
     if HAS_SWA:
         slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
 
-    if slot_idx < 0:
+    if (slot_idx < 0) | (slot_idx == reserved_skip_index):
         return
 
     block_idx = slot_idx // block_size
@@ -285,6 +287,7 @@ def launch_reshape_and_cache_flash(
     swa_slot_mapping=None,
     k_scale=None,
     v_scale=None,
+    reserved_skip_index=-1,
 ):
     """
     Launch wrapper for reshape_and_cache_flash Triton kernel.
@@ -301,6 +304,8 @@ def launch_reshape_and_cache_flash(
         swa_slot_mapping: Optional SWA remapping table
         k_scale: Optional key scaling factor
         v_scale: Optional value scaling factor
+        reserved_skip_index: Slot whose writes are skipped, e.g. the reserved
+            padding slot 0 that store_cache skips; -1 (default) skips none.
     """
 
     num_tokens = key.shape[0]
@@ -331,6 +336,7 @@ def launch_reshape_and_cache_flash(
         num_heads,
         head_size,
         key_cache.shape[1],
+        reserved_skip_index,
         HEAD_BLOCK=HEAD_BLOCK,
         BLOCK_D=BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),

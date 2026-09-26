@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, TypeGuard, Union
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
+    store_k_slots,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -145,6 +146,57 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _kv_scale_divides(
+    scale: Optional[Union[float, torch.Tensor]],
+) -> TypeGuard[Union[float, torch.Tensor]]:
+    """Whether dividing by ``scale`` would change any value.
+
+    Host scalars only: reading a device tensor would sync, illegal under graph capture,
+    so a tensor scale always divides.
+    """
+    if scale is None:
+        return False
+    if isinstance(scale, torch.Tensor):
+        return True
+    return scale != 1.0
+
+
+def _has_dense_kv_rows(
+    t: torch.Tensor, head_num: int, head_dim: int, num_tokens: int
+) -> bool:
+    """Whether ``t`` holds exactly ``num_tokens`` rows addressable as
+    ``token * t.stride(0) + head * head_dim + dim``.
+
+    Weaker than ``is_contiguous`` (the kernel takes the token stride) but strict
+    on the count: it sizes the grid, and the slot index is read unmasked.
+    """
+    row = head_num * head_dim
+    if t.is_contiguous():
+        return t.numel() == num_tokens * row
+    if t.dim() == 2:
+        return tuple(t.shape) == (num_tokens, row) and t.stride(1) == 1
+    if t.dim() == 3:
+        return (
+            tuple(t.shape) == (num_tokens, head_num, head_dim)
+            and t.stride(1) == head_dim
+            and t.stride(2) == 1
+        )
+    return False
+
+
+def _as_token_head_dim(t: torch.Tensor, head_num: int, head_dim: int) -> torch.Tensor:
+    """View ``t`` as ``[tokens, head_num, head_dim]`` without moving data.
+
+    Splits only the trailing block, so a strided token dimension survives a ``view``
+    that would otherwise raise. Guard with :func:`_has_dense_kv_rows`.
+    """
+    if t.dim() == 3 and t.shape[1] == head_num and t.shape[2] == head_dim:
+        return t
+    if t.dim() == 2 and t.shape[1] == head_num * head_dim:
+        return t.unflatten(1, (head_num, head_dim))
+    return t.view(-1, head_num, head_dim)
 
 
 def _set_kv_buffer_impl(
@@ -2581,6 +2633,69 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def can_store_kv_fused_cast(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+    ) -> bool:
+        """Whether the pending dtype cast can be folded into the paged write.
+
+        The fused store reuses K's head geometry for V and applies no scale, so
+        mismatched shapes or a non-unit scale must fall back.
+        """
+        if self.kv_cache_layout != "nhd" or self.use_hnd:
+            return False
+        if self.is_quantized_kv_cache or self.store_dtype != torch.uint8:
+            return False
+        if cache_k.dtype == self.dtype or cache_k.dtype != cache_v.dtype:
+            return False
+        if self.head_dim != self.v_head_dim:
+            return False
+        if _kv_scale_divides(k_scale) or _kv_scale_divides(v_scale):
+            return False
+        # store_kv_fused_cast presents the buffer as page-size 1; a subclass whose
+        # per-layer buffer is already paged (NPU) would be mis-indexed.
+        if self.k_buffer[layer_id - self.start_layer].dim() != 3:
+            return False
+        num_tokens = loc.numel()
+        return (
+            _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, num_tokens)
+            and _has_dense_kv_rows(cache_v, self.head_num, self.head_dim, num_tokens)
+            and cache_k.shape == cache_v.shape
+        )
+
+    def store_kv_fused_cast(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        """Cast K/V to the cache dtype and scatter both in one launch.
+
+        Guard with :meth:`can_store_kv_fused_cast`.
+        """
+        from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
+
+        # store_cache carries its own slot bound; this kernel does not.
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "store_kv_fused_cast")
+        # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
+        # slot-indexed buffer as page-size 1.
+        launch_reshape_and_cache_flash(
+            _as_token_head_dim(cache_k, self.head_num, self.head_dim),
+            _as_token_head_dim(cache_v, self.head_num, self.head_dim),
+            self._get_key_buffer(layer_id).unsqueeze(1),
+            self._get_value_buffer(layer_id).unsqueeze(1),
+            loc,
+            # Padded rows target the reserved slot 0, which attention reads back;
+            # skip it as the store_cache fallback does.
+            reserved_skip_index=0,
+        )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2619,9 +2734,9 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2999,9 +3114,9 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -3373,9 +3488,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
@@ -5402,7 +5517,20 @@ class MHATokenToKOnlyPool(KVCache):
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
-        self.k_buffer[layer_id][loc] = cache_k
+        k_buffer = self.k_buffer[layer_id]
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_k_buffer (MHA K-only)"
+        )
+        if _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, loc.numel()):
+            store_k_slots(
+                k_buffer,
+                _as_token_head_dim(cache_k, self.head_num, self.head_dim),
+                loc,
+            )
+        else:
+            # store_k_slots needs each token's (head, dim) block dense. This branch
+            # also wraps a negative slot rather than skipping it; loc has none here.
+            k_buffer[loc] = cache_k
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
@@ -5763,7 +5891,7 @@ class MiniMaxSparseKVPool(KVCache):
             )
         sub_pool = self.index_k_pool
         if cache_idx_k.dtype != sub_pool.dtype:
-            if k_scale is not None:
+            if _kv_scale_divides(k_scale):
                 cache_idx_k = cache_idx_k / k_scale
         sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
 
@@ -5840,13 +5968,18 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics; quantizes for fp8
-        # pools — the fused raw-byte path is disqualified there by
-        # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
-        # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
-        # applies any non-None scale with an IN-PLACE div_ (extra kernel +
-        # caller-tensor mutation), which must not fire for unit scale.
-        self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
+        if self.main_pool.can_store_kv_fused_cast(
+            layer.layer_id, loc, cache_k, cache_v, k_scale, v_scale
+        ):
+            self.main_pool.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
+        else:
+            # Fallback: separate stores (identical semantics; quantizes for fp8
+            # pools — the fused raw-byte path is disqualified there by
+            # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
+            # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
+            # applies any non-None scale with an IN-PLACE div_ (extra kernel +
+            # caller-tensor mutation), which must not fire for unit scale.
+            self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
         else:
