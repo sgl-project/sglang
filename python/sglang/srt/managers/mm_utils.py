@@ -42,6 +42,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.segmented_features import (
+    SegmentedFeatures,
+    expand_segmented_item,
+)
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
@@ -1110,9 +1114,93 @@ def _try_simple_split(item, num_items, expanded_mm_items):
     return True
 
 
+def _slice_segmented_model_data(item, num_parts):
+    """Build the model-data slicer used when expanding segmented features.
+
+    Mirrors what the simple-split path does. Most keys are aligned either with
+    the item count or with feature rows, which _slice_model_data handles. The
+    exception is a patch-aligned key -- Step3's patch_pixel_values and
+    patch_newline_mask -- whose dim-0 counts image patches, not feature rows,
+    and so must be cut on the boundaries num_patches records instead.
+    """
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_parts
+    )
+
+    def slice_model_data(data, *, index, start, end, num_items, total_feature_len):
+        sliced = _slice_model_data(
+            data,
+            index=index,
+            start=start,
+            end=end,
+            num_items=num_items,
+            total_feature_len=total_feature_len,
+        )
+        if patch_slices is None:
+            return sliced
+        patch_start, patch_end = patch_slices[index]
+        for key in _PATCH_ALIGNED_KEYS:
+            value = data.get(key)
+            if value is not None and _get_length(value) == total_num_patches:
+                sliced[key] = _slice_value(value, patch_start, patch_end)
+        return sliced
+
+    return slice_model_data
+
+
+def _offsets_per_part(model_specific_data, num_parts, num_offsets):
+    """How many consecutive placeholder spans each part owns, or None.
+
+    One span per part is the ordinary case: a request with N images holds N
+    runs of the image token, one per image.
+
+    Step3 is the exception in tree. It wraps every crop of an image in its own
+    boundary tokens, so one image's placeholders arrive as num_patches + 1
+    separate runs and a request with three images has eight of them. Splitting
+    one span per part there would hand image two the tail of image one.
+    num_patches already records the crop count per image, so the grouping is
+    known; requiring it to account for exactly every span is what makes it
+    safe to apply -- a layout that merges or adds runs fails the check and the
+    caller falls back to the dense tensor.
+    """
+    if num_offsets == num_parts:
+        return [1] * num_parts
+
+    patch_slices, _ = _compute_patch_slices(model_specific_data, num_parts)
+    if patch_slices is None:
+        return None
+    grouped = [end - start + 1 for start, end in patch_slices]
+    if sum(grouped) != num_offsets:
+        return None
+    return grouped
+
+
 def get_new_expanded_mm_items(original_mm_items):
     expanded_mm_items = []
     for item in original_mm_items:
+        if isinstance(item.feature, SegmentedFeatures):
+            # The processor recorded the part boundaries, so none of the grid
+            # inference below has to rediscover them -- and cannot get them
+            # wrong. Either step may still decline, and both mean the same
+            # thing: this item is not one part per image. Collapse to the
+            # tensor torch.cat would have produced and take the ordinary path,
+            # so emitting segmented features is always safe.
+            num_parts = item.feature.num_parts
+            expanded = None
+            grouping = _offsets_per_part(
+                item.model_specific_data,
+                num_parts,
+                len(item.offsets) if item.offsets is not None else 0,
+            )
+            if grouping is not None:
+                expanded = expand_segmented_item(
+                    item, _slice_segmented_model_data(item, num_parts), grouping
+                )
+            if expanded is not None:
+                expanded_mm_items.extend(expanded)
+                continue
+            item.feature = item.feature.dense()
+
         is_bundled = item.offsets is not None and len(item.offsets) > 1
 
         if is_bundled:
