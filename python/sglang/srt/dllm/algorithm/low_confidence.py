@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.sampling import DllmSamplingPlan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -32,6 +33,18 @@ class LowConfidence(DllmAlgorithm):
         x = torch.argmax(logits, dim=-1)
         probs = torch.nn.functional.softmax(logits, dim=-1)
         confidence = torch.gather(probs, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
+        plan = DllmSamplingPlan.maybe_build(forward_batch.sampling_info)
+        if plan is not None:
+            rows = plan.sampled_rows
+            tokens, conf = plan.sample(
+                logits=logits[rows].view(-1, vocab_size),
+                req_ids=rows.repeat_interleave(self.block_size),
+                argmax_probs=confidence[rows].reshape(-1),
+            )
+            x = x.index_copy(0, rows, tokens.view(-1, self.block_size).to(x.dtype))
+            confidence = confidence.index_copy(
+                0, rows, conf.view(-1, self.block_size).to(confidence.dtype)
+            )
         confidence = torch.where(block_mask_index, confidence, -float("inf"))
 
         transfer_index = confidence > self.threshold
