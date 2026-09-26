@@ -25,6 +25,27 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{content}",
+                },
+            },
+        },
+    },
+}
+
+
 class NonHarmonyStreamTestCase(CustomTestCase):
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
@@ -200,6 +221,44 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             if payload.get("type") == "response.output_item.added"
         ]
         self.assertIn("function_call", added_kinds)
+
+    def test_truncated_response_template_call_is_incomplete_without_arguments(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "response_template"
+        serving.tokenizer_manager.tokenizer.response_template = RESPONSE_TEMPLATE
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        request._response_parser_prefix = "<assistant>"
+        chunk = engine_chunk('<call:get_weather>{"city":', finish=True)
+        chunk["meta_info"]["finish_reason"] = {"type": "length"}
+
+        events = StreamFixture(serving, request).run([chunk])
+        payloads = event_payloads(events)
+        deltas = "".join(
+            payload["delta"]
+            for payload in payloads
+            if payload["type"] == "response.function_call_arguments.delta"
+        )
+        terminal = payloads[-1]
+
+        self.assertEqual(deltas, "")
+        self.assertEqual(terminal["type"], "response.incomplete")
+        self.assertEqual(terminal["response"]["status"], "incomplete")
+        self.assertEqual(terminal["response"]["output"][0]["name"], "get_weather")
+        self.assertEqual(terminal["response"]["output"][0]["arguments"], "")
+        self.assertEqual(terminal["response"]["output"][0]["status"], "incomplete")
 
     def test_required_native_parser_matches_full_response(self):
         serving = make_serving()

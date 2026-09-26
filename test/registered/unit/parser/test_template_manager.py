@@ -969,6 +969,27 @@ class TestResolveAutoParsers(CustomTestCase):
     """Tests for resolve_auto_parsers()."""
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+    response_template = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "content": {"content": "text"},
+            "thinking": {
+                "open": "<think>",
+                "close": "</think>",
+            },
+            "tool_calls": {
+                "open": "<call>",
+                "close": "</call>",
+                "content": "json",
+                "transform": {
+                    "function": {
+                        "name": "tool",
+                        "arguments": "{content}",
+                    },
+                },
+            },
+        },
+    }
 
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
@@ -992,6 +1013,105 @@ class TestResolveAutoParsers(CustomTestCase):
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_uses_runtime_tokenizer_configuration(self):
+        args = ServerArgs(
+            model_path="weights-path",
+            tokenizer_path="tokenizer-path",
+            tokenizer_mode="slow",
+            tokenizer_backend="fastokens",
+            revision="tokenizer-revision",
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+            trust_remote_code=True,
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        get_tokenizer = Mock(return_value=tokenizer)
+
+        with _patch_hf_transformers_utils(get_tokenizer):
+            resolve_auto_parsers(args)
+
+        get_tokenizer.assert_called_once_with(
+            "tokenizer-path",
+            tokenizer_mode="slow",
+            trust_remote_code=True,
+            revision="tokenizer-revision",
+            tokenizer_backend="fastokens",
+        )
+
+    def test_existing_detection_takes_precedence_over_response_template(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        tokenizer.response_template = self.response_template
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_response_template_fills_undetected_parsers(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = self.response_template
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "response_template")
+        self.assertEqual(_declared(args, "tool_call_parser"), "response_template")
+
+    def test_response_template_resolves_only_supported_parser_fields(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {"open": "<think>", "close": "</think>"},
+            },
+        }
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(
+            _declared(args, "reasoning_parser"),
+            "response_template",
+        )
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_unsupported_response_template_is_ignored(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "metadata": {
+                    "open": "<metadata>",
+                    "close": "</metadata>",
+                    "content": "json",
+                },
+            },
+        }
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)
@@ -1158,6 +1278,17 @@ class TestResolveAutoParsers(CustomTestCase):
 
     def test_explicit_jinja_template_takes_precedence(self):
         tokenizer = _DummyTokenizer([], chat_template=None)
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {"open": "<think>", "close": "</think>"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                },
+            },
+        }
 
         with tempfile.NamedTemporaryFile("w", suffix=".jinja") as f:
             f.write(

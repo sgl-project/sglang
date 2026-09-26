@@ -1,0 +1,977 @@
+"""Tests for checkpoint-driven response-template adapters."""
+
+import copy
+import json
+import unittest
+from types import SimpleNamespace
+
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    Function,
+    ResponsesRequest,
+    Tool,
+    ToolChoice,
+)
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.gemma4_detector import (
+    Gemma4Detector as Gemma4ToolDetector,
+)
+from sglang.srt.parser.reasoning_parser import Gemma4Detector as Gemma4ReasoningDetector
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+    configure_response_template_request,
+    resolve_response_template,
+    tool_close_token_ids,
+    validate_response_template_for_serving,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+# Public checkpoint metadata shared by google/gemma-4-12B-it and
+# google/gemma-4-26B-A4B-it.
+GEMMA4_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "fields": {
+        "content": {
+            "close": ["<turn|>", "<|tool_response>", "<eos>"],
+            "content": "text",
+        },
+        "thinking": {
+            "close": "<channel|>",
+            "content": "text",
+            "open": "<|channel>thought\n",
+        },
+        "tool_calls": {
+            "close": "<tool_call|>",
+            "content": "json",
+            "content_args": {
+                "string_delims": [['<|"|>', '<|"|>']],
+                "unquoted_keys": True,
+            },
+            "open_pattern": r"<\|tool_call>call:(?P<name>\w+)",
+            "repeats": True,
+            "transform": {
+                "function": {
+                    "arguments": "{content}",
+                    "name": "{name}",
+                },
+                "type": "function",
+            },
+        },
+    },
+    "start_anchor": ["<|turn>model\n", "<tool_response|>"],
+}
+
+PREFIX = "<|turn>model\n"
+THINKING = "<|channel>thought\nI should check the weather.<channel|>"
+TOOL_CALL = (
+    '<|tool_call>call:get_weather{location:<|"|>New York<|"|>,days:3,'
+    "details:{metric:true},hours:[1,2]}<tool_call|>"
+)
+
+# Arguments parse even when the call is cut off before its closer.
+XML_TOOL_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "<|call|>",
+            "repeats": True,
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": r"<arg:(?P<key>\w+)>(?P<value>.*?)</arg>",
+            },
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+        },
+    },
+}
+XML_CALL_WITHOUT_CLOSER = "<call:get_weather><arg:location>Paris</arg><arg:days>3"
+
+
+def _tool(name: str = "get_weather") -> Tool:
+    return Tool(
+        type="function",
+        function=Function(
+            name=name,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "details": {"type": "object"},
+                    "hours": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+            },
+        ),
+    )
+
+
+def _call_values(calls):
+    return [(call.name, json.loads(call.parameters)) for call in calls]
+
+
+def _chunks(text, size):
+    return [text[index : index + size] for index in range(0, len(text), size)]
+
+
+def _collect_tool_stream(detector, chunks):
+    normal_parts = []
+    calls = {}
+    for chunk in chunks:
+        result = detector.parse_streaming_increment(chunk, [_tool()])
+        normal_parts.append(result.normal_text)
+        for call in result.calls:
+            entry = calls.setdefault(
+                call.tool_index,
+                {"name": "", "parameters": ""},
+            )
+            if call.name:
+                entry["name"] = call.name
+            if call.parameters:
+                entry["parameters"] += call.parameters
+    finished = detector.finish([_tool()])
+    normal_parts.append(finished.normal_text)
+    for call in finished.calls:
+        entry = calls.setdefault(
+            call.tool_index,
+            {"name": "", "parameters": ""},
+        )
+        if call.name:
+            entry["name"] = call.name
+        if call.parameters:
+            entry["parameters"] += call.parameters
+    parsed_calls = [
+        (call["name"], json.loads(call["parameters"]))
+        for _, call in sorted(calls.items())
+    ]
+    return "".join(normal_parts), parsed_calls
+
+
+class TestResponseTemplateLoading(unittest.TestCase):
+    def test_loads_response_template_from_tokenizer_config(self):
+        tokenizer = SimpleNamespace(
+            init_kwargs={"response_template": GEMMA4_RESPONSE_TEMPLATE}
+        )
+
+        self.assertEqual(
+            resolve_response_template(tokenizer),
+            GEMMA4_RESPONSE_TEMPLATE,
+        )
+        explicit = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        self.assertIs(resolve_response_template(tokenizer, explicit), explicit)
+
+    def test_rejects_unsupported_semantic_fields(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "citations": {
+                    "open": "<citation>",
+                    "close": "</citation>",
+                    "content": "text",
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unsupported semantic fields"):
+            validate_response_template_for_serving(template)
+
+        for field_name, update in (
+            ("content", {"content": "json"}),
+            ("thinking", {"transform": "{content}"}),
+        ):
+            with self.subTest(field=field_name, update=update):
+                template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+                template["fields"][field_name].update(update)
+                with self.assertRaisesRegex(ValueError, "cannot be streamed"):
+                    validate_response_template_for_serving(template)
+
+    def test_checkpoint_metadata_takes_precedence_over_subclass_fallback(self):
+        class FallbackDetector(ResponseTemplateToolDetector):
+            response_template = XML_TOOL_TEMPLATE
+
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        self.assertIs(
+            FallbackDetector(tokenizer=tokenizer).response_template,
+            GEMMA4_RESPONSE_TEMPLATE,
+        )
+        self.assertIs(FallbackDetector().response_template, XML_TOOL_TEMPLATE)
+
+    def test_tool_detector_requires_tool_calls_field(self):
+        template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        del template["fields"]["tool_calls"]
+        tokenizer = SimpleNamespace(response_template=template)
+
+        with self.assertRaisesRegex(ValueError, "no 'tool_calls' field"):
+            ResponseTemplateToolDetector(response_template=template)
+        self.assertEqual(
+            tool_close_token_ids("response_template", tokenizer), frozenset()
+        )
+
+
+class TestGemma4ResponseTemplateParity(unittest.TestCase):
+    def test_non_streaming_reasoning_parity(self):
+        for text in ("It will be sunny.", THINKING + "It will be sunny."):
+            with self.subTest(text=text):
+                existing = Gemma4ReasoningDetector().detect_and_parse(text)
+                template = ResponseTemplateReasoningDetector(
+                    response_template=GEMMA4_RESPONSE_TEMPLATE,
+                    prefix=PREFIX,
+                ).detect_and_parse(text)
+
+                self.assertEqual(template.reasoning_text, existing.reasoning_text)
+                self.assertEqual(template.normal_text, existing.normal_text)
+
+    def test_non_streaming_tool_call_parity(self):
+        text = "Some text before " + TOOL_CALL
+        existing = Gemma4ToolDetector().detect_and_parse(text, [_tool()])
+        template = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        ).detect_and_parse(text, [_tool()])
+
+        self.assertEqual(template.normal_text, existing.normal_text)
+        self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
+
+    def test_non_streaming_repeated_tool_call_parity(self):
+        text = TOOL_CALL + TOOL_CALL
+        existing = Gemma4ToolDetector().detect_and_parse(text, [_tool()])
+        template = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        ).detect_and_parse(text, [_tool()])
+
+        self.assertEqual(template.normal_text, existing.normal_text)
+        self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
+
+    def test_content_between_tool_calls_is_preserved(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        )
+
+        parsed = detector.detect_and_parse(
+            TOOL_CALL + " between calls " + TOOL_CALL,
+            [_tool()],
+        )
+
+        self.assertEqual(parsed.normal_text, " between calls ")
+        self.assertEqual(len(parsed.calls), 2)
+
+    def test_malformed_tool_body_does_not_expose_reasoning(self):
+        malformed = TOOL_CALL.replace("<tool_call|>", "unexpected<tool_call|>")
+        parsed = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        ).detect_and_parse(THINKING + malformed)
+
+        self.assertEqual(parsed.reasoning_text, "I should check the weather.")
+        self.assertEqual(parsed.normal_text, malformed)
+
+    def test_required_tool_field_does_not_expose_reasoning(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {
+                    "open": "<think>",
+                    "close": "</think>",
+                    "content": "text",
+                },
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                    "optional": False,
+                },
+            },
+        }
+
+        parsed = ResponseTemplateReasoningDetector(
+            response_template=template,
+            prefix="<assistant>",
+        ).detect_and_parse("<think>reason</think>answer")
+
+        self.assertEqual(parsed.reasoning_text, "reason")
+        self.assertEqual(parsed.normal_text, "answer")
+
+    def test_thinking_only_template_preserves_plain_content(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "thinking": {
+                    "open": "<think>",
+                    "close": "</think>",
+                    "content": "text",
+                },
+            },
+        }
+
+        parsed = ResponseTemplateReasoningDetector(
+            response_template=template,
+            prefix="<assistant>",
+        ).detect_and_parse("answer")
+
+        self.assertEqual(parsed.reasoning_text, "")
+        self.assertEqual(parsed.normal_text, "answer")
+
+    def test_streaming_reasoning_parity(self):
+        text = THINKING + "It will be sunny."
+        for chunk_size in (1, 7, len(text)):
+            with self.subTest(chunk_size=chunk_size):
+                existing = Gemma4ReasoningDetector()
+                template = ResponseTemplateReasoningDetector(
+                    response_template=GEMMA4_RESPONSE_TEMPLATE,
+                    prefix=PREFIX,
+                )
+                existing_reasoning = []
+                existing_normal = []
+                template_reasoning = []
+                template_normal = []
+                for chunk in _chunks(text, chunk_size):
+                    existing_result = existing.parse_streaming_increment(chunk)
+                    existing_reasoning.append(existing_result.reasoning_text)
+                    existing_normal.append(existing_result.normal_text)
+                    template_result = template.parse_streaming_increment(chunk)
+                    template_reasoning.append(template_result.reasoning_text)
+                    template_normal.append(template_result.normal_text)
+
+                existing_end = existing.finish()
+                template_end = template.finish()
+                existing_reasoning.append(existing_end.reasoning_text)
+                existing_normal.append(existing_end.normal_text)
+                template_reasoning.append(template_end.reasoning_text)
+                template_normal.append(template_end.normal_text)
+
+                self.assertEqual(
+                    "".join(template_reasoning),
+                    "".join(existing_reasoning),
+                )
+                self.assertEqual(
+                    "".join(template_normal),
+                    "".join(existing_normal),
+                )
+
+    def test_streaming_tool_call_parity(self):
+        for chunk_size in (1, 7, len(TOOL_CALL)):
+            with self.subTest(chunk_size=chunk_size):
+                existing = Gemma4ToolDetector()
+                template = ResponseTemplateToolDetector(
+                    response_template=GEMMA4_RESPONSE_TEMPLATE,
+                    prefix=PREFIX,
+                )
+                chunks = _chunks(TOOL_CALL, chunk_size)
+
+                self.assertEqual(
+                    _collect_tool_stream(template, chunks),
+                    _collect_tool_stream(existing, chunks),
+                )
+
+    def test_streaming_tool_name_timing_parity(self):
+        opening = "<|tool_call>call:get_weather{"
+        for detector in (
+            Gemma4ToolDetector(),
+            ResponseTemplateToolDetector(
+                response_template=GEMMA4_RESPONSE_TEMPLATE,
+                prefix=PREFIX,
+            ),
+        ):
+            with self.subTest(detector=type(detector).__name__):
+                parsed = detector.parse_streaming_increment(opening, [_tool()])
+
+                self.assertEqual(parsed.normal_text, "")
+                self.assertEqual(
+                    [
+                        (call.tool_index, call.name, call.parameters)
+                        for call in parsed.calls
+                    ],
+                    [(0, "get_weather", "")],
+                )
+
+
+class TestResponseTemplateAdapters(unittest.TestCase):
+    def test_parser_prefix_request_state_is_private(self):
+        requests = (
+            ChatCompletionRequest(messages=[]),
+            ResponsesRequest(input="hello"),
+        )
+
+        for request in requests:
+            with self.subTest(request=type(request).__name__):
+                request._response_parser_prefix = PREFIX
+
+                self.assertEqual(request._response_parser_prefix, PREFIX)
+                self.assertNotIn("response_parser_prefix", request.model_dump())
+                self.assertEqual(
+                    request.model_copy()._response_parser_prefix,
+                    PREFIX,
+                )
+
+    def test_adapters_use_checkpoint_metadata(self):
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        reasoning = ReasoningParser(
+            model_type="response_template",
+            tokenizer=tokenizer,
+            prefix=PREFIX,
+        )
+        tools = FunctionCallParser(
+            tools=[_tool()],
+            tool_call_parser="response_template",
+            tokenizer=tokenizer,
+            prefix=PREFIX,
+        )
+
+        reasoning_text, tool_wire = reasoning.parse_non_stream(THINKING + TOOL_CALL)
+        normal_text, calls = tools.parse_non_stream(tool_wire)
+
+        self.assertEqual(reasoning_text, "I should check the weather.")
+        self.assertEqual(normal_text, "")
+        self.assertEqual(
+            _call_values(calls),
+            [
+                (
+                    "get_weather",
+                    {
+                        "location": "New York",
+                        "days": 3,
+                        "details": {"metric": True},
+                        "hours": [1, 2],
+                    },
+                )
+            ],
+        )
+
+    def test_empty_thinking_prefill_routes_generated_content(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "<|channel>thought\n<channel|>",
+        )
+
+        parsed = detector.parse_streaming_increment("Hello<turn|>")
+        finished = detector.finish()
+
+        self.assertEqual(parsed.reasoning_text + finished.reasoning_text, "")
+        self.assertEqual(parsed.normal_text + finished.normal_text, "Hello")
+
+    def test_open_thinking_prefill_routes_reasoning_and_content(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "<|channel>thought\n",
+        )
+
+        parsed = detector.parse_streaming_increment(
+            "Still thinking<channel|>Done<turn|>"
+        )
+        finished = detector.finish()
+
+        self.assertEqual(
+            parsed.reasoning_text + finished.reasoning_text,
+            "Still thinking",
+        )
+        self.assertEqual(parsed.normal_text + finished.normal_text, "Done")
+
+    def test_nonempty_prefix_content_is_not_replayed(self):
+        reasoning = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "<|channel>thought\nExisting reasoning",
+        )
+        content = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer",
+        )
+        non_streaming = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer",
+        )
+
+        reasoning_parsed = reasoning.parse_streaming_increment(
+            " continued<channel|>Done<turn|>"
+        )
+        content_parsed = content.parse_streaming_increment(" continued<turn|>")
+        non_streaming_parsed = non_streaming.detect_and_parse(" continued<turn|>")
+
+        self.assertEqual(reasoning_parsed.reasoning_text, " continued")
+        self.assertEqual(reasoning_parsed.normal_text, "Done")
+        self.assertEqual(content_parsed.normal_text, " continued")
+        self.assertEqual(non_streaming_parsed.normal_text, " continued")
+
+    def test_held_prefix_bytes_are_not_replayed(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer <",
+        )
+
+        parsed = detector.parse_streaming_increment("b> tail<turn|>")
+
+        self.assertEqual(parsed.normal_text, "b> tail")
+
+    def test_parser_config_disables_generated_special_token_spacing(self):
+        request = ChatCompletionRequest(messages=[])
+
+        configure_response_template_request(request)
+        sampling_params = request.to_sampling_params([], {})
+
+        self.assertFalse(sampling_params["skip_special_tokens"])
+        self.assertFalse(sampling_params["spaces_between_special_tokens"])
+        self.assertFalse(sampling_params["no_stop_trim"])
+
+    def test_reasoning_requires_explicit_enable_without_template_policy(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+
+        self.assertEqual(detector.reasoning_default, "explicit_enable_thinking")
+
+    def test_reasoning_subclass_can_define_regex_delimiters_and_policy(self):
+        class PatternReasoningDetector(ResponseTemplateReasoningDetector):
+            response_template = {
+                "start_anchor": "<assistant>",
+                "fields": {
+                    "thinking": {
+                        "open_pattern": r"<analysis(?: mode=\"\w+\")?>",
+                        "close_pattern": r"</analysis\s*>",
+                    },
+                    "content": {"content": "text"},
+                },
+            }
+            _default_think_start = "<analysis>"
+            _default_think_end = "</analysis>"
+            thinks_internally = True
+            reasoning_default = "always"
+
+        detector = PatternReasoningDetector()
+
+        self.assertEqual(detector.think_start_token, "<analysis>")
+        self.assertEqual(detector.think_end_token, "</analysis>")
+        self.assertTrue(detector.thinks_internally)
+        self.assertEqual(detector.reasoning_default, "always")
+
+    def test_transform_each_tool_region_emits_all_calls(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open": "<calls>",
+                    "close": "</calls>",
+                    "content": "json",
+                    "transform_each": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "{name}",
+                            "arguments": "{arguments}",
+                        },
+                    },
+                },
+            },
+        }
+        tools = [_tool(), _tool("get_forecast")]
+        text = (
+            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+        )
+        detector = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+
+        parsed = detector.detect_and_parse(text, tools)
+
+        self.assertEqual(parsed.normal_text, "")
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in parsed.calls],
+            [
+                ("get_weather", {"location": "Paris"}),
+                ("get_forecast", {"days": 3}),
+            ],
+        )
+
+        streaming = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+        opened = streaming.parse_streaming_increment("<calls>", tools)
+        closed = streaming.parse_streaming_increment(
+            text.removeprefix("<calls>"),
+            tools,
+        )
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in closed.calls],
+            [
+                ("get_weather", {"location": "Paris"}),
+                ("get_forecast", {"days": 3}),
+            ],
+        )
+
+    def test_malformed_call_is_dropped(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        malformed = TOOL_CALL.replace("<tool_call|>", "unexpected<tool_call|>")
+
+        result = detector.detect_and_parse("hello" + malformed + TOOL_CALL, [_tool()])
+
+        self.assertEqual(result.normal_text, "hello")
+        self.assertEqual([call.name for call in result.calls], ["get_weather"])
+
+    def test_streaming_malformed_call_is_dropped_before_emission(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        malformed = TOOL_CALL.replace("<tool_call|>", "unexpected<tool_call|>")
+
+        content = detector.parse_streaming_increment("hello", [_tool()])
+        parsed = detector.parse_streaming_increment(malformed, [_tool()])
+
+        self.assertEqual(content.normal_text, "hello")
+        self.assertEqual(parsed.normal_text, "")
+        self.assertEqual(parsed.calls, [])
+        self.assertFalse(detector.incomplete_tool_call_indices)
+
+    def test_streaming_malformed_call_leaves_emitted_name_incomplete(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        opening, body = TOOL_CALL.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        failed = detector.parse_streaming_increment(
+            body.replace("<tool_call|>", "unexpected<tool_call|>"),
+            [_tool()],
+        )
+
+        self.assertEqual(
+            [(call.name, call.parameters) for call in opened.calls],
+            [("get_weather", "")],
+        )
+        self.assertEqual(failed.normal_text, "")
+        self.assertEqual(failed.calls, [])
+        self.assertEqual(detector.incomplete_tool_call_indices, {0})
+        later = detector.parse_streaming_increment(" trailing bytes", [_tool()])
+        self.assertEqual(later.normal_text, " trailing bytes")
+        self.assertEqual(later.calls, [])
+        next_call = detector.parse_streaming_increment(TOOL_CALL, [_tool()])
+        self.assertEqual({call.tool_index for call in next_call.calls}, {1})
+
+    def test_streaming_invalid_call_value_leaves_emitted_name_incomplete(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open_pattern": r"<call:(?P<name>\w+)>",
+                    "close": "</call>",
+                    "content": "json",
+                    "repeats": True,
+                    "transform": {"function": {"name": "{name}"}},
+                },
+            },
+        }
+        detector = ResponseTemplateToolDetector(response_template=template)
+
+        opened = detector.parse_streaming_increment("<call:get_weather>{", [_tool()])
+        closed = detector.parse_streaming_increment("}", [_tool()])
+        closed = detector.parse_streaming_increment("</call>", [_tool()])
+
+        self.assertEqual(
+            [(call.name, call.parameters) for call in opened.calls],
+            [("get_weather", "")],
+        )
+        self.assertEqual(closed.calls, [])
+        self.assertEqual(detector.incomplete_tool_call_indices, {0})
+
+    def test_one_shot_parse_does_not_disturb_active_stream(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        )
+        opening, body = TOOL_CALL.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        one_shot = detector.detect_and_parse(TOOL_CALL, [_tool()])
+        closed = detector.parse_streaming_increment(body, [_tool()])
+
+        self.assertEqual([call.name for call in opened.calls], ["get_weather"])
+        self.assertEqual(len(one_shot.calls), 1)
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in closed.calls], [(0, None)]
+        )
+        self.assertEqual(detector.incomplete_tool_call_indices, set())
+
+    def test_streaming_waits_when_tool_name_depends_on_content(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "content": {"content": "text"},
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "json",
+                    "repeats": True,
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "{content.name}",
+                            "arguments": "{content.arguments}",
+                        },
+                    },
+                },
+            },
+        }
+        detector = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        )
+
+        opened = detector.parse_streaming_increment("<call>", [_tool()])
+        closed = detector.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"location":"Paris"}}</call>',
+            [_tool()],
+        )
+
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in closed.calls],
+            [("get_weather", {"location": "Paris"})],
+        )
+
+    def test_prefilled_malformed_call_is_dropped(self):
+        opening, body = TOOL_CALL.split("{", 1)
+        malformed_body = "{" + body.replace(
+            "<tool_call|>",
+            "unexpected<tool_call|>",
+        )
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + opening,
+        )
+
+        parsed = detector.parse_streaming_increment(malformed_body, [_tool()])
+
+        self.assertEqual(parsed.normal_text, "")
+        self.assertEqual(parsed.calls, [])
+
+    def test_non_streaming_call_opened_in_prefix_is_parsed(self):
+        opening, body = TOOL_CALL.split("{", 1)
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + opening,
+        )
+
+        parsed = detector.detect_and_parse("{" + body, [_tool()])
+
+        self.assertEqual(parsed.normal_text, "")
+        self.assertEqual(
+            _call_values(parsed.calls),
+            [
+                (
+                    "get_weather",
+                    {
+                        "location": "New York",
+                        "days": 3,
+                        "details": {"metric": True},
+                        "hours": [1, 2],
+                    },
+                )
+            ],
+        )
+
+    def test_streaming_call_opened_in_prefix_emits_name_then_arguments(self):
+        opening, body = TOOL_CALL.split("{", 1)
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + opening,
+        )
+
+        parsed = detector.parse_streaming_increment("{" + body, [_tool()])
+
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in parsed.calls],
+            [(0, "get_weather"), (0, None)],
+        )
+        self.assertEqual(
+            json.loads(parsed.calls[1].parameters),
+            {
+                "location": "New York",
+                "days": 3,
+                "details": {"metric": True},
+                "hours": [1, 2],
+            },
+        )
+
+    def test_call_without_closer_is_dropped(self):
+        def parse(template, text):
+            parser = FunctionCallParser(
+                tools=[_tool()],
+                tool_call_parser="response_template",
+                tokenizer=SimpleNamespace(response_template=template),
+            )
+            return parser.parse_non_stream("hello" + text)
+
+        text, calls = parse(XML_TOOL_TEMPLATE, XML_CALL_WITHOUT_CLOSER + "<|call|>")
+        self.assertEqual(text, "hello")
+        self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
+
+        for template, text in (
+            (XML_TOOL_TEMPLATE, XML_CALL_WITHOUT_CLOSER),
+            (GEMMA4_RESPONSE_TEMPLATE, TOOL_CALL.removesuffix("<tool_call|>")),
+            (GEMMA4_RESPONSE_TEMPLATE, TOOL_CALL.removesuffix("}<tool_call|>")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse(template, text), ("hello", []))
+
+    def test_zero_width_closer_is_not_mistaken_for_cut_off(self):
+        template = copy.deepcopy(XML_TOOL_TEMPLATE)
+        del template["fields"]["tool_calls"]["close"]
+        template["fields"]["tool_calls"]["close_pattern"] = r"(?=<end>)"
+        parser = FunctionCallParser(
+            tools=[_tool()],
+            tool_call_parser="response_template",
+            tokenizer=SimpleNamespace(response_template=template),
+        )
+
+        text, calls = parser.parse_non_stream(
+            "hello<call:get_weather><arg:location>Paris</arg><end>"
+        )
+
+        self.assertEqual(text, "hello<end>")
+        self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
+
+    def test_streamed_call_without_closer_stays_incomplete(self):
+        for template, first_call, cut_call in (
+            (
+                XML_TOOL_TEMPLATE,
+                XML_CALL_WITHOUT_CLOSER + "<|call|>",
+                XML_CALL_WITHOUT_CLOSER,
+            ),
+            (
+                GEMMA4_RESPONSE_TEMPLATE,
+                TOOL_CALL,
+                TOOL_CALL.removesuffix("<tool_call|>") + "<tool_",
+            ),
+        ):
+            with self.subTest(template=template["start_anchor"]):
+                parser = FunctionCallParser(
+                    tools=[_tool()],
+                    tool_call_parser="response_template",
+                    tokenizer=SimpleNamespace(response_template=template),
+                )
+
+                parser.parse_stream_chunk(first_call)
+                streamed_text, streamed_calls = parser.parse_stream_chunk(cut_call)
+                end_text, end_calls = parser.parse_stream_end()
+
+                self.assertEqual(streamed_text + end_text, "")
+                self.assertEqual(
+                    [(call.name, call.parameters) for call in streamed_calls],
+                    [("get_weather", "")],
+                )
+                self.assertEqual(end_calls, [])
+                self.assertEqual(parser.detector.incomplete_tool_call_indices, {1})
+
+    def test_tool_close_token_ids(self):
+        tokenizer = SimpleNamespace(
+            response_template=XML_TOOL_TEMPLATE,
+            encode=lambda text, add_special_tokens: {"<|call|>": [7]}[text],
+        )
+
+        self.assertEqual(
+            tool_close_token_ids("response_template", tokenizer), frozenset({7})
+        )
+        self.assertEqual(tool_close_token_ids("qwen", tokenizer), frozenset())
+        self.assertEqual(
+            tool_close_token_ids("response_template", SimpleNamespace()),
+            frozenset(),
+        )
+
+    def test_unknown_tool_is_dropped_when_forwarding_is_disabled(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        unknown = TOOL_CALL.replace("get_weather", "unknown")
+
+        result = detector.detect_and_parse(unknown, [_tool()])
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_unknown_tool_is_not_emitted_early(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        unknown = TOOL_CALL.replace("get_weather", "unknown")
+        opening, body = unknown.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        closed = detector.parse_streaming_increment(body, [_tool()])
+
+        self.assertEqual(opened.calls, [])
+        self.assertEqual(closed.normal_text, "")
+        self.assertEqual(closed.calls, [])
+
+    def test_strict_tools_require_native_constraint_support(self):
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        tool = _tool()
+        tool.function.strict = True
+        parser = FunctionCallParser(
+            tools=[tool],
+            tool_call_parser="response_template",
+            tokenizer=tokenizer,
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not support strict"):
+            parser.get_structure_constraint("auto")
+
+    def test_required_and_named_tools_use_generic_json_schema(self):
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        parser = FunctionCallParser(
+            tools=[_tool()],
+            tool_call_parser="response_template",
+            tokenizer=tokenizer,
+        )
+
+        for choice in (
+            "required",
+            ToolChoice(function={"name": "get_weather"}),
+        ):
+            with self.subTest(choice=choice):
+                constraint = parser.get_structure_constraint(choice)
+                self.assertEqual(constraint[0], "json_schema")
+
+        strict_tool = _tool()
+        strict_tool.function.strict = True
+        strict_parser = FunctionCallParser(
+            tools=[strict_tool],
+            tool_call_parser="response_template",
+            tokenizer=tokenizer,
+        )
+        self.assertEqual(
+            strict_parser.get_structure_constraint("required")[0],
+            "json_schema",
+        )
+
+    def test_parallel_false_auto_is_rejected_without_native_constraint(self):
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        parser = FunctionCallParser(
+            tools=[_tool()],
+            tool_call_parser="response_template",
+            tokenizer=tokenizer,
+        )
+
+        with self.assertRaisesRegex(ValueError, "parallel_tool_calls=False"):
+            parser.get_structure_constraint("auto", parallel_tool_calls=False)
+
+
+if __name__ == "__main__":
+    unittest.main()

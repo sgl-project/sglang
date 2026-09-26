@@ -107,6 +107,11 @@ from sglang.srt.parser.jinja_template_utils import (
     process_content_for_template_format,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+    configure_response_template_request,
+)
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -121,6 +126,11 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+
+def _incomplete_tool_call_indices(parser) -> set[int]:
+    detector = getattr(parser, "detector", parser)
+    return getattr(detector, "incomplete_tool_call_indices", set())
 
 
 def normalize_tool_content(role: str, content):
@@ -1206,6 +1216,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        if self._requires_response_template_detokenization(request):
+            configure_response_template_request(request)
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1289,7 +1301,37 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        self._maybe_set_response_parser_prefix(request, adapted_request)
         return adapted_request, request
+
+    def _maybe_set_response_parser_prefix(
+        self,
+        request,
+        adapted_request: GenerateReqInput,
+    ) -> None:
+        """Give response-template parsers the rendered assistant prefill."""
+        if not self._requires_response_template_detokenization(request):
+            return
+        prefix = adapted_request.text
+        if not isinstance(prefix, str) and adapted_request.input_ids:
+            prefix = self.tokenizer_manager.tokenizer.decode(
+                adapted_request.input_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
+            )
+        request._response_parser_prefix = prefix or ""
+
+    def _requires_response_template_detokenization(self, request) -> bool:
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            return True
+
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            request.tool_choice != "none"
+            and bool(self._effective_tools(request))
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        )
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
@@ -2076,7 +2118,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
-                if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
+                if (
+                    has_tool_calls.get(idx, False)
+                    and finish_reason_type == "stop"
+                    and not _incomplete_tool_call_indices(parser_dict.get(idx))
+                ):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
@@ -2375,6 +2421,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    request._response_parser_prefix,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2554,6 +2601,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: dict[str, Any],
         tool_choice: str | ToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
+        response_parser_prefix: str = "",
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2564,7 +2612,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(
-                tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
+                tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                prefix=response_parser_prefix,
             )
             detector_owns_format = (
                 parser.detector.supports_structural_tag()
@@ -3008,6 +3059,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        prefix=request._response_parser_prefix,
                     )
                     use_native_parser = (
                         probe.detector.supports_structural_tag()
@@ -3022,6 +3074,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
                 )
 
         parser = parser_dict[index]

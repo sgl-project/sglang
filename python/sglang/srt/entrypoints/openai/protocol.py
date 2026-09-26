@@ -58,6 +58,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     field_serializer,
     field_validator,
@@ -848,6 +849,8 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 
 class ChatCompletionRequest(BaseModel):
+    _response_parser_prefix: str = PrivateAttr(default="")
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1777,6 +1780,8 @@ ResponseInputOutputItem: TypeAlias = Union[
 
 class ResponsesRequest(BaseModel):
     """Request body for v1/responses endpoint."""
+
+    _response_parser_prefix: str = PrivateAttr(default="")
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False

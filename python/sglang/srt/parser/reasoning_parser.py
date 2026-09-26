@@ -48,6 +48,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 
 
 class StreamingParseResult:
@@ -2256,6 +2257,7 @@ class ReasoningParser:
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
+        "response_template": ResponseTemplateReasoningDetector,
     }
 
     def __init__(
@@ -2266,6 +2268,7 @@ class ReasoningParser:
         request: ChatCompletionRequest = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
+        prefix: str | None = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -2335,6 +2338,11 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
+
+        if prefix is None:
+            prefix = getattr(request, "_response_parser_prefix", "")
+        if prefix and issubclass(detector_class, ResponseTemplateReasoningDetector):
+            kwargs["prefix"] = prefix
 
         self.detector = detector_class(**kwargs)
 
