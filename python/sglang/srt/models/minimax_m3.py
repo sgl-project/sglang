@@ -1460,6 +1460,35 @@ class MiniMaxM3Model(nn.Module):
 
         self.layers_to_capture = []
 
+    def set_layers_to_capture(self, capture_points: list[int]) -> None:
+        """Configure layer-entry points used for auxiliary hidden capture."""
+        capture_points = [int(point) for point in capture_points]
+        if not capture_points:
+            raise ValueError("MiniMax-M3 capture points must be non-empty.")
+        if len(set(capture_points)) != len(capture_points):
+            raise ValueError(
+                f"MiniMax-M3 capture points must be unique, got {capture_points}."
+            )
+        if capture_points != sorted(capture_points):
+            raise ValueError(
+                "MiniMax-M3 capture points must be strictly increasing, "
+                f"got {capture_points}."
+            )
+
+        invalid = [
+            point for point in capture_points if point < 0 or point >= len(self.layers)
+        ]
+        if invalid:
+            raise ValueError(
+                "MiniMax-M3 capture points are outside the transformer layer "
+                f"range: invalid={invalid}, num_layers={len(self.layers)}."
+            )
+
+        self.layers_to_capture = capture_points
+        capture_set = set(capture_points)
+        for layer_id, layer in enumerate(self.layers):
+            setattr(layer, "_is_layer_to_capture", layer_id in capture_set)
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -1484,7 +1513,7 @@ class MiniMaxM3Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not self.layers_to_capture:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -1623,19 +1652,28 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            capture_points = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            capture_points = [int(layer_id) + 1 for layer_id in layer_ids]
+        self.model.set_layers_to_capture(capture_points)
 
-        # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id
-        # list, so set it explicitly (mirrors qwen3_next/qwen2_moe).
-        for layer_id in self.model.layers_to_capture:
-            if 0 <= layer_id < len(self.model.layers):
-                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit target layer ids for hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_layers_to_capture([int(layer_id) + 1 for layer_id in layer_ids])
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.set_dflash_layers_to_capture(layer_ids)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
