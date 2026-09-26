@@ -85,6 +85,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+    concat_rollout_trajectory_data,
+)
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.realtime.video import (
     RAW_RGB_CONTENT_TYPE,
@@ -141,6 +145,9 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
+    rollout_trajectory_data: list[RolloutTrajectoryData | None] = field(
+        default_factory=list
+    )
 
 
 def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
@@ -1335,11 +1342,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             and output_batch.trajectory_timesteps is not None
         ):
             merged.trajectory_timesteps = output_batch.trajectory_timesteps
-        if (
-            merged.rollout_trajectory_data is None
-            and output_batch.rollout_trajectory_data is not None
-        ):
-            merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
 
     @staticmethod
     def _collect_expanded_parts(
@@ -1359,6 +1361,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             parts.trajectory_latents.append(output_batch.trajectory_latents)
         if isinstance(output_batch.noise_pred, torch.Tensor):
             parts.noise_preds.append(output_batch.noise_pred)
+        parts.rollout_trajectory_data.append(output_batch.rollout_trajectory_data)
         if output_batch.trajectory_decoded:
             GPUWorker._collect_trajectory_decoded(
                 parts, output_batch.trajectory_decoded
@@ -1408,6 +1411,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.cat(decoded_step, dim=0)
                 for decoded_step in parts.trajectory_decoded_parts
             ]
+        if any(data is not None for data in parts.rollout_trajectory_data):
+            merged.rollout_trajectory_data = concat_rollout_trajectory_data(
+                parts.rollout_trajectory_data
+            )
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
