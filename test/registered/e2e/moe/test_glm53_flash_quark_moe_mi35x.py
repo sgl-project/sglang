@@ -49,6 +49,7 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
             SimpleNamespace(
                 no_combine=False,
                 activation="silu",
+                is_gated=True,
                 gemm1_alpha=None,
                 gemm1_clamp_limit=None,
             )
