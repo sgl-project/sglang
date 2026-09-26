@@ -557,8 +557,8 @@ install_sglang() {
 }
 
 install_nccl() {
-    # PyTorch pins 2.29.7, so this override must run after every command
-    # that resolves Python dependencies (including lmms-eval).
+    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # after every command that resolves Python dependencies (including lmms-eval).
     $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
