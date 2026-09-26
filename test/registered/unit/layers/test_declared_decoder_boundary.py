@@ -408,6 +408,46 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 )
                 self.assertTrue(layers[3]._steps.ffn_input.keywords["gathers_residual"])
 
+    def test_a_dense_mlp_on_every_rank(self):
+        # moe_dense_tp_size 1: each rank runs the dense MLP on its own slice, as
+        # an a2a MoE does, and owes no sum. The layers after it take that slice.
+        parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        no_overlap = SimpleNamespace(
+            overlap=SimpleNamespace(enable_two_batch_overlap=False)
+        )
+        for a2a in (False, True):
+            with (
+                self.subTest(a2a=a2a),
+                patch.object(comm, "get_exec", lambda: no_overlap),
+            ):
+                layers = [
+                    build(
+                        planned_modes(
+                            i,
+                            4,
+                            sparse=sparse,
+                            previous_sparse=previous,
+                            parallel=parallel,
+                            a2a=a2a,
+                        ),
+                        parallel,
+                        a2a=a2a,
+                        allow_reduce_scatter=True,
+                    )
+                    for i, (sparse, previous) in enumerate(
+                        ((False, False), (False, False), (True, False), (True, True))
+                    )
+                ]
+                self.assertEqual([self.declared(layer) for layer in layers], [True] * 4)
+                for dense in layers[:2]:
+                    self.assertIs(dense._steps.ffn_input.func, comm._mlp_input_scatter)
+                    self.assertIsNone(dense._steps.ffn_output.group)
+                for after_dense in layers[1:3]:
+                    self.assertIs(
+                        after_dense._steps.attention_input,
+                        comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
+                    )
+
     def test_the_last_a2a_layer_folds_the_residual_back(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         last = build(
@@ -438,14 +478,21 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
             ),
-            "dense MLP fully DP": (
+            # The layer before a sparse one gathers its output for the split.
+            "dense MLP fully DP under two-batch overlap": (
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1),
             ),
         }
+        two_batch_overlap = SimpleNamespace(
+            overlap=SimpleNamespace(enable_two_batch_overlap=True)
+        )
         for name, (facts, parallel) in cases.items():
             with self.subTest(name):
-                with planning(parallel):
+                with (
+                    planning(parallel),
+                    patch.object(comm, "get_exec", lambda: two_batch_overlap),
+                ):
                     communicator = LayerCommunicator.__new__(LayerCommunicator)
                     communicator.layer_scatter_modes = facts
                     communicator.allow_deferred_ffn_reduction = True

@@ -187,7 +187,7 @@ def decoder_layer_sides(
     """An attention followed by an FFN, derived from the groups each computes
     over. The FFN runs either on the TP group (a dense MLP, or a MoE not
     dispatched per DP shard) or on this rank's local rows (a MoE dispatched per
-    DP shard, which completes its own combine)."""
+    DP shard, which completes its own combine, or a dense MLP on every rank)."""
     # Attention computes over the attention-TP ranks of one DP (and CP) shard.
     attention = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes

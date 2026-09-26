@@ -814,9 +814,9 @@ class LayerCommunicator:
 
     def _input_can_be_scattered(self) -> bool:
         """Whether a batch may run this layer with input-scattered attention:
-        configured, on pure TP without an a2a backend. The rest of what
-        ``AttnTpContext.init_context`` requires is only known once the model is
-        built."""
+        configured, on pure TP without an a2a backend or a dense MLP on every
+        rank. The rest of what ``AttnTpContext.init_context`` requires is only
+        known once the model is built."""
         parallel = get_parallel()
         return (
             parallel.enable_attn_tp_input_scattered
@@ -824,6 +824,7 @@ class LayerCommunicator:
             and parallel.attn_dp_size == 1
             and parallel.attn_cp_size == 1
             and get_moe_a2a_backend().is_none()
+            and not enable_moe_dense_fully_dp()
         )
 
     def _declared_sides(
@@ -839,8 +840,13 @@ class LayerCommunicator:
         modes = self.layer_scatter_modes
         parallel = get_parallel()
         # A MoE dispatched per DP shard computes on this rank's local rows and
-        # hands its layer's output on there.
+        # hands its layer's output on there; so does a dense MLP on every rank.
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
+        dense_on_local_rows = enable_moe_dense_fully_dp()
+
+        def on_local_rows(sparse: bool) -> bool:
+            return moe_on_local_rows if sparse else dense_on_local_rows
+
         if not (
             self._takes_declared_boundaries
             and (parallel.attn_cp_size == 1 or _cp_on_declarations())
@@ -850,7 +856,11 @@ class LayerCommunicator:
                 and parallel.attn_dp_size > 1
                 and modes.is_layer_sparse
             )
-            and not enable_moe_dense_fully_dp()
+            # Under two-batch overlap a dense layer before a sparse one gathers
+            # its output for the split; those layers keep the scatter-mode steps.
+            and not (
+                dense_on_local_rows and get_exec().overlap.enable_two_batch_overlap
+            )
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
@@ -860,11 +870,10 @@ class LayerCommunicator:
         may_leave = parallel.attn_cp_size == 1
         return decoder_layer_sides(
             axis_sizes=_token_axis_sizes(cp_active=cp_active),
-            ffn_on_local_rows=modes.is_layer_sparse and moe_on_local_rows,
+            ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
             previous_on_local_rows=(
                 not modes.is_first_layer
-                and modes.is_previous_layer_sparse
-                and moe_on_local_rows
+                and on_local_rows(modes.is_previous_layer_sparse)
             ),
             is_last_layer=modes.is_last_layer,
             attention_gathers_local_rows=_use_ag_after_qlora,
