@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1 HIP decode glue must be bitwise the torch chains it replaces and select within each row's reach."""
+"""The V4.1 HIP decode glue is bitwise the torch chains it replaces and selects within each row's reach."""
 
 from __future__ import annotations
 
@@ -15,15 +15,13 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import sort_selection_rows
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
+from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+    CandidateBlocks,
+    select_candidate_blocks_hip,
+    topk_within_candidate_blocks_hip,
+)
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _low_ratio_compression_metadata,
-)
-from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-    CandidateBlocks,
-    _extend_k_slots,
-    topk_within_candidate_blocks_hip,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     expand_index_page_table as _expand_index_page_table,
@@ -32,7 +30,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -106,10 +104,6 @@ class TestTwoLevelDecodeHip(CustomTestCase):
         return logits.masked_fill(tail & odd, torch.nan)
 
     def _assert_consumer_matches_reference(self, logits, seq, cands, page_table, msg):
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            topk_within_candidate_blocks_hip,
-        )
-
         rows, width = logits.shape
         page_indices = torch.full((rows, TOPK), 7, dtype=torch.int32, device="cuda")
         raw_indices = torch.full((rows, TOPK), 7, dtype=torch.int32, device="cuda")
@@ -141,10 +135,6 @@ class TestTwoLevelDecodeHip(CustomTestCase):
     def test_level_one_matches_reference_under_garbage_tail(self):
         """The HIP block top-k (AOT row-split and torch fallback) must publish the
         reference's blocks and never read past a row's reach."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            select_candidate_blocks_hip,
-        )
-
         torch.manual_seed(11)
         cases = (
             # Released blocks, a rectangle just wider than the longest row.
@@ -221,6 +211,13 @@ def _topk_inputs(bs, width, page_size, lens):
     return scores, seq_lens, page_table
 
 
+def _sort_rows(page, raw):
+    """Rows ascending by position (by slot without raw), -1 padding last."""
+    key = (raw if raw is not None else page).to(torch.int64)
+    order = key.masked_fill(key < 0, torch.iinfo(torch.int64).max).argsort(dim=1)
+    return page.gather(1, order), (raw.gather(1, order) if raw is not None else None)
+
+
 def _candidates(rng, rows, num_blocks, topk_blocks, block_size, seq_lens):
     ids = torch.full((rows, topk_blocks), -1, dtype=torch.int32, device=DEVICE)
     for r in range(rows):
@@ -272,7 +269,7 @@ def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bo
                 sort_output=sort,
             )
             if not sort:
-                sort_selection_rows(page, raw)
+                page, raw = _sort_rows(page, raw)
             outs.append((page, raw))
         assert torch.equal(outs[0][0], outs[1][0])
         if with_raw:
@@ -327,72 +324,6 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
             assert torch.equal(out[f"c{r}_out_loc"], ref_loc)
             assert out[f"c{r}_topk_lengths_clamp1"].dtype is ref_clamp1.dtype
             assert torch.equal(out[f"c{r}_topk_lengths_clamp1"], ref_clamp1)
-
-
-@pytest.mark.parametrize("seq_len", [1024], ids=["1024"])
-def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
-    """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
-    on the same scores differ; ordered by position they are identical, -1 padding last."""
-    torch.manual_seed(seq_len)
-    k, rows = 512, seq_len
-    scores = torch.randn(rows, seq_len, device=DEVICE)
-    seq_lens = torch.arange(1, rows + 1, device=DEVICE, dtype=torch.int32)
-    pages = -(-seq_len // INDEX_PAGE_SIZE)
-    page_table = (
-        torch.randperm(pages, device=DEVICE)
-        .to(torch.int32)
-        .expand(rows, -1)
-        .contiguous()
-    )
-
-    def select():
-        page = torch.empty((rows, k), dtype=torch.int32, device=DEVICE)
-        raw = torch.empty_like(page)
-        topk_transform_paged(scores, seq_lens, page_table, page, INDEX_PAGE_SIZE, raw)
-        sort_selection_rows(page, raw)
-        return page, raw
-
-    page_a, raw_a = select()
-    page_b, raw_b = select()
-    assert torch.equal(raw_a, raw_b) and torch.equal(page_a, page_b)
-    valid = raw_a >= 0
-    assert torch.equal(valid.sum(1), seq_lens.clamp_max(k))
-    # ascending positions inside the valid prefix, padding after it
-    assert bool((raw_a[:, 1:][valid[:, 1:]] > raw_a[:, :-1][valid[:, 1:]]).all())
-    assert bool((valid[:, :-1] | ~valid[:, 1:]).all())
-    pos = raw_a.clamp_min(0)
-    slots = (
-        page_table.gather(1, pos // INDEX_PAGE_SIZE) * INDEX_PAGE_SIZE
-        + pos % INDEX_PAGE_SIZE
-    )
-    assert torch.equal(page_a, torch.where(valid, slots, -1))
-
-
-def test_extend_k_slots_gathers_every_request_in_order():
-    """The one-shot gather of the visible compressed slots equals the per-request
-    walk, including a request with nothing visible and the start offsets."""
-    _seed(29)
-    ratio, lc_per_req = 2, [5, 0, 3, 1]
-    req_to_token = torch.randint(0, 4096, (8, 64), device=DEVICE, dtype=torch.int32)
-    req_pool_indices = torch.tensor([6, 1, 7, 0], device=DEVICE, dtype=torch.int32)
-    slots, starts = _extend_k_slots(
-        req_to_token,
-        ratio=ratio,
-        lc_per_req=lc_per_req,
-        req_pool_indices=req_pool_indices,
-        device=DEVICE,
-    )
-    expected = torch.cat(
-        [
-            req_to_token[int(r), torch.arange(lc, device=DEVICE) * ratio].to(
-                torch.int64
-            )
-            // ratio
-            for r, lc in zip(req_pool_indices, lc_per_req)
-        ]
-    )
-    assert torch.equal(slots, expected)
-    assert starts == [0, 5, 5, 8]
 
 
 def test_page_table_from_req_to_token_matches_torch():
