@@ -475,6 +475,7 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    pp_proxy_tensors=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -569,10 +570,19 @@ def run_eagle_verify(
     forward_batch_output = target_worker.forward_batch_generation(
         batch=None,
         forward_batch=verify_forward_batch,
+        pp_proxy_tensors=pp_proxy_tensors,
         is_verify=True,
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+
+    # Intermediate PP stages only execute the target slice. Sampling and KV
+    # acceptance belong exclusively to the last stage.
+    if logits_output is None:
+        return GenerationBatchResult(
+            pp_hidden_states_proxy_tensors=forward_batch_output.pp_hidden_states_proxy_tensors,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
@@ -672,4 +682,5 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        spec_accept_indices=accept_index,
     )

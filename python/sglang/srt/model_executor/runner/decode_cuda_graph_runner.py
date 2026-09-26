@@ -929,8 +929,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors = None
         # pipeline parallelism
         if self.pp_size > 1:
+            # With DP attention, the transformer stack passes scattered
+            # attention-TP tokens across a PP boundary. Non-first stages must
+            # receive that local slice; using the global capture token count
+            # makes the subsequent TP all-gather see an input that is too
+            # large for its output buffer.
+            pp_hidden_tokens = num_tokens
+            if not self.model_runner.pp_group.is_first_rank and attn_tp_sharded:
+                pp_hidden_tokens = num_tokens // get_parallel().attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
