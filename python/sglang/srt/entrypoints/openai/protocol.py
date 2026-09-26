@@ -37,6 +37,7 @@ from typing import (
 )
 
 from openai.types.responses import (
+    ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
@@ -1752,9 +1753,40 @@ class ResponseTool(BaseModel):
     format: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
-    def validate_function_tool(self) -> ResponseTool:
+    def validate_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
+        if self.type == "namespace" and self.tools is not None:
+            if not self.name:
+                raise ValueError("Namespace tools must include a name")
+            for child in self.tools:
+                if child.get("type") not in ("function", "custom") or not child.get(
+                    "name"
+                ):
+                    raise ValueError(
+                        "Namespace entries must be named function or custom tools"
+                    )
+                ResponseTool.model_validate(child)
+        return self
+
+
+class ResponseAdditionalTools(BaseModel):
+    type: Literal["additional_tools"]
+    role: Literal["developer"]
+    tools: List[ResponseTool]
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> ResponseAdditionalTools:
+        for tool in self.tools:
+            if tool.type not in ("function", "custom", "namespace"):
+                raise ValueError(
+                    "additional_tools supports function, custom and namespace tools, "
+                    f"got {tool.type!r}"
+                )
+            if not tool.name:
+                raise ValueError("additional_tools entries must include a name")
+            if tool.type == "namespace" and tool.tools is None:
+                raise ValueError("Namespace tools must include a tools list")
         return self
 
 
@@ -1772,6 +1804,7 @@ ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ResponseCustomToolCall,
 ]
 
 
@@ -1794,7 +1827,7 @@ class ResponsesRequest(BaseModel):
     ] = None
     # Accept dict-shaped items as the loose arm; downstream normalization
     # handles replayed shapes that don't satisfy every openai TypedDict.
-    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
+    input: Union[str, List[Union[ResponseInputOutputItem, Dict[str, Any]]]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1914,6 +1947,16 @@ class ResponsesRequest(BaseModel):
         if not isinstance(item, dict):
             return item
 
+        if item.get("type") == "additional_tools":
+            return ResponseAdditionalTools.model_validate(item).model_dump(
+                exclude_none=True
+            )
+
+        if item.get("type") == "function_call" and item.get("namespace"):
+            return ResponseFunctionToolCall.model_validate(item)
+        if item.get("type") == "custom_tool_call" and item.get("namespace"):
+            return ResponseCustomToolCall.model_validate(item)
+
         # an output item replayed into input carries a string id; without this it'd
         # be read as an item-reference, drop its content, and fail as an empty {}.
         # input-item ids aren't resolved server-side, so just drop it.
@@ -1979,6 +2022,8 @@ class ResponsesRequest(BaseModel):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
+            if tool_choice.get("namespace"):
+                name = f"{tool_choice['namespace']}.{name}"
             return {"type": "function", "name": name}
         return "auto"
 
@@ -2290,6 +2335,7 @@ ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ResponseCustomToolCall,
 ]
 
 
