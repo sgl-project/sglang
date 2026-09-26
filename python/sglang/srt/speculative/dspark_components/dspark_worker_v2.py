@@ -165,7 +165,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not self._is_pd_prefill
         )
         if (
-            get_parallel().enable_dp_attention
+            not _is_npu
+            and get_parallel().enable_dp_attention
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):

@@ -1016,6 +1016,18 @@ class DeepseekV4AscendAttnBackend(
             out_cache_loc=out_cache_loc,
             block_size=block_size,
         )
+        # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
+        # but seq_lens is not, so pad the tail with -1 ("skip") to match.
+        num_padded_tokens = out_cache_loc.shape[0]
+        if ori_sparse_indices.shape[0] < num_padded_tokens:
+            pad_rows = num_padded_tokens - ori_sparse_indices.shape[0]
+            pad = torch.full(
+                (pad_rows, ori_sparse_indices.shape[1]),
+                -1,
+                dtype=ori_sparse_indices.dtype,
+                device=ori_sparse_indices.device,
+            )
+            ori_sparse_indices = torch.cat([ori_sparse_indices, pad], dim=0)
         ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
 
         fm.ori_sparse_indices = ori_sparse_indices
