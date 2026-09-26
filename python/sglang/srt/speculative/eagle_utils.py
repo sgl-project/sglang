@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -734,6 +735,9 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    *,
+    watermark_state: Optional[WatermarkState] = None,
+    watermark_full_mask: bool = True,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -795,6 +799,46 @@ def eagle_sample(
     # Apply grammar mask if provided
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
+
+    watermark_context_hashes = None
+    watermark_selected = None
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after verify.
+            next_token_logits = next_token_logits.clone()
+        if next_token_logits.is_cuda:
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative_from_tree(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_tokens=verify_input.draft_token,
+                    custom_mask=verify_input.custom_mask,
+                    positions=verify_input.positions,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                    full_mask=watermark_full_mask,
+                )
+            )
+        else:
+            contexts, context_lengths = watermark_state.speculative_contexts(
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_input.draft_token,
+                custom_mask=verify_input.custom_mask,
+                positions=verify_input.positions,
+                draft_token_num=verify_input.draft_token_num,
+                full_mask=watermark_full_mask,
+                context_windows=watermark_state.context_windows(sampling_info),
+            )
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    contexts=contexts,
+                    context_lengths=context_lengths,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                )
+            )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -1044,7 +1088,16 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    return predict, num_correct_drafts + 1, accept_index
+    accept_lens = num_correct_drafts + 1
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        watermark_state.record_speculative(
+            batch.req_pool_indices,
+            watermark_context_hashes,
+            watermark_selected,
+            accept_index,
+            accept_lens,
+        )
+    return predict, accept_lens, accept_index
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

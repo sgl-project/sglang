@@ -480,7 +480,13 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                watermark_state=self.model_runner.watermark_state,
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -489,8 +495,17 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index].flatten()
-            next_token_ids = accept_tokens
+            accept_tokens = predict[accept_index]
+            if (
+                self.model_runner.watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+            ):
+                self.model_runner.watermark_state.append_speculative(
+                    batch.req_pool_indices,
+                    accept_tokens,
+                    accept_lens,
+                )
+            next_token_ids = accept_tokens.flatten()
 
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.

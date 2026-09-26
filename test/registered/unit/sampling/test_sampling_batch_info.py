@@ -571,6 +571,29 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
+    def test_watermark_host_enablement_tracks_filter_and_merge(self):
+        info = _make_info(
+            batch_size=2,
+            watermark_enabled=torch.tensor([False, True]),
+            watermark_candidates_host=[False, True],
+            has_watermark_candidates=True,
+        )
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertEqual(info.watermark_enabled.tolist(), [False])
+        self.assertEqual(info.watermark_candidates_host, [False])
+        self.assertFalse(info.has_watermark_candidates)
+
+        other = _make_info(
+            batch_size=1,
+            watermark_enabled=torch.tensor([True]),
+            watermark_candidates_host=[True],
+            has_watermark_candidates=True,
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.watermark_enabled.tolist(), [False, True])
+        self.assertEqual(info.watermark_candidates_host, [False, True])
+        self.assertTrue(info.has_watermark_candidates)
+
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
@@ -673,7 +696,10 @@ class TestFromScheduleBatch(CustomTestCase):
         # (or leaked) process context.
         self._exec_ns = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=False),
+            features=SimpleNamespace(
+                enable_custom_logit_processor=False,
+                enable_watermark=False,
+            ),
         )
         exec_patch = patch(
             "sglang.srt.sampling.sampling_batch_info.get_exec",
@@ -726,6 +752,16 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+
+    def test_empty_batch_uses_max_top_k_merge_identity(self):
+        batch = MagicMock()
+        batch.reqs = []
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertEqual(len(info), 0)
+        self.assertEqual(info.max_top_k, 1)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""

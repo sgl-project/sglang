@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -70,6 +71,7 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
+    max_top_k: int = TOP_K_ALL
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -98,6 +100,12 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
 
     # Device
     device: str = "cuda"
@@ -194,6 +202,27 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        features = get_exec().features
+        if features.enable_watermark:
+            watermark_config = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+            watermark_keys = watermark_config.keys
+            watermark_context_windows = watermark_config.context_windows
+            watermark_enabled = watermark_config.enabled
+            watermark_candidates_host = watermark_config.candidates_host
+            has_watermark_candidates = watermark_config.has_candidates
+        else:
+            watermark_keys = None
+            watermark_context_windows = None
+            watermark_enabled = None
+            watermark_candidates_host = None
+            has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -259,6 +288,7 @@ class SamplingBatchInfo:
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
             ),
             vocab_size=vocab_size,
+            max_top_k=max((r.sampling_params.top_k for r in reqs), default=1),
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
@@ -268,6 +298,11 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark_keys=watermark_keys,
+            watermark_context_windows=watermark_context_windows,
+            watermark_enabled=watermark_enabled,
+            watermark_candidates_host=watermark_candidates_host,
+            has_watermark_candidates=has_watermark_candidates,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -424,10 +459,19 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        if self.watermark_candidates_host is not None:
+            self.watermark_candidates_host = [
+                self.watermark_candidates_host[index] for index in keep_indices
+            ]
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -547,17 +591,28 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
+        if (
+            self.watermark_candidates_host is not None
+            and other.watermark_candidates_host is not None
+        ):
+            self.watermark_candidates_host.extend(other.watermark_candidates_host)
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
+
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.max_top_k = max(self.max_top_k, other.max_top_k)
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
 
         self.adjusted_merge_batch(other)

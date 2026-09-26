@@ -254,8 +254,17 @@ class ServerArgs:
 
     @property
     def launch_command(self) -> str | None:
-        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
+        """Original CLI arguments or Engine call, with secrets redacted."""
         return getattr(self, "_launch_command", None)
+
+    def __repr__(self) -> str:
+        hidden = {"watermark_key", "watermark_key_b", "watermark_config"}
+        values = ", ".join(
+            f"{field.name}={getattr(self, field.name)!r}"
+            for field in record_fields(type(self))
+            if field.name not in hidden
+        )
+        return f"ServerArgs({values})"
 
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping."""
@@ -622,7 +631,10 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
+
+    server_args._launch_command = redact_watermark_command_line(argv)
     return server_args
 
 
