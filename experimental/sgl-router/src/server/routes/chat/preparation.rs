@@ -8,7 +8,7 @@ use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -94,23 +94,21 @@ impl PreparedChatRequest {
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
-        let input_ids = match (self.tokens.as_ref(), self.parsed_body.as_ref()) {
-            (Some(tokens), Some(parsed_body))
-                if self.can_forward_input_ids
-                    && tokens.rendered_from_chat
-                    && can_forward_chat_tokens(parsed_body) =>
-            {
-                Some(tokens.ids.as_slice())
-            }
-            _ => None,
-        };
-        if chat_tokenization_failed(
+        let forwarding = input_ids_forwarding(
             self.can_forward_input_ids,
             self.parsed_body.as_ref(),
             self.tokens.as_ref(),
-        ) {
+        );
+        ctx.metrics
+            .record_input_ids_forwarding(&self.model.0, forwarding);
+        if forwarding == InputIdsForwarding::TokenizeFailed {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
+        let input_ids = self
+            .tokens
+            .as_ref()
+            .filter(|_| forwarding == InputIdsForwarding::Forwarded)
+            .map(|tokens| tokens.ids.as_slice());
         build_outgoing_body(
             &self.body,
             self.parsed_body,
@@ -562,26 +560,32 @@ fn can_forward_chat_tokens(value: &Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
+/// Whether router-rendered `input_ids` replace engine tokenization.
 ///
-/// Count chats with forwarding enabled that pass the forwarding guard
-/// but lack chat-rendered tokens. Excluded requests are expected fallbacks,
-/// even when rendering fails.
-fn chat_tokenization_failed(
+/// Only chats with forwarding enabled that pass the forwarding guard are
+/// eligible; an eligible chat without chat-rendered tokens is a failed offload.
+/// Multimodal chats are reported apart from other guard exclusions.
+fn input_ids_forwarding(
     can_forward_input_ids: bool,
     request_value: Option<&Value>,
     request_tokens: Option<&RequestTokens>,
-) -> bool {
+) -> InputIdsForwarding {
     if !can_forward_input_ids {
-        return false;
+        return InputIdsForwarding::Disabled;
     }
-    let chat_request = request_value.is_some_and(|v| {
+    if request_value.is_some_and(request_has_multimodal_content) {
+        return InputIdsForwarding::IneligibleMultimodal;
+    }
+    let eligible = request_value.is_some_and(|v| {
         v.get("messages").is_some_and(|m| m.is_array()) && can_forward_chat_tokens(v)
     });
-    if !chat_request {
-        return false;
+    if !eligible {
+        InputIdsForwarding::Ineligible
+    } else if request_tokens.is_some_and(|t| t.rendered_from_chat) {
+        InputIdsForwarding::Forwarded
+    } else {
+        InputIdsForwarding::TokenizeFailed
     }
-    !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -658,6 +662,29 @@ fn request_has_non_text_content(value: &Value) -> bool {
         .is_some_and(|msgs| {
             msgs.iter()
                 .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
+        })
+}
+
+/// Image, video, and audio content parts need the engine's multimodal
+/// processor, so such chats can never carry `input_ids`. Other non-string
+/// parts (`refusal`, `thinking`, untyped) are ordinary guard exclusions.
+fn request_has_multimodal_content(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|p| {
+                            matches!(
+                                p.get("type").and_then(|t| t.as_str()),
+                                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                            )
+                        })
+                    })
+            })
         })
 }
 
@@ -847,6 +874,39 @@ mod tests {
     }
 
     #[test]
+    fn request_has_multimodal_content_detects_media_parts() {
+        for part in [
+            json!({"type":"image_url","image_url":{"url":"x"}}),
+            json!({"type":"video_url","video_url":{"url":"x"}}),
+            json!({"type":"audio_url","audio_url":{"url":"x"}}),
+            json!({"type":"input_audio","input_audio":{"data":"x"}}),
+        ] {
+            assert!(
+                request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"user","content":[part]}]
+                })),
+                "part {part} is multimodal"
+            );
+        }
+        for content in [
+            json!("hello"),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            json!([{"type":"refusal","refusal":"no"}]),
+            json!([{"type":"thinking","thinking":"hmm"}]),
+            json!([{"text":"untyped"}]),
+            json!(["bare string"]),
+            Value::Null,
+        ] {
+            assert!(
+                !request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":content}]
+                })),
+                "content {content} is not multimodal"
+            );
+        }
+    }
+
+    #[test]
     fn reasoning_history_is_an_expected_forwarding_omission() {
         let mut value = json!({"messages": [
             {"role":"user", "content":"hi"},
@@ -854,7 +914,10 @@ mod tests {
             {"role":"user", "content":"next"}
         ]});
         assert!(!can_forward_chat_tokens(&value));
-        assert!(!chat_tokenization_failed(true, Some(&value), None));
+        assert_eq!(
+            input_ids_forwarding(true, Some(&value), None),
+            InputIdsForwarding::Ineligible
+        );
         value["messages"][1]["reasoning_content"] = Value::Null;
         assert!(can_forward_chat_tokens(&value));
         value["messages"][1]
@@ -877,7 +940,10 @@ mod tests {
                 .collect();
             let value = json!({"messages": messages});
             assert!(!can_forward_chat_tokens(&value), "{roles:?}");
-            assert!(!chat_tokenization_failed(true, Some(&value), None));
+            assert_eq!(
+                input_ids_forwarding(true, Some(&value), None),
+                InputIdsForwarding::Ineligible
+            );
         }
         assert!(can_forward_chat_tokens(&json!({"messages": [
             {"role": "system", "content": "instructions"},
@@ -930,27 +996,37 @@ mod tests {
     }
 
     #[test]
-    fn offload_failures_only_count_forwardable_chats_missing_rendered_tokens() {
+    fn input_ids_forwarding_outcome_per_request() {
+        use InputIdsForwarding::*;
         let chat = json!({"messages":[{"role":"user","content":"hi"}]});
         let tools = json!({"messages":[{"role":"user","content":"hi"}], "tools":[{"type":"function","function":{"name":"f"}}]});
         let prompt = json!({"prompt":"hi"});
-        for (formatter, value, rendered, failed) in [
-            (true, Some(&chat), Some(true), false),
-            (true, Some(&chat), Some(false), true),
-            (true, Some(&chat), None, true),
-            (false, Some(&chat), None, false),
-            (true, Some(&tools), None, false),
-            (true, Some(&prompt), None, false),
-            (true, None, None, false),
+        let image = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"x"}}
+        ]}]});
+        let text_parts =
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
+        for (enabled, value, rendered, expected) in [
+            (true, Some(&chat), Some(true), Forwarded),
+            (true, Some(&chat), Some(false), TokenizeFailed),
+            (true, Some(&chat), None, TokenizeFailed),
+            (false, Some(&chat), Some(true), Disabled),
+            (true, Some(&tools), Some(true), Ineligible),
+            (true, Some(&prompt), None, Ineligible),
+            (true, None, None, Ineligible),
+            (true, Some(&image), None, IneligibleMultimodal),
+            (false, Some(&image), None, Disabled),
+            (true, Some(&text_parts), None, Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],
                 rendered_from_chat,
             });
             assert_eq!(
-                chat_tokenization_failed(formatter, value, tokens.as_ref()),
-                failed,
-                "formatter={formatter}, request={value:?}, rendered={rendered:?}"
+                input_ids_forwarding(enabled, value, tokens.as_ref()),
+                expected,
+                "enabled={enabled}, request={value:?}, rendered={rendered:?}"
             );
         }
     }

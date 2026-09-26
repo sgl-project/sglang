@@ -58,9 +58,24 @@ def delegates_to_super(forward):
     )
 
 
+def declares_no_deferral(node):
+    """Builds its communicator with allow_deferred_ffn_reduction=False: its FFN
+    completes its own reduction."""
+    return any(
+        keyword.arg == "allow_deferred_ffn_reduction"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is False
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        for keyword in call.keywords
+    )
+
+
 def defers(node):
     """Asks whether to leave the reduction to the next layer (directly or
     through ffn_exit), or wraps its output as unreduced itself."""
+    if declares_no_deferral(node):
+        return False
     return any(
         any(calls(node, name))
         for name in ("ffn_exit", "should_fuse_mlp_allreduce_with_next_layer", UNREDUCED)
@@ -106,6 +121,7 @@ class Census:
                 if name not in deferring
                 for _, node in defs
                 if set(base_names(node)) & deferring
+                and not declares_no_deferral(node)
                 and (
                     method(node, "forward") is None
                     or delegates_to_super(method(node, "forward"))
