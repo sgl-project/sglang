@@ -2239,8 +2239,13 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
+        # This router may already emit the shared slots.
+        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
     _fold_pad_into_append = False
     recorder_was_fused = False
+    _fold_pad_weights_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2292,21 +2297,20 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         #
-        # Fold: when the fused append+remap kernel runs below (aiter per-rank
-        # shared-slot path, EPLB off) it folds this padded fill itself
-        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
-        # _fill_padded_rows launch here.
+        # Let append kernels materialize padded ids when remapping is disabled.
+        eplb_remap_enabled = _eplb_remap_enabled()
         _fold_pad_into_append = (
-            num_fused_shared_experts > 0
-            and _use_aiter
-            and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
+            _aiter_append
+            and not eplb_remap_enabled
+            and (use_per_rank_shared_slots or not _skip_hip_pad_mask)
+        )
+        _fold_pad_weights_into_append = (
+            _fold_pad_into_append and not use_per_rank_shared_slots
         )
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
-            _is_hip
-            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
             and layer_id is not None
@@ -2331,7 +2335,7 @@ def _post_process_topk_ids(
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if not recorder_was_fused and _eplb_remap_enabled():
+        if not recorder_was_fused and eplb_remap_enabled:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
@@ -2342,12 +2346,6 @@ def _post_process_topk_ids(
 
     if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = topk_ids
-
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
-        # That router emits the shared slots itself; appending again would write
-        # the shared id twice and evict a real routed expert.
-        _aiter_append = topk_ids.shape[-1] < topk_config.top_k
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2391,7 +2389,7 @@ def _post_process_topk_ids(
             ),
         )
     elif _aiter_append:
-        M, N = router_logits.shape
+        N = router_logits.shape[1]
         scale_factor = (
             1.0
             if fused_shared_experts_scaling_factor is None
@@ -2409,6 +2407,9 @@ def _post_process_topk_ids(
             num_fused_shared_experts,
             scale_factor,
             N,  # base id for shared experts
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_weights_into_append else None
+            ),
         )
 
     elif use_per_rank_shared_slots:
@@ -2435,7 +2436,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.

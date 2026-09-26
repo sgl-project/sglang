@@ -65,7 +65,12 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sglang.srt.utils import (
+    BumpAllocator,
+    cdiv,
+    get_bool_env_var,
+    get_device_core_count,
+)
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -144,6 +149,39 @@ if _use_aiter_gfx95:
     )
 
 
+_ABSORB_BMM_DECODE_MAX_M = 256
+_absorb_bmm_num_cu = 0
+
+
+def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
+    """Return decode tile settings, or None outside the decode row limit."""
+    global _absorb_bmm_num_cu
+    if m <= 0 or m > _ABSORB_BMM_DECODE_MAX_M:
+        return None
+    if not _absorb_bmm_num_cu:
+        _absorb_bmm_num_cu = get_device_core_count()
+    num_cu = _absorb_bmm_num_cu
+    m_tiles_16 = cdiv(m, 16)
+    block_n = 128
+    while block_n > 32 and 4 * heads * m_tiles_16 * cdiv(n, block_n) < 3 * num_cu:
+        block_n //= 2
+    n_tiles = cdiv(n, block_n)
+    block_m = 16
+    while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
+        block_m *= 2
+    workgroups = heads * cdiv(m, block_m) * n_tiles
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": max(1, cdiv(workgroups, num_cu)),
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+    }
+
+
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
     """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
     if (
@@ -195,6 +233,9 @@ def rocm_absorb_q_bmm(
                     transpose_bm=False,  # (B, M, N)
                     transpose_bm_in=True,  # (M, B, K)
                     dtype=torch.bfloat16,
+                    config=_absorb_bmm_config(
+                        q_nope.shape[1], q_nope.shape[0], attn.w_kc.shape[2]
+                    ),
                 )
             )
         else:
@@ -253,6 +294,9 @@ def rocm_absorb_v_bmm(
                 transpose_bm=True,
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
+                config=_absorb_bmm_config(
+                    attn.num_local_heads, attn_output.shape[0], attn.w_vc.shape[-1]
+                ),
             )
         elif not is_in_tc_piecewise_cuda_graph():
             # Same (batch, heads, dim) layout as the quantized paths above, so the

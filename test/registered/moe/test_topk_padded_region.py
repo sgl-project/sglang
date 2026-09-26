@@ -189,6 +189,33 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
         finally:
             topk_mod._skip_hip_pad_mask = orig
 
+    def test_flag_skips_weight_masking_with_shared_append(self):
+        n, k, n_valid = 16, 8, 5
+        topk_weights = torch.rand((n, k), device=self.DEVICE) + 0.5
+        topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
+        router_logits = torch.rand((n, 64), device=self.DEVICE)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(top_k=k + 1, num_fused_shared_experts=1)
+        orig_skip = topk_mod._skip_hip_pad_mask
+        orig_aiter = topk_mod._use_aiter
+        topk_mod._skip_hip_pad_mask = True
+        topk_mod._use_aiter = True
+        try:
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+            )
+        finally:
+            topk_mod._skip_hip_pad_mask = orig_skip
+            topk_mod._use_aiter = orig_aiter
+
+        self.assertTrue(torch.all(out_ids[n_valid:, :k] == 0))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0))
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
 @unittest.skipIf(_IS_HIP, "HIP keeps the pre-mask routing contract (AITER/MORI)")

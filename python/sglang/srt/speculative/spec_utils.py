@@ -31,6 +31,8 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.ops.speculative.row_argmax import row_argmax
+from sglang.kernels.ops.speculative.temperature_softmax import temperature_softmax
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -137,7 +139,7 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     q.clamp_min_(torch.finfo(torch.float32).tiny)
     scores = probs.float() / q
     if num_samples == 1:
-        sample_index = scores.argmax(dim=-1, keepdim=True)
+        sample_index = row_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -157,7 +159,7 @@ def renorm_draft_probs(
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+    return temperature_softmax(next_token_logits, sampling_info.temperatures)
 
 
 def sample_draft_proposal(
@@ -185,7 +187,7 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
-    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    probs = temperature_softmax(next_token_logits, temperatures)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
