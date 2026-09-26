@@ -184,9 +184,12 @@ def get_default_hidden_dim(
         )
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
+        deepseek_v4_shared = getattr(config, "model_type", None) == "deepseek_v4"
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
-        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+        if deepseek_v4_shared or (
+            first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0
+        ):
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
             if moe_inter is not None and n_shared is not None:
@@ -194,9 +197,12 @@ def get_default_hidden_dim(
         return config.hidden_size, inter * 2
     elif module_name == "down_proj":
         inter = config.intermediate_size
+        deepseek_v4_shared = getattr(config, "model_type", None) == "deepseek_v4"
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
-        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+        if deepseek_v4_shared or (
+            first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0
+        ):
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
             if moe_inter is not None and n_shared is not None:
@@ -221,6 +227,19 @@ def get_default_hidden_dim(
             config.kv_lora_rank,
             config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
         )
+    elif module_name == "wq_a":
+        return config.hidden_size, config.q_lora_rank
+    elif module_name == "wq_b":
+        return config.q_lora_rank, config.num_attention_heads * config.head_dim
+    elif module_name == "wkv":
+        return config.hidden_size, config.head_dim
+    elif module_name == "wo_a":
+        return (
+            config.num_attention_heads * config.head_dim // config.o_groups,
+            config.o_groups * config.o_lora_rank,
+        )
+    elif module_name == "wo_b":
+        return config.o_groups * config.o_lora_rank, config.hidden_size
     elif module_name in DSA_INDEXER_LORA_NAMES:
         from sglang.srt.configs.model_config import (
             get_dsa_index_head_dim,
@@ -260,6 +279,7 @@ def get_default_hidden_dim(
 
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -295,20 +315,44 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
-        # DSA indexer projections are qualified with their parent module name
-        # because the bare leaf names collide with unrelated modules in other
-        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
-        "wq_b": "indexer.wq_b",
-        "wk": "indexer.wk",
-        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
     for name in target_modules:
+        parent_qualified_name = ".".join(name.split(".")[-2:])
+        if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+            result.add(parent_qualified_name)
+            continue
+
         base_name = name.split(".")[-1]
+        dsa_name = f"indexer.{base_name}"
+        if dsa_name in DSA_INDEXER_LORA_NAMES:
+            # PR #29874 accepted PEFT's bare DSA leaves. Preserve that
+            # behavior for DSA-only models, but resolve the same leaf to the
+            # main projection when the loaded model actually owns one (for
+            # example DeepSeek-V4 self_attn.wq_b). A DSA adapter on such a
+            # model must use the unambiguous parent-qualified name.
+            has_main_projection = base_model is not None and any(
+                module_name.split(".")[-1] == base_name
+                and ".".join(module_name.split(".")[-2:]) != dsa_name
+                for module_name, _module in base_model.named_modules()
+            )
+            result.add(base_name if has_main_projection else dsa_name)
+            continue
+
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
+
+
+def matches_lora_target(module_name: str, target_modules: Set[str]) -> bool:
+    """Match a concrete module path without aliasing a DSA child to its parent leaf."""
+    parts = module_name.split(".")
+    leaf_name = parts[-1]
+    parent_qualified_name = ".".join(parts[-2:])
+    if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+        return parent_qualified_name in target_modules
+    return leaf_name in target_modules or parent_qualified_name in target_modules
 
 
 def get_stacked_multiply(
@@ -344,6 +388,11 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     """
     best = None
     for target_module in target_modules:
+        if (
+            target_module in {name.split(".")[-1] for name in DSA_INDEXER_LORA_NAMES}
+            and f".indexer.{target_module}" in f".{full_module_name}"
+        ):
+            continue
         if target_module in full_module_name:
             if best is None or len(target_module) > len(best):
                 best = target_module
@@ -362,6 +411,7 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
+    "wo_b",
 ]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
@@ -370,6 +420,8 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    "wq_a",
+    "wkv",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -388,6 +440,9 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "wq_b",
+        "wo_a",
+        "wo_b",
     }
 )
 
@@ -412,6 +467,11 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "fused_qkv_a_proj_with_mqa",
         "q_b_proj",
         "kv_b_proj",
+        "wq_a",
+        "wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
     }
     | DSA_INDEXER_LORA_NAMES
 )
@@ -458,7 +518,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             else:
                 raw_names.add(leaf_name)
 
-    normalized = get_normalized_target_modules(raw_names)
+    normalized = get_normalized_target_modules(raw_names, base_model=model)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
     # Allow models to declare additional LoRA-compatible modules that
