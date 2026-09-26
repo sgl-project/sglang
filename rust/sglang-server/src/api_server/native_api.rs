@@ -230,7 +230,11 @@ async fn generate(
     }
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (mut payloads, is_batch) = match body.into_requests() {
+    // Fan `text`/`input_ids`/`sampling_params` into per-request payloads —
+    // including the `n > 1` fan-out, which `into_requests` refuses or expands
+    // before anything else sees the request. `is_batch` = the response is a JSON
+    // array (a list body, or `n > 1`).
+    let (mut payloads, is_batch) = match body.into_requests(&state.server_args) {
         Ok(v) => v,
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
@@ -568,8 +572,9 @@ fn terminal_stream_frame_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::config::{DisaggregationMode, ServerArgs};
     use crate::message::response::ChunkEvent;
-    use crate::tokenizer_manager::wiring::Senders;
+    use crate::tokenizer_manager::wiring::{Senders, TmEvent};
     use crate::utils::error::Error;
     use futures::StreamExt;
     use std::time::Duration;
@@ -580,6 +585,156 @@ mod tests {
             tokenizer_tx: flume::unbounded().0,
             detokenizer_tx: vec![],
         }
+    }
+
+    /// An `AppState` that KEEPS the intake receiver, so a test can see what the
+    /// handler actually submitted.
+    ///
+    /// `senders()` above drops every receiver on the floor, which is fine for the
+    /// frame-shaping tests but useless here — and worse than useless: a dropped
+    /// receiver disconnects the channel, so `submit` fails and the handler answers
+    /// 503, i.e. the test fails for a reason unrelated to what it is checking.
+    fn test_state(server_args: ServerArgs) -> (Arc<AppState>, flume::Receiver<TmEvent>) {
+        let (tok_manager_tx, tok_manager_rx) = flume::unbounded();
+        let state = AppState {
+            senders: Senders {
+                tok_manager_tx,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![],
+            },
+            response_buf: 16,
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+            response_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Not-ready is fine here: readiness gates only the health endpoints.
+            startup_readiness: Default::default(),
+        };
+        (Arc::new(state), tok_manager_rx)
+    }
+
+    fn body(json: &str) -> Result<Json<GenerateBody>, JsonRejection> {
+        Ok(Json(serde_json::from_str(json).expect("valid body")))
+    }
+
+    /// Drive `generate` far enough to see the refusal, with nothing to answer the
+    /// submitted requests. Only valid for paths that reject before submitting.
+    async fn refuse(state: Arc<AppState>, json: &str) -> StatusCode {
+        generate(State(state), body(json)).await.status()
+    }
+
+    // ----- parallel sampling: admission + routing -----
+
+    /// `n > 1` with any mm field is refused on EVERY model — including a text-only
+    /// one, where the fields would otherwise be inert — and nothing is submitted.
+    ///
+    /// Refusing regardless of model is what keeps mm out of the fan-out entirely,
+    /// so the siblings never clone it and the clone budget never weighs it. It is
+    /// not a regression: `n > 1` was refused outright before this path existed.
+    #[tokio::test]
+    async fn parallel_sampling_with_mm_fields_is_refused_on_any_model() {
+        for is_multimodal in [true, false] {
+            let mut sa = ServerArgs::default();
+            sa.model_config.is_multimodal = is_multimodal;
+            let (state, rx) = test_state(sa);
+            let status = refuse(
+                state,
+                r#"{"text": "a", "image_data": "u", "sampling_params": {"n": 3}}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "is_multimodal={is_multimodal}"
+            );
+            assert!(
+                rx.is_empty(),
+                "nothing may reach the scheduler (is_multimodal={is_multimodal})"
+            );
+        }
+    }
+
+    /// PD disaggregation is refused for now: Python gives all `n` samples of a
+    /// prompt one `bootstrap_room`, so the pairing protocol has to be settled
+    /// before this can be honored.
+    #[tokio::test]
+    async fn pd_parallel_sampling_is_refused() {
+        let sa = ServerArgs {
+            disaggregation_mode: DisaggregationMode::Prefill,
+            ..Default::default()
+        };
+        let (state, rx) = test_state(sa);
+        let status = refuse(state, r#"{"text": "a", "sampling_params": {"n": 3}}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(rx.is_empty(), "nothing may reach the scheduler");
+    }
+
+    /// A bad sampling parameter is ONE 400 and ZERO submissions.
+    ///
+    /// The "zero submissions" half is the point. Validating after the fan-out also
+    /// fails the request, but as `200 + [err, err, err]` (per-item errors are
+    /// packed into the batch array) — and by then three requests are already on
+    /// the scheduler burning GPU. A status-code-only assertion would not tell the
+    /// two apart, because 200 and 400 never get confused.
+    #[tokio::test]
+    async fn bad_params_reject_before_any_request_is_submitted() {
+        let (state, rx) = test_state(ServerArgs::default());
+        let status = refuse(
+            state,
+            r#"{"text": "a", "sampling_params": {"n": 3, "top_p": -1}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            rx.is_empty(),
+            "no sibling may be submitted before validation"
+        );
+    }
+
+    /// At `n == 1` the same bad parameter is NOT caught up front: the request is
+    /// submitted and the intake FSM's `Normalizing` step rejects it, exactly as
+    /// before this feature.
+    ///
+    /// That placement is deliberate — normalization does the stop-string work, and
+    /// the FSM runs it on a core-bound thread rather than the API runtime — so the
+    /// early-validation path must stay scoped to `n > 1`. Asserting the eventual
+    /// 400 here is not possible without a fake scheduler; what matters, and what
+    /// this pins, is that the single-request path is untouched.
+    #[tokio::test]
+    async fn one_sample_still_defers_validation_to_the_fsm() {
+        let (state, rx) = test_state(ServerArgs::default());
+        let handle = tokio::spawn(generate(
+            State(state),
+            body(r#"{"text": "a", "sampling_params": {"top_p": -1}}"#),
+        ));
+        let event = rx
+            .recv_async()
+            .await
+            .expect("n == 1 must still submit; the FSM does the rejecting");
+        assert!(matches!(event, TmEvent::Intake(_)));
+        handle.abort();
+    }
+
+    /// `n = 3` submits exactly three requests, with the `{rid}_{i}` ids the client
+    /// will see echoed back as `meta_info.id`.
+    #[tokio::test]
+    async fn three_samples_submit_three_requests() {
+        let (state, rx) = test_state(ServerArgs::default());
+        let handle = tokio::spawn(generate(
+            State(state),
+            body(r#"{"text": "a", "rid": "r", "sampling_params": {"n": 3}}"#),
+        ));
+        let mut rids = Vec::new();
+        for _ in 0..3 {
+            match rx.recv_async().await {
+                Ok(TmEvent::Intake(req)) => rids.push(req.rid.client_facing().to_owned()),
+                _ => panic!("expected an intake event"),
+            }
+        }
+        rids.sort();
+        assert_eq!(rids, ["r_0", "r_1", "r_2"]);
+        assert!(rx.is_empty(), "exactly three, no more");
+        handle.abort();
     }
 
     fn frame(rid: u64, text: &str) -> ResponseItem {

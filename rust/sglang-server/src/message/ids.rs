@@ -26,7 +26,12 @@ const UNIQ_SEP: u8 = b'#';
 const UNIQ_DIGITS: usize = 16;
 /// Total bytes appended. Fixed-width by construction — both halves are `u32`
 /// formatted `{:08x}` — which is what makes stripping a slice, not a search.
-const UNIQ_SUFFIX_LEN: usize = 1 + UNIQ_DIGITS;
+pub(crate) const UNIQ_SUFFIX_LEN: usize = 1 + UNIQ_DIGITS;
+
+/// Longest client-supplied rid accepted. It keys the detok table and travels on
+/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
+/// Measured on the client-facing form (see [`Rid::client_facing`]).
+pub(crate) const MAX_RID_LEN: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct Rid {
