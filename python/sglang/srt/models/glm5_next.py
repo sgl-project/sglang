@@ -77,6 +77,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    resolve_kda_conv_params_dtype,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -536,7 +537,7 @@ class Glm5NextLinearAttention(nn.Module):
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=resolve_kda_conv_params_dtype(),
             prefix=f"{prefix}.qkv_conv1d",
             tp_rank=head_shard_rank,
             tp_size=head_shard_size,

@@ -42,6 +42,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    resolve_kda_conv_params_dtype,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
@@ -397,7 +398,7 @@ class KimiDeltaAttention(nn.Module):
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=resolve_kda_conv_params_dtype(),
             prefix=f"{prefix}.qkv_conv1d",
             tp_rank=self.shard_tp_rank,
             tp_size=self.shard_tp_size,
