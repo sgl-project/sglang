@@ -124,12 +124,16 @@ class SWAChunkCache(ChunkCache):
 
         self.sliding_window_size = params.sliding_window_size
         self.chunked_prefill_size = params.chunked_prefill_size
+        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
 
     def supports_swa(self) -> bool:
         assert self.sliding_window_size is not None, (
             "sliding_window_size must be set for SWAChunkCache"
         )
         return True
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        return self.sliding_window_size if self.decoder_swa_bounded_replay else 0
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

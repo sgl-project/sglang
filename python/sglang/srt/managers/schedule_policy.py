@@ -654,6 +654,7 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
+        self._chunk_budget = self.rem_chunk_tokens
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
@@ -824,6 +825,30 @@ class PrefillAdder:
         if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0
+
+    def _hold_back_final_chunk(self, chunk_len: int, remaining: int) -> int:
+        """Shorten a non-final chunk so the final chunk is at least one SWA
+        window long. Returns the shortened length, `chunk_len` when no
+        shortening is needed or no chunk budget could leave a window, or 0 when
+        a later batch can take the rest in one chunk."""
+        window = (
+            self.tree_cache.swa_reprefill_tail_tokens()
+            if self.tree_cache is not None
+            else 0
+        )
+        if not window:
+            return chunk_len
+        rest = remaining - chunk_len
+        if rest <= 0 or rest >= window:
+            return chunk_len
+        held = (remaining - window) // self.page_size * self.page_size
+        if (
+            held <= 0
+            and self._chunk_budget is not None
+            and self._chunk_budget < remaining
+        ):
+            return chunk_len
+        return max(0, held)
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -1094,6 +1119,10 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated:
+            new_len = self._hold_back_final_chunk(new_len, cand_extend_input_len)
+            if new_len <= 0:
+                return req
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1245,7 +1274,11 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._hold_back_final_chunk(
+                self.rem_chunk_tokens, cand_extend_input_len
+            )
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1432,6 +1465,11 @@ class PrefillAdder:
                 and get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
+                return AddReqResult.OTHER
+            chunk_tokens_limit = self._hold_back_final_chunk(
+                chunk_tokens_limit, len(req.full_untruncated_fill_ids) - prefix_len
+            )
+            if chunk_tokens_limit <= 0:
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly

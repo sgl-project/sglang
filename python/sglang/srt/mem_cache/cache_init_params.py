@@ -47,6 +47,7 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+    decoder_swa_bounded_replay: bool = False
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
