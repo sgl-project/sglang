@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -69,9 +70,10 @@ def free_swa_out_of_window_slots(
     assert req.kv.cache_protected_len % page_size == 0, (
         "cache_protected_len must be page aligned"
     )
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
+    swa_evicted_seqlen = max(
+        req.kv.get_evicted_seqlen(ComponentType.SWA), req.kv.swa_dead_lo(page_size)
     )
+    req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -89,22 +91,19 @@ def free_swa_out_of_window_slots(
         # retained checkpoint could never be matched and holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
-    new_swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen,
-        evict_threshold,
-    )
+    new_swa_evicted_seqlen = max(swa_evicted_seqlen, evict_threshold)
 
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+    if new_swa_evicted_seqlen > swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, swa_evicted_seqlen:new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa_segment(
-            free_slots, start_pos=req.kv.swa_evicted_seqlen
+            free_slots, start_pos=swa_evicted_seqlen
         )
-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+        req.kv.set_evicted_seqlen(ComponentType.SWA, new_swa_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -160,7 +159,7 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if req.skip_radix_cache_insert:
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
@@ -213,20 +212,22 @@ def dsv41_dspark_needs_rebootstrap(
     return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
 
 
-def retraction_backup(
+def backup_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when the host pool cannot hold the backup; the caller
-    aborts the request since its KV cannot be preserved."""
+    """Returns False when no backup can be taken ('none' backend, or the host
+    pool cannot hold it); the caller aborts the request."""
     if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
         # Drain the in-flight verify before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
+    if backend == "none":
+        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
@@ -236,11 +237,11 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
     return req.kv.retraction_backup is not None
 
 
-def retraction_restore(
+def restore_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -257,11 +258,13 @@ def retraction_restore(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
-def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+def discard_kv_cache_backup(
+    req: Req, tree_cache: BasePrefixCache, backend: str
+) -> None:
     if backend == "cpu_tensor":
         req.kv.retraction_backup = None
         return
@@ -271,11 +274,13 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.kv.retraction_backup)
+    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+    what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -289,22 +294,23 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.kv.mamba_pool_idx = None
         return
-
-    owned_kv_len = req.owned_kv_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        owned_kv_len=owned_kv_len,
-    )
-
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # internally, then sets req_pool_idx = None.
-    assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    if not req.kv.holds_kv:
+    if tree_cache.claim_kv_row(req):
+        # A streaming session detached the kv record to keep the row.
+        assert not req.kv.holds_kv
         return
 
-    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    owned_kv_len = req.owned_kv_len()
+    is_insert = is_insert and not req.skip_radix_cache_insert
+    if is_insert:
+        tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
+    else:
+        # The protected prefix is not this req's to free.
+        tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        tree_cache.unpin(req)
+    _release_overallocated_kv_indices(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    tree_cache.on_release(req, inserted=is_insert)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

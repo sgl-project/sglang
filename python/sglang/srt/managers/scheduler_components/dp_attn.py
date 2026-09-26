@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
@@ -180,7 +181,7 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            torch.distributed.all_gather_into_tensor(
+            all_gather_single(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
@@ -226,7 +227,6 @@ def _update_gather_batch(
     require_mlp_tp_gather: bool,
     skip_global_metadata=False,
 ):
-    # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -234,6 +234,15 @@ def _update_gather_batch(
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
+        )
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        # Fresh counts have not yet been adjusted by the coordination plan.
+        batch.dp_spec_prefill_coordination_applied = False
+        info = mlp_sync_info.tp0_info_cpu
+        batch.dp_spec_prefill_coordination_metadata = (
+            mlp_sync_info.global_num_tokens,
+            mlp_sync_info.global_num_tokens_for_logprob,
+            info[:, 3],
         )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
@@ -338,6 +347,8 @@ def _local_prefill_cuda_graph_vote(
 
     if prefill_graph_runner is None:
         return True
+    if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
+        return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,
@@ -484,7 +495,6 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
-
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
@@ -571,6 +581,9 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            # Keep verification rows in their native mode on heterogeneous steps.
+            return batch
         if batch is None or not batch.forward_mode.is_decode():
             return batch
         # Global triggers from the gather. This rank's own eligibility (spec/

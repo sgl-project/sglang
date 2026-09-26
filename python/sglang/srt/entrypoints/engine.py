@@ -69,9 +69,11 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -1182,6 +1184,20 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
+            # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
+            # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
+            # the backstop.
+            if threading.current_thread() is threading.main_thread():
+
+                def sigterm_handler(signum, frame):
+                    logger.warning(
+                        f"SIGTERM received on node_rank {get_parallel().node_rank}; "
+                        "waiting for the rank-0 ShutdownReq broadcast to stop "
+                        "the schedulers."
+                    )
+
+                signal.signal(signal.SIGTERM, sigterm_handler)
+
             # A node-local Rust listener owns the health endpoints when present.
             rust_server_owns_base_port = (
                 envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
@@ -1535,6 +1551,20 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; close it with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the session and finalize quantized weights into kernel layout."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def update_weights_from_distributed(

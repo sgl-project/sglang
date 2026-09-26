@@ -749,11 +749,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
         self._assert_receipt_anchor(node, params)
+        if node is self.root_node:
+            return result
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
+            node,
+            params.get_lock_uuid(ComponentType.SWA),
+            result.device_frees,
+            result.host_frees,
         )
 
         # Drop strictly-lower-priority locks co-located on the node, skipping
@@ -1264,7 +1269,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 dup = value_slice[dup_start:consumed_from]
                 abs_start = state.total_prefix_length + dup_start
                 swa_already_freed = min(
-                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
+                    max(
+                        state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start,
+                        0,
+                    ),
+                    dup.numel(),
                 )
                 if swa_already_freed > 0:
                     step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))

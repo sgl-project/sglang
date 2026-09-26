@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.gelu_tanh_cat",
+        KernelBackend.JIT,
+        "activation.gelu_tanh_cat_jit:fused_gelu_tanh_cat",
+        _CUDA,
+        "BF16 tanh GELU plus channel concatenation.",
+    ),
+    (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
         "norm.group_norm_silu:apply_group_norm_silu",
@@ -76,6 +83,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "norm.wan_rmsnorm_silu_triton:wan_rmsnorm_silu",
         _CUDA,
         "Wan VAE channels_last_3d RMSNorm + SiLU.",
+    ),
+    (
+        "diffusion.wan_norm_silu_post",
+        KernelBackend.JIT,
+        "norm.wan_norm_silu_post:wan_norm_silu_post",
+        _CUDA,
+        "Wan VAE FP32 normalization post-ops with the native denominator.",
     ),
     (
         "diffusion.rmsnorm_scale_shift",
@@ -527,6 +541,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
     "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
@@ -557,6 +573,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
+    "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
@@ -571,6 +589,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_scale_residual_norm_scale_shift_fp8": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "try_fused_scale_residual_norm_scale_shift_nvfp4": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
+    "can_use_wan_norm_silu_post": "norm.wan_norm_silu_post",
+    "wan_norm_silu_post": "norm.wan_norm_silu_post",
     "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
@@ -589,6 +609,8 @@ _EXPORTS: dict[str, str] = {
     "fuse_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_residual_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_scale_shift_kernel": "modulate.scale_shift_triton",
+    "try_fused_fp32_layernorm_bf16": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "try_fused_scaled_residual_bf16": "modulate.scale_shift_triton",
     "try_fused_scaled_residual_add_exact": "modulate.scale_shift_triton",
     "timestep_embedding": "modulate.timestep_embedding_jit",
     "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
