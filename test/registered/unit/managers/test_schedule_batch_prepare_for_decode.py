@@ -220,8 +220,9 @@ class TestPrepareForDecodePenaltyHistory(unittest.TestCase):
         self.assertEqual(counts.sum(dim=1).tolist(), [0.0, 1.0, 1.0])
 
     def test_non_overlap_penalizes_req_last_output_token(self):
-        """Without overlap resolve_forward_inputs skips its gather branch, so
-        prepare_for_decode must count the current req.output_ids[-1] itself."""
+        """Without overlap the previous step's result is processed before
+        prepare_for_decode, so req.output_ids[-1] is current and must be counted
+        there; the resolve-time feed only runs under overlap."""
         batch, penalizer = _make_penalized_decode_batch(enable_overlap=False)
         self._prepare_for_decode(batch)
 
