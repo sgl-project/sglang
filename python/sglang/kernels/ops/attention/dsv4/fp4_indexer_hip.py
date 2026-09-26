@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
-from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -900,55 +900,3 @@ def indexer_head_weights(
         num_warps=4,
     )
     return out
-
-
-@triton.jit
-def _sort_selection_rows_kernel(
-    page_ptr,
-    raw_ptr,
-    stride,
-    HAS_RAW: tl.constexpr,
-    K: tl.constexpr,
-    PAD_KEY: tl.constexpr,
-):
-    offs = tl.program_id(0) * stride + tl.arange(0, K)
-    page = tl.load(page_ptr + offs)
-    if HAS_RAW:
-        raw = tl.load(raw_ptr + offs)
-    else:
-        raw = page
-    # (position, slot) pairs as one int64 key; -1 padding sorts last
-    key = tl.where(raw < 0, PAD_KEY, raw).to(tl.int64) << 32
-    key = tl.sort(key | (page.to(tl.int64) & 0xFFFFFFFF), dim=0)
-    page = (key & 0xFFFFFFFF).to(tl.int32)
-    tl.store(page_ptr + offs, tl.where(key >> 32 == PAD_KEY, -1, page))
-    if HAS_RAW:
-        raw = (key >> 32).to(tl.int32)
-        tl.store(raw_ptr + offs, tl.where(raw == PAD_KEY, -1, raw))
-
-
-def sort_selection_rows(
-    page_indices: torch.Tensor, raw_indices: Optional[torch.Tensor] = None
-) -> None:
-    """Order every row of a top-k selection ascending by position (by slot without raw_indices),
-    -1 padding last, in place: the sparse attention sums in the order given."""
-    rows, k = page_indices.shape
-    assert k & (k - 1) == 0, k
-    assert page_indices.stride(1) == 1 and (
-        raw_indices is None
-        or (
-            raw_indices.shape == page_indices.shape
-            and raw_indices.stride() == page_indices.stride()
-        )
-    )
-    if rows == 0:
-        return
-    _sort_selection_rows_kernel[(rows,)](
-        page_indices,
-        raw_indices if raw_indices is not None else page_indices,
-        page_indices.stride(0),
-        HAS_RAW=raw_indices is not None,
-        K=k,
-        PAD_KEY=torch.iinfo(torch.int32).max,
-        num_warps=4,
-    )

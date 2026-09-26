@@ -52,9 +52,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4,
 )
-from sglang.kernels.ops.moe.rocm_router_gate import (
-    rocm_router_gemv_split_k,
-)
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
