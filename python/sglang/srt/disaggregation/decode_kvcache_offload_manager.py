@@ -277,6 +277,28 @@ class DecodeKVCacheOffloadManager:
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
 
+    def drain_before_retraction(self):
+        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""
+        self.check_offload_progress()
+        cc = self.cache_controller
+        # Retraction frees the device KV these copies read. Storage backups read only
+        # host memory, so they do not count.
+        pending = torch.tensor(
+            [bool(cc.ack_write_queue or self.ongoing_offload or self.offload_inflight)],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+            )
+        if pending.item():
+            raise RuntimeError(
+                "Decode KV offload copies are still pending on some rank; "
+                f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
+                f"{len(self.ongoing_offload)} copies, "
+                f"{len(self.offload_inflight)} requests)."
+            )
+
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
