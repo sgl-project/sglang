@@ -1658,6 +1658,70 @@ class LayerCommunicator:
         result as a context manager around the FFN call, then call ``finish``."""
         return FfnExit(self, forward_batch)
 
+    def _branch_rows(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[Layout, Layout, Layout]:
+        """The rows of this layer's FFN input, of its residual while the FFN
+        runs, and of what the layer hands on, for a batch that runs its ordinary
+        steps."""
+        if self._batch_steps(forward_batch) is not self._steps:
+            raise NotImplementedError(
+                "a branch on a batch with attention CP, LayerNorm SP or "
+                "input-scattered attention"
+            )
+        if self._declared is not None:
+            sides = self._declared
+            return sides.ffn.layout, sides.ffn_residual_rows, sides.output_rows
+        layouts, modes = self._context.layouts, self.layer_scatter_modes
+        return (
+            layouts[modes.mlp_mode],
+            layouts[modes.middle_residual_mode],
+            layouts[modes.layer_output_mode],
+        )
+
+    def branch_input(
+        self,
+        source: "LayerCommunicator",
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The FFN input and residual that ``source``'s boundary read for its
+        own FFN, for this layer's FFN, which branches from the same input: moved
+        to the rows this FFN needs and its residual's rows."""
+        rows, residual_rows, _ = source._branch_rows(forward_batch)
+        to, residual_to, _ = self._branch_rows(forward_batch)
+        return (
+            move_rows(hidden_states, rows, to, forward_batch),
+            move_rows(residual, residual_rows, residual_to, forward_batch),
+        )
+
+    def branch_output(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """This layer's complete FFN output as a branch's contribution, which
+        adds to the layer's output without writing the residual: moved to the
+        rows the layer hands on."""
+        rows, _, to = self._branch_rows(forward_batch)
+        return move_rows(hidden_states, rows, to, forward_batch)
+
+    def merge_branch(
+        self,
+        contribution: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        source: "LayerCommunicator",
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A contribution from ``branch_output`` summed with what ``source``'s
+        layer hands on, ``hidden_states`` and ``residual``, moved to the rows
+        this layer hands on."""
+        _, _, rows = source._branch_rows(forward_batch)
+        _, _, to = self._branch_rows(forward_batch)
+        hidden_states = move_rows(hidden_states, rows, to, forward_batch)
+        residual = move_rows(residual, rows, to, forward_batch)
+        return contribution + hidden_states, residual
+
     def finish_layer_stack(
         self,
         hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
@@ -2133,6 +2197,34 @@ def _reduce_and_redistribute_output_to_dp(
         global_hidden_states, hidden_states, forward_batch, cp_shard_counts
     )
     return global_hidden_states
+
+
+def move_rows(
+    hidden_states: torch.Tensor,
+    rows: Layout,
+    to: Layout,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """A complete value from the rows it is on to ``to``: gathered over the
+    token axes ``to`` does not shard (attention TP, then attention DP), or cut to
+    this rank's share of those it does (attention DP, then attention TP)."""
+    gathered, cut = rows.sharded - to.sharded, to.sharded - rows.sharded
+    if (gathered and cut) or TokenAxis.ATTN_CP in gathered | cut:
+        raise NotImplementedError(f"{rows=} {to=}")
+    if TokenAxis.ATTN_TP_SCATTER in gathered:
+        hidden_states = _redistribute_from_attn_tp_shards(hidden_states)
+    if TokenAxis.ATTN_DP in gathered:
+        hidden_states = _redistribute_input_to_dp(hidden_states, forward_batch)
+    if TokenAxis.ATTN_DP in cut:
+        hidden_states = _to_local_tokens(
+            _redistribute_output, forward_batch, hidden_states
+        )
+    if TokenAxis.ATTN_TP_SCATTER in cut:
+        parallel = get_parallel()
+        hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
+            parallel.attn_tp_rank
+        ]
+    return hidden_states
 
 
 class FusedMlpInput(msgspec.Struct, frozen=True):
