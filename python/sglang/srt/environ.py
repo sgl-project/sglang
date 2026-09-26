@@ -737,7 +737,7 @@ class Envs:
     # ===================================================================
     # Tool calling and native web search
     # ===================================================================
-    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(True)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.

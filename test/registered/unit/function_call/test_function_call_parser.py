@@ -4348,12 +4348,15 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_unknown_function(self):
-        """Test parsing with unknown function name - skipped by default (SGLANG_FORWARD_UNKNOWN_TOOLS=false)."""
-        text = '<|tool_call_start|>[unknown_function(arg="value")]<|tool_call_end|>'
-        result = self.detector.detect_and_parse(text, self.tools)
+        """Test parsing with unknown function name - dropped when SGLANG_FORWARD_UNKNOWN_TOOLS=false."""
+        from sglang.srt.environ import envs
 
-        # By default, unknown functions are skipped (consistent with other detectors)
-        self.assertEqual(len(result.calls), 0)
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            text = '<|tool_call_start|>[unknown_function(arg="value")]<|tool_call_end|>'
+            result = self.detector.detect_and_parse(text, self.tools)
+
+            # When SGLANG_FORWARD_UNKNOWN_TOOLS=false, unknown functions are skipped
+            self.assertEqual(len(result.calls), 0)
 
     def test_detect_and_parse_empty_content(self):
         """Test parsing with empty content between markers."""
