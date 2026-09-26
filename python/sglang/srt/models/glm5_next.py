@@ -8,7 +8,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.attention.fla.fused_norm_gate import (
+    FusedRMSNormGated,
+    can_use_rms_norm_gated_per_token_fp8,
+    rms_norm_gated_per_token_fp8,
+)
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
@@ -52,7 +56,10 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    fp8_ptpc_linear_active,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -325,6 +332,21 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+GLM53_KDA_PTPC_BF16_MAX_M = {
+    "qkv_proj": 4095,
+    "f_a_proj": 4095,
+    "g_a_proj": 4095,
+    "o_proj": 5631,
+}
+GLM53_KDA_PTPC_ALLOWED_K = {
+    "o_proj": (1024, 2048),
+}
+GLM53_KDA_FUSED_O_NORM_MIN_M = {
+    1024: 1,
+    2048: 256,
+}
+
+
 class Glm5NextLinearAttention(nn.Module):
     _PACKED_MODULES_MAPPING = {
         "fused_qkvbfg_a_proj": [
@@ -408,11 +430,18 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = self._can_fuse_proj(
+        ptpc_modules = set(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+        use_ptpc_qkv = "qkv_proj" in ptpc_modules
+        use_ptpc_fg = bool({"f_a_proj", "g_a_proj"} & ptpc_modules)
+        self.do_fuse_qkvbfg = not (use_ptpc_qkv or use_ptpc_fg) and self._can_fuse_proj(
             quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
         )
-        self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
-            quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+        self.fuse_bfg = (
+            not self.do_fuse_qkvbfg
+            and not use_ptpc_fg
+            and self._can_fuse_proj(
+                quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+            )
         )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -567,6 +596,8 @@ class Glm5NextLinearAttention(nn.Module):
             tp_size=head_shard_size,
         )
 
+        self._configure_ptpc_modules()
+
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -586,8 +617,49 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
+    def _configure_ptpc_modules(self) -> None:
+        ptpc_modules = set(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+        supported_ptpc_modules = set(GLM53_KDA_PTPC_BF16_MAX_M)
+        unknown_ptpc_modules = ptpc_modules - supported_ptpc_modules
+        if unknown_ptpc_modules:
+            raise ValueError(
+                "Unsupported GLM-5.3-Flash KDA PTPC modules: "
+                f"{sorted(unknown_ptpc_modules)}; supported: "
+                f"{sorted(supported_ptpc_modules)}"
+            )
+        shared_input_modules = {"qkv_proj", "f_a_proj", "g_a_proj"}
+        selected_shared_input_modules = ptpc_modules & shared_input_modules
+        if selected_shared_input_modules not in (
+            set(),
+            {"qkv_proj"},
+            shared_input_modules,
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash KDA PTPC requires qkv_proj, f_a_proj, and "
+                "g_a_proj to be selected together so their activation "
+                "quantization is shared"
+            )
+        for module_name in ptpc_modules:
+            module = getattr(self, module_name, None)
+            if module is None:
+                raise ValueError(
+                    f"GLM-5.3-Flash KDA PTPC module {module_name!r} is unavailable "
+                    f"for fused_qkvbfg={self.do_fuse_qkvbfg}"
+                )
+            if not isinstance(module.quant_method, UnquantizedLinearMethod):
+                raise ValueError(
+                    f"GLM-5.3-Flash KDA PTPC requires UnquantizedLinearMethod for "
+                    f"{module_name}, got {type(module.quant_method).__name__}"
+                )
+            module._glm53_kda_ptpc_module = module_name
+            module._fp8_ptpc_bf16_max_m = GLM53_KDA_PTPC_BF16_MAX_M[module_name]
+            allowed_k = GLM53_KDA_PTPC_ALLOWED_K.get(module_name)
+            if allowed_k is not None:
+                module._fp8_ptpc_allowed_k = allowed_k
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        shared_input = self._maybe_quantize_ptpc_input(self.qkv_proj, hidden_states)
+        qkv, _ = self.qkv_proj(shared_input)
 
         if self.fuse_bfg:
             fused_states = self.fused_bfg_a_proj(hidden_states)
@@ -597,14 +669,52 @@ class Glm5NextLinearAttention(nn.Module):
             )
         else:
             beta = self.b_proj(hidden_states)[0]
-            forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+            f_a_input = (
+                shared_input
+                if fp8_ptpc_linear_active(self.f_a_proj, num_tokens)
+                else hidden_states
+            )
+            g_a_input = (
+                shared_input
+                if fp8_ptpc_linear_active(self.g_a_proj, num_tokens)
+                else hidden_states
+            )
+            forget_gate = self.f_b_proj(self.f_a_proj(f_a_input)[0])[0]
+            g_proj_states = self.g_b_proj(self.g_a_proj(g_a_input)[0])[0]
 
         return (
             qkv,
             beta,
             forget_gate,
             g_proj_states,
+        )
+
+    @staticmethod
+    def _maybe_quantize_ptpc_input(layer, x: torch.Tensor):
+        if not fp8_ptpc_linear_active(layer, x.numel() // x.shape[-1]):
+            return x
+        import aiter
+
+        x_2d = x.view(-1, x.shape[-1])
+        return aiter.per_token_quant_hip(x_2d, quant_dtype=aiter.dtypes.fp8)
+
+    def _use_fused_o_norm_ptpc(
+        self,
+        core_attn_out: torch.Tensor,
+        norm_gate: torch.Tensor,
+    ) -> bool:
+        if not fp8_ptpc_linear_active(self.o_proj):
+            return False
+        local_k = self.o_proj.weight.shape[1]
+        min_m = GLM53_KDA_FUSED_O_NORM_MIN_M.get(local_k)
+        if min_m is None:
+            return False
+        num_tokens = core_attn_out.numel() // local_k
+        return num_tokens >= min_m and can_use_rms_norm_gated_per_token_fp8(
+            core_attn_out,
+            norm_gate,
+            self.o_norm.weight,
         )
 
     def forward_qkvbfg_fused(
@@ -655,10 +765,18 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-
-        return self.o_proj(core_attn_out)[0]
+        if self._use_fused_o_norm_ptpc(core_attn_out, norm_gate):
+            o_proj_input = rms_norm_gated_per_token_fp8(
+                core_attn_out,
+                norm_gate,
+                self.o_norm.weight,
+                self.o_norm.eps,
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
+            core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+            o_proj_input = self._maybe_quantize_ptpc_input(self.o_proj, core_attn_out)
+        return self.o_proj(o_proj_input)[0]
 
 
 class Glm5NextDecoderLayer(nn.Module):
