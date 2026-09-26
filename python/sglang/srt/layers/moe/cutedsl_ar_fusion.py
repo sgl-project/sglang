@@ -7,7 +7,6 @@ shared-expert add folded in when the runner hands back a MoeFinalizeHandoff.
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Callable, Optional, Sequence
 
@@ -15,9 +14,9 @@ import msgspec
 import torch
 
 from sglang.srt.layers.communicator import (
-    CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
     ScatterMode,
+    UnreducedOutput,
     get_attn_tp_context,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -177,6 +176,9 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
+
     fusion_service: CuteDSLFusionService | None = None
 
     # The runner can defer and a successor or the final norm consumes the handoff.
@@ -186,113 +188,87 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     # A replicated output follows the reduction; moving it would scale that by tp.
     owes_local_reduction: bool = False
 
-    def prepare_attn(
-        self,
-        hidden_states,
-        residual,
-        forward_batch,
-        quant_format: str = "",
-        post_residual_addition=None,
-    ):
-        if isinstance(hidden_states, MoeFinalizeHandoff):
-            if not self._should_use_finalize(forward_batch, hidden_states.m):
-                raise RuntimeError(
-                    "received deferred MoE output on an ineligible path "
-                    f"(M={hidden_states.m}, mode={forward_batch.forward_mode})"
-                )
-            if residual is None:
-                raise RuntimeError("deferred MoE finalize requires residual input")
-            gamma = _fused_norm_gamma(self.input_layernorm)
-            if gamma is None:
-                raise RuntimeError(
-                    "deferred MoE finalize requires a fusable RMSNorm flavour"
-                )
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            assert self.fusion_service is not None
-            hidden_states, residual = self.fusion_service.finalize(
-                handoff=hidden_states, residual=residual, gamma=gamma
-            )
-            return self._finish_prepare_attn(
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
-
-        if (
-            residual is not None
-            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-            and hidden_states._sglang_needs_allreduce_fusion
-            and self._can_consume_post_moe_all_reduce(
-                forward_batch, int(hidden_states.shape[0])
-            )
-        ):
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            assert self.fusion_service is not None
-            hidden_states, residual = self.fusion_service.all_reduce_residual_rms_norm(
-                local_contribution=hidden_states,
-                residual=residual,
-                gamma=_fused_norm_gamma(self.input_layernorm),
-            )
-            return self._finish_prepare_attn(
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
-
-        return super().prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=quant_format,
-            post_residual_addition=post_residual_addition,
+    def _select_attn_input_fusions(self):
+        return (
+            self._finalize_output_and_update_and_read_residual_cutedsl,
+            self._reduce_output_and_update_and_read_residual_cutedsl,
+            *super()._select_attn_input_fusions(),
         )
 
-    def prepare_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cache=None,
+    def _finalize_output_and_update_and_read_residual_cutedsl(
+        self, owed, residual, forward_batch, post_residual_addition
     ):
-        if cache is not None:
-            self._context.cache = cache
-        if self._should_use_all_reduce_rms_norm(
-            forward_batch, int(hidden_states.shape[0]), residual
-        ):
-            assert self.fusion_service is not None and residual is not None
-            return self.fusion_service.all_reduce_residual_rms_norm(
-                local_contribution=hidden_states,
-                residual=residual,
-                gamma=_fused_norm_gamma(self.post_attention_layernorm),
+        """Finish a deferred MoE finalize with the all-reduce, residual add and
+        input norm."""
+        if not isinstance(owed, MoeFinalizeHandoff):
+            return None
+        if not self._should_use_finalize(forward_batch, owed.m):
+            raise RuntimeError(
+                "received deferred MoE output on an ineligible path "
+                f"(M={owed.m}, mode={forward_batch.forward_mode})"
             )
-        return super().prepare_mlp(hidden_states, residual, forward_batch, cache=cache)
+        gamma = _fused_norm_gamma(self.input_layernorm)
+        if gamma is None:
+            raise RuntimeError(
+                "deferred MoE finalize requires a fusable RMSNorm flavour"
+            )
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        assert self.fusion_service is not None
+        return self.fusion_service.finalize(
+            handoff=owed, residual=residual, gamma=gamma
+        )
 
-    def _should_use_all_reduce_rms_norm(
-        self,
-        forward_batch: ForwardBatch,
-        m: int,
-        residual: Optional[torch.Tensor],
-    ) -> bool:
-        communicate_fn = self._communicate_with_all_reduce_and_layer_norm_fn
-        if isinstance(communicate_fn, functools.partial):
-            norm_fn = communicate_fn.func
-            residual_input_mode = communicate_fn.keywords.get("residual_input_mode")
-        else:
-            norm_fn = communicate_fn
-            residual_input_mode = None
+    def _reduce_output_and_update_and_read_residual_cutedsl(
+        self, owed, residual, forward_batch, post_residual_addition
+    ):
+        """Complete the all-reduce the previous layer left with the residual add
+        and input norm."""
+        if not isinstance(owed, UnreducedOutput) or not (
+            self._can_consume_post_moe_all_reduce(
+                forward_batch, int(owed.partial.shape[0])
+            )
+        ):
+            return None
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        assert self.fusion_service is not None
+        return self.fusion_service.all_reduce_residual_rms_norm(
+            local_contribution=owed.partial,
+            residual=residual,
+            gamma=_fused_norm_gamma(self.input_layernorm),
+        )
+
+    def _select_mlp_input_fusions(self, residual_input_mode):
+        fusions = super()._select_mlp_input_fusions(residual_input_mode)
         parallel = get_parallel()
-        return (
-            self._common_eligible(forward_batch, m)
-            and residual is not None
-            and _fused_norm_gamma(self.post_attention_layernorm) is not None
-            and norm_fn
-            is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
-            and residual_input_mode is ScatterMode.TP_ATTN_FULL
-            and self._context.attn_dp_size == 1
+        if (
+            residual_input_mode is ScatterMode.TP_ATTN_FULL
             and parallel.attn_tp_size == parallel.tp_size
+            and _fused_norm_gamma(self.post_attention_layernorm) is not None
+        ):
+            return (
+                self._mlp_input_reduce_output_and_update_and_read_residual_cutedsl,
+                *fusions,
+            )
+        return fusions
+
+    def _mlp_input_reduce_output_and_update_and_read_residual_cutedsl(
+        self, hidden_states, residual, forward_batch
+    ):
+        """The attention output's all-reduce with the residual add and the
+        post-attention norm."""
+        if not (
+            self._common_eligible(forward_batch, int(hidden_states.shape[0]))
+            and residual is not None
             and not get_exec().comm.enable_quant_communications
+        ):
+            return None
+        assert self.fusion_service is not None
+        return self.fusion_service.all_reduce_residual_rms_norm(
+            local_contribution=hidden_states,
+            residual=residual,
+            gamma=_fused_norm_gamma(self.post_attention_layernorm),
         )
 
     def _should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
