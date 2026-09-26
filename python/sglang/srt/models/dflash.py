@@ -571,6 +571,12 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    # Checkpoints store q/k/v and gate/up as separate tensors; a quantization
+    # config that names those shards is matched against the fused modules.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -613,11 +619,7 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    prefix=(
-                        (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.is_nemotron_35_draft
-                        else ""
-                    ),
+                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
                 )
                 for i in range(num_layers)
             ]
@@ -639,19 +641,14 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.is_nemotron_35_draft:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
-            self.fc = ReplicatedLinear(
-                self.num_context_features * hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=fc_prefix,
-            )
-        else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
-            )
+        # Quantizable, like every other linear of the draft.
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc" if prefix else "fc",
+        )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -709,9 +706,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -721,9 +716,7 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -776,29 +769,74 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
         loaded_params = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
-            "encoder.fc.weight": "fc.weight",
             "encoder.output_norm_enc.weight": "hidden_norm.weight",
         }
+        # Checkpoint tensors that have no parameter on the draft by design.
+        _IGNORED_TENSOR_SUFFIXES = (
+            ".bias",
+            ".inv_freq",
+            ".cos_cached",
+            ".sin_cached",
+            ".input_scale",
+            ".output_scale",
+            ".k_scale",
+            ".v_scale",
+            ".kv_scale",
+        )
 
-        def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
+        def resolve_name(name: str, known: dict) -> Optional[str]:
+            if name in known:
                 return name
             if name.startswith("model."):
                 stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
+                if stripped_name in known:
                     return stripped_name
             else:
                 prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
+                if prefixed_name in known:
                     return prefixed_name
+            return None
+
+        def alias_vendor_name(name: str) -> str:
             aliased_name = _VENDOR_ENCODER_ALIASES.get(name)
-            if aliased_name is not None and aliased_name in params_dict:
+            if aliased_name is not None:
+                return aliased_name
+            if name.startswith("encoder.fc."):
+                return name[len("encoder.") :]
+            return name
+
+        def resolve_param_name(name: str) -> Optional[str]:
+            resolved_name = resolve_name(name, params_dict)
+            if resolved_name is not None:
+                return resolved_name
+            aliased_name = alias_vendor_name(name)
+            if aliased_name != name and aliased_name in params_dict:
                 return aliased_name
             return None
+
+        def reject_unmatched(*, name: str, param_name: str) -> None:
+            """Refuse a tensor for a module the draft has, under a parameter
+            name that module does not have (a dense tensor for a packed layer
+            or the reverse); tensors for absent modules stay ignored."""
+            if name.endswith(_IGNORED_TENSOR_SUFFIXES):
+                return
+            module_stem = alias_vendor_name(param_name).rsplit(".", 1)[0]
+            module_name = resolve_name(module_stem, modules_dict)
+            if module_name is None:
+                return
+            module = modules_dict[module_name]
+            raise ValueError(
+                f"DFLASH checkpoint tensor {name!r} has no matching parameter on "
+                f"{module_name} ({type(module).__name__} with parameters "
+                f"{sorted(dict(module.named_parameters(recurse=False)))}). The "
+                "draft was built without it: its config or quantization config "
+                "does not describe this layer the way the checkpoint stores it."
+            )
 
         for name, loaded_weight in weights:
             unprefixed_name = name.removeprefix("model.")
@@ -815,6 +853,7 @@ class DFlashDraftModel(nn.Module):
                 mapped_name = name.replace(weight_name, param_name)
                 resolved_name = resolve_param_name(mapped_name)
                 if resolved_name is None:
+                    reject_unmatched(name=name, param_name=mapped_name)
                     continue
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -824,28 +863,23 @@ class DFlashDraftModel(nn.Module):
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
-                    # Ignore unexpected weights (e.g., HF rotary caches).
+                    reject_unmatched(name=name, param_name=name)
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
-                    if self.is_nemotron_35_draft:
-                        expected_shape = (
-                            int(self.config.hidden_size),
-                            int(self.num_context_features * self.config.hidden_size),
-                        )
-                        loaded_shape = _logical_linear_weight_shape(
-                            param,
-                            loaded_weight,
-                            output_features=expected_shape[0],
-                        )
-                        shape_matches = loaded_shape == expected_shape or (
-                            getattr(param, "pack_factor", None) is None
-                            and tuple(loaded_weight.shape) == tuple(param.shape)
-                        )
-                    else:
-                        expected_shape = tuple(param.shape)
-                        loaded_shape = tuple(loaded_weight.shape)
-                        shape_matches = loaded_shape == expected_shape
+                    expected_shape = (
+                        int(self.config.hidden_size),
+                        int(self.num_context_features * self.config.hidden_size),
+                    )
+                    loaded_shape = _logical_linear_weight_shape(
+                        param,
+                        loaded_weight,
+                        output_features=expected_shape[0],
+                    )
+                    shape_matches = loaded_shape == expected_shape or (
+                        getattr(param, "pack_factor", None) is None
+                        and tuple(loaded_weight.shape) == tuple(param.shape)
+                    )
                     if not shape_matches:
                         raise ValueError(
                             "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
@@ -865,6 +899,16 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
+
+        # A checkpoint that fills the decoder layers but never fc would leave
+        # fc at whatever memory its weight was allocated over.
+        if any(name.startswith("layers.") for name in loaded_params) and not any(
+            name.startswith("fc.") for name in loaded_params
+        ):
+            raise ValueError(
+                "DFLASH checkpoint has decoder-layer tensors but no fc tensor "
+                "(fc.weight, encoder.fc.weight, or their packed forms)."
+            )
 
         if self.projector_type == "domino":
             required = {
@@ -959,9 +1003,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -973,16 +1015,14 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         num_slices = int(self.num_context_features)
         slice_size = int(target_hidden.shape[-1]) // num_slices
         slices = target_hidden.view(target_hidden.shape[0], num_slices, slice_size)
-        compute_dtype = self.fc.weight.dtype
+        compute_dtype = self.hidden_norm.weight.dtype
         if slices.dtype != compute_dtype:
             slices = slices.to(compute_dtype)
         normed = torch.empty_like(slices)
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        projected = self.fc(fused)
-        if self.is_nemotron_35_draft:
-            projected = projected[0]
+        projected, _ = self.fc(fused)
         return self.hidden_norm(projected)
 
 
