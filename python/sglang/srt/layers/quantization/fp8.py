@@ -126,6 +126,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+
+if _is_hip:
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+    )
+    from sglang.srt.layers.quantization import fp8_hip
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -951,6 +958,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif backend.is_gfx95():
+            fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
@@ -1161,6 +1170,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if _is_hip:
+            if self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+                return fp8_hip.apply_dense(self, layer, x, bias)
+            # the gfx950 producers wrap their operand only for the gfx950 routes above
+            assert not isinstance(x, (Fp8GridActivation, Mxfp8Activation)), type(x)
 
         mxfp8_view = self.use_mxfp8 or (
             self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready

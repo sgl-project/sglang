@@ -917,7 +917,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
+    # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
@@ -1574,9 +1576,9 @@ class Envs:
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
+    # tuned batched_gemm_bf16 (gfx95). On by default on ROCm; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)

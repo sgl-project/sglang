@@ -1,58 +1,37 @@
-"""Tests for the DeepSeek-V4 decode ``wo_a`` bf16 batched-matmul routing.
-
-Covers ``deepseek_v4._apply_wo_a_bf16_matmul``, which (opt-in via
-``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` on HIP/gfx95) routes the MLA output-absorb
-bf16 GEMM off the rocBLAS/Tensile ``Cijk_*`` batched GEMM onto aiter's tuned
-``batched_gemm_bf16``, with an einsum fallback.
-
-The opt-in flag and the aiter kernel are resolved ONCE at module import
-(``_wo_a_aiter_gemm_eligible`` -> ``_wo_a_aiter_batched_gemm_enabled`` and the
-pre-imported ``_wo_a_batched_gemm_bf16``) so the decode critical path pays no
-``EnvBool.get()`` or function-local import per token. The tests therefore drive
-those cached module globals directly.
-
-Validates:
-1. Static eligibility -- ``_wo_a_aiter_gemm_eligible`` is true only when the
-   flag, the global ``SGLANG_USE_AITER`` switch, HIP, and gfx95 are all set
-   (table-driven).
-2. Dispatch/gating -- with the reroute disabled, or on prefill
-   (``is_decode=False``), the plain ``torch.einsum("tgd,grd->tgr", ...)`` path
-   runs (bit-identical to the old code); only decode + enabled hits the kernel.
-3. Fallback -- a runtime kernel failure degrades to the einsum and disables the
-   reroute for the rest of the process (no per-call retry / log spam on the
-   decode critical path).
-4. Numerics -- on gfx95 with aiter, the aiter kernel is genuinely used and its
-   result matches the einsum within bf16 tolerance across ``T/G/D/R`` shapes
-   (the PR's model-free bit-check).
-
-deepseek_v4 pulls in the full model stack, so this is registered as an AMD GPU
-test and only imported behind ``is_hip()`` -- matching the existing AMD aiter
-op tests.
-"""
+"""`_apply_wo_a_bf16_matmul` on ROCm must gate the aiter reroute, fall back to einsum, and match einsum on the gfx950 routes."""
 
 import unittest
 from unittest import mock
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(is_hip(), "wo_a batched_gemm_bf16 routing requires ROCm")
-class TestWoABf16BatchedGemm(unittest.TestCase):
+class TestWoABf16BatchedGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        # Import the heavy model module only on a GPU runner (see module docstring).
+        # import the heavy model module only on a GPU runner
         from sglang.srt.models import deepseek_v4 as dsv4
+        from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense
 
         cls.dsv4 = dsv4
+        cls.gfx95_dense = deepseek_v4_gfx95_dense
         cls.device = "cuda"  # torch maps "cuda" onto the ROCm HIP device
 
     def setUp(self):
         torch.manual_seed(0)
+        # the gfx950 wo_a route reads the exec bag (deterministic gate): publish one
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         # The one-shot runtime-disable flag is process-global; reset it so a
         # failure case in one test cannot leak into another.
         self.dsv4._wo_a_aiter_batched_gemm_disabled = False
@@ -113,6 +92,8 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                     mock.patch.object(
                         self.dsv4, "_wo_a_aiter_batched_gemm_enabled", enabled
                     ),
+                    # the gfx950 fp8-grid fork would run before the aiter kernel
+                    mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
                     mock.patch.object(
                         self.dsv4, "_wo_a_batched_gemm_bf16", fake_kernel
                     ),
@@ -143,6 +124,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
 
         with (
             mock.patch.object(self.dsv4, "_wo_a_aiter_batched_gemm_enabled", True),
+            mock.patch.object(self.gfx95_dense, "_wo_a_fp8_grid_gemm", None),
             mock.patch.object(self.dsv4, "_wo_a_batched_gemm_bf16", _boom),
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
@@ -197,6 +179,80 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                 self.assertEqual(out.dtype, torch.bfloat16)
                 rel = ((out.float() - ref).abs() / (ref.abs() + 1e-6)).max().item()
                 self.assertLessEqual(rel, 5e-4)
+
+
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
+class TestWoABf16PrefillAndVerifyRoutes(CustomTestCase):
+    """gfx950 prefill rows write the token-major layout directly and verify rows keep the
+    GEMV / split-K / strided-bmm regimes bit-exact under graph replay."""
+
+    def setUp(self):
+        from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        self.project = _apply_wo_a_bf16_matmul
+        torch.manual_seed(39186)
+
+    def operands(self, rows, *, strided=False, dtype=torch.bfloat16, width=4096):
+        x = torch.randn(rows, 4 if strided else 2, width, device="cuda", dtype=dtype)
+        if strided:
+            x = x[:, 1:3]
+        w = torch.randn(2, 1024, width, device="cuda", dtype=dtype) * 0.015625
+        return x, w
+
+    def test_prefill_and_mutable_graph(self):
+        for rows, strided in (
+            (4096, False),
+            (4097, True),
+            (65536, False),
+        ):
+            with self.subTest(rows=rows, strided=strided):
+                x, w = self.operands(rows, strided=strided)
+                y = self.project(x, w, is_decode=False, is_prefill=True)
+                self.assertTrue(y.is_contiguous())
+                torch.testing.assert_close(
+                    y, torch.einsum("tgd,grd->tgr", x, w), atol=0, rtol=0
+                )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y = self.project(x, w, is_decode=False, is_prefill=True)
+                for _ in range(2):
+                    x.normal_()
+                    w.normal_(std=0.015625)
+                    graph.replay()
+                    torch.testing.assert_close(
+                        y, torch.einsum("tgd,grd->tgr", x, w), atol=0, rtol=0
+                    )
+                del graph, x, w, y
+
+    def test_decode_verify_and_mutable_graph(self):
+
+        for rows in (1, 2, 8, 64, 129):
+            with self.subTest(rows=rows):
+                x, w = self.operands(rows, strided=rows == 8)
+                kwargs = dict(is_decode=True, is_target_verify=rows > 1)
+                self.project(x, w, **kwargs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y = self.project(x, w, **kwargs)
+                for _ in range(2):
+                    x.normal_()
+                    w.normal_(std=0.015625)
+                    graph.replay()
+                    ref = torch.einsum("tgd,grd->tgr", x, w)
+                    self.assertTrue(y.is_contiguous())
+                    if rows > 8:
+                        torch.testing.assert_close(y, ref, atol=0, rtol=0)
+                    else:
+                        # split-K sums in its own fixed order: occasional one-ulp bf16
+                        # flips against einsum, far below one ulp (2^-8) on average
+                        error = (y.float() - ref.float()).square().mean()
+                        self.assertLess(
+                            (error / ref.float().square().mean()).sqrt().item(), 1e-3
+                        )
 
 
 if __name__ == "__main__":
