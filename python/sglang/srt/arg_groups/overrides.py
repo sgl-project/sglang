@@ -887,6 +887,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "MistralLarge3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
