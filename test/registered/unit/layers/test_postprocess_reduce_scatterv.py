@@ -6,6 +6,7 @@ import contextlib
 import itertools
 import types
 import unittest
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -33,6 +34,13 @@ def steps(*, ffn_output_move):
     """A layer's steps with the given FFN output move; None sends the output
     back over attention DP."""
     return comm.BoundarySteps(
+        attention_prepare=partial(
+            comm._attention_input_step,
+            layer_input=None,
+            fusions=(),
+            enters_stack=False,
+            residual_ops=comm.ADD_AND_NORM,
+        ),
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
         ffn_input_rows=comm.Layout(frozenset()),

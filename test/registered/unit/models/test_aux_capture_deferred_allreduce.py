@@ -1,4 +1,5 @@
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,6 +48,13 @@ class DeferringLayer(nn.Module):
         self.return_topk = return_topk
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         self.layer_communicator._steps = comm.BoundarySteps(
+            attention_prepare=partial(
+                comm._attention_input_step,
+                layer_input=None,
+                fusions=(),
+                enters_stack=False,
+                residual_ops=comm.ADD_AND_NORM,
+            ),
             attention_input=comm.CommunicateSimpleFn._trivial,
             ffn_input=comm._mlp_input_norm,
             ffn_input_rows=comm.Layout(frozenset()),

@@ -6,6 +6,7 @@ fused matmul fast-paths need a real TP group and are covered by the e2e test.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -186,6 +187,13 @@ class TestSpRegionSteps(CustomTestCase):
     def ordinary_steps(self, attention_input):
         """The layer's steps outside the region, which must not run inside it."""
         return comm.BoundarySteps(
+            attention_prepare=partial(
+                comm._attention_input_step,
+                layer_input=None,
+                fusions=(),
+                enters_stack=False,
+                residual_ops=comm.ADD_AND_NORM,
+            ),
             attention_input=attention_input,
             ffn_input=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
             ffn_input_rows=Layout(frozenset()),

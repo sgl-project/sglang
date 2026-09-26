@@ -837,6 +837,8 @@ class LayerCommunicator:
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
         )
+        # The fused kernels every batch's attention input tries first.
+        self._attn_input_fusions = self._select_attn_input_fusions()
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
         self._declared = sides
@@ -868,7 +870,6 @@ class LayerCommunicator:
             if sides is not None and self._input_can_be_scattered()
             else None
         )
-        self._attn_input_fusions = self._select_attn_input_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -884,6 +885,8 @@ class LayerCommunicator:
             _select_boundary_steps(
                 sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes()),
                 residual_ops=residual_ops,
+                attention_fusions=self._attn_input_fusions,
+                enters_stack=self.layer_scatter_modes.is_first_layer,
             )
             if layernorm_sp.layernorm_sp_enabled()
             else None
@@ -1032,7 +1035,13 @@ class LayerCommunicator:
             ffn_sum_is_movable=modes.mlp_mode
             not in (ScatterMode.MOE_FULL, ScatterMode.SCATTERED),
             fused=fused,
-            layer_input=_complete_scattered_input,
+            attention_prepare=partial(
+                _attention_input_step,
+                layer_input=_complete_scattered_input,
+                fusions=self._attn_input_fusions,
+                enters_stack=modes.is_first_layer,
+                residual_ops=ops,
+            ),
         )
 
     def _steps_for_input_scattered(self, sides: DecoderLayerSides) -> "BoundarySteps":
@@ -1058,14 +1067,24 @@ class LayerCommunicator:
             # DSA and hook-less attention take the slice gathered.
             handoff = _hand_scattered_input_to_attention
         return _select_boundary_steps(
-            scattered, residual_ops=self._residual_ops, attention_handoff=handoff
+            scattered,
+            residual_ops=self._residual_ops,
+            attention_handoff=handoff,
+            attention_fusions=self._attn_input_fusions,
+            enters_stack=self.layer_scatter_modes.is_first_layer,
         )
 
     def _steps_from_declarations(
         self, sides: DecoderLayerSides, **kwargs
     ) -> "BoundarySteps":
         """The steps this layer runs for a set of declarations."""
-        return _select_boundary_steps(sides, residual_ops=self._residual_ops, **kwargs)
+        return _select_boundary_steps(
+            sides,
+            residual_ops=self._residual_ops,
+            attention_fusions=self._attn_input_fusions,
+            enters_stack=self.layer_scatter_modes.is_first_layer,
+            **kwargs,
+        )
 
     def _post_init_communicate(self) -> Tuple[Callable, Callable]:
         """The attention input move and the postprocess the scatter modes
@@ -1171,62 +1190,24 @@ class LayerCommunicator:
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
         self.publish_attn_lora_layout()
-        # The layer stack's first layer starts its residual from its input.
-        enters = residual is None and self.layer_scatter_modes.is_first_layer
-        # What the previous layer left to complete: an UnreducedOutput, or a
-        # producer's handoff that one of the fused entries consumes.
-        owed = None if isinstance(hidden_states, torch.Tensor) else hidden_states
-        if owed is not None and residual is None:
-            raise RuntimeError(f"{type(owed).__name__} requires residual input")
-        if (
-            isinstance(owed, UnreducedOutput)
-            and owed.reduce_and_redistribute is not None
-        ):
-            # No fused kernel runs under attention DP: the reduce-scatter back to
-            # this rank's tokens comes first.
-            hidden_states, owed = reduce_output(owed), None
-        if owed is not None:
-            for fused in self._attn_input_fusions:
-                result = fused(owed, residual, forward_batch, post_residual_addition)
-                if result is not None:
-                    return self._finish_prepare_attn(
-                        hidden_states=result[0],
-                        residual=result[1],
-                        forward_batch=forward_batch,
-                    )
-            hidden_states = owed.partial
         # The SP region opens at the first layer, re-evaluated per forward so a
-        # crash mid-loop cannot leak into the next one.
+        # crash mid-loop cannot leak into the next one. It sets what the batch's
+        # steps are chosen from, and the first layer's input owes nothing.
         if self._sp_steps is not None and self.layer_scatter_modes.is_first_layer:
             get_forward().set(
                 "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        layer_input = self._batch_steps(forward_batch).layer_input
-        if layer_input is not None:
-            hidden_states, residual = layer_input(
-                hidden_states, residual, self._context
-            )
-        ops = self._residual_ops
-        if enters:
-            hidden_states, residual = ops.enter(hidden_states), None
-        if owed is not None and hidden_states.shape[0] != 0:
-            hidden_states = reduce_output(owed)
-        if residual is None:
-            # The previous layer already wrote its output into the residual.
-            hidden_states, residual = ops.read_attention_input(
-                hidden_states, self.input_layernorm, quant_format
-            )
-        else:
-            hidden_states, residual = ops.update_and_read_attention_input(
-                hidden_states,
-                residual,
-                self.input_layernorm,
-                quant_format,
-                post_residual_addition,
-            )
-
+        hidden_states, residual = self._batch_steps(forward_batch).attention_prepare(
+            hidden_states,
+            residual,
+            forward_batch,
+            self.input_layernorm,
+            self._context,
+            quant_format=quant_format,
+            post_residual_addition=post_residual_addition,
+        )
         return self._finish_prepare_attn(
             hidden_states=hidden_states,
             residual=residual,
@@ -2289,6 +2270,10 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     from the attention output to the FFN input, and the FFN output on to the
     rows the layer hands on."""
 
+    # The half into the attention: completes what the input owes, writes the
+    # previous output into the residual and reads the attention input
+    # (_attention_input_step); attention_input then moves it.
+    attention_prepare: Callable
     attention_input: Callable
     ffn_input: Callable
     # The rows ffn_input hands the FFN.
@@ -2304,9 +2289,6 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     ffn_output_move_completes_sum: bool = False
     # The fused kernels ffn_input tries first.
     fused: Tuple["FusedMlpInput", ...] = ()
-    # Completes what the layer's input owes before the input norm; None when it
-    # owes nothing.
-    layer_input: Optional[Callable] = None
     # Hands the attention its input once attention_input has moved it:
     # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
     attention_handoff: Callable = _hand_qkv_hook_its_input
@@ -2314,6 +2296,54 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     @property
     def returns_over_dp(self) -> bool:
         return self.ffn_output_move is None
+
+
+def _attention_input_step(
+    hidden_states: Union[torch.Tensor, "UnreducedOutput"],
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+    norm: torch.nn.Module,
+    context: "CommunicateContext",
+    *,
+    quant_format: str,
+    post_residual_addition: Optional[torch.Tensor],
+    layer_input: Optional[Callable],
+    fusions: Tuple[Callable, ...],
+    enters_stack: bool,
+    residual_ops: ResidualOps,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A boundary's half into an attention: complete what the previous layer
+    left (a value that owes a sum, or a producer's handoff one of ``fusions``
+    consumes with the add and norm), what the input owes by construction
+    (``layer_input``), then write the previous output into the residual and read
+    the attention input with ``norm``. The layer stack's first layer
+    (``enters_stack``) starts its residual from its input."""
+    enters = residual is None and enters_stack
+    owed = None if isinstance(hidden_states, torch.Tensor) else hidden_states
+    if owed is not None and residual is None:
+        raise RuntimeError(f"{type(owed).__name__} requires residual input")
+    if isinstance(owed, UnreducedOutput) and owed.reduce_and_redistribute is not None:
+        # No fused kernel runs under attention DP: the reduce-scatter back to
+        # this rank's tokens comes first.
+        hidden_states, owed = reduce_output(owed), None
+    if owed is not None:
+        for fused in fusions:
+            result = fused(owed, residual, forward_batch, post_residual_addition)
+            if result is not None:
+                return result
+        hidden_states = owed.partial
+    if layer_input is not None:
+        hidden_states, residual = layer_input(hidden_states, residual, context)
+    if enters:
+        hidden_states, residual = residual_ops.enter(hidden_states), None
+    if owed is not None and hidden_states.shape[0] != 0:
+        hidden_states = reduce_output(owed)
+    if residual is None:
+        # The previous layer already wrote its output into the residual.
+        return residual_ops.read_attention_input(hidden_states, norm, quant_format)
+    return residual_ops.update_and_read_attention_input(
+        hidden_states, residual, norm, quant_format, post_residual_addition
+    )
 
 
 class InputRead(Enum):
@@ -2332,12 +2362,12 @@ class Boundary(msgspec.Struct, frozen=True):
     the neighbouring layer runs the other half of that one."""
 
     edge: EdgeDecl
-    # The consumer's half: what completes a sum the input owes by construction,
-    # then the step that brings it into the stage (for the FFN, completing the
-    # attention output's sum, the add and the norm too).
-    layer_input: Optional[Callable] = None
-    input_step: Optional[Callable] = None
-    # The fused kernels input_step tries first.
+    # The consumer's half: completing what the input owes, the add and the
+    # norm; into the FFN also the move onto the rows it needs.
+    prepare: Optional[Callable] = None
+    # Into an attention, the move onto its rows after prepare.
+    input_move: Optional[Callable] = None
+    # The fused kernels an FFN's prepare tries first.
     fused: Tuple["FusedMlpInput", ...] = ()
     # The producer's half: the postprocess that moves the output onto the rows
     # the layer hands on; None when it goes back over attention DP, whose step
@@ -2348,8 +2378,8 @@ class Boundary(msgspec.Struct, frozen=True):
 
     @property
     def input_rows(self) -> Layout:
-        """The rows input_step hands the consumer: what it needs, still sharded
-        over the axes it gathers itself."""
+        """The rows the consumer is handed: what it needs, still sharded over
+        the axes it gathers itself."""
         need = self.edge.need
         return Layout(
             need.layout.sharded
@@ -2361,18 +2391,22 @@ def make_boundary(
     edge: EdgeDecl,
     *,
     reads: Optional[InputRead],
-    fusions: Tuple["FusedMlpInput", ...] = (),
+    fusions: Tuple = (),
     force_layernorm_before_gather: bool = False,
     cp_moves: Optional[CpMoves] = None,
     residual_ops: ResidualOps = ADD_AND_NORM,
+    enters_stack: bool = False,
 ) -> Boundary:
     """The steps a layer runs at ``edge``, around the residual operations;
     ``cp_moves`` for an edge that gathers over or returns across attention CP.
     ``reads`` is how the consumer reads its input, or None when the consumer
     runs in the next layer and ``edge.need`` is the rows this layer hands on:
-    then only the producer's half runs here. The consumer's half reads only
-    this edge's declarations, never what the producer chose for a batch; a sum
-    left for a batch arrives with the value."""
+    then only the producer's half runs here. ``fusions`` are the fused kernels
+    the consumer tries first (FusedMlpInput into an FFN, the attention input's
+    entries into an attention); ``enters_stack`` for the edge into the layer
+    stack's first attention. The consumer's half reads only this edge's
+    declarations, never what the producer chose for a batch; a sum left for a
+    batch arrives with the value."""
     if reads is None:
         if edge.need.layout != edge.residual_to:
             raise NotImplementedError(f"{edge=}")
@@ -2400,7 +2434,7 @@ def make_boundary(
             cp_moves=cp_moves,
             residual_ops=residual_ops,
         )
-        return Boundary(edge, input_step=input_step, fused=fused)
+        return Boundary(edge, prepare=input_step, fused=fused)
     layer_input = None
     if edge.produced.always_leaves:
         # A reduce-scatter completes the TP sum onto each rank's slice, which the
@@ -2415,8 +2449,14 @@ def make_boundary(
         layer_input = tp_reduce_scatter
     return Boundary(
         edge,
-        layer_input=layer_input,
-        input_step=_select_attention_input_move(edge.residual_to, edge.need),
+        prepare=partial(
+            _attention_input_step,
+            layer_input=layer_input,
+            fusions=fusions,
+            enters_stack=enters_stack,
+            residual_ops=residual_ops,
+        ),
+        input_move=_select_attention_input_move(edge.residual_to, edge.need),
     )
 
 
@@ -2428,10 +2468,14 @@ def _select_boundary_steps(
     cp_moves: Optional[CpMoves] = None,
     residual_ops: ResidualOps = ADD_AND_NORM,
     attention_handoff: Callable = _hand_qkv_hook_its_input,
+    attention_fusions: Tuple[Callable, ...] = (),
+    enters_stack: bool = False,
 ) -> BoundarySteps:
     """The steps of a decoder layer: its three boundaries, each chosen from the
     declarations of its two sides, around the layer's residual operations. Both
-    edges that cross attention CP take the same ``cp_moves``."""
+    edges that cross attention CP take the same ``cp_moves``; the attention's
+    input tries ``attention_fusions``, and the layer stack's first layer
+    (``enters_stack``) starts its residual there."""
     edges = decoder_layer_edges(sides)
     out_of_ffn = make_boundary(
         edges.out_of_ffn, reads=None, cp_moves=cp_moves, residual_ops=residual_ops
@@ -2445,18 +2489,22 @@ def _select_boundary_steps(
         residual_ops=residual_ops,
     )
     into_attention = make_boundary(
-        edges.into_attention, reads=InputRead.ATTENTION, residual_ops=residual_ops
+        edges.into_attention,
+        reads=InputRead.ATTENTION,
+        fusions=attention_fusions,
+        residual_ops=residual_ops,
+        enters_stack=enters_stack,
     )
     return BoundarySteps(
-        attention_input=into_attention.input_step,
-        ffn_input=into_ffn.input_step,
+        attention_prepare=into_attention.prepare,
+        attention_input=into_attention.input_move,
+        ffn_input=into_ffn.prepare,
         ffn_input_rows=into_ffn.input_rows,
         ffn_output=edges.out_of_ffn.produced,
         ffn_output_move=out_of_ffn.output_move,
         ffn_output_move_completes_sum=out_of_ffn.output_move_completes_sum,
         ffn_sum_is_movable=edges.out_of_ffn.produced.group is not None,
         fused=into_ffn.fused,
-        layer_input=into_attention.layer_input,
         attention_handoff=attention_handoff,
     )
 

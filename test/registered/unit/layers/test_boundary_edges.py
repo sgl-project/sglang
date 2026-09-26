@@ -78,7 +78,7 @@ class TestDecoderLayerEdges(CustomTestCase):
         self.assertTrue(edge.produced.always_leaves)
         self.assertEqual(edge.residual_to, rows(axis_sizes, TokenAxis.ATTN_TP_SCATTER))
         boundary = make_boundary(edge, reads=InputRead.ATTENTION)
-        self.assertIs(boundary.layer_input, comm.tp_reduce_scatter)
+        self.assertIs(boundary.prepare.keywords["layer_input"], comm.tp_reduce_scatter)
 
 
 class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
@@ -110,8 +110,18 @@ class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
                 residual_to=attention,
             )
             boundary = make_boundary(edge, reads=InputRead.ATTENTION)
-            halves.add((boundary.layer_input, boundary.input_step, boundary.fused))
-        self.assertEqual(halves, {(None, comm.CommunicateSimpleFn._trivial, ())})
+            halves.add(
+                (
+                    boundary.prepare.func,
+                    tuple(sorted(boundary.prepare.keywords.items())),
+                    boundary.input_move,
+                )
+            )
+        self.assertEqual(len(halves), 1)
+        ((func, keywords, move),) = halves
+        self.assertIs(func, comm._attention_input_step)
+        self.assertIsNone(dict(keywords)["layer_input"])
+        self.assertIs(move, comm.CommunicateSimpleFn._trivial)
 
 
 class TestNonAlternatingEdges(CustomTestCase):
@@ -135,8 +145,8 @@ class TestNonAlternatingEdges(CustomTestCase):
         producer = make_boundary(edge, reads=None)
         self.assertIs(producer.output_move, Pair._trivial)
         consumer = make_boundary(edge, reads=InputRead.ATTENTION)
-        self.assertIsNone(consumer.layer_input)
-        self.assertIs(consumer.input_step, comm.CommunicateSimpleFn._trivial)
+        self.assertIsNone(consumer.prepare.keywords["layer_input"])
+        self.assertIs(consumer.input_move, comm.CommunicateSimpleFn._trivial)
 
     def test_an_ffn_into_an_ffn(self):
         axis_sizes = sizes(dp=2, tp=2)
@@ -150,7 +160,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=attention,
             residual_to=attention,
         )
-        step = make_boundary(complete, reads=InputRead.FFN).input_step
+        step = make_boundary(complete, reads=InputRead.FFN).prepare
         self.assertIs(step.func, comm._mlp_input_dp_replicate)
         self.assertFalse(step.keywords["reduces_attention_tp"])
         # An FFN that leaves its TP sum to the next FFN is not supported yet.

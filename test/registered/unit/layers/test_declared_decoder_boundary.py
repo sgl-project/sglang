@@ -753,7 +753,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 # Only the first layer's input, the embedding's partial sum,
                 # is completed onto the slice.
                 self.assertIs(
-                    steps.layer_input,
+                    steps.attention_prepare.keywords["layer_input"],
                     comm.tp_reduce_scatter if layer_id == 0 else None,
                 )
                 self.assertIs(steps.attention_input, comm.CommunicateSimpleFn._trivial)
@@ -1204,6 +1204,7 @@ class TestTheSequenceParallelRegion(CustomTestCase):
 
     SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
     SP_STEPS = comm.BoundarySteps(
+        attention_prepare=comm._attention_input_step,
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
         # The linears gather each rank's slice themselves.
@@ -1214,9 +1215,17 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     )
 
     def unbound(self, steps):
-        """``steps`` with the plain residual's binding taken off the FFN input."""
+        """``steps`` with the plain residual's binding taken off the FFN input
+        and the attention input, whose input owes nothing in the region."""
         self.assertEqual(steps.ffn_input.keywords, {"residual_ops": comm.ADD_AND_NORM})
-        return msgspec.structs.replace(steps, ffn_input=steps.ffn_input.func)
+        attention = steps.attention_prepare.keywords
+        self.assertIsNone(attention["layer_input"])
+        self.assertIs(attention["residual_ops"], comm.ADD_AND_NORM)
+        return msgspec.structs.replace(
+            steps,
+            ffn_input=steps.ffn_input.func,
+            attention_prepare=steps.attention_prepare.func,
+        )
 
     def test_the_region_declarations_choose_local_steps(self):
         for attn_tp in (2, 4):
@@ -1243,7 +1252,6 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                         self.SP_STEPS.ffn_output_move,
                     ),
                 )
-                self.assertIsNone(steps.layer_input)
 
     def test_a_layer_under_sp_takes_both_sets_of_steps(self):
         parallel = parallel_of(attn_dp=1, attn_tp=2)
@@ -1326,7 +1334,10 @@ class TestInputScatteredAttention(CustomTestCase):
                     hands_on_partial=hands_on,
                 )
                 steps = comm._select_boundary_steps(sides)
-                self.assertIs(steps.layer_input, comm.tp_reduce_scatter)
+                self.assertIs(
+                    steps.attention_prepare.keywords["layer_input"],
+                    comm.tp_reduce_scatter,
+                )
                 self.assertIs(steps.attention_input, comm.CommunicateSimpleFn._trivial)
                 self.assertIs(steps.ffn_input, comm._mlp_input_residual_into_sum)
                 self.assertIs(
@@ -1502,14 +1513,71 @@ class TestOneRepresentation(CustomTestCase):
             ),
             parallel_of(attn_dp=1, attn_tp=2),
         )._steps
-        self.assertIs(steps.layer_input, comm._complete_scattered_input)
+        self.assertIs(
+            steps.attention_prepare.keywords["layer_input"],
+            comm._complete_scattered_input,
+        )
         hidden, residual = torch.ones(2, HIDDEN), torch.ones(2, HIDDEN)
         with patch.object(
             comm, "get_attn_tp_context", lambda: SimpleNamespace(input_scattered=False)
         ):
             self.assertEqual(
-                steps.layer_input(hidden, residual, None), (hidden, residual)
+                steps.attention_prepare.keywords["layer_input"](hidden, residual, None),
+                (hidden, residual),
             )
+
+
+class TestTheAttentionInputHalf(CustomTestCase):
+    """Every batch variant's half into the attention tries the fused entries
+    the layer chose, and starts the residual only on the stack's first
+    layer."""
+
+    def build_fusable(self, modes, parallel, **planning_kwargs):
+        with planning(parallel, **planning_kwargs):
+            return LayerCommunicator(
+                layer_scatter_modes=modes,
+                input_layernorm=FusableNorm(),
+                post_attention_layernorm=Norm(),
+            )
+
+    def test_every_variant_takes_the_layers_fused_entries(self):
+        cp = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
+        for name, parallel, kwargs in (
+            (
+                "input-scattered",
+                parallel_of(attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True),
+                {},
+            ),
+            ("LayerNorm SP", parallel_of(attn_dp=1, attn_tp=2), {"sp": True}),
+            ("prefill CP", cp, {}),
+        ):
+            for layer_id in (0, 1):
+                with self.subTest(name, layer_id=layer_id):
+                    modes = planned_modes(
+                        layer_id,
+                        3,
+                        sparse=False,
+                        previous_sparse=False,
+                        parallel=parallel,
+                    )
+                    communicator = self.build_fusable(modes, parallel, **kwargs)
+                    fusions = communicator._attn_input_fusions
+                    self.assertTrue(fusions)
+                    variants = [
+                        steps
+                        for steps in (
+                            communicator._steps,
+                            communicator._sp_steps,
+                            communicator._input_scattered_steps,
+                            communicator._cp_steps,
+                        )
+                        if steps is not None
+                    ]
+                    self.assertEqual(len(variants), 2)
+                    for steps in variants:
+                        bound = steps.attention_prepare.keywords
+                        self.assertIs(bound["fusions"], fusions)
+                        self.assertIs(bound["enters_stack"], layer_id == 0)
 
 
 class TestPrefillCP(CustomTestCase):

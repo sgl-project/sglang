@@ -3,9 +3,11 @@ and applies the input norm in the form the attention's quant format wants."""
 
 import contextlib
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
@@ -51,8 +53,17 @@ def communicator(norm):
     c._context = None
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
+    # Construction picks the fused entries; call it under the platform patches.
+    c._attn_input_fusions = c._select_attn_input_fusions()
     # A layer whose attention takes its input as it is and owes nothing on it.
     c._steps = comm.BoundarySteps(
+        attention_prepare=partial(
+            comm._attention_input_step,
+            layer_input=None,
+            fusions=c._attn_input_fusions,
+            enters_stack=False,
+            residual_ops=comm.ADD_AND_NORM,
+        ),
         attention_input=lambda hidden_states, **_: hidden_states,
         ffn_input=comm._mlp_input_norm,
         ffn_input_rows=comm.Layout(frozenset()),
@@ -60,8 +71,6 @@ def communicator(norm):
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=False,
     )
-    # Construction picks the fused entries; call it under the platform patches.
-    c._attn_input_fusions = c._select_attn_input_fusions()
     return c
 
 
@@ -223,6 +232,32 @@ class TestPrepareAttnSteps(CustomTestCase):
                 else:
                     self.assertEqual(norm.calls, [])
                     self.assertIs(residual, local)
+
+    def test_an_owed_reduce_scatter_is_not_offered_to_a_fused_kernel(self):
+        with platform(fusion=True) as (_, all_reduce, _):
+            c = communicator(Norm())
+            # An entry that would take anything it is offered.
+            takes_anything = MagicMock(return_value=("fused", "fused"))
+            c._steps = msgspec.structs.replace(
+                c._steps,
+                attention_prepare=partial(
+                    comm._attention_input_step,
+                    layer_input=None,
+                    fusions=(takes_anything,),
+                    enters_stack=False,
+                    residual_ops=comm.ADD_AND_NORM,
+                ),
+            )
+            partial_sum = torch.ones(3, 4)
+            step = MagicMock(return_value=torch.full((1, 4), 7.0))
+            c.prepare_attn(
+                comm.UnreducedOutput(partial_sum, reduce_and_redistribute=step),
+                torch.zeros(1, 4),
+                None,
+            )
+            step.assert_called_once_with(partial_sum)
+            takes_anything.assert_not_called()
+            self.assertEqual(all_reduce.call_count, 0)
 
     def test_an_unreduced_output_without_a_residual_is_rejected(self):
         for step in (None, MagicMock()):
