@@ -5,13 +5,15 @@ import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
 )
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import is_npu, run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
@@ -208,13 +210,27 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        def _initialize() -> int:
+            # ACL device/context binding is thread-local. run_with_deadline
+            # executes this in a separate thread, so the device must be set
+            # inside that thread; otherwise AscendDirectTransport's
+            # aclrtGetDevice fails with "Call acl failed".
+            if is_npu():
+                torch.npu.set_device(self.gpu_id)
+            return self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
+            )
+
+        # Also bind the device on the calling thread for later ACL calls
+        # (e.g. register_memory) issued from this thread.
+        if is_npu():
+            torch.npu.set_device(self.gpu_id)
+
+        ret_value = run_with_deadline(
+            _initialize,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
