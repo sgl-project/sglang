@@ -64,8 +64,7 @@ class PeerRecovery:
     def fatal(self, batch, reason):
         self._quarantined.append(batch)
         self.shutdown(reason)
-        # The parent shuts down the engine; this worker must not acknowledge
-        # buffer reuse or dequeue another chunk while that happens.
+        # Stop this worker without acknowledging buffer reuse.
         raise SystemExit(reason)
 
 
@@ -81,8 +80,7 @@ class TransferBatch:
         self.finished = False
 
     def acquire(self):
-        # Multiple decode ranks can belong to one room. A stable order avoids
-        # deadlocks between overlapping rank sets on different transfer queues.
+        # Lock decode ranks in a stable order across transfer queues.
         for peer in self.peers:
             self.locks.enter_context(self.recovery.lock(peer))
         for peer in self.peers:
@@ -94,8 +92,7 @@ class TransferBatch:
     def post(self, handle, peer):
         assert peer in self.peers
         self.handles.append((handle, peer))
-        # transfer() may raise after posting. Its handle still belongs to the
-        # barrier even though the caller never received a return value.
+        # A failed post may still own an in-flight transfer.
         return self.agent.transfer(handle)
 
     def wait(
@@ -112,8 +109,7 @@ class TransferBatch:
                 try:
                     state = self.agent.check_xfer_state(handle)
                 except disconnect_errors:
-                    # NIXL reports a terminal backend error and may remove the
-                    # remote metadata. Never replay this request's slot indices.
+                    # REMOTE_DISCONNECT is a terminal backend error.
                     if peer not in self.failed_peers:
                         logger.warning(
                             "NIXL peer %s disconnected; retiring its transfer batch",
@@ -125,9 +121,8 @@ class TransferBatch:
                 except missing_errors:
                     self.failed = True
                     self.failed_peers.add(peer)
-                    # NIXL 1.4.1 checks metadata existence before consulting an
-                    # in-progress handle. Restore that lookup, then poll again;
-                    # NOT_FOUND itself does not establish completion.
+                    # NIXL 1.4.1 hides handle status when peer metadata is absent.
+                    # Restore it before polling; NOT_FOUND does not mean completion.
                     try:
                         if not self.agent.check_remote_metadata(peer):
                             self.agent.add_remote_agent(self.recovery.metadata(peer))
@@ -159,8 +154,7 @@ class TransferBatch:
             else:
                 time.sleep(0)
 
-        # Every tracked handle has a terminal result. Release before replacing
-        # any prepared descriptor that could still be referenced by a handle.
+        # Descriptors must outlive every transfer handle that references them.
         for handle, peer in self.handles:
             try:
                 self.agent.release_xfer_handle(handle)
@@ -177,9 +171,7 @@ class TransferBatch:
                 ):
                     self.recovery.refresh(peer)
             except Exception:
-                # The handles have already been retired. Keep this peer dirty
-                # so a later batch retries registration, without killing the
-                # transfer thread or blocking other peers on its queue.
+                # All transfers retired; retry registration on a later batch.
                 self.failed = True
                 self.recovery._dirty.add(peer)
                 logger.exception("Failed to reconnect NIXL peer %s; will retry", peer)

@@ -55,7 +55,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import check_pkg_version_at_least, run_with_deadline
 
 try:
     from nixl._bindings import (
@@ -506,37 +506,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
 
-        if (
-            disaggregation_mode == DisaggregationMode.PREFILL
-            and envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT.get()
-        ):
-            from importlib.metadata import version
-
-            from packaging.version import Version
-
-            if backend != "UCX" or Version(version("nixl")) < Version("1.4.1"):
-                raise ValueError(
-                    "NIXL reconnect requires the UCX backend and NIXL >= 1.4.1"
-                )
-            parent_pid = os.getppid()
-
-            def shutdown(reason):
-                logger.error(
-                    "NIXL recovery cannot retire transfers; shutting down engine: %s",
-                    reason,
-                )
-                os.kill(parent_pid, signal.SIGQUIT)
-                # Parent diagnostics can take seconds. Do not let this scheduler
-                # reuse source pages while handles have an unknown outcome.
-                os._exit(1)
-
-            self._peer_recovery = PeerRecovery(
-                self.agent,
-                lambda peer: self.decode_kv_args_table[peer].agent_metadata,
-                self._rebuild_peer_descriptors,
-                shutdown,
-            )
-
+        self._init_peer_recovery(backend)
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -593,6 +563,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _init_peer_recovery(self, backend):
+        self._peer_recovery = None
+        if not (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and backend == "UCX"
+            and envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT.get()
+            and check_pkg_version_at_least("nixl", "1.4.1")
+        ):
+            return
+        self._recovery_parent_pid = os.getppid()
+        self._peer_recovery = PeerRecovery(
+            agent=self.agent,
+            metadata=lambda peer: self.decode_kv_args_table[peer].agent_metadata,
+            rebuild=self._rebuild_peer_descriptors,
+            shutdown=self._shutdown_on_recovery_failure,
+        )
+
+    def _shutdown_on_recovery_failure(self, reason):
+        logger.error("NIXL transfers could not be retired; shutting down: %s", reason)
+        os.kill(self._recovery_parent_pid, signal.SIGQUIT)
+        # Parent diagnostics delay shutdown; stop source-page reuse immediately.
+        os._exit(1)
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (

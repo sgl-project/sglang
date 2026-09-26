@@ -210,6 +210,32 @@ class TestPeerRecovery(CustomTestCase):
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(Queue(chunks))
 
+    def test_recovery_default_version_gate_and_opt_out(self):
+        for version, backend, mode, disabled, expected in (
+            ("1.4.1", "UCX", "prefill", False, True),
+            ("1.5.0", "UCX", "prefill", False, True),
+            ("1.4.0", "UCX", "prefill", False, False),
+            ("1.3.2", "UCX", "prefill", False, False),
+            ("1.4.1", "UCCL", "prefill", False, False),
+            ("1.4.1", "UCX", "decode", False, False),
+            ("1.4.1", "UCX", "prefill", True, False),
+        ):
+            with (
+                self.subTest(
+                    version=version, backend=backend, mode=mode, disabled=disabled
+                ),
+                patch.dict("os.environ"),
+                patch("sglang.srt.utils.common.version", return_value=version),
+            ):
+                flag = conn.envs.SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT
+                flag.clear()
+                if disabled:
+                    flag.set(False)
+                mgr = self.manager()
+                mgr.disaggregation_mode = conn.DisaggregationMode(mode)
+                mgr._init_peer_recovery(backend)
+                self.assertEqual(mgr._peer_recovery is not None, expected)
+
     def test_post_disconnect_fails_one_request_and_next_request_succeeds(self):
         """A post exception previously lost the handle and permanently poisoned the peer."""
         mgr = self.manager()
