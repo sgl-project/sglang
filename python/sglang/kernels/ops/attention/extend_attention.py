@@ -87,12 +87,11 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # late-prefill kernel from ~12.57 ms to ~5.24 ms.
             BLOCK_M, BLOCK_N = (64, 32)
             num_warps = 4
-        elif _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
-            # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+        elif _is_gfx95 and Lq <= 256:
+            # Each workgroup streams the whole prefix, so a larger query tile halves
+            # the KV bytes read per call; 128/8 warps is 16 rows per warp, exactly one
+            # MFMA tile at matrix_instr_nonkdim=16. Measured on MI355X at head_dim
+            # 64, 128 and 256, bit-identical; re-measure before widening past 256.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
