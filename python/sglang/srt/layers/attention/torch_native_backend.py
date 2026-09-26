@@ -75,6 +75,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -93,6 +94,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa: bool
             causal: bool
             is_cross_attn: bool
+            cross_attention_custom_mask: Flat per-request query-by-encoder mask.
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -101,10 +103,14 @@ class TorchNativeAttnBackend(AttentionBackend):
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
+        use_cross_attention_mask = (
+            is_cross_attn and cross_attention_custom_mask is not None
+        )
+
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q, start_kv = 0, 0
+        start_q, start_kv, start_mask = 0, 0, 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
@@ -125,13 +131,16 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            if use_cross_attention_mask:
+                # Each mask row corresponds to a current query position.
+                per_req_query_redudant = per_req_query
+            else:
+                per_req_query_redudant = torch.empty(
+                    (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                    dtype=per_req_query.dtype,
+                    device=per_req_query.device,
+                )
+                per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -147,7 +156,17 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             attn_mask = None
             is_causal = causal
-            if sliding_window_size is not None and sliding_window_size > -1:
+            if use_cross_attention_mask:
+                kv_len = end_kv - start_kv
+                end_mask = start_mask + extend_seq_len_q * kv_len
+                attn_mask = (
+                    cross_attention_custom_mask[start_mask:end_mask]
+                    .view(extend_seq_len_q, kv_len)
+                    .to(dtype=torch.bool)
+                )
+                start_mask = end_mask
+                is_causal = False
+            elif sliding_window_size is not None and sliding_window_size > -1:
                 attn_mask = self._make_sliding_window_mask(
                     q_len=seq_len_kv,
                     kv_len=seq_len_kv,
@@ -169,7 +188,12 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            if use_cross_attention_mask:
+                output[start_q:end_q, :, :] = per_req_out_redudant
+            else:
+                output[start_q:end_q, :, :] = per_req_out_redudant[
+                    prefill_seq_len_q:, :, :
+                ]
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -188,6 +212,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -204,6 +229,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa: bool
             causal: bool
             is_cross_attn: bool
+            cross_attention_custom_mask: Flat per-request query-by-encoder mask.
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -212,7 +238,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q, start_kv = 0, 0
+        start_q, start_kv, start_mask = 0, 0, 0
         for seq_idx in range(seq_lens.shape[0]):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
@@ -248,7 +274,17 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             attn_mask = None
             is_causal = causal
-            if sliding_window_size is not None and sliding_window_size > -1:
+            if is_cross_attn and cross_attention_custom_mask is not None:
+                kv_len = end_kv - start_kv
+                end_mask = start_mask + seq_len_q * kv_len
+                attn_mask = (
+                    cross_attention_custom_mask[start_mask:end_mask]
+                    .view(seq_len_q, kv_len)
+                    .to(dtype=torch.bool)
+                )
+                start_mask = end_mask
+                is_causal = False
+            elif sliding_window_size is not None and sliding_window_size > -1:
                 attn_mask = self._make_sliding_window_mask(
                     q_len=seq_len_q,
                     kv_len=seq_len_kv,
@@ -324,6 +360,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa=use_gqa,
             causal=causal,
             is_cross_attn=layer.is_cross_attention,
+            cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
             sliding_window_size=(
                 layer.sliding_window_size
                 if causal
@@ -386,6 +423,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa=use_gqa,
             causal=False,
             is_cross_attn=layer.is_cross_attention,
+            cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
             sliding_window_size=(
                 layer.sliding_window_size
                 if not layer.is_cross_attention

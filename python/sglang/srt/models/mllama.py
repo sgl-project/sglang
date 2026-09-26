@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from array import array
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -37,7 +37,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    _compute_pad_value,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -832,6 +836,7 @@ class MllamaForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("vision_model", prefix),
         )
+        self.num_tokens_per_image = self.vision_model.num_patches * self.max_num_tiles
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
@@ -849,13 +854,17 @@ class MllamaForConditionalGeneration(nn.Module):
     def pad_input_ids(
         self, input_ids: array[int], mm_inputs: MultimodalInputs
     ) -> array[int]:
-        pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
+        prompt_length = len(input_ids)
+        mm_inputs.mm_items[0].mllama_prompt_length = prompt_length
         pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
-
-        num_concurrent_media, num_tiles = pixel_values.shape[1:3]
-        num_patches = self.vision_model.num_patches
-        image_len = num_concurrent_media * num_tiles * num_patches
+        image_len = self.vision_model.num_patches * sum(
+            item.feature.shape[1] * item.feature.shape[2] for item in mm_inputs.mm_items
+        )
         mm_inputs.num_image_tokens = image_len
+        if image_len > self.num_tokens_per_image:
+            # Generated tokens use a different visual mask. Include the boundary
+            # so a longer prompt gets its own decoder KV entries.
+            pad_values[0] = _compute_pad_value(hash((pad_values[0], prompt_length)))
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
@@ -869,12 +878,14 @@ class MllamaForConditionalGeneration(nn.Module):
         max_num_images = max_num_tiles = bs = 0
         for i, mm_input in enumerate(forward_batch.mm_inputs):
             if not forward_batch.encoder_cached[i] and mm_input is not None:
-                pixel_values = torch.cat(
-                    [item.feature for item in mm_input.mm_items], dim=0
+                max_num_images = max(
+                    max_num_images,
+                    sum(item.feature.shape[1] for item in mm_input.mm_items),
                 )
-                max_num_images = max(max_num_images, pixel_values.shape[1])
-
-                max_num_tiles = max(max_num_tiles, pixel_values.shape[2])
+                max_num_tiles = max(
+                    max_num_tiles,
+                    max(item.feature.shape[2] for item in mm_input.mm_items),
+                )
                 bs += 1
 
         if max_num_images * max_num_tiles * bs == 0:
@@ -901,21 +912,19 @@ class MllamaForConditionalGeneration(nn.Module):
                 if forward_batch.encoder_cached[k] or mm_input is None:
                     continue
 
-                encoder_lens_need.append(forward_batch.encoder_lens[k])
-                pixel_values = torch.cat(
-                    [item.feature for item in mm_input.mm_items], dim=0
-                )
-                for j in range(pixel_values.shape[1]):
-                    img = pixel_values[0, j]
-                    num_tiles = img.shape[0]
-                    batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
-                        "aspect_ratio_ids"
-                    ][0, j]
-
-                    batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
+                encoder_lens_need.append(forward_batch.encoder_lens_cpu[k])
+                image_start = 0
+                for item in mm_input.mm_items:
+                    num_images, num_tiles = item.feature.shape[1:3]
+                    image_end = image_start + num_images
+                    batched_images[i, image_start:image_end, :num_tiles] = item.feature[
                         0
-                    ].model_specific_data["aspect_ratio_mask"][0, j]
+                    ]
+                    batched_ar_ids[i, image_start:image_end] = item.aspect_ratio_ids[0]
+                    batched_ar_mask[i, image_start:image_end, :num_tiles] = (
+                        item.aspect_ratio_mask[0]
+                    )
+                    image_start = image_end
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need
@@ -946,29 +955,67 @@ class MllamaForConditionalGeneration(nn.Module):
 
         return cross_attention_states_flat
 
+    def prepare_forward_batch(self, forward_batch: ForwardBatch):
+        """Prepare image visibility before the attention backend plans KV reads."""
+        forward_batch.cross_attention_custom_mask = None
+        if not forward_batch.mm_inputs or not any(forward_batch.encoder_lens_cpu):
+            return
+
+        is_decode = forward_batch.forward_mode.is_decode()
+        device = forward_batch.seq_lens.device
+        mask_parts = []
+        for i, encoder_len in enumerate(forward_batch.encoder_lens_cpu):
+            q_len = 1 if is_decode else forward_batch.extend_seq_lens_cpu[i]
+            if encoder_len == 0 or q_len == 0:
+                continue
+            mm_input = forward_batch.mm_inputs[i]
+            positions, tile_masks = mllama_image_layout(mm_input.mm_items)
+            prompt_length = mm_input.mm_items[0].mllama_prompt_length
+            # Image visibility stays constant beyond the prompt boundary.
+            query_start = (
+                prompt_length if is_decode else forward_batch.extend_prefix_lens_cpu[i]
+            )
+            mask = build_mllama_cross_attention_mask(
+                image_positions=positions,
+                tile_masks=tile_masks,
+                num_patches=self.vision_model.num_patches,
+                query_start=query_start,
+                query_length=q_len,
+                prompt_length=prompt_length,
+                device=device,
+            )
+            # Fully masked rows use finite attention, with both visual residuals
+            # zeroed by get_full_text_row_masked_out_mask.
+            mask |= ~mask.any(dim=1, keepdim=True)
+            mask_parts.append(mask.flatten())
+
+        if mask_parts:
+            forward_batch.cross_attention_custom_mask = torch.cat(mask_parts)
+
     def get_full_text_row_masked_out_mask(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            full_text_row_masked_out_mask = forward_batch.encoder_lens != 0
-        else:
-            full_text_row_masked_out_mask = torch.ones(
-                forward_batch.extend_seq_lens.sum(), dtype=torch.bool
-            )
-            start_pos = 0
-
-            for seq_len, encoder_len in zip(
-                forward_batch.seq_lens.tolist(), forward_batch.encoder_lens_cpu
-            ):
-                if encoder_len == 0:
-                    full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = (
-                        False
-                    )
-                start_pos += encoder_len
-
-            full_text_row_masked_out_mask = full_text_row_masked_out_mask.to(
-                forward_batch.seq_lens.device
+            # Meta extends image visibility during generation for single-image
+            # prompts. Each image occupies a fixed number of encoder slots.
+            return (forward_batch.encoder_lens == self.num_tokens_per_image).reshape(
+                -1, 1
             )
 
-        return full_text_row_masked_out_mask.reshape(-1, 1)
+        device = forward_batch.seq_lens.device
+        parts = []
+        for i, q_len in enumerate(forward_batch.extend_seq_lens_cpu):
+            if forward_batch.encoder_lens_cpu[i] == 0:
+                parts.append(torch.zeros(q_len, dtype=torch.bool, device=device))
+                continue
+            first_item = forward_batch.mm_inputs[i].mm_items[0]
+            query_start = forward_batch.extend_prefix_lens_cpu[i]
+            query_positions = torch.arange(
+                query_start, query_start + q_len, device=device
+            )
+            visible = query_positions >= first_item.offsets[0][0]
+            if forward_batch.encoder_lens_cpu[i] != self.num_tokens_per_image:
+                visible &= query_positions < first_item.mllama_prompt_length
+            parts.append(visible)
+        return torch.cat(parts).reshape(-1, 1)
 
     def forward(
         self,
@@ -982,7 +1029,7 @@ class MllamaForConditionalGeneration(nn.Module):
             self._batch_image_inputs(forward_batch)
         )
 
-        # TODO: support multi-image by this mask
+        # The backend consumes the batch's image mask when planning attention.
         cross_attention_mask = None
         cross_attention_states = None
 
@@ -1076,6 +1123,64 @@ class MllamaForConditionalGeneration(nn.Module):
                 param = params_dict.pop(name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+def mllama_image_layout(
+    mm_items: Sequence[MultimodalDataItem],
+) -> Tuple[List[int], List[torch.Tensor]]:
+    """Return image positions and tile masks in encoder KV order.
+
+    Offsets are inclusive spans in decoder text coordinates, with one token
+    per image.
+    Aspect-ratio metadata survives release of the pixel tensors after prefill.
+    """
+    positions, tile_masks = [], []
+    for item in mm_items:
+        item_positions = [
+            pos for start, end in item.offsets for pos in range(start, end + 1)
+        ]
+        masks = torch.as_tensor(item.aspect_ratio_mask)
+        masks = masks.reshape(-1, masks.shape[-1])
+        positions.extend(item_positions)
+        tile_masks.extend(masks.unbind(0))
+    return positions, tile_masks
+
+
+def build_mllama_cross_attention_mask(
+    image_positions: Sequence[int],
+    tile_masks: Sequence[torch.Tensor],
+    num_patches: int,
+    query_start: int,
+    query_length: int,
+    prompt_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a boolean [text queries, encoder tokens] visibility mask.
+
+    An image is visible from its marker through the text preceding the next
+    image group. Consecutive markers share an end position. Meta's reference
+    implementation extends single-image visibility during generation and ends
+    multi-image visibility at the prompt boundary. Each tile contributes
+    ``num_patches`` encoder tokens.
+    """
+    query_positions = torch.arange(
+        query_start, query_start + query_length, device=device
+    )
+    last_end = prompt_length if len(image_positions) > 1 else query_start + query_length
+    ends = [*image_positions[1:], last_end]
+    for i in range(len(ends) - 2, -1, -1):
+        if image_positions[i] + 1 == image_positions[i + 1]:
+            ends[i] = ends[i + 1]
+
+    parts = []
+    for start, end, tile_mask in zip(image_positions, ends, tile_masks):
+        visible = (query_positions >= start) & (query_positions < end)
+        parts.append(
+            visible[:, None] & tile_mask.to(device=device, dtype=torch.bool)[None, :]
+        )
+    if not parts:
+        return torch.empty(query_length, 0, dtype=torch.bool, device=device)
+    return torch.cat(parts, dim=1).repeat_interleave(num_patches, dim=1)
 
 
 EntryClass = MllamaForConditionalGeneration
