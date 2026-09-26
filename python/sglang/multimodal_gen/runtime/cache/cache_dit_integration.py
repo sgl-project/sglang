@@ -403,6 +403,10 @@ class CustomBlockAdapterSpec:
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
 _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "MingImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
     "QwenImage21Transformer2DModel": CustomBlockAdapterSpec(
         blocks_attr="transformer_blocks",
         forward_pattern=ForwardPattern.Pattern_3,

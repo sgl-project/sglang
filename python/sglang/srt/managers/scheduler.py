@@ -126,6 +126,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -137,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -288,9 +290,9 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    discard_kv_cache_backup,
     maybe_cache_unfinished_req,
     release_kv_cache,
-    retraction_discard,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -494,6 +496,7 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
@@ -1739,6 +1742,14 @@ class Scheduler(
                     self.send_weights_to_remote_instance,
                 ),
                 (
+                    BeginWeightUpdateReqInput,
+                    self.weight_updater.begin_weight_update,
+                ),
+                (
+                    EndWeightUpdateReqInput,
+                    self.weight_updater.end_weight_update,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -2446,7 +2457,9 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hicache_storage=lambda: (
+                self.enable_hicache_storage or self.enable_lmcache
+            ),
             rust_server=self.rust_server,
         )
 
@@ -2752,6 +2765,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
+                sampling_logprobs_mode=recv_req.sampling_logprobs_mode,
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -3097,7 +3111,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3420,6 +3434,7 @@ class Scheduler(
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+            token_indices_to_pool=recv_req.token_indices_to_pool,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
@@ -3600,6 +3615,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
+            or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3702,6 +3718,7 @@ class Scheduler(
             need_mlp_sync
             and not self.spec_algorithm.is_none()
             and not get_spec().speculative_skip_dp_mlp_sync
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
@@ -3922,6 +3939,15 @@ class Scheduler(
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
+            # A forward batch runs one pooling mode, so setwise readout requests
+            # (token_indices_to_pool) cannot share a batch with last-token ones.
+            # Admit only the first request's mode; the other stays queued.
+            if adder.can_run_list and (
+                (req.token_indices_to_pool is not None)
+                != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
+                continue
+
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
@@ -3944,7 +3970,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -3987,6 +4013,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_lmcache
                         or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
@@ -4857,12 +4884,12 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
             if_success = True
         else:
-            logging.warning("Hierarchical cache is not enabled.")
+            logging.warning("Hierarchical cache or LMCache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
@@ -4892,6 +4919,7 @@ class Scheduler(
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
+                or self.enable_lmcache
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
                 # Singleton PD polls no longer yield through a collective.
@@ -5022,6 +5050,8 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+            elif self.enable_lmcache:
+                idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle
 
@@ -5423,6 +5453,8 @@ class Scheduler(
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 release_kv_cache(req, self.tree_cache)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5486,6 +5518,10 @@ class Scheduler(
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    if decode_req.host_staged:
+                        # Keep the host destination alive until prefill stops writing.
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                        continue
                     receiver = decode_req.kv_receiver
                     receiver.abort()
                     # Arm drain-ack accounting once the ABORT is sent, so acks
@@ -5507,7 +5543,7 @@ class Scheduler(
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        retraction_discard(
+                        discard_kv_cache_backup(
                             decode_req,
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,

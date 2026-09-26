@@ -288,11 +288,29 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            pre_initialize_workspaces,
+            resolve_flashinfer_allreduce_fusion_backend,
+            uses_cutedsl_ar_fusion,
+        )
+
         if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
+        if uses_cutedsl_ar_fusion():
+            # Nothing else resolves the configured backend, so check the platform.
+            resolve_flashinfer_allreduce_fusion_backend()
+            if not mr.is_draft_worker:
+                # A draft installs no fusion communicator.
+                from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                    prepare_cutedsl_fusion,
+                )
+
+                prepare_cutedsl_fusion(
+                    mr.model, max_running_requests=mr.max_running_requests
+                )
+            return
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
