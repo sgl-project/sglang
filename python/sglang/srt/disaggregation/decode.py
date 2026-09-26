@@ -2388,8 +2388,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        # or timed out. Entries:
+        # (decode_req, start_time, deadline, metadata_idx, required_acks).
+        self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2768,12 +2769,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
-        deadline = time.monotonic() + self.deferred_kv_release_timeout
+        start_time = time.monotonic()
+        deadline = start_time + self.deferred_kv_release_timeout
         # Require an ack from every notified prefill rank (dummy-proof). Snapshot
         # now -- the receiver may be cleared by resolve time.
         required_acks = len(decode_req.kv_receiver.bootstrap_infos)
         self._deferred_releases.append(
-            (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
+            (
+                decode_req,
+                start_time,
+                deadline,
+                decode_req.metadata_buffer_index,
+                required_acks,
+            )
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
@@ -2791,6 +2799,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
+    def num_pending_deferred_releases(self) -> int:
+        return len(self._deferred_releases)
+
+    def _observe_deferred_kv_release(
+        self, duration_seconds: float, outcome: str
+    ) -> None:
+        if self.scheduler.metrics_reporter.enable_metrics:
+            self.scheduler.metrics_collector.observe_decode_deferred_kv_release(
+                duration_seconds=duration_seconds,
+                outcome=outcome,
+            )
+
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
         if not self._deferred_releases:
@@ -2800,7 +2820,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.kv_receiver.kv_mgr.is_abort_release_safe(
                     req.req.bootstrap_room, acks
                 )
-                for req, _, _, acks in self._deferred_releases
+                for req, _, _, _, acks in self._deferred_releases
                 if self.enable_host_receive and req.host_staged
             ],
             dtype=torch.int32,
@@ -2814,36 +2834,52 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         now = time.monotonic()
         still_held = []
         to_release = []
-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
+        for (
+            decode_req,
+            start_time,
+            deadline,
+            idx,
+            required_acks,
+        ) in self._deferred_releases:
             room = decode_req.req.bootstrap_room
             if self.enable_host_receive and decode_req.host_staged:
                 if next(host_ready):
-                    to_release.append((decode_req, idx, room, True))
+                    to_release.append((decode_req, start_time, idx, room, True))
                 else:
                     # A timeout cannot prove that a remote write has stopped.
-                    still_held.append((decode_req, deadline, idx, required_acks))
+                    still_held.append(
+                        (decode_req, start_time, deadline, idx, required_acks)
+                    )
                 continue
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
             if not drained and now < deadline:
-                still_held.append((decode_req, deadline, idx, required_acks))
+                still_held.append(
+                    (decode_req, start_time, deadline, idx, required_acks)
+                )
             else:
-                to_release.append((decode_req, idx, room, drained))
+                to_release.append((decode_req, start_time, idx, room, drained))
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
-        for decode_req, idx, room, drained in to_release:
+        for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
                     f"{self.deferred_kv_release_timeout}s without a full drain "
                     f"ack from prefill; releasing anyway."
                 )
+            outcome = "drained" if drained else "timeout"
             try:
                 self._do_release(decode_req, idx)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
                 logger.exception(f"Deferred KV release failed for room {room}")
+                outcome = "error"
+            self._observe_deferred_kv_release(
+                duration_seconds=max(0.0, now - start_time),
+                outcome=outcome,
+            )
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
