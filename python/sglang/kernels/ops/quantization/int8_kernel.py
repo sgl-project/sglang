@@ -9,10 +9,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.srt.utils import get_device_name, is_cuda, is_hip
+from sglang.srt.utils import get_device_name, is_cpu, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sglang.kernels.ops.quantization.per_token_group_quant import (
         per_token_group_quant,
@@ -59,6 +60,13 @@ def _per_token_quant_int8(
 
 
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    if _is_cpu:
+        x_q, scales = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x.contiguous())
+        scales = scales.to(scale_dtype)
+        if cal_sum:
+            return x_q, scales, x.sum(dim=-1)
+        return x_q, scales
+
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
