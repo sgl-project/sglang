@@ -706,6 +706,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         defer_finalize: bool = False,
     ):
+        if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
+            from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
+
+            if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
+                return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
