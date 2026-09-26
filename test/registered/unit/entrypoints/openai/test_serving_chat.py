@@ -1207,6 +1207,86 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_glm47_constraint_is_scoped_to_active_tools(self):
+        """A request with tool use disabled must not get a GLM47 tool grammar.
+
+        Grammar termination ends generation without consulting ``ignore_eos``.
+        """
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "add",
+                "parameters": {"type": "object"},
+            },
+        }
+        requests = (
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            ),
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+                tools=[tool],
+                tool_choice="none",
+            ),
+        )
+
+        for request in requests:
+            with (
+                self.subTest(tool_choice=request.tool_choice),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                parser_cls.assert_not_called()
+                self.assertIsNone(result.tool_call_constraint)
+
+    def test_glm47_constraint_remains_enabled_for_non_strict_auto_tools(self):
+        """Non-strict tools with tool_choice=auto keep the GLM47 grammar."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser = parser_cls.return_value
+            parser.get_structure_constraint.return_value = (
+                "full_assistant_ebnf",
+                "root ::= assistant_turn",
+            )
+
+            result = self.chat._process_messages(request, is_multimodal=False)
+
+            parser_cls.assert_called_once()
+            parser.get_structure_constraint.assert_called_once()
+            self.assertEqual(
+                result.tool_call_constraint,
+                ("full_assistant_ebnf", "root ::= assistant_turn"),
+            )
+
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
         self.template_manager.chat_template_name = None
