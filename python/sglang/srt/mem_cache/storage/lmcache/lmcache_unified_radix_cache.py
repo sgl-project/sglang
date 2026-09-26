@@ -769,7 +769,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
-            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, swa_missing_end)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), swa_missing_end),
+            )
 
     def _publish_external_loaded_prefix(self, req: Req, *, token_ids_len: int) -> None:
         """Publish retrieved KV and immutable Mamba state into the device tree."""
@@ -807,7 +810,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
                 chunked=True,
                 priority=req.priority or 0,
             )

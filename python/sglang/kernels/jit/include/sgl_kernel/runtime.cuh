@@ -38,6 +38,12 @@
 #ifndef cudaDevAttrComputeCapabilityMinor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlock
+#define cudaDevAttrMaxSharedMemoryPerBlock hipDeviceAttributeMaxSharedMemoryPerBlock
+#endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#endif
 #ifndef cudaRuntimeGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #endif

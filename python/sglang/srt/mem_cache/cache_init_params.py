@@ -55,5 +55,6 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+    tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()

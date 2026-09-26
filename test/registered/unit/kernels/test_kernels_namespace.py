@@ -290,6 +290,12 @@ def test_reclassified_public_entry_points_are_inventoried():
         ("attention.fused_rope_wo_a_bf16", (10, 0), True),
         ("attention.fused_rope_wo_a_bf16", (10, 3), True),
         ("attention.fused_rope_wo_a_bf16", (12, 0), False),
+        ("attention.deep_select_topk", (8, 0), False),
+        ("attention.deep_select_topk", (9, 0), True),
+        ("attention.deep_select_topk", (10, 0), True),
+        ("attention.deep_select_topk", (10, 1), False),
+        ("attention.deep_select_topk", (10, 3), True),
+        ("attention.deep_select_topk", (12, 0), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):
@@ -299,6 +305,16 @@ def test_registered_architecture_boundaries(op, sm, expected):
     )
     assert K.capabilities_satisfied(spec.capabilities, platform) is expected
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_deep_select_spec_matches_wrapper_architectures():
+    """The group cannot import the wrapper, so this is the only link between the two SM lists."""
+    from sglang.kernels.ops.attention import deep_select
+
+    spec = K.registry.get_backend("attention.deep_select_topk", KernelBackend.JIT)
+    assert spec.capabilities == frozenset(
+        Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select._SUPPORTED_CAPABILITIES
+    )
 
 
 if __name__ == "__main__":
