@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tch::Tensor;
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, MAMBA};
+use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -350,6 +350,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.component_state(MAMBA).is_evict_device_ongoing,
             "Mamba device eviction not started"
         );
+        assert!(
+            tree_core
+                .component_state(MAMBA)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal Mamba eviction before advancing"
+        );
         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -358,15 +365,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .device_lru_list(MAMBA)
                 .get_lru_no_lock(&tree_core.arena);
         }
-        let next = loop {
+        let next = 'step: {
             if tracker[&ct] >= tree_core.component_state(MAMBA).evict_device_request_cnt {
-                break None;
+                break 'step None;
             }
             let Some(x) = cursor else {
-                break None;
+                break 'step None;
             };
             if !tree_core.device_lru_list(MAMBA).in_list(Some(x)) {
-                break None;
+                break 'step None;
             }
             assert!(
                 tree_core.arena.has_device_value(x, MAMBA),
@@ -375,14 +382,28 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             cursor = tree_core
                 .device_lru_list(MAMBA)
                 .get_prev_no_lock(x, &tree_core.arena);
-            // A load-back pin means an in-flight DMA targets this node's slices.
-            if tree_core.arena.node(x).is_load_back_pending() {
-                continue;
-            }
+            // The Mamba LRU filters its own transfer/request locks. Full load
+            // pins and expanded SWA backups can cover unrelated Mamba state
+            // restored by a later request, which remains independently evictable.
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break 'step Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
+            let node = tree_core.arena.node(x);
+            if tree_core.enable_hicache
+                && tree_core.is_write_back
+                && !node.has_host_value(MAMBA)
+                && !node.backuped()
+                && node.has_device_value(FULL)
+            {
+                // Keep the state live until the controller finishes D->H I/O.
+                // Native code never calls Python while holding the tree lock.
+                let node_id = node.id;
+                tree_core
+                    .component_state_mut(MAMBA)
+                    .evict_device_pending_node = Some(node_id);
+                break 'step None;
+            }
+            // Other policies and already-backed states need no I/O.
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,
@@ -392,7 +413,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 Some(tracker),
             );
             tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
-            break None;
+            None
         };
         tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
         next
@@ -698,11 +719,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let x_next = tree_core
                 .host_lru_list(MAMBA)
                 .get_prev_no_lock(cur, &tree_core.arena);
-            // A load-back pin means an in-flight DMA reads this node's host slices.
-            if tree_core.arena.node(cur).is_load_back_pending() {
-                x = x_next;
-                continue;
-            }
+            // The host LRU filters Mamba's own locks. A Full load-back pin may
+            // cover an ancestor whose Mamba state is not being transferred.
             if tree_core.evictable_host_leaves.contains(cur) {
                 // Host leaf: atomic eviction (all components host + delete)
                 tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);

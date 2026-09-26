@@ -74,7 +74,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    create_tree_core,
+    select_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -204,11 +207,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = (
-            params.tree_core_backend
-            if params.tree_core_backend is not None
-            else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-        )
+        self._tree_core_backend = select_tree_core_backend(params)
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -756,6 +755,35 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[Optional[NodeId], bool]:
         """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # Rust yields before freeing internal state (#40680). Make room
+            # in the state pool, then drain the D->H ack before its tombstone.
+            # Allocation failure still permits the legacy drop to make progress.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # Internal SWA write-back (#40712) can cover several unbacked
+            # segments. Make room for the whole window before the D->H backup.
+            # A failed allocation still resumes eviction to free device slots.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
@@ -887,8 +915,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
-            isinstance(self.tree_core, UnifiedTreeCore)
-            and self.host_memory_mode == "cache"
+            self.host_memory_mode == "cache"
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )

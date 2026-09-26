@@ -77,7 +77,10 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    _TREE_CORE_REGISTRY,
+    resolve_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
@@ -115,7 +118,7 @@ register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
 # A dedicated test entry point overrides this without changing the process-wide
 # production backend selection. Direct Python-core tests in this module remain
 # Python-only; every fixture-backed cache test is shared by both inspectors.
-_TREE_CORE_TEST_BACKEND: Optional[str] = None
+_TREE_CORE_TEST_BACKEND: Optional[str] = "python"
 
 
 def _selected_tree_core_test_backend() -> str:
@@ -123,9 +126,6 @@ def _selected_tree_core_test_backend() -> str:
 
 
 def _session_radix_cache_test_values() -> tuple[bool, ...]:
-    # TODO(Jialin): Restore the session-enabled case after porting #29173 to Rust.
-    if _selected_tree_core_test_backend() == "rust":
-        return (False,)
     return False, True
 
 
@@ -454,11 +454,11 @@ def _aux_storage_key_transfers(cache, node_id):
 
 def build_fixture(
     cfg: CacheConfig,
-    *,
     enable_kv_cache_events: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
+    tree_core_backend: Optional[str] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -593,29 +593,26 @@ def build_fixture(
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
-    selected_backend = _selected_tree_core_test_backend()
-    if selected_backend == "python":
+    requested_backend = tree_core_backend or _selected_tree_core_test_backend()
+    selected_backend = resolve_tree_core_backend(requested_backend, cache_init_params)
 
-        def inspector_factory(params, components):
-            return UnifiedTreeCoreInspector(params, components)
+    def python_inspector_factory(params, components):
+        return UnifiedTreeCoreInspector(params, components)
 
-    elif selected_backend == "rust":
+    def rust_inspector_factory(params, _components):
         from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
 
-        def inspector_factory(params, _components):
-            return RustUnifiedTreeCoreInspector(params)
+        return RustUnifiedTreeCoreInspector(params)
 
-    else:
-        inspector_factory = None
-
-    if inspector_factory is not None:
-        with (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(selected_backend),
-            mock.patch.dict(_TREE_CORE_REGISTRY, {selected_backend: inspector_factory}),
-        ):
-            cache = UnifiedRadixCache(params=cache_init_params)
-    else:
+    with (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(requested_backend),
+        mock.patch.dict(
+            _TREE_CORE_REGISTRY,
+            {"python": python_inspector_factory, "rust": rust_inspector_factory},
+        ),
+    ):
         cache = UnifiedRadixCache(params=cache_init_params)
+    assert cache._tree_core_backend == selected_backend
     assert isinstance(cache.tree_core, UnifiedTreeCoreInspectionInterface), (
         "The shared unified radix-cache unit suite requires a TreeCore backend "
         "that implements UnifiedTreeCoreInspectionInterface"
@@ -4640,7 +4637,6 @@ class UnifiedRadixCacheSuite:
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
         """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         storage_dir = tempfile.mkdtemp()
@@ -4781,7 +4777,6 @@ class UnifiedRadixCacheSuite:
     def test_buffer_only_load_back_reuses_partial_masked_full(self):
         """FULL-only rematch reuses a resident head and fetches only its tail."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         page_size = self.cfg.page_size
@@ -4994,7 +4989,6 @@ class UnifiedRadixCacheSuite:
         A window-sized fetch still passes the global threshold, but after
         sibling growth its FULL splice is shorter than its SWA transfer."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         # Buffer-mode plan/commit logic is layout-independent, and each
         # hicache fixture retains its pools for the whole file run. Pin to
         # one config so the matrix does not exhaust a small CI GPU.
@@ -5581,13 +5575,6 @@ class UnifiedRadixCacheSuite:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
 
-    def _skip_swa_window_repair_on_rust(self):
-        # Buffer-mode consumption repairs SWA tombstones under the loaded
-        # window through swa_tombstone_ranges/attach_swa_window, which the
-        # Rust tree core does not implement yet.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("buffer-mode SWA window repair is Python-core only")
-
     def _simulate_backup(self, cache, node):
         """Simulate D->H backup over the whole root->node path (parent-first)."""
         for ancestor in self._path_chain(cache, node):
@@ -5682,8 +5669,8 @@ class UnifiedRadixCacheSuite:
             # Background prefetch/backup threads are daemon; stop them per-test.
             self.addCleanup(cache.cache_controller._stop_storage_threads)
 
-    def _build_hicache_fixture(self):
-        fixture = build_fixture(self.cfg)
+    def _build_hicache_fixture(self, tree_core_backend: Optional[str] = None):
+        fixture = build_fixture(self.cfg, tree_core_backend=tree_core_backend)
         cache, _, _ = fixture
         self._init_hicache(cache)
         return fixture
@@ -6185,12 +6172,6 @@ class UnifiedRadixCacheSuite:
         it stays servable."""
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
-        if self.cfg.has_swa:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
-        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
-        # its eviction walk still tombstones the state without a host backup.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node state demote is Python-core only")
         cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
             "write_back"
         )
@@ -6213,11 +6194,13 @@ class UnifiedRadixCacheSuite:
             _host_value(cache, node, ComponentType.MAMBA),
             "state demoted to host, not dropped",
         )
+        # SWA can split off device-only Full ancestors without Mamba states.
+        # They count toward the Full hit but not the host-hit budget; the
+        # scheduler collects their resident KV after reviving the state below.
         self.assertEqual(
-            len(m.device_indices) + m.host_hit_length,
+            m.full_kv_hit_length,
             len(seq_a),
-            "the full prefix stays servable (device KV is claimed once the "
-            "state is revived)",
+            "the full prefix remains cached",
         )
         self.assertGreaterEqual(
             m.mamba_host_hit_length, 1, "load-back armed for the host state"
@@ -6247,12 +6230,11 @@ class UnifiedRadixCacheSuite:
     def test_hicache_internal_mamba_backup_waits_for_pending_swa(self):
         if not (self.cfg.has_swa and self.cfg.has_mamba):
             self.skipTest("requires Full, SWA and Mamba components")
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node state demote is Python-core only")
         page = self.cfg.page_size
         cache, allocator, req_pool = build_fixture(
             replace(self.cfg, sliding_window_size=3 * page)
         )
+        self.assertEqual(cache._tree_core_backend, _selected_tree_core_test_backend())
 
         def insert(length):
             return self._insert(
@@ -6293,8 +6275,6 @@ class UnifiedRadixCacheSuite:
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
-        if self.cfg.has_swa:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
 
         cache.evict(EvictParams(num_tokens=0, mamba_num=10))
@@ -6326,15 +6306,10 @@ class UnifiedRadixCacheSuite:
         stays servable instead of losing a window of matchable prefix."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
-        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
-        # its eviction walk still tombstones the SWA KV without a host backup.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node SWA demote is Python-core only")
         cache, req_to_token_pool, seq_a, seq_b = self._build_internal_swa_fixture(
             "write_back"
         )
+        self.assertEqual(cache._tree_core_backend, _selected_tree_core_test_backend())
 
         result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
@@ -6388,8 +6363,6 @@ class UnifiedRadixCacheSuite:
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_through")
 
         cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
@@ -6510,11 +6483,10 @@ class UnifiedRadixCacheSuite:
             self.skipTest("requires SWA-only")
         if self.cfg.sliding_window_size <= self.cfg.page_size:
             self.skipTest("the window must reach past the leaf's own page")
-        if _selected_tree_core_test_backend() == "rust":
-            # needs_incremental_backup is a component method on Python nodes;
-            # the Rust core pins the same contract in its own unit suite.
-            self.skipTest("component-level check is Python-core only")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        # This test exercises the Python component's collector directly.
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
+            tree_core_backend="python"
+        )
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
         if len(chain) < 2:
             self.skipTest("chain too short")
@@ -6565,8 +6537,6 @@ class UnifiedRadixCacheSuite:
         cache.dec_lock_ref(zeroed.best_match_node, lock.to_dec_params())
 
     def test_evict_host_drains_freed_host_values_to_the_pools(self):
-        if self.cfg.has_swa and self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -10193,12 +10163,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
     def test_write_through_eviction_counts_unbacked_tokens(self):
-        if _selected_tree_core_test_backend() == "rust":
-            # The unbacked-eviction tracker is a Python tree-core feature;
-            # UnifiedRadixCache only enables it for that backend.
-            self.skipTest(
-                "write-through unbacked-eviction tracking is Python-core only"
-            )
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
         cache.metrics_collector = mock.Mock()
@@ -10622,14 +10586,10 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             node_id = children[0]
 
     def _assert_protocol_violation(self, fn, fragment):
-        """The Python core asserts; the Rust core panics (a BaseException
-        subclass at the PyO3 boundary). Either way the message names the
-        violation and the operation never completes silently."""
+        """Both cores report ownership violations as ordinary Python exceptions."""
         try:
             fn()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as exc:  # pyo3 PanicException derives from BaseException
+        except (AssertionError, RuntimeError) as exc:
             self.assertIn(fragment, str(exc))
         else:
             self.fail(f"protocol violation went unreported: {fragment}")
@@ -10815,9 +10775,9 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         unlocks, so a leaf whose last lock is an auxiliary one is readmitted
         even when Full released first. Component-level replay of the Python
         core; the Rust crate covers its own order in its unit tests."""
-        if _selected_tree_core_test_backend() != "python":
-            self.skipTest("drives Python component objects directly")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg, tree_core_backend="python"
+        )
         seq = self._make_seq(1, self.cfg.sliding_window_size)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
