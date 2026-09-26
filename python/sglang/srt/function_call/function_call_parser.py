@@ -86,6 +86,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k2_raw_id": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
         "ling3": Ling3Detector,

@@ -10,6 +10,7 @@ from sglang.srt.function_call.kimik2_detector import (
 )
 from sglang.srt.parser.reasoning_parser import KimiK2Detector as KimiK2ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
@@ -1392,6 +1393,62 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "search")
+
+
+# ============================================================
+# Part 4: model-emitted tool_call_id capture (kimi_k2_raw_id)
+# ============================================================
+
+
+class TestKimiK2RawToolCallId(CustomTestCase):
+    """The detector records the model-emitted id on ``ToolCallItem.tool_call_id``
+    for every id form it accepts; ``kimi_k2_raw_id`` serves it verbatim."""
+
+    # Standard, prefix-less, and bare-counter ids; counters continue the history.
+    CHUNKS = [
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:5",
+        '<|tool_call_argument_begin|>{"path":',
+        ' "/a.py"}<|tool_call_end|>',
+        '<|tool_call_begin|>get_weather:7<|tool_call_argument_begin|>{"city": ',
+        '"Tokyo"}<|tool_call_end|>',
+        '<|tool_call_begin|>9<|tool_call_argument_begin|>{"city": "Osaka"}',
+        "<|tool_call_end|><|tool_calls_section_end|>",
+    ]
+    EXPECTED = [
+        (0, "ReadFile", "functions.ReadFile:5"),
+        (1, "get_weather", "get_weather:7"),
+        (2, "get_weather", "9"),
+    ]
+
+    def setUp(self):
+        self.tools = [
+            _make_tool("ReadFile"),
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    def test_non_streaming_captures_raw_id(self):
+        result = KimiK2FuncDetector().detect_and_parse("".join(self.CHUNKS), self.tools)
+        self.assertEqual(
+            [(c.tool_index, c.name, c.tool_call_id) for c in result.calls],
+            self.EXPECTED,
+        )
+
+    def test_streaming_captures_raw_id_on_name_delta(self):
+        detector = KimiK2FuncDetector()
+        events = []
+        for chunk in self.CHUNKS:
+            events.extend(detector.parse_streaming_increment(chunk, self.tools).calls)
+        self.assertEqual(
+            [(ev.tool_index, ev.name, ev.tool_call_id) for ev in events if ev.name],
+            self.EXPECTED,
+        )
 
 
 if __name__ == "__main__":
