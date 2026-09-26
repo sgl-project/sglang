@@ -523,3 +523,54 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         res.headers(),
     );
 }
+
+/// A request rejected while injecting bootstrap fields (an f64-overflow
+/// literal the routing-fields fallback accepted, re-parsed for PD) must not
+/// book a forwarding outcome; a dispatched chat on the same deployment must.
+#[tokio::test]
+async fn pd_reparse_rejection_books_no_forwarding_outcome() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+
+    let overflow = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"tiny","messages":[{"role":"user","content":"hi"}],"temperature":1e400}"#,
+        ))
+        .unwrap();
+    let res = build_router(Arc::clone(&ctx)).oneshot(overflow).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !ctx.metrics
+            .render()
+            .contains("sgl_router_input_ids_forwarding_total{"),
+        "a request rejected while building the outgoing body was never dispatched"
+    );
+
+    let res = build_router(Arc::clone(&ctx))
+        .oneshot(chat_request())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(ctx.metrics.render().contains(
+        r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="disabled"} 1"#
+    ));
+}
