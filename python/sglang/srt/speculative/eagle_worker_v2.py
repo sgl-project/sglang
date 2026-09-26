@@ -891,6 +891,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
                         forward_batch.sampling_info.top_ks,
+                        sampling_seed=forward_batch.sampling_info.sampling_seed,
+                        positions=forward_batch.positions + 1,
+                        draft_step=i + 1,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1102,7 +1105,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             use_rejection_sampling,
         )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            topk_p, topk_index = fast_sample(
+                probs,
+                num_samples=1,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch.seq_lens,
+            )
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
@@ -1244,6 +1252,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch.seq_lens,
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
