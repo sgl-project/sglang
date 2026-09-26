@@ -1485,7 +1485,7 @@ class LayerwiseOffloadManager:
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
-        """Yield each pinned allocation before copying weights to transfer its lease."""
+        """Yield each pinned allocation to transfer its lease."""
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
@@ -1579,21 +1579,23 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                # create concatenated CPU buffer (in pinned memory)
-                if pin_this_layer:
-                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
-                else:
-                    cpu_buffer = torch.empty(total_numel, dtype=dtype)
+                cpu_buffer, populated = self._prepare_host_buffer(
+                    contiguous_weights,
+                    aligned_offsets,
+                    total_numel,
+                    dtype,
+                    pin_this_layer,
+                )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
-                # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
                     current_offset = aligned_offsets[name]
                     numel = local_weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
-                        local_weight.flatten()
-                    )
+                    if not populated:
+                        cpu_buffer[current_offset : current_offset + numel].copy_(
+                            local_weight.flatten()
+                        )
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
@@ -1610,6 +1612,45 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+    @staticmethod
+    def _prepare_host_buffer(
+        weights: List[Tuple[str, torch.Tensor, torch.Tensor]],
+        offsets: Dict[str, int],
+        total_numel: int,
+        dtype: torch.dtype,
+        pin: bool,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Return a host buffer and whether CPU weights already populate it."""
+        nbytes = total_numel * dtype.itemsize
+        if (
+            pin
+            and nbytes >= _REGISTER_MIN_BYTES
+            and all(local.device.type == "cpu" for _, _, local in weights)
+        ):
+            storage = _shared_storage(nbytes)
+            if storage is not None:
+                buffer = torch.empty(0, dtype=dtype).set_(
+                    storage, 0, (total_numel,), (1,)
+                )
+                # CPU copies populate pages in parallel before registration;
+                # GPU copies must keep their pinned destination to avoid staging
+                for name, _, local in weights:
+                    offset = offsets[name]
+                    buffer[offset : offset + local.numel()].copy_(local.flatten())
+                if _pin_in_place(buffer):
+                    return buffer, True
+                # retain the originals until registration succeeds so fallback
+                # does not hold an extra full-size populated allocation
+                del buffer, storage
+
+        buffer = (
+            _pinned_empty(total_numel, dtype=dtype)
+            if pin
+            else torch.empty(total_numel, dtype=dtype)
+        )
+        # the caller must attach the pin lease before a fallible pinned copy
+        return buffer, False
 
     def _finalize_initialization(self) -> None:
         # prefetch the head of the stream for warm-up. Under `forward` residency
