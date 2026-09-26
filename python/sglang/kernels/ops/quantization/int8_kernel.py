@@ -61,8 +61,10 @@ def _per_token_quant_int8(
 
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     if _is_cpu:
-        x_q, scales = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x.contiguous())
-        scales = scales.to(scale_dtype)
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        x_q_u8, scales = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x_2d)
+        x_q = (x_q_u8.to(torch.int16) - 128).to(torch.int8).view_as(x)
+        scales = scales.to(scale_dtype).view(x.shape[:-1] + (1,))
         if cal_sum:
             return x_q, scales, x.sum(dim=-1)
         return x_q, scales
