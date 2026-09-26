@@ -1175,13 +1175,16 @@ def test_component_commit_keeps_only_adopted_pages():
 
 
 @pytest.mark.parametrize("mamba_exist", [False, True])
-def test_mamba_commit_copies_node_state_and_loads_only_a_new_slot(mamba_exist):
+def test_mamba_commit_copies_node_state_and_frees_an_unneeded_slot(mamba_exist):
     node_state = torch.tensor([7])
     component = MambaComponent.__new__(MambaComponent)
     component.tree_core = SimpleNamespace(
         get_component_device_value=lambda node_id, component_type: node_state
     )
-    component.cache = SimpleNamespace()
+    allocator = MagicMock()
+    component.cache = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(mamba_allocator=allocator)
+    )
     req = SimpleNamespace(kv=ReqKvInfo(mamba_pool_idx=torch.tensor(3)))
     transfer = PoolTransfer(
         name=PoolName.MAMBA, keys=["d"], device_indices=torch.tensor([9])
@@ -1204,7 +1207,9 @@ def test_mamba_commit_copies_node_state_and_loads_only_a_new_slot(mamba_exist):
         canonical_full=torch.arange(8),
     )
 
+    # A node that already has a state keeps it; the loaded slot is returned.
     assert loaded == ([] if mamba_exist else [transfer])
+    assert allocator.free.call_count == int(mamba_exist)
     assert transfer.device_indices.tolist() == [9]
     assert req.kv.mamba_cow_src_index is node_state
     assert int(req.kv.mamba_pool_idx) == 3

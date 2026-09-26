@@ -738,8 +738,10 @@ class MambaComponent(TreeComponent):
         assert insert_result is not None
         # The forward's COW waits for the load before reading the source slot.
         self._cow_node_state_into_req(req, insert_result.last_device_node)
-        # load_back freed the loaded slot when the node already had a state.
-        return None if insert_result.mamba_exist else transfer
+        if insert_result.mamba_exist:
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            return None
+        return transfer
 
     # ---- HiCache Hooks ----
 

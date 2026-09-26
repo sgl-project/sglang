@@ -369,10 +369,6 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node

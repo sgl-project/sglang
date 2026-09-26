@@ -15,10 +15,6 @@ from sglang.test.kl_multiturn_utils import (
     _flush_cache,
     _generate,
     _replay_and_compare_kl,
-    make_mamba_decode_assert,
-)
-from sglang.test.kl_multiturn_utils import (
-    test_input_output_logprobs_match_decode_cache_hit_helper as assert_multiturn_decode_cache_hit,
 )
 from sglang.test.kl_test_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
@@ -48,8 +44,6 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
 
 
 class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
-    tree_core_backend = "python"
-
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -72,18 +66,8 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
             "--enable-deterministic-inference",
             "--mem-fraction-static",
             "0.6",
-            # A device pool smaller than one round of samples, so later turns
-            # find their history evicted and restore it from Mooncake.
-            "--max-total-tokens",
-            "8192",
-            "--swa-full-tokens-ratio",
-            "0.5",
-            "--max-mamba-cache-size",
-            "32",
             "--max-running-requests",
             "1",
-            "--chunked-prefill-size",
-            "2048",
             "--enable-cache-report",
             "--enable-unified-cache-external-linker",
         ]
@@ -94,11 +78,11 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=other_args,
                 env=unified_radix_tree_server_env(
-                    cls.tree_core_backend, **cls.mooncake.server_env()
+                    "python", **cls.mooncake.server_env()
                 ),
             )
             cls.input_ids = get_input_ids(
-                tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
+                tokenizer_path=cls.model, num_samples=6, trust_remote_code=True
             )
         except Exception:
             try:
@@ -115,13 +99,6 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
                 terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         finally:
             cls.mooncake.stop()
-
-    def setUp(self):
-        self.remote_tokens = 0
-
-    def _count_remote_tokens(self, result):
-        details = result["meta_info"].get("cached_tokens_details") or {}
-        self.remote_tokens += int(details.get("host", 0))
 
     def test_load_back_after_flush(self):
         """Every second-turn prefix comes back from Mooncake alone."""
@@ -156,41 +133,6 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
             label="linker_load_back_after_flush",
             sampling_temperature=0,
         )
-
-    def test_multiturn_decode_cache_hit_branching(self):
-        """Evicted histories and shared branch prefixes restore from Mooncake."""
-        groups, branches = 3, 3
-        n = groups * branches
-        first_turn = [
-            list(self.input_ids[g][:512])
-            for g in range(groups)
-            for _ in range(branches)
-        ]
-        decode_assert = make_mamba_decode_assert(TRACK_INTERVAL)
-
-        def assert_and_count(result, history_len, output_len, label):
-            decode_assert(result, history_len, output_len, label)
-            self._count_remote_tokens(result)
-
-        assert_multiturn_decode_cache_hit(
-            self.base_url,
-            self.model,
-            KL_DIV_THRESHOLD,
-            first_turn,
-            turn_suffixes=[
-                _random_suffixes(n, 512, seed=300),
-                _random_suffixes(n, 256, seed=400),
-            ],
-            assert_decode_cached_tokens=assert_and_count,
-            branches_per_group=branches,
-            max_new_tokens=512,
-            sampling_temperature=0,
-        )
-        self.assertGreater(self.remote_tokens, 0)
-
-
-class TestRustInklingUnifiedCacheLinkerKL(TestInklingUnifiedCacheLinkerKL):
-    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":

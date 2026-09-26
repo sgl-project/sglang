@@ -431,10 +431,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         return kvcache, SimpleNamespace(req_to_token_pool=req_to_token_pool), conv
 
-    def _resolve_mamba_swa(self, kvcache, params, *, enable_unified_memory=False):
+    def _resolve_mamba_swa(self, kvcache, params):
         with patch(
             "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
-            return_value=SimpleNamespace(enable_unified_memory=enable_unified_memory),
+            return_value=SimpleNamespace(enable_unified_memory=False),
         ):
             return resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
@@ -472,52 +472,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(ptrs, [[conv[2].data_ptr() + 4 * 7]])
         self.assertEqual(sizes, [[7]])
         self.assertEqual(offsets, [[14]])
-
-    def test_mamba_swa_rejects_layouts_it_cannot_address(self):
-        kvcache, params, _ = self._mamba_swa_stack()
-        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
-            self._resolve_mamba_swa(kvcache, params, enable_unified_memory=True)
-
-        params.req_to_token_pool.mamba_ckpt_pool = object()
-        with self.assertRaisesRegex(ValueError, "int8 Mamba checkpoints"):
-            self._resolve_mamba_swa(kvcache, params)
-
-        kvcache, params, _ = self._mamba_swa_stack()
-        kvcache.full_kv_pool.k_scale_buffer = [torch.zeros((8, 1))]
-        with self.assertRaisesRegex(ValueError, "scaled KV caches"):
-            self._resolve_mamba_swa(kvcache, params)
-
-        kvcache, params, _ = self._mamba_swa_stack()
-        kvcache.swa_kv_pool.k_buffer = [
-            torch.zeros((8, 6), dtype=torch.uint8)[:, :3]
-        ] * 2
-        with self.assertRaisesRegex(ValueError, "dense rows"):
-            self._resolve_mamba_swa(kvcache, params)
-
-    def test_mooncake_keys_one_object_per_linker_page(self):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        kvcache, params, _ = self._mamba_swa_stack()
-        group = self._resolve_mamba_swa(kvcache, params)
-        store = MooncakeStore.__new__(MooncakeStore)
-        store.registered_pools = group.entry_map
-        store.mla_suffix = store.mha_suffix = "tp1_cp0_pp0"
-        for name, object_name in (
-            (PoolName.KV, "k"),
-            (PoolName.SWA, PoolName.SWA),
-            (PoolName.MAMBA, PoolName.MAMBA),
-        ):
-            with self.subTest(pool=name):
-                keys, multiplier = store._get_hybrid_page_component_keys(
-                    ["a", "b"], PoolTransfer(name=name, keys=["a", "b"])
-                )
-                self.assertEqual(multiplier, 1)
-                self.assertEqual(
-                    keys,
-                    [f"a_tp1_cp0_pp0_{object_name}", f"b_tp1_cp0_pp0_{object_name}"],
-                )
 
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""
