@@ -231,7 +231,7 @@ impl ChatFormatter {
         })
     }
 
-    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 is stale.
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 stays disabled.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.deepseek {
             Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
