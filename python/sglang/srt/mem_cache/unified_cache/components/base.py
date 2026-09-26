@@ -130,6 +130,8 @@ class TreeComponent(ABC):
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
+    # False when linker transfer indices address one state slot, not token pages.
+    linker_indices_are_paged: bool = True
 
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)

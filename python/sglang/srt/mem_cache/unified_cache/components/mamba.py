@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    linker_indices_are_paged = False
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -191,30 +193,30 @@ class MambaComponent(TreeComponent):
         # Copy-on-write the matched device mamba state into a per-request slot.
         if not params.cow_mamba:
             return result
+        assert params.req is not None
+        self._cow_node_state_into_req(params.req, result.best_match_node)
+        return result
+
+    def _cow_node_state_into_req(self, req: Req, node_id: NodeId) -> None:
         src_index = self.tree_core.get_component_device_value(
-            result.best_match_node, self.component_type
+            node_id, self.component_type
         )
         if src_index is None:
-            return result
-        req = params.req
-        assert req is not None
+            return
         if not req.kv.holds_mamba:
             dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if dst_index is None:
                 # Pin the window via inc/dec_lock_ref so evict's SWA release
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
-                lock_result = self.cache.inc_lock_ref(result.best_match_node)
+                lock_result = self.cache.inc_lock_ref(node_id)
                 self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                self.cache.dec_lock_ref(
-                    result.best_match_node, lock_result.to_dec_params()
-                )
+                self.cache.dec_lock_ref(node_id, lock_result.to_dec_params())
                 assert dst_index is not None, "Can not alloc mamba cache"
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
-        return result
 
     def commit_insert_component_data(
         self,
@@ -682,9 +684,64 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        ct = self.component_type
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[ct].value
+            if value is None:
+                return None
+            # One state per node, valid only at the node's end boundary.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            allocator = self.cache.req_to_token_pool.mamba_allocator
+            slot = allocator.alloc(1)
+            if slot is None:
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                slot = allocator.alloc(1)
+            if slot is None:
+                return None
+            transfer.device_indices = slot
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        assert insert_result is not None
+        # The forward's COW waits for the load before reading the source slot.
+        self._cow_node_state_into_req(req, insert_result.last_device_node)
+        if insert_result.mamba_exist:
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            return None
+        return transfer
 
     # ---- HiCache Hooks ----
 

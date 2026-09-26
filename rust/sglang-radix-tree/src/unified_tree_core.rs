@@ -2834,19 +2834,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Enable or disable the direct external-cache linker.
-    pub fn set_enable_external_cache_linker(
-        &mut self,
-        value: bool,
-    ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
+    pub fn set_enable_external_cache_linker(&mut self, value: bool) {
         self.enable_external_cache_linker = value;
-        Ok(())
     }
 
     // ==== KV cache placement events ====

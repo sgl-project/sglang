@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_memory
 
 
 class DevicePoolEntry:
@@ -423,6 +424,102 @@ def _build_dsa_device_pool_group(
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _require_contiguous_rows(name: PoolName, buffers: Sequence[torch.Tensor]) -> None:
+    # A page is copied as one byte range per buffer, so rows must be dense.
+    for buffer in buffers:
+        row_bytes = buffer.nbytes // buffer.shape[0]
+        dense = buffer.stride(0) * buffer.element_size() == row_bytes
+        if not dense or not buffer[0].is_contiguous():
+            raise ValueError(
+                f"The direct external linker needs dense rows in pool {name}; "
+                f"got shape={tuple(buffer.shape)}, stride={buffer.stride()}."
+            )
+
+
+def _mha_device_pool_entry(
+    name: PoolName, pool: Any, layer_mapping: dict[int, int], page_size: int
+) -> DevicePoolEntry:
+    if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
+        raise ValueError(
+            "The direct external linker does not support scaled KV caches yet."
+        )
+    num_layers = len(pool.k_buffer)
+    buffers = [*pool.k_buffer, *pool.v_buffer]
+    _require_contiguous_rows(name, buffers)
+    return DevicePoolEntry(
+        name=name,
+        indices_from_pool=name,
+        device_pool=pool,
+        components=[buffers],
+        layer_mapping={
+            layer: (index, num_layers + index) for layer, index in layer_mapping.items()
+        },
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+        _swa_layer_mappings,
+    )
+
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The direct external linker does not support --enable-unified-memory "
+            "on hybrid Mamba models yet."
+        )
+    req_to_token_pool = params.req_to_token_pool
+    if (
+        req_to_token_pool.mamba_ckpt_pool is not None
+        or req_to_token_pool.short_conv_pool.enabled
+        or req_to_token_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    mamba_mapping = _stage_local_layer_mapping(
+        req_to_token_pool.mamba_map, kvcache.start_layer
+    )
+    mamba_pool = req_to_token_pool.mamba_pool
+    mamba_cache = mamba_pool.mamba_cache
+    layers = range(mamba_pool.num_mamba_layers)
+    # One row per state slot; conv-only models carry an empty temporal state.
+    mamba_components = [
+        [state[layer] for layer in layers]
+        for state in (mamba_cache.temporal, *mamba_cache.conv)
+        if state.numel() > 0
+    ]
+    _require_contiguous_rows(
+        PoolName.MAMBA, [buffer for group in mamba_components for buffer in group]
+    )
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV, kvcache.full_kv_pool, full_mapping, page_size
+        ),
+        _mha_device_pool_entry(
+            PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
+        ),
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=mamba_components,
+            layer_mapping=mamba_mapping,
+            page_size=1,
+            rows_are_pages=True,
+        ),
+    ]
+    num_layers = max(full_mapping.keys() | swa_mapping.keys() | mamba_mapping.keys())
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
 def resolve_hybrid_device_pool_group(
