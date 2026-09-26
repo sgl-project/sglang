@@ -19,6 +19,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    mask_topk_scores,
+    select_candidate_blocks,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -30,6 +34,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -38,6 +45,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -64,9 +72,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     cut_request_masks,
     expand_index_page_table,
     make_candidate_indexer,
-    mask_topk_scores,
     published_masks,
-    select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -80,7 +86,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    deep_gemm_fp4_paged_mqa_logits,
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -3340,7 +3345,6 @@ class DeepseekV4AttnBackend(
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
-        columns = torch.arange(width, device=lens.device)
         for rows, plan in metadata.row_chunks():
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
@@ -3351,17 +3355,14 @@ class DeepseekV4AttnBackend(
                 plan,
                 width,
             )
-            lens_c = lens[rows].unsqueeze(-1)
-            # Columns past a row's length hold garbage.
-            s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
-            idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-            reach = idx < lens_c
-            slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
-                idx % page_size
+            topk_transform_paged_torch(
+                logits,
+                lens[rows],
+                page_table[rows],
+                page_indices[rows, :topk],
+                page_size,
+                raw_indices[rows, :topk] if raw_indices is not None else None,
             )
-            page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
-            if raw_indices is not None:
-                raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
 
     def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos, req=None) -> None:
         from sglang.srt.model_executor.runner_utils.capture_mode import (
