@@ -383,6 +383,8 @@ class Mxfp8DenseGemmBackend(Enum):
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
     # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
+    # gfx950 aiter MXFP8 GEMM: plain fp8 weight + compact 32x32 ue8m0 block scale bytes
+    GFX95_MXFP8_AITER = "gfx95_mxfp8_aiter"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -406,10 +408,14 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_gfx95_mxfp8_native(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
 
+    def is_gfx95_mxfp8_aiter(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
+
     def is_gfx95(self) -> bool:
         return self in (
             Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
             Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+            Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER,
         )
 
     def is_unsupported(self) -> bool:
@@ -742,6 +748,8 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         if backend.is_triton():
             return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+        if backend.is_aiter():
+            return Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
         return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
     # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
@@ -787,6 +795,12 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
         )
 
         return mxfp8_native_blockscaled_linear
+    if backend.is_gfx95_mxfp8_aiter():
+        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+            aiter_mxfp8_blockscaled_linear,
+        )
+
+        return aiter_mxfp8_blockscaled_linear
     return _unsupported_mxfp8_linear
 
 
