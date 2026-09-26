@@ -1,8 +1,8 @@
-> **Customize this file**: Tailor this template to your project by noting specific contribution types you're looking for, adding a Code of Conduct, or adjusting the writing guidelines to match your style.
-
 # Contribute to the documentation
 
 Thank you for your interest in contributing to our documentation! This guide will help you get started.
+
+Contributing code rather than docs? Start with the [Contribution Guide](docs/developer_guide/contribution_guide.mdx), which covers building SGLang from source, pre-commit, unit tests and CI.
 
 ## How to contribute
 
@@ -22,7 +22,7 @@ Thank you for your interest in contributing to our documentation! This guide wil
 6. Preview your changes at `http://localhost:3000`
 7. Commit your changes and submit a pull request
 
-For more details on local development, see our [development guide](development.mdx).
+For more details on local development, including `mint broken-links` and how to add a cookbook recipe, see the [docs README](README.md).
 
 ## Writing guidelines
 
