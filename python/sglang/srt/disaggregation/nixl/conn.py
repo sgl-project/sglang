@@ -379,10 +379,12 @@ class TransferStatus:
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
-    # PP ranks that have sent state data (state is layer-specific, each PP rank sends its portion).
-    received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
-    # Whether state data is expected (set based on state_type).
-    expects_state: bool = False
+    # State components received per pp_rank: {pp_rank: set of component_ids}
+    received_state_per_pp: Dict[int, Set[int]] = dataclasses.field(
+        default_factory=lambda: defaultdict(set)
+    )
+    # Components with non-empty destination indices.
+    expected_state_components: Set[int] = dataclasses.field(default_factory=set)
     # KV part notifications for mixed-memory transfers. Keyed by
     # (pp_rank, chunk_id); normal homogeneous transfers bypass this.
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
@@ -391,18 +393,16 @@ class TransferStatus:
     def is_done(self):
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
-        # If state data is expected, check all PP ranks have sent it
-        if (
-            self.expects_state
-            and len(self.received_state_per_pp) < self.num_pp_ranks_expected
-        ):
-            return False
         # All PP ranks must have reported their expected count
         if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
             return False
         # Each PP rank must have received all expected chunks
         for pp_rank, expected in self.expected_kvs_per_pp.items():
             if len(self.received_kvs_per_pp[pp_rank]) != expected:
+                return False
+            if not self.expected_state_components.issubset(
+                self.received_state_per_pp[pp_rank]
+            ):
                 return False
         return True
 
@@ -2781,7 +2781,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 #   stg:   {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}
                 #          _{page_start}_{num_pages}_{agent_name}               -> 9 fields
                 #   aux:   {room}_aux                                           -> 2 fields
-                #   state: {room}_state_{pp_rank}                               -> 3 fields
+                #   state: {room}_state_{pp_rank}_{component_id}                -> 4 fields
                 # maxsplit=8 keeps everything past the 8th underscore in the
                 # last component, so agent_name (which may itself contain
                 # underscores) lands intact in components[8] for the stg path.
@@ -2811,7 +2811,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._handle_aux_notification(room, components)
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                    component_id = int(components[3]) if len(components) > 3 else 0
+                    self.transfer_statuses[room].received_state_per_pp[pp_rank].add(
+                        component_id
+                    )
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -3287,12 +3290,11 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
 
-        # Mark that we expect state data if state_indices was provided.
-        # Match the prefill-side truthy check: an empty list means the
-        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
-        # won't send state notifs, so we must not expect them.
-        if state_indices:
-            self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
+        self.kv_mgr.transfer_statuses[self.bootstrap_room].expected_state_components = {
+            component_id
+            for component_id, indices in enumerate(state_indices or [])
+            if indices is not None and len(indices) > 0
+        }
 
         self.started_transfer = True
         self.init_time = time.time()
