@@ -230,18 +230,23 @@ class XPUAttentionBackend(AttentionBackend):
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
+                # The DSpark draft block forward reuses TARGET_VERIFY but feeds
+                # spec_info.num_tokens_per_req queries/req (gamma), which differs
+                # from the global speculative_num_draft_tokens used by the target
+                # verify. Segment queries/keys by the per-request width the
+                # spec_info carries, not the global (mirrors the triton backend).
+                num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
                 metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    forward_batch.seq_lens + num_tokens_per_req
                 ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_q = num_tokens_per_req
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + self.speculative_num_draft_tokens
+                    forward_batch.seq_lens_cpu.max().item() + num_tokens_per_req
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    batch_size * num_tokens_per_req + 1,
+                    num_tokens_per_req,
                     dtype=torch.int32,
                     device=device,
                 )
