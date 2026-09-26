@@ -413,9 +413,9 @@ class QwenImage21TransformerBlock(nn.Module):
             apply_modulation(
                 state["hidden_states"], self.img_norm1, prefix_modulation[0]
             )
-            if not cache
+            if state["hidden_states"] is not None
             else None
-            for state, cache in zip(prefix_states, caches, strict=True)
+            for state in prefix_states
         ]
         attention, prefix_attentions = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
@@ -536,10 +536,13 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
             prefix_modulation = self.prepare_modulation(zero_temb)
         if prefix_caches is None:
             prefix_caches = [[None] * self.num_layers for _ in layouts]
-        prefix_states, ropes = [], []
+        prefix_states, ropes, prefilled = [], [], set()
         for sample, layout in enumerate(layouts):
             prefix = None
-            if not prefix_caches[sample][0]:
+            caches = prefix_caches[sample]
+            # samples sharing one cache let the first of them prefill it
+            if not caches[0] and id(caches) not in prefilled:
+                prefilled.add(id(caches))
                 prefix = self.txt_in(
                     encoder_hidden_states[
                         sample : sample + 1, : layout["encoder_seq_len"]

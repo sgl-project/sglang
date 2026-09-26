@@ -166,7 +166,7 @@ Height and width must be positive multiples of 32. Reference images preserve
 their aspect ratio and are resized to approximately the requested output area;
 the same resized image feeds the VLM and VAE. Image labels are deterministic
 (`Picture 1`, `Picture 2`, and so on). Multiple outputs receive independent
-noise seeds and independent prefix caches.
+noise seeds and share one prefix cache per prompt.
 
 ## 5. Runtime features
 

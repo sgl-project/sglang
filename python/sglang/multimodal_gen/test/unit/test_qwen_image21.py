@@ -391,6 +391,36 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
     assert actual.stride() == expected.stride()
 
 
+def test_outputs_of_one_prompt_share_prefix_caches(monkeypatch):
+    module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
+    monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(f"{module}.set_forward_context", lambda **kwargs: nullcontext())
+    processor = Mock()
+    processor.apply_chat_template.return_value = [[1]]
+    stage = QwenImage21EncodingStage(
+        Mock(), processor, None, SimpleNamespace(config={})
+    )
+    stage.encode_prompt = Mock(return_value=(torch.zeros(3, 8), torch.zeros(3).bool()))
+    batch = SimpleNamespace(
+        height=32,
+        width=32,
+        condition_image=None,
+        prompt=["first", "second"],
+        negative_prompt=None,
+        num_outputs_per_prompt=2,
+        do_classifier_free_guidance=True,
+        extra={},
+    )
+    stage.forward(batch, SimpleNamespace(pipeline_config=QwenImage21PipelineConfig()))
+    positive = batch.extra["qwen21_positive"]["prefix_caches"]
+    negative = batch.extra["qwen21_negative"]["prefix_caches"]
+    assert len(positive) == len(negative) == 4
+    assert positive[0] is positive[1] and positive[2] is positive[3]
+    # different prompts and guidance branches hold different prefixes
+    assert positive[0] is not positive[2]
+    assert positive[0] is not negative[0]
+
+
 def test_condition_image_loading_preserves_alpha(tmp_path):
     path = tmp_path / "condition.png"
     Image.new("RGBA", (32, 32), (12, 34, 56, 78)).save(path)
