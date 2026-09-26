@@ -787,6 +787,9 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # SGLANG_HUGEPAGE_SIZE=THP: most MiB of the pool that may stay on 4 KiB
+    # pages after MADV_COLLAPSE before allocation fails; negative = no limit.
+    SGLANG_HUGEPAGE_THP_MAX_SMALL_MB = EnvInt(256)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport

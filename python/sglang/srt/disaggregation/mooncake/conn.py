@@ -38,8 +38,11 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
+    chunk_register_regions,
     group_concurrent_contiguous,
     pack_int_lists,
+    register_chunk_pages,
+    register_chunks_compatible,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -159,6 +162,8 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    # The decode's SGLANG_DISAGG_REGISTER_CHUNK_PAGES (0: whole buffers).
+    dst_register_chunk_pages: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -207,6 +212,9 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
                 if len(msg) > 19 and msg[19]
                 else []
+            ),
+            dst_register_chunk_pages=(
+                int(msg[20].decode("ascii")) if len(msg) > 20 and msg[20] else 0
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -341,12 +349,42 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     seen.add((ptr, length))
                     regions.append((ptr, length))
 
-        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
-        add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
+        chunk_pages = register_chunk_pages()
+        if chunk_pages > 0 and self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Transfer destinations only: prefill splits every transfer at
+            # these page boundaries (group_concurrent_contiguous).
+            chunks = chunk_register_regions(
+                self.kv_args.kv_data_ptrs or [],
+                self.kv_args.kv_data_lens or [],
+                self.kv_args.kv_item_lens or [],
+                chunk_pages,
+            )
+            add([ptr for ptr, _ in chunks], [length for _, length in chunks])
+        else:
+            chunks = None
+            add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        others = list(
+            zip(self.kv_args.aux_data_ptrs or [], self.kv_args.aux_data_lens or [])
+        )
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
-            add(ptrs, lens)
+            others.extend(zip(ptrs or [], lens or []))
+        if chunks is not None:
+            # A buffer that is also KV (the unified pool reports one raw buffer
+            # as KV and mamba state) would be registered twice, and its state
+            # transfers are not split at the KV chunk boundaries.
+            kv = list(
+                zip(self.kv_args.kv_data_ptrs or [], self.kv_args.kv_data_lens or [])
+            )
+            for ptr, length in others:
+                if any(ptr < k + n and k < ptr + length for k, n in kv):
+                    raise ValueError(
+                        "SGLANG_DISAGG_REGISTER_CHUNK_PAGES does not support a "
+                        f"non-KV buffer ({ptr:#x}, {length} B) that overlaps a "
+                        "KV buffer, e.g. a unified KV/state memory pool."
+                    )
+        add([ptr for ptr, _ in others], [length for _, length in others])
         return regions
 
     def register_buffer_to_engine(self):
@@ -2212,6 +2250,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        dst_chunk_pages = (
+                            target_rank_registration_info.dst_register_chunk_pages
+                        )
+                        if not register_chunks_compatible(
+                            register_chunk_pages(), dst_chunk_pages
+                        ):
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room,
+                                failure_reason=(
+                                    "Decode session "
+                                    f"{req.mooncake_session_id} registered its KV "
+                                    "in chunks of SGLANG_DISAGG_REGISTER_CHUNK_PAGES="
+                                    f"{dst_chunk_pages} pages; this prefill splits "
+                                    f"transfers at {register_chunk_pages()} pages. "
+                                    "Set the same value on both roles."
+                                ),
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -3001,6 +3057,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            str(register_chunk_pages()).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:
