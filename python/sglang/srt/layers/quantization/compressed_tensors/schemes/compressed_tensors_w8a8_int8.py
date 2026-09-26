@@ -12,6 +12,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -21,11 +22,12 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -99,6 +101,29 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         return 80
 
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            if self.strategy == QuantizationStrategy.TENSOR:
+                max_w_scale, weight = requantize_with_max_scale(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    logical_widths=layer.logical_widths,
+                )
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            elif self.strategy == QuantizationStrategy.CHANNEL:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
+                layer.weight_scale = Parameter(
+                    layer.weight_scale.data, requires_grad=False
+                )
+            else:
+                raise ValueError(f"Unknown quantization strategy {self.strategy}")
+
+            _amx_process_weight_after_loading(layer, ["weight"])
+            layer.input_scale = None
+            layer.input_zero_point = None
+            layer.azp_adj = None
+            return
+
         # If per tensor, when we have a fused module (e.g. QKV) with per
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per channel
@@ -171,6 +196,16 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
+        if _is_cpu:
+            return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,
+            )
+
         x_q, x_scale = per_token_quant_int8(x)
 
         return int8_scaled_mm(

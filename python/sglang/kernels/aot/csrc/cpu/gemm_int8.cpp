@@ -504,8 +504,8 @@ at::Tensor int8_scaled_mm_with_quant(
   TORCH_CHECK(mat2.scalar_type() == at::kChar, "int8_scaled_mm_with_quant: expect mat2 to be int8.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "int8_scaled_mm_with_quant: expect scales to be float32.");
 
-  const int64_t buffer_size = M * K + M * sizeof(float);
-  auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
+  auto Aq = at::empty({M, K}, mat1.options().dtype(at::kByte));
+  auto As = at::empty({M}, mat1.options().dtype(at::kFloat));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
   const bool has_bias = bias.has_value();
@@ -516,8 +516,8 @@ at::Tensor int8_scaled_mm_with_quant(
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
-    uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
-    float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
+    uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>();
+    float* __restrict__ As_data = As.data_ptr<float>();
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
