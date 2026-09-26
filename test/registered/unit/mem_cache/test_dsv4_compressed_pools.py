@@ -307,6 +307,25 @@ class TestV41KVPoolLayouts(CustomTestCase):
         # The 2-token c128 page is the only production page that pads.
         self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
 
+    def test_pd_entries_cover_the_c4_kv_page_count(self):
+        """The PD transfer walks every registered entry with the c4 KV pool's
+        page count, so the c4 indexer must reserve the same FULL logical page."""
+        pool = self.make_pool(
+            [0, 4, 128],
+            [],
+            KVLayout.V4,
+            c4_size=PAGE_SIZE,
+            c128_size=PAGE_SIZE // 32,
+            c4_state_pool_size=16,
+            c128_state_pool_size=16,
+        )
+        self.assertEqual(pool.c4_indexer_kv_pool.size, pool.c4_kv_pool.size)
+        _, data_lens, item_lens = pool.get_contiguous_buf_infos()
+        rows = [n // item for n, item in zip(data_lens, item_lens)]
+        c4_kv_rows = _num_dsv4_physical_kv_pages(PAGE_SIZE, PAGE_SIZE // 4, PAGE_SIZE)
+        self.assertEqual(rows[:2], [c4_kv_rows] * 2)  # c4 KV, then its indexer
+        self.assertEqual(min(rows), c4_kv_rows)
+
 
 class TestPagedDSparkWithEncoderReplay(CustomTestCase):
     def setUp(self):

@@ -519,6 +519,7 @@ class DeepSeekV4IndexerPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         use_fp4_indexer: Optional[bool] = None,
+        global_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -531,6 +532,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        self.global_page_size = global_page_size or page_size
         if use_fp4_indexer is None:
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.use_fp4_indexer = use_fp4_indexer
@@ -547,7 +549,10 @@ class DeepSeekV4IndexerPool(KVCache):
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
-        num_pages = (self.size + self.page_size + 1) // self.page_size
+        # Same page count as the KV pool of this ratio: PD registers both by page.
+        num_pages = _num_dsv4_physical_kv_pages(
+            self.size, self.page_size, self.global_page_size
+        )
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1455,6 +1460,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 layer_counts[ratio],
                 device,
                 enable_memory_saver,
+                global_page_size=page_size,
             )
             for ratio, config in configs.items()
             if config.indexer_size is not None
@@ -1527,10 +1533,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         device: str,
         enable_memory_saver: bool,
         force_fp4: bool = False,
+        global_page_size: Optional[int] = None,
     ) -> DeepSeekV4IndexerPool:
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
-        dedicated-buffer NPU variant. ``force_fp4`` forces the fp4 low-ratio layout."""
+        dedicated-buffer NPU variant. ``force_fp4`` forces the fp4 low-ratio layout.
+        ``global_page_size`` is the model-wide logical page size, as for
+        :meth:`_make_kv_pool`."""
         if force_fp4:
             pool = DeepSeekV4IndexerPool(
                 size,
@@ -1541,6 +1550,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
                 use_fp4_indexer=True,
+                global_page_size=global_page_size,
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).
             pool.index_k_rne = True
@@ -1553,6 +1563,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            global_page_size=global_page_size,
         )
 
     def _make_compress_state_pool(
