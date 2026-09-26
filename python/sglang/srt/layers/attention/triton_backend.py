@@ -1620,9 +1620,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                loc_info = KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
+                loc_info = KVWriteLoc.for_batch(
+                    forward_batch,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
                     full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
                 if layer.k_scale is None:
@@ -2206,9 +2206,9 @@ class TritonAttnBackend(AttentionBackend):
                     # pool, refreshed into a capture-stable buffer before replay —
                     # translating inside set_kv_buffer would be captured and replay
                     # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,
@@ -2218,9 +2218,9 @@ class TritonAttnBackend(AttentionBackend):
                 self._set_kv_buffer(
                     forward_batch,
                     layer,
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,
@@ -2417,6 +2417,7 @@ class TritonMultiStepDraftBackend:
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self,
@@ -2435,6 +2436,7 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
+        v2p = self.kv_index_translator.full_flat_v2p()
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -2444,6 +2446,7 @@ class TritonMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
+            v2p,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
@@ -2453,6 +2456,7 @@ class TritonMultiStepDraftBackend:
             self.page_size,
             self.draft_window_size,
             self.draft_sink_size,
+            TRANSLATE=v2p is not None,
         )
 
         if call_fn is None:
@@ -2592,7 +2596,10 @@ def update_sliding_window_buffer(
         total_tokens=window_kv_indices.numel(),
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        sliding_window=translator.reads_are_translated,
+        sliding_window=(
+            translator.reads_are_translated
+            and isinstance(token_to_kv_pool, BaseSWAKVPool)
+        ),
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]

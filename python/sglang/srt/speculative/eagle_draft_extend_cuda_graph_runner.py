@@ -417,6 +417,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
+            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -627,6 +628,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )
