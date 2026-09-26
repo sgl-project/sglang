@@ -3,6 +3,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,7 +44,7 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
         steps=[],
         total_duration_ms=2000 if generate_baseline else 1000,
     )
-    server._validate_and_record(case, record, load_time_ms=100)
+    server._validate_and_record(SimpleNamespace(load_time_ms=100), case, record)
     assert len(server._perf_results) == 1
     assert bool(common._PENDING_BASELINE_DUMPS) == generate_baseline
 
