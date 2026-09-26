@@ -6,6 +6,10 @@ Combined accuracy + performance test for DeepSeek-V4-Flash FP4 on MI35x ROCm 7.2
 
 Both tests share a single launched server.
 
+The 0731 checkpoint bundles a DSpark draft head, but this test serves the target
+only: the DSV4 loader skips `mtp.*` outside a draft worker, so the draft weights
+never reach VRAM and `--mem-fraction-static 0.90` below stays valid.
+
 Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
 """
 
@@ -31,7 +35,7 @@ register_amd_ci(
 )
 
 DEEPSEEK_V4_FP4_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_V4_FP4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash"
+    "DEEPSEEK_V4_FP4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash-0731"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
