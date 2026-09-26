@@ -57,6 +57,9 @@ class NativeAgent:
             raise Missing()
         return SimpleNamespace(peer=peer, state="PROC", notif=notif)
 
+    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif):
+        return self.initialize_xfer(op, src, dst, dst, notif)
+
     def transfer(self, h):
         if self.post_fault and h.peer == "bad":
             self.post_fault = False
@@ -85,9 +88,8 @@ class NativeAgent:
         self.released.append(h)
 
     def prep_xfer_dlist(self, peer, descs, kind):
-        h = (peer, descs, kind)
-        self.prepared.append(h)
-        return h
+        self.prepared.append((peer, descs, kind))
+        return peer
 
     def release_dlist_handle(self, h):
         self.rebuilds.append(h)
@@ -120,10 +122,13 @@ class TestPeerRecovery(CustomTestCase):
         mgr.attn_tp_rank = mgr.attn_cp_rank = mgr.pp_rank = 0
         mgr.attn_cp_size = mgr.pp_size = 1
         mgr.transfer_source_rank = 0
+        mgr.src_mem_kind = "VRAM"
+        mgr._num_slots_src = 3
         mgr.kv_args = SimpleNamespace(
             engine_rank=0,
-            kv_data_ptrs=[],
-            kv_item_lens=[],
+            kv_data_ptrs=[500],
+            kv_item_lens=[4],
+            kv_layer_ids=[],
             aux_data_ptrs=[100],
             aux_item_lens=[8],
             pp_rank=0,
@@ -132,18 +137,25 @@ class TestPeerRecovery(CustomTestCase):
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.prep_handles = {
-            "bad": "bad-dlist",
-            "healthy": "healthy-dlist",
+            "bad": "bad",
+            "healthy": "healthy",
             "": "source",
         }
         mgr.prep_handles_slice_dst = {}
         mgr.decode_kv_args_table = {
             peer: SimpleNamespace(
+                agent_name=peer,
                 decode_tp_size=1,
                 dst_aux_ptrs=[200],
                 gpu_id=0,
                 kv_xfer_segments=None,
-                dst_kv_item_lens=[],
+                dst_kv_item_lens=[4],
+                dst_kv_ptrs=[1000],
+                dst_kv_mem_kinds=["VRAM"],
+                dst_homogeneous_mem_kind="VRAM",
+                dst_kv_layer_ids=[],
+                dst_num_slots=3,
+                requires_dcp_relayout=False,
                 agent_metadata=peer.encode(),
             )
             for peer in ("bad", "healthy")
@@ -173,7 +185,7 @@ class TestPeerRecovery(CustomTestCase):
                 endpoint="127.0.0.1",
                 dst_port=5555,
                 agent_name=peer,
-                dst_kv_indices=np.array([], dtype=np.int32),
+                dst_kv_indices=np.array([1], dtype=np.int32),
                 dst_aux_index=0,
                 required_dst_info_num=1,
                 dst_state_indices=[],
@@ -182,8 +194,8 @@ class TestPeerRecovery(CustomTestCase):
         }
         return conn.TransferKVChunk(
             room=room,
-            prefill_kv_indices=np.array([], dtype=np.int32),
-            index_slice=slice(0, 0),
+            prefill_kv_indices=np.array([0], dtype=np.int32),
+            index_slice=slice(0, 1),
             is_last_chunk=True,
             chunk_id=0,
             prefill_aux_index=0,
@@ -237,8 +249,11 @@ class TestPeerRecovery(CustomTestCase):
                 self.assertEqual(
                     mgr.request_status, {1: KVPoll.Failed, 2: KVPoll.Success}
                 )
-                self.assertEqual(len(mgr.agent.released), 2)
-                self.assertEqual(mgr.agent.rebuilds, ["bad-dlist"])
+                self.assertEqual(
+                    [h.notif for h in mgr.agent.released],
+                    [b"1_kv_0_1_0", b"2_kv_0_1_0", b"2_aux"],
+                )
+                self.assertEqual(mgr.agent.rebuilds, ["bad"])
                 self.assertEqual(len(mgr.messages), 1)
 
     def test_drained_failed_request_acknowledges_decode_abort(self):
@@ -276,31 +291,8 @@ class TestPeerRecovery(CustomTestCase):
                     [[b"ABORT_ACK", b"1", b"0"]],
                 )
 
-    def test_idle_metadata_loss_rebuilds_destination_geometry_only(self):
-        mgr = self.manager()
-        mgr.kv_args.kv_item_lens = [4]
-        mgr.kv_args.kv_layer_ids = []
-        mgr.src_mem_kind = "VRAM"
-        peer = mgr.decode_kv_args_table["bad"]
-        peer.agent_name = "bad"
-        peer.dst_kv_item_lens = [4]
-        peer.dst_kv_ptrs = [1000]
-        peer.dst_kv_mem_kinds = ["VRAM"]
-        peer.dst_kv_layer_ids = []
-        peer.dst_num_slots = 3
-        peer.requires_dcp_relayout = False
-        mgr.agent.metadata.remove("bad")
-        self.run_chunks(mgr, [self.chunk(mgr, 4)])
-        self.assertEqual(mgr.request_status[4], KVPoll.Success)
-        self.assertEqual(len(mgr.agent.prepared), 1)
-        peer, descs, kind = mgr.agent.prepared[0]
-        self.assertEqual((peer, kind), ("bad", "VRAM"))
-        np.testing.assert_array_equal(descs, [[1000, 4, 0], [1004, 4, 0], [1008, 4, 0]])
-        self.assertEqual(mgr.prep_handles["healthy"], "healthy-dlist")
-        self.assertEqual(mgr.prep_handles[""], "source")
-
-    def test_recovery_releases_all_peer_descriptor_cache_variants(self):
-        """Stale slice or mixed-memory descriptors must not survive a peer generation."""
+    def test_metadata_loss_replaces_only_failed_peer_descriptors(self):
+        """Retire every destination cache variant while preserving shared sources."""
         mgr = self.manager()
         mgr.prep_handles_slice_dst = {
             "bad": ("slice", 3, 0),
@@ -310,9 +302,15 @@ class TestPeerRecovery(CustomTestCase):
             SimpleNamespace(src_handle="shared-source", dst_handle="mixed-dst")
         ]
         mgr.agent.metadata.remove("bad")
-        self.run_chunks(mgr, [self.chunk(mgr, 5)])
-        self.assertEqual(mgr.request_status[5], KVPoll.Success)
-        self.assertEqual(mgr.agent.rebuilds, ["bad-dlist", "slice", "mixed-dst"])
+        self.run_chunks(mgr, [self.chunk(mgr, 4)])
+        self.assertEqual(mgr.request_status[4], KVPoll.Success)
+        self.assertEqual(mgr.agent.rebuilds, ["bad", "slice", "mixed-dst"])
+        self.assertEqual(len(mgr.agent.prepared), 1)
+        peer, descs, kind = mgr.agent.prepared[0]
+        self.assertEqual((peer, kind), ("bad", "VRAM"))
+        np.testing.assert_array_equal(descs, [[1000, 4, 0], [1004, 4, 0], [1008, 4, 0]])
+        self.assertEqual(mgr.prep_handles["healthy"], "healthy")
+        self.assertEqual(mgr.prep_handles[""], "source")
         self.assertEqual(
             mgr.prep_handles_slice_dst, {"healthy": ("healthy-slice", 3, 0)}
         )
