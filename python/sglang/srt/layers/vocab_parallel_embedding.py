@@ -487,10 +487,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             packed_factor = (
                 param.packed_factor
                 if isinstance(param, BasevLLMParameter)
-                else param.packed_factor
+                else param.pack_factor
             )
             assert loaded_weight.shape[output_dim] == (
-                self.org_vocab_size // param.packed_factor
+                self.org_vocab_size // packed_factor
             )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
