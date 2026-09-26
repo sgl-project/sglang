@@ -70,7 +70,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.8,
+    0.7,
     "--quantization",
     "modelslim",
     "--chunked-prefill-size",
