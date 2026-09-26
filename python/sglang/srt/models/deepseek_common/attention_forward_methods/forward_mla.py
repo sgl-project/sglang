@@ -314,11 +314,11 @@ class DeepseekMLAForwardMixin:
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
-        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
+        # weights and skip the per-layer Q all-gather.
         q_replicate_active = (
             self.is_dcp_q_replicate_phase(forward_batch)
             and not self.use_deep_gemm_bmm
-            and self.has_replicated_q_proj()
+            and self.w_kc_qrep is not None
         )
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
@@ -480,10 +480,8 @@ class DeepseekMLAForwardMixin:
             )
         if q_replicate_active:
             # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep).transpose(
+                0, 1
             )
         elif getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf

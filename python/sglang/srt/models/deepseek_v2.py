@@ -2224,7 +2224,6 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
-        # Block-FP8 q_b_proj replica (module with weight/weight_scale_inv).
         self.q_b_proj_qrep = None
 
         self.w_scale_k = None
@@ -2549,13 +2548,7 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
-    def has_replicated_q_proj(self) -> bool:
-        return self.w_kc_qrep is not None and (
-            self.q_b_proj_qrep_weight is not None or self.q_b_proj_qrep is not None
-        )
-
     def q_b_proj_replicated_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Full-head Q from the DCP-gathered q-proj (skips the Q all-gather)."""
         if self.q_b_proj_qrep is not None:
             q = self.q_b_proj_qrep.quant_method.apply(self.q_b_proj_qrep, x)
         else:
