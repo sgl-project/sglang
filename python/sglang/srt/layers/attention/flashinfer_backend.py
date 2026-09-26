@@ -170,6 +170,17 @@ class PrefillMetadata:
 # FlashInferAttnBackend._full_cg_prefill_workspace_bytes.
 FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 
+# Models whose FlashInfer plans need a larger workspace than the default.
+_LARGE_WORKSPACE_ARCHITECTURES = frozenset(
+    {
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
+        "MiMoForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    }
+)
+
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
@@ -391,18 +402,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
-        if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLMoeForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
-        ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
-
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
         # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
@@ -421,7 +420,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+
+        # An explicit SGLANG_FLASHINFER_WORKSPACE_SIZE wins over the per-model
+        # and deterministic-mode defaults, so a smaller GPU can shrink it.
+        workspace_size = self._resolve_workspace_size(
+            model_runner.model_config.hf_config.architectures,
+            self.enable_deterministic,
+        )
+        if workspace_size is not None:
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(workspace_size)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
@@ -556,6 +563,36 @@ class FlashInferAttnBackend(AttentionBackend):
             f"KV cache method {method_name!r} does not support {phase} with "
             f"flashinfer attention backend. Available {phase} accesses: {available}."
         )
+
+    @staticmethod
+    def _resolve_workspace_size(
+        architectures: List[str], enable_deterministic: bool
+    ) -> Optional[int]:
+        """Return the workspace size to set, or None to leave the env value alone.
+
+        Deterministic inference needs 2 GiB, and some models need 512 MiB, but
+        neither default replaces a size the user set explicitly: on an 8 GB
+        card a fixed 2 GiB workspace is the difference between starting and
+        running out of memory.
+        """
+        if enable_deterministic:
+            default = 2048 * 1024 * 1024
+        elif any(arch in _LARGE_WORKSPACE_ARCHITECTURES for arch in architectures):
+            default = 512 * 1024 * 1024
+        else:
+            return None
+
+        if envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set():
+            user_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+            if user_size < default:
+                logger.info(
+                    "Using SGLANG_FLASHINFER_WORKSPACE_SIZE=%d instead of the "
+                    "%d-byte default for this configuration.",
+                    user_size,
+                    default,
+                )
+            return None
+        return default
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
