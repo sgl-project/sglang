@@ -363,6 +363,7 @@ class TestDeferFfnReduction(CustomTestCase):
         step=None,
         sp_active=False,
     ):
+        tp_group_object = object()
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
         communicator._sp_steps = sp_region_steps() if sp_active else None
@@ -400,11 +401,19 @@ class TestDeferFfnReduction(CustomTestCase):
                 "get_moe_a2a_backend",
                 return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
             ),
+            # What the MoE declares its skipped reduction leaves.
             patch.object(
-                comm, "post_experts_output_is_complete", return_value=output_complete
+                moe_utils,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
             ),
             patch.object(
-                comm,
+                moe_utils,
+                "post_experts_output_is_complete",
+                return_value=output_complete,
+            ),
+            patch.object(
+                moe_utils,
                 "get_exec",
                 return_value=types.SimpleNamespace(
                     comm=types.SimpleNamespace(
@@ -413,20 +422,29 @@ class TestDeferFfnReduction(CustomTestCase):
                 ),
             ),
             patch.object(
-                comm.envs.SGLANG_SHARED_EXPERT_TP1,
+                moe_utils.envs.SGLANG_SHARED_EXPERT_TP1,
                 "get",
                 return_value=shared_expert_tp1,
             ),
             patch.object(
-                comm,
+                moe_utils,
                 "get_lora",
                 return_value=types.SimpleNamespace(enable_lora=lora),
             ),
-            patch.object(
-                comm, "_deferred_reduction_runs_on_the_tp_group", return_value=tp_group
-            ),
             get_parallel().override(
                 moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
+            ),
+            patch.object(
+                moe_utils,
+                "get_parallel",
+                return_value=types.SimpleNamespace(
+                    moe_ep_size=1, moe_tp_size=4, tp_group=tp_group_object
+                ),
+            ),
+            patch.object(
+                moe_utils,
+                "post_experts_reduction_group",
+                return_value=tp_group_object if tp_group else object(),
             ),
         ):
             return communicator._ffn_sum_moves_to_next_layer(
@@ -483,8 +501,9 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
 
 
 class TestDeferredReductionGroup(CustomTestCase):
-    """The unfused completion runs on the same group object the FFN would have
-    reduced over, or the FFN keeps its reduction."""
+    """The MoE declares its skipped reduction one TP all-reduce only when it
+    runs on the same group object the FFN would have reduced over; otherwise
+    the FFN keeps its reduction."""
 
     def _runs_on_tp(
         self, *, moe_ep_size, moe_tp_size, ep_is_tp=True, moe_tp_is_tp=True
@@ -499,10 +518,29 @@ class TestDeferredReductionGroup(CustomTestCase):
             moe_tp_group=tp_group if moe_tp_is_tp else object(),
         )
         with (
-            patch.object(comm, "get_parallel", return_value=parallel),
             patch.object(moe_utils, "get_parallel", return_value=parallel),
+            patch.object(
+                moe_utils,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: True),
+            ),
+            patch.object(
+                moe_utils, "post_experts_output_is_complete", return_value=False
+            ),
+            patch.object(
+                moe_utils,
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    comm=types.SimpleNamespace(enable_quant_communications=False)
+                ),
+            ),
+            patch.object(
+                moe_utils,
+                "get_lora",
+                return_value=types.SimpleNamespace(enable_lora=False),
+            ),
         ):
-            return comm._deferred_reduction_runs_on_the_tp_group()
+            return moe_utils.post_experts_sum_is_one_all_reduce()
 
     def test_pure_tp_and_pure_ep_reduce_over_the_tp_group(self):
         self.assertTrue(self._runs_on_tp(moe_ep_size=1, moe_tp_size=4))
