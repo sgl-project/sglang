@@ -660,13 +660,13 @@ class _ScaleResidualNormScaleShift(CustomOp):
 
         try:
             from sglang.kernels.ops.diffusion import (
-                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
+                flydsl_norm_supports,
             )
         except ImportError:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+        if not flydsl_norm_supports(x.shape[-1], self.eps):
             return self.forward_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
@@ -890,13 +890,13 @@ class _NormScaleShift(CustomOp):
 
         try:
             from sglang.kernels.ops.diffusion import (
-                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
+                flydsl_norm_supports,
             )
         except ImportError:
             return self.forward_native(x, shift, scale)
 
-        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+        if not flydsl_norm_supports(x.shape[-1], self.eps):
             return self.forward_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(
