@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import requests
+import torch
 import zmq
 
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_device
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
@@ -26,11 +29,19 @@ from sglang.test.scripted_runtime.io_struct import (
 from sglang.test.scripted_runtime.utils import close_zmq_socket
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
+
+CANARY_REFERENCE_TIMEOUT_SCALE: float = 4.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
 LISTENER_ACCEPT_TIMEOUT_S: float = 300.0
 HTTP_READY_TIMEOUT_S: float = 300.0
 HTTP_READY_POLL_INTERVAL_S: float = 0.5
 SERVER_HOST: str = "127.0.0.1"
+
+CANARY_LAUNCH_DEFAULTS: Dict[str, Any] = dict(
+    kv_canary="raise",
+    kv_canary_real_data="partial",
+    kv_canary_sweep_interval=100,
+)
 
 
 class ScriptedHttpServer:
@@ -42,6 +53,7 @@ class ScriptedHttpServer:
         server_process: mp.process.BaseProcess,
         out_of_band_error_path: Path,
         http_port: int,
+        run_timeout_s: float = DEFAULT_RUN_TIMEOUT_S,
     ) -> None:
         self._ctx = ctx
         self._socket = socket
@@ -50,6 +62,7 @@ class ScriptedHttpServer:
         self._base_url = f"http://{SERVER_HOST}:{http_port}"
         self._shutdown_done = False
         self._dirty: Optional[str] = None
+        self._run_timeout_s = run_timeout_s
 
     @classmethod
     def start(cls, **engine_kwargs: Any) -> ScriptedHttpServer:
@@ -57,7 +70,7 @@ class ScriptedHttpServer:
 
         ctx = zmq.Context()
         dispatch_port, socket = get_zmq_socket_on_host(ctx, zmq.PAIR, host=SERVER_HOST)
-        server_process, http_port = _spawn_server_process(
+        server_process, http_port, run_timeout_s = _spawn_server_process(
             endpoint=f"tcp://{SERVER_HOST}:{dispatch_port}",
             out_of_band_error_path=out_of_band_error_path,
             engine_kwargs=engine_kwargs,
@@ -69,6 +82,7 @@ class ScriptedHttpServer:
             server_process=server_process,
             out_of_band_error_path=out_of_band_error_path,
             http_port=http_port,
+            run_timeout_s=run_timeout_s,
         )
         try:
             self._await_handshake()
@@ -83,8 +97,10 @@ class ScriptedHttpServer:
         script_fn: Callable,
         *,
         args: Tuple[Any, ...] = (),
-        timeout_s: float = DEFAULT_RUN_TIMEOUT_S,
+        timeout_s: Optional[float] = None,
     ) -> None:
+        if timeout_s is None:
+            timeout_s = self._run_timeout_s
         if self._dirty:
             raise RuntimeError(f"ScriptedHttpServer is dirty: {self._dirty}")
 
@@ -217,23 +233,42 @@ def _create_oob_error_file() -> Path:
     return Path(err_path)
 
 
+def _default_run_timeout_s(*, kv_canary: str, device: str) -> float:
+    if _canary_decode_graph_override(kv_canary=kv_canary, device=device):
+        return DEFAULT_RUN_TIMEOUT_S * CANARY_REFERENCE_TIMEOUT_SCALE
+    return DEFAULT_RUN_TIMEOUT_S
+
+
+def _canary_decode_graph_override(*, kv_canary: str, device: str) -> Dict[str, Any]:
+    if kv_canary != "none" and use_torch_reference(torch.device(device)):
+        # install_canary refuses a captured decode over the torch reference.
+        return {"cuda_graph_backend_decode": "disabled"}
+    return {}
+
+
 def _spawn_server_process(
     *,
     endpoint: str,
     out_of_band_error_path: Path,
     engine_kwargs: Dict[str, Any],
-) -> Tuple[mp.process.BaseProcess, int]:
+) -> Tuple[mp.process.BaseProcess, int, float]:
     mp_ctx = mp.get_context("spawn")
+    device = engine_kwargs.get("device") or get_device()
     launch_kwargs: Dict[str, Any] = dict(
         host=SERVER_HOST,
         port=get_free_port(),
-        kv_canary="raise",
-        kv_canary_real_data="partial",
-        kv_canary_sweep_interval=100,
         disable_prefill_cuda_graph=True,
+        **CANARY_LAUNCH_DEFAULTS,
     )
     launch_kwargs.update(engine_kwargs)
+    for key, value in _canary_decode_graph_override(
+        kv_canary=launch_kwargs["kv_canary"], device=device.split(":")[0]
+    ).items():
+        launch_kwargs.setdefault(key, value)
     http_port = launch_kwargs["port"]
+    run_timeout_s = _default_run_timeout_s(
+        kv_canary=launch_kwargs["kv_canary"], device=device.split(":")[0]
+    )
     server_process = mp_ctx.Process(
         target=_launch_scripted_http_server,
         kwargs=launch_kwargs,
@@ -252,7 +287,7 @@ def _spawn_server_process(
     ):
         server_process.start()
 
-    return server_process, http_port
+    return server_process, http_port, run_timeout_s
 
 
 def _launch_scripted_http_server(**engine_kwargs: Any) -> None:
