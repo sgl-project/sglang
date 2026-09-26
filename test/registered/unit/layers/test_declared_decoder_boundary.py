@@ -20,6 +20,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers import communicator_mhc as mhc_module
 from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
@@ -34,7 +35,11 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     scatter_mode_layouts,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.communicator_mhc import (
+    MHCCommunicateSummableTensorPairFn,
+    MHCCommunicateWithAllReduceAndLayerNormFn,
+    MHCLayerCommunicator,
+)
 from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusionLayerCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -541,10 +546,134 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         self.assertFalse(self.declared(build(direct, dp)))
 
     def test_subclasses_that_pick_their_own_steps(self):
-        for cls in (MHCLayerCommunicator, CuteDSLFusionLayerCommunicator):
+        self.assertFalse(CuteDSLFusionLayerCommunicator._takes_declared_boundaries)
+        for cls in (LayerCommunicator, MHCLayerCommunicator):
             with self.subTest(cls.__name__):
-                self.assertFalse(cls._takes_declared_boundaries)
-        self.assertTrue(LayerCommunicator._takes_declared_boundaries)
+                self.assertTrue(cls._takes_declared_boundaries)
+
+
+def build_mhc(modes, parallel, *, a2a=False, two_batch_overlap=False, **kwargs):
+    overlap = SimpleNamespace(
+        overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap)
+    )
+    with planning(parallel, a2a=a2a), patch.object(comm, "get_exec", lambda: overlap):
+        return MHCLayerCommunicator(
+            layer_scatter_modes=modes,
+            input_layernorm=Norm(),
+            post_attention_layernorm=Norm(),
+            is_first_layer=modes.is_first_layer,
+            hc_mult=2,
+            hc_attn_pre=lambda *a: None,
+            hc_ffn_pre=lambda *a: None,
+            hc_post=lambda *a: None,
+            **kwargs,
+        )
+
+
+class TestMhcOnTheDeclarations(CustomTestCase):
+    """An MHC layer takes the same declarations as any other and runs its own
+    implementation of each step they call for."""
+
+    def test_each_boundary_takes_its_own_implementation(self):
+        gather = MHCCommunicateWithAllReduceAndLayerNormFn
+        move = MHCCommunicateSummableTensorPairFn
+        for name, parallel, ffn_input, output_move in (
+            (
+                "attention TP 1",
+                parallel_of(attn_dp=1, attn_tp=1),
+                gather._simple,
+                move._trivial,
+            ),
+            (
+                "the attention-TP sum",
+                parallel_of(attn_dp=1, attn_tp=2),
+                gather._gather_hidden_states_and_residual,
+                move._trivial,
+            ),
+            # The DP gather runs after hc_post, which is not a plain add.
+            (
+                "a DP gather",
+                parallel_of(attn_dp=2, attn_tp=2),
+                gather._gather_hidden_states_and_residual,
+                None,
+            ),
+        ):
+            with self.subTest(name):
+                communicator = build_mhc(layer_facts(1, 3), parallel)
+                self.assertIs(communicator._steps.ffn_input.func, ffn_input)
+                self.assertIs(communicator._steps.ffn_output_move, output_move)
+
+    def test_the_move_back_over_dp_stays_with_the_layer(self):
+        parallel = parallel_of(attn_dp=2, attn_tp=2)
+        communicator = build_mhc(layer_facts(1, 3), parallel, allow_reduce_scatter=True)
+        self.assertTrue(communicator._steps.returns_over_dp)
+        self.assertFalse(communicator._steps.ffn_output.leaves_for_next_layer)
+        self.assertFalse(communicator._local_token_move_can_go_to_next_layer(None))
+        max_len = SimpleNamespace(
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: True),
+            forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: False),
+        )
+        with (
+            planning(parallel),
+            patch.object(comm, "get_forward", lambda: SimpleNamespace(sp_active=False)),
+            patch.object(mhc_module, "should_use_dp_reduce_scatterv", lambda: False),
+            patch.object(
+                mhc_module,
+                "get_attn_tp_context",
+                lambda: SimpleNamespace(input_scattered=False),
+            ),
+        ):
+            self.assertTrue(communicator.should_use_reduce_scatter(max_len))
+
+    def test_a2a_layers_take_their_slice_with_the_coefficients(self):
+        parallel = parallel_of(attn_dp=2, attn_tp=2)
+        layers = [
+            build_mhc(
+                planned_modes(
+                    i,
+                    3,
+                    sparse=sparse,
+                    previous_sparse=previous,
+                    parallel=parallel,
+                    a2a=True,
+                ),
+                parallel,
+                a2a=True,
+            )
+            for i, (sparse, previous) in enumerate(
+                ((False, False), (True, False), (True, True))
+            )
+        ]
+        first_a2a, last = layers[1], layers[2]
+        self.assertIs(
+            first_a2a._steps.ffn_input.func,
+            MHCCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+        )
+        self.assertTrue(first_a2a._steps.ffn_input.keywords["scatters_residual"])
+        self.assertFalse(last._steps.ffn_input.keywords["scatters_residual"])
+        self.assertIs(
+            last._steps.ffn_output_move, MHCCommunicateSummableTensorPairFn._gather
+        )
+
+    def test_two_batch_overlap_keeps_the_scatter_modes(self):
+        # A dense layer before a sparse one gathers its output for the split,
+        # so dense layers on every rank keep their scatter-mode steps.
+        parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        modes = planned_modes(
+            1, 3, sparse=False, previous_sparse=False, parallel=parallel
+        )
+        declared = build_mhc(modes, parallel)
+        kept = build_mhc(modes, parallel, two_batch_overlap=True)
+        # Both run MHC's own slice onto each rank's rows.
+        self.assertIs(
+            declared._steps.ffn_input.func,
+            MHCCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+        )
+        self.assertIs(kept._steps.ffn_input.func, declared._steps.ffn_input.func)
+        # The declared layer never reads a scatter mode; the kept one does.
+        build_mhc(layer_facts(1, 3), parallel)
+        with self.assertRaises(AssertionError):
+            build_mhc(layer_facts(1, 3), parallel, two_batch_overlap=True)
 
 
 class TestTheAttentionOutputDecidesItsSum(CustomTestCase):

@@ -762,17 +762,8 @@ class LayerCommunicator:
         )
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
-        if (
-            sides is None
-            and self._takes_declared_boundaries
-            and (_generic_prefill_cp_shards_tokens() and _gathers_over_attention_cp())
-        ):
-            # The scatter-mode steps have no attention-CP gather.
-            raise NotImplementedError(
-                "a DSA or MLA prefill CP layer outside the declarations"
-            )
         self._steps = (
-            _select_boundary_steps(
+            self._steps_from_declarations(
                 sides,
                 fusions=self._select_mlp_input_fusions(),
                 force_layernorm_before_gather=force_layernorm_before_dp_gather,
@@ -783,7 +774,7 @@ class LayerCommunicator:
         # The steps a batch that shards its tokens over attention CP runs; None
         # without CP or where the steps come from the scatter modes.
         self._cp_steps = (
-            _select_boundary_steps(
+            self._steps_from_declarations(
                 self._declared_sides(cp_active=True),
                 fusions=self._select_mlp_input_fusions(),
                 force_layernorm_before_gather=force_layernorm_before_dp_gather,
@@ -952,9 +943,21 @@ class LayerCommunicator:
             layer_input=_complete_scattered_input,
         )
 
+    def _steps_from_declarations(
+        self, sides: DecoderLayerSides, **kwargs
+    ) -> "BoundarySteps":
+        """The steps this layer runs for a set of declarations. A layer with
+        its own residual operations (MHC) chooses its own implementations."""
+        return _select_boundary_steps(sides, **kwargs)
+
     def _post_init_communicate(self) -> Tuple[Callable, Callable]:
         """The attention input move and the postprocess the scatter modes
         choose."""
+        if _generic_prefill_cp_shards_tokens() and _gathers_over_attention_cp():
+            # These tables have no attention-CP gather.
+            raise NotImplementedError(
+                "a DSA or MLA prefill CP layer outside the declarations"
+            )
         return (
             CommunicateSimpleFn.get_fn(
                 input_mode=self.layer_scatter_modes.layer_input_mode,
