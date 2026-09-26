@@ -131,23 +131,23 @@ class _ModalityTable(dict):
 _MODALITIES = _ModalityTable()
 
 
-def shm_feature_buffers(buffers) -> list:
-    """The ``mm.feature.*`` buffers a request parked in POSIX shm: everything
-    that is not an inline numpy array is the Rust extension's ``ShmBuffer``."""
+def settle_shm_buffers(buffers, *, admitted: bool) -> None:
+    """Decide the unlink duty for every segment a drained request parked in
+    POSIX shm (any buffer that is not an inline numpy array is the Rust
+    extension's ``ShmBuffer``, whatever its name). Admitted: Rust hands the
+    duty to the ``ShmPointerMMData`` stubs, which unlink after the
+    post-broadcast open on every rank. Rejected: unlink now. Both are
+    idempotent on the Rust side. This is the drain loop's job, never a
+    wrapper's, so a package's own ``_wrap_mm_result`` needs no knowledge of it."""
     import numpy as np
 
-    return [
-        value
-        for name, value in buffers.items()
-        if name.startswith("mm.feature.") and not isinstance(value, np.ndarray)
-    ]
-
-
-def discard_shm_buffers(shm_buffers) -> None:
-    """Unlink the segments of a request that will not be admitted. Idempotent
-    on the Rust side, so it is safe after a partial wrap already unlinked some."""
-    for buffer in shm_buffers:
-        buffer.discard()
+    for value in buffers.values():
+        if isinstance(value, np.ndarray):
+            continue
+        if admitted:
+            value.release()
+        else:
+            value.discard()
 
 
 class MmTransportStats:
@@ -355,12 +355,10 @@ class RustMmProcessor:
             MultimodalProcessorOutput,
         )
 
-        # Rust keeps the unlink duty for every segment until the whole request
-        # wrapped: only then is it handed to the stubs (`release`). Any failure
-        # in between closes the stubs built so far and unlinks every segment
-        # (`discard`), wrapped or not, so a rejected request leaves nothing in
-        # /dev/shm.
-        shm_buffers = shm_feature_buffers(buffers)
+        # Ownership of the segments is not decided here: the drain loop
+        # releases or discards every `ShmBuffer` once it knows whether the
+        # request is admitted (`settle_shm_buffers`). A failure part-way only
+        # has to close the stubs built so far, which hold an open mapping each.
         stubs: list = []
         try:
             # Decoded straight from the numpy buffer (a memoryview over the
@@ -389,10 +387,7 @@ class RustMmProcessor:
         except BaseException:
             for stub in stubs:
                 stub.close_and_unlink()
-            discard_shm_buffers(shm_buffers)
             raise
-        for buffer in shm_buffers:
-            buffer.release()
         return output
 
     @staticmethod

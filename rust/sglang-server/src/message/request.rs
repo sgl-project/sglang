@@ -158,8 +158,10 @@ where
 {
     struct InputIds(OneOrMany<TokenIds>);
 
+    // Token width follows `TokenIds` (i64 in this crate); main's parser was
+    // written against its i32 alias and is ported here.
     enum FirstElement {
-        Token(i32),
+        Token(i64),
         Tokens(TokenIds),
     }
 
@@ -171,17 +173,15 @@ where
                 type Value = FirstElement;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    formatter.write_str("an i32 token or a list of i32 tokens")
+                    formatter.write_str("a token id or a list of token ids")
                 }
 
                 fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                    i32::try_from(value)
-                        .map(FirstElement::Token)
-                        .map_err(E::custom)
+                    Ok(FirstElement::Token(value))
                 }
 
                 fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                    i32::try_from(value)
+                    i64::try_from(value)
                         .map(FirstElement::Token)
                         .map_err(E::custom)
                 }
@@ -219,7 +219,7 @@ where
                         None => OneOrMany::One(Vec::new()),
                         Some(FirstElement::Token(first)) => {
                             let mut tokens = vec![first];
-                            while let Some(token) = sequence.next_element::<i32>()? {
+                            while let Some(token) = sequence.next_element::<i64>()? {
                                 tokens.push(token);
                             }
                             OneOrMany::One(tokens)

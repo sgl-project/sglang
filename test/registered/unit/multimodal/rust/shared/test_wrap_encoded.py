@@ -214,10 +214,9 @@ class TestWrapEncodedShm(TestWrapEncoded):
         output, features = self.build()
         for item in output.mm_items:
             self.assertIsInstance(item.feature, ShmPointerMMData)
-        # Admitted: Rust handed the unlink to the stubs, and the segments are
-        # still there for the TP receivers to open after the broadcast.
-        self.assertTrue(all(b.released for b in self._buffers))
-        self.assertFalse(any(b.discarded for b in self._buffers))
+        # The wrapper never decides ownership: nothing released or discarded
+        # here, and the segments are still there for the drain loop to settle.
+        self.assertFalse(any(b.released or b.discarded for b in self._buffers))
         self.assertTrue(all(segment_exists(b.name) for b in self._buffers))
         # The stub is a zero-copy view over the segment until materialized.
         self.assertEqual(
@@ -237,9 +236,9 @@ class TestWrapEncodedShm(TestWrapEncoded):
             with self.assertRaises(FileNotFoundError):
                 shared_memory.SharedMemory(name=item.feature.shm_name)
 
-    def test_partial_wrap_failure_leaves_no_segment(self):
-        """Item 1 fails after item 0's stub exists: the stub is closed and both
-        segments are unlinked, and nothing was handed to Python."""
+    def test_partial_wrap_failure_closes_stubs_and_decides_nothing(self):
+        """Item 1 fails after item 0's stub exists: the stub is closed, and the
+        wrapper neither releases nor discards; that is the drain loop's call."""
         features = np.arange(30, dtype=np.float32)
         meta = msgspec.msgpack.decode(self.meta().tobytes())
         del meta["items"][1]["model_specific_data"]["image_grid_thw"]
@@ -250,9 +249,7 @@ class TestWrapEncodedShm(TestWrapEncoded):
         }
         with self.assertRaises(KeyError):
             RustMmProcessor.wrap_encoded(self.spec, buffers)
-        self.assertFalse(any(b.released for b in self._buffers))
-        self.assertTrue(all(b.discarded for b in self._buffers))
-        self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+        self.assertFalse(any(b.released or b.discarded for b in self._buffers))
 
 
 class TestDrainShmOwnership(TestWrapEncodedShm):
@@ -264,7 +261,7 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
     # Reuse the shm fixture only; the inherited cases already ran above.
     test_wraps_and_slices_native_buffers = None
     test_optional_pad_values_use_precomputed_hashes = None
-    test_partial_wrap_failure_leaves_no_segment = None
+    test_partial_wrap_failure_closes_stubs_and_decides_nothing = None
 
     def _server(self, header, buffers):
         from sglang.srt.rust_server.server import RustServer
@@ -348,6 +345,52 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
             self.assertIsInstance(item.feature, ShmPointerMMData)
             item.feature.materialize()
         self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+
+    def test_external_wrapper_never_touches_ownership(self):
+        """An external package's `_wrap_mm_result` builds stubs from the
+        segment names and knows nothing about release/discard. Its segments
+        must still be there for the TP receivers after `drain` returns, and
+        must be unlinked when its wrapping fails."""
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
+        from sglang.srt.rust_server.server import RustServer
+
+        class PackageServer(RustServer):
+            fail = False
+
+            def _wrap_mm_result(self, buffers):
+                if self.fail:
+                    raise RuntimeError("package wrapper failed")
+                stubs = []
+                for i in range(2):
+                    b = buffers[f"mm.feature.{i}"]
+                    stub = ShmPointerMMData.__new__(ShmPointerMMData)
+                    stub.__setstate__(
+                        {"shm_name": b.name, "shape": b.shape, "dtype": None}
+                    )
+                    stubs.append(stub)
+                return stubs  # opaque to drain; only ownership matters here
+
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                server, errors = self._server(
+                    self._header("pkg"), self._request_buffers()
+                )
+                server.__class__ = PackageServer
+                server.fail = fail
+                drained = server.drain(8)
+                if fail:
+                    self.assertEqual(drained, [])
+                    self.assertEqual([rid for rid, _ in errors], ["pkg"])
+                    self.assertTrue(all(b.discarded for b in self._buffers))
+                    self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+                else:
+                    self.assertEqual(len(drained), 1)
+                    self.assertTrue(all(b.released for b in self._buffers))
+                    self.assertTrue(all(segment_exists(b.name) for b in self._buffers))
+                    for stub in drained[0].mm_inputs:
+                        stub.close_and_unlink()
+                self._segments, self._buffers = [], []
+                self.setUp()
 
 
 if __name__ == "__main__":

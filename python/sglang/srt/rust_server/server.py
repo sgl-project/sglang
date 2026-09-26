@@ -30,8 +30,7 @@ from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
-    discard_shm_buffers,
-    shm_feature_buffers,
+    settle_shm_buffers,
 )
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
@@ -195,7 +194,10 @@ class RustServer:
         """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
         ShmBuffer}``) into the scheduler's ``MultimodalProcessorOutput``. Model
         packages with an external processor override this for their own
-        item layout; the buffer names are the contract (see ``wrap_encoded``)."""
+        item layout; the buffer names are the contract (see ``wrap_encoded``).
+        A wrapper only translates: it may build ``ShmPointerMMData`` stubs from
+        a ``ShmBuffer``'s name, and the segment stays valid for every TP rank
+        because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
 
@@ -236,35 +238,43 @@ class RustServer:
         out = []
         for req in self.server.recv_requests(limit):
             buffers = dict(req.buffers)
+            # Rust holds the unlink duty for every shm segment until this loop
+            # settles the request: released to the stubs on admission, unlinked
+            # on rejection. The wrapper never decides this (see `_wrap_mm_result`).
             try:
-                obj = msgpack_decode_explained(req.header)
-            except MsgpackDecodeError as e:
-                # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
-                logger.warning(
-                    "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
-                )
-                if e.rid is not None:
-                    self.server.push_error(e.rid, f"invalid request: {e.reason}")
-                # The buffers were never looked at: Rust still owns their
-                # segments, so unlink them now rather than at GC time.
-                discard_shm_buffers(shm_feature_buffers(buffers))
+                obj = self._admit(req.header, buffers)
+            except Exception:
+                settle_shm_buffers(buffers, admitted=False)
                 continue
-            try:
-                self._attach_buffers(obj, buffers)
-            except Exception as e:
-                logger.warning(
-                    "rust ingress: rejecting request %s: %s: %s",
-                    obj.rid,
-                    type(e).__name__,
-                    e,
-                )
-                self.server.push_error(obj.rid, f"invalid request: {e}")
-                # `wrap_encoded` already discarded on its own failure; this
-                # covers a failure before it, and discard is idempotent.
-                discard_shm_buffers(shm_feature_buffers(buffers))
-                continue
+            settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
         return out
+
+    def _admit(self, header: bytes, buffers: dict):
+        """Decode and attach one drained request, or report the rejection to
+        its client and raise."""
+        try:
+            obj = msgpack_decode_explained(header)
+        except MsgpackDecodeError as e:
+            # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
+            logger.warning(
+                "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
+            )
+            if e.rid is not None:
+                self.server.push_error(e.rid, f"invalid request: {e.reason}")
+            raise
+        try:
+            self._attach_buffers(obj, buffers)
+        except Exception as e:
+            logger.warning(
+                "rust ingress: rejecting request %s: %s: %s",
+                obj.rid,
+                type(e).__name__,
+                e,
+            )
+            self.server.push_error(obj.rid, f"invalid request: {e}")
+            raise
+        return obj
 
     def _attach_buffers(self, obj, buffers: dict) -> None:
         """Attach one drained request's named buffers to its decoded header."""
