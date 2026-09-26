@@ -1,13 +1,16 @@
 # ComfyUI SGLDiffusion Pipeline Tests
 
-This directory contains tests for each ComfyUI pipeline integration.
+These e2e tests start the **native** Flux / Qwen-Image / Z-Image pipeline with
+`comfyui_mode=True` and feed pre-encoded latents, timesteps, and embeddings the
+way the plugin adapter would. Adapter, session, and CUDA IPC unit tests live
+under `python/sglang/multimodal_gen/test/unit/`.
 
 ## Test Files
 
-- `test_zimage_pipeline.py` - Tests for ComfyUIZImagePipeline
-- `test_flux_pipeline.py` - Tests for ComfyUIFluxPipeline
-- `test_qwen_image_pipeline.py` - Tests for ComfyUIQwenImagePipeline
-- `test_qwen_image_edit_pipeline.py` - Tests for ComfyUIQwenImageEditPipeline (I2I/edit mode)
+- `test_zimage_pipeline.py` - Z-Image native pipeline under `--comfyui-mode`
+- `test_flux_pipeline.py` - Flux native pipeline under `--comfyui-mode`
+- `test_qwen_image_pipeline.py` - Qwen-Image native pipeline under `--comfyui-mode`
+- `test_qwen_image_edit_pipeline.py` - Qwen-Image-Edit native pipeline (I2I/edit; experimental)
 
 ## Running Tests
 

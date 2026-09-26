@@ -1,0 +1,48 @@
+---
+title: ComfyUI plugin
+description: Use SGLang Diffusion from ComfyUI in server mode or as a per-step DiT backend.
+---
+
+The [ComfyUI SGLDiffusion plugin](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion) has two modes.
+
+**Server mode** talks to a standalone `sglang serve` process over HTTP. ComfyUI sends prompts and receives images or video. This is the same path as the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api).
+
+**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Z-Image pipeline under `--comfyui-mode`. A single-file ComfyUI `.safetensors` is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
+
+Integrated mode does not ship a separate `comfyui_*` pipeline class per model.
+
+## Install the plugin
+
+1. Install `sglang[diffusion]`. See [Installation](/docs/sglang-diffusion/installation).
+2. Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI's `custom_nodes/` directory.
+3. Restart ComfyUI.
+
+Example workflows live next to the plugin under `workflows/`.
+
+## Integrated mode
+
+1. Load the DiT with `SGLDiffusion UNET Loader`.
+2. Set `num_gpus`, `tp_size`, `model_type`, or compile flags with `SGLDiffusion Options`.
+3. Connect the loaded model to a standard ComfyUI sampler.
+
+Supported integrated-mode families: Flux, Qwen-Image, Z-Image. Qwen-Image edit is experimental.
+
+## How a sampler step reaches the worker
+
+The plugin README has the [architecture diagram](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion#architecture). The hop is:
+
+1. A model adapter packs ComfyUI tensors into an SGLang `Req`.
+2. Local ZMQ replaces CUDA tensors with IPC handles so latents stay on GPU.
+3. Rank 0 materializes the handles. Multi-rank `--comfyui-mode` then detaches CUDA tensors and broadcasts them over NCCL. The general SP / CFG / TP path is still the original `broadcast_pyobj`.
+4. The worker pipeline keeps `transformer` plus a pass-through scheduler. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
+
+Integrated mode currently supports:
+
+| Family | ComfyUI `model_type` | Native pipeline | Example checkpoints |
+| --- | --- | --- | --- |
+| Flux | `flux` | `FluxPipeline` | `FLUX.1-dev` |
+| Z-Image | `lumina2` | `ZImagePipeline` | `Z-Image-Turbo` |
+| Qwen-Image | `qwen_image` | `QwenImagePipeline` | `Qwen-Image`, `Qwen-Image-2512` |
+| Qwen-Image edit | `qwen_image_edit` | `QwenImageEditPlusPipeline` | `Qwen-Image-Edit-2511` (experimental) |
+
+To add a model, register a checkpoint spec under `runtime/loader/comfyui_checkpoints/` and a `ComfyUIModelAdapter`. Do not add another ComfyUI pipeline class.

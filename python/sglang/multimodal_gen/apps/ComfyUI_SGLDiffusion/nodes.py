@@ -89,7 +89,12 @@ class SGLDOptions:
         # Convert -1 to None for optional parameters (matching ServerArgs defaults)
         ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
         ring_degree = None if ring_degree == -1 else ring_degree
+        tp_size = None if tp_size == -1 else tp_size
+        sp_degree = None if sp_degree == -1 else sp_degree
         attention_backend = None if attention_backend == "" else attention_backend
+        # dp_degree is a leftover alias; ServerArgs only has dp_size.
+        if dp_degree not in (None, 1) and dp_size in (None, 1):
+            dp_size = dp_degree
 
         options = {
             "model_type": model_type,
@@ -100,7 +105,6 @@ class SGLDOptions:
             "ulysses_degree": ulysses_degree,
             "ring_degree": ring_degree,
             "dp_size": dp_size,
-            "dp_degree": dp_degree,
             "enable_cfg_parallel": enable_cfg_parallel,
             "attention_backend": attention_backend,
         }
