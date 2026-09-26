@@ -8,7 +8,7 @@ use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -26,6 +26,8 @@ pub(super) struct PreparedChatRequest {
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
+    caller_set_rid: bool,
+    fans_out: bool,
     can_forward_input_ids: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -69,42 +71,55 @@ impl PreparedChatRequest {
             body,
             tokens,
             input_token_count,
+            caller_set_rid: fields.caller_set_rid,
+            fans_out: requests_multiple_samples(&fields, &sampling_defaults),
             can_forward_input_ids,
             parsed_body,
             sampling_defaults,
         })
     }
 
+    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
+        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs; PD must finish KV transfer.
+        if self.caller_set_rid || self.fans_out || pd_mode {
+            return None;
+        }
+        Some(uuid::Uuid::new_v4().simple().to_string())
+    }
+
     pub(super) fn into_outgoing_body(
         self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
+        engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
-        let input_ids = match (self.tokens.as_ref(), self.parsed_body.as_ref()) {
-            (Some(tokens), Some(parsed_body))
-                if self.can_forward_input_ids
-                    && tokens.rendered_from_chat
-                    && can_forward_chat_tokens(parsed_body) =>
-            {
-                Some(tokens.ids.as_slice())
-            }
-            _ => None,
-        };
-        if chat_tokenization_failed(
+        let forwarding = input_ids_forwarding(
             self.can_forward_input_ids,
             self.parsed_body.as_ref(),
             self.tokens.as_ref(),
-        ) {
-            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
-        }
-        build_outgoing_body(
+        );
+        let input_ids = self
+            .tokens
+            .as_ref()
+            .filter(|_| forwarding == InputIdsForwarding::Forwarded)
+            .map(|tokens| tokens.ids.as_slice());
+        let body = build_outgoing_body(
             &self.body,
             self.parsed_body,
             input_ids,
             bootstrap,
             &self.sampling_defaults,
-        )
+            engine_rid,
+        )?;
+        // Book only after the outgoing body exists; a request rejected here
+        // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
+        ctx.metrics
+            .record_input_ids_forwarding(&self.model.0, forwarding);
+        if forwarding == InputIdsForwarding::TokenizeFailed {
+            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+        }
+        Ok(body)
     }
 }
 
@@ -116,6 +131,8 @@ pub(super) struct RoutingFields {
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
+    // Preserve both string and list IDs without retaining their contents.
+    caller_set_rid: bool,
 }
 
 /// Null is absent; unrepresentable values are rejected only under a sampling contract.
@@ -248,6 +265,7 @@ impl RoutingKey {
 enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
+    Rid,
     Other,
 }
 
@@ -267,6 +285,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "model" => RequestKey::Routing(RoutingKey::Model),
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
+                    "rid" => RequestKey::Rid,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -324,6 +343,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                         SamplingValue::Unusable
                     };
                 }
+                RequestKey::Rid => {
+                    fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
+                }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
                     map.next_value::<IgnoredAny>()?;
@@ -374,6 +396,22 @@ fn should_tokenize_request(
     can_forward_input_ids || policy_needs_request_tokens || bucket_routing_enabled
 }
 
+// Use the effective n, including injected defaults; unreadable values opt out.
+fn requests_multiple_samples(
+    fields: &RoutingFields,
+    sampling_defaults: &[(SamplingField, Number)],
+) -> bool {
+    match fields.sampling_field(SamplingField::N) {
+        SamplingValue::Number(n) => n > 1.0,
+        SamplingValue::Unusable => true,
+        SamplingValue::Absent => sampling_defaults
+            .iter()
+            .find(|(field, _)| *field == SamplingField::N)
+            .and_then(|(_, value)| value.as_f64())
+            .is_some_and(|n| n > 1.0),
+    }
+}
+
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
     (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
@@ -391,9 +429,10 @@ pub(super) struct BootstrapFields {
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
-fn append_sampling_defaults(
+fn append_top_level_fields(
     body: &Bytes,
     sampling_defaults: &[(SamplingField, Number)],
+    rid: Option<&str>,
 ) -> Option<Bytes> {
     use std::io::Write as _;
 
@@ -405,13 +444,23 @@ fn append_sampling_defaults(
     let has_members = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + 1);
+    let rid_budget = rid.map_or(0, |rid| rid.len() + ",\"rid\":\"\"".len());
+    let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + rid_budget + 1);
     output.extend_from_slice(&body[..close]);
-    for (i, (field, value)) in sampling_defaults.iter().enumerate() {
-        if has_members || i > 0 {
+    let mut wrote_any = has_members;
+    for (field, value) in sampling_defaults {
+        if wrote_any {
             output.push(b',');
         }
         write!(output, "\"{}\":{}", field.wire_name(), value).ok()?;
+        wrote_any = true;
+    }
+    if let Some(rid) = rid {
+        if wrote_any {
+            output.push(b',');
+        }
+        output.extend_from_slice(b"\"rid\":");
+        serde_json::to_writer(&mut output, rid).ok()?;
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
@@ -424,14 +473,15 @@ fn build_outgoing_body(
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
     sampling_defaults: &[(SamplingField, Number)],
+    rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
-    let sampling_only = input_ids.is_none() && bootstrap.is_none();
-    if sampling_only && sampling_defaults.is_empty() {
+    let needs_parse = input_ids.is_some() || bootstrap.is_some();
+    if !needs_parse && sampling_defaults.is_empty() && rid.is_none() {
         // Cloning Bytes shares the original allocation when no injection is needed.
         return Ok(body.clone());
     }
-    if sampling_only {
-        if let Some(spliced) = append_sampling_defaults(body, sampling_defaults) {
+    if !needs_parse {
+        if let Some(spliced) = append_top_level_fields(body, sampling_defaults, rid) {
             return Ok(spliced);
         }
     }
@@ -445,6 +495,9 @@ fn build_outgoing_body(
             return Err(invalid_request());
         }
     };
+    if let Some(rid) = rid {
+        body_fields.insert("rid".into(), Value::String(rid.to_owned()));
+    }
     for (field, default) in sampling_defaults {
         body_fields.insert(field.wire_name().into(), default.clone().into());
     }
@@ -510,26 +563,32 @@ fn can_forward_chat_tokens(value: &Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
+/// Whether router-rendered `input_ids` replace engine tokenization.
 ///
-/// Count chats with forwarding enabled that pass the forwarding guard
-/// but lack chat-rendered tokens. Excluded requests are expected fallbacks,
-/// even when rendering fails.
-fn chat_tokenization_failed(
+/// Only chats with forwarding enabled that pass the forwarding guard are
+/// eligible; an eligible chat without chat-rendered tokens is a failed offload.
+/// Multimodal chats are reported apart from other guard exclusions.
+fn input_ids_forwarding(
     can_forward_input_ids: bool,
     request_value: Option<&Value>,
     request_tokens: Option<&RequestTokens>,
-) -> bool {
+) -> InputIdsForwarding {
     if !can_forward_input_ids {
-        return false;
+        return InputIdsForwarding::Disabled;
     }
-    let chat_request = request_value.is_some_and(|v| {
+    if request_value.is_some_and(request_has_multimodal_content) {
+        return InputIdsForwarding::IneligibleMultimodal;
+    }
+    let eligible = request_value.is_some_and(|v| {
         v.get("messages").is_some_and(|m| m.is_array()) && can_forward_chat_tokens(v)
     });
-    if !chat_request {
-        return false;
+    if !eligible {
+        InputIdsForwarding::Ineligible
+    } else if request_tokens.is_some_and(|t| t.rendered_from_chat) {
+        InputIdsForwarding::Forwarded
+    } else {
+        InputIdsForwarding::TokenizeFailed
     }
-    !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -606,6 +665,29 @@ fn request_has_non_text_content(value: &Value) -> bool {
         .is_some_and(|msgs| {
             msgs.iter()
                 .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
+        })
+}
+
+/// Image, video, and audio content parts need the engine's multimodal
+/// processor, so such chats can never carry `input_ids`. Other non-string
+/// parts (`refusal`, `thinking`, untyped) are ordinary guard exclusions.
+fn request_has_multimodal_content(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|p| {
+                            matches!(
+                                p.get("type").and_then(|t| t.as_str()),
+                                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                            )
+                        })
+                    })
+            })
         })
 }
 
@@ -739,7 +821,8 @@ mod tests {
                 .unwrap()
                 .extend(fields.as_object().unwrap().clone());
             for value in [None, Some(original.clone())] {
-                let out = build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[]).unwrap();
+                let out =
+                    build_outgoing_body(&body, value, ids, bootstrap.as_ref(), &[], None).unwrap();
                 assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(), expected);
             }
         }
@@ -750,7 +833,7 @@ mod tests {
         for raw in [r#"{"model":"x"}"#, r#"{"model":"x","messages":[]}"#] {
             let body = Bytes::copy_from_slice(raw.as_bytes());
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &[]).unwrap();
+                let out = build_outgoing_body(&body, value, None, None, &[], None).unwrap();
                 assert_eq!(out, body);
                 assert_eq!(out.as_ptr(), body.as_ptr());
             }
@@ -794,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn request_has_multimodal_content_detects_media_parts() {
+        for part in [
+            json!({"type":"image_url","image_url":{"url":"x"}}),
+            json!({"type":"video_url","video_url":{"url":"x"}}),
+            json!({"type":"audio_url","audio_url":{"url":"x"}}),
+            json!({"type":"input_audio","input_audio":{"data":"x"}}),
+        ] {
+            assert!(
+                request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"user","content":[part]}]
+                })),
+                "part {part} is multimodal"
+            );
+        }
+        for content in [
+            json!("hello"),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            json!([{"type":"refusal","refusal":"no"}]),
+            json!([{"type":"thinking","thinking":"hmm"}]),
+            json!([{"text":"untyped"}]),
+            json!(["bare string"]),
+            Value::Null,
+        ] {
+            assert!(
+                !request_has_multimodal_content(&json!({
+                    "messages":[{"role":"user","content":content}]
+                })),
+                "content {content} is not multimodal"
+            );
+        }
+    }
+
+    #[test]
     fn reasoning_history_is_an_expected_forwarding_omission() {
         let mut value = json!({"messages": [
             {"role":"user", "content":"hi"},
@@ -801,7 +917,10 @@ mod tests {
             {"role":"user", "content":"next"}
         ]});
         assert!(!can_forward_chat_tokens(&value));
-        assert!(!chat_tokenization_failed(true, Some(&value), None));
+        assert_eq!(
+            input_ids_forwarding(true, Some(&value), None),
+            InputIdsForwarding::Ineligible
+        );
         value["messages"][1]["reasoning_content"] = Value::Null;
         assert!(can_forward_chat_tokens(&value));
         value["messages"][1]
@@ -824,7 +943,10 @@ mod tests {
                 .collect();
             let value = json!({"messages": messages});
             assert!(!can_forward_chat_tokens(&value), "{roles:?}");
-            assert!(!chat_tokenization_failed(true, Some(&value), None));
+            assert_eq!(
+                input_ids_forwarding(true, Some(&value), None),
+                InputIdsForwarding::Ineligible
+            );
         }
         assert!(can_forward_chat_tokens(&json!({"messages": [
             {"role": "system", "content": "instructions"},
@@ -877,27 +999,37 @@ mod tests {
     }
 
     #[test]
-    fn offload_failures_only_count_forwardable_chats_missing_rendered_tokens() {
+    fn input_ids_forwarding_outcome_per_request() {
+        use InputIdsForwarding::*;
         let chat = json!({"messages":[{"role":"user","content":"hi"}]});
         let tools = json!({"messages":[{"role":"user","content":"hi"}], "tools":[{"type":"function","function":{"name":"f"}}]});
         let prompt = json!({"prompt":"hi"});
-        for (formatter, value, rendered, failed) in [
-            (true, Some(&chat), Some(true), false),
-            (true, Some(&chat), Some(false), true),
-            (true, Some(&chat), None, true),
-            (false, Some(&chat), None, false),
-            (true, Some(&tools), None, false),
-            (true, Some(&prompt), None, false),
-            (true, None, None, false),
+        let image = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"x"}}
+        ]}]});
+        let text_parts =
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
+        for (enabled, value, rendered, expected) in [
+            (true, Some(&chat), Some(true), Forwarded),
+            (true, Some(&chat), Some(false), TokenizeFailed),
+            (true, Some(&chat), None, TokenizeFailed),
+            (false, Some(&chat), Some(true), Disabled),
+            (true, Some(&tools), Some(true), Ineligible),
+            (true, Some(&prompt), None, Ineligible),
+            (true, None, None, Ineligible),
+            (true, Some(&image), None, IneligibleMultimodal),
+            (false, Some(&image), None, Disabled),
+            (true, Some(&text_parts), None, Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],
                 rendered_from_chat,
             });
             assert_eq!(
-                chat_tokenization_failed(formatter, value, tokens.as_ref()),
-                failed,
-                "formatter={formatter}, request={value:?}, rendered={rendered:?}"
+                input_ids_forwarding(enabled, value, tokens.as_ref()),
+                expected,
+                "enabled={enabled}, request={value:?}, rendered={rendered:?}"
             );
         }
     }
@@ -1108,7 +1240,7 @@ mod tests {
             &metrics(),
         )
         .unwrap();
-        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject).unwrap();
+        let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject, None).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&out).unwrap(),
             json!({
@@ -1240,7 +1372,7 @@ mod tests {
             let inject = resolve_sampling_defaults(&config, &fields_of(raw), &metrics()).unwrap();
             assert_eq!(inject.len(), 2);
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-                let out = build_outgoing_body(&body, value, None, None, &inject).unwrap();
+                let out = build_outgoing_body(&body, value, None, None, &inject, None).unwrap();
                 assert_eq!(std::str::from_utf8(&out).unwrap(), expected, "{raw}");
                 let parsed: Value = serde_json::from_slice(&out).unwrap();
                 assert_eq!(parsed["temperature"], json!(1.0));
@@ -1463,5 +1595,36 @@ mod tests {
             "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
             "a value at the cap is still read"
         );
+    }
+
+    #[test]
+    fn abort_opt_outs_follow_caller_rid_and_effective_sample_count() {
+        for raw in [r#"{"rid":"abc"}"#, r#"{"rid":["a","b"]}"#] {
+            assert!(fields_of(raw).caller_set_rid);
+        }
+        assert!(!fields_of(r#"{"rid":null}"#).caller_set_rid);
+        for (raw, fan_out) in [
+            (r#"{}"#, false),
+            (r#"{"n":1}"#, false),
+            (r#"{"n":2}"#, true),
+            (r#"{"n":"3"}"#, true),
+            (r#"{"n":[2]}"#, true),
+        ] {
+            assert_eq!(
+                requests_multiple_samples(&fields_of(raw), &[]),
+                fan_out,
+                "{raw}"
+            );
+        }
+        for (config, fan_out) in [(r#"{"n":1}"#, false), (r#"{"n":4}"#, true)] {
+            let fields = fields_of("{}");
+            let defaults = resolve_sampling_defaults(
+                &overrides_of(ConflictPolicy::Reject, config),
+                &fields,
+                &metrics(),
+            )
+            .unwrap();
+            assert_eq!(requests_multiple_samples(&fields, &defaults), fan_out);
+        }
     }
 }

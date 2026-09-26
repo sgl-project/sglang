@@ -18,7 +18,7 @@ import platform
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_mlx_ci
@@ -142,50 +142,6 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestMetalCaptureProfilerMPS(unittest.TestCase):
-    """MPS path: start_mps wraps torch.mps.profiler.metal_capture."""
-
-    def test_start_mps_success(self):
-        import torch
-
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
-
-        mock_ctx = MagicMock()
-        mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
-        mock_ctx.__exit__ = MagicMock(return_value=False)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(
-                torch.mps.profiler, "metal_capture", return_value=mock_ctx
-            ):
-                profiler, result = MetalCaptureProfiler.start_mps(trace_path)
-
-        self.assertTrue(result.success)
-        self.assertIsNotNone(profiler)
-        self.assertEqual(profiler.label, "MPS")
-        self.assertFalse(profiler.standalone)
-
-    def test_start_mps_runtime_error_returns_failure(self):
-        import torch
-
-        from sglang.srt.hardware_backend.mlx.profiler import MetalCaptureProfiler
-
-        with tempfile.TemporaryDirectory() as tmp:
-            trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(
-                torch.mps.profiler,
-                "metal_capture",
-                side_effect=RuntimeError("MPS profiler unavailable"),
-            ):
-                profiler, result = MetalCaptureProfiler.start_mps(trace_path)
-
-        self.assertIsNone(profiler)
-        self.assertFalse(result.success)
-        self.assertIn("MTL_CAPTURE_ENABLED", result.message)
-
-
-@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestSchedulerProfilerManagerMPS(unittest.TestCase):
     """SchedulerProfilerManager._start_profile handles Metal capture failures.
 
@@ -261,7 +217,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
                     torch.mps.profiler, "metal_capture", return_value=capture_ctx
                 ),
                 mock_patch("torch.distributed.barrier"),
-                get_parallel().override(tp_rank=0, pp_size=1, moe_ep_size=1),
+                get_parallel().override(tp_rank=0, dp_size=1, pp_size=1, moe_ep_size=1),
             ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)

@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferDestination,
     KVTransferMetric,
     StateType,
 )
@@ -182,6 +183,7 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            and self.supports_deferred_decode_kv_release
         )
         self._dcp_pack_buffers = None
         self._dcp_pack_max_tokens: Optional[int] = None
@@ -382,7 +384,9 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
-    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+    def _init_dcp_pack_buffers_once(
+        self, dcp_size: int, *, include_draft: bool = False
+    ) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
@@ -397,6 +401,7 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens
 
@@ -1654,9 +1659,12 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # Preserve the target until in-flight writes drain, even when
+                # the scheduler has already observed Failed and cleared the room.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1925,6 +1933,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         raise NotImplementedError
 
