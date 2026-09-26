@@ -134,6 +134,7 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "attention_backend_override",
     "cache_dit_params",
     "cfg_gate_step",
+    "dpcache_budget",
     "enable_cache_dit",
     "quality",
     "skip_softmax_params",
@@ -297,6 +298,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
             request, "attention_backend_override"
         ),
         "skip_softmax_params": _extra_value(request, "skip_softmax_params"),
+        "dpcache_budget": _extra_value(request, "dpcache_budget"),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,

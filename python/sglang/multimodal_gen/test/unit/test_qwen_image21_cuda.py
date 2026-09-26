@@ -2,6 +2,7 @@
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21Sampling
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
 )
+from sglang.multimodal_gen.runtime.cache.dpcache import DPCacheState, predict_feature
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -371,3 +373,76 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+def bf16_inputs(seed):
+    kwargs = inputs(seed, edit=False)
+    for key in ("hidden_states", "encoder_hidden_states", "timestep"):
+        kwargs[key] = kwargs[key].bfloat16()
+    return kwargs
+
+
+def run_steps(model, kwargs, timesteps, dpcache_state=None):
+    # the DiT reads DPCache state from the request, like the denoising stage sets it
+    batch = SimpleNamespace(
+        dpcache_states=None if dpcache_state is None else {False: dpcache_state},
+        dpcache_budget=None,
+        is_cfg_negative=False,
+        is_warmup=False,
+        extra={},
+    )
+    outputs = []
+    for step, timestep in enumerate(timesteps):
+        kwargs["timestep"].fill_(timestep)
+        with set_forward_context(
+            current_timestep=step, attn_metadata=None, forward_batch=batch
+        ):
+            outputs.append(model(**kwargs))
+    return outputs
+
+
+@torch.no_grad()
+def test_dpcache_all_full_schedule_is_bit_exact(bf16_model):
+    """Scheduling every step full must not change any output or prefix KV."""
+    timesteps = (900, 700, 500, 300, 100)
+    reference = bf16_inputs(3)
+    cached = deepcopy(reference)
+    expected = run_steps(bf16_model, reference, timesteps)
+    state = DPCacheState(range(len(timesteps)), num_steps=len(timesteps))
+    actual = run_steps(bf16_model, cached, timesteps, state)
+    for a, e in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, e, atol=0, rtol=0)
+    for a, e in zip(
+        cached["prefix_caches"][0], reference["prefix_caches"][0], strict=True
+    ):
+        torch.testing.assert_close(a["key"], e["key"], atol=0, rtol=0)
+    assert (state.num_full, state.num_predicted) == (5, 0)
+
+
+@torch.no_grad()
+def test_dpcache_predicted_step_skips_blocks_and_uses_current_timestep(bf16_model):
+    timesteps = (900, 700, 500, 300)
+    kwargs = bf16_inputs(4)
+    features = []
+    handle = bf16_model.norm_out.register_forward_pre_hook(
+        lambda module, args: features.append(args[0].clone())
+    )
+    ran = []
+    hooks = [
+        block.register_forward_pre_hook(lambda *args: ran.append(True))
+        for block in bf16_model.transformer_blocks
+    ]
+    try:
+        state = DPCacheState((0, 1, 2), num_steps=len(timesteps))
+        outputs = run_steps(bf16_model, kwargs, timesteps, state)
+    finally:
+        handle.remove()
+        for hook in hooks:
+            hook.remove()
+    assert len(ran) == 3 * len(bf16_model.transformer_blocks)
+    predicted = predict_feature(features[1], features[2], 1, 2, 3)
+    torch.testing.assert_close(features[3], predicted, atol=0, rtol=0)
+    # the output head must use step 3's timestep, not the last full step's
+    temb = bf16_model.time_text_embed(kwargs["timestep"] / 1000, torch.bfloat16)
+    expected = bf16_model.proj_out(bf16_model.norm_out(predicted, temb))
+    torch.testing.assert_close(outputs[3], expected, atol=0, rtol=0)
