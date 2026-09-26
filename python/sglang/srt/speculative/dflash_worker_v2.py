@@ -1,7 +1,7 @@
 import logging
 import math
 import os
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -91,6 +91,9 @@ from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
 
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +361,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
+    def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)]
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -396,11 +402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
-        # One decision, used twice: whether the draft runs on an attention-TP
-        # slice of its own. It picks how the runner is built, and then what the
-        # scope may say about attention every time it is entered -- a draft
-        # built outside the scope keeps the target's replica count and still
-        # gathers with it.
+        # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = get_parallel().enable_dp_attention
         if self.draft_owns_attention:
             draft_init_ctx = draft_tp_context(

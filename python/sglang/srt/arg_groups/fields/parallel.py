@@ -1,11 +1,4 @@
-"""Config fields of the ``parallel`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``parallel`` bag, which is what ``get_parallel()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``parallel`` namespace."""
 
 from __future__ import annotations
 
@@ -280,18 +273,7 @@ class Parallel(msgspec.Struct):
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
 
-    # ---- derived: the quotients of the leaves above -------------------------
-    #
-    # Declared here, beside what they are computed from, because a namespace is
-    # one file and one class. They are not annotated, so they are not dataclass
-    # fields and `collect_input_fields` does not put them on the record -- which
-    # is right: a quotient has no operator input to preserve, and the record is
-    # what crosses a process boundary, so a width put there would be a stale
-    # copy the moment an elastic scale-up restamps one. Every input is a leaf
-    # above, so all six are fixed once the configuration is: `publish` computes
-    # them through `parallel_widths_of` and stores them as ordinary bag leaves,
-    # and `ParallelContext` answers with the stamp when a scale-up has moved
-    # one.
+    # Derived fields are computed at publication and are not stored in ServerArgs.
     attn_tp_size = Derived(
         fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
@@ -321,13 +303,7 @@ class Parallel(msgspec.Struct):
         "wider than one rank, which is exactly when the group gets built.",
     )
 
-    # -- written at runtime, not carried by any configuration --------------
-    #
-    # No `fn`: nothing here is a function of the leaves above. A rank is
-    # written by `publish` from the spawn bundle; a group by the build that
-    # creates it. Until one of them has run there is no answer, and a read
-    # says so rather than deriving something that would answer a different
-    # question.
+    # Runtime fields: publish sets ranks; distributed initialization sets groups.
     tp_rank = Derived(doc="This process's place in the tensor-parallel group.")
     pp_rank = Derived(doc="This process's place in the pipeline group.")
     moe_ep_rank = Derived(doc="This process's place in the expert-parallel group.")

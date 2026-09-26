@@ -4,6 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
+from array import array
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import (
@@ -31,13 +32,13 @@ from sglang.kernels.ops.attention.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
-from sglang.kernels.ops.attention.dsv4.wo_a import (
-    fused_rope_wo_a_bf16,
+from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
+from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
+from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
-from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -3852,25 +3853,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
-        # The MoE sees DP-gathered rows, so this rank's local count cannot mask them.
-        # The standard dispatcher masks padding in the gathered buffer.
-        saved_num_token_non_padded = forward_batch.num_token_non_padded
-        if _use_tp_moe_gather:
-            forward_batch.num_token_non_padded = None
-        try:
-            with (
-                get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
-                gathered_rows,
-            ):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                    skip_shared_experts=_do_shared_local,
-                )
-        finally:
-            forward_batch.num_token_non_padded = saved_num_token_non_padded
+        with (
+            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            gathered_rows,
+        ):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=_do_shared_local,
+            )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -4981,7 +4974,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def pad_input_ids(self, input_ids, mm_inputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )

@@ -45,9 +45,6 @@ def test_dp_leaders_reuse_node_local_ports(
                 server_args=SimpleNamespace(),
                 model_config=SimpleNamespace(is_multimodal=False),
             )
-            # Where this rank sits, stated whole: the attention rank follows
-            # from the TP rank and the attention-TP width, and the identities
-            # refuse the combination if it describes no real layout.
             with parallel.override(
                 tp_rank=tp_rank,
                 attn_dp_rank=dp_rank,

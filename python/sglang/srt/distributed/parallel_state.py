@@ -46,7 +46,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+    set_global_tcp_store,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -54,6 +58,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -267,7 +272,7 @@ class GroupCoordinator:
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
-    use_pymscclpp: bool  # a hint of whether to use PyMsccl
+    use_mscclpp: bool  # a hint of whether to use MSCCL++
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
@@ -287,7 +292,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_pynccl: bool,
-        use_pymscclpp: bool,
+        use_mscclpp: bool,
         use_custom_allreduce: bool,
         use_torch_symm_mem_all_reduce: bool,
         use_hpu_communicator: bool,
@@ -424,7 +429,7 @@ class GroupCoordinator:
 
         # Import communicators
         self.use_pynccl = use_pynccl
-        self.use_pymscclpp = use_pymscclpp
+        self.use_mscclpp = use_mscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
@@ -471,10 +476,11 @@ class GroupCoordinator:
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
-        if use_pymscclpp and self.world_size > 1:
+        if use_mscclpp and self.world_size > 1:
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                group_name=group_name,
             )
 
         self.ca_comm: Optional[Any] = None
@@ -1091,9 +1097,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
-            )
+            reduce_scatter_single(output, input, group=self.device_group)
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -1285,6 +1289,13 @@ class GroupCoordinator:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
 
+        pymscclpp_comm = self.pymscclpp_comm
+        if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
+            output, input
+        ):
+            pymscclpp_comm.all_gather(output, input)
+            return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -1295,9 +1306,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
-            )
+            all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
@@ -1388,9 +1397,7 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
+                all_gather_single(output_tensor, input_, group=self.device_group)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 
@@ -1518,9 +1525,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        # Always use pynccl to avoid capturing hip graph failure on torch
-        # version smaller than or equal to 2.11
-        if is_hip() and self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+        if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             self.pynccl_comm.broadcast(input_, src=src)
         else:
             # Broadcast.
@@ -2089,7 +2094,7 @@ def init_world_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=False,
-        use_pymscclpp=False,
+        use_mscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
@@ -2109,7 +2114,7 @@ def init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
-    use_mscclpp_allreduce: Optional[bool] = None,
+    use_mscclpp: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2117,8 +2122,8 @@ def init_model_parallel_group(
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-    if use_mscclpp_allreduce is None:
-        use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
+    if use_mscclpp is None:
+        use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     return GroupCoordinator(
@@ -2130,7 +2135,7 @@ def init_model_parallel_group(
             if use_pynccl is None
             else use_pynccl
         ),
-        use_pymscclpp=use_mscclpp_allreduce,
+        use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
@@ -2156,12 +2161,10 @@ _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 @contextmanager
 def pdmux_prefill_tp_group():
-    """Run on the prefill stream's own tensor-parallel communicator.
+    """Use the duplicate TP communicator for the prefill stream.
 
-    PD multiplexing builds a duplicate TP group -- the same ranks, a second
-    communicator -- so prefill and decode can occupy separate streams without
-    serialising on one. Nothing about the topology differs, so the scope states
-    the handle and nothing else.
+    PD multiplexing keeps prefill and decode on separate communicators with
+    the same ranks. Only the TP handle changes within this scope.
     """
     assert _PDMUX_PREFILL_TP_GROUP is not None, (
         "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
@@ -2274,7 +2277,7 @@ def graph_capture(stream=None):
 logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
-_ENABLE_MSCCLPP_ALL_REDUCE = False
+_ENABLE_MSCCLPP = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 _ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
@@ -2284,9 +2287,9 @@ def set_custom_all_reduce(enable: bool):
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
 
-def set_mscclpp_all_reduce(enable: bool):
-    global _ENABLE_MSCCLPP_ALL_REDUCE
-    _ENABLE_MSCCLPP_ALL_REDUCE = enable
+def set_mscclpp(enable: bool):
+    global _ENABLE_MSCCLPP
+    _ENABLE_MSCCLPP = enable
 
 
 def set_torch_symm_mem_all_reduce(enable: bool):
@@ -2503,9 +2506,7 @@ def init_distributed_environment(
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size"
         )
-    # Stated here rather than with the groups below it: WORLD is built in this
-    # function, and every group `initialize_model_parallel` builds is placed by
-    # reading it back.
+    # Publish WORLD before model-parallel initialization reads its local rank.
     get_parallel().override_permanently(world_group=_WORLD)
 
 
@@ -2520,17 +2521,8 @@ def initialize_model_parallel(
     """
     Initialize model parallel groups at the published widths.
 
-    Every width comes from the runtime context rather than from an argument:
-    the configuration already says how wide each dimension is, and a caller
-    that translates it again is a second place for the two to disagree. A
-    process that needs a narrower layout than the one it published -- the
-    media encoder is the case in the tree -- states that layout on the context
-    first, so what it builds and what it answers stay the same thing.
-
-    The remaining arguments are not topology. `backend` is decided by the
-    device, `duplicate_tp_group` and `enable_symm_mem` by other namespaces, and
-    `recovered_rank` / `rank_offset` / `max_world_size` describe this
-    particular join rather than the layout being joined.
+    Read topology widths from ``get_parallel()``. Callers needing a different
+    layout must override the context before building groups.
 
     The widths this reads:
         tp_size: GPUs used for tensor model parallelism.
@@ -2935,19 +2927,8 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    # The groups just built and the configuration they were built from are two
-    # accounts of one layout, and this is where they meet: stating a group
-    # checks the identities, so a group built on the wrong peers is refused
-    # here rather than hanging in a collective later.
-    #
-    # A dimension this configuration does not have is left unstated -- `_DCP`
-    # is None without decode context parallelism -- so reading it says the
-    # group was never built, which is what these getters have always said,
-    # rather than handing back a None to fail on at the collective.
-    #
-    # WORLD is not here: it is built and stated by
-    # `init_distributed_environment`, which is what lets every build above
-    # place its group by reading `get_world_group().local_rank`.
+    # Validate group widths against the context. Leave disabled groups unset
+    # so reading them raises. WORLD was published by distributed initialization.
     built = {
         "tp_group": _TP,
         "pp_group": _PP,
@@ -3061,8 +3042,6 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     old_pp_group = _PP
     _PP = pp_group
     try:
-        # `pp_size` is a configured leaf: unlike the rank and the handle it
-        # does not follow the group being swapped, so the scope has to name it.
         with get_parallel().override(
             pp_size=pp_group.world_size,
             pp_rank=pp_group.rank_in_group,
@@ -3076,40 +3055,26 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: bool):
-    """Run under a different tensor-parallel group until this scope ends.
+    """Temporarily replace the TP group and its runtime-context values.
 
-    This is for draft workers of speculative decoding, which run the draft model
-    at the target's attention-TP width rather than its global TP width.
-
-    The scope replaces both the module global that ``get_tp_group()`` reads and
-    the members the runtime context answers with.
-
-    Which members depends on what the draft is, and only the worker knows: the
-    same call site hands over an attention-TP slice for one draft and the
-    target's whole TP group for another, so this cannot be read off the group.
-
-    ``owns_attention`` says which. A draft that owns its attention topology
-    runs the whole model on the group being installed -- there is no
-    attention-DP replica inside it, so its attention identity is the group
-    itself, one replica, one context shard, and no expert dimension either.
-    Leaving those names on the target's answers is what lets a draft read
-    report a replica count the draft does not have.
-
-    A draft that does not own it was built outside any scope and keeps the
-    target's layout: the process is still one of several attention-DP replicas
-    and still gathers with them. Claiming one replica there is the same error
-    in the other direction, and the reader that acts on it is a collective -- a
-    DP gather takes its buffer size from the replica count and its communicator
-    from this group, so the two stop agreeing.
-
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
-        owns_attention (bool): whether the draft's attention topology is this
-            group, decided by the worker where it builds its draft runner
+    For speculative drafts with ``owns_attention=True``, the installed group
+    is the draft's attention-TP group, with attention-DP, attention-CP, and
+    MoE-DP/EP widths set to one. Otherwise, retain the target's attention
+    topology. The worker must specify this based on how it constructed the draft.
     """
 
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
+
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
 
     _TP_STATE_PATCHED = True
     global _TP
@@ -3137,10 +3102,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
@@ -3458,24 +3425,15 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
 
 
-# --- deprecation ---------------------------------------------------------
-#
-# These getters are the definition of a name, not a second spelling of it.
-# Business code asks `get_parallel()`, which answers by calling them and which
-# a scope can redirect; a call that arrives here directly cannot be redirected,
-# so a draft worker's scope does not reach it. The package that defines them
-# keeps calling them -- a read there would go through the context back into
-# itself -- so the warning fires only for callers outside it, and once per
-# name, because the point is to name the replacement rather than to fill a log.
+# Use `get_parallel()` outside this package. Warn once per deprecated getter.
 _EXEMPT_CALLERS = ("sglang.srt.distributed.",)
 
-# Which context name each getter here answers. The shim's own bookkeeping --
-# what a getter was replaced by is of no interest to whoever declares the field
-# -- so it is written next to the warning that uses it.
 _CONTEXT_NAME_OF = {
     "get_world_group": "world_group",
     "get_tp_group": "tp_group",
+    "get_tensor_model_parallel_group": "tp_group",
     "get_pp_group": "pp_group",
+    "get_pipeline_model_parallel_group": "pp_group",
     "get_moe_ep_group": "moe_ep_group",
     "get_moe_dp_group": "moe_dp_group",
     "get_moe_tp_group": "moe_tp_group",
@@ -3494,13 +3452,8 @@ _CONTEXT_NAME_OF = {
     "get_attn_context_model_parallel_rank": "attn_cp_rank",
     "get_dcp_rank": "dcp_rank",
 }
-# The width getters read a built group; the context answers the same names from
-# the configuration. Those are one answer rather than two only for the groups
-# the build checks against the configuration -- `_WIDTH_AND_GROUP` in
-# `runtime_context` -- so only those are listed here. `moe_dp`, `moe_tp` and
-# `dcp` are not on that list and are deliberately absent: the MoE-DP group is
-# the attention-CP group when the latter is wider, and the other two are simply
-# not pinned yet.
+# Only deprecate width getters whose group widths are validated against
+# configuration by `_WIDTH_AND_GROUP` in `runtime_context`.
 _CONTEXT_NAME_OF["get_tensor_model_parallel_world_size"] = "tp_size"
 _CONTEXT_NAME_OF["get_attn_tensor_model_parallel_world_size"] = "attn_tp_size"
 _CONTEXT_NAME_OF["get_attn_context_model_parallel_world_size"] = "attn_cp_size"
@@ -3540,9 +3493,7 @@ del _name, _replacement, _fn
 
 
 # What `from sglang.srt.distributed import *` re-exports: everything public
-# except the deprecated getters. Business code reaches them through
-# `get_parallel()`, and the package that defines them imports them from this
-# module by name, so nothing needs the package path to reach one.
+# except the deprecated getters.
 __all__ = [
     _public
     for _public in list(globals())

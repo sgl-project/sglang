@@ -608,6 +608,17 @@ def device_stream_context(stream):
     return torch.get_device_module(stream.device).stream(stream)
 
 
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
@@ -1268,6 +1279,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -1932,7 +1950,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1941,7 +1959,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2389,7 +2407,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2944,18 +2962,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

@@ -46,6 +46,13 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def restore_weights_before_loading(self, layer: nn.Module) -> None:
+        """Undo an in-place repack so checkpoint-format weights can be loaded again.
+
+        Needed only when `process_weights_after_loading` changes parameter shapes.
+        """
+        return
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""

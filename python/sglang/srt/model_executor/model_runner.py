@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -38,7 +38,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     get_healthy_expert_location_src_rank,
-    get_scale_cohort_target,
+    get_scale_cohort,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
@@ -54,6 +54,7 @@ from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
+    should_advance_eplb_counter,
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
@@ -89,6 +90,8 @@ from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
+    Phase,
+    check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -116,6 +119,12 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
     capture_prefill_graph,
+    drop_elastic_cuda_graph_state,
+    finalize_cuda_graph_capture,
+    recapture_elastic_cuda_graph,
+    resolve_elastic_cuda_graph_config,
+    sync_elastic_cuda_graph_config,
+    validate_elastic_cuda_graph_recapture,
 )
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
@@ -124,7 +133,6 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
     ModelLayerInfo,
-    adjust_hybrid_swa_layer_ids,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -429,7 +437,7 @@ class ModelRunner:
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
-        set_offloader(create_offloader(dp_rank=get_parallel().dp_rank))
+        set_offloader(create_offloader())
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -493,6 +501,7 @@ class ModelRunner:
             register_scale_cohort(
                 get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
+                self._elastic_cuda_graph_enabled(),
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
@@ -534,13 +543,6 @@ class ModelRunner:
             state.snapshot_active_to_last()
             state.sync_active_to_cpu()
             state.scale_phase = "syncing_new_world"
-        self._elastic_scale_ready_barrier(
-            target_size=join_effective_ep_size,
-            log_tag="JOINER",
-        )
-        if state is not None:
-            state.scale_phase = "serving_expanded"
-        self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
@@ -580,7 +582,6 @@ class ModelRunner:
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
-            tp_rank=get_parallel().tp_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -651,12 +652,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
-        prepare_moe_topk(
-            model=self.model,
-            model_config=self.model_config,
-            moe_ep_size=get_parallel().moe_ep_size,
-            moe_ep_rank=get_parallel().moe_ep_rank,
-        )
+        prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
 
@@ -670,12 +666,7 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-        )
-        adjust_hybrid_swa_layer_ids(
-            model_config=self.model_config,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_hybrid_swa=self.is_hybrid_swa,
+            draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
@@ -752,8 +743,6 @@ class ModelRunner:
         self.expert_backup_client = (
             ExpertBackupClient(
                 model_config=self.model_config,
-                moe_ep_size=get_parallel().moe_ep_size,
-                moe_ep_rank=get_parallel().moe_ep_rank,
                 get_model=lambda: self.model,
             )
             if (
@@ -795,16 +784,12 @@ class ModelRunner:
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
@@ -972,7 +957,6 @@ class ModelRunner:
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
-                pp_size=get_parallel().pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
@@ -1105,14 +1089,36 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
+        is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
+        defer_decode_capture = (
+            is_scale_joiner
+            and capture_decode_cuda_graph
+            and self._elastic_cuda_graph_enabled()
+        )
+        if is_scale_joiner:
+            self._validate_elastic_cuda_graph_recapture()
         capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            model_runner=self,
+            capture_decode_cuda_graph=(
+                capture_decode_cuda_graph and not defer_decode_capture
+            ),
+            finalize=not defer_decode_capture,
+            defer_distributed_setup=defer_decode_capture,
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+
+        if is_scale_joiner:
+            if self._elastic_cuda_graph_enabled():
+                if defer_decode_capture:
+                    self._recapture_elastic_cuda_graphs()
+                    finalize_cuda_graph_capture(self)
+            # Scheduler startup calls this path even when CUDA graphs are disabled.
+            target_size = get_parallel().ep_join_rank_offset + self.tp_size
+            self._finalize_elastic_ep_joiner(target_size)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1157,11 +1163,7 @@ class ModelRunner:
         self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
             device=self.device, is_draft_worker=self.is_draft_worker
         )
-        # Read once, here: a draft runner is constructed inside the scope that
-        # states its topology and used outside it, so what it holds has to be
-        # the placement it was built for rather than whatever the context
-        # answers later. Groups and widths alike -- a runner asked about its own
-        # shape after the scope has closed must still describe itself.
+        # Capture draft placement at construction; the runner outlives the scope.
         parallel = get_parallel()
         self.tp_group = parallel.tp_group
         self.pp_group = parallel.pp_group
@@ -1390,6 +1392,22 @@ class ModelRunner:
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
     @property
+    def logical_max_total_num_tokens(self):
+        """Request-token capacity in logical tokens, not per-rank DCP rows."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.kv_cache_configurator.logical_token_capacity(
+                max_total_num_tokens=self.max_total_num_tokens
+            )
+        )
+
+    @property
+    def effective_logical_max_total_num_tokens(self):
+        """Logical request limit, preserving hybrid SWA's separate pool bounds."""
+        if self.is_hybrid_swa:
+            return self.effective_max_total_num_tokens
+        return self.logical_max_total_num_tokens
+
+    @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
@@ -1608,6 +1626,8 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+        if self.lora_manager is not None and self.lora_manager.enable_dp_attention:
+            self.lora_manager.prepare_lora_batch(forward_batch)
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
         # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
@@ -1766,7 +1786,8 @@ class ModelRunner:
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
+        # should_advance_eplb_counter is always True on non-hip platform
+        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
@@ -1776,7 +1797,10 @@ class ModelRunner:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if get_exec().moe.elastic_ep_backend is not None:
+        if (
+            get_exec().moe.elastic_ep_backend is not None
+            and not self._elastic_cuda_graph_enabled()
+        ):
             self.maybe_join_ep_ranks()
 
         return output
@@ -1896,6 +1920,7 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+                and forward_batch.token_indices_to_pool is None
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )
@@ -2044,9 +2069,19 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+        *,
+        role: str,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
+            role=role,
         )
 
     def _expand_eplb_metadata_for_scale(
@@ -2130,6 +2165,13 @@ class ModelRunner:
                 target_size,
             )
 
+    def _finalize_elastic_ep_joiner(self, target_size: int) -> None:
+        self._elastic_scale_ready_barrier(target_size=target_size, log_tag="JOINER")
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.scale_phase = "serving_expanded"
+        self._rearm_eplb_after_elastic_scale()
+
     def _finalize_scale_up(
         self,
         ranks_to_join: list[int],
@@ -2179,6 +2221,9 @@ class ModelRunner:
         )
         get_context().override("elastic_ep.scale", dp_size=target_size)
 
+        recapture_cuda_graph = self._elastic_cuda_graph_enabled()
+        if recapture_cuda_graph:
+            self._recapture_elastic_cuda_graphs()
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
@@ -2203,6 +2248,49 @@ class ModelRunner:
                 target_size,
                 ranks_to_join,
             )
+
+    def _elastic_cuda_graph_enabled(self) -> bool:
+        parallel = get_parallel()
+        return (
+            get_exec().moe.elastic_ep_backend is not None
+            and parallel.max_ep_size is not None
+            and parallel.max_ep_size > parallel.tp_size
+            and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+        )
+
+    def _validate_elastic_cuda_graph_recapture(self) -> None:
+        if not self._elastic_cuda_graph_enabled():
+            return
+
+        validate_elastic_cuda_graph_recapture()
+        self.attn_backend.validate_elastic_cuda_graph_recapture()
+
+    def _recapture_elastic_cuda_graphs(self) -> None:
+        if not self._elastic_cuda_graph_enabled():
+            return
+
+        sync_elastic_cuda_graph_config(
+            config=resolve_elastic_cuda_graph_config(self),
+            device=self.device,
+            world_group=dist.group.WORLD,
+        )
+        drop_elastic_cuda_graph_state(
+            decode_runner=self.decode_cuda_graph_runner,
+            eager_runner=self.eager_runner,
+        )
+        self.decode_cuda_graph_runner = None
+        capture = recapture_elastic_cuda_graph(model_runner=self)
+        self.decode_cuda_graph_runner = capture.runner
+        self.graph_memory_usage = replace_graph_memory_usage(
+            self.graph_memory_usage,
+            capture.memory_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
+        self.graph_time_usage = replace_graph_time_usage(
+            self.graph_time_usage,
+            capture.time_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():
@@ -2251,14 +2339,36 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort_target = get_scale_cohort_target(effective_size)
-            if cohort_target is None:
+            cohort = get_scale_cohort(effective_size)
+            if cohort is None:
                 return
-            if cohort_target != pending_size:
+            if cohort.target_ep_size != pending_size:
                 error = (
                     f"Requested target EP size {pending_size} does not match "
-                    f"joining cohort target {cohort_target}"
+                    f"joining cohort target {cohort.target_ep_size}"
                 )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            cuda_graph_enabled = self._elastic_cuda_graph_enabled()
+            if cohort.cuda_graph_enabled != cuda_graph_enabled:
+                error = (
+                    "Primary and joining cohort must use the same CUDA graph "
+                    "configuration for Elastic EP scale-up"
+                )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            try:
+                self._validate_elastic_cuda_graph_recapture()
+            except ValueError as exc:
+                error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)

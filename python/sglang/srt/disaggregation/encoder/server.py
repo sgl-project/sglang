@@ -39,7 +39,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention_flags,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -589,12 +592,7 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        # The encoder serves the vision tower on a world of its own: `tp_size`
-        # ranks wide, with no pipeline, no expert or MoE-DP dimension and no
-        # decode context parallelism, whatever the generation side published.
-        # That has always been the layout it builds; stating it is what stops
-        # the context from answering with the other side's topology while these
-        # groups answer with this one.
+        # The encoder uses a separate WORLD with tensor and attention-CP parallelism.
         parallel = get_parallel()
         attn_cp_size = parallel.attn_cp_size
         attn_tp_size = parallel.tp_size // attn_cp_size
@@ -615,7 +613,8 @@ class MMEncoder:
             moe_tp_size=parallel.tp_size,
         )
         initialize_model_parallel()
-        initialize_dp_attention(server_args, self.model_config)
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(self.model_config)
 
         self.model = load_model(
             model_config=self.model_config,
@@ -671,11 +670,8 @@ class MMEncoder:
                 get_mm().mm_global_cache_backend,
             )
             self.mm_global_cache = EmbeddingCacheController(
-                rank,
-                get_parallel().tp_size,
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
-                tp_group=get_parallel().tp_group.cpu_group,
                 all_rank_get=False,
                 dtype=self._embedding_dtype,
             )
