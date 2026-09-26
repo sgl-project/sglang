@@ -74,7 +74,7 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
     def test_dual_gemv_matches_torch_mm(self):
         """One launch, two independent projections; torch.mm on the same operands is
         the reference."""
-        for rows in (1, 2, 4, 8):
+        for rows in (1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 33, 48):
             with self.subTest(rows=rows):
                 q_lora = torch.randn(
                     rows, Q_LORA_RANK, dtype=torch.bfloat16, device=self.dev

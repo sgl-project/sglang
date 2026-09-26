@@ -28,11 +28,7 @@ CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cuh: TOK_STRIDE (128 K bytes + 4 scal
 Q_LORA_RANK = 2048  # dual_gemv_bf16.cuh: Kq
 HIDDEN_SIZE = 6144  # dual_gemv_bf16.cuh: Kk
 QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cuh: quant block == HEAD_DIM
-# The only per-launch row cap among the four kernels (dual_gemv_bf16.cuh).
-# Section A is chunked to it rather than capping the whole path, so larger
-# verify batches stay fused.
-DUAL_GEMV_MAX_M = 8
-MAX_ROWS = 48  # bs 8 x num_draft_tokens 6
+MAX_ROWS = 48  # bs 8 x num_draft_tokens 6; dual_gemv_bf16.cuh kMaxRows matches it
 
 
 def supported_hardware() -> bool:
@@ -258,19 +254,8 @@ class Gfx950FusedIndexer:
         head_gate = ws.head_gate[:rows]
         logits = ws.logits[:rows, :cols]
 
-        # node 1: oq = q_lora @ wq_b.T and ok = x @ [wk ; weights_proj].T in
-        # one GEMV.  Exact: the slices keep the stride(0) the binding reads,
-        # and rows <= 8 is a single launch.
-        for i in range(0, rows, DUAL_GEMV_MAX_M):
-            j = min(i + DUAL_GEMV_MAX_M, rows)
-            gemv.dual_gemv_bf16(
-                q_lora[i:j],
-                w_q_b,
-                q_proj[i:j],
-                x[i:j],
-                w_kw,
-                kw[i:j],
-            )
+        # node 1: oq = q_lora @ wq_b.T and ok = x @ [wk ; weights_proj].T, one launch.
+        gemv.dual_gemv_bf16(q_lora[:rows], w_q_b, q_proj, x[:rows], w_kw, kw)
 
         # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
         # indexer_k_quant_and_cache(k) | head gate.  The Hadamard is inline, so

@@ -1,6 +1,4 @@
-/// Fused dual bf16 GEMV for the gfx950 DSA indexer: Q [M,4096] from K=2048 and
-/// KW [M,160] from K=6144 in one grid, since the 160-column half alone leaves
-/// the card idle.  M is specialised in [1,8], the decode batch of one step.
+/// Dual bf16 GEMV for the gfx950 DSA indexer: Q [M,4096] and KW [M,160] in one launch.
 
 #pragma once
 
@@ -12,18 +10,13 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/runtime.cuh>
-#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <cstdint>
-
 namespace sglang {
 
-/// The kernel's own scalar aliases live here rather than at ``sglang`` scope:
-/// it wants the compiler builtin ``__bf16`` for its ext_vector_type packs,
-/// which is a different type from ``sglang::bf16_t`` (``__hip_bfloat16``).
+// Local bf16_t is the builtin __bf16 that ext_vector_type needs, not sglang::bf16_t.
 namespace dsa_gfx950::dual_gemv {
 
 using namespace ::sglang::host;
@@ -33,6 +26,16 @@ typedef __bf16 bf16_t;
 typedef bf16_t bf16x2_t __attribute__((ext_vector_type(2)));
 typedef bf16_t bf16x8_t __attribute__((ext_vector_type(8)));
 typedef float float4_t __attribute__((ext_vector_type(4)));
+
+constexpr int kThreads = 256;
+constexpr int kKq = 2048;
+constexpr int kKk = 6144;
+constexpr int kMaxRows = 48;  // fused_decode.MAX_ROWS
+constexpr int kQCols = 16;
+constexpr int kQSteps = kKq / 128;
+constexpr int kQStageRows = 16;
+constexpr int kQStageLd = kThreads + 1;  // 16-byte pad per row against LDS bank conflicts
+constexpr int kKwVecs = kKk / (8 * kThreads);
 
 __device__ __forceinline__ float dot2_bf16(unsigned int x, unsigned int w, float acc) {
   return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(bf16x2_t, x), __builtin_bit_cast(bf16x2_t, w), acc, false);
@@ -49,214 +52,165 @@ __device__ __forceinline__ ushort_t f32_to_bf16_rne(float f) {
   return static_cast<ushort_t>(u >> 16);
 }
 
-// gfx950 exact-Q path.  This is the reduction topology used by the production
-// hipBLASLt MT16x16x512 kernel: four local-split-U accumulators, each owning a
-// contiguous 128-K slice of every DepthU=512 tile, reduced in wave order.
-template <int M>
-__device__ __forceinline__ void load_q_mfma_operands(
+// K offset of MFMA step s, in hipBLASLt MT16x16x512's reduction order so Q matches it bit for bit.
+__device__ __forceinline__ int q_step_k(int s) {
+  return (s >> 2) * 512 + (s & 3) * 32;
+}
+
+// 16 Q columns for all M rows; the weights load once and the first 16 x rows go through LDS.
+__device__ __forceinline__ void gemv_q(
     const bf16_t* __restrict__ x,
     const bf16_t* __restrict__ w,
-    int col0,
-    int N,
-    int K,
-    int wave,
-    int lane,
-    int step,
-    bf16x8_t& a,
-    bf16x8_t& b) {
-  const int operand_row = lane & 15;
-  const int kg = lane >> 4;
-  const int base = (step >> 2) * 512;
-  const int off = (step & 3) * 32;
-  const int kk = base + wave * 128 + off;
-  a = {};
-  b = {};
-  if (operand_row < M) {
-    a = *reinterpret_cast<const bf16x8_t*>(x + (long)operand_row * K + kk + kg * 8);
-  }
-  const int wc = col0 + operand_row;
-  if (wc < N) {
-    b = *reinterpret_cast<const bf16x8_t*>(w + (long)wc * K + kk + kg * 8);
-  }
-}
-
-// ``THREADS`` runs this body as ``THREADS/256`` independent 256-thread column
-// groups inside one workgroup, each with its own waves, columns, LDS slice and
-// reduction.
-template <int M, int THREADS, int PIPE = 0>
-__device__ __forceinline__ void gemv_q_mfma_lsu4(
-    const uint4* __restrict__ Xv,
-    const uint4* __restrict__ Wv,
     ushort_t* __restrict__ O,
     long ldo,
+    int M,
     int col0,
-    int N,
-    int K,
     float* __restrict__ smem) {
-  static_assert(THREADS % 256 == 0, "MFMA Q path needs a multiple of 256");
-  constexpr int kQGroups = THREADS / 256;
-  const int gid = (kQGroups == 1) ? 0 : (int)(threadIdx.x >> 8);
-  const int tid = (kQGroups == 1) ? (int)threadIdx.x : (int)(threadIdx.x & 255);
-  if constexpr (kQGroups > 1) {
-    smem += gid * (64 * M);  // 4 waves x 16 columns x M floats per group
-    col0 += gid * 16;
-  }
-  const int wave = tid >> 6;
-  const int lane = tid & 63;
-  const auto* x = reinterpret_cast<const bf16_t*>(Xv);
-  const auto* w = reinterpret_cast<const bf16_t*>(Wv);
-  float4_t acc = {};
-  // Shift the next global-load pair ahead of the current dependent MFMA.
-  // The accumulator visits the same 16 K fragments in the same order; only
-  // the operand lifetime changes.  This is therefore bit-exact to LSU4.
-  constexpr int kStages = PIPE + 1;
-  bf16x8_t abuf[kStages];
-  bf16x8_t bbuf[kStages];
+  const int wave = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int frag = lane & 15;
+  const int kofs = wave * 128 + (lane >> 4) * 8;
+  const bf16_t* wp = w + (long)(col0 + frag) * kKq + kofs;
+  const bf16_t* xp = x + (long)frag * kKq + kofs;
+  bf16x8_t a[kQSteps];
+  bf16x8_t b[kQSteps];
+  {
+    bf16x8_t xv[kQStageRows];
 #pragma unroll
-  for (int preload = 0; preload < kStages - 1; ++preload) {
-    load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, preload, abuf[preload], bbuf[preload]);
-  }
+    for (int r = 0; r < kQStageRows; ++r)
+      if (r < M) xv[r] = *reinterpret_cast<const bf16x8_t*>(x + (long)r * kKq + threadIdx.x * 8);
 #pragma unroll
-  for (int step = 0; step < 16; ++step) {
-    const int cur = step % kStages;
-    const int ahead = step + kStages - 1;
-    if (ahead < 16) {
-      const int next = ahead % kStages;
-      load_q_mfma_operands<M>(x, w, col0, N, K, wave, lane, ahead, abuf[next], bbuf[next]);
+    for (int s = 0; s < kQSteps; ++s)
+      b[s] = *reinterpret_cast<const bf16x8_t*>(wp + q_step_k(s));
+    bf16x8_t* xs = reinterpret_cast<bf16x8_t*>(smem);
+#pragma unroll
+    for (int r = 0; r < kQStageRows; ++r)
+      if (r < M) xs[r * kQStageLd + threadIdx.x] = xv[r];
+    __syncthreads();
+#pragma unroll
+    for (int s = 0; s < kQSteps; ++s)
+      a[s] = frag < M ? xs[frag * kQStageLd + (kofs + q_step_k(s)) / 8] : bf16x8_t{};
+    __syncthreads();
+  }
+  const int groups = (M + 15) >> 4;
+  for (int g = 0; g < groups; ++g) {
+    const bool more = g + 1 < groups;
+    const bool next_valid = 16 * (g + 1) + frag < M;
+    const bf16_t* xn = xp + (long)16 * (g + 1) * kKq;
+    float4_t acc = {};
+#pragma unroll
+    for (int s = 0; s < kQSteps; ++s) {
+      acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(a[s], b[s], acc, 0, 0, 0);
+      if (more) {
+        a[s] = next_valid ? *reinterpret_cast<const bf16x8_t*>(xn + q_step_k(s)) : bf16x8_t{};
+      }
     }
-    acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(abuf[cur], bbuf[cur], acc, 0, 0, 0);
-    asm volatile("" : "+v"(acc));
-  }
-  const int out_col_local = lane & 15;
-  const int out_row0 = (lane >> 4) * 4;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    if (out_row0 + j < M) {
-      smem[(wave * 16 + out_col_local) * M + out_row0 + j] = acc[j];
-    }
+    // [group][wave][column][row], so the wave-order sum below reads stride 256.
+    *reinterpret_cast<float4_t*>(smem + ((g * 4 + wave) * 16 + frag) * 16 + (lane >> 4) * 4) = acc;
   }
   __syncthreads();
-
-  if (tid < 16 * M) {
-    const int c = tid / M;
-    const int r = tid - c * M;
-    float sum = smem[c * M + r] + smem[(16 + c) * M + r];
-    sum += smem[(32 + c) * M + r];
-    sum += smem[(48 + c) * M + r];
-    if (col0 + c < N) O[(long)r * ldo + col0 + c] = f32_to_bf16_rne(sum);
+  for (int i = threadIdx.x; i < M * kQCols; i += kThreads) {
+    const int r = i >> 4;
+    const int c = i & 15;
+    const float* p = smem + ((r >> 4) * 64 + c) * 16 + (r & 15);
+    float sum = p[0] + p[256];
+    sum += p[512];
+    sum += p[768];
+    O[(long)r * ldo + col0 + c] = f32_to_bf16_rne(sum);
   }
 }
 
-// one column-group body.  smem is [THREADS/64][NCOL][M] floats.
-template <int M, int THREADS, int TPC, int NCOL, int VPT>
-__device__ __forceinline__ void gemv_group(
+// NCOL KW columns for R rows from row0.
+template <int R, int NCOL>
+__device__ __forceinline__ void gemv_kw(
     const uint4* __restrict__ Xv,
     long ldxv,
     const uint4* __restrict__ Wv,
     long ldwv,
     ushort_t* __restrict__ O,
     long ldo,
-    int blk_col0,
+    int M,
+    int row0,
+    int col0,
     int N,
-    float* smem) {
-  constexpr int kGroups = THREADS / TPC;
-  constexpr int kWPG = TPC / 64;  // waves per group (>=1 by construction)
-
+    float* __restrict__ smem) {
   const int tid = threadIdx.x;
-  const int lane = tid % TPC;  // K-slot inside the group
-  const int gid = tid / TPC;   // which column group
-  const int cbase = blk_col0 + gid * NCOL;
-
-  // ---- X into registers, packed as 4 x bf16x2 per 16-byte vector ----------
-  unsigned int xr[M][VPT][4];
+  unsigned int xr[R][kKwVecs][4];
 #pragma unroll
-  for (int m = 0; m < M; ++m) {
+  for (int m = 0; m < R; ++m) {
 #pragma unroll
-    for (int p = 0; p < VPT; ++p) {
-      uint4 t;
-      t = Xv[m * ldxv + lane + p * TPC];
+    for (int p = 0; p < kKwVecs; ++p) {
+      uint4 t = {0u, 0u, 0u, 0u};
+      if (row0 + m < M) t = Xv[(long)(row0 + m) * ldxv + tid + p * kThreads];
       xr[m][p][0] = t.x;
       xr[m][p][1] = t.y;
       xr[m][p][2] = t.z;
       xr[m][p][3] = t.w;
     }
   }
-
-  // ---- all NCOL x VPT weight vectors in flight ---------------------------
-  uint4 wr[NCOL][VPT];
+  uint4 wr[NCOL][kKwVecs];
 #pragma unroll
   for (int c = 0; c < NCOL; ++c) {
-    int col = cbase + c;
+    const int col = col0 + c;
     // clamp instead of branch: out-of-range columns are computed and dropped
-    const uint4* wp = Wv + (long)(col < N ? col : 0) * ldwv + lane;
+    const uint4* wp = Wv + (long)(col < N ? col : 0) * ldwv + tid;
 #pragma unroll
-    for (int p = 0; p < VPT; ++p) {
-      wr[c][p] = wp[p * TPC];
+    for (int p = 0; p < kKwVecs; ++p) {
+      wr[c][p] = wp[p * kThreads];
     }
   }
-
-  float acc[NCOL][M];
-#pragma unroll
-  for (int c = 0; c < NCOL; ++c)
-#pragma unroll
-    for (int m = 0; m < M; ++m)
-      acc[c][m] = 0.0f;
-
+  float acc[NCOL][R] = {};
 #pragma unroll
   for (int c = 0; c < NCOL; ++c) {
 #pragma unroll
-    for (int p = 0; p < VPT; ++p) {
+    for (int p = 0; p < kKwVecs; ++p) {
       unsigned int w4[4] = {wr[c][p].x, wr[c][p].y, wr[c][p].z, wr[c][p].w};
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
 #pragma unroll
-        for (int m = 0; m < M; ++m)
+        for (int m = 0; m < R; ++m)
           acc[c][m] = dot2_bf16(xr[m][p][e], w4[e], acc[c][m]);
       }
     }
   }
-
-  // ---- reduce: 64-lane butterfly, then cross-wave through LDS -------------
   const int wave = tid >> 6;
   const int wlane = tid & 63;
 #pragma unroll
-  for (int c = 0; c < NCOL; ++c) {
+  for (int off = 32; off > 0; off >>= 1) {
 #pragma unroll
-    for (int m = 0; m < M; ++m) {
-      float v = acc[c][m];
+    for (int c = 0; c < NCOL; ++c)
 #pragma unroll
-      for (int off = 32; off > 0; off >>= 1)
-        v += __shfl_down(v, off, 64);
-      if (wlane == 0) smem[(wave * NCOL + c) * M + m] = v;
-    }
+      for (int m = 0; m < R; ++m)
+        acc[c][m] += __shfl_down(acc[c][m], off, 64);
+  }
+  if (wlane == 0) {
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c)
+#pragma unroll
+      for (int m = 0; m < R; ++m)
+        smem[(wave * NCOL + c) * R + m] = acc[c][m];
   }
   __syncthreads();
-
-  constexpr int kOut = kGroups * NCOL * M;
-  if (tid < kOut) {
-    const int g = tid / (NCOL * M);
-    const int r = tid - g * (NCOL * M);
-    const int c = r / M;
-    const int m = r - c * M;
+  if (tid < NCOL * R) {
+    const int c = tid / R;
+    const int m = tid - c * R;
     float s = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWPG; ++w)
-      s += smem[((g * kWPG + w) * NCOL + c) * M + m];
-    const int col = blk_col0 + g * NCOL + c;
-    if (col < N) {
-      const ushort_t v = f32_to_bf16_rne(s);
-      O[(long)m * ldo + col] = v;
-    }
+    for (int w = 0; w < 4; ++w)
+      s += smem[(w * NCOL + c) * R + m];
+    const int col = col0 + c;
+    if (col < N && row0 + m < M) O[(long)(row0 + m) * ldo + col] = f32_to_bf16_rne(s);
   }
 }
 
-template <int M, int THREADS, int TPCK, int NCOLK, int VPTK, int TPCQ, int NCOLQ, int VPTQ, int QPIPE = 0>
-__global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
-    const uint4* __restrict__ Xq,
-    const uint4* __restrict__ Wq,
+// The KW blocks lead the grid so their loads queue ahead of the Q weight stream.
+template <int R, int NCOL>
+__global__ __launch_bounds__(kThreads) void dual_gemv_kernel(
+    const bf16_t* __restrict__ Xq,
+    const bf16_t* __restrict__ Wq,
     ushort_t* __restrict__ Oq,
     long ldoq,
-    int Nq,
+    int nblk_q,
     const uint4* __restrict__ Xk,
     long ldxk,
     const uint4* __restrict__ Wk,
@@ -264,34 +218,30 @@ __global__ __launch_bounds__(THREADS) void dual_gemv_kernel(
     ushort_t* __restrict__ Ok,
     long ldok,
     int Nk,
-    int nblk_k) {
-  constexpr int kColsPerBlkK = (THREADS / TPCK) * NCOLK;
-  constexpr int kColsPerBlkQ = (THREADS / TPCQ) * NCOLQ;
-  constexpr int kSmemK = (THREADS / 64) * NCOLK * M;
-  constexpr int kSmemQ = (THREADS / 64) * NCOLQ * M;
-  __shared__ float smem[kSmemK > kSmemQ ? kSmemK : kSmemQ];
-
-  const int bid = blockIdx.x;
-  // The K blocks sit at the END of the grid, so the Q blocks -- which carry the
-  // longer dependent chain -- are dispatched first.
-  const int first_k = gridDim.x - nblk_k;
-  const bool do_k = bid >= first_k;
-  const int b = do_k ? bid - first_k : bid;
-
-  if (do_k) {
-    gemv_group<M, THREADS, TPCK, NCOLK, VPTK>(Xk, ldxk, Wk, ldwk, Ok, ldok, b * kColsPerBlkK, Nk, smem);
+    int nblk_kc,
+    int M) {
+  constexpr int kSmemQ = kQStageRows * kQStageLd * 4;
+  static_assert(kSmemQ >= (kMaxRows / 16) * 4 * 16 * 16 && kSmemQ >= 4 * NCOL * R);
+  __shared__ __attribute__((aligned(16))) float smem[kSmemQ];
+  const int nblk_k = gridDim.x - nblk_q;
+  int bid = blockIdx.x;
+  bid = bid < nblk_k ? bid + nblk_q : bid - nblk_k;
+  if (bid < nblk_q) {
+    gemv_q(Xq, Wq, Oq, ldoq, M, bid * kQCols, smem);
   } else {
-    gemv_q_mfma_lsu4<M, THREADS, QPIPE>(Xq, Wq, Oq, ldoq, b * kColsPerBlkQ, Nq, VPTQ * TPCQ * 8, smem);
+    const int b = bid - nblk_q;
+    const int rc = b / nblk_kc;
+    const int cb = b - rc * nblk_kc;
+    gemv_kw<R, NCOL>(Xk, ldxk, Wk, ldwk, Ok, ldok, M, rc * R, cb * NCOL, Nk, smem);
   }
 }
 
 struct Args {
-  const uint4* Xq;
-  const uint4* Wq;
+  const bf16_t* Xq;
+  const bf16_t* Wq;
   ushort_t* Oq;
   long ldoq;
   int Nq;
-  int Kq;
   const uint4* Xk;
   long ldxk;
   const uint4* Wk;
@@ -299,43 +249,41 @@ struct Args {
   ushort_t* Ok;
   long ldok;
   int Nk;
-  int Kk;
+  int M;
   hipStream_t stream;
 };
 
-template <int M, int THREADS, int TPCK, int NCOLK, int TPCQ, int NCOLQ, int QPIPE = 0>
+template <int R, int NCOL>
 void launch(const Args& a) {
-  constexpr int kColsK = (THREADS / TPCK) * NCOLK;
-  constexpr int kColsQ = (THREADS / TPCQ) * NCOLQ;
-  // The shipped configuration is the only one this file builds: 16-byte
-  // vectors per thread, 3 on the K half and 1 on the Q half.
-  constexpr int VPTK = 3;
-  constexpr int VPTQ = 1;
-  RuntimeCheck(
-      a.Kk == VPTK * TPCK * 8 && a.Kq == VPTQ * TPCQ * 8,
-      "dual_gemv is built for Kk=6144, Kq=2048; got Kk=",
-      a.Kk,
-      " Kq=",
-      a.Kq);
-  const int nblk_k = (a.Nk + kColsK - 1) / kColsK;
-  const int nblk_q = (a.Nq + kColsQ - 1) / kColsQ;
-  dual_gemv_kernel<M, THREADS, TPCK, NCOLK, VPTK, TPCQ, NCOLQ, VPTQ, QPIPE>
-      <<<dim3(nblk_k + nblk_q), dim3(THREADS), 0, a.stream>>>(
-          a.Xq, a.Wq, a.Oq, a.ldoq, a.Nq, a.Xk, a.ldxk, a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_k);
+  const int nblk_q = a.Nq / kQCols;
+  const int nblk_kc = (a.Nk + NCOL - 1) / NCOL;
+  const int nblk_kr = (a.M + R - 1) / R;
+  dual_gemv_kernel<R, NCOL><<<dim3(nblk_q + nblk_kc * nblk_kr), dim3(kThreads), 0, a.stream>>>(
+      a.Xq, a.Wq, a.Oq, a.ldoq, nblk_q, a.Xk, a.ldxk, a.Wk, a.ldwk, a.Ok, a.ldok, a.Nk, nblk_kc, a.M);
 }
 
-// The accepted configuration.  Its parameters are template arguments, not a
-// selector: retuning means editing this line.
-//                       THR TPCK NK TPCQ NQ  PIPE
-template <int M>
-void dispatch(const Args& a) {
-  launch<M, 256, 256, 2, 256, 16, 2>(a);
+// KW block shape (rows x columns) per M range.
+inline void dispatch(const Args& a) {
+  if (a.M == 1) {
+    launch<1, 1>(a);
+  } else if (a.M == 2) {
+    launch<2, 1>(a);
+  } else if (a.M <= 4) {
+    launch<4, 1>(a);
+  } else if (a.M <= 6) {
+    launch<2, 2>(a);
+  } else if (a.M <= 8) {
+    launch<4, 2>(a);
+  } else if (a.M <= 24) {
+    launch<4, 4>(a);
+  } else {
+    launch<8, 4>(a);
+  }
 }
 }  // namespace dsa_gfx950::dual_gemv
 
 struct DualGemvBf16Kernel {
-  /// Oq = Xq @ Wq^T and Ok = Xk @ Wk^T in one launch.  All six tensors are
-  /// bf16; outputs are written, never accumulated.
+  /// Oq = Xq @ Wq^T and Ok = Xk @ Wk^T, all bf16; outputs are overwritten.
   static void
   run(const tvm::ffi::TensorView Xq,
       const tvm::ffi::TensorView Wq,
@@ -354,8 +302,7 @@ struct DualGemvBf16Kernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    // The Q half addresses x + operand_row * K, so a padded tensor would read
-    // the wrong rows with no other symptom; hence packed strides on Xq/Wq.
+    // Q reads x at row * K, so a padded Xq or Wq would silently read wrong rows.
     TensorMatcher({M_, Kq_}).with_dtype<bf16_t>().with_device(device_).with_strides({Kq_, 1}).verify(Xq);
     TensorMatcher({Nq_, Kq_}).with_dtype<bf16_t>().with_device(device_).with_strides({Kq_, 1}).verify(Wq);
     TensorMatcher({M_, Nq_}).with_dtype<bf16_t>().with_device(device_).with_strides({-1, 1}).verify(Oq);
@@ -364,55 +311,32 @@ struct DualGemvBf16Kernel {
     TensorMatcher({M_, Nk_}).with_dtype<bf16_t>().with_device(device_).with_strides({-1, 1}).verify(Ok);
 
     const auto M = static_cast<int>(M_.unwrap());
-    RuntimeCheck(M >= 1 && M <= 8, "dual_gemv is specialised for M in [1,8], got ", M);
+    RuntimeCheck(M >= 1 && M <= impl::kMaxRows, "dual_gemv supports M in [1,", impl::kMaxRows, "], got ", M);
+    const auto Kq = static_cast<int>(Kq_.unwrap());
+    const auto Kk = static_cast<int>(Kk_.unwrap());
+    RuntimeCheck(
+        Kk == impl::kKk && Kq == impl::kKq, "dual_gemv is built for Kk=6144, Kq=2048; got Kk=", Kk, " Kq=", Kq);
 
     impl::Args a;
-    a.Xq = reinterpret_cast<const uint4*>(Xq.data_ptr());
-    a.Wq = reinterpret_cast<const uint4*>(Wq.data_ptr());
+    a.Xq = reinterpret_cast<const impl::bf16_t*>(Xq.data_ptr());
+    a.Wq = reinterpret_cast<const impl::bf16_t*>(Wq.data_ptr());
     a.Oq = reinterpret_cast<impl::ushort_t*>(Oq.data_ptr());
-    a.Kq = static_cast<int>(Kq_.unwrap());
     a.Nq = static_cast<int>(Nq_.unwrap());
     a.ldoq = Oq.stride(0);
     a.Xk = reinterpret_cast<const uint4*>(Xk.data_ptr());
     a.Wk = reinterpret_cast<const uint4*>(Wk.data_ptr());
     a.Ok = reinterpret_cast<impl::ushort_t*>(Ok.data_ptr());
-    a.Kk = static_cast<int>(Kk_.unwrap());
     a.Nk = static_cast<int>(Nk_.unwrap());
     a.ldxk = Xk.stride(0) / 8;
     a.ldwk = Wk.stride(0) / 8;
     a.ldok = Ok.stride(0);
+    a.M = M;
     a.stream = LaunchKernel::resolve_device(device_.unwrap());
 
-    // A 16-byte (8 bf16) load is the unit, so every K-half row start has to
-    // land on one; the Q half is packed with Kq == 2048.
+    RuntimeCheck(a.Nq % impl::kQCols == 0, "dual_gemv needs n_q % 16 == 0, got ", a.Nq);
     RuntimeCheck(Xk.stride(0) % 8 == 0 && Wk.stride(0) % 8 == 0, "the K operands must start on an 8-element boundary");
 
-    switch (M) {
-      case 1:
-        impl::dispatch<1>(a);
-        break;
-      case 2:
-        impl::dispatch<2>(a);
-        break;
-      case 3:
-        impl::dispatch<3>(a);
-        break;
-      case 4:
-        impl::dispatch<4>(a);
-        break;
-      case 5:
-        impl::dispatch<5>(a);
-        break;
-      case 6:
-        impl::dispatch<6>(a);
-        break;
-      case 7:
-        impl::dispatch<7>(a);
-        break;
-      case 8:
-        impl::dispatch<8>(a);
-        break;
-    }
+    impl::dispatch(a);
     RuntimeDeviceCheck();
   }
 };
