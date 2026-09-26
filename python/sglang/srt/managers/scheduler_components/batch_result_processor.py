@@ -918,6 +918,16 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+        # A locally idle DP rank still runs empty batches while its peers decode.
+        # Refresh its gauges here too; it may never reach scheduler idle handling.
+        # With overlap, this result may precede an active decode or prefill batch.
+        scheduler = self.metrics_reporter.scheduler
+        current_batch = scheduler.cur_batch_for_debug
+        if not scheduler.running_batch.reqs and (
+            current_batch is None or not current_batch.reqs
+        ):
+            self.metrics_reporter._maybe_log_idle_metrics()
+
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,
