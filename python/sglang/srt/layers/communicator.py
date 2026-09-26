@@ -39,11 +39,13 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.boundary_layout import (
     DecoderLayerSides,
+    EdgeDecl,
     Layout,
     StageInput,
     StageOutput,
     SumGroup,
     TokenAxis,
+    decoder_layer_edges,
     decoder_layer_sides,
     input_scattered_layer_sides,
     scattered_residual_layer_sides,
@@ -2314,6 +2316,110 @@ class BoundarySteps(msgspec.Struct, frozen=True):
         return self.ffn_output_move is None
 
 
+class InputRead(Enum):
+    """How a boundary's consumer reads its input from the residual: with the
+    attention input norm (prepare_attn) or with the FFN input norm and its
+    fused kernels (prepare_mlp)."""
+
+    ATTENTION = auto()
+    FFN = auto()
+
+
+class Boundary(msgspec.Struct, frozen=True):
+    """The steps one layer runs at one boundary, chosen from both sides'
+    declarations. A layer runs the consumer's half of a boundary into one of
+    its stages, and the producer's half of the boundary after its last stage;
+    the neighbouring layer runs the other half of that one."""
+
+    edge: EdgeDecl
+    # The consumer's half: what completes a sum the input owes by construction,
+    # then the step that brings it into the stage (for the FFN, completing the
+    # attention output's sum, the add and the norm too).
+    layer_input: Optional[Callable] = None
+    input_step: Optional[Callable] = None
+    # The fused kernels input_step tries first.
+    fused: Tuple["FusedMlpInput", ...] = ()
+    # The producer's half: the postprocess that moves the output onto the rows
+    # the layer hands on; None when it goes back over attention DP, whose step
+    # the FFN exit and postprocess choose per batch.
+    output_move: Optional[Callable] = None
+    # Whether output_move also completes the sum the producer leaves.
+    output_move_completes_sum: bool = False
+
+    @property
+    def input_rows(self) -> Layout:
+        """The rows input_step hands the consumer: what it needs, still sharded
+        over the axes it gathers itself."""
+        need = self.edge.need
+        return Layout(
+            need.layout.sharded
+            | (self.edge.produced.layout.sharded & need.gathers_itself)
+        )
+
+
+def make_boundary(
+    edge: EdgeDecl,
+    *,
+    reads: Optional[InputRead],
+    fusions: Tuple["FusedMlpInput", ...] = (),
+    force_layernorm_before_gather: bool = False,
+    cp_moves: Optional[CpMoves] = None,
+    residual_ops: ResidualOps = ADD_AND_NORM,
+) -> Boundary:
+    """The steps a layer runs at ``edge``, around the residual operations;
+    ``cp_moves`` for an edge that gathers over or returns across attention CP.
+    ``reads`` is how the consumer reads its input, or None when the consumer
+    runs in the next layer and ``edge.need`` is the rows this layer hands on:
+    then only the producer's half runs here. The consumer's half reads only
+    this edge's declarations, never what the producer chose for a batch; a sum
+    left for a batch arrives with the value."""
+    if reads is None:
+        if edge.need.layout != edge.residual_to:
+            raise NotImplementedError(f"{edge=}")
+        returns_over_dp, output_move, completes_sum = _select_ffn_output_move(
+            edge.produced,
+            residual=edge.residual,
+            to=edge.residual_to,
+            cp_moves=cp_moves,
+            residual_ops=residual_ops,
+        )
+        return Boundary(
+            edge,
+            output_move=None if returns_over_dp else output_move,
+            output_move_completes_sum=completes_sum,
+        )
+    if reads is InputRead.FFN:
+        input_step, fused = _select_ffn_input(
+            edge.produced,
+            residual=edge.residual,
+            residual_to=edge.residual_to,
+            need=edge.need,
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            fusions=fusions,
+            residual_joins_sum=edge.residual_joins_sum,
+            cp_moves=cp_moves,
+            residual_ops=residual_ops,
+        )
+        return Boundary(edge, input_step=input_step, fused=fused)
+    layer_input = None
+    if edge.produced.always_leaves:
+        # A reduce-scatter completes the TP sum onto each rank's slice, which the
+        # attention takes: its group is the TP group without attention DP or CP.
+        if (
+            edge.produced.group is not SumGroup.TP
+            or edge.residual.sharded
+            or TokenAxis.ATTN_TP_SCATTER not in edge.need.gathers_itself
+            or edge.residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
+        ):
+            raise NotImplementedError(f"{edge=}")
+        layer_input = tp_reduce_scatter
+    return Boundary(
+        edge,
+        layer_input=layer_input,
+        input_step=_select_attention_input_move(edge.residual_to, edge.need),
+    )
+
+
 def _select_boundary_steps(
     sides: DecoderLayerSides,
     *,
@@ -2323,53 +2429,34 @@ def _select_boundary_steps(
     residual_ops: ResidualOps = ADD_AND_NORM,
     attention_handoff: Callable = _hand_qkv_hook_its_input,
 ) -> BoundarySteps:
-    """The steps a set of declarations chooses, around the layer's residual
-    operations; ``cp_moves`` for the ones that gather over attention CP."""
-    returns_over_dp, ffn_output_move, completes_sum = _select_ffn_output_move(
-        sides.ffn_output,
-        residual=sides.ffn_residual_rows,
-        to=sides.output_rows,
+    """The steps of a decoder layer: its three boundaries, each chosen from the
+    declarations of its two sides, around the layer's residual operations. Both
+    edges that cross attention CP take the same ``cp_moves``."""
+    edges = decoder_layer_edges(sides)
+    out_of_ffn = make_boundary(
+        edges.out_of_ffn, reads=None, cp_moves=cp_moves, residual_ops=residual_ops
+    )
+    into_ffn = make_boundary(
+        edges.into_ffn,
+        reads=InputRead.FFN,
+        fusions=fusions,
+        force_layernorm_before_gather=force_layernorm_before_gather,
         cp_moves=cp_moves,
         residual_ops=residual_ops,
     )
-    rows = sides.input_rows
-    layer_input = None
-    if sides.input_owes is not None:
-        # A reduce-scatter completes the TP sum onto each rank's slice, which the
-        # attention takes: its group is the TP group without attention DP or CP.
-        if (
-            sides.input_owes is not SumGroup.TP
-            or rows.sharded
-            or TokenAxis.ATTN_TP_SCATTER not in sides.attention.gathers_itself
-        ):
-            raise NotImplementedError(f"{sides=}")
-        layer_input = tp_reduce_scatter
-        rows = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-    ffn_input, fused = _select_ffn_input(
-        sides.attention_output,
-        residual=rows,
-        residual_to=sides.ffn_residual_rows,
-        need=sides.ffn,
-        force_layernorm_before_gather=force_layernorm_before_gather,
-        fusions=fusions,
-        residual_joins_sum=sides.residual_joins_attention_sum,
-        cp_moves=cp_moves,
-        residual_ops=residual_ops,
+    into_attention = make_boundary(
+        edges.into_attention, reads=InputRead.ATTENTION, residual_ops=residual_ops
     )
     return BoundarySteps(
-        attention_input=_select_attention_input_move(rows, sides.attention),
-        ffn_input=ffn_input,
-        # What the FFN needs, still sharded over the axes it gathers itself.
-        ffn_input_rows=Layout(
-            sides.ffn.layout.sharded
-            | (sides.attention_output.layout.sharded & sides.ffn.gathers_itself)
-        ),
-        ffn_output=sides.ffn_output,
-        ffn_output_move=None if returns_over_dp else ffn_output_move,
-        ffn_output_move_completes_sum=completes_sum,
-        ffn_sum_is_movable=sides.ffn_output.group is not None,
-        fused=fused,
-        layer_input=layer_input,
+        attention_input=into_attention.input_step,
+        ffn_input=into_ffn.input_step,
+        ffn_input_rows=into_ffn.input_rows,
+        ffn_output=edges.out_of_ffn.produced,
+        ffn_output_move=out_of_ffn.output_move,
+        ffn_output_move_completes_sum=out_of_ffn.output_move_completes_sum,
+        ffn_sum_is_movable=edges.out_of_ffn.produced.group is not None,
+        fused=into_ffn.fused,
+        layer_input=into_attention.layer_input,
         attention_handoff=attention_handoff,
     )
 
