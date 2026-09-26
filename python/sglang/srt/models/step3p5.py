@@ -572,6 +572,9 @@ class Step3p5DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            # The dense MLP all-reduces its own output unless postprocess
+            # reduce-scatters it; it never leaves the sum to the next layer.
+            allow_deferred_ffn_reduction=self.use_moe,
         )
 
         self.layer_id = layer_id
@@ -618,18 +621,9 @@ class Step3p5DecoderLayer(nn.Module):
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return ffn_exit.finish(hidden_states, residual)
 
-        # The dense MLP all-reduces its own output unless postprocess
-        # reduce-scatters it; it never leaves the sum to the next layer.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False, mlp_reduce_scatter=mlp_reduce_scatter
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        return self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        return ffn_exit.finish(hidden_states, residual)
 
 
 class Step3p5Model(nn.Module):
