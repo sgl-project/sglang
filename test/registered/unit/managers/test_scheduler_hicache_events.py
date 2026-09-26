@@ -26,6 +26,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
+        s.enable_lmcache = False
         s.enable_hicache_storage = True
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry

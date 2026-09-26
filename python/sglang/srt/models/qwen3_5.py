@@ -43,7 +43,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    reduce_output,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -103,7 +107,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_lora,
     get_parallel,
     get_stream,
@@ -300,20 +303,6 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
-
-
-def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
-
-    if not expect_deferred:
-        if isinstance(hidden_states, MoeFinalizeHandoff):
-            raise RuntimeError("unexpected deferred-finalize handoff")
-        hidden_states._sglang_needs_allreduce_fusion = True
-        return hidden_states
-
-    if not isinstance(hidden_states, MoeFinalizeHandoff):
-        raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
-    return hidden_states
 
 
 if _is_npu:
@@ -1140,7 +1129,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
@@ -1177,53 +1165,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        defer_moe_finalize = (
-            fuse_mlp_allreduce
-            and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and self.layer_communicator.should_defer_moe_finalize(
-                forward_batch, int(hidden_states.shape[0])
-            )
-        )
-        if (
-            fuse_mlp_allreduce
-            and self.layer_communicator.is_last_layer
-            and not defer_moe_finalize
-        ):
-            # The last layer has no prepare_attn consumer for deferred AllReduce;
-            # fall back before MLP so postprocess_layer performs the collective.
-            fuse_mlp_allreduce = False
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
-                    defer_finalize=defer_moe_finalize,
+                    defer_finalize=ffn_exit.defer_moe_finalize,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states = _finish_mlp_output(
-                hidden_states, expect_deferred=defer_moe_finalize
-            )
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return ffn_exit.finish(hidden_states, residual)
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
@@ -1381,7 +1332,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
         )
@@ -1614,51 +1564,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        defer_moe_finalize = (
-            fuse_mlp_allreduce
-            and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            and self.layer_communicator.should_defer_moe_finalize(
-                forward_batch, int(hidden_states.shape[0])
-            )
-        )
-        if (
-            fuse_mlp_allreduce
-            and self.layer_communicator.is_last_layer
-            and not defer_moe_finalize
-        ):
-            fuse_mlp_allreduce = False
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
-                    defer_finalize=defer_moe_finalize,
+                    defer_finalize=ffn_exit.defer_moe_finalize,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states = _finish_mlp_output(
-                hidden_states, expect_deferred=defer_moe_finalize
-            )
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
+        return ffn_exit.finish(hidden_states, residual)
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1934,9 +1849,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
+                hidden_states = reduce_output(hidden_states)
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
