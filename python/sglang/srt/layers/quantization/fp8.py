@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     block_fp8_scale_to_mxfp8_e8m0,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
@@ -64,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     input_to_float8,
+    inverse_transform_scale_ue8m0,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
@@ -158,6 +160,20 @@ def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     if not _use_aiter:
         raise RuntimeError("FP8 weight unshuffle requires AITER")
     return unshuffle_aiter_fp8_weight(weight)
+
+
+def _xpu_dequant_block_fp8(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: List[int],
+    out_dtype: torch.dtype = torch.bfloat16,
+    scale_is_ue8m0: bool = False,
+) -> torch.Tensor:
+    # Folding the per-[block_n, block_k] scale into the weight once at load turns
+    # the runtime op into a plain mm, which oneDNN serves directly.
+    if scale_is_ue8m0:
+        scale = inverse_transform_scale_ue8m0(scale, mn=weight.shape[-2])
+    return block_quant_dequant(weight, scale, block_size, out_dtype)
 
 
 if _use_aiter or _use_hip_int4:
@@ -515,6 +531,14 @@ class Fp8LinearMethod(LinearMethodBase):
             or (_is_hip and envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
         )
         self.weight_block_size = self.quant_config.weight_block_size
+        self.xpu_fp8_to_bf16_gemm = (
+            is_xpu()
+            and not self.use_mxfp8
+            and envs.SGLANG_OPT_XPU_FP8_TO_BF16_GEMM.get()
+        )
+        # True once the weight has been materialized as bf16, which sends apply()
+        # to F.linear instead of the block-fp8 kernel.
+        self.xpu_dense_bf16 = False
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
@@ -616,6 +640,9 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+        # Set to True by a model that reads .weight / .weight_scale_inv itself and
+        # runs its own GEMM (DeepSeek-V4 wo_a).
+        layer.keep_plain_weight_layout = False
 
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
@@ -722,6 +749,26 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.xpu_dense_bf16:
+            return
+        if (
+            self.xpu_fp8_to_bf16_gemm
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and not layer.keep_plain_weight_layout
+        ):
+            layer.weight = Parameter(
+                _xpu_dequant_block_fp8(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.weight_block_size,
+                    out_dtype=layer.orig_dtype,
+                    scale_is_ue8m0=layer.weight_scale_inv.format_ue8m0,
+                ),
+                requires_grad=False,
+            )
+            del layer.weight_scale_inv
+            self.xpu_dense_bf16 = True
+            return
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -1151,6 +1198,14 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.xpu_dense_bf16:
+            if isinstance(x, tuple):
+                raise RuntimeError(
+                    "The dequantized bf16 dense path requires unquantized "
+                    "activations, but received a pre-quantized tuple."
+                )
+            return F.linear(x, layer.weight, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
