@@ -1278,6 +1278,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
 
+    def test_olmo3_keeps_hybrid_swa_memory(self):
+        sa = self._construct(
+            "Olmo3ForCausalLM", "olmo3", config_extra={"num_hidden_layers": 4}
+        )
+        hf_config = base_module.model_config_of(sa).hf_config
+        self.assertEqual(hf_config.architectures, ["Olmo2ForCausalLM"])
+        self.assertTrue(hf_config.is_hybrid_swa)
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_olmo3_hybrid_swa_memory_off_under_hierarchical_cache(self):
+        from sglang.srt.arg_groups.model_overrides.olmo2 import _olmo2_overrides
+
+        overrides = _olmo2_overrides(
+            SimpleNamespace(attention_backend="triton", enable_hierarchical_cache=True),
+            SimpleNamespace(architectures=["Olmo2ForCausalLM"], is_hybrid_swa=True),
+        )
+        self.assertTrue(overrides["disable_hybrid_swa_memory"])
+
+    def test_olmo3_opt_in_is_read_from_the_text_config(self):
+        from sglang.srt.arg_groups.model_overrides.olmo2 import _olmo2_overrides
+
+        overrides = _olmo2_overrides(
+            SimpleNamespace(
+                attention_backend="triton", enable_hierarchical_cache=False
+            ),
+            SimpleNamespace(
+                architectures=["Olmo2ForCausalLM"],
+                text_config=SimpleNamespace(is_hybrid_swa=True),
+            ),
+        )
+        self.assertNotIn("disable_hybrid_swa_memory", overrides)
+
     def test_exaone_conditional_on_sliding_window_pattern(self):
         # With the pattern the branch also asserts an explicit backend.
         sa = self._construct(
