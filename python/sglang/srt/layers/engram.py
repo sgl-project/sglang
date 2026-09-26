@@ -42,7 +42,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -875,6 +875,57 @@ def engram_gate(
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
+def build_engram_projection(
+    input_size,
+    output_size,
+    *,
+    quant_config,
+    prefix,
+    tp_rank=0,
+    tp_size=1,
+    dp_attention=False,
+    cp_size=1,
+    prefill_cp=False,
+    sequence_parallel=False,
+):
+    """Shard replicated-token WKV columns, gathering outputs before the Engram gate."""
+    block = getattr(quant_config, "weight_block_size", None)
+    if (
+        tp_size not in (4, 8)
+        or dp_attention
+        or cp_size != 1
+        or prefill_cp
+        or sequence_parallel
+        or output_size % tp_size
+        or (block and (output_size // tp_size) % block[0])
+    ):
+        return ReplicatedLinear(
+            input_size,
+            output_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    layer = ColumnParallelLinear(
+        input_size,
+        output_size,
+        bias=False,
+        gather_output=True,
+        quant_config=quant_config,
+        prefix=prefix,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    logger.info(
+        "Engram projection TP enabled: %s rank=%d/%d local_weight=%s gather_output=True",
+        prefix,
+        tp_rank,
+        tp_size,
+        tuple(layer.weight.shape),
+    )
+    return layer
+
+
 class Engram(nn.Module):
     def __init__(
         self,
@@ -893,12 +944,20 @@ class Engram(nn.Module):
             layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = ReplicatedLinear(
+        parallel = get_parallel()
+        self.wkv = build_engram_projection(
             n_hash_cols * layout.head_dim,
             dim * (hc_mult + 1),
-            bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wkv", prefix),
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            dp_attention=parallel.enable_dp_attention,
+            cp_size=parallel.attn_cp_size,
+            prefill_cp=parallel.enable_prefill_cp,
+            sequence_parallel=(
+                parallel.enable_layernorm_sp or parallel.enable_attn_tp_input_scattered
+            ),
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
