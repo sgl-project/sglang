@@ -150,14 +150,15 @@ def sparse_logits(
 def topk_transform_sparse(
     logits: torch.Tensor,
     valid_lens: torch.Tensor,
-    phys_blocks: torch.Tensor,
-    page_indices: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
 ) -> None:
-    """Top-``k`` (``k = page_indices.shape[1]``) of every row of the sparse
+    """Top-``k`` (``k = out_indices.shape[1]``) of every row of the sparse
     ``logits`` (bf16 ``[rows, topk_blocks * 8]``) within its first ``valid_lens[b]``
-    columns, written as pool slots, ``-1`` where a row has fewer than ``k`` valid
-    columns, in no particular order; ``phys_blocks`` ``[rows, topk_blocks]`` int32
-    holds the published blocks as pool slots / 8."""
+    columns, ``-1`` where a row has fewer than ``k`` valid columns, in no
+    particular order. Column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``
+    with ``blocks`` ``[rows, topk_blocks]`` int32: the published blocks as pool
+    slots / 8 for pool slots, or as logical block ids for compressed positions."""
     topk_transform_bf16_small(
-        logits, valid_lens, phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
+        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

@@ -23,9 +23,9 @@ from sglang.kernels.ops.attention.dsv4.candidate_table import (
     build_sparse_indexer_schedule,
     sort_candidate_blocks,
     sparse_logits,
+    topk_transform_sparse,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_bf16_small,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
@@ -329,12 +329,8 @@ class SparseTableBackend:
             published.blocks.shape[1],
         )
         assert out.raw_indices is None
-        topk_transform_bf16_small(
-            logits,
-            published.valid_lens,
-            published.phys_blocks,
-            out.page_indices,
-            CANDIDATE_BLOCK_SIZE,
+        topk_transform_sparse(
+            logits, published.valid_lens, published.phys_blocks, out.page_indices
         )
 
     def _get_prefill_data(self, inputs: PrefillInputs) -> Optional[DeepGEMMPrefillData]:
@@ -470,11 +466,5 @@ def select_prefill_table(
         table.blocks.shape[1],
     )
     # request-relative compressed positions, -1 padded
-    topk_transform_bf16_small(
-        logits,
-        table.valid_lens,
-        table.blocks,
-        out_positions,
-        CANDIDATE_BLOCK_SIZE,
-    )
+    topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
     out_positions.add_(torch.where(out_positions >= 0, data.request_starts[:, None], 0))
