@@ -11,10 +11,11 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
 )
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -142,25 +143,25 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length):
+    def register(self, ptr, length) -> None:
         try:
             ret_value = self.engine.register_memory(ptr, length)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError("Mooncake memory registration failed") from exc
 
         if ret_value != 0:
-            logger.debug("Mooncake memory registration %s failed.", ptr)
+            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
 
-    def deregister(self, ptr):
+    def deregister(self, ptr) -> None:
         try:
             ret_value = self.engine.unregister_memory(ptr)
-        except Exception:
-            # Mark deregister as failed
-            ret_value = -1
+        except Exception as exc:
+            raise RuntimeError("Mooncake memory deregistration failed") from exc
 
         if ret_value != 0:
-            logger.debug("Mooncake memory deregistration %s failed.", ptr)
+            raise RuntimeError(
+                f"Mooncake memory deregistration failed (ret={ret_value})"
+            )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
@@ -207,11 +208,15 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = self.engine.initialize(
-            hostname,
-            "P2PHANDSHAKE",
-            protocol,
-            device_name if device_name is not None else "",
+        ret_value = run_with_deadline(
+            lambda: self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                protocol,
+                device_name if device_name is not None else "",
+            ),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
@@ -307,9 +312,7 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     return _mooncake_transfer_engine
 
 
-def maybe_init_shared_mooncake_transfer_engine(
-    *, server_args: ServerArgs, gpu_id: int
-) -> None:
+def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)

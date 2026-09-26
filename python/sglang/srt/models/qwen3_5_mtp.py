@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -34,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -57,31 +57,46 @@ def _mtp_quant_config(quant_config):
     # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
     # BF16. Disable quantization for those checkpoints; non-serialized
     # modelopt_fp4 still converts MoE expert weights on load.
+    if quant_config and quant_config.get_name() == "modelopt_mixed":
+        # MIXED_PRECISION lists mtp.* layers only when the MTP head is quantized.
+        if any(name.startswith("mtp.") for name in quant_config.quantized_layers):
+            return quant_config
+        return None
     if quant_config and (
-        quant_config.get_name() == "modelopt_mixed"
-        or (
-            quant_config.get_name() == "modelopt_fp4"
-            and quant_config.is_checkpoint_nvfp4_serialized
-        )
+        quant_config.get_name() == "modelopt_fp4"
+        and quant_config.is_checkpoint_nvfp4_serialized
     ):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
+    # Some Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module
+    # entirely in bf16, listing every `mtp.*` layer under the quantization
+    # exclude list. Skip quantization for those so linear/MoE weight loaders
+    # allocate bf16 shapes (see sgl-project/sglang#23146).
+    #
+    # Others are mixed: the routed experts stay MXFP4 while attention, the
+    # shared expert and fc are excluded. Skipping there would make the MoE
+    # loader allocate bf16 experts that the MXFP4 checkpoint shards no longer
+    # fit. The routed experts are the bulk of the draft, so use them as the
+    # signal and skip only when they are excluded too; the per-layer
+    # exclusions keep the remaining bf16 modules bf16 on their own.
     if quant_config and quant_config.get_name() == "quark":
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+        mtp_excludes = [
+            layer
+            for layer in getattr(quant_config, "exclude_layers", [])
+            if isinstance(layer, str) and layer.startswith("mtp.")
+        ]
+        if mtp_excludes and any("mlp.experts" in layer for layer in mtp_excludes):
             return None
     return quant_config
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # The loader reads this off the model class and hands it to the quant
+    # config, which needs it to expand fused module names (qkv_proj ->
+    # q/k/v_proj) before matching them against an exclude list. Without it an
+    # excluded attention projection is not recognised as excluded.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -110,7 +125,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
@@ -128,7 +143,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             is_nextn=True,
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -154,14 +169,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # A last-stage draft can share only the target lm_head under PP; retain its
+        # own embedding for the first-stage half it cannot receive.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+            self.lm_head.weight = head
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
         if self.config.tie_word_embeddings:
@@ -214,6 +231,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # Captured prefill gives padded embeddings but real-height target states;
+            # place the real rows in an equal-height slot whose padding stays unread.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
@@ -279,8 +306,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             "_input_scale",
         )
 
-        # fused experts: experts.w13_weight / experts.w2_weight
-        is_fused_expert = False
+        # Fused checkpoint tensors: experts.gate_up_proj / experts.down_proj.
+        # The checkpoint interleaves these with separate shared-expert tensors,
+        # so picking one mapping must not affect the next weight.
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -311,6 +339,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # The last-stage MTP draft cannot share the target embedding on PP0.
+            # Load the checkpoint embedding into its retained local copy instead
+            # of leaving the torch.empty() allocation uninitialized.
+            if name in (
+                "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            ):
+                param_name = "model.embed_tokens.weight"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -339,13 +384,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     f"mlp.experts.{num_experts}.",
                 )
 
+            is_fused_expert = (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
+
             # 1) Process stacked parameters (q_proj/k_proj/v_proj & gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Check if this is a fused expert weight
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 # Skip non-matching weights
                 if weight_name not in name:
                     continue
@@ -375,7 +424,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 # 2) Process MoE expert weights (including fused experts)
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

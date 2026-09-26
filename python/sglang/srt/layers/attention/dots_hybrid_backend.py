@@ -140,6 +140,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._active_backend = backend
         self.token_to_kv_pool = backend.token_to_kv_pool
         self.req_to_token_pool = backend.req_to_token_pool
+        self.kv_index_translator = backend.kv_index_translator
         self.needs_cpu_seq_lens = True
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
@@ -404,6 +405,7 @@ class DotsHybridAttnBackend(AttentionBackend):
         self.swa_backend = swa_backend
         self.token_to_kv_pool = swa_backend.token_to_kv_pool
         self.req_to_token_pool = swa_backend.req_to_token_pool
+        self.kv_index_translator = swa_backend.kv_index_translator
         # SWA latent expansion uses host sequence-length mirrors.
         self.needs_cpu_seq_lens = True
         self._dp_rebuilt_batch_id: int | None = None

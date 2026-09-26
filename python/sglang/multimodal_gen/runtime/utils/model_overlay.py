@@ -42,6 +42,14 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
         "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
         "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
     },
+    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree": {
+        "overlay_repo_id": "kevin-mi/FastH3-4step-Preview-overlay",
+        "overlay_revision": "f769cb8001dae335089de7b250364335bc7cb183",
+    },
+    "OpenVDN/vdn-minimax-h3": {
+        "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
+        "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
+    },
 }
 
 
@@ -269,11 +277,19 @@ def _find_missing_required_paths(
     return missing
 
 
+# Smaller files are copied, not linked: materializers rewrite configs in place,
+# and a write through a link rewrites the Hugging Face cache blob behind it.
+_OVERLAY_LINK_MIN_BYTES = 64 * 1024 * 1024
+
+
 def _link_or_copy_file(src: str, dst: str) -> None:
     src = os.path.realpath(src)
     _ensure_dir(os.path.dirname(dst))
     if os.path.lexists(dst):
         os.remove(dst)
+    if os.path.getsize(src) < _OVERLAY_LINK_MIN_BYTES:
+        shutil.copy2(src, dst)
+        return
     try:
         os.link(src, dst)
         return

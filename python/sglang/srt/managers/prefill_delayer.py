@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -75,10 +76,7 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        dp_size: int,
-        attn_tp_size: int,
         cpu_group,
-        server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
@@ -91,14 +89,14 @@ class PrefillDelayer:
         self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
-        self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
+        self._queue_min_ratio = get_schedule().prefill_delayer_queue_min_ratio
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
-        self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
+        self._max_delay_ms = get_schedule().prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
-        self._prefill_max_requests = server_args.prefill_max_requests
+        self._prefill_max_requests = get_schedule().prefill_max_requests
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
@@ -107,9 +105,10 @@ class PrefillDelayer:
             f"max_delay_ms={self._max_delay_ms} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
-        self.dp_size = dp_size
-        self.enable_dp_attention = get_parallel().enable_dp_attention
-        dp_size_dim = dp_size if self.enable_dp_attention else 1
+        parallel = get_parallel()
+        self.dp_size = parallel.dp_size
+        self.enable_dp_attention = parallel.enable_dp_attention
+        dp_size_dim = self.dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
@@ -119,9 +118,9 @@ class PrefillDelayer:
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
-            assert (
-                device_group is not None
-            ), "device_group is required when using NCCL for PrefillDelayer all-gather"
+            assert device_group is not None, (
+                "device_group is required when using NCCL for PrefillDelayer all-gather"
+            )
             self._gather_group = device_group
             self._gather_device = device
         else:
@@ -132,7 +131,7 @@ class PrefillDelayer:
         # token_watermark_force_allow, running_batch, max_prefill_bs,
         # waiting_queue_len.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_tp_size, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -142,9 +141,9 @@ class PrefillDelayer:
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
 
-        assert (
-            not get_schedule().disable_overlap_schedule
-        ), "To use PrefillDelayer, disable_overlap_schedule must be False."
+        assert not get_schedule().disable_overlap_schedule, (
+            "To use PrefillDelayer, disable_overlap_schedule must be False."
+        )
 
     def _negotiate_should_allow_prefill(
         self,
@@ -371,7 +370,7 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
-        torch.distributed.all_gather_into_tensor(
+        all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,
             group=self._gather_group,

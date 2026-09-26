@@ -12,7 +12,7 @@ from sglang.srt.parser.reasoning_parser import KimiK2Detector as KimiK2Reasoning
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
-register_cpu_ci(est_time=4, suite="base-c-test-cpu")
+register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
 
 
 def _make_tool(name, parameters=None):
@@ -309,7 +309,7 @@ class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
     def test_no_leak_on_error_fallback(self):
         """On parse errors, normal_text fallback has tokens stripped."""
         cleaned = _strip_special_tokens(
-            "leaked<|tool_calls_section_begin|>" "<|tool_call_end|>content"
+            "leaked<|tool_calls_section_begin|><|tool_call_end|>content"
         )
         self.assertEqual(cleaned, "leakedcontent")
 
@@ -992,7 +992,7 @@ class TestKimiK2EndToEnd(unittest.TestCase):
                 "<|tool_call_begin|>functions.get_weather:1"
                 f'<|tool_call_argument_begin|>{{"city":',
                 ' "Bad", "valid": fasle',
-                "<|tool_call_end|>" "<|tool_calls_section_end|>" + good_section_1,
+                "<|tool_call_end|><|tool_calls_section_end|>" + good_section_1,
             ],
         }
 

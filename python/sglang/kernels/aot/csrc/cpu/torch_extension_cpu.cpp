@@ -43,6 +43,32 @@ at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps,
 at::Tensor
 layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
+// fused_scale_shift
+at::Tensor
+fused_scale_shift_cpu(const at::Tensor& input, const at::Tensor& scale, const at::Tensor& shift, double scale_constant);
+
+// fused_norm_scale_shift
+at::Tensor fused_norm_scale_shift_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
+// fused_scale_residual_norm_scale_shift
+std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
+    const at::Tensor& residual,
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& gate,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
 
@@ -57,6 +83,20 @@ at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias,
     double eps);
+
+// fused_qk_norm (per-head, in place)
+void fused_qk_norm_cpu(
+    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
+void fused_qk_norm_rope_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    bool is_neox,
+    const at::Tensor& position_ids,
+    const at::Tensor& cos_sin_cache,
+    int64_t rotary_dim);
 
 // fused_qk_rmsnorm
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
@@ -211,6 +251,8 @@ void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
+    double k_cache_scale,
+    double v_cache_scale,
     at::Tensor& output,
     const std::optional<at::Tensor>& key,
     const std::optional<at::Tensor>& value,
@@ -233,6 +275,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -245,7 +289,8 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask);
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -298,6 +343,14 @@ at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat2,
     at::Tensor& scales2,
     std::vector<int64_t> block_size,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
+
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
@@ -496,6 +549,8 @@ void multimodal_rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// murmur_hash32
+at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -605,6 +660,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def("fused_qk_norm_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps) -> ()");
+  m.impl("fused_qk_norm_cpu", torch::kCPU, &fused_qk_norm_cpu);
+  m.def(
+      "fused_qk_norm_rope_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps, "
+      "bool is_neox, Tensor position_ids, Tensor cos_sin_cache, int rotary_dim) -> ()");
+  m.impl("fused_qk_norm_rope_cpu", torch::kCPU, &fused_qk_norm_rope_cpu);
   m.def(
       "fused_qk_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps) -> "
       "(Tensor, Tensor)");
@@ -624,6 +685,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "head_dim, int num_head) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
+  m.def("fused_scale_shift_cpu(Tensor input, Tensor scale, Tensor shift, float scale_constant) -> Tensor");
+  m.impl("fused_scale_shift_cpu", torch::kCPU, &fused_scale_shift_cpu);
+  m.def(
+      "fused_norm_scale_shift_cpu("
+      "Tensor input, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> Tensor");
+
+  m.impl("fused_norm_scale_shift_cpu", torch::kCPU, &fused_norm_scale_shift_cpu);
+  m.def(
+      "fused_scale_residual_norm_scale_shift_cpu("
+      "Tensor residual, "
+      "Tensor input, "
+      "Tensor? gate, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> (Tensor, Tensor)");
+
+  m.impl("fused_scale_residual_norm_scale_shift_cpu", torch::kCPU, &fused_scale_residual_norm_scale_shift_cpu);
 
   // speculative decoding
   m.def(
@@ -707,8 +796,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
-      "value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, float k_cache_scale, float "
+      "v_cache_scale, Tensor(a!) output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
@@ -716,10 +805,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // extend
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
-      "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
+      "Tensor v_buffer, float k_buf_scale, float v_buf_scale, Tensor req_to_token, Tensor req_pool_indices, Tensor "
+      "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -758,6 +848,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+  m.def(
+      "fp8_per_tensor_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType "
+      "out_dtype, bool is_vnni) -> Tensor");
+  m.impl("fp8_per_tensor_scaled_mm_cpu", torch::kCPU, &fp8_per_tensor_scaled_mm_cpu);
 
   // mxfp4 gemm
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
@@ -880,6 +974,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // murmur_hash32
+  m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");
+  m.impl("murmur_hash32_cpu", torch::kCPU, &murmur_hash32_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(

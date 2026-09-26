@@ -24,13 +24,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _verify_batch(bs: int, draft_token_num: int) -> SimpleNamespace:
     return SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
         batch_size=bs,
+        input_ids=torch.zeros(bs * draft_token_num, dtype=torch.int64),
         spec_info=SimpleNamespace(draft_token_num=draft_token_num),
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,
