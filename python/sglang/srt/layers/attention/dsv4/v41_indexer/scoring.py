@@ -51,11 +51,10 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
 
-    def empty_selection(self, topk: int, init: bool = True) -> torch.Tensor:
-        out = self.request_starts.new_empty((self.num_rows, topk), dtype=torch.int32)
-        if init:
-            out.fill_(-1)
-        return out
+    def empty_selection(self, topk: int) -> torch.Tensor:
+        return self.request_starts.new_full(
+            (self.num_rows, topk), -1, dtype=torch.int32
+        )
 
     def write_selection(self, selected: torch.Tensor, out: Selection) -> None:
         num_tokens, topk = selected.shape
@@ -238,13 +237,12 @@ _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
 class RequestScores(msgspec.Struct, frozen=True):
-    index: int  # position among the chunk's requests, empty ones included
-    lc: int  # compressed positions visible at its newest row; 0 scores nothing
+    lc: int  # compressed positions visible at its newest row
     k: int
-    columns: Optional[torch.Tensor] = None  # arange(lc)
-    tok: Optional[torch.Tensor] = None  # [rows_b] its query rows in the chunk
-    lens: Optional[torch.Tensor] = None  # [rows_b] compressed positions each row sees
-    slots: Optional[torch.Tensor] = None  # [lc] index-K pool slot of each position
+    columns: torch.Tensor  # arange(lc)
+    tok: torch.Tensor  # [rows_b] its query rows in the chunk
+    lens: torch.Tensor  # [rows_b] compressed positions each row sees
+    slots: torch.Tensor  # [lc] index-K pool slot of each position
 
 
 class ChunkScores(msgspec.Struct, frozen=True):
@@ -269,7 +267,7 @@ def prefill_requests(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
-    """An empty request comes with no chunk."""
+    """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -281,19 +279,18 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+    for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
         lc = int(lens.max().item())
         if lc == 0:
-            yield RequestScores(index=b, lc=0, k=0), iter(())
             continue
         j = torch.arange(lc, device=pos.device)
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         request = RequestScores(
-            index=b, lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
+            lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
         yield (
             request,

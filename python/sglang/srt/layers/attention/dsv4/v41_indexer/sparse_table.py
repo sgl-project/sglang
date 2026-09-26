@@ -77,7 +77,6 @@ class _SparsePrefillTable(_SparseTable):
     q_dtype: torch.dtype
     page_size: int  # index-K pool page size (slots)
     rows_per_request: List[int]  # rows of each request, in row order
-    topk_blocks: int
 
     def tail(self, rows_per_request: List[int]) -> _SparsePrefillTable:
         rows = get_tail_row_indices(
@@ -86,7 +85,7 @@ class _SparsePrefillTable(_SparseTable):
             device=self.blocks.device,
         )
         compress_lens = self.compress_lens[rows].contiguous()
-        _, valid_lens = candidate_row_lens(compress_lens, self.topk_blocks)
+        _, valid_lens = candidate_row_lens(compress_lens, self.blocks.shape[1])
         return _build_prefill_table(
             blocks=self.blocks[rows].contiguous(),
             compress_lens=compress_lens,
@@ -96,7 +95,6 @@ class _SparsePrefillTable(_SparseTable):
             rows_per_request=rows_per_request,
             q_dtype=self.q_dtype,
             valid_lens=valid_lens,
-            topk_blocks=self.topk_blocks,
         )
 
 
@@ -351,7 +349,6 @@ def _build_prefill_table(
     rows_per_request: List[int],
     q_dtype: torch.dtype,
     valid_lens: torch.Tensor,
-    topk_blocks: int,
 ) -> _SparsePrefillTable:
     # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
     phys_blocks = sort_candidate_blocks(blocks, compress_lens, page_table, page_size)
@@ -372,7 +369,6 @@ def _build_prefill_table(
         q_dtype=q_dtype,
         page_size=page_size,
         rows_per_request=rows_per_request,
-        topk_blocks=topk_blocks,
     )
 
 
@@ -392,6 +388,7 @@ def publish_prefill_table(
     device = data.q_fp4.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
+    zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
     # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv, width_align=8):
         lens = data.compress_lens[tile]
@@ -411,7 +408,7 @@ def publish_prefill_table(
         topk_transform_ragged_v2(
             keys,
             nblocks[tile],
-            out_offsets=torch.zeros(logits.shape[0], dtype=torch.int32, device=device),
+            out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
     request_ids = torch.repeat_interleave(
@@ -428,7 +425,6 @@ def publish_prefill_table(
         rows_per_request=data.rows_per_request,
         q_dtype=data.q_fp4.dtype,
         valid_lens=valid_lens,
-        topk_blocks=topk_blocks,
     )
 
 

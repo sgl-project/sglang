@@ -56,7 +56,7 @@ class FullTopKIndexer:
             self._torch_prefill(inputs, out)
 
     def topk_prefill_captured(self, inputs: CapturedPrefillInputs, out: Selection):
-        return _deep_gemm_prefill_captured(inputs, self.token_to_kv_pool, out)
+        self._deep_gemm_prefill_captured(inputs, out)
 
     def topk_decode(self, inputs: DecodeInputs, out: Selection) -> None:
         if self.use_deep_gemm_decode:
@@ -142,46 +142,43 @@ class FullTopKIndexer:
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
         write_decode(out, d, idx)
 
-
-def _deep_gemm_prefill_captured(
-    inputs: CapturedPrefillInputs,
-    token_to_kv_pool: DeepSeekV4TokenToKVPool,
-    out: Selection,
-) -> None:
-    indexer = inputs.indexer
-    metadata = inputs.paged_metadata
-    assert indexer.n_local_heads == indexer.n_heads
-    q_fp4, q_sf = quantize_index_q(inputs.q)
-    num_tokens, num_heads = q_fp4.shape[0], q_fp4.shape[1]
-    q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
-    q_sf = q_sf.view(num_tokens, 1, num_heads)
-    weights = inputs.weights.float()
-    page_size = metadata.compressed_page_size
-    k_cache = get_index_k_cache(
-        token_to_kv_pool=token_to_kv_pool,
-        layer_id=inputs.layer_id,
-        page_size=page_size,
-    )
-
-    width = metadata.max_compressed_seq_len
-    lens = metadata.compressed_seq_lens
-    page_table = metadata.page_table
-    topk = min(indexer.index_topk, width)
-    for rows, plan in metadata.row_chunks():
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (q_fp4[rows], q_sf[rows]),
-            k_cache,
-            weights[rows],
-            lens[rows],
-            page_table[rows],
-            plan,
-            width,
+    def _deep_gemm_prefill_captured(
+        self, inputs: CapturedPrefillInputs, out: Selection
+    ) -> None:
+        indexer = inputs.indexer
+        metadata = inputs.paged_metadata
+        assert indexer.n_local_heads == indexer.n_heads
+        q_fp4, q_sf = quantize_index_q(inputs.q)
+        num_tokens, num_heads = q_fp4.shape[0], q_fp4.shape[1]
+        q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
+        q_sf = q_sf.view(num_tokens, 1, num_heads)
+        weights = inputs.weights.float()
+        page_size = metadata.compressed_page_size
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=inputs.layer_id,
+            page_size=page_size,
         )
-        topk_transform_paged_torch(
-            logits,
-            lens[rows],
-            page_table[rows],
-            out.page_indices[rows, :topk],
-            page_size,
-            out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
-        )
+
+        width = metadata.max_compressed_seq_len
+        lens = metadata.compressed_seq_lens
+        page_table = metadata.page_table
+        topk = min(indexer.index_topk, width)
+        for rows, plan in metadata.row_chunks():
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (q_fp4[rows], q_sf[rows]),
+                k_cache,
+                weights[rows],
+                lens[rows],
+                page_table[rows],
+                plan,
+                width,
+            )
+            topk_transform_paged_torch(
+                logits,
+                lens[rows],
+                page_table[rows],
+                out.page_indices[rows, :topk],
+                page_size,
+                out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
+            )

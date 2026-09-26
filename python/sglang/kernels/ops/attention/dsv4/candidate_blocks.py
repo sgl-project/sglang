@@ -181,8 +181,7 @@ def topk_among_blocks(
     if width == 0 or n == 0:
         return torch.full((rows, k), -1, dtype=torch.int64, device=scores.device)
     if width % block_size:
-        # A block-aligned width lets the gather below index blocks, not columns;
-        # callers on the DeepGEMM path slice their tile to one so this is a no-op.
+        # the DeepGEMM callers slice their tile block-aligned, so this is a no-op there
         scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
     num_blocks = scores.shape[1] // block_size
     by_block = scores.unflatten(1, (num_blocks, block_size))
@@ -190,9 +189,7 @@ def topk_among_blocks(
     ids = blocks64.clamp(0, num_blocks - 1)
     # [rows, n, block_size], the only scratch of the row count's size
     candidates = by_block.gather(1, ids[:, :, None].expand(rows, n, block_size))
-    # column j of block b is position b * block_size + j, kept if b is a real
-    # block and the position is causal: j < lens - b * block_size (a padded
-    # block is -1, so its room exceeds block_size and the sign test drops it)
+    # column j of block b is position b * block_size + j, kept if j < lens - b * block_size
     offsets = torch.arange(block_size, device=scores.device, dtype=lens.dtype)
     room = lens[:, None] - blocks64 * block_size
     drop = (offsets[None, None, :] >= room[:, :, None]) | (blocks64 < 0)[:, :, None]
