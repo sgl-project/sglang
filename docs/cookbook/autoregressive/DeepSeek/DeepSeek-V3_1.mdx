@@ -18,8 +18,6 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.

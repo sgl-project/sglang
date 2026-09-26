@@ -13,6 +13,7 @@ export const ZImageTurboDeployment = () => {
           { id: 'b200', label: 'B200', default: true },
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
+          { id: 'xeon', label: 'XEON', default: false },
           { id: 'a2', label: 'A2 Series', default: false },
           { id: 'a3', label: 'A3 Series', default: false },
           { id: 'arc_b', label: 'BMG', default: false }
@@ -22,6 +23,11 @@ export const ZImageTurboDeployment = () => {
 
     generateCommand: function(values) {
       const { hardware } = values;
+
+      if (hardware === 'xeon') {
+        return `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve \\
+      --model-path Tongyi-MAI/Z-Image-Turbo`;
+      }
 
       if (hardware === 'a2') {
         return `sglang serve \\

@@ -43,6 +43,12 @@ HF_TOKEN=$HF_TOKEN sglang serve \
   --port 30010
 ```
 
+Intel Xeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu HF_TOKEN=$HF_TOKEN sglang serve --model-path ideogram-ai/ideogram-4-nf4 --port 30010
+```
+
 FP8:
 
 ```bash Command
@@ -51,6 +57,12 @@ HF_TOKEN=$HF_TOKEN sglang serve \
   --num-gpus 1 \
   --performance-mode auto \
   --port 30010
+```
+
+Intel Xeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu HF_TOKEN=$HF_TOKEN sglang serve --model-path ideogram-ai/ideogram-4-fp8 --port 30010
 ```
 
 Comfy-Org NVFP4:
@@ -75,6 +87,12 @@ HF_TOKEN=$HF_TOKEN sglang serve \
   --port 30010
 ```
 
+IntelXeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu HF_TOKEN=$HF_TOKEN sglang serve --model-path fal/ideogram-v4-fast --port 30010
+```
+
 fal Instant:
 
 ```bash Command
@@ -83,6 +101,12 @@ HF_TOKEN=$HF_TOKEN sglang serve \
   --num-gpus 1 \
   --performance-mode auto \
   --port 30010
+```
+
+Intel Xeon CPU deployment is supported for the fal checkpoints with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only flags.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu HF_TOKEN=$HF_TOKEN sglang serve --model-path fal/ideogram-v4-instant --port 30010
 ```
 
 ### Tensor and sequence parallelism

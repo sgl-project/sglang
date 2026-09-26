@@ -53,6 +53,20 @@ sglang serve \
   --port 30010
 ```
 
+Intel Xeon CPU deployment is supported by prefixing the server command with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and omitting GPU-only flags.
+
+Serve ERNIE-Image:
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path baidu/ERNIE-Image --port 30010
+```
+
+Serve ERNIE-Image-Turbo:
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path baidu/ERNIE-Image-Turbo --port 30010
+```
+
 ## 4. Generate an image
 
 Use the OpenAI-compatible image generation API after the server starts:
