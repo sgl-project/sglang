@@ -161,6 +161,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     get_main_process_id,
     get_tokenizer_worker_class,
+    multi_tokenizer_args_shm_name,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -231,7 +232,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     # Read configuration from shared memory
     main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
-        f"multi_tokenizer_args_{main_pid}"
+        multi_tokenizer_args_shm_name(main_pid)
     )
     server_args: ServerArgs
     port_args: PortArgs

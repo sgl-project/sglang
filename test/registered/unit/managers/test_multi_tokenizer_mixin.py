@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -9,11 +10,15 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
+    multi_tokenizer_args_shm_name,
+    read_from_shared_memory,
+    write_to_shared_memory,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -160,6 +165,41 @@ class TestMultiTokenizerMixin(unittest.TestCase):
     def test_get_tokenizer_worker_class_rejects_non_worker(self):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
+
+
+class TestMultiTokenizerArgsShmName(unittest.TestCase):
+    def test_same_pid_in_two_pid_namespaces_keeps_args_apart(self):
+        # Two containers sharing /dev/shm (docker --ipc=host) both run their server as pid 1.
+        names = []
+        for pid_ns in (4026532001, 4026532002):
+            with patch.object(
+                multi_tokenizer_mixin, "_pid_namespace_id", return_value=pid_ns
+            ):
+                names.append(multi_tokenizer_args_shm_name(1))
+        self.assertNotEqual(names[0], names[1])
+        shms = [
+            write_to_shared_memory(("port-a", "server-a", {}), names[0]),
+            write_to_shared_memory(("port-b", "server-b", {}), names[1]),
+        ]
+        try:
+            self.assertEqual(
+                read_from_shared_memory(names[0]), ("port-a", "server-a", {})
+            )
+            self.assertEqual(
+                read_from_shared_memory(names[1]), ("port-b", "server-b", {})
+            )
+        finally:
+            for shm in shms:
+                shm.close()
+                shm.unlink()
+
+    def test_without_pid_namespace_falls_back_to_pid(self):
+        with patch.object(
+            multi_tokenizer_mixin, "_pid_namespace_id", return_value=None
+        ):
+            self.assertEqual(
+                multi_tokenizer_args_shm_name(1234), "multi_tokenizer_args_1234"
+            )
 
 
 if __name__ == "__main__":

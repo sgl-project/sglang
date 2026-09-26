@@ -31,6 +31,8 @@ class TestMakeShmName(unittest.TestCase):
     def test_creator_pid_parsing(self):
         self.assertEqual(_creator_pid("sgl_shm_mq_1234_abcd1234"), 1234)
         self.assertEqual(_creator_pid("multi_tokenizer_args_5678"), 5678)
+        # Qualified by the PID namespace (multi_tokenizer_args_shm_name).
+        self.assertEqual(_creator_pid("multi_tokenizer_args_4026531836_5678"), 5678)
         self.assertIsNone(_creator_pid("psm_deadbeef"))
         self.assertIsNone(_creator_pid("sgl_shm_garbage"))
         self.assertIsNone(_creator_pid("multi_tokenizer_args_notanint"))

@@ -769,6 +769,29 @@ def get_main_process_id() -> int:
     return multiprocessing.current_process()._parent_pid
 
 
+def _pid_namespace_id() -> Optional[int]:
+    """Inode of this process's PID namespace, or None without /proc (e.g. macOS)."""
+    try:
+        return os.stat("/proc/self/ns/pid").st_ino
+    except OSError:
+        return None
+
+
+def multi_tokenizer_args_shm_name(main_pid: int) -> str:
+    """Name of the shared memory holding the multi-tokenizer args of `main_pid`.
+
+    A pid is unique only within its PID namespace. Containers that share /dev/shm
+    (e.g. docker --ipc=host) each run their server as pid 1, so a pid-only name
+    lets one server read, or overwrite, another server's args. Readers (tokenizer
+    workers, Engine.attach_tokenizer_worker) address `main_pid` from the same PID
+    namespace, so they derive the same name.
+    """
+    pid_ns = _pid_namespace_id()
+    if pid_ns is None:
+        return f"multi_tokenizer_args_{main_pid}"
+    return f"multi_tokenizer_args_{pid_ns}_{main_pid}"
+
+
 def write_to_shared_memory(obj, name: str) -> shared_memory.SharedMemory:
     """Write data to shared memory"""
     serialized = pickle.dumps(obj)
@@ -811,7 +834,7 @@ def write_data_for_multi_tokenizer(
     current_pid = os.getpid()
     logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
     args = (port_args, server_args, scheduler_info)
-    args_shm = write_to_shared_memory(args, f"multi_tokenizer_args_{current_pid}")
+    args_shm = write_to_shared_memory(args, multi_tokenizer_args_shm_name(current_pid))
     args_shm.close()
 
     return args_shm
