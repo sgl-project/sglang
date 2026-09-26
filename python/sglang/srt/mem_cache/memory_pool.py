@@ -45,6 +45,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
+    set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -269,6 +270,92 @@ def _set_kv_buffer_prefix_valid_impl(
         num_warps=num_warps,
         num_stages=2,
     )
+
+
+def _set_kv_buffer_prefix_valid_impl_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    if row_dim <= 0:
+        return
+
+    if row_dim >= 4096:
+        elems_per_tile = 256
+        num_warps = 8
+    elif row_dim >= 2048:
+        elems_per_tile = 128
+        num_warps = 4
+    else:
+        elems_per_tile = 64
+        num_warps = 4
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_dim, elems_per_tile),
+    )
+    set_kv_buffer_prefix_valid_tiled_fp8[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        k_scale,
+        v_scale,
+        int(k.stride(0)),
+        int(v.stride(0)),
+        int(k_cache.stride(0)),
+        int(v_cache.stride(0)),
+        int(loc_2d.shape[1]),
+        ROW_ELEMS=row_dim,
+        ELEMS_PER_TILE=elems_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
+def _resolve_fused_scale(
+    scale,
+    layer_scale,
+    layer_scale_float,
+) -> Optional[float]:
+    if isinstance(scale, (float, int)):
+        return float(scale)
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.numel() == 1
+        and scale.device.type == "cpu"
+    ):
+        return float(scale.item())
+
+    if (
+        scale is not None
+        and scale is layer_scale
+        and isinstance(layer_scale_float, (float, int))
+    ):
+        return float(layer_scale_float)
+
+    return None
 
 
 class ReqToTokenPool:
@@ -2998,21 +3085,6 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
-
         if loc_2d.device != self.k_buffer[0].device:
             loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
         if commit_lens.device != self.k_buffer[0].device:
@@ -3049,6 +3121,52 @@ class MHATokenToKVPool(KVCache):
                 "prefix-valid commit requires equal-width K/V rows, got "
                 f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
             )
+
+        fused_k_scale = _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
+        fused_v_scale = _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
+        # fuse quantization and writing into the same kernel
+        if (
+            cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and fused_k_scale is not None
+            and fused_v_scale is not None
+        ):
+            _set_kv_buffer_prefix_valid_impl_fp8(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                fused_k_scale,
+                fused_v_scale,
+                loc_2d,
+                commit_lens,
+                row_dim=self.row_dim,
+            )
+            return
+
+        # fallback: eager quantization
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
 
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
