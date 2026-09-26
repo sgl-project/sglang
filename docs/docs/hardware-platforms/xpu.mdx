@@ -365,6 +365,45 @@ the `cuda_graph` tag is a no-op there.
 > allocator accounting, and the second stays flat because torch keeps the freed block
 > cached. Query actual device memory via sysman (`ZES_ENABLE_SYSMAN=1`) instead.
 
+## RL Weight Sync (`update_weights_from_tensor`) on Intel XPU
+
+Online RL training pushes fresh weights into a colocated engine after every
+optimizer step. The API is the same as on CUDA — pass device tensors, or the
+serialized per-rank payloads that veRL/Megatron integrations build:
+
+```python
+engine.update_weights_from_tensor([(name, tensor) for name, tensor in params])
+```
+
+The transport underneath differs. PyTorch has no XPU tensor IPC — there is no
+`UntypedStorage._share_xpu_` and no XPU branch in
+`torch/multiprocessing/reductions.py` (tracked in
+[intel/torch-xpu-ops#1678](https://github.com/intel/torch-xpu-ops/issues/1678)) —
+so SGLang stages each serialized XPU tensor through a POSIX shared-memory
+segment: the trainer copies device to host SHM, the payload carries only the
+segment name, and the scheduler copies host to its own device and unlinks the
+segment. Practical consequences:
+
+- **Size `/dev/shm` for `tp_size * bucket_bytes`.** A payload is staged per
+  receiving TP rank, and every rank's copy is independent, so a 2 GiB bucket at
+  `--tp 8` holds 16 GiB of tmpfs live at once and costs eight device-to-host
+  copies. Set `--shm-size` from that product, and raise the bucket size only
+  while the product still fits; exhaustion surfaces as a
+  `Failed to stage a ... XPU tensor through shared memory` error.
+- **Cost is one device-to-host plus one host-to-device copy per payload**,
+  measured at roughly 1 GiB/s and 2 GiB/s respectively on Arc Pro B60. Within a
+  fixed `tp_size * bucket_bytes` budget, fewer and larger buckets (or
+  `load_format="flattened_bucket"`) amortize the per-tensor overhead.
+- **Producer and consumer must be on the same node**, as with CUDA IPC, and each
+  payload is consumed exactly once — the integration must serialize one payload
+  per receiving TP rank, which SGLang's own helpers already do.
+- **A staged segment can outlive a failed sync.** The synchronous engine APIs
+  reclaim their own staging once the update returns, but a trainer that hands
+  payloads to a separate engine process cannot know when the transfer ended, so a
+  crash between staging and loading leaves segments behind. They are named
+  `sgl_shm_xputensor_<pid>_*`; reclaim them with
+  `rm /dev/shm/sgl_shm_xputensor_*` once no weight sync is in flight.
+
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
 SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.

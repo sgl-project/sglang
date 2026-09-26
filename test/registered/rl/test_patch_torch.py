@@ -6,11 +6,41 @@ from typing import List
 import torch
 import torch.multiprocessing as mp
 
+from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-2-gpu-large-amd")
+
+
+class TestReduceNonCudaTensor(CustomTestCase):
+    def test_cpu_and_meta_tensors_serialize_after_patch(self):
+        """A weight-sync payload may hold tensors that are not CUDA tensors.
+
+        The device-uuid rewrite ran on every reduction, but only the CUDA-IPC
+        payload carries a device at that argument index: a CPU tensor reduces to
+        3 arguments, so it died with IndexError, and a meta tensor to 7, where
+        index 6 is requires_grad and got the uuid string written over it.
+        """
+        monkey_patch_torch_reductions()
+
+        for tensor in (
+            torch.arange(6, dtype=torch.float32),
+            torch.zeros(4, requires_grad=True),
+            torch.empty(2, 3, device="meta"),
+            torch.empty(2, device="meta", requires_grad=True),
+        ):
+            with self.subTest(device=tensor.device.type, grad=tensor.requires_grad):
+                out = MultiprocessingSerializer.deserialize(
+                    MultiprocessingSerializer.serialize(tensor)
+                )
+                self.assertEqual(out.device, tensor.device)
+                self.assertEqual(out.shape, tensor.shape)
+                self.assertEqual(out.requires_grad, tensor.requires_grad)
+                if tensor.device.type != "meta":
+                    self.assertTrue(torch.equal(out.detach(), tensor.detach()))
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):

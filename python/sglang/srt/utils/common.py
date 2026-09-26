@@ -3266,6 +3266,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.utils.patch_torch", "_rebuild_cuda_tensor_modified"),
         ("torch_npu.multiprocessing.reductions", "rebuild_npu_tensor"),
         ("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified"),
+        ("sglang.srt.utils.xpu_tensor_shm", "_rebuild_xpu_tensor_from_shm"),
         ("torch.multiprocessing.reductions", "rebuild_nested_tensor"),
         ("torch.multiprocessing.reductions", "rebuild_sparse_coo_tensor"),
         ("torch.multiprocessing.reductions", "rebuild_sparse_compressed_tensor"),
