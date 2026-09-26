@@ -3013,27 +3013,17 @@ class DeepseekV4HipRadixBackend(
 
         raise NotImplementedError("ragged attention")
 
-    def _low_ratio_index_topk_dense(
-        self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+    def _low_ratio_index_topk(
+        self,
+        layer,
+        x,
+        q_lora,
+        req,
+        pos,
+        forward_batch,
+        *,
+        rows_per_request=None,  # NOTE: only used in CP
     ) -> None:
-        if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
-            req = torch.repeat_interleave(
-                forward_batch.req_pool_indices.to(torch.int64),
-                q_lens.to(torch.int64),
-                output_size=x.shape[0],
-            )
-            DeepseekV4AttnBackend._low_ratio_index_topk(
-                self, layer, x, q_lora, req, pos, forward_batch
-            )
-            return
-        self.forward_metadata.core_metadata.drop_folded_sparse_indices(
-            layer.compress_ratio
-        )
-        low_ratio_index_topk_hip_extend(
-            self, layer, x, q_lora, pos, forward_batch, query_lens_cpu=q_lens_cpu
-        )
-
-    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
         """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;
         SGLANG_DSV41_TORCH_PREFILL_INDEXER keeps the torch oracle for prefill. Target-verify
         takes the decode body: the torch body syncs per request and cannot be captured."""
@@ -3050,11 +3040,25 @@ class DeepseekV4HipRadixBackend(
             )
         elif (
             forward_batch.forward_mode.is_extend()
-            and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
-            and forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
+            # CP rows are rank-local, which the torch oracle cannot score (as on CUDA)
+            and (
+                rows_per_request is not None
+                or (
+                    not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+                    and forward_batch.seq_lens_cpu is not None
+                    and forward_batch.extend_seq_lens_cpu is not None
+                )
+            )
         ):
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            low_ratio_index_topk_hip_extend(
+                self,
+                layer,
+                x,
+                q_lora,
+                pos,
+                forward_batch,
+                query_lens_cpu=rows_per_request,
+            )
         else:
             DeepseekV4AttnBackend._low_ratio_index_topk(
                 self, layer, x, q_lora, req, pos, forward_batch
