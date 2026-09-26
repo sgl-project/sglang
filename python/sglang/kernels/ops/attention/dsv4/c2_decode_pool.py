@@ -13,6 +13,7 @@ from triton.language.extra import libdevice
 def _c2_decode_pool_kernel(
     kv_ptr,  # [n, D] fp32
     score_ptr,  # [n, D] fp32
+    norm_weight_ptr,
     pos_ptr,  # [n] int64
     raw_out_loc_ptr,  # [n] int32/int64
     out_loc_ptr,  # [n] int32/int64
@@ -28,6 +29,8 @@ def _c2_decode_pool_kernel(
     STATE_SCORE_STRIDE: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FUSE_NORM: tl.constexpr,
+    NORM_EPS: tl.constexpr,
 ):
     row = tl.program_id(0)
 
@@ -95,6 +98,13 @@ def _c2_decode_pool_kernel(
     t0 = t0 + 0.0
     t1 = t1 + 0.0
     pooled = t0 + t1
+    if FUSE_NORM:
+        # finish rounds the pooled latent before computing RMS statistics.
+        rounded = pooled.to(tl.bfloat16).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(rounded * rounded, axis=0) / D + NORM_EPS)
+        weight = tl.load(norm_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        normalized = rounded * inv_rms
+        pooled = normalized * weight
     tl.store(pooled_ptr + row * D + offs, pooled, mask=mask)
 
     # One program per row, so these are written exactly once each; no guard.
@@ -114,23 +124,34 @@ def c2_decode_pool(
     pad_row: int,
     *,
     ring_size: int = 0,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ratio-2 decode pair pooling; updates `state_kv` / `state_score` in place.
 
     With ring_size > 0 the state halves may be views of an interleaved
     CompressStatePool ring, one row per request otherwise; pad_row is the
-    padded-graph-row sentinel and is never written.
+    padded-graph-row sentinel and is never written when ring_size > 0.
+    With norm_weight, return the BF16 pre-RoPE latent after pool rounding and
+    RMSNorm; otherwise return the FP32 pooled values.
     """
     assert kv.is_contiguous() and score.is_contiguous()
     assert state_kv.stride(1) == state_score.stride(1) == 1
     assert kv.dtype == torch.float32 and score.dtype == torch.float32
     n, D = kv.shape
-    pooled = torch.empty_like(kv)
+    if norm_weight is not None:
+        assert norm_weight.shape == (D,) and norm_weight.is_contiguous()
+        assert norm_weight.device == kv.device
+        assert norm_weight.dtype in (torch.bfloat16, torch.float32)
+    pooled = torch.empty_like(
+        kv, dtype=torch.bfloat16 if norm_weight is not None else torch.float32
+    )
     group_pos = torch.empty_like(pos)
     slots = torch.empty(n, dtype=out_loc.dtype, device=out_loc.device)
     _c2_decode_pool_kernel[(n,)](
         kv,
         score,
+        norm_weight,
         pos,
         raw_out_loc,
         out_loc,
@@ -146,6 +167,9 @@ def c2_decode_pool(
         STATE_SCORE_STRIDE=state_score.stride(0),
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
+        FUSE_NORM=norm_weight is not None,
+        NORM_EPS=norm_eps,
         num_warps=4,
+        enable_fp_fusion=norm_weight is None,
     )
     return pooled, group_pos, slots
