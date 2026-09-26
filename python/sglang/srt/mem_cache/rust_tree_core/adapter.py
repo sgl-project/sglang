@@ -626,6 +626,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_salt=key.cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
+                mamba_value_seqlen=params.mamba_value_seqlen,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
