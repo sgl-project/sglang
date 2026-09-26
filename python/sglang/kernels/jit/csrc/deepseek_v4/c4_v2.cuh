@@ -46,6 +46,7 @@ constexpr int32_t kTileElements = 4;
 struct Compress4DecodeParams {
   void* __restrict__ kv_buffer;
   const void* __restrict__ kv_input;
+  int64_t kv_input_stride;
   void* __restrict__ kv_output;
   const void* __restrict__ score_bias;
   const PlanD* __restrict__ plan_d;
@@ -55,6 +56,7 @@ struct Compress4DecodeParams {
 struct Compress4PrefillParams {
   void* __restrict__ kv_buffer;
   const void* __restrict__ kv_input;
+  int64_t kv_input_stride;
   void* __restrict__ kv_output;
   const void* __restrict__ score_bias;
   const PlanC* __restrict__ plan_c;
@@ -82,6 +84,7 @@ SGL_DEVICE void c4_forward(
     const InputFloat* kv_src,     // ragged pointer at position = 4n + 3
     OutFloat* kv_out,
     const InputFloat* score_bias,
+    const int64_t kv_input_stride,
     const bool should_overlap,
     const int32_t buffer_len) {
   using namespace device;
@@ -99,11 +102,11 @@ SGL_DEVICE void c4_forward(
 
   if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
     if (should_overlap) {
-      const auto kv_start = kv_src - 7 * Trait::kElementSize;  // point to start
+      const auto kv_start = kv_src - 7 * kv_input_stride;  // point to start
 #pragma unroll
       for (int32_t i = 0; i < 4; ++i) {
         const auto src = i < buffer_len ? kv_buf_0 : kv_start;
-        const auto base = src + i * Trait::kElementSize;
+        const auto base = src + i * (i < buffer_len ? Trait::kElementSize : kv_input_stride);
         kv[i] = gmem_in.load(base);
         score[i] = gmem_in.load(base + Trait::kScoreOffset);
       }
@@ -117,18 +120,18 @@ SGL_DEVICE void c4_forward(
       }
     }
 
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
+    const auto kv_start = kv_src - 3 * kv_input_stride;  // point to start
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
       const auto src = i + 4 < buffer_len ? kv_buf_1 : kv_start;
-      const auto base = src + i * Trait::kElementSize + Trait::kOverlapOffset;
+      const auto base = src + i * (i + 4 < buffer_len ? Trait::kElementSize : kv_input_stride) + Trait::kOverlapOffset;
       kv[i + 4] = gmem_in.load(base);
       score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
     }
   } else {  // mixed dtype
     using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
     const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
-    const auto kv_start_0 = kv_src - 7 * Trait::kElementSize;  // point to start
+    const auto kv_start_0 = kv_src - 7 * kv_input_stride;  // point to start
 
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
@@ -142,7 +145,7 @@ SGL_DEVICE void c4_forward(
           score[i][j] = cast<InputFloat>(score_tmp[j]);
         }
       } else if (should_overlap) {
-        const auto base = kv_start_0 + i * Trait::kElementSize;
+        const auto base = kv_start_0 + i * kv_input_stride;
         kv[i] = gmem_in.load(base);
         score[i] = gmem_in.load(base + Trait::kScoreOffset);
       } else {
@@ -153,7 +156,7 @@ SGL_DEVICE void c4_forward(
       }
     }
 
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
+    const auto kv_start = kv_src - 3 * kv_input_stride;  // point to start
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
       if (i + 4 < buffer_len) {
@@ -166,7 +169,7 @@ SGL_DEVICE void c4_forward(
           score[i + 4][j] = cast<InputFloat>(score_tmp[j]);
         }
       } else {
-        const auto base = kv_start + i * Trait::kElementSize + Trait::kOverlapOffset;
+        const auto base = kv_start + i * kv_input_stride + Trait::kOverlapOffset;
         kv[i + 4] = gmem_in.load(base);
         score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
       }
@@ -271,7 +274,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const auto kv_buffer = static_cast<BufferFloat*>(params.kv_buffer) + split_offset;
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
 
-  const auto kv_src = kv_input + global_bid * Trait::kElementSize;
+  const auto kv_src = kv_input + global_bid * params.kv_input_stride;
   const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
   const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
@@ -282,7 +285,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   if (plan.seq_len % 4 == 0) {
     const auto need_overlap = plan.seq_len > 4;
     c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
-        kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, 8);
+        kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, params.kv_input_stride, need_overlap, 8);
   }
 }
 
@@ -305,7 +308,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + plan.ragged_id * params.kv_input_stride;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
@@ -313,7 +316,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const bool need_overlap = plan.seq_len > 4;
   PDLWaitPrimary<kUsePDL>();
   c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
-      kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
+      kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, params.kv_input_stride, need_overlap, plan.buffer_len);
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
@@ -337,7 +340,7 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   if (plan.is_invalid()) return;
 
   // each warp will handle a contiguous region
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + plan.ragged_id * params.kv_input_stride;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
@@ -402,9 +405,15 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input
+        .with_strides({-1, 1})
         .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
+    using InputVector = device::AlignedVector<InputFloat, kTileElements>;
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(kv_input.data_ptr()) % alignof(InputVector) == 0,
+        "kv_input base address must support aligned vector loads");
+    RuntimeCheck(kv_input.stride(0) % kTileElements == 0, "kv_input row stride must support aligned vector loads");
     TensorMatcher({N, kHeadDim})  // kv compressed output
         .with_dtype<OutFloat>()
         .with_device(device_)
@@ -419,6 +428,7 @@ struct FlashCompress4Kernel {
     const auto params = Compress4DecodeParams{
         .kv_buffer = kv_buffer.data_ptr(),
         .kv_input = kv_input.data_ptr(),
+        .kv_input_stride = kv_input.stride(0),
         .kv_output = kv_output.data_ptr(),
         .score_bias = ape.data_ptr(),
         .plan_d = plan_d,
@@ -449,9 +459,15 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_buffer);
     TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
+        .with_strides({-1, 1})
         .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_input);
+    using InputVector = device::AlignedVector<InputFloat, kTileElements>;
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(kv_input.data_ptr()) % alignof(InputVector) == 0,
+        "kv_input base address must support aligned vector loads");
+    RuntimeCheck(kv_input.stride(0) % kTileElements == 0, "kv_input row stride must support aligned vector loads");
     TensorMatcher({C, kHeadDim})  // kv compressed output (compact)
         .with_dtype<OutFloat>()
         .with_device(device_)
@@ -469,6 +485,7 @@ struct FlashCompress4Kernel {
     const auto params = Compress4PrefillParams{
         .kv_buffer = kv_buffer.data_ptr(),
         .kv_input = kv_input.data_ptr(),
+        .kv_input_stride = kv_input.stride(0),
         .kv_output = kv_output.data_ptr(),
         .score_bias = ape.data_ptr(),
         .plan_c = plan_c,
