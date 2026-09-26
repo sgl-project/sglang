@@ -218,9 +218,7 @@ def forward_mega_moe(
 
     if moe.mega_shared_l1_weights is not None:
         fused_fork_flag = (
-            moe.alt_stream is not None
-            and num_tokens > 0
-            and get_is_capture_mode()
+            moe.alt_stream is not None and num_tokens > 0 and get_is_capture_mode()
         )
         if not fused_fork_flag:
             return _run_mega_routed(
