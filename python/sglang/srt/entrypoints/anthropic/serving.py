@@ -394,7 +394,10 @@ class AnthropicServing:
                 return None, None
 
             reasoning_text = "\n".join(thinking_parts)
-            if self.openai_serving_chat.supports_native_reasoning_history():
+            chat_template = self._chat_template()
+            if self.openai_serving_chat.supports_native_reasoning_history() or (
+                isinstance(chat_template, str) and "reasoning_content" in chat_template
+            ):
                 return reasoning_text, None
 
             try:

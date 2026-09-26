@@ -999,6 +999,47 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(assistant_msg.reasoning_content, "ponder")
         self.assertEqual(assistant_msg.content, "hello")
 
+    def test_assistant_thinking_history_uses_template_reasoning_content(self):
+        """Jinja templates that consume ``reasoning_content`` keep it separate."""
+        serving = self._serving(chat_template="{{ message.reasoning_content }}")
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+
+    def test_thinking_only_turn_uses_template_reasoning_content(self):
+        """A template-backed thinking-only turn retains its reasoning history."""
+        serving = self._serving(chat_template="{{ message.reasoning_content }}")
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "ponder"}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "")
+
     def test_thinking_only_turn_keeps_native_reasoning_content(self):
         """An assistant turn that is only thinking still carries its reasoning."""
 
