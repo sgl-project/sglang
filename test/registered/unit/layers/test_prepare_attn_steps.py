@@ -42,6 +42,8 @@ class Norm:
 def communicator(norm):
     c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
     c.input_layernorm = norm
+    # A layer inside the stack: an absent residual was written back before.
+    c.layer_scatter_modes = SimpleNamespace(is_first_layer=False)
     c._sp_steps = None
     c._input_scattered_steps = None
     c._cp_steps = None

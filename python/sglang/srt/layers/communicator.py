@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import msgspec
 import torch
@@ -46,6 +46,7 @@ from sglang.srt.layers.boundary_layout import (
     TokenAxis,
     decoder_layer_sides,
     input_scattered_layer_sides,
+    scattered_residual_layer_sides,
     sequence_parallel_layer_sides,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
@@ -651,6 +652,92 @@ def _attn_input_update_and_read_residual(quant_format: str):
     return _update_and_read_residual_plain
 
 
+class ResidualOps(Protocol):
+    """How a layer writes each stage's output into its residual and reads the
+    next stage's input from it. The boundary steps complete sums and move
+    tokens around these operations. AddAndNorm adds and normalizes; MHC's
+    hyper-connection streams implement the same operations (communicator_mhc)."""
+
+    # The write-back is a plain add, which one rank may run before the sum it
+    # adds into completes: the DP partial order, and a residual that joins the
+    # attention output's sum.
+    adds_plainly: bool
+    # The layer writes its FFN output into the residual itself instead of
+    # leaving that to the next layer's input.
+    updates_residual_after_ffn: bool
+
+    def enter(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The residual the layer stack starts from, given its input."""
+
+    def read_attention_input(self, residual, norm, quant_format: str) -> Tuple:
+        """The attention input and the residual, from a residual that already
+        holds the previous layer's output."""
+
+    def update_and_read_attention_input(
+        self, hidden_states, residual, norm, quant_format: str, post_residual_addition
+    ) -> Tuple:
+        """Write the previous layer's output into the residual, then read the
+        attention input from it."""
+
+    def update_and_read_ffn_input(self, hidden_states, residual, norm) -> Tuple:
+        """Write the attention output into the residual, then read the FFN
+        input from it."""
+
+    def update_residual(self, hidden_states, residual) -> torch.Tensor:
+        """The residual with the FFN output written into it."""
+
+    def residual_to_attn_tp_shard(self, residual, context) -> torch.Tensor:
+        """This attention-TP rank's slice of the residual."""
+
+    def residual_from_attn_tp_shards(self, residual) -> torch.Tensor:
+        """The residual gathered from every attention-TP rank's slice."""
+
+
+class AddAndNorm:
+    """A plain residual: a stage's output is added into it, and the next
+    stage's input is its norm. An empty batch skips the norms."""
+
+    adds_plainly = True
+    updates_residual_after_ffn = False
+
+    def enter(self, hidden_states):
+        return hidden_states
+
+    def read_attention_input(self, residual, norm, quant_format):
+        if residual.shape[0] == 0:
+            return residual, residual
+        return _attn_input_update_and_read_residual(quant_format)(
+            norm, residual, None, None
+        )
+
+    def update_and_read_attention_input(
+        self, hidden_states, residual, norm, quant_format, post_residual_addition
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+        return _attn_input_update_and_read_residual(quant_format)(
+            norm, hidden_states, residual, post_residual_addition
+        )
+
+    def update_and_read_ffn_input(self, hidden_states, residual, norm):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, residual
+        return norm(hidden_states, residual)
+
+    def update_residual(self, hidden_states, residual):
+        hidden_states += residual
+        return hidden_states
+
+    def residual_to_attn_tp_shard(self, residual, context):
+        return _redistribute_to_attn_tp_shards(residual, context)
+
+    def residual_from_attn_tp_shards(self, residual):
+        return _redistribute_from_attn_tp_shards(residual)
+
+
+ADD_AND_NORM = AddAndNorm()
+
+
 class UnreducedOutput(msgspec.Struct, frozen=True):
     """A layer output that still owes its sum, left for the next layer's input.
     Hand it to the next layer, or pass it through reduce_output() before reading
@@ -730,6 +817,8 @@ class LayerCommunicator:
     # Whether this class's boundary steps may be chosen from both sides'
     # declarations; a subclass that picks its own steps says no.
     _takes_declared_boundaries = True
+    # A plain residual unless the layer is built with its own.
+    _residual_ops: ResidualOps = ADD_AND_NORM
 
     def __init__(
         self,
@@ -744,6 +833,8 @@ class LayerCommunicator:
         fused_ar_quant_keep_bf16: bool = False,
         # False for a layer whose FFN always completes its own reduction.
         allow_deferred_ffn_reduction: bool = True,
+        # How the layer writes its residual and reads its stages' inputs.
+        residual_ops: ResidualOps = ADD_AND_NORM,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -755,6 +846,7 @@ class LayerCommunicator:
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
         self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
+        self._residual_ops = residual_ops
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -804,7 +896,8 @@ class LayerCommunicator:
         # q_lora, which input-scattered attention needs.
         self._sp_steps = (
             _select_boundary_steps(
-                sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes())
+                sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes()),
+                residual_ops=residual_ops,
             )
             if layernorm_sp.layernorm_sp_enabled()
             else None
@@ -904,6 +997,7 @@ class LayerCommunicator:
         attention_input, postprocess = self._post_init_communicate()
         ffn_input, fused = self._select_mlp_input()
         modes = self.layer_scatter_modes
+        ops = self._residual_ops
         ffn_output = StageOutput(
             self._context.layouts[modes.mlp_mode],
             group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
@@ -926,7 +1020,7 @@ class LayerCommunicator:
             ffn_output_move=(
                 None
                 if postprocess is CommunicateSummableTensorPairFn._scatter_hidden_states
-                else postprocess
+                else partial(postprocess, residual_ops=ops)
             ),
             # Not when the way back is the MoE-CP scatter, nor when a SCATTERED
             # FFN computes whole tokens with nothing left to sum.
@@ -938,21 +1032,35 @@ class LayerCommunicator:
 
     def _steps_for_input_scattered(self, sides: DecoderLayerSides) -> "BoundarySteps":
         """The steps a batch with input-scattered attention runs at this layer,
-        for the layer's ordinary declarations ``sides``."""
-        return _select_boundary_steps(
-            input_scattered_layer_sides(
+        for the layer's ordinary declarations ``sides``. A plain residual comes
+        back to the full rows inside the attention output's sum; one whose
+        write-back is not a plain add stays on each rank's slice."""
+        if self._residual_ops.adds_plainly:
+            scattered = input_scattered_layer_sides(
                 axis_sizes=_token_axis_sizes(),
                 ffn_group=sides.ffn_output.group,
                 hands_on_partial=self.allow_reduce_scatter and not self.is_last_layer,
             )
+            handoff = _hand_qkv_hook_its_input
+        else:
+            scattered = scattered_residual_layer_sides(
+                axis_sizes=_token_axis_sizes(),
+                ffn_group=sides.ffn_output.group,
+                is_first_layer=self.layer_scatter_modes.is_first_layer,
+                is_last_layer=self.is_last_layer,
+                leaves_for_reduce_scatter=self.allow_reduce_scatter,
+            )
+            # DSA and hook-less attention take the slice gathered.
+            handoff = _hand_scattered_input_to_attention
+        return _select_boundary_steps(
+            scattered, residual_ops=self._residual_ops, attention_handoff=handoff
         )
 
     def _steps_from_declarations(
         self, sides: DecoderLayerSides, **kwargs
     ) -> "BoundarySteps":
-        """The steps this layer runs for a set of declarations. A layer with
-        its own residual operations (MHC) chooses its own implementations."""
-        return _select_boundary_steps(sides, **kwargs)
+        """The steps this layer runs for a set of declarations."""
+        return _select_boundary_steps(sides, residual_ops=self._residual_ops, **kwargs)
 
     def _post_init_communicate(self) -> Tuple[Callable, Callable]:
         """The attention input move and the postprocess the scatter modes
@@ -1057,7 +1165,8 @@ class LayerCommunicator:
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
         self.publish_attn_lora_layout()
-
+        # The layer stack's first layer starts its residual from its input.
+        enters = residual is None and self.layer_scatter_modes.is_first_layer
         # What the previous layer left to complete: an UnreducedOutput, or a
         # producer's handoff that one of the fused entries consumes.
         owed = None if isinstance(hidden_states, torch.Tensor) else hidden_states
@@ -1093,17 +1202,24 @@ class LayerCommunicator:
             hidden_states, residual = layer_input(
                 hidden_states, residual, self._context
             )
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        elif owed is not None:
+        ops = self._residual_ops
+        if enters:
+            hidden_states, residual = ops.enter(hidden_states), None
+        if owed is not None and hidden_states.shape[0] != 0:
             hidden_states = reduce_output(owed)
-            hidden_states, residual = _attn_input_update_and_read_residual(
-                quant_format
-            )(self.input_layernorm, hidden_states, residual, post_residual_addition)
+        if residual is None:
+            # The previous layer already wrote its output into the residual.
+            hidden_states, residual = ops.read_attention_input(
+                hidden_states, self.input_layernorm, quant_format
+            )
         else:
-            hidden_states, residual = _attn_input_update_and_read_residual(
-                quant_format
-            )(self.input_layernorm, hidden_states, residual, post_residual_addition)
+            hidden_states, residual = ops.update_and_read_attention_input(
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                quant_format,
+                post_residual_addition,
+            )
 
         return self._finish_prepare_attn(
             hidden_states=hidden_states,
@@ -1131,24 +1247,27 @@ class LayerCommunicator:
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
         """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        hidden_states = self._batch_steps(forward_batch).attention_input(
+        steps = self._batch_steps(forward_batch)
+        hidden_states = steps.attention_input(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             context=self._context,
         )
-        if self.qkv_latent_func is not None:
-            attn_inputs = AttentionInputs(
-                hidden_states, forward_batch, self.qkv_latent_func
-            )
-            get_attn_tp_context().set_attn_inputs(attn_inputs)
+        hidden_states = steps.attention_handoff(
+            hidden_states, forward_batch, self.qkv_latent_func
+        )
         return hidden_states, residual
 
     def _select_attn_input_fusions(self) -> Tuple[Callable, ...]:
         """The fused kernels that complete what the previous layer left together
         with the residual update and the input norm, in the order they are tried.
         Each takes (owed, residual, forward_batch, post_residual_addition) and
-        returns None when it does not take the batch."""
-        if not hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+        returns None when it does not take the batch. They add the residual
+        plainly."""
+        if not (
+            self._residual_ops.adds_plainly
+            and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
+        ):
             return ()
         self._attn_input_fuses_quant = (
             self.enable_fused_ar_quant
@@ -1203,19 +1322,20 @@ class LayerCommunicator:
 
     def _select_mlp_input(self) -> Tuple[Callable, Tuple["FusedMlpInput", ...]]:
         """The attention-TP -> FFN boundary's steps, chosen from the layouts, and
-        the fused kernels they try first. The MHC and DSA-CP communicators pick
-        their own implementations."""
+        the fused kernels they try first."""
         kind = mlp_input_kind(self.layer_scatter_modes, self._context)
         residual_input_mode = self.layer_scatter_modes.layer_input_mode
+        ops = self._residual_ops
         if kind is MlpInputKind.NORM:
-            return _mlp_input_norm, ()
+            return partial(_mlp_input_norm, residual_ops=ops), ()
         if kind is MlpInputKind.ATTN_TP_ALL_REDUCE:
-            return _mlp_input_attn_tp_all_reduce, ()
+            return partial(_mlp_input_attn_tp_all_reduce, residual_ops=ops), ()
         if kind is MlpInputKind.SCATTER:
             return (
                 partial(
                     _mlp_input_scatter,
                     scatters_residual=residual_input_mode == ScatterMode.TP_ATTN_FULL,
+                    residual_ops=ops,
                 ),
                 (),
             )
@@ -1226,7 +1346,10 @@ class LayerCommunicator:
         steps = partial(
             _mlp_input_gather,
             order=_mlp_input_order(
-                self._context, residual_input_mode, tuple(f.run for f in fusions)
+                self._context,
+                residual_input_mode,
+                tuple(f.run for f in fusions),
+                residual_ops=ops,
             ),
         )
         if kind is MlpInputKind.GATHER_MOE_CP:
@@ -1235,8 +1358,11 @@ class LayerCommunicator:
 
     def _select_mlp_input_fusions(self) -> Tuple["FusedMlpInput", ...]:
         """The fused kernels that can take the attention -> FFN steps, in the
-        order they are tried."""
-        if not hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion"):
+        order they are tried. They add the residual plainly."""
+        if not (
+            self._residual_ops.adds_plainly
+            and hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion")
+        ):
             return ()
         return (
             FusedMlpInput(
@@ -1295,25 +1421,23 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        steps = self._batch_steps(forward_batch)
-        if steps.returns_over_dp:
-            step = self._postprocess_dp_step(forward_batch) or _redistribute_output
-            return _to_local_tokens(step, forward_batch, hidden_states), residual
-        return steps.ffn_output_move(
-            hidden_states=hidden_states,
-            residual=residual,
+        return self._complete_ffn_output_now(
+            hidden_states,
+            residual,
             forward_batch=forward_batch,
-            context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
-            is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+            dp_step=self._postprocess_dp_step(forward_batch),
         )
 
     def _local_token_move_can_go_to_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
         """Whether the next layer's input can run this layer's move of its FFN
-        output back to this rank's tokens: the base postprocess scatter."""
-        return self._batch_steps(forward_batch).returns_over_dp
+        output back to this rank's tokens: the base postprocess scatter, when
+        the next layer's input also writes the output into the residual."""
+        return (
+            self._batch_steps(forward_batch).returns_over_dp
+            and not self._residual_ops.updates_residual_after_ffn
+        )
 
     def _postprocess_dp_step(
         self, forward_batch: ForwardBatch
@@ -1427,16 +1551,27 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         dp_step: Optional[Callable],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """This layer's postprocess, run with the attention-DP step the FFN exit
-        chose."""
-        if self._local_token_move_can_go_to_next_layer(forward_batch):
-            return (
-                _to_local_tokens(
-                    dp_step or _redistribute_output, forward_batch, hidden_states
-                ),
-                residual,
+        """This layer's postprocess, run with the attention-DP step already
+        chosen: the move back to where the next layer reads the FFN output, then
+        the write-back into the residual for a layer that does it itself."""
+        steps = self._batch_steps(forward_batch)
+        if steps.returns_over_dp:
+            hidden_states = _to_local_tokens(
+                dp_step or _redistribute_output, forward_batch, hidden_states
             )
-        return self.postprocess_layer(hidden_states, residual, forward_batch)
+        else:
+            hidden_states, residual = steps.ffn_output_move(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+                allow_reduce_scatter=self.allow_reduce_scatter,
+                is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+            )
+        if residual is not None and self._residual_ops.updates_residual_after_ffn:
+            hidden_states = self._residual_ops.update_residual(hidden_states, residual)
+            residual = None
+        return hidden_states, residual
 
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
@@ -1760,7 +1895,9 @@ class CommunicateSimpleFn:
 
 
 def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
-    gathered = get_local_dp_buffer(get_parallel().attn_tp_group)
+    gathered = get_local_dp_buffer(
+        get_parallel().attn_tp_group, hidden_size=tensor.shape[-1]
+    )
     attn_tp_all_gather_into_tensor(gathered, tensor)
     return gathered
 
@@ -1882,9 +2019,10 @@ def _mlp_input_without_dp(
     *,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ):
     if gathers_residual:
-        residual = _redistribute_from_attn_tp_shards(residual)
+        residual = residual_ops.residual_from_attn_tp_shards(residual)
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
@@ -1892,7 +2030,7 @@ def _mlp_input_without_dp(
     hidden_states = _mlp_input_reduce_output(hidden_states, forward_batch)
     if _is_npu and context.cache is not None:
         _ = prepare_weight_cache(hidden_states, context.cache)
-    return layernorm(hidden_states, residual)
+    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
 
 
 def _mlp_input_dp_replicate(
@@ -1905,12 +2043,14 @@ def _mlp_input_dp_replicate(
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ):
-    """Attention DP: complete the attention-TP sum if it is owed, add and
-    normalize locally, then gather. With ``places_cp_shards`` each CP rank puts
-    its shard of the DP group's tokens beside the others' in the group's slot."""
+    """Attention DP: complete the attention-TP sum if it is owed, write the
+    output into the residual and read the FFN input locally, then gather. With
+    ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
+    beside the others' in the group's slot."""
     if gathers_residual:
-        residual = _redistribute_from_attn_tp_shards(residual)
+        residual = residual_ops.residual_from_attn_tp_shards(residual)
     if hidden_states.shape[0] != 0:
         if reduces_attention_tp:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
@@ -1918,7 +2058,13 @@ def _mlp_input_dp_replicate(
             get_parallel().tp_group,
             disabled=not is_allocation_symmetric(),
         ):
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = residual_ops.update_and_read_ffn_input(
+                hidden_states, residual, layernorm
+            )
+    else:
+        hidden_states, residual = residual_ops.update_and_read_ffn_input(
+            hidden_states, residual, layernorm
+        )
     cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
     return (
         _redistribute_input_to_dp(hidden_states, forward_batch, cp_shard_counts),
@@ -1957,6 +2103,7 @@ def _mlp_input_order(
     context: CommunicateContext,
     residual_input_mode: ScatterMode,
     fusions: Tuple[Callable, ...],
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ) -> Callable:
     """The steps from the attention output to the FFN input, chosen from facts
     fixed at construction."""
@@ -1965,13 +2112,21 @@ def _mlp_input_order(
     )
     if context.attn_dp_size == 1:
         return partial(
-            _mlp_input_without_dp, gathers_residual=gathers_residual, fusions=fusions
+            _mlp_input_without_dp,
+            gathers_residual=gathers_residual,
+            fusions=fusions,
+            residual_ops=residual_ops,
         )
-    if context.force_layernorm_before_dp_gather or context.attn_tp_size == 1:
+    if (
+        context.force_layernorm_before_dp_gather
+        or context.attn_tp_size == 1
+        or not residual_ops.adds_plainly
+    ):
         return partial(
             _mlp_input_dp_replicate,
             gathers_residual=gathers_residual,
             reduces_attention_tp=context.attn_tp_size > 1,
+            residual_ops=residual_ops,
         )
     return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual)
 
@@ -2058,6 +2213,53 @@ def _same_ranks(a: GroupCoordinator, b: GroupCoordinator) -> bool:
     return sorted(a.ranks) == sorted(b.ranks)
 
 
+def _hand_qkv_hook_its_input(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    qkv_latent_func: Optional[Callable],
+) -> torch.Tensor:
+    """Give the attention's QKV hook the attention input."""
+    if qkv_latent_func is not None:
+        get_attn_tp_context().set_attn_inputs(
+            AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
+        )
+    return hidden_states
+
+
+def _hand_scattered_input_to_attention(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    qkv_latent_func: Optional[Callable],
+) -> torch.Tensor:
+    """Input-scattered attention takes each rank's slice, and its QKV hook
+    gathers the rows after the projection. DSA and attention without a hook
+    consume full hidden states, so those are gathered here, and the hook is
+    told they are."""
+    ctx = get_attn_tp_context()
+    if ctx.is_dsa or qkv_latent_func is None:
+        hidden_states = _tp_all_gather_scattered_rows(hidden_states, forward_batch)
+    if qkv_latent_func is not None:
+        ctx.set_attn_inputs(
+            AttentionInputs(
+                hidden_states,
+                forward_batch,
+                qkv_latent_func,
+                is_pre_gathered=ctx.is_dsa,
+            )
+        )
+    return hidden_states
+
+
+def _tp_all_gather_scattered_rows(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    # Input-scattered attention keeps the same number of tokens on every TP rank.
+    total_tokens = forward_batch.input_ids.shape[0]
+    output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
+    return output
+
+
 class BoundarySteps(msgspec.Struct, frozen=True):
     """The steps a batch runs at a layer's boundaries: into the attention,
     from the attention output to the FFN input, and the FFN output on to the
@@ -2079,6 +2281,9 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     # Completes what the layer's input owes before the input norm; None when it
     # owes nothing.
     layer_input: Optional[Callable] = None
+    # Hands the attention its input once attention_input has moved it:
+    # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
+    attention_handoff: Callable = _hand_qkv_hook_its_input
 
     @property
     def returns_over_dp(self) -> bool:
@@ -2091,14 +2296,17 @@ def _select_boundary_steps(
     fusions: Tuple["FusedMlpInput", ...] = (),
     force_layernorm_before_gather: bool = False,
     cp_moves: Optional[CpMoves] = None,
+    residual_ops: ResidualOps = ADD_AND_NORM,
+    attention_handoff: Callable = _hand_qkv_hook_its_input,
 ) -> BoundarySteps:
-    """The steps a set of declarations chooses; ``cp_moves`` for the ones
-    that gather over attention CP."""
+    """The steps a set of declarations chooses, around the layer's residual
+    operations; ``cp_moves`` for the ones that gather over attention CP."""
     returns_over_dp, ffn_output_move, completes_sum = _select_ffn_output_move(
         sides.ffn_output,
         residual=sides.ffn_residual_rows,
         to=sides.output_rows,
         cp_moves=cp_moves,
+        residual_ops=residual_ops,
     )
     rows = sides.input_rows
     layer_input = None
@@ -2122,6 +2330,7 @@ def _select_boundary_steps(
         fusions=fusions,
         residual_joins_sum=sides.residual_joins_attention_sum,
         cp_moves=cp_moves,
+        residual_ops=residual_ops,
     )
     return BoundarySteps(
         attention_input=_select_attention_input_move(rows, sides.attention),
@@ -2132,6 +2341,7 @@ def _select_boundary_steps(
         ffn_sum_is_movable=sides.ffn_output.group is not None,
         fused=fused,
         layer_input=layer_input,
+        attention_handoff=attention_handoff,
     )
 
 
@@ -2173,13 +2383,16 @@ def _select_ffn_input(
     fusions: Tuple[FusedMlpInput, ...],
     residual_joins_sum: bool = False,
     cp_moves: Optional[CpMoves] = None,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ) -> Tuple[Callable, Tuple[FusedMlpInput, ...]]:
     """The steps from the attention output to the FFN input, and the fused
     kernels they try first: complete the attention-TP sum, move the residual to
-    the rows it has while the FFN runs, add it and normalize, and bring the rows
-    to what the FFN's group needs: a gather over attention DP, or each rank's
-    own slice. A kernel in ``fusions`` is tried only when nothing is gathered or
-    sliced, and only if it completes the sum the attention output owes."""
+    the rows it has while the FFN runs, write the output into it and read the
+    FFN input, and bring the rows to what the FFN's group needs: a gather over
+    attention DP, or each rank's own slice. A kernel in ``fusions`` is tried
+    only when nothing is gathered or sliced, and only if it completes the sum
+    the attention output owes. A write-back that is not a plain add runs only
+    after the sum completes."""
     # What the attention output owes decides the steps: the attention-TP sum,
     # always left by the output projection, or nothing.
     owes_attention_tp = produced.group is SumGroup.ATTN_TP
@@ -2202,9 +2415,19 @@ def _select_ffn_input(
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
-            partial(_mlp_input_scatter, scatters_residual=residual != residual_to),
+            partial(
+                _mlp_input_scatter,
+                scatters_residual=residual != residual_to,
+                residual_ops=residual_ops,
+            ),
             (),
         )
+    if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP_SCATTER}:
+        # The residual stays on each rank's slice while the FFN takes the
+        # attention's rows (MHC on an input-scattered batch).
+        if gathered or not owes_attention_tp or residual != residual_to:
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        return partial(_mlp_input_on_residual_shard, residual_ops=residual_ops), ()
     if gathered == {TokenAxis.ATTN_CP}:
         # Each CP rank completes its own chunk, then the CP moves gather them.
         if cp_moves is None:
@@ -2217,6 +2440,7 @@ def _select_ffn_input(
             force_layernorm_before_gather=force_layernorm_before_gather,
             fusions=fusions,
             residual_joins_sum=residual_joins_sum,
+            residual_ops=residual_ops,
         )
         return partial(cp_moves.gather, gather=on_chunk), fused
     if (
@@ -2235,10 +2459,12 @@ def _select_ffn_input(
     gathers_residual = residual != residual_to
     if not gathered:
         if not owes_attention_tp:
-            return _mlp_input_norm, ()
+            return partial(_mlp_input_norm, residual_ops=residual_ops), ()
         if gathers_residual and residual_joins_sum:
             # Each rank adds its slice of the residual into its share of the
             # sum, so the all-reduce also brings the residual back to every row.
+            if not residual_ops.adds_plainly:
+                raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return _mlp_input_residual_into_sum, ()
         fused = tuple(f for f in fusions if f.completes is produced.group)
         return (
@@ -2246,6 +2472,7 @@ def _select_ffn_input(
                 _mlp_input_without_dp,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
+                residual_ops=residual_ops,
             ),
             fused,
         )
@@ -2255,7 +2482,11 @@ def _select_ffn_input(
     # Over attention DP and CP, the DP gather puts each CP rank's shard in its
     # DP group's slot, so the one DP sum gathers both axes.
     places_cp_shards = TokenAxis.ATTN_CP in gathered
-    if owes_attention_tp and not force_layernorm_before_gather:
+    if (
+        owes_attention_tp
+        and not force_layernorm_before_gather
+        and residual_ops.adds_plainly
+    ):
         return (
             partial(
                 _mlp_input_dp_partial,
@@ -2270,6 +2501,7 @@ def _select_ffn_input(
             gathers_residual=gathers_residual,
             reduces_attention_tp=owes_attention_tp,
             places_cp_shards=places_cp_shards,
+            residual_ops=residual_ops,
         ),
         (),
     )
@@ -2281,21 +2513,38 @@ def _select_ffn_output_move(
     residual: Layout,
     to: Layout,
     cp_moves: Optional[CpMoves] = None,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ) -> Tuple[bool, Optional[Callable], bool]:
     """How the FFN output reaches the rows the layer hands on: whether it goes
     back by undoing the attention-DP gather (the FFN exit and postprocess run
     that step), or else the postprocess that moves it, None when there is none
     to choose here; and whether that move also completes the sum the FFN
     leaves."""
+    pair = CommunicateSummableTensorPairFn
     if produced.layout == residual:
         if to == residual:
-            return False, CommunicateSummableTensorPairFn._trivial, False
+            return False, pair._trivial, False
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
-            # Each rank's slice back to the attention's rows: fold the residual
-            # into the output, then gather over attention TP.
-            return False, CommunicateSummableTensorPairFn._gather, False
+            # Each rank's slice back to the attention's rows: write the output
+            # into the residual, then gather over attention TP.
+            return False, partial(pair._gather, residual_ops=residual_ops), False
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
+    if returned == {TokenAxis.ATTN_TP_SCATTER} and to in (residual, produced.layout):
+        # The residual stays on each rank's slice (MHC on an input-scattered
+        # batch): a reduce-scatter onto the slice completes the sum the FFN
+        # leaves; a complete output is only sliced.
+        sums = produced.leaves_for_reduce_scatter
+        return (
+            False,
+            partial(
+                pair._onto_residual_shard,
+                sums=sums,
+                gathers_back=to != residual,
+                residual_ops=residual_ops,
+            ),
+            sums,
+        )
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     if returned == {TokenAxis.ATTN_CP}:
@@ -2380,11 +2629,10 @@ def _mlp_input_norm(
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
     context: CommunicateContext,
+    *,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ):
-    # TODO move these `if shape != 0` into LayerNorm itself
-    if hidden_states.shape[0] != 0:
-        hidden_states, residual = layernorm(hidden_states, residual)
-    return hidden_states, residual
+    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
 
 
 def _mlp_input_attn_tp_all_reduce(
@@ -2393,6 +2641,8 @@ def _mlp_input_attn_tp_all_reduce(
     forward_batch: ForwardBatch,
     layernorm: torch.nn.Module,
     context: CommunicateContext,
+    *,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ):
     """All-reduce hidden states inside the attention TP group, then layernorm.
 
@@ -2401,9 +2651,7 @@ def _mlp_input_attn_tp_all_reduce(
     ``TP_ATTN_FULL`` across the boundary.
     """
     hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
-    if hidden_states.shape[0] != 0:
-        hidden_states, residual = layernorm(hidden_states, residual)
-    return hidden_states, residual
+    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
 
 
 def _mlp_input_scatter(
@@ -2414,14 +2662,35 @@ def _mlp_input_scatter(
     context: CommunicateContext,
     *,
     scatters_residual: bool,
+    residual_ops: ResidualOps = ADD_AND_NORM,
 ):
     hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(
         hidden_states, context
     )
     if scatters_residual:
-        residual = _redistribute_to_attn_tp_shards(residual, context)
-    if hidden_states.shape[0] != 0:
-        hidden_states, residual = layernorm(hidden_states, residual)
+        residual = residual_ops.residual_to_attn_tp_shard(residual, context)
+    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
+
+
+def _mlp_input_on_residual_shard(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
+    context: CommunicateContext,
+    *,
+    residual_ops: ResidualOps,
+):
+    """The residual stays on each rank's slice while the FFN takes the full
+    rows: reduce-scatter the attention output onto the slice, which completes
+    its sum, write it into the residual and read the FFN input there, then
+    gather the input back into the attention output's rows."""
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    shard = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+    get_parallel().tp_group.reduce_scatter_tensor(shard, hidden_states)
+    shard, residual = residual_ops.update_and_read_ffn_input(shard, residual, layernorm)
+    attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual
 
 
@@ -2690,10 +2959,40 @@ class CommunicateSummableTensorPairFn:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
+        residual_ops: ResidualOps = ADD_AND_NORM,
         **kwargs,
     ):
-        hidden_states += residual
+        hidden_states = residual_ops.update_residual(hidden_states, residual)
         return _redistribute_from_attn_tp_shards(hidden_states), None
+
+    @staticmethod
+    def _onto_residual_shard(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        *,
+        sums: bool,
+        gathers_back: bool,
+        residual_ops: ResidualOps,
+        **kwargs,
+    ):
+        """Bring the FFN output onto the slice of the rows the residual is on:
+        a reduce-scatter that also completes its sum when ``sums``, else this
+        rank's slice of the complete output. With ``gathers_back`` it is
+        written into the residual there and the full rows are gathered back."""
+        if sums:
+            hidden_states, _ = tp_reduce_scatter(hidden_states, None, context)
+        else:
+            hidden_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
+        if not gathers_back:
+            return hidden_states, residual
+        local_states = residual_ops.update_residual(hidden_states, residual)
+        hidden_states = local_states.new_empty(
+            local_states.shape[0] * context.tp_size, *local_states.shape[1:]
+        )
+        get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
+        return hidden_states, None
 
     @staticmethod
     def _scatter(

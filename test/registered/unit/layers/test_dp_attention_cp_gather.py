@@ -231,7 +231,9 @@ class TestDpCpGather(CustomTestCase):
                     ),
                     (
                         (comm, "get_local_dp_buffer"),
-                        lambda group: torch.empty(local_buffer_len, HIDDEN).double(),
+                        lambda group, hidden_size=None: torch.empty(
+                            local_buffer_len, hidden_size or HIDDEN
+                        ).double(),
                     ),
                 ]:
                     stack.enter_context(patch.object(*target, value))

@@ -94,11 +94,8 @@ def make_communicator(
     communicator._cp_steps = None
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
-    communicator.postprocess_layer = MagicMock(
-        side_effect=lambda hidden_states, residual, forward_batch: (
-            hidden_states + 1,
-            residual,
-        )
+    communicator._complete_ffn_output_now = MagicMock(
+        side_effect=lambda hidden_states, residual, **_: (hidden_states + 1, residual)
     )
     return communicator
 
@@ -126,7 +123,7 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(seen, (True, False))
         self.assertIsInstance(hidden_states, UnreducedOutput)
         self.assertIs(residual, self.residual)
-        communicator.postprocess_layer.assert_not_called()
+        communicator._complete_ffn_output_now.assert_not_called()
 
     def test_reduction_left_to_next_layer_declares_its_group(self):
         group = make_group()
@@ -152,7 +149,7 @@ class TestFfnExit(CustomTestCase):
         self.assertIs(bound.func, comm._to_local_tokens)
         self.assertEqual(bound.args, (step, self.forward_batch))
         self.assertIs(residual, self.residual)
-        communicator.postprocess_layer.assert_not_called()
+        communicator._complete_ffn_output_now.assert_not_called()
         step.assert_not_called()
 
     def test_a_deferred_sum_carries_the_scatter_back_under_attention_dp(self):
@@ -165,7 +162,7 @@ class TestFfnExit(CustomTestCase):
         bound = hidden_states.reduce_and_redistribute
         self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
         self.assertEqual(bound.args, (group, self.forward_batch))
-        communicator.postprocess_layer.assert_not_called()
+        communicator._complete_ffn_output_now.assert_not_called()
         group.all_reduce.assert_not_called()
 
     def test_postprocess_completes_other_exits(self):
@@ -177,7 +174,7 @@ class TestFfnExit(CustomTestCase):
                 seen, (hidden_states, residual) = self.run_exit(communicator)
                 self.assertEqual(seen, (False, reduce_scatter))
                 self.assertNotIsInstance(hidden_states, UnreducedOutput)
-                communicator.postprocess_layer.assert_called_once()
+                communicator._complete_ffn_output_now.assert_called_once()
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
 
@@ -189,7 +186,7 @@ class TestFfnExit(CustomTestCase):
 
         self.assertEqual(seen, (False, True))
         communicator._ffn_sum_moves_to_next_layer.assert_not_called()
-        communicator.postprocess_layer.assert_called_once()
+        communicator._complete_ffn_output_now.assert_called_once()
         torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
 
     def test_finish_applies_the_decision_the_ffn_saw(self):
@@ -206,7 +203,7 @@ class TestFfnExit(CustomTestCase):
                 hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
                 self.assertEqual(seen, (fuse, False))
                 self.assertEqual(isinstance(hidden_states, UnreducedOutput), fuse)
-                self.assertEqual(communicator.postprocess_layer.called, not fuse)
+                self.assertEqual(communicator._complete_ffn_output_now.called, not fuse)
 
     def test_flags_are_restored_after_the_ffn(self):
         before = published_flags()
@@ -223,7 +220,7 @@ class TestFfnExit(CustomTestCase):
         )
         seen, _ = self.run_exit(communicator)
         self.assertEqual(seen, (False, False))
-        communicator.postprocess_layer.assert_called_once()
+        communicator._complete_ffn_output_now.assert_called_once()
 
     def test_deferral_implies_fusion_and_passes_the_handoff_through(self):
         """A deferring communicator publishes both flags, and a non-tensor
@@ -244,7 +241,7 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(
             ffn_exit.finish(handoff, self.residual), (handoff, self.residual)
         )
-        communicator.postprocess_layer.assert_not_called()
+        communicator._complete_ffn_output_now.assert_not_called()
         self.assertFalse(get_forward().defer_moe_finalize)
 
         # The MoE may decline per forward; a tensor then takes the fused exit.

@@ -184,10 +184,12 @@ GATHER_LAYOUT = (TP_ATTN_FULL, TP_ATTN_FULL, FULL, TP_ATTN_FULL)
 
 
 class TestMlpInputOrder(CustomTestCase):
-    def assert_order(self, order, func, **keywords):
+    def assert_order(self, order, func, residual_ops=comm.ADD_AND_NORM, **keywords):
         self.assertIsInstance(order, partial)
         self.assertIs(order.func, func)
-        self.assertEqual(order.keywords, keywords)
+        bound = dict(order.keywords)
+        self.assertIs(bound.pop("residual_ops", comm.ADD_AND_NORM), residual_ops)
+        self.assertEqual(bound, keywords)
 
     def test_facts_fixed_at_construction_pick_the_order(self):
         fusions = (object(),)
@@ -268,43 +270,62 @@ class TestMlpInputOrder(CustomTestCase):
         ):
             with self.subTest(expected=expected.__name__):
                 _, (steps, fused) = communicator(layout, context, Fusable())
-                self.assertIs(steps, expected)
+                self.assert_order(steps, expected)
                 self.assertEqual(fused, ())
         _, (steps, _) = communicator(
             (TP_ATTN_FULL, TP_ATTN_FULL, SCATTERED, SCATTERED), tp, Fusable()
         )
         self.assert_order(steps, comm._mlp_input_scatter, scatters_residual=True)
 
-    def test_mhc_picks_its_own_implementation_of_the_kind(self):
-        from sglang.srt.layers.communicator_mhc import (
-            MHCCommunicateWithAllReduceAndLayerNormFn as MHC,
-        )
+    def test_mhc_runs_the_shared_steps_with_its_residual(self):
         from sglang.srt.layers.communicator_mhc import (
             MHCLayerCommunicator,
+            MHCState,
         )
 
-        mhc = object()
-        for layout, func, residual_keyword in (
+        mhc = MHCState(hc_mult=2, hc_attn_pre=None, hc_ffn_pre=None, hc_post=None)
+        for layout, func, order, keywords in (
             (
                 GATHER_LAYOUT,
-                MHC._gather_hidden_states_and_residual,
-                dict(residual_on_slice=False),
+                comm._mlp_input_gather,
+                comm._mlp_input_without_dp,
+                # The fused add + RMSNorm kernels do not write hc_post.
+                dict(gathers_residual=False, fusions=()),
             ),
             (
                 (TP_ATTN_FULL, TP_ATTN_FULL, SCATTERED, SCATTERED),
-                MHC._scatter_hidden_states_and_residual,
+                comm._mlp_input_scatter,
+                None,
                 dict(scatters_residual=True),
             ),
         ):
             with self.subTest(func=func.__name__):
                 c = MHCLayerCommunicator.__new__(MHCLayerCommunicator)
-                c.mhc = mhc
+                c._residual_ops = mhc
                 c.layer_scatter_modes = modes(*layout)
                 c._context = make_context(tp=2)
                 c.post_attention_layernorm = Fusable()
                 steps, fused = c._select_mlp_input()
-                self.assert_order(steps, func, **residual_keyword, mhc=mhc)
+                if order is None:
+                    self.assert_order(steps, func, residual_ops=mhc, **keywords)
+                else:
+                    self.assertIs(steps.func, func)
+                    self.assert_order(
+                        steps.keywords["order"], order, residual_ops=mhc, **keywords
+                    )
                 self.assertEqual(fused, ())
+
+    def test_mhc_gathers_over_dp_after_its_write_back(self):
+        from sglang.srt.layers.communicator_mhc import MHCState
+
+        mhc = MHCState(hc_mult=2, hc_attn_pre=None, hc_ffn_pre=None, hc_post=None)
+        self.assert_order(
+            comm._mlp_input_order(make_context(dp=2, tp=2), SCATTERED, (), mhc),
+            comm._mlp_input_dp_replicate,
+            residual_ops=mhc,
+            gathers_residual=True,
+            reduces_attention_tp=True,
+        )
 
 
 if __name__ == "__main__":

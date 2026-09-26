@@ -70,9 +70,8 @@ class DeferringLayer(nn.Module):
         self.layer_communicator._ffn_leaves_sum_to_reduce_scatter = (
             lambda batch, dp_step: False
         )
-        self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
-            all_reduce(hidden),
-            residual,
+        self.layer_communicator._complete_ffn_output_now = (
+            lambda hidden, residual, **_: (all_reduce(hidden), residual)
         )
 
     def forward(
