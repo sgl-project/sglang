@@ -999,6 +999,15 @@ class LayerCommunicator:
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
         dense_on_local_rows = enable_moe_dense_fully_dp()
 
+        # A MoE whose data-parallel groups are the CP ranks computes each CP
+        # shard of a GQA prefill CP on its own ranks.
+        ffn_on_cp_shards = (
+            modes.is_layer_sparse
+            and parallel.attn_cp_size > 1
+            and parallel.moe_dp_size == parallel.attn_cp_size
+            and not _gathers_over_attention_cp()
+        )
+
         def on_local_rows(sparse: bool) -> bool:
             return moe_on_local_rows if sparse else dense_on_local_rows
 
@@ -1034,13 +1043,17 @@ class LayerCommunicator:
             may_leave = not cp_active
             may_leave_to_reduce_scatter = True
         else:
-            # Otherwise under CP the FFN completes its own sum: the next layer's
-            # input holds only this rank's chunk, and a reduce-scatter back over
-            # attention DP would split across the CP ranks.
-            may_leave = may_leave_to_reduce_scatter = parallel.attn_cp_size == 1
+            # Otherwise under CP an FFN over every CP shard completes its own
+            # sum: the next layer's input holds only this rank's chunk, and a
+            # reduce-scatter back over attention DP would split across the CP
+            # ranks. One on its own CP shard hands on its rows as without CP.
+            may_leave = may_leave_to_reduce_scatter = (
+                parallel.attn_cp_size == 1 or ffn_on_cp_shards
+            )
         return decoder_layer_sides(
             axis_sizes=token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
+            ffn_shards_over_cp=ffn_on_cp_shards,
             previous_on_local_rows=(
                 not modes.is_first_layer
                 and on_local_rows(modes.is_previous_layer_sparse)
@@ -2297,10 +2310,17 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
 
 def _cp_on_declarations() -> bool:
     """Whether attention CP is one the declarations cover: a prefill CP that
-    shards tokens, with DSA or MLA attention, or with the FFN input gathered
-    over a MoE-CP group that is the whole CP group."""
+    shards tokens, with DSA or MLA attention, with the FFN input gathered over a
+    MoE-CP group that is the whole CP group, or, without attention DP, with the
+    MoE's data-parallel groups the CP ranks (a MoE then computes each CP shard
+    on its own ranks)."""
+    parallel = get_parallel()
     return _generic_prefill_cp_shards_tokens() and (
-        _gathers_over_attention_cp() or get_parallel().moe_dp_size == 1
+        _gathers_over_attention_cp()
+        or parallel.moe_dp_size == 1
+        or (
+            parallel.moe_dp_size == parallel.attn_cp_size and parallel.attn_dp_size == 1
+        )
     )
 
 

@@ -85,6 +85,35 @@ class TestDecoderLayerEdges(CustomTestCase):
         self.assertIs(boundary.prepare.keywords["layer_input"], comm.tp_reduce_scatter)
 
 
+class TestAMoeOnEachCpShard(CustomTestCase):
+    """A MoE whose data-parallel groups are the CP ranks computes each CP shard
+    on its own ranks: its input stays sharded over CP, and the attention output
+    reaches it without a gather."""
+
+    def test_the_ffn_rows_stay_sharded_over_cp(self):
+        axis_sizes = sizes(cp=2, tp=2)
+        sides = decoder_layer_sides(
+            axis_sizes=axis_sizes,
+            ffn_on_local_rows=False,
+            previous_on_local_rows=False,
+            is_last_layer=False,
+            attention_gathers_local_rows=False,
+            ffn_group=SumGroup.MOE_OUTPUT,
+            leaves_for_next_layer=False,
+            leaves_for_reduce_scatter=False,
+            leaves_for_reduce_scatterv=False,
+            ffn_shards_over_cp=True,
+        )
+        cp_rows = rows(axis_sizes, TokenAxis.ATTN_CP)
+        self.assertEqual(sides.ffn.layout, cp_rows)
+        self.assertEqual(sides.ffn_output.layout, cp_rows)
+        self.assertIs(sides.ffn_output.group, SumGroup.MOE_OUTPUT)
+        # On the attention's rows: the input step completes the attention-TP
+        # sum and reads, moving nothing.
+        edges = decoder_layer_edges(sides)
+        self.assertEqual(edges.into_ffn.need.layout, edges.into_ffn.produced.layout)
+
+
 class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
     """Two layers build the two halves of one boundary without sharing it; the
     consumer's half never depends on what the producer may leave for a batch,
