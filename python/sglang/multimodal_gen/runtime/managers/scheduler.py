@@ -580,10 +580,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req.prompt, str
         ):
             return "prompt_type"
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if not self._supports_dynamic_batch_image_conditioning(base_req, candidate_req):
             return "image_conditioning"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
@@ -618,6 +615,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         return not callable(checker) or all(checker(req) for req in reqs)
 
+    def _supports_dynamic_batch_image_conditioning(self, *reqs: Req) -> bool:
+        checker = getattr(
+            self.server_args.pipeline_config,
+            "supports_dynamic_batching_with_image_conditioning",
+            None,
+        )
+        image_paths = [getattr(req, "image_path", None) for req in reqs]
+        if all(image_path is None for image_path in image_paths):
+            return True
+        if not callable(checker) or not checker():
+            return False
+        return all(isinstance(image_path, str) for image_path in image_paths)
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
@@ -641,10 +651,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             return False
 
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if not self._supports_dynamic_batch_image_conditioning(base_req, candidate_req):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return False
@@ -903,6 +910,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         merged_req.extra = deepcopy(merged_req.extra)
         merged_req.extra["dynamic_batch_seeds"] = dynamic_batch_seeds
+        if any(req.image_path is not None for req in reqs):
+            merged_req.image_path = [req.image_path for req in reqs]
+            merged_req.extra["dynamic_batch_image_conditioning"] = True
         merged_req.return_file_paths_only = base_req.return_file_paths_only
         if merged_req.return_file_paths_only:
             dynamic_output_paths: list[str] = []
