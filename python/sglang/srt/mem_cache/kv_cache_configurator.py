@@ -677,10 +677,10 @@ class KVCacheConfigurator:
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
+        # Same headroom the non-shared path uses. This was a hand-rolled copy of
+        # get_req_to_token_extra_context_len that had drifted narrower than the
+        # decode reserve the allocator actually takes.
+        extra_max_context_len = get_req_to_token_extra_context_len()
 
         mamba_layer_ids = [
             i
@@ -763,10 +763,10 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified tri-pool does not support an MLA full side yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
+        # Same headroom the non-shared path uses. This was a hand-rolled copy of
+        # get_req_to_token_extra_context_len that had drifted narrower than the
+        # decode reserve the allocator actually takes.
+        extra_max_context_len = get_req_to_token_extra_context_len()
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
