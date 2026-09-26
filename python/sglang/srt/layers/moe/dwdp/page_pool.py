@@ -6,23 +6,28 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-from cuda.bindings import driver as cuda
+import msgspec
 
-from sglang.srt.utils.cuda_vmm_utils import (
-    VmmReservation,
-    align_up,
-    check_drv,
-    get_device_granularity,
-    make_device_allocation_prop,
-)
+from sglang.srt.utils.vmm_backend import get_vmm_backend
+from sglang.srt.utils.vmm_common import Reservation, align_up
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE_MULTIPLIER = 8
 
 
+class PoolBinding(msgspec.Struct, frozen=True):
+    """One run of pool pages inside a composite VA: ``num_pages`` pages starting at
+    page ``page_offset`` of ``slot``, mapped at ``offset`` in ``reservation``."""
+
+    slot: int
+    reservation: Reservation
+    offset: int
+    num_pages: int
+    page_offset: int
+
+
 class PagePool:
-    # local (non-fabric) handles avoid consuming NVLink routing table entries
     DEFAULT_PAGE_SIZE_MULTIPLIER = DEFAULT_PAGE_SIZE_MULTIPLIER
 
     def __init__(
@@ -33,8 +38,8 @@ class PagePool:
         page_size: Optional[int] = None,
     ):
         self._device_id = device_id
-        self._granularity = granularity or get_device_granularity(device_id)
-        self._prop = make_device_allocation_prop(device_id, handle_types=None)
+        self._backend = get_vmm_backend(device_id)
+        self._granularity = granularity or self._backend.granularity
 
         if page_size is None:
             self._page_size = self.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
@@ -52,10 +57,11 @@ class PagePool:
         for slot_idx, num_pages in enumerate(self._slot_pages):
             handles = []
             for _ in range(num_pages):
-                reservation = VmmReservation(
+                # pool pages stay local to this rank, so exporting them would spend
+                # a scarce per-device peer-sharing resource for nothing
+                reservation = self._backend.make_reservation(
                     self._page_size,
-                    self._prop,
-                    device_id,
+                    exportable=False,
                     alignment=self._granularity,
                 )
                 handle = reservation.map(0, self._page_size, retain_handle=True)
@@ -85,23 +91,20 @@ class PagePool:
     def slot_size(self, slot: int) -> int:
         return self._slot_sizes[slot]
 
-    def map_pages(
-        self,
-        slot: int,
-        reservation: VmmReservation,
-        offset: int,
-        size: int,
-        page_offset: int = 0,
-    ) -> None:
-        aligned_size = align_up(size, self._page_size)
-        num_pages_needed = aligned_size // self._page_size
-
-        for i in range(num_pages_needed):
-            handle = self._page_handles[slot][page_offset + i]
-            reservation.map_existing(
-                offset + i * self._page_size,
+    def map_binding(self, binding: PoolBinding) -> None:
+        for i in range(binding.num_pages):
+            handle = self._page_handles[binding.slot][binding.page_offset + i]
+            binding.reservation.map_existing(
+                binding.offset + i * self._page_size,
                 self._page_size,
                 handle,
+            )
+
+    def unmap_binding(self, binding: PoolBinding) -> None:
+        for i in range(binding.num_pages):
+            binding.reservation.unmap_existing(
+                binding.offset + i * self._page_size,
+                self._page_size,
             )
 
     def release(self) -> None:
@@ -110,7 +113,7 @@ class PagePool:
         self._released = True
         for handles in self._page_handles:
             for h in handles:
-                check_drv(cuda.cuMemRelease(h), "cuMemRelease")
+                self._backend.release_handle(h)
         self._page_handles = [[], []]
 
 

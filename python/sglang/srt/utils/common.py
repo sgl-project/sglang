@@ -420,6 +420,52 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+@lru_cache(maxsize=None)
+def _xpu_memory_query_works(gpu_id: int) -> bool:
+    """Probe the Level Zero memory query once per device: an old loader or missing
+    sysman telemetry degrades instead of failing a launch."""
+    try:
+        from sglang.srt.utils.xpu_vmm_utils import get_device_memory_in_use
+
+        get_device_memory_in_use(gpu_id)
+    except (ImportError, RuntimeError, OSError) as error:
+        logger.warning(
+            f"Level Zero memory query unavailable for XPU {gpu_id} ({error}); "
+            f"falling back to torch.xpu.memory_allocated, which sees only torch's "
+            f"own allocator."
+        )
+        return False
+    return True
+
+
+def _xpu_memory_in_use(gpu_id: int) -> int:
+    """Device memory in use on an XPU, counting allocations torch cannot see.
+
+    torch.xpu.memory_allocated knows only its own allocator, and mem_get_info
+    forwards a free == total stub, so Level Zero sysman is the only whole-device
+    source.
+    """
+    torch_in_use = torch.xpu.memory_allocated(gpu_id)
+    if not _xpu_memory_query_works(gpu_id):
+        return torch_in_use
+
+    from sglang.srt.utils.xpu_vmm_utils import get_device_memory_in_use
+
+    # The sysman process query counts then fills, so a process starting between the
+    # two calls fails this query but not the next one; retry before degrading.
+    for _ in range(2):
+        try:
+            return max(torch_in_use, get_device_memory_in_use(gpu_id))
+        except (RuntimeError, OSError) as error:
+            last_error = error
+    logger.warning(
+        f"Level Zero memory query failed twice for XPU {gpu_id} ({last_error}); "
+        f"falling back to torch.xpu.memory_allocated, which sees only torch's own "
+        f"allocator, so memory pools may be sized too high."
+    )
+    return torch_in_use
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -465,9 +511,8 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory = total_gpu_memory - _xpu_memory_in_use(gpu_id)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()

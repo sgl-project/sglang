@@ -1000,6 +1000,13 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Path to a Level Zero loader exporting the VMM entry points; needed only
+    # where the loader on the default search path predates 1.28.
+    SGLANG_XPU_ZE_LOADER_SO_PATH = EnvStr(None)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)

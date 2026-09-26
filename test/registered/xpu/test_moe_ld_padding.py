@@ -13,10 +13,13 @@ from sglang.srt.layers.moe.utils import (
     xpu_moe_ld_padding_elems,
 )
 from sglang.srt.layers.quantization.unquant import _empty_xpu_moe_expert_weight
-from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+# The padding gate and the allocator live in unquant.py, which every backend
+# shares; the cases needing a real XPU skip, the rest guard that shared path.
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestXpuMoeLdPadding(CustomTestCase):
@@ -60,11 +63,16 @@ class TestXpuMoeLdPadding(CustomTestCase):
         unpadded = _empty_xpu_moe_expert_weight(E, N, 1024, torch.bfloat16)
         self.assertTrue(unpadded.is_contiguous())
 
-    def test_only_pads_weights_that_land_on_xpu(self):
-        # is_xpu() only says an XPU exists on the machine; the weights
-        # can still be built for CPU/CUDA. create_weights takes no device
-        # argument, so the gate reads the ambient device context. Padding a
-        # non-XPU weight would make it non-contiguous for no benefit.
+    def _publish(self, **fields):
+        # the gate reads dwdp_size off the parallel bag, which every server
+        # process has published by the time create_weights runs
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _build_weights(self, device, use_triton_kernels=False):
         from sglang.srt.layers.moe import MoeRunnerConfig
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
@@ -74,19 +82,25 @@ class TestXpuMoeLdPadding(CustomTestCase):
                 self.moe_runner_config = MoeRunnerConfig(activation="silu")
                 self.moe_runner_config.is_gated = True
 
-        def build(device, use_triton_kernels=False):
-            method = UnquantizedFusedMoEMethod(use_triton_kernels=use_triton_kernels)
-            layer = _Layer()
-            with torch.device(device):
-                method.create_weights(
-                    layer=layer,
-                    num_experts=8,
-                    hidden_size=3072,
-                    intermediate_size_per_partition=3072,
-                    params_dtype=torch.bfloat16,
-                    with_bias=False,
-                )
-            return layer.w13_weight, layer.w2_weight
+        method = UnquantizedFusedMoEMethod(use_triton_kernels=use_triton_kernels)
+        layer = _Layer()
+        with torch.device(device):
+            method.create_weights(
+                layer=layer,
+                num_experts=8,
+                hidden_size=3072,
+                intermediate_size_per_partition=3072,
+                params_dtype=torch.bfloat16,
+                with_bias=False,
+            )
+        return layer.w13_weight, layer.w2_weight
+
+    def test_only_pads_weights_that_land_on_xpu(self):
+        # is_xpu() only says an XPU exists on the machine; the weights
+        # can still be built for CPU/CUDA. create_weights takes no device
+        # argument, so the gate reads the ambient device context. Padding a
+        # non-XPU weight would make it non-contiguous for no benefit.
+        self._publish(dwdp_size=1)
 
         with (
             unittest.mock.patch(
@@ -98,15 +112,15 @@ class TestXpuMoeLdPadding(CustomTestCase):
             ),
         ):
             # Backend on but building for CPU -> must stay contiguous.
-            w13_cpu, w2_cpu = build("cpu")
+            w13_cpu, w2_cpu = self._build_weights("cpu")
             self.assertTrue(w13_cpu.is_contiguous())
             self.assertTrue(w2_cpu.is_contiguous())
 
             if torch.xpu.is_available():
-                w13_xpu, _ = build("xpu")
+                w13_xpu, _ = self._build_weights("xpu")
                 self.assertFalse(w13_xpu.is_contiguous())
                 # The Triton path stores B transposed and ignores row stride.
-                w13_triton, _ = build("xpu", use_triton_kernels=True)
+                w13_triton, _ = self._build_weights("xpu", use_triton_kernels=True)
                 self.assertTrue(w13_triton.is_contiguous())
 
         # Backend forced to Triton -> never padded, even on XPU.
@@ -120,9 +134,33 @@ class TestXpuMoeLdPadding(CustomTestCase):
             ),
         ):
             device = "xpu" if torch.xpu.is_available() else "cpu"
-            w13, w2 = build(device)
+            w13, w2 = self._build_weights(device)
             self.assertTrue(w13.is_contiguous())
             self.assertTrue(w2.is_contiguous())
+
+    @unittest.skipUnless(torch.xpu.is_available(), "the gate only pads on XPU")
+    def test_dwdp_suppresses_padding(self):
+        # DWDP addresses experts inside a composite virtual address space by their
+        # logical byte size, so a padded row stride puts them at the wrong offsets.
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        with (
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+        ):
+            self._publish(dwdp_size=1)
+            w13_plain, _ = self._build_weights("xpu")
+            self.assertFalse(w13_plain.is_contiguous())
+
+            self._publish(dwdp_size=2)
+            w13_dwdp, w2_dwdp = self._build_weights("xpu")
+            self.assertTrue(w13_dwdp.is_contiguous())
+            self.assertTrue(w2_dwdp.is_contiguous())
 
     def test_loader_style_copy_into_padded_view(self):
         # Mirrors _load_w13 / _load_w2: narrow the destination along a dim and
