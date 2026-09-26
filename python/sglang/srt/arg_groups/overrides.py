@@ -1551,9 +1551,19 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
 def _speculative_moe_runner_default(view: Any) -> dict:
     """Default the speculative (draft) MoE runner backend to the resolved
     target-model backend. Invoked at the head of the speculative-decoding
-    hook, after the MoE kernel chain has resolved."""
+    hook, after the MoE kernel chain has resolved.
+
+    megamoe's global-expert-id dispatch assumes a quantized layer; MTP/NextN
+    drafts never are, so inheriting it here mismatches their actual (Triton)
+    runner and corrupts expert-id dispatch (issue #40623;
+    _deepseek_spec_moe_resolution above carries the same fact for the
+    HIP+DeepSeek-fp4 case). Fall back to auto instead.
+    """
     if view.speculative_moe_runner_backend is None:
-        return {"speculative_moe_runner_backend": view.moe_runner_backend}
+        default = view.moe_runner_backend
+        if default == "flashinfer_megamoe":
+            default = "auto"
+        return {"speculative_moe_runner_backend": default}
     return {}
 
 

@@ -162,7 +162,7 @@ class Spec(msgspec.Struct):
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
-            help="Choose the runner backend for MoE in speculative decoding.",
+            help="Choose the runner backend for MoE in speculative decoding. Defaults to --moe-runner-backend, except megamoe defaults the draft to auto (MTP/NextN draft layers are unquantized, which megamoe's global-expert-id dispatch doesn't support).",
             choices=MOE_RUNNER_BACKEND_CHOICES,
             resolvable=True,
         ),
@@ -170,7 +170,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except megamoe defaults the draft to none (MTP/NextN draft layers are unquantized, which megamoe's global-expert-id dispatch doesn't support).",
             choices=[
                 "none",
                 "deepep",
