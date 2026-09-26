@@ -493,7 +493,11 @@ def get_rope_config(config):
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
-        rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+        # An override of rope_scaling on a built config can leave
+        # rope_parameters without rope_theta. Prefer config.rope_theta.
+        rope_theta = rope_params.get(
+            "rope_theta", getattr(config, "rope_theta", 10000)
+        )
         return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
