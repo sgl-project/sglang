@@ -1,9 +1,12 @@
+from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -313,3 +316,64 @@ def test_cache_hit_skips_encoder_residency_and_input_preparation(encoder_count):
     request("hello", enabled=False)
     assert all(encoder.calls == 5 for encoder in encoders)
     assert strategy.prepare_for_use.call_count == 4 * encoder_count
+
+
+class TextEncodingDPGroup:
+    world_size = 2
+
+    def __init__(self, rank):
+        self.rank_in_group = rank
+        self.gathers = 0
+
+    def all_reduce(self, tensor):
+        dist.all_reduce(tensor)
+        return tensor
+
+    def all_gather(self, tensor, dim):
+        self.gathers += 1
+        outputs = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(outputs, tensor)
+        return torch.cat(outputs, dim=dim)
+
+
+def run_text_encoding_dp(rank, rendezvous):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=rendezvous,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        encoder = FullHiddenStateEncoder().eval()
+        args = make_server_args(pipeline_config=make_text_config())
+        with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+            stage = TextEncodingStage([encoder], [object()])
+        group = TextEncodingDPGroup(rank)
+        stage._text_encode_dp_group = Mock(return_value=group)
+        cache = ConditioningCache(4096)
+        with torch.no_grad(), cache.scope():
+            for attempt in range(3):
+                if attempt == 1 and rank == 0:
+                    cache.clear()
+                before = group.gathers
+                outputs = stage.encode_text(
+                    ["a", "bb", "ccc"], args, device="cpu", return_attention_mask=True
+                )
+                assert group.gathers > before
+                assert outputs[0][0][:, 0, 0].tolist() == [10, 11, 12]
+                assert outputs[4] == [[2, 2, 2]]
+                outputs[0][0].zero_()
+        assert encoder.calls == (2 if rank == 0 else 1)
+        assert cache.hits == (1 if rank == 0 else 2)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_batch_dp_keeps_gathering_on_rank_local_encoder_hits(tmp_path):
+    mp.spawn(
+        run_text_encoding_dp,
+        args=(f"file://{tmp_path / 'dp-rendezvous'}",),
+        nprocs=2,
+        join=True,
+    )
