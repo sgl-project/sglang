@@ -725,6 +725,11 @@ class AddAndNorm:
         )
 
     def update_and_read_ffn_input(self, hidden_states, residual, norm):
+        if residual is None:
+            # The layer stack starts at this FFN: its input is the residual.
+            if hidden_states.shape[0] == 0:
+                return hidden_states, hidden_states
+            return norm(hidden_states), hidden_states
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
         return norm(hidden_states, residual)
@@ -820,6 +825,9 @@ class LayerCommunicator:
         allow_deferred_ffn_reduction: bool = True,
         # How the layer writes its residual and reads its stages' inputs.
         residual_ops: ResidualOps = ADD_AND_NORM,
+        # A layer that is one stage of a sequence of stages, instead of an
+        # attention followed by an FFN.
+        stage: Optional["LayerStage"] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -839,6 +847,18 @@ class LayerCommunicator:
         )
         # The fused kernels every batch's attention input tries first.
         self._attn_input_fusions = self._select_attn_input_fusions()
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
+        # LoRA kernels need the per-layer token layout only under DP attention.
+        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
+            get_lora().enable_lora
+        )
+        if stage is not None:
+            self._init_stage(stage)
+            return
+        # Its two boundaries, for a layer that is one stage.
+        self.stage_edges = None
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
         self._declared = sides
@@ -870,20 +890,13 @@ class LayerCommunicator:
             if sides is not None and self._input_can_be_scattered()
             else None
         )
-        self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_spec().speculative_algorithm
-        )
-        # LoRA kernels need the per-layer token layout only under DP attention.
-        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
-            get_lora().enable_lora
-        )
 
         # Under LayerNorm SP, the steps the layer runs while the region is
         # active; None without SP. The two are exclusive: SP runs a model without
         # q_lora, which input-scattered attention needs.
         self._sp_steps = (
             _select_boundary_steps(
-                sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes()),
+                sequence_parallel_layer_sides(axis_sizes=token_axis_sizes()),
                 residual_ops=residual_ops,
                 attention_fusions=self._attn_input_fusions,
                 enters_stack=self.layer_scatter_modes.is_first_layer,
@@ -892,12 +905,51 @@ class LayerCommunicator:
             else None
         )
 
+    def _init_stage(self, stage: "LayerStage") -> None:
+        """A layer that is one stage: every batch runs the two boundaries its
+        declarations give."""
+        if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
+            raise NotImplementedError(
+                "a layer that is one stage with attention CP or LayerNorm SP"
+            )
+        self._declared = None
+        self._cp_steps = self._input_scattered_steps = self._sp_steps = None
+        self.stage_edges = stage.edges
+        into_edge, out_edge = stage.edges
+        reads_ffn = stage.reads is InputRead.FFN
+        into = make_boundary(
+            into_edge,
+            reads=stage.reads,
+            fusions=(
+                self._select_mlp_input_fusions()
+                if reads_ffn
+                else self._attn_input_fusions
+            ),
+            force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
+            residual_ops=self._residual_ops,
+            enters_stack=stage.enters_stack,
+        )
+        out = make_boundary(out_edge, reads=None, residual_ops=self._residual_ops)
+        self._steps = BoundarySteps(
+            attention_prepare=_another_stage if reads_ffn else into.prepare,
+            attention_input=_another_stage if reads_ffn else into.input_move,
+            ffn_input=into.prepare if reads_ffn else _another_stage,
+            ffn_input_rows=into.input_rows,
+            ffn_output=out_edge.produced,
+            ffn_output_move=out.output_move,
+            ffn_output_move_completes_sum=out.output_move_completes_sum,
+            ffn_sum_is_movable=out_edge.produced.group is not None,
+            fused=into.fused,
+        )
+
     @property
     def input_rows(self) -> Layout:
         """The rows the layer's input and residual arrive on in a batch that
         runs its ordinary steps."""
         if self._declared is not None:
             return self._declared.input_rows
+        if self.stage_edges is not None:
+            return self.stage_edges[0].residual
         return self._context.layouts[self.layer_scatter_modes.layer_input_mode]
 
     def _input_can_be_scattered(self) -> bool:
@@ -971,7 +1023,7 @@ class LayerCommunicator:
             # attention DP would split across the CP ranks.
             may_leave = may_leave_to_reduce_scatter = parallel.attn_cp_size == 1
         return decoder_layer_sides(
-            axis_sizes=_token_axis_sizes(cp_active=cp_active),
+            axis_sizes=token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
             previous_on_local_rows=(
                 not modes.is_first_layer
@@ -1051,14 +1103,14 @@ class LayerCommunicator:
         write-back is not a plain add stays on each rank's slice."""
         if self._residual_ops.adds_plainly:
             scattered = input_scattered_layer_sides(
-                axis_sizes=_token_axis_sizes(),
+                axis_sizes=token_axis_sizes(),
                 ffn_group=sides.ffn_output.group,
                 hands_on_partial=self.allow_reduce_scatter and not self.is_last_layer,
             )
             handoff = _hand_qkv_hook_its_input
         else:
             scattered = scattered_residual_layer_sides(
-                axis_sizes=_token_axis_sizes(),
+                axis_sizes=token_axis_sizes(),
                 ffn_group=sides.ffn_output.group,
                 is_first_layer=self.layer_scatter_modes.is_first_layer,
                 is_last_layer=self.is_last_layer,
@@ -1561,6 +1613,12 @@ class LayerCommunicator:
             residual = None
         return hidden_states, residual
 
+    def mixer_exit(self, forward_batch: ForwardBatch) -> "MixerExit":
+        """Decide once whether this stage's mixer (an attention-like stage)
+        skips its output all-reduce. Use the result as a context manager around
+        the mixer, then call ``finish``."""
+        return MixerExit(self, forward_batch)
+
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call, then call ``finish``."""
@@ -1717,6 +1775,42 @@ def _leave_to_next_layer(
     residual: torch.Tensor,
 ) -> Tuple[UnreducedOutput, torch.Tensor]:
     return wrap(hidden_states), residual
+
+
+class MixerExit:
+    """The scope that publishes a mixer's decision while it runs: inside the
+    ``with`` block ``fuse_mlp_allreduce`` on ``get_forward()`` tells its
+    row-parallel output projection to skip the all-reduce. It skips when the
+    stage's output always leaves its sum (to an FFN stage, which completes it in
+    its input), and when it may leave it and the fused kernel takes it into the
+    next input norm."""
+
+    __slots__ = ("skips_reduction", "_hands_on", "_scope")
+
+    def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
+        produced = communicator._batch_steps(forward_batch).ffn_output
+        self._hands_on = (
+            produced.leaves_for_next_layer
+            and communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+        )
+        self.skips_reduction = produced.always_leaves or self._hands_on
+        self._scope = get_forward().scoped(fuse_mlp_allreduce=self.skips_reduction)
+
+    def __enter__(self) -> "MixerExit":
+        self._scope.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._scope.__exit__(*exc_info)
+
+    def finish(
+        self, hidden_states: torch.Tensor
+    ) -> Union[torch.Tensor, UnreducedOutput]:
+        """The mixer's output: its partial sum to the FFN stage after it, as a
+        value that owes the sum to a mixer after it, or complete."""
+        if self._hands_on:
+            return UnreducedOutput(hidden_states, group=get_parallel().tp_group)
+        return hidden_states
 
 
 class FfnExit:
@@ -2128,7 +2222,7 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     return post_experts_reduction_group()
 
 
-def _token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
+def token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
     """The token axes' sizes for a batch: attention CP shards tokens only on
     a CP extend (``cp_active``); otherwise every CP rank holds them all."""
     parallel = get_parallel()
@@ -2144,7 +2238,7 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
     rows: from the rows the first overlapped layer takes to the attention's,
     and back again for each half."""
     attention = Layout.sharded_over(
-        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=_token_axis_sizes()
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=token_axis_sizes()
     )
     pair = CommunicateSummableTensorPairFn
     if layer_input_rows == attention:
@@ -2346,6 +2440,11 @@ def _attention_input_step(
     )
 
 
+def _another_stage(*args, **kwargs):
+    """The steps of a stage a single-stage layer does not have."""
+    raise RuntimeError("this layer is one stage and does not have the other")
+
+
 class InputRead(Enum):
     """How a boundary's consumer reads its input from the residual: with the
     attention input norm (prepare_attn) or with the FFN input norm and its
@@ -2353,6 +2452,18 @@ class InputRead(Enum):
 
     ATTENTION = auto()
     FFN = auto()
+
+
+class LayerStage(msgspec.Struct, frozen=True):
+    """A layer that is one stage of a sequence of stages, each an
+    attention-like mixer or an FFN: how it reads its input, its two boundaries
+    (into it, and out of it onto the rows every layer hands on, as
+    ``boundary_layout.stage_edges`` gives them), and whether the layer stack
+    starts at it."""
+
+    reads: InputRead
+    edges: Tuple[EdgeDecl, EdgeDecl]
+    enters_stack: bool = False
 
 
 class Boundary(msgspec.Struct, frozen=True):
