@@ -2368,6 +2368,21 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "metadata": {"type": "object"},
+                        },
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2476,6 +2491,237 @@ class TestQwen3CoderDetector(unittest.TestCase):
             params = json.loads(collected_params)
             self.assertEqual(params["location"], "Boston")
             self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_string_parameter_emits_before_closing_tag(self):
+        detector = Qwen3CoderDetector()
+        prefix = (
+            "<tool_call><function=write_file>"
+            "<parameter=file_path>/tmp/demo</parameter>"
+            "<parameter=content>"
+        )
+        calls = detector.parse_streaming_increment(prefix, self.tools).calls
+        calls += detector.parse_streaming_increment("x" * 1000, self.tools).calls
+
+        fragments = "".join(call.parameters for call in calls)
+        self.assertIn('"content": "', fragments)
+        self.assertIn("x" * 100, fragments)
+        self.assertLess(len(detector._buffer), 128)
+
+        tail = (
+            "</parameter><parameter=count>42</parameter>"
+            '<parameter=metadata>{"a": [1, 2]}</parameter>'
+            "</function></tool_call>"
+        )
+        calls += detector.parse_streaming_increment(tail, self.tools).calls
+        parameters = "".join(call.parameters for call in calls)
+        self.assertEqual(
+            json.loads(parameters),
+            {
+                "file_path": "/tmp/demo",
+                "content": "x" * 1000,
+                "count": 42,
+                "metadata": {"a": [1, 2]},
+            },
+        )
+
+    def test_streaming_string_parameter_matches_non_streaming(self):
+        values = [
+            "",
+            "null",
+            "NULL",
+            "nul",
+            "nullish",
+            "\n",
+            "\n\n",
+            "\n hello\n",
+            "\n\nbody\n",
+            '中文🙂"\\\t\r\n' * 20,
+            "a < x and </param is not a delimiter",
+        ]
+        for value in values:
+            text = (
+                "<tool_call><function=write_file>"
+                "<parameter=file_path>/tmp/demo</parameter>"
+                f"<parameter=content>{value}</parameter>"
+                "<parameter=count>42</parameter>"
+                '<parameter=metadata>{"a": [1, 2]}</parameter>'
+                "</function></tool_call>"
+            )
+            expected = json.loads(
+                Qwen3CoderDetector()
+                .detect_and_parse(text, self.tools)
+                .calls[0]
+                .parameters
+            )
+            for chunk_size in (1, 2, 3, 5, 17, 41, len(text)):
+                with self.subTest(value=value, chunk_size=chunk_size):
+                    detector = Qwen3CoderDetector()
+                    fragments = []
+                    for offset in range(0, len(text), chunk_size):
+                        result = detector.parse_streaming_increment(
+                            text[offset : offset + chunk_size], self.tools
+                        )
+                        fragments.extend(call.parameters for call in result.calls)
+                    self.assertEqual(json.loads("".join(fragments)), expected)
+
+    def test_streaming_composed_string_schemas_emit_before_closing_tag(self):
+        """String unions must not buffer the whole value or change conversion."""
+        schemas = [
+            {"type": ["string", "null"]},
+            {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            {"oneOf": [{"type": "null"}, {"type": "string"}]},
+            {"allOf": [{"type": "string"}, {"maxLength": 4096}]},
+            {"enum": ["hello", "world"]},
+            {"type": "str"},
+            {},
+        ]
+        for schema in schemas:
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name="write",
+                        parameters={
+                            "type": "object",
+                            "properties": {"content": schema},
+                        },
+                    ),
+                )
+            ]
+            prefix = "<tool_call><function=write><parameter=content>"
+            tail = "</parameter></function></tool_call>"
+            for value in ('中文🙂"\\' * 100, "null", "NULL", "nullable", "\n\nbody\n"):
+                text = prefix + value + tail
+                expected = json.loads(
+                    Qwen3CoderDetector()
+                    .detect_and_parse(text, tools)
+                    .calls[0]
+                    .parameters
+                )
+                for chunk_size in (1, 2, 3, 5, 17, 4096):
+                    with self.subTest(
+                        schema=schema, value=value[:20], chunk_size=chunk_size
+                    ):
+                        detector = Qwen3CoderDetector()
+                        parts = []
+                        open_text = prefix + value
+                        for offset in range(0, len(open_text), chunk_size):
+                            parts.extend(
+                                c.parameters
+                                for c in detector.parse_streaming_increment(
+                                    open_text[offset : offset + chunk_size], tools
+                                ).calls
+                            )
+                        if len(value) > 100:
+                            self.assertIn('"content": "', "".join(parts))
+                            self.assertLess(len(detector._buffer), 128)
+                        for offset in range(0, len(tail), chunk_size):
+                            parts.extend(
+                                c.parameters
+                                for c in detector.parse_streaming_increment(
+                                    tail[offset : offset + chunk_size], tools
+                                ).calls
+                            )
+                        self.assertEqual(json.loads("".join(parts)), expected)
+
+    def test_streaming_nonstring_schema_conversion_is_preserved(self):
+        """Array unions and other typed values must never enter the string path."""
+        cases = [
+            (
+                {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ]
+                },
+                '["NYC"]',
+                ["NYC"],
+            ),
+            ({"type": ["array", "null"]}, '["NYC"]', ["NYC"]),
+            ({"type": "integer"}, "42", 42),
+            ({"type": "boolean"}, "true", True),
+            ({"type": "object"}, '{"a": [1, 2]}', {"a": [1, 2]}),
+        ]
+        for schema, value, expected in cases:
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name="write",
+                        parameters={
+                            "type": "object",
+                            "properties": {"content": schema},
+                        },
+                    ),
+                )
+            ]
+            text = "<tool_call><function=write><parameter=content>" + value
+            tail = "</parameter></function></tool_call>"
+            for chunk_size in (1, 2, 3, 5, 17, 4096):
+                with self.subTest(schema=schema, chunk_size=chunk_size):
+                    detector = Qwen3CoderDetector()
+                    parts = []
+                    for offset in range(0, len(text), chunk_size):
+                        parts.extend(
+                            c.parameters
+                            for c in detector.parse_streaming_increment(
+                                text[offset : offset + chunk_size], tools
+                            ).calls
+                        )
+                    self.assertEqual("".join(parts), "")
+                    parts.extend(
+                        c.parameters
+                        for c in detector.parse_streaming_increment(tail, tools).calls
+                    )
+                    self.assertEqual(json.loads("".join(parts)), {"content": expected})
+                    parsed = Qwen3CoderDetector().detect_and_parse(text + tail, tools)
+                    self.assertEqual(
+                        json.loads(parsed.calls[0].parameters), {"content": expected}
+                    )
+
+    def test_streaming_string_terminators_and_repeated_calls(self):
+        """Split terminators must close only their value and reset the next call."""
+        for terminator in ("</parameter>", "", "</parameter>\n"):
+            text = (
+                "<tool_call><function=write_file><parameter=content>\n\nbody\n"
+                + terminator
+                + "<parameter=count>42</parameter></function></tool_call>"
+                + "<tool_call><function=write_file><parameter=content>null</function></tool_call>"
+            )
+            expected = [
+                json.loads(c.parameters)
+                for c in Qwen3CoderDetector().detect_and_parse(text, self.tools).calls
+            ]
+            for chunk_size in (1, 2, 3, 5, 17, len(text)):
+                with self.subTest(terminator=terminator, chunk_size=chunk_size):
+                    detector = Qwen3CoderDetector()
+                    parts = {}
+                    for offset in range(0, len(text), chunk_size):
+                        for call in detector.parse_streaming_increment(
+                            text[offset : offset + chunk_size], self.tools
+                        ).calls:
+                            parts[call.tool_index] = (
+                                parts.get(call.tool_index, "") + call.parameters
+                            )
+                    self.assertEqual(
+                        [json.loads(parts[k]) for k in sorted(parts)], expected
+                    )
+
+    def test_interrupted_stream_does_not_close_string_parameter(self):
+        detector = Qwen3CoderDetector()
+        chunks = [
+            "<tool_call><function=write_file><parameter=content>",
+            "x" * 1000,
+            "y" * 1000,
+        ]
+        fragments = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            fragments.extend(call.parameters for call in result.calls)
+            self.assertLess(len(detector._buffer), 128)
+
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads("".join(fragments))
 
     def test_streaming_with_text_and_tool(self):
         """
