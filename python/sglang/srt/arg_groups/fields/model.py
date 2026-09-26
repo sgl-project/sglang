@@ -382,3 +382,7 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_max_deliveries: A[
+        int,
+        "Cumulative non-refundable IPC deliveries per owner generation; drain and restart the owner when exhausted.",
+    ] = 128

@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import dataclasses
+import json
 import logging
 import multiprocessing
 import os
@@ -59,6 +60,7 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    CLIENT_CONNECTION_TIMEOUT,
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -72,18 +74,12 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import choose_daemon_transport_backend
+from .transport import DeliveryBudgetExceeded, choose_daemon_transport_backend
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-
-# Per-connection timeout for the serial serve loop. A client exchange is tiny
-# (a config dict + IPC handle metadata), so this generous bound never trips a
-# healthy client, yet guarantees one hung/dead peer can't stall the other
-# engine ranks indefinitely.
-CLIENT_CONNECTION_TIMEOUT = 30.0
 
 
 @dataclasses.dataclass
@@ -103,6 +99,7 @@ class WeightCacheDaemonArgs:
     dist_init_method: Optional[str] = None
     timeout: int = 1800
     force: bool = False
+    status: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -126,6 +123,11 @@ class WeightCacheDaemonArgs:
         )
         parser.add_argument("--timeout", type=int, default=1800)
         parser.add_argument("--force", action="store_true")
+        parser.add_argument(
+            "--status",
+            action="store_true",
+            help="Query one owner's recovery budget without loading weights (use --gpu-id or --weight-cache-socket).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
@@ -136,6 +138,7 @@ class WeightCacheDaemonArgs:
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            status=args.status,
         )
 
 
@@ -449,28 +452,28 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
-            if name not in state_dict_names:
+        from sglang.srt.weight_cache.common.traversal import iter_state
+
+        state_metadata = list(iter_state(self.model))
+        for name, kind, persistent, buf in state_metadata:
+            if kind == "buffer" and name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
-        self.transport_backend = choose_daemon_transport_backend(state_tensors)
-        self.state_entries = self.transport_backend.prepare_export(state_tensors)
-
-        # Log approximate serialized metadata size (not payload-backed bytes).
-        # Only the handle blob carries real weight, so measure it directly:
-        # stringifying every entry would allocate a copy of all handles.
-        total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
+        self.transport_backend = choose_daemon_transport_backend(
+            state_tensors,
+            max_deliveries=resolving_view(self.server_args).weight_cache_max_deliveries,
         )
+        self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name, kind, persistent, _ in state_metadata:
+            if name in self.state_entries:
+                self.state_entries[name]["persistent"] = persistent
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} tensors "
+            f"Prepared {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
-            f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"transport={self.transport_backend.name}; fresh IPC reductions per fetch"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
@@ -589,15 +592,36 @@ class WeightCacheDaemon:
                 f"Serving {len(self.state_entries)} tensors via "
                 f"{self.transport_backend.name} transport"
             )
-            self.transport_backend.send_fetch_state_response(
+            try:
+                self.transport_backend.send_fetch_state_response(
+                    conn,
+                    config=self.config.to_dict(),
+                    entries=self.state_entries,
+                    # PID so the client can watch daemon liveness: if this
+                    # process dies while clients hold IPC mappings, their
+                    # param.data (and any CUDA-graph-captured addresses) dangle.
+                    pid=os.getpid(),
+                    preloaded_weights_bytes=self.preloaded_weights_bytes,
+                )
+            except DeliveryBudgetExceeded as error:
+                send_msg(
+                    conn,
+                    {
+                        "status": "budget_exhausted",
+                        "message": str(error),
+                        **self.transport_backend.stats(),
+                    },
+                )
+
+        elif req.get("type") == "query_status":
+            send_msg(
                 conn,
-                config=self.config.to_dict(),
-                entries=self.state_entries,
-                # PID so the client can watch daemon liveness: if this
-                # process dies while clients hold IPC mappings, their
-                # param.data (and any CUDA-graph-captured addresses) dangle.
-                pid=os.getpid(),
-                preloaded_weights_bytes=self.preloaded_weights_bytes,
+                {
+                    "status": "ok",
+                    "pid": os.getpid(),
+                    "config": self.config.to_dict(),
+                    **self.transport_backend.stats(),
+                },
             )
 
         elif req.get("type") == "ping":
@@ -613,15 +637,15 @@ class WeightCacheDaemon:
             )
 
     def shutdown(self):
-        """Release GPU memory and clean up."""
+        """Stop serving; retain exported allocations until process exit.
+
+        A client watches our process identity, not Python object lifetimes.
+        Clearing model/state while this process is still alive would leave a
+        window where its live-producer check succeeds on freed allocations.
+        """
+        self._running = False
         if dist.is_initialized():
             dist.destroy_process_group()
-        if self.model is not None:
-            del self.model
-            self.model = None
-        self.state_entries.clear()
-        current_platform.empty_cache()
-        self._running = False
 
 
 def run_weight_cache_daemon(
@@ -874,7 +898,23 @@ if __name__ == "__main__":
 
     server_args = prepare_server_args(server_argv)
     daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
-    if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
+    if daemon_args.status:
+        cfg = resolving_view(server_args)
+        gpu_id = (
+            daemon_args.gpu_id if daemon_args.gpu_id is not None else cfg.base_gpu_id
+        )
+        path = cfg.weight_cache_socket or get_socket_path(
+            current_platform.get_device_uuid(gpu_id)
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(30)
+            conn.connect(path)
+            send_msg(conn, {"type": "query_status"})
+            response = recv_msg(conn)
+            if response.get("status") != "ok":
+                raise RuntimeError(f"Weight-cache status rejected: {response}")
+            print(json.dumps(response, sort_keys=True))
+    elif daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
         gpu_id = (
             daemon_args.gpu_id
             if daemon_args.gpu_id is not None

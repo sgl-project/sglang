@@ -226,6 +226,7 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
         }
     }
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.model_path = "/published/h3"
     pipeline.server_args = SimpleNamespace(
         model_variant="hybrid",
         model_subfolder=None,
@@ -233,7 +234,9 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
         transformer_weights_path=None,
     )
     with patch.object(
-        ComposedPipelineBase, "_load_config", return_value=model_index
+        ComposedPipelineBase,
+        "resolve_model_config",
+        return_value=(pipeline.model_path, model_index),
     ) as load:
         if weights is None:
             with pytest.raises(ValueError, match="requires explicit merged weights"):

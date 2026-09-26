@@ -54,6 +54,11 @@ These settings should preserve model behavior while changing residency, parallel
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}>Weight cache for fast recovery</td>
+      <td style={{padding: "9px 12px"}}>Reloading weights dominates worker restart time, and a separate owner can keep supported components GPU-resident.</td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/weight_cache">Weight cache</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}><code>--performance-mode</code></td>
       <td style={{padding: "9px 12px"}}>You want a safe preset for speed or memory without overriding explicit flags.</td>
       <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/deployment_cookbook">Deployment and Performance Modes</a></td>

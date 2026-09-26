@@ -141,6 +141,11 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     apply_plugin_hooks()
     configure_logger(server_args)
 
+    if server_args.weight_cache_mode != "off":
+        from sglang.multimodal_gen.runtime.weight_cache.preflight import preflight
+
+        preflight(server_args)
+
     # Start a new server with multiple worker processes
     if server_args.enable_metrics:
         configure_metrics()
@@ -168,10 +173,17 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     for i in range(local_num_gpus):
         rank = rank_offset + i
+        device_index = i
+        if server_args.weight_cache_mode != "off":
+            from sglang.multimodal_gen.runtime.weight_cache.placement import (
+                local_device_index,
+            )
+
+            device_index = local_device_index(server_args, i)
         reader, writer = worker_context.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         spec = SchedulerProcessSpec(
-            local_rank=i,
+            local_rank=device_index,
             rank=rank,
             server_args=server_args_payload,
             pipe_writer=writer,
