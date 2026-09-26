@@ -3908,6 +3908,19 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        # SGLANG_1093_DECODE_PREFER_V2
+        # Prefill-first scheduling lets new prefills preempt decode and blow
+        # multi-turn TPOT under speculative decoding without mixed chunk.
+        # Defer *new* prefills while decode is running, but still advance an
+        # in-flight chunked_req so a partial prefill cannot stall forever.
+        if (
+            not self.spec_algorithm.is_none()
+            and not self.is_mixed_chunk
+            and not running_batch.is_empty()
+            and self.chunked_req is None
+        ):
+            return None, running_batch
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
