@@ -2370,6 +2370,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Under overlap, prepare_for_decode leaves the penalizer update to
+    # resolve_forward_inputs, where the in-flight last token is known.
+    penalty_update_pending: bool = False
 
     # For split prefill
     split_index: int = 0
@@ -3191,6 +3194,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        # The mixed resolve feeds the running rows' relayed tokens to the
+        # merged penalizers, where those rows follow the prefill rows.
+        self.penalty_update_pending = running_batch.penalty_update_pending
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
         if tail_base is not None:
@@ -3529,10 +3535,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
-        # Under overlap batch.input_ids is just a placeholder here -- the
-        # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
+        # The Req-side token is current only without overlap; under overlap
+        # it trails by one step, see penalty_update_pending.
         last_tokens = [
             req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
             for req in self.reqs
@@ -3581,7 +3585,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         append_beam_tail(self)
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
+            if self.enable_overlap:
+                self.penalty_update_pending = True
+            else:
+                self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
