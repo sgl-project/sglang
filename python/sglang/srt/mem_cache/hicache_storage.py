@@ -40,6 +40,37 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+        ):
+            raise ValueError("DCP storage requires a DCP-aligned logical page size.")
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -396,6 +427,8 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
         self.config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
@@ -405,6 +438,13 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file. TP
+            # size restricts reuse to matching topologies; TP rank is omitted.
+            self.config_suffix += (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -444,7 +484,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_storage_owner=storage_config.is_storage_writer,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

@@ -10,13 +10,18 @@ pool sizing, and that the transfer entry points hand *physical* rows to the
 kernels.
 """
 
+import tempfile
 import unittest
+from itertools import product
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,16 +50,24 @@ def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
     )
 
 
-def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
+def _make_host_pool(
+    dcp_rank: int,
+    device_size: int = 1024,
+    dcp_size: int = DCP_SIZE,
+    layout: str = "layer_first",
+    dtype: torch.dtype = torch.float16,
+) -> MLATokenToKVPoolHost:
+    device = _fake_mla_device_pool(device_size)
+    device.store_dtype = dtype
     return MLATokenToKVPoolHost(
-        _fake_mla_device_pool(device_size),
+        device,
         host_to_device_ratio=2.0,
         host_size=0,
-        page_size=WIDENED_PAGE,
-        layout="layer_first",
+        page_size=PHYSICAL_PAGE * dcp_size,
+        layout=layout,
         pin_memory=False,
         device="cpu",
-        dcp_size=DCP_SIZE,
+        dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
 
@@ -188,10 +201,118 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_data_page_is_guarded(self):
-        pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(AssertionError):
-            pool.get_data_page(0)
+
+class TestDcpStoragePages(CustomTestCase):
+    def test_file_round_trip_to_different_allocations(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(directory),
+        ):
+            for dcp_size, layout, kv_dtype in product(
+                (2, 4),
+                ("layer_first", "page_first", "page_first_direct"),
+                (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2),
+            ):
+                dtype = (
+                    torch.uint8
+                    if kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    else kv_dtype
+                )
+                for rank in range(dcp_size):
+                    with (
+                        self.subTest(
+                            dcp_size=dcp_size, rank=rank, layout=layout, dtype=kv_dtype
+                        ),
+                        # File keys do not yet isolate different KV formats.
+                        envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+                            str(Path(directory) / f"{layout}-{kv_dtype}")
+                        ),
+                    ):
+                        source = _make_host_pool(
+                            rank, dcp_size=dcp_size, layout=layout, dtype=dtype
+                        )
+                        target = _make_host_pool(
+                            rank, dcp_size=dcp_size, layout=layout, dtype=dtype
+                        )
+                        values = (
+                            torch.arange(source.kv_buffer.numel()) * 13 + rank * 17
+                        ) % 251
+                        source.kv_buffer.copy_(values.reshape(source.kv_buffer.shape))
+                        target.kv_buffer.fill_(255)
+                        expected = target.kv_buffer.clone()
+                        backend = HiCacheFile(
+                            HiCacheStorageConfig(
+                                tp_rank=rank,
+                                tp_size=dcp_size,
+                                pp_rank=0,
+                                pp_size=1,
+                                attn_cp_rank=0,
+                                attn_cp_size=1,
+                                is_mla_model=True,
+                                enable_storage_metrics=False,
+                                is_page_first_layout=layout == "page_first",
+                                model_name="page-test",
+                                dcp_size=dcp_size,
+                                dcp_rank=rank,
+                                logical_page_size=64 * dcp_size,
+                                extra_config={
+                                    "max_size": "0",
+                                    "min_free_space": "0",
+                                    "enable_metadata_cache": False,
+                                },
+                            )
+                        )
+
+                        def page_view(buffer, page):
+                            if layout == "layer_first":
+                                return buffer[:, page * 64 : (page + 1) * 64]
+                            if layout == "page_first":
+                                return buffer[page * 64 : (page + 1) * 64]
+                            return buffer[page : page + 1]
+
+                        for source_page, target_page in ((3, 5), (1, 0)):
+                            key = f"page-{source_page}"
+                            payload = source.get_data_page(source_page * 64 * dcp_size)
+                            expected_bytes = (
+                                64 * 2 * 12 * source.kv_buffer.element_size()
+                            )
+                            self.assertEqual(
+                                payload.numel() * payload.element_size(), expected_bytes
+                            )
+                            torch.testing.assert_close(
+                                payload,
+                                page_view(source.kv_buffer, source_page).flatten(),
+                            )
+                            self.assertTrue(backend.set(key, payload))
+                            path = (
+                                Path(backend.file_path)
+                                / f"{backend._get_suffixed_key(key)}.bin"
+                            )
+                            self.assertEqual(path.stat().st_size, expected_bytes)
+                            restored = backend.get(
+                                key, target.get_dummy_flat_data_page()
+                            )
+                            target.set_from_flat_data_page(
+                                target_page * 64 * dcp_size, restored
+                            )
+                            page_view(expected, target_page).copy_(
+                                page_view(source.kv_buffer, source_page)
+                            )
+                        torch.testing.assert_close(
+                            target.kv_buffer, expected, rtol=0, atol=0
+                        )
+
+    def test_invalid_logical_starts_and_zero_copy_are_rejected(self):
+        pool = _make_host_pool(1, dcp_size=2, layout="page_first")
+        for index in (-128, 1, 64):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.get_data_page(index)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
+        with self.assertRaises(IndexError):
+            pool.get_data_page(pool.logical_size)
+        with self.assertRaises(NotImplementedError):
+            pool.get_page_buffer_meta(torch.arange(128))
 
 
 if __name__ == "__main__":
