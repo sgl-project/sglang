@@ -59,6 +59,50 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertEqual(props["ratio"]["type"], "number")
         self._assert_accepts(schema)
 
+    def test_string_encoded_numeric_constraints(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "minimum": "1",
+                    "maximum": "10.5",
+                },
+                "label": {"type": "string", "minLength": "2"},
+                "values": {
+                    "type": "array",
+                    "maxItems": "3",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "score": {"type": "number", "multipleOf": "0.25"}
+                        },
+                    },
+                },
+            },
+        }
+        normalize_json_schema_types(schema)
+        properties = schema["properties"]
+        self.assertEqual(properties["count"]["minimum"], 1)
+        self.assertEqual(properties["count"]["maximum"], 10.5)
+        self.assertEqual(properties["label"]["minLength"], 2)
+        self.assertEqual(properties["values"]["maxItems"], 3)
+        self.assertEqual(
+            properties["values"]["items"]["properties"]["score"]["multipleOf"],
+            0.25,
+        )
+        self._assert_accepts(schema)
+
+    def test_invalid_numeric_constraints_remain_invalid(self):
+        values = ("many", "1.5", "true", {}, [])
+        for value in values:
+            with self.subTest(value=value):
+                schema = {"type": "array", "maxItems": value}
+                normalize_json_schema_types(schema)
+                self.assertEqual(schema["maxItems"], value)
+                with self.assertRaises(SchemaError):
+                    self._assert_accepts(schema)
+
     def test_prefix_matched_numeric_types(self):
         schema = {
             "type": "object",
