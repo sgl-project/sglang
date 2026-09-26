@@ -156,6 +156,8 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Per-forward memoization of pre-expanded [B, 2, M] fmha_v2 block tables
+    fmha_v2_block_tables: Optional[dict] = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -408,6 +410,40 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+
+    def _fmha_v2_paged_inputs(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+    ):
+        """Build (qkv, block_tables) for trtllm_fmha_v2_prefill.
+
+        The kernel addresses K and V blocks from k_cache's base pointer via
+        int32 block offsets. When V sits at a block-aligned offset from K
+        (the fused pool halves), pass the views with pre-expanded [B, 2, M]
+        offsets, avoiding an expensive copy of KV caches.
+        """
+        block_bytes = k_cache.stride(0) * k_cache.element_size()
+        delta, rem = divmod(v_cache.data_ptr() - k_cache.data_ptr(), block_bytes)
+        if rem != 0 or not 0 < delta < torch.iinfo(torch.int32).max // 2:
+            logger.warning_once(
+                "fmha_v2 prefill: KV pool is not fused block-aligned, so the forward "
+                "copies the full per-layer KV pool on every prefill call (slow)."
+            )
+            return (q, torch.stack([k_cache, v_cache], dim=1)), page_table
+
+        tables = self.forward_metadata.fmha_v2_block_tables
+        if tables is None:
+            tables = self.forward_metadata.fmha_v2_block_tables = {}
+        key = (page_table.data_ptr(), tuple(page_table.shape), delta)
+        expanded = tables.get(key)
+        if expanded is None:
+            expanded = tables[key] = torch.stack(
+                [page_table, page_table + delta], dim=1
+            )
+        return (q, (k_cache, v_cache)), expanded
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1733,9 +1769,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            qkv, fmha_v2_block_tables = self._fmha_v2_paged_inputs(
+                q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table
+            )
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
-                (q, paged_kv),
+                qkv,
                 input_layout="Q_PAGED_KV_NHD",
                 workspace_buffer=self.workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
@@ -1746,7 +1784,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=page_table,
+                block_tables=fmha_v2_block_tables,
                 out_dtype=self.q_data_type,
                 mask_mode="causal",
                 window_left=layer.sliding_window_size,
