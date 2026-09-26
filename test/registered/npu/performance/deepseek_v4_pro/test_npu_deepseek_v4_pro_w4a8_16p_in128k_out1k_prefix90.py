@@ -57,7 +57,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
 # Server launch arguments for DSV4-Pro W4A8 two-node 16p PD-mix.
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
-    32,
+    16,
     "--nnodes",
     2,
     "--trust-remote-code",
@@ -90,7 +90,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "auto",
     "--enable-metrics",
     "--dp-size",
-    32,
+    16,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--disable-radix-cache",
