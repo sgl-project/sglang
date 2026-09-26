@@ -636,6 +636,7 @@ def _minimax_h3_attention_core_impl(
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
     gate_compress: torch.Tensor | None = None,
+    ulysses_qkv_ready: bool = False,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -651,7 +652,8 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if not ulysses_qkv_ready:
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
         if gate_compress is not None:
             gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
 
@@ -752,6 +754,42 @@ def _minimax_h3_attention_core_impl(
 _minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
 
 
+def _can_use_ulysses_gather_qkv(
+    arch: MiniMaxH3DiTArchConfig,
+    quant_config: QuantizationConfig | None,
+    *,
+    tp_size: int,
+    ulysses_size: int,
+    ring_size: int,
+    server_args: Any,
+) -> bool:
+    """Decide weight ownership before allocating or loading any QKV tensor.
+
+    Unsupported configurations retain the original full TP-local weights.
+    After sharding, silently falling back to the original projection would
+    consume the wrong heads, so this gate belongs to model construction.
+    """
+    return (
+        current_platform.is_cuda()
+        and quant_config is None
+        and tp_size == 2
+        and ulysses_size == 2
+        and ring_size == 1
+        and arch.hidden_size == 5376
+        and arch.num_attention_heads == 56
+        and arch.attention_head_dim == 128
+        and not arch.checkpoint_uses_diffusers_layout
+        and not arch.has_gate_compress
+        and arch.hybrid_attention is None
+        and server_args is not None
+        and server_args.performance_mode == "memory"
+        and not server_args.enable_torch_compile
+        and not server_args.enable_breakable_cuda_graph
+        and not server_args.use_fsdp_inference
+        and server_args.lora_path is None
+    )
+
+
 class MiniMaxH3Attention(nn.Module):
     def __init__(
         self,
@@ -761,6 +799,7 @@ class MiniMaxH3Attention(nn.Module):
         prefix: str,
         bcg_breakpoint: bool = True,
         cube_sparse_capable: bool = True,
+        use_ulysses_gather_qkv: bool = False,
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
@@ -775,6 +814,18 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = arch.attention_head_dim
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
+        self._use_ulysses_gather_qkv = use_ulysses_gather_qkv
+        self._ulysses_size, self._ulysses_rank = get_ulysses_ctx()
+        self.qkv_num_heads = (
+            self.num_heads // self._ulysses_size
+            if use_ulysses_gather_qkv
+            else self.num_heads
+        )
+        qkv_inner_dim = (
+            self.inner_dim // self._ulysses_size
+            if use_ulysses_gather_qkv
+            else self.inner_dim
+        )
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
         self._attention_impl = None
@@ -792,7 +843,7 @@ class MiniMaxH3Attention(nn.Module):
         # for TP > 1.
         self.qkv_proj = MergedColumnParallelLinear(
             arch.hidden_size,
-            [self.inner_dim] * 3,
+            [qkv_inner_dim] * 3,
             bias=False,
             gather_output=False,
             params_dtype=_BF16_DTYPE,
@@ -863,11 +914,11 @@ class MiniMaxH3Attention(nn.Module):
             )
         impl_cls = backend.get_impl_cls()
         self._attention_impl = impl_cls(
-            num_heads=self.num_heads,
+            num_heads=self.qkv_num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.softmax_scale,
-            num_kv_heads=self.num_heads,
+            num_kv_heads=self.qkv_num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
         )
@@ -887,9 +938,21 @@ class MiniMaxH3Attention(nn.Module):
             head_dim: int,
         ) -> Callable[[torch.Tensor], torch.Tensor]:
             def _reorder(loaded_weight: torch.Tensor) -> torch.Tensor:
+                heads = arch.num_attention_heads
+                if self._use_ulysses_gather_qkv:
+                    rest = loaded_weight.shape[1:]
+                    grouped = loaded_weight.reshape(
+                        self.tp_size,
+                        self._ulysses_size,
+                        heads // (self.tp_size * self._ulysses_size),
+                        3 * head_dim,
+                        *rest,
+                    )
+                    loaded_weight = grouped[:, self._ulysses_rank].reshape(-1, *rest)
+                    heads //= self._ulysses_size
                 return _reorder_grouped_qkv_to_qkv(
                     loaded_weight,
-                    num_query_groups=arch.num_attention_heads,
+                    num_query_groups=heads,
                     heads_per_group=1,
                     head_dim=head_dim,
                 )
@@ -903,13 +966,17 @@ class MiniMaxH3Attention(nn.Module):
             # [num_query_groups, q_per_group + k + v] before splitting.
             # MiniMax H3 uses MHA, so checkpoint rows are per-head [q, k, v],
             # while SGLang stores [q_all, k_all, v_all].
+            partition = self._ulysses_size if self._use_ulysses_gather_qkv else 1
+            rank = self.qkv_proj.tp_rank * partition
+            if self._use_ulysses_gather_qkv:
+                rank += self._ulysses_rank
             if _copy_grouped_qkv_tp_shard(
                 param,
                 loaded_weight,
                 num_query_groups=arch.num_attention_heads,
                 head_dim=arch.attention_head_dim,
-                tp_rank=self.qkv_proj.tp_rank,
-                tp_size=self.tp_size,
+                tp_rank=rank,
+                tp_size=self.tp_size * partition,
             ):
                 return
             base_loader(param, _reorder_checkpoint_weight(loaded_weight))
@@ -1080,11 +1147,24 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_heads, self.head_dim)
-        v = v.view(total, self.num_heads, self.head_dim)
+        if self._use_ulysses_gather_qkv:
+            if not ulysses_active or ring_active or rope_cache is None:
+                raise ValueError(
+                    "MiniMax-H3 sharded QKV requires U2, no Ring, and a full-row RoPE cache"
+                )
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                _usp_minimax_h3_gather_project_qkv,
+            )
+
+            qkv = _usp_minimax_h3_gather_project_qkv(x, self.qkv_proj.weight)
+            projected_total = qkv.shape[0]
+        else:
+            qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
+            projected_total = total
+        q, k, v = qkv.split(self.qkv_num_heads * self.head_dim, dim=-1)
+        q = q.view(projected_total, self.qkv_num_heads, self.head_dim)
+        k = k.view(projected_total, self.qkv_num_heads, self.head_dim)
+        v = v.view(projected_total, self.qkv_num_heads, self.head_dim)
         if (
             self.hybrid is not None
             and self._attention_backend_enum
@@ -1162,6 +1242,7 @@ class MiniMaxH3Attention(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
             gate_compress=gate_compress,
+            ulysses_qkv_ready=self._use_ulysses_gather_qkv,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -1375,6 +1456,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        use_ulysses_gather_qkv: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -1383,6 +1465,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            use_ulysses_gather_qkv=use_ulysses_gather_qkv,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
         self.adaln_proj = (
@@ -1682,6 +1765,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        if getattr(self, "_use_ulysses_gather_qkv", False):
+            raise ValueError(
+                "MiniMax-H3 LoRA requires restarting without "
+                "SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV"
+            )
         _reject_non_lora_delta_tensors(adapter)
         if self._adaln_precomputed:
             _reject_adaln_lora(list(adapter))
@@ -1772,6 +1860,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         return cache.resolve_slots(step_timesteps, keys=keys)
 
     def validate_lora_layers(self, layer_names: list[str]) -> None:
+        if getattr(self, "_use_ulysses_gather_qkv", False):
+            raise ValueError(
+                "MiniMax-H3 LoRA requires restarting without "
+                "SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV"
+            )
         if self._adaln_precomputed:
             _reject_adaln_lora(layer_names)
 
@@ -1947,6 +2040,28 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ulysses_size=ulysses_size,
             ring_size=get_ring_ctx()[0],
         )
+        self._use_ulysses_gather_qkv = False
+        if envs.SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV:
+            from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+            try:
+                server_args = get_global_server_args()
+            except ValueError:
+                server_args = None
+            self._use_ulysses_gather_qkv = _can_use_ulysses_gather_qkv(
+                arch,
+                quant_config,
+                tp_size=tp_size,
+                ulysses_size=ulysses_size,
+                ring_size=get_ring_ctx()[0],
+                server_args=server_args,
+            )
+            if not self._use_ulysses_gather_qkv:
+                logger.warning(
+                    "Ignoring SGLANG_MINIMAX_H3_ULYSSES_GATHER_QKV: requires "
+                    "native unquantized H3, TP2 x U2, Ring1, memory mode, "
+                    "eager execution, and no FSDP or LoRA."
+                )
 
         self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim
@@ -2029,6 +2144,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    use_ulysses_gather_qkv=self._use_ulysses_gather_qkv,
                 )
                 for index in range(arch.num_layers)
             ]
@@ -2255,13 +2371,17 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         local_seq_len = seq_len // sp_ws
         ring_chunk_len = local_seq_len * ulysses_ws
         row_start = ring_rank * ring_chunk_len + ulysses_rank * local_seq_len
+        cache_rows = local_seq_len
+        if self._use_ulysses_gather_qkv:
+            row_start = ring_rank * ring_chunk_len
+            cache_rows = ring_chunk_len
         rope_freqs = self.rope(
-            img_position_ids[:, row_start : row_start + local_seq_len]
+            img_position_ids[:, row_start : row_start + cache_rows]
         ).to(device)
         result = (
             _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
             torch.arange(
-                local_seq_len,
+                cache_rows,
                 device=device,
                 dtype=torch.long,
             ),
@@ -2551,11 +2671,18 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope_cache = kwargs.get("rope_cache")
         if rope_cache is None:
             self.materialize_mps_non_layer_weights("rope")
-            rope_freqs = self.rope(img_position_ids[:, row_start:row_stop]).to(device)
+            rope_start = row_start
+            rope_rows = local_seq_len
+            if self._use_ulysses_gather_qkv:
+                rope_start = ring_rank * ring_chunk_len
+                rope_rows = ring_chunk_len
+            rope_freqs = self.rope(
+                img_position_ids[:, rope_start : rope_start + rope_rows]
+            ).to(device)
             rope_cache = (
                 _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
                 torch.arange(
-                    local_seq_len,
+                    rope_rows,
                     device=device,
                     dtype=torch.long,
                 ),
