@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from typing import List, Optional
+
 import torch
 
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    PrefillCandidateBlocks,
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_block_mask,
     mask_topk_scores,
     select_candidate_block_ids,
 )
-from sglang.srt.layers.attention.mqa_logits_utils import (
-    mqa_logits_row_bytes,
-    mqa_logits_rows_per_chunk,
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_rows_per_tile,
+)
+from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    CandidateIndexer,
+    CandidateMetadata,
+    PrefillCandidateBlocks,
+    PrefillIndexerInputs,
 )
 from sglang.srt.utils.common import ceil_align
 
@@ -58,18 +64,9 @@ def dense_prefill_topk(
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
         return selected, published
-    row_alignment = 128 // q[0].shape[1]
-    rows_per_chunk = mqa_logits_rows_per_chunk(
-        num_rows=ceil_align(row, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_SCORE_BUDGET_BYTES,
+    rows_per_chunk = flat_index_logits_rows_per_tile(
+        row, width, heads=q[0].shape[1], budget_bytes=_SCORE_BUDGET_BYTES
     )
-    if rows_per_chunk is None:
-        rows_per_chunk = row
-    else:
-        rows_per_chunk = max(
-            row_alignment, rows_per_chunk // row_alignment * row_alignment
-        )
     for offset in range(0, row, rows_per_chunk):
         rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
@@ -89,6 +86,95 @@ def dense_prefill_topk(
     return selected, published
 
 
+def _dense_topk(
+    inputs: PrefillIndexerInputs,
+    out_positions: torch.Tensor,
+    *,
+    topk_blocks: int,
+    block_size: int,
+    publish: bool,
+    candidates: Optional[PrefillCandidateBlocks],
+) -> Optional[PrefillCandidateBlocks]:
+    selected, published = dense_prefill_topk(
+        q=(inputs.q_fp4, inputs.q_sf),
+        kv=inputs.kv,
+        weights=inputs.weights,
+        starts=inputs.request_starts,
+        lengths=inputs.compress_lens,
+        request_lengths=list(zip(inputs.rows_per_request, inputs.lens_per_request)),
+        topk=out_positions.shape[1],
+        candidate_topk_blocks=topk_blocks,
+        candidate_block_size=block_size,
+        publish_candidates=publish,
+        candidates=candidates,
+    )
+    out_positions.copy_(selected)
+    return published
+
+
+def plain_prefill_topk(
+    inputs: PrefillIndexerInputs, out_positions: torch.Tensor
+) -> None:
+    """The top-k of an index layer outside the candidate scheme, over its dense
+    scores tile by tile."""
+    _dense_topk(
+        inputs,
+        out_positions,
+        topk_blocks=0,
+        block_size=1,
+        publish=False,
+        candidates=None,
+    )
+
+
+class DenseCandidateIndexer(CandidateIndexer):
+    """Candidates as block ids per request (``PrefillCandidateBlocks``): the
+    source keeps its best blocks from its dense scores, a consumer masks its own
+    dense scores to -inf outside them and runs the plain top-k, tile by tile.
+    The prefill implementation for the CP layout; Hopper still runs the same
+    selection inline in the backend."""
+
+    def __init__(self, topk_blocks: int, block_size: int):
+        self.topk_blocks = topk_blocks
+        self.block_size = block_size
+
+    def publish_prefill(
+        self, inputs: PrefillIndexerInputs, out_positions: torch.Tensor
+    ) -> PrefillCandidateBlocks:
+        published = _dense_topk(
+            inputs,
+            out_positions,
+            topk_blocks=self.topk_blocks,
+            block_size=self.block_size,
+            publish=True,
+            candidates=None,
+        )
+        assert published is not None
+        return published
+
+    def select_prefill(
+        self,
+        published: CandidateMetadata,
+        inputs: PrefillIndexerInputs,
+        out_positions: torch.Tensor,
+    ) -> None:
+        assert isinstance(published, PrefillCandidateBlocks), "candidate blocks missing"
+        _dense_topk(
+            inputs,
+            out_positions,
+            topk_blocks=self.topk_blocks,
+            block_size=self.block_size,
+            publish=False,
+            candidates=published,
+        )
+
+    def prefill_tail(
+        self, published: CandidateMetadata, tail_lens: List[int]
+    ) -> PrefillCandidateBlocks:
+        assert isinstance(published, PrefillCandidateBlocks), "candidate blocks missing"
+        return published.tail(tail_lens)
+
+
 def _select_tile(
     *,
     q: tuple[torch.Tensor, torch.Tensor],
@@ -106,7 +192,7 @@ def _select_tile(
 ) -> None:
     from deep_gemm import fp8_fp4_mqa_logits
 
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
     logits = fp8_fp4_mqa_logits(q, kv, weights, starts, starts + lengths, False, width)
     if publish is not None or consume is not None:

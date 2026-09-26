@@ -7,6 +7,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -158,6 +159,49 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
+    # once per batch by AiterAttnBackend._asm_context_prefill_indices.
+    asm_ctx_ready: bool = False
+    asm_ctx_tok_idx: Optional[torch.Tensor] = None
+    asm_ctx_cu_k: Optional[torch.Tensor] = None
+    # (page_indptr, page_ids, last_page_len); None means use the token-level table
+    paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+def _build_paged_kv_view(
+    kv_indices: torch.Tensor, seq_lens_cpu: torch.Tensor, page_size: int
+):
+    """Token-level flashinfer KV table -> the page-level view aiter's asm
+    paged-varlen prefill expects.
+
+    The paged allocator packs each page contiguously, so a token slot's page id
+    is slot // page_size. The arithmetic runs on seq_lens_cpu so it costs no
+    device sync; only the gather touches the GPU.
+    """
+    device = kv_indices.device
+    seq_lens = seq_lens_cpu.to(torch.int64)
+    pages = (seq_lens + page_size - 1) // page_size
+
+    page_indptr = torch.zeros(pages.numel() + 1, dtype=torch.int32)
+    page_indptr[1:] = torch.cumsum(pages, dim=0)
+    tok_base = torch.zeros(pages.numel() + 1, dtype=torch.int64)
+    tok_base[1:] = torch.cumsum(seq_lens, dim=0)
+
+    within = torch.arange(
+        int(page_indptr[-1]), dtype=torch.int64
+    ) - torch.repeat_interleave(page_indptr[:-1].to(torch.int64), pages)
+    gather = torch.repeat_interleave(tok_base[:-1], pages) + within * page_size
+    page_ids = (kv_indices[gather.to(device)] // page_size).to(torch.int32)
+    last_page_len = ((seq_lens - 1) % page_size + 1).to(torch.int32)
+    return page_indptr.to(device), page_ids, last_page_len.to(device)
+
+
+def _paged_prefill_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """aiter's asm paged-varlen guard takes only a power-of-two GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    gqa = num_q_heads // num_kv_heads
+    return gqa & (gqa - 1) == 0
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -176,6 +220,12 @@ def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
         return False
     return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
+
+
+# Cross-check the per-batch fast indices against the generic gather (syncs).
+_GFX_ASM_CTX_GATHER_CHECK = (
+    os.environ.get("SGLANG_GFX_ASM_CTX_GATHER_CHECK", "0") == "1"
+)
 
 
 def _asm_context_prefill_gather_indices(
@@ -1058,6 +1108,70 @@ class AiterAttnBackend(AttentionBackend):
                 required_tokens, dtype=torch.int32, device=device
             )
         return self._kv_indices_scratch[:required_tokens]
+
+    def _asm_context_prefill_indices(
+        self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
+    ):
+        """KV slots and cu_seqlens_k for the ASM context-chunk prefill, computed
+        once per batch and shared by every full-attention layer.
+
+        For a plain extend batch AiterIndicesUpdaterPrefill lays kv_indices out
+        token by token with kv_indptr = cumsum(seq_lens), so the slots to gather
+        are the first sum(seq_lens) entries and cu_seqlens_k is kv_indptr itself;
+        both follow from host-side lengths without a device sync. Anything else
+        (spec batches, missing host lengths, or a short table) takes the generic
+        gather, which validates the metadata on the device.
+        """
+        fm = self.forward_metadata
+        if fm.asm_ctx_ready:
+            return fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k
+        fm.asm_ctx_ready = True
+        total_k = 0
+        if (
+            forward_batch.spec_info is None
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            total_k = int(forward_batch.seq_lens_cpu[:bs].sum())
+        if 0 < total_k <= fm.kv_indices.numel():
+            tok_idx = fm.kv_indices[:total_k]
+            cu_k = fm.kv_indptr[: bs + 1]
+            if cu_k.dtype != torch.int32:
+                cu_k = cu_k.to(torch.int32)
+            if _GFX_ASM_CTX_GATHER_CHECK:
+                ref = _asm_context_prefill_gather_indices(
+                    fm.kv_indptr[: bs + 1],
+                    fm.kv_indices,
+                    forward_batch.seq_lens[:bs],
+                    num_kv_slots,
+                    forward_batch.forward_mode,
+                )
+                assert (
+                    ref is not None
+                    and torch.equal(ref[0], tok_idx.to(torch.long))
+                    and torch.equal(ref[1].to(torch.int32), cu_k)
+                ), (
+                    "asm context prefill: fast gather indices differ from the generic gather"
+                )
+                logger.info(
+                    "[asm-context-prefill] fast gather indices verified: bs=%d total_k=%d",
+                    bs,
+                    total_k,
+                )
+        else:
+            gathered = _asm_context_prefill_gather_indices(
+                fm.kv_indptr[: bs + 1],
+                fm.kv_indices,
+                forward_batch.seq_lens[:bs],
+                num_kv_slots,
+                forward_batch.forward_mode,
+            )
+            if gathered is None:
+                return None, None
+            tok_idx, cu_k = gathered
+            cu_k = cu_k.to(torch.int32)
+        fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k = tok_idx, cu_k
+        return tok_idx, cu_k
 
     def _set_uniform_qo_indptr(
         self, bs: int, tokens_per_req: int, device: torch.device
@@ -1954,6 +2068,25 @@ class AiterAttnBackend(AttentionBackend):
                         self.indices_updater_prefill.kv_indices
                     ).to(torch.int32)
 
+                # Once per batch, not per layer: forward_extend only consumes it.
+                # The arch test is not redundant with the flag: the asm guard is
+                # gfx95-only, and elsewhere there is no kernel for this shape at
+                # all, so building a view we must not pass is wasted work.
+                paged_kv_view = None
+                if (
+                    envs.SGLANG_AITER_PAGED_PREFILL_ASM.get()
+                    and is_gfx95_supported()
+                    and self.page_size == 64
+                    and not self.kv_cache_is_vectorized_5d
+                    and not self.use_sliding_window_kv_pool
+                    and not self.use_triton_unified_attention
+                ):
+                    paged_kv_view = _build_paged_kv_view(
+                        self.indices_updater_prefill.kv_indices,
+                        forward_batch.seq_lens_cpu,
+                        self.page_size,
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
@@ -1963,6 +2096,7 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                     swa_out_cache_loc=swa_out_cache_loc,
+                    paged_kv_view=paged_kv_view,
                 )
 
     def _plan_dcp_decode_metadata(
@@ -3467,12 +3601,32 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
+            # Whether the paged asm prefill kernel can serve this layer on this
+            # batch. Both the gather branch below and the paged branch at the
+            # end of this method key off it, so the two stay mutually exclusive
+            # by construction: one flag, read twice, cannot drift out of sync
+            # the way two copies of the same condition would.
+            paged_asm_available = (
+                self.forward_metadata.paged_kv_view is not None
+                and _paged_prefill_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
+            )
+
             # Context-chunk prefill (extend batches WITH a prefix) via the
             # gfx950 ASM fp8 varlen fmha. The ck_tile paged batch_prefill runs
             # at ~15% FP8 MFU at these shapes while the ASM kernel is ~3.5x
             # faster; gathering the paged fp8 KV into a contiguous varlen
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
+            # This applies to Qwen3.5 full-attention layers only currently,
+            # Other configurations fall through to the attention paths below.
+            #
+            # Yields to the paged asm kernel when there is one, since that reads
+            # the cache in place and does the same attention with no gather at
+            # all. This is not a blanket disable: on any batch or layer that
+            # kernel cannot serve, the flag is False and this branch runs
+            # exactly as it does today.
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
@@ -3489,18 +3643,14 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 and not self.kv_cache_is_vectorized_5d
                 and self.forward_metadata.max_kv_len is not None
+                and not paged_asm_available
             ):
                 bs = forward_batch.batch_size
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                gathered = _asm_context_prefill_gather_indices(
-                    self.forward_metadata.kv_indptr[: bs + 1],
-                    self.forward_metadata.kv_indices,
-                    forward_batch.seq_lens[:bs],
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id).shape[0],
-                    forward_batch.forward_mode,
+                tok_idx, cu_k = self._asm_context_prefill_indices(
+                    forward_batch, bs, k_cache.shape[0]
                 )
-                if gathered is not None:
-                    tok_idx, cu_k = gathered
+                if tok_idx is not None:
                     hk = layer.tp_k_head_num * layer.qk_head_dim
                     hv = layer.tp_v_head_num * layer.v_head_dim
                     # uint8 view: index_select is not implemented for fp8.
@@ -3531,7 +3681,7 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale.reshape(1),
                         v_descale.reshape(1),
                         self.qo_indptr[:bs0],
-                        cu_k.to(torch.int32),
+                        cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
                         softmax_scale=layer.scaling,
@@ -3631,12 +3781,36 @@ class AiterAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+            kv_indptr_arg = self.forward_metadata.kv_indptr[:bs0]
+            if (
+                paged_asm_available
+                and page_table is self.forward_metadata.kv_indices
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+                and self.kv_cache_dtype == fp8_dtype
+            ):
+                # These must match aiter's asm guard: there is no CK arm for 4D
+                # LINEAR page-64 fp8 hd256, so a shape the guard rejects raises
+                # rather than falling back. The arch half of the guard is
+                # checked where paged_kv_view is built.
+                page_indptr, page_ids, last_page_len = (
+                    self.forward_metadata.paged_kv_view
+                )
+                kv_indptr_arg = page_indptr[:bs0]
+                page_table = page_ids
+                k_cache = k_cache.view(-1, self.page_size, *k_cache.shape[-2:])
+                v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
+                extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
                 self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
+                kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,

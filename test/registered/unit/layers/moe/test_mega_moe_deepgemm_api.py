@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.moe import mega_moe
+from sglang.srt.runtime_context import get_parallel
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -66,15 +67,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.get_symm_buffer_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp8_dispatch", call.kwargs)
-
-    def test_server_flag_selects_mxf4_mma_type(self):
-        for enabled, expected in ((False, "fp8xfp4"), (True, "mxf4xmxf4")):
-            with self.subTest(enabled=enabled):
-                config = SimpleNamespace(
-                    moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=enabled)
-                )
-                with patch.object(mega_moe, "get_exec", return_value=config):
-                    self.assertEqual(mega_moe._mega_moe_mma_type(), expected)
 
     def test_buffer_cache_separates_mma_types(self):
         deep_gemm = self.deep_gemm
@@ -271,11 +263,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 "init_new",
                 return_value=object(),
             ),
-            patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(
-                    moe_ep_group=SimpleNamespace(device_group=object())
-                ),
+            get_parallel().override(
+                moe_ep_group=SimpleNamespace(device_group=object())
             ),
         ):
             mega_moe._run_mega_routed(

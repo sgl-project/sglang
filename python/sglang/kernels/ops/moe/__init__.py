@@ -128,7 +128,37 @@ def topk_softmax(
     )
 
 
-__all__ = ["moe_align_block_size", "topk_softmax"]
+def situ_and_mul_masked_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    scale_ue8m0: bool = False,
+    topk: int = 8,
+    transposed: bool = False,
+    swizzle: bool = False,
+) -> None:
+    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
+
+    return impl(
+        input,
+        output,
+        output_scale,
+        quant_group_size,
+        masked_m,
+        beta,
+        linear_beta,
+        scale_ue8m0,
+        topk,
+        transposed,
+        swizzle,
+    )
+
+
+__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
 
 
 # Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
@@ -202,5 +232,16 @@ register_kernel(
         target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
         capabilities=_CUDA,
         description="Row gather of quantized values plus their scales, one launch.",
+    )
+)
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+register_kernel(
+    KernelSpec(
+        op="moe.situ_and_mul_masked_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
