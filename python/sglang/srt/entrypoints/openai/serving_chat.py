@@ -111,7 +111,9 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
 from sglang.srt.utils import ImageData
-from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
+from sglang.srt.utils.weight_versions import (
+    build_endpoint_weight_version_sglext_fields,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -2308,6 +2310,9 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids = None
         if self._should_return_output_ids(request):
             output_ids = [list(ret_item["output_ids"]) for ret_item in ret]
+        weight_version_fields = build_endpoint_weight_version_sglext_fields(
+            ret[0]["meta_info"]
+        )
         response_sglext = None
         if (
             routed_experts
@@ -2315,6 +2320,7 @@ class OpenAIServingChat(OpenAIServingBase):
             or spec_tokens_details
             or input_ids is not None
             or output_ids is not None
+            or weight_version_fields
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
@@ -2322,6 +2328,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,
                 output_ids=output_ids,
+                **weight_version_fields,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -2446,7 +2453,6 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 
