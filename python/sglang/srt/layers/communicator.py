@@ -83,8 +83,8 @@ from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
     is_moe_input_scattered_across_dp_ranks,
-    post_experts_output_is_complete,
     post_experts_reduction_group,
+    post_experts_sum_is_one_all_reduce,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -780,16 +780,6 @@ def _batch_size(forward_batch: ForwardBatch) -> int:
     )
 
 
-def _deferred_reduction_runs_on_the_tp_group() -> bool:
-    """Whether an MoE output's one all-reduce runs over the TP group object
-    itself, the group a dense FFN and reduce_moe_output reduce over."""
-    parallel = get_parallel()
-    if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
-        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
-        return False
-    return post_experts_reduction_group() is parallel.tp_group
-
-
 def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
     if is_dp_attention_enabled():
         # The FFN runs on every DP rank's tokens, so every rank decides alike.
@@ -799,19 +789,9 @@ def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
 
 def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
     """Whether the next layer's all-reduce is the one the FFN would have run
-    itself: one full-precision sum over the same TP group, on an output
-    that is a plain partial sum. The output is not a plain partial sum when the
-    MoE combine already summed it, a replicated shared expert is added after the
-    reduction, or LoRA-B runs on the unreduced activations."""
-    return (
-        _ffn_has_tokens(forward_batch)
-        and get_moe_a2a_backend().is_none()
-        and not post_experts_output_is_complete(is_tp_path=True)
-        and not get_exec().comm.enable_quant_communications
-        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
-        and not get_lora().enable_lora
-        and _deferred_reduction_runs_on_the_tp_group()
-    )
+    itself, as the MoE declares it (post_experts_sum_is_one_all_reduce), on a
+    batch the FFN runs."""
+    return _ffn_has_tokens(forward_batch) and post_experts_sum_is_one_all_reduce()
 
 
 class LayerCommunicator:

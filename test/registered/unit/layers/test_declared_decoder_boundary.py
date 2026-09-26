@@ -37,6 +37,7 @@ from sglang.srt.layers.communicator import (
     scatter_mode_layouts,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusionLayerCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1830,7 +1831,21 @@ def running(*, reduce_scatterv, a2a=False):
     with ExitStack() as stack:
         stack.enter_context(planning(lambda: state().parallel, a2a=a2a))
         for name, value in replaced.items():
-            stack.enter_context(patch.object(comm, name, value))
+            if hasattr(comm, name):
+                stack.enter_context(patch.object(comm, name, value))
+        # What the MoE declares its skipped reduction leaves, read in its module.
+        for name, value in (
+            ("get_parallel", lambda: state().parallel),
+            ("get_moe_a2a_backend", comm.get_moe_a2a_backend),
+            (
+                "post_experts_output_is_complete",
+                replaced["post_experts_output_is_complete"],
+            ),
+            ("post_experts_reduction_group", replaced["post_experts_reduction_group"]),
+            ("get_lora", replaced["get_lora"]),
+            ("get_exec", replaced["get_exec"]),
+        ):
+            stack.enter_context(patch.object(moe_utils, name, value))
         yield
 
 
