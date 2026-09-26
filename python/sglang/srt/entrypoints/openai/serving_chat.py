@@ -262,6 +262,22 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
     return config or None
 
 
+def _dsv_assistant_generation_header(spec: str, thinking_mode: str) -> str:
+    """Assistant generation header for the DeepSeek encoders, for the case
+    where continue_final_message stripped the whole list and no message is
+    left to render it. Mirrors each encoder's normal-generation composition.
+    """
+    if spec in ("dsv4", "dsv41"):
+        module = encoding_dsv41 if spec == "dsv41" else encoding_dsv4
+        return module.ASSISTANT_SP_TOKEN + (
+            module.thinking_start_token
+            if thinking_mode == "thinking"
+            else module.thinking_end_token
+        )
+    # dsv32's user template ends the prompt right after the assistant token
+    return "<｜Assistant｜>"
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -1544,7 +1560,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # An empty system message hosts the request tools; dsv41 renders a
             # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
+            # messages can also be empty here when continue_final_message strips
+            # a lone trailing assistant message, so the emptiness check must not
+            # index messages[0].
+            if (not messages or messages[0]["role"] != "system") and (
+                request.tools or not is_dsv41
+            ):
+                # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [
@@ -1617,6 +1639,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
+                if not messages:
+                    # The strip emptied the list, so nothing rendered the
+                    # assistant generation header. Emit it explicitly or the
+                    # prefix would continue bare text, not an assistant turn.
+                    header_ids = self.tokenizer_manager.tokenizer.encode(
+                        _dsv_assistant_generation_header(
+                            self.chat_encoding_spec, thinking_mode
+                        )
+                    )
+                    if (
+                        header_ids
+                        and header_ids[0]
+                        == self.tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        header_ids = header_ids[1:]
+                    prompt_ids = prompt_ids + header_ids
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )

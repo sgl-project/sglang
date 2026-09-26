@@ -1626,6 +1626,36 @@ class ServingChatTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
                     self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv_encoders_handle_continue_final_message_only_assistant(self):
+        """continue_final_message may strip the only message; do not IndexError."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "assistant", "content": "partial answer"}],
+                    continue_final_message=True,
+                )
+
+                # The lone assistant message is removed by continue_final_message,
+                # so the encoder must tolerate the now-empty message list.
+                self.chat._process_messages(req, is_multimodal=False)
+
+                # The strip also leaves nothing to render the assistant
+                # generation header from; it must be emitted explicitly, or the
+                # prefix would continue bare text rather than an assistant turn.
+                encode_calls = (
+                    self.chat.tokenizer_manager.tokenizer.encode.call_args_list
+                )
+                rendered = " ".join(str(call.args[0]) for call in encode_calls)
+                assert "<｜Assistant｜>" in rendered, (
+                    f"{chat_encoding_spec}: assistant generation header missing "
+                    f"from the prompt after the strip emptied the message list"
+                )
+
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
