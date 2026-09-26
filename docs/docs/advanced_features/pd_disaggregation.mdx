@@ -379,6 +379,21 @@ pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 ```
 
 
+For UCX with NIXL 1.4.1 or later, prefill workers can opt into peer reconnect
+with `SGLANG_DISAGGREGATION_NIXL_ENABLE_RECONNECT=1`. A remote disconnect fails
+the affected transfer batch; new requests can use the same live decode worker
+after its metadata and prepared destination descriptors have been rebuilt.
+Requests are not replayed into their old KV slots. Other peers retain their
+connections and registered buffers.
+
+Recovery waits for every posted handle in the affected batch to reach a terminal
+NIXL result before retiring handles or acknowledging failed requests. If a
+handle cannot be inspected, retired, or settled within five seconds of a failure,
+the prefill engine requests shutdown through its scheduler parent. Run under a
+supervisor that replaces failed workers. This fallback is for unsuccessful
+recovery, rather than every in-flight disconnect. Peer replacement still uses
+the normal bootstrap registration with a new agent identity.
+
 ### Usage
 
 ### Llama Single Node
