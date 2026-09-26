@@ -1161,6 +1161,9 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Colocated RL engines share a host; a per-process JIT cache dir keeps them
+    # from racing on the same files.
+    SGLANG_DG_CACHE_DIR_PER_PROCESS = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
