@@ -1476,12 +1476,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
 
 class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
-    """Write-through backups queued (locked) at insert time and executed by
-    flush_pending_backups when SGLANG_HICACHE_BACKUP_NODES_PER_STEP > 0."""
+    """Write-through backups queued (locked) at insert time and executed as a
+    batch by the step's flush_pending_backups when batched write-through is on."""
 
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
-    def _build(self, nodes_per_step, cfg=None):
+    def _build(self, batched, cfg=None):
         cfg = cfg or self.cfg
         cache, allocator, _ = build_fixture(cfg)
         server_args = ServerArgs(
@@ -1496,7 +1496,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1
         cache.load_back_threshold = 0
-        cache._backup_nodes_per_step = nodes_per_step
+        cache._batch_write_through = batched
         return cache, allocator
 
     def _insert(self, cache, allocator, tokens):
@@ -1515,7 +1515,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         return cache.tree_core.get_component_device_lock_ref(node, ComponentType.FULL)
 
     def test_insert_queues_a_locked_node_and_flush_backs_it_up(self):
-        cache, allocator = self._build(nodes_per_step=8)
+        cache, allocator = self._build(batched=True)
         self._insert(cache, allocator, [1, 2, 3, 4])
         node = self._leaf_for(cache, [1, 2, 3, 4])
         self.assertEqual(list(cache.queued_backups), [node])
@@ -1537,27 +1537,8 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         self.assertEqual(self._full_lock(cache, node), 0)
         cache.sanity_check()
 
-    def test_per_step_cap_bounds_the_backups_one_flush_executes(self):
-        cache, allocator = self._build(nodes_per_step=2)
-        seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
-        for seq in seqs:
-            self._insert(cache, allocator, seq)
-        nodes = [self._leaf_for(cache, seq) for seq in seqs]
-        self.assertEqual(list(cache.queued_backups), nodes)
-
-        cache.flush_pending_backups()
-        self.assertEqual(list(cache.queued_backups), nodes[2:])
-        self.assertEqual(list(cache.ongoing_write_through), nodes[:2])
-
-        cache.flush_pending_backups()
-        self.assertEqual(cache.queued_backups, {})
-        cache.writing_check(write_back=True)
-        self.assertTrue(all(cache.tree_core.is_backuped(node) for node in nodes))
-        self.assertTrue(all(self._full_lock(cache, node) == 0 for node in nodes))
-        cache.sanity_check()
-
     def test_split_of_a_queued_node_queues_the_new_parent_through_the_next_chain(self):
-        cache, allocator = self._build(nodes_per_step=8)
+        cache, allocator = self._build(batched=True)
         self._insert(cache, allocator, [1, 2, 3, 4])
         node = self._leaf_for(cache, [1, 2, 3, 4])
         # Split the queued node before its backup ran: [1, 2] becomes the parent,
@@ -1581,7 +1562,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         cache.sanity_check()
 
     def test_host_alloc_failure_drops_the_queued_backup_and_releases_its_lock(self):
-        cache, allocator = self._build(nodes_per_step=8)
+        cache, allocator = self._build(batched=True)
         self._insert(cache, allocator, [1, 2, 3, 4])
         node = self._leaf_for(cache, [1, 2, 3, 4])
         with mock.patch.object(
@@ -1622,7 +1603,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         cache.sanity_check()
 
     def test_flush_backs_up_disjoint_queued_nodes_with_one_host_allocation(self):
-        cache, allocator = self._build(nodes_per_step=8)
+        cache, allocator = self._build(batched=True)
         seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
         for seq in seqs:
             self._insert(cache, allocator, seq)
@@ -1635,7 +1616,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         self._assert_all_backed_up(cache, nodes)
 
     def test_batch_allocation_failure_falls_back_to_node_by_node(self):
-        cache, allocator = self._build(nodes_per_step=8)
+        cache, allocator = self._build(batched=True)
         seqs = ([1, 2, 3, 4], [5, 6, 7, 8])
         for seq in seqs:
             self._insert(cache, allocator, seq)
@@ -1657,7 +1638,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
             kv_size=64,
             max_context_len=64,
         )
-        cache, allocator = self._build(nodes_per_step=8, cfg=cfg)
+        cache, allocator = self._build(batched=True, cfg=cfg)
         self._insert(cache, allocator, [1, 2, 3, 4])
         parent = self._leaf_for(cache, [1, 2, 3, 4])
         self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
@@ -1671,8 +1652,8 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         )
         self._assert_all_backed_up(cache, [parent, child])
 
-    def test_default_cap_backs_up_at_insert_time(self):
-        cache, allocator = self._build(nodes_per_step=0)
+    def test_default_backs_up_at_insert_time(self):
+        cache, allocator = self._build(batched=False)
         self._insert(cache, allocator, [1, 2, 3, 4])
         node = self._leaf_for(cache, [1, 2, 3, 4])
         self.assertEqual(cache.queued_backups, {})
