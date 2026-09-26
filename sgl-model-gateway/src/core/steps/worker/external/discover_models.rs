@@ -229,46 +229,206 @@ impl StepExecutor<ExternalWorkerWorkflowData> for DiscoverModelsStep {
         context: &mut WorkflowContext<ExternalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
-
-        // If no API key is provided, skip model discovery and use wildcard mode.
-        if config.api_key.as_ref().is_none_or(|k| k.is_empty()) {
-            info!(
-                "No API key provided for {} - using wildcard mode (accepts any model). \
-                 User's Authorization header will be forwarded to backend.",
-                config.url
-            );
-            // Leave model_cards empty for wildcard mode
-            return Ok(StepResult::Success);
-        }
+        let has_api_key = config.api_key.as_ref().is_some_and(|key| !key.is_empty());
 
         debug!("Discovering models from external endpoint {}", config.url);
 
-        let model_cards = fetch_models(&config.url, config.api_key.as_deref())
-            .await
-            .map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("discover_models"),
-                message: format!("Failed to discover models from {}: {}", config.url, e),
-            })?;
-
-        if model_cards.is_empty() {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("discover_models"),
-                message: format!("No models discovered from {}", config.url),
-            });
+        match fetch_models(&config.url, config.api_key.as_deref()).await {
+            Ok(model_cards) if !model_cards.is_empty() => {
+                info!(
+                    "Discovered {} models from {}: {:?}",
+                    model_cards.len(),
+                    config.url,
+                    model_cards.iter().map(|c| &c.id).collect::<Vec<_>>()
+                );
+                context.data.model_cards = model_cards;
+            }
+            // A keyed upstream that advertises nothing is a misconfiguration, as
+            // before.
+            Ok(_) if has_api_key => {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("discover_models"),
+                    message: format!("No models discovered from {}", config.url),
+                });
+            }
+            // Keyless upstreams stay usable when the endpoint is reachable but
+            // publishes an empty list; see the fallback below.
+            Ok(_) => {
+                info!(
+                    "No models advertised by {} - using wildcard mode (accepts any model). \
+                     User's Authorization header will be forwarded to backend.",
+                    config.url
+                );
+            }
+            Err(e) if has_api_key => {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("discover_models"),
+                    message: format!("Failed to discover models from {}: {}", config.url, e),
+                });
+            }
+            // Without a key there is nothing to authenticate discovery with, so a
+            // failure is not fatal: the endpoint may simply not implement
+            // /v1/models. Registering a wildcard worker keeps the previous
+            // behavior (accept any model, forward the caller's Authorization).
+            Err(e) => {
+                info!(
+                    "Could not read models from {} ({}) - using wildcard mode (accepts any \
+                     model). User's Authorization header will be forwarded to backend.",
+                    config.url, e
+                );
+            }
         }
 
-        info!(
-            "Discovered {} models from {}: {:?}",
-            model_cards.len(),
-            config.url,
-            model_cards.iter().map(|c| &c.id).collect::<Vec<_>>()
-        );
-
-        context.data.model_cards = model_cards;
         Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wfaas::WorkflowInstanceId;
+
+    use super::*;
+    use crate::protocols::worker_spec::WorkerConfigRequest;
+
+    const TWO_MODELS: &str = r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-2024-05-13"},{"id":"whisper-1"}]}"#;
+    const NO_MODELS: &str = r#"{"object":"list","data":[]}"#;
+
+    /// Stand-in for an upstream's `/v1/models` endpoint.
+    async fn spawn_models_endpoint(status: u16, body: &'static str) -> String {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || async move { (StatusCode::from_u16(status).unwrap(), body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn workflow_data(
+        url: &str,
+        api_key: Option<&str>,
+    ) -> WorkflowContext<ExternalWorkerWorkflowData> {
+        WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            ExternalWorkerWorkflowData {
+                config: WorkerConfigRequest {
+                    url: url.to_string(),
+                    api_key: api_key.map(str::to_string),
+                    model_id: None,
+                    worker_type: None,
+                    priority: None,
+                    cost: None,
+                    runtime: None,
+                    labels: HashMap::new(),
+                    bootstrap_port: None,
+                    tokenizer_path: None,
+                    reasoning_parser: None,
+                    tool_parser: None,
+                    chat_template: None,
+                    health_check_timeout_secs: 30,
+                    health_check_interval_secs: 60,
+                    health_success_threshold: 2,
+                    health_failure_threshold: 3,
+                    disable_health_check: true,
+                    max_connection_attempts: 20,
+                    dp_aware: false,
+                },
+                model_cards: Vec::new(),
+                workers: None,
+                labels: HashMap::new(),
+                app_context: None,
+                actual_workers: None,
+            },
+        )
+    }
+
+    fn discovered_ids(context: &WorkflowContext<ExternalWorkerWorkflowData>) -> Vec<&str> {
+        let mut ids: Vec<&str> = context
+            .data
+            .model_cards
+            .iter()
+            .map(|card| card.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A keyless upstream that publishes its list is discovered, instead of being
+    /// registered as a single wildcard worker.
+    #[tokio::test]
+    async fn keyless_upstream_is_discovered() {
+        let url = spawn_models_endpoint(200, TWO_MODELS).await;
+        let mut context = workflow_data(&url, None);
+
+        let result = DiscoverModelsStep.execute(&mut context).await.unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert_eq!(discovered_ids(&context), vec!["gpt-4o", "whisper-1"]);
+        let gpt4o = context
+            .data
+            .model_cards
+            .iter()
+            .find(|card| card.id == "gpt-4o")
+            .expect("gpt-4o card");
+        assert_eq!(gpt4o.aliases, vec!["gpt-4o-2024-05-13"]);
+    }
+
+    /// Reachable endpoint, empty list: keep the previous wildcard behavior.
+    #[tokio::test]
+    async fn keyless_upstream_with_empty_list_stays_wildcard() {
+        let url = spawn_models_endpoint(200, NO_MODELS).await;
+        let mut context = workflow_data(&url, None);
+
+        let result = DiscoverModelsStep.execute(&mut context).await.unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert!(discovered_ids(&context).is_empty(), "wildcard worker");
+    }
+
+    /// An upstream that does not implement `/v1/models` must not break a keyless
+    /// registration.
+    #[tokio::test]
+    async fn keyless_upstream_without_v1_models_stays_wildcard() {
+        let url = spawn_models_endpoint(404, "not found").await;
+        let mut context = workflow_data(&url, None);
+
+        let result = DiscoverModelsStep.execute(&mut context).await.unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert!(discovered_ids(&context).is_empty(), "wildcard worker");
+    }
+
+    /// Keyed behavior is unchanged: a failed discovery is still fatal.
+    #[tokio::test]
+    async fn keyed_upstream_still_fails_when_discovery_fails() {
+        let url = spawn_models_endpoint(404, "not found").await;
+        let mut context = workflow_data(&url, Some("secret"));
+
+        let result = DiscoverModelsStep.execute(&mut context).await;
+
+        assert!(
+            result.is_err(),
+            "keyed discovery failure stays a step error"
+        );
+    }
+
+    /// Keyed upstreams that advertise nothing still fail, as before.
+    #[tokio::test]
+    async fn keyed_upstream_with_empty_list_still_fails() {
+        let url = spawn_models_endpoint(200, NO_MODELS).await;
+        let mut context = workflow_data(&url, Some("secret"));
+
+        let result = DiscoverModelsStep.execute(&mut context).await;
+
+        assert!(result.is_err(), "keyed empty discovery stays a step error");
     }
 }
