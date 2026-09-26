@@ -196,6 +196,7 @@ def _create_flashmla_metadata():
 # only for that shape and go stale silently if FlashMLA retunes it.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
+_FLASHMLA_SCHED_MAX_SHARED_BYTES = 48 << 10
 
 
 @functools.lru_cache(maxsize=None)
@@ -232,6 +233,10 @@ def _maybe_precompute_flashmla_sched_meta(
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    # Skip when shared memory exceeds the limit.
+    smem_bytes = 4 * (b * 5 + 1 + num_sm_parts * 8)
+    if smem_bytes > _FLASHMLA_SCHED_MAX_SHARED_BYTES:
+        return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
     flashmla_sched_meta(
