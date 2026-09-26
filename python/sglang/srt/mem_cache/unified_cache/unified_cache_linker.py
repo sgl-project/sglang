@@ -420,12 +420,11 @@ class UnifiedCacheLinkerWrapper:
             if req.kv is None:
                 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-                req.kv = ReqKvInfo(
-                    kv_allocated_len=prefix_len,
-                    swa_evicted_seqlen=prefix_len,
-                )
-            else:
-                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, prefix_len)
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+            )
 
         # match placed the SWA branch point before this tail was known; a point
         # the tail covers is gone, since the request inserts the whole tail.

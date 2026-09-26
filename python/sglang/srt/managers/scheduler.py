@@ -496,6 +496,7 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
@@ -1250,7 +1251,8 @@ class Scheduler(
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
             page_size=self.page_size,
-            num_pages=self.max_total_num_tokens // self.page_size,
+            num_pages=self.max_total_num_tokens
+            // self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
@@ -2345,8 +2347,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2456,7 +2457,9 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hicache_storage=lambda: (
+                self.enable_hicache_storage or self.enable_lmcache
+            ),
             rust_server=self.rust_server,
         )
 
@@ -2527,7 +2530,7 @@ class Scheduler(
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
-            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            token_capacity=self.max_total_num_tokens,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
         )
@@ -2798,6 +2801,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                token_indices_to_pool=recv_req.token_indices_to_pool,
             )
             req.tokenizer = self.tokenizer
 
@@ -3108,7 +3112,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3617,6 +3621,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
+            or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3971,7 +3976,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4014,6 +4019,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_lmcache
                         or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
@@ -4891,12 +4897,12 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_lmcache:
             self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
+            logger.info("Hierarchical cache or LMCache cleared successfully!")
             if_success = True
         else:
-            logging.warning("Hierarchical cache is not enabled.")
+            logging.warning("Hierarchical cache or LMCache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
@@ -4926,6 +4932,7 @@ class Scheduler(
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
+                or self.enable_lmcache
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
                 # Singleton PD polls no longer yield through a collective.
@@ -5056,6 +5063,8 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+            elif self.enable_lmcache:
+                idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle
 

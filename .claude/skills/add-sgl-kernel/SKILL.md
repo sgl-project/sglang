@@ -5,6 +5,10 @@ description: Step-by-step tutorial for adding a heavyweight AOT CUDA/C++ kernel 
 
 # Tutorial: Adding a New Kernel to `sgl-kernel` (AOT / Heavyweight)
 
+Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
+operator namespace, logical grouping, lazy registry metadata, and test placement.
+The implementation tutorial below does not replace that API contract.
+
 This tutorial walks through adding a simple element-wise scale operation as an AOT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
 
 ## Goal
@@ -193,6 +197,21 @@ def scale(
 Then re-export it from `python/sglang/kernels/aot/python/sgl_kernel/__init__.py` following the existing import style used by other kernels.
 
 ---
+
+## SGLang integration (required for runtime use)
+
+After exposing the AOT wheel symbol, add a lazy wrapper and a `KernelSpec` under
+`python/sglang/kernels/ops/<group>/`. Set `backend=KernelBackend.AOT`, record
+actual device/architecture support, and keep `sgl_kernel` imports inside the
+implementation path. SGLang runtime and integration tests import that wrapper.
+For this example, use `sglang.kernels.ops.elementwise.scale`.
+
+The wheel-level tests below validate its standalone API/build. They do not
+replace CI-registered SGLang correctness tests in
+`test/registered/kernels/ops/elementwise/test_scale.py` and benchmarks in
+`test/registered/kernels/benchmark/elementwise/bench_scale.py`. Follow
+`write-sglang-test` for their registration and CI budget; do not register tests
+under the shipped `python/sglang/` package.
 
 ## Step 6: Write tests (required)
 

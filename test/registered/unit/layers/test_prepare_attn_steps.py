@@ -42,12 +42,14 @@ class Norm:
 def communicator(norm):
     c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
     c.input_layernorm = norm
-    c._sp_variant = None
+    c._sp_region = False
     c.qkv_latent_func = None
     c._context = None
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
     c._communicate_simple_fn = lambda hidden_states, **_: hidden_states
+    # Construction picks the fused entries; call it under the platform patches.
+    c._attn_input_fusions = c._select_attn_input_fusions()
     return c
 
 

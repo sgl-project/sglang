@@ -1236,7 +1236,8 @@ def test_linker_load_preserves_swa_boundaries(
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
             req.kv = ReqKvInfo(
-                kv_allocated_len=prefix_len, swa_evicted_seqlen=prefix_len - 2
+                kv_allocated_len=prefix_len,
+                component_evicted_seqlens={ComponentType.SWA: prefix_len - 2},
             )
         return transfer
 
@@ -1269,7 +1270,8 @@ def test_linker_load_preserves_swa_boundaries(
         None
         if previous_boundary is None
         else ReqKvInfo(
-            kv_allocated_len=previous_boundary, swa_evicted_seqlen=previous_boundary
+            kv_allocated_len=previous_boundary,
+            component_evicted_seqlens={ComponentType.SWA: previous_boundary},
         )
     )
     req = SimpleNamespace(
@@ -1293,7 +1295,7 @@ def test_linker_load_preserves_swa_boundaries(
     assert restored.tolist() == list(range(4))
     assert wrapper.inflight_load_rids == ["rid"]
     assert req.swa_branching_seqlen is None
-    assert req.kv.swa_evicted_seqlen == expected_boundary
+    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
