@@ -593,7 +593,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):

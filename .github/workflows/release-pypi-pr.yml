@@ -84,7 +84,7 @@ jobs:
         run: |
           pip install \
             auditwheel build patchelf wheel "setuptools>=61.0" \
-            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0"
+            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.14.0"
 
       - name: Build wheel
         run: |

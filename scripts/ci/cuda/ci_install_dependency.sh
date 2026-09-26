@@ -541,7 +541,8 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX \
+        --override "${REPO_ROOT}/scripts/ci/torch-override.txt"
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -557,8 +558,8 @@ install_sglang() {
 }
 
 install_nccl() {
-    # PyTorch pins 2.29.7, so this override must run after every command
-    # that resolves Python dependencies (including lmms-eval).
+    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # after every command that resolves Python dependencies (including lmms-eval).
     $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
