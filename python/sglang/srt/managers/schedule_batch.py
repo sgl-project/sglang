@@ -115,7 +115,6 @@ from sglang.srt.mem_cache.common import (
     RetractionBackup,
     backup_kv_cache,
     evict_from_tree_cache,
-    free_swa_out_of_window_slots,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -3903,6 +3902,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            # Auxiliary windows check their own cursors and prefix locks.
+            has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -3922,9 +3923,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
-                        and swa_evict_due(req)
+                        and (has_auxiliary_swa or swa_evict_due(req))
                     ):
-                        self._evict_swa(req, req.seqlen - 1)
+                        # The scheduler already gated the primary window,
+                        # including backends that use a forward-based cadence.
+                        self._evict_swa(
+                            req,
+                            req.seqlen - 1,
+                            eviction_interval=(
+                                eviction_interval if has_auxiliary_swa else 1
+                            ),
+                        )
 
                     # Once the decode position has moved past the sliding window,
                     # the SWA portion of the prefill-time tree lock is no longer
@@ -3959,17 +3968,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
             self.token_to_kv_pool_allocator.free_group_end()
 
-    def _evict_swa(self, req: Req, pre_len: int):
+    def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.tree_cache.sliding_window_size,
-            page_size=self.tree_cache.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            is_chunk_cache=self.tree_cache.is_chunk_cache(),
-            retain_floor=self.tree_cache.swa_retain_floor(req),
+        self.tree_cache.evict_sliding_windows(
+            req, pre_len, eviction_interval=eviction_interval
         )
 
     def __str__(self):

@@ -607,6 +607,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def supports_auxiliary_swa(self) -> bool:
+        return False
+
+    def evict_sliding_windows(
+        self, req: Req, pre_len: int, *, eviction_interval: int = 1
+    ) -> None:
+        """Slide request-owned windows at the scheduler's safe eviction frontier."""
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=self.is_chunk_cache(),
+            retain_floor=self.swa_retain_floor(req),
+            eviction_interval=eviction_interval,
+        )
+
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
         # that pairs SWA with mamba/conv checkpoints has to keep the window behind
