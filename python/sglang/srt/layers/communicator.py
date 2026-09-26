@@ -972,6 +972,13 @@ class LayerCommunicator:
             attn_tp_size=self._context.attn_tp_size,
         )[self.layer_scatter_modes.layer_input_mode]
 
+    @property
+    def input_on_attention_tp_slices(self) -> bool:
+        """Whether the layer's input arrives on each attention-TP rank's slice
+        of its rows (after a layer on local rows), in a batch that runs its
+        ordinary steps."""
+        return TokenAxis.ATTN_TP_SCATTER in self.input_rows.sharded
+
     def _input_can_be_scattered(self) -> bool:
         """Whether a batch may run this layer with input-scattered attention:
         configured, on pure TP without an a2a backend or a dense MLP on every
@@ -2138,6 +2145,19 @@ def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:
     ):
         return forward_batch.attn_cp_metadata.per_rank_actual_token
     return None
+
+
+def moe_cp_gathers_sparse_moe_input(forward_batch: ForwardBatch) -> bool:
+    """Whether a sparse MoE's input is gathered over the MoE-CP group on this
+    batch: a MoE on the TP group under a GQA prefill CP whose MoE-CP group is
+    wider than the MoE's data-parallel groups, on a CP extend. DSA and MLA CP
+    gather over attention CP instead."""
+    return (
+        not is_moe_input_scattered_across_dp_ranks()
+        and is_enable_moe_cp_allgather()
+        and not _gathers_over_attention_cp()
+        and moe_cp_gathered_rows(forward_batch) is not None
+    )
 
 
 def _redistribute_input_to_moe_cp(
