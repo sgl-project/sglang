@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -2680,9 +2680,25 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
+        self.layer_communicator = self._build_layer_communicator(
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        )
+
+    def _build_layer_communicator(
+        self,
+        *,
+        input_layernorm: nn.Module,
+        post_attention_layernorm: nn.Module,
+        qkv_latent_func: Optional[Callable],
+        allow_deferred_ffn_reduction: bool = True,
+    ):
+        """The communicator for this layer's norms; it chooses its boundary
+        steps from them at construction."""
         if get_parallel().enable_prefill_cp:
             communicator_cls = DSACPLayerCommunicator
-        elif not is_nextn and _use_mnnvl_cutedsl_fusion():
+        elif not self.is_nextn and _use_mnnvl_cutedsl_fusion():
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
             from sglang.srt.layers.moe.cutedsl_ar_fusion import (
                 CuteDSLFusionLayerCommunicator,
@@ -2691,12 +2707,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             communicator_cls = CuteDSLFusionLayerCommunicator
         else:
             communicator_cls = LayerCommunicator
-        self.layer_communicator = communicator_cls(
+        return communicator_cls(
             layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+            input_layernorm=input_layernorm,
+            post_attention_layernorm=post_attention_layernorm,
             allow_reduce_scatter=True,
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            qkv_latent_func=qkv_latent_func,
+            allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
         )
 
     def _detect_gfx95_quant_format(self) -> str:

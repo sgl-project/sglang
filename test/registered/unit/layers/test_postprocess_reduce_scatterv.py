@@ -140,8 +140,9 @@ class TestPostprocessReduceScatterv(CustomTestCase):
     def test_postprocess_passes_the_layer_sparsity(self):
         seen = {}
         communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._sp_variant = None
+        communicator._sp_region = False
         communicator._context = None
+        communicator._postprocess_scatters_to_local_tokens = False
         communicator.allow_reduce_scatter = False
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
         communicator._communicate_summable_tensor_pair_fn = lambda **kwargs: (
@@ -149,6 +150,26 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         )
         communicator.postprocess_layer(None, None, None)
         self.assertIs(seen["is_layer_sparse"], True)
+
+    def test_postprocess_takes_the_output_back_with_the_exit_step(self):
+        # Under attention DP the base postprocess brings the FFN output back with
+        # the step the FFN exit chooses.
+        for step in (object(), None):
+            with self.subTest(reduce_scatter=step is not None):
+                communicator = LayerCommunicator.__new__(LayerCommunicator)
+                communicator._sp_region = False
+                communicator._postprocess_scatters_to_local_tokens = True
+                communicator._postprocess_dp_step = lambda forward_batch: step
+                with patch.object(
+                    comm, "_to_local_tokens", side_effect=lambda s, fb, h: (s, h)
+                ):
+                    hidden_states, residual = communicator.postprocess_layer(
+                        "h", "r", "fb"
+                    )
+                self.assertEqual(
+                    hidden_states, (step or comm._redistribute_output, "h")
+                )
+                self.assertEqual(residual, "r")
 
 
 class TestReduceAndRedistributeOutputStep(CustomTestCase):
@@ -163,8 +184,11 @@ class TestReduceAndRedistributeOutputStep(CustomTestCase):
             patch.object(comm, "should_use_dp_reduce_scatterv", return_value=varlen),
             patch.object(comm, "can_use_dp_reduce_scatter", return_value=tiles),
         ):
+            # A MoE block leaves its sum to reduce_scatterv whenever it applies.
             return comm._reduce_and_redistribute_output_step(
-                forward_batch, allow_reduce_scatter=allow, is_layer_sparse=sparse
+                forward_batch,
+                leaves_for_reduce_scatter=allow,
+                leaves_for_reduce_scatterv=allow or sparse,
             )
 
     def test_every_condition(self):

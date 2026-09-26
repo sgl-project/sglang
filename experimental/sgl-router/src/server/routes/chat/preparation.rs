@@ -99,24 +99,27 @@ impl PreparedChatRequest {
             self.parsed_body.as_ref(),
             self.tokens.as_ref(),
         );
-        ctx.metrics
-            .record_input_ids_forwarding(&self.model.0, forwarding);
-        if forwarding == InputIdsForwarding::TokenizeFailed {
-            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
-        }
         let input_ids = self
             .tokens
             .as_ref()
             .filter(|_| forwarding == InputIdsForwarding::Forwarded)
             .map(|tokens| tokens.ids.as_slice());
-        build_outgoing_body(
+        let body = build_outgoing_body(
             &self.body,
             self.parsed_body,
             input_ids,
             bootstrap,
             &self.sampling_defaults,
             engine_rid,
-        )
+        )?;
+        // Book only after the outgoing body exists; a request rejected here
+        // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
+        ctx.metrics
+            .record_input_ids_forwarding(&self.model.0, forwarding);
+        if forwarding == InputIdsForwarding::TokenizeFailed {
+            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+        }
+        Ok(body)
     }
 }
 
