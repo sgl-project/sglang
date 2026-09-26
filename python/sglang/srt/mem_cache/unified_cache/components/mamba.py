@@ -702,12 +702,8 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-        if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
-        req.kv.mamba_pool_idx = dst[0]
+        dst = self._alloc_request_state_slot(req)
+        assert dst is not None, "Cannot alloc mamba for load_back"
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def finalize_load_back(
@@ -720,28 +716,31 @@ class MambaComponent(TreeComponent):
 
     # ---- Buffer-mode load-back handoff ----
 
-    def ensure_request_state_slot(self, req: Req) -> bool:
-        """Ensure a request slot, returning False if eviction cannot free one."""
-        if req.kv.mamba_pool_idx is not None:
-            return True
+    def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is not None:
+            req.kv.mamba_pool_idx = dst[0]
+        return dst
+
+    def prepare_buffer_load_back(self, req: Req) -> Optional[PrepareLoadBackResult]:
+        """Ensure a request slot; None if eviction cannot free one."""
+        if req.kv.holds_mamba:
+            return PrepareLoadBackResult()
+        dst = self._alloc_request_state_slot(req)
         if dst is None:
-            return False
-        req.kv.mamba_pool_idx = dst[0]
-        return True
+            return None
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
-    def release_request_state_slot(self, req: Req) -> None:
-        """Roll back a request slot allocated for a cancelled load-back."""
-        self.cache.req_to_token_pool.mamba_allocator.free(
-            req.kv.mamba_pool_idx.unsqueeze(-1)
-        )
-        req.kv.mamba_pool_idx = None
-
-    def supersede_pending_state_copy(self, req: Req) -> None:
-        """Reset the replay cursor and discard CoW/clear superseded by H2D."""
+    def finalize_buffer_load_back(
+        self, req: Req, prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        """Roll back on failure; on success the H2D supersedes replay and CoW/clear."""
+        if not success:
+            self.finalize_load_back(req, prep, success=False)
+            return
         write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
         if write_pos is not None and req.kv.mamba_pool_idx is not None:
             slot = self.cache.req_to_token_pool.translate_mamba_indices(

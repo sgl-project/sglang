@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapp
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
+    PrepareLoadBackResult,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -134,14 +135,11 @@ class _OngoingBufferLoadBack(msgspec.Struct):
 
 
 class _MambaHandoff(msgspec.Struct):
-    """Two H2D destinations sharing a host slot.
-
-    slot_allocated marks a new request slot to release on rollback.
-    """
+    """Two H2D destinations sharing a host slot."""
 
     node_copy: PoolTransfer
     request_copy: PoolTransfer
-    slot_allocated: bool
+    prep: PrepareLoadBackResult
 
 
 class _AnchorLock(msgspec.Struct):
@@ -1005,14 +1003,23 @@ class BufferModePipeline:
         return True
 
     def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.mamba_host_hit_length = 0
-        self._clear_storage_hit(req)
+        self._clear_staged_hit(req)
         self._cache._resolve_storage_prefetch_tokens(
             req.cache_request_handle, f.num_tokens, reason="device_covered"
         )
         self.release_staged_hold(req.cache_request_handle, reason=None)
+
+    def _drop_staged_hit(self, req: Req, reason: str) -> None:
+        self.release_staged_hold(req.cache_request_handle, reason=reason)
+        self._clear_staged_hit(req)
+
+    @classmethod
+    def _clear_staged_hit(cls, req: Req) -> None:
+        req.staged_prefetch_plan = None
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        cls._clear_storage_hit(req)
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1134,15 +1141,10 @@ class BufferModePipeline:
                 req.rid,
                 f.num_tokens,
             )
-            self.release_staged_hold(req.cache_request_handle, reason="no_mamba_state")
-            req.staged_prefetch_plan = None
-            req.host_hit_length = 0
-            req.swa_host_hit_length = 0
-            req.mamba_host_hit_length = 0
-            self._clear_storage_hit(req)
+            self._drop_staged_hit(req, reason="no_mamba_state")
             return None
-        slot_allocated = req.kv.mamba_pool_idx is None
-        if not mamba.ensure_request_state_slot(req):
+        prep = mamba.prepare_buffer_load_back(req)
+        if prep is None:
             self.defer_staged_admission(req, pool="mamba")
             return None
         return _MambaHandoff(
@@ -1152,7 +1154,7 @@ class BufferModePipeline:
                 host_indices=node_copy.host_indices,
                 device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
             ),
-            slot_allocated=slot_allocated,
+            prep=prep,
         )
 
     def defer_staged_admission(self, req: Req, *, pool: str) -> None:
@@ -1189,12 +1191,7 @@ class BufferModePipeline:
             pool,
             f.num_tokens,
         )
-        self.release_staged_hold(request, reason="device_capacity")
-        req.staged_prefetch_plan = None
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.mamba_host_hit_length = 0
-        self._clear_storage_hit(req)
+        self._drop_staged_hit(req, reason="device_capacity")
 
     def init_load_back(
         self, params: InitLoadBackParams
@@ -1288,14 +1285,14 @@ class BufferModePipeline:
             node_id=load_back_id,
             extra_pools=load_xfers or None,
         )
+        if handoff is not None:
+            mamba.finalize_buffer_load_back(
+                req, handoff.prep, success=device_indices is not None
+            )
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
-            if handoff is not None and handoff.slot_allocated:
-                mamba.release_request_state_slot(req)
             return self.defer_staged_admission(req, pool="full_or_aux")
-        if handoff is not None:
-            mamba.supersede_pending_state_copy(req)
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None

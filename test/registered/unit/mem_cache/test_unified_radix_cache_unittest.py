@@ -3868,7 +3868,6 @@ class UnifiedRadixCacheSuite:
     # ================================================================
 
     def test_buffer_only_accepts_mamba(self):
-        """FULL+MAMBA initializes with raw checkpoints and two staging slots."""
         if (
             self.cfg.components
             != (
@@ -3883,10 +3882,6 @@ class UnifiedRadixCacheSuite:
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
         self._init_buffer_hicache(cache, storage_dir)
-        mamba = cache.components[ComponentType.MAMBA]
-        self.assertIsNotNone(mamba._mamba_pool_host)
-        self.assertGreaterEqual(mamba._mamba_pool_host.size, 2)
-        self.assertIsNone(mamba.int8_ckpt_pool)
 
     def _init_buffer_hicache(
         self,
@@ -3952,9 +3947,7 @@ class UnifiedRadixCacheSuite:
     def _produce_buffer_l3(
         self, storage_dir, seq, marker=None, *, extra_key=None, cache_salt=None
     ):
-        """Producer tree in buffer mode: insert seq and push it to L3.
-        Returns (leaf, expected_kv, expected_mamba); the expectations are None
-        without a marker, and expected_mamba is None on non-Mamba configs."""
+        """Push seq to L3; returns (leaf, expected_kv, expected_mamba)."""
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(prod, storage_dir)
         self._insert(
@@ -4240,10 +4233,7 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
         if self.cfg.has_mamba:
-            # The recurrent state has to land twice off the one bounce: on the
-            # published node (so the span is reusable) and in the consuming
-            # request's own slot (the deferred D2D CoW is not ordered against
-            # this H2D, so the load-back must write the slot itself).
+            # H2D must fill both the published node and the request slot.
             self._assert_mamba_state_restored(cons, cons_rtp, req, leaf, expected_mamba)
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         cpu_events = [

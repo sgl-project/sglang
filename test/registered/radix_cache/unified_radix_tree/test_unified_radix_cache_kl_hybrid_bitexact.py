@@ -453,7 +453,6 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             "buffer_only",
             "--hicache-storage-backend",
             "file",
-            # Avoid scanning the storage directory for each existence query.
             "--hicache-storage-backend-extra-config",
             '{"enable_metadata_cache": true}',
             "--hicache-write-policy",
@@ -466,7 +465,6 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             # Partial fetches would make the hit assertions timing-dependent.
             "--hicache-storage-prefetch-policy",
             "wait_complete",
-            # Match the cache-mode class's eviction/rotation budget.
             "--chunked-prefill-size",
             "2048",
             "--max-total-tokens",
@@ -483,11 +481,9 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
-            },
+            env=unified_radix_tree_server_env(
+                "python", SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.storage_dir
+            ),
         )
         cls.input_ids = [
             ids[:BUFFER_ONLY_PROMPT_TOKENS]
