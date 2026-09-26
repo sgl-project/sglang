@@ -6230,12 +6230,11 @@ class UnifiedRadixCacheSuite:
     def test_hicache_internal_mamba_backup_waits_for_pending_swa(self):
         if not (self.cfg.has_swa and self.cfg.has_mamba):
             self.skipTest("requires Full, SWA and Mamba components")
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node state demote is Python-core only")
         page = self.cfg.page_size
         cache, allocator, req_pool = build_fixture(
             replace(self.cfg, sliding_window_size=3 * page)
         )
+        self.assertEqual(cache._tree_core_backend, _selected_tree_core_test_backend())
 
         def insert(length):
             return self._insert(

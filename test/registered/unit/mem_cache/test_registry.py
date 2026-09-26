@@ -253,26 +253,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def test_hicache_host_memory_mode_is_set_before_cache_construction(self):
-        ctx = _make_ctx(self, enable_hierarchical_cache=True, is_hybrid_swa=True)
-        # The tree-core resolver must see the host mode before construction.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
-                ctx.server_args, ctx.params
-            )
-            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
     def test_unified_radix_cache_with_mori_external_linker(self):
         from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 

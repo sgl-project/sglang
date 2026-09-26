@@ -1418,8 +1418,8 @@ def test_insert_host_reports_a_dropped_write_through_suffix():
 def test_host_lock_refs_round_trip(swa, missing_receipt):
     core = _swa_tree_core() if swa else _tree_core()
     core.set_hicache_enabled()
-    _insert(core, [1], [10])
-    leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    # The Full-only insertion is not a resumable SWA match until SWA is set below.
+    leaf = _insert(core, [1], [10]).last_device_node
     component_transfers = {}
     if swa:
         core.has_swa_host_pool = True
@@ -1446,9 +1446,9 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
     params = host_lock.to_dec_params()
     if missing_receipt:
         params.component_host_lock_uuids.clear()
-        with pytest.raises(BaseException, match="no entry found for key") as error:
+        with pytest.raises(RuntimeError, match="no entry found for key") as error:
             core.dec_host_lock_ref(leaf, params)
-        assert error.type.__name__ == "PanicException"
+        assert type(error.value.__cause__).__name__ == "PanicException"
         return  # A Rust ownership violation poisons the core.
     core.dec_host_lock_ref(leaf, params)
     if swa:
@@ -3122,7 +3122,7 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
         InsertParams(
             key=_key(list(range(8))),
             value=allocator.alloc(8),
-            swa_evicted_seqlen=4,
+            component_evicted_seqlens={ComponentType.SWA: 4},
         )
     )
     assert submissions == [(parent, 4), (child, 0)]
@@ -3214,7 +3214,7 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
         InsertParams(
             key=_key(list(range(8))),
             value=allocator.alloc(8),
-            swa_evicted_seqlen=0,
+            component_evicted_seqlens={ComponentType.SWA: 0},
             mamba_value=torch.tensor([202]),
         )
     )
@@ -3375,15 +3375,16 @@ def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
     assert evict_component(ComponentType.MAMBA, 1) == 1
     assert submissions[-1][:2] == (grandparent, 4)
     assert core.get_component_device_value(grandparent, ComponentType.MAMBA) is None
-    # The real DMA source and active request checkpoint remain protected.
+    # The completed backup and active request retain their other device values.
     for node, slot in ((anchor, 203), (leaf, 204)):
         assert core.get_component_device_value(node, ComponentType.MAMBA).tolist() == [
             slot
         ]
     for (node, ct), value in retained.items():
         assert torch.equal(core.get_component_device_value(node, ct), value)
-    core.sanity_check(active, [])
-    cache._finish_write_through_ack(anchor)
+    # #41092 drains the earlier SWA ACK before attempting the failed backup.
+    assert not cache.ongoing_write_through
+    core.sanity_check([(leaf, leaf)], [])
     cache.dec_lock_ref(leaf, leaf_lock)
     core.sanity_check([], [])
 
@@ -3409,7 +3410,11 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     )
     indices = allocator.alloc(12)
     cache.insert(
-        InsertParams(key=_key(list(range(12))), value=indices, swa_evicted_seqlen=8)
+        InsertParams(
+            key=_key(list(range(12))),
+            value=indices,
+            component_evicted_seqlens={ComponentType.SWA: 8},
+        )
     )
     if hicache:
         cache.tree_core.set_hicache_enabled()
@@ -3507,7 +3512,11 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
     full_values = torch.arange(10, 26, dtype=torch.int64)
     _pump_insert(
         core,
-        InsertParams(key=key, value=full_values, swa_evicted_seqlen=16),
+        InsertParams(
+            key=key,
+            value=full_values,
+            component_evicted_seqlens={ComponentType.SWA: 16},
+        ),
     )
     # A five-token window stages two four-token pages. Bigrams add one raw
     # boundary token but preserve the logical repair span [8, 16).
@@ -3543,7 +3552,7 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
         InsertParams(
             key=key,
             value=torch.arange(10, 18, dtype=torch.int64),
-            swa_evicted_seqlen=8,
+            component_evicted_seqlens={ComponentType.SWA: 8},
         ),
     )
     assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 8)]
@@ -3588,7 +3597,7 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
         InsertParams(
             key=key,
             value=torch.arange(10, 18, dtype=torch.int64),
-            swa_evicted_seqlen=8,
+            component_evicted_seqlens={ComponentType.SWA: 8},
         ),
     )
     _, leaf, _ = core.match_full_device_prefix(key)
@@ -3619,7 +3628,7 @@ def test_swa_window_repair_rejects_invalid_publication_without_partial_changes()
         InsertParams(
             key=key,
             value=torch.arange(10, 18, dtype=torch.int64),
-            swa_evicted_seqlen=8,
+            component_evicted_seqlens={ComponentType.SWA: 8},
         ),
     )
     core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
@@ -4277,9 +4286,9 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
         if swa_only:
             # Early release always walks SWA, even if the receipt marks it skipped.
             missing.skipped_lock_components = (ComponentType.SWA,)
-        with pytest.raises(BaseException, match="no entry found for key") as error:
+        with pytest.raises(RuntimeError, match="no entry found for key") as error:
             release(leaf, missing)
-        assert error.type.__name__ == "PanicException"
+        assert type(error.value.__cause__).__name__ == "PanicException"
         return  # A Rust ownership violation poisons the core.
     release(leaf, result.to_dec_params())
     assert core.swa_protected_size() == 0

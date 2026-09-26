@@ -139,17 +139,8 @@ fn swa_window_attach_under_lock_restamps_lru_and_releases_accounting() {
     assert!(!tc.host_lru_list(SWA).in_list(Some(middle)));
     assert!(tc.host_lru_list(SWA).in_list(Some(head)));
     assert!(tc.host_lru_list(SWA).in_list(Some(leaf)));
-    tc.dec_lock_ref(
-        leaf_id,
-        &DecLockRefParams {
-            node_id: receipt.node_id,
-            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
-            skipped_lock_components: receipt.skipped_lock_components,
-        },
-        false,
-    )
-    .unwrap();
+    tc.dec_lock_ref(leaf_id, &receipt.to_dec_params(), false)
+        .unwrap();
     assert_eq!(tc.swa_protected_size(), 0);
     assert_eq!(tc.swa_evictable_size(), 2);
     for node in [head, middle, leaf] {
@@ -3178,15 +3169,7 @@ fn internal_swa_resume_preserves_new_request_and_dma_locks() {
         assert!(step.device_frees.is_empty());
         assert!(tc.arena.has_device_value(idx, SWA));
         tc.arena.node_mut(idx).write_through_pending_id = None;
-        swa.release_component_lock(
-            &mut tc,
-            idx,
-            &DecLockRefParams {
-                swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                ..Default::default()
-            },
-            false,
-        );
+        swa.release_component_lock(&mut tc, idx, &lock.to_dec_params(), false);
         request_internal_swa_backup(&mut tc, b, 2);
         tc.evict_device_end(SWA);
         tc.sanity_check(&[], &[]);
@@ -5236,17 +5219,8 @@ fn swa_device_eviction_preserves_a_locked_load_back_destination() {
     assert_eq!(next, None);
     tc.evict_device_end(SWA);
     assert!(tc.arena.has_device_value(n, SWA));
-    tc.dec_lock_ref(
-        tc.arena.node(n).id,
-        &DecLockRefParams {
-            node_id: receipt.node_id,
-            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
-            skipped_lock_components: receipt.skipped_lock_components,
-        },
-        false,
-    )
-    .expect("live test node");
+    tc.dec_lock_ref(tc.arena.node(n).id, &receipt.to_dec_params(), false)
+        .expect("live test node");
     tc.finish_load_back(tc.arena.node(n).id)
         .expect("live test node");
     tc.evict_device_start(SWA, 4);
@@ -5274,12 +5248,7 @@ fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
         tc.host_lru_list_mut(SWA).insert_mru(idx);
         tc.update_evictable_leaf_sets_(idx);
     }
-    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
-        node_id: receipt.node_id,
-        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
-        skipped_lock_components: receipt.skipped_lock_components,
-    };
+    let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
     let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
     let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
     let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
@@ -5399,12 +5368,7 @@ fn check_swa_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
     tc.host_lru_list_mut(SWA).insert_mru(b);
     tc.update_evictable_leaf_sets_(a);
     tc.update_evictable_leaf_sets_(b);
-    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
-        node_id: receipt.node_id,
-        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
-        skipped_lock_components: receipt.skipped_lock_components,
-    };
+    let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
     let ancestor_host_lock = lock_ancestor_host
         .then(|| release_params(tc.inc_host_lock_ref(a_id).expect("live ancestor")));
     let host_lock = release_params(tc.inc_host_lock_ref(b_id).expect("live anchor"));
