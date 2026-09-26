@@ -1,12 +1,20 @@
 import unittest
+from types import SimpleNamespace
 
 import sgl_kernel  # noqa: F401
 import torch
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     static_quant_fp8,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+    CompressedTensorsW8A8Fp8,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -84,6 +92,45 @@ class TestCPUQuantOps(CustomTestCase):
         self.assertEqual(scale_u8.shape, (3, 2))
         dequant = q.float() * _ue8m0_to_float(scale_u8).repeat_interleave(32, dim=-1)
         torch.testing.assert_close(dequant, x, atol=0.04, rtol=0.04)
+
+    def test_compressed_tensors_w8a16_fp8_cpu(self):
+        x = torch.randn(5, 64, dtype=torch.bfloat16)
+        weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
+        weight_scale = torch.tensor([0.02], dtype=torch.float32)
+        bias = torch.randn(32, dtype=torch.float32) / 10
+        layer = SimpleNamespace(weight=weight, weight_scale=weight_scale)
+        scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
+
+        out = scheme.apply_weights(layer, x, bias)
+        ref = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            x, weight, weight_scale, bias, x.dtype, False
+        )
+
+        torch.testing.assert_close(out, ref)
+
+    def test_compressed_tensors_w8a16_fp8_cpu_rejects_multi_scale(self):
+        weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
+        layer = SimpleNamespace(
+            weight=weight,
+            weight_scale=torch.tensor([0.02, 0.03], dtype=torch.float32),
+        )
+        scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
+
+        with self.assertRaisesRegex(NotImplementedError, "multiple weight scales"):
+            scheme.process_weights_after_loading(layer)
+
+    def test_compressed_tensors_w8a8_fp8_cpu_unsupported(self):
+        x = torch.randn(3, 64, dtype=torch.bfloat16)
+        weight = (torch.randn(5, 64) / 4).to(torch.float8_e4m3fn)
+        weight_scale = torch.tensor(0.02, dtype=torch.float32)
+        layer = SimpleNamespace(
+            weight=weight, weight_scale=weight_scale, input_scale=None
+        )
+        quant_args = QuantizationArgs(num_bits=8, strategy=QuantizationStrategy.TENSOR)
+        scheme = CompressedTensorsW8A8Fp8(quant_args, False)
+
+        with self.assertRaisesRegex(NotImplementedError, "W8A8 FP8 linear"):
+            scheme.apply_weights(layer, x, None)
 
 
 if __name__ == "__main__":
