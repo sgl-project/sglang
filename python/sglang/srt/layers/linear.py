@@ -39,13 +39,19 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
         QuantizationConfig,
-        QuantizeMethodBase,
     )
 
 _is_hip = is_hip()
@@ -79,7 +85,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 _is_cpu = is_cpu()
-_is_npu = is_npu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -183,9 +188,19 @@ class LinearBase(torch.nn.Module):
         self.params_dtype = params_dtype
         self.quant_config = quant_config
         if quant_config is None:
-            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+            self.quant_method = None
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    get_npu_online_linear_method,
+                )
 
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
+                self.quant_method = get_npu_online_linear_method(prefix=prefix)
+            if self.quant_method is None:
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                )
+
+                self.quant_method = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
@@ -275,7 +290,7 @@ class ReplicatedLinear(LinearBase):
             param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
 
         # The per-tensor quant-scale must be 1 dimension
-        if _is_npu:
+        if current_platform.is_npu():
             if param.size() != loaded_weight.size() and param.size(0) == 1:
                 if torch.allclose(loaded_weight, loaded_weight[0]):
                     loaded_weight = loaded_weight[:1]

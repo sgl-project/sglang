@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.utils import copy_or_rebind_param
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
@@ -22,6 +23,13 @@ from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
+)
+from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+    NPUOnlineIntegerQuantSpec,
+    get_npu_online_moe_integer_quant_spec,
+    npu_dynamic_quantize_weight,
+    npu_format_online_moe_scale,
+    npu_format_online_weight,
 )
 
 logger = logging.getLogger(__name__)
@@ -1015,36 +1023,128 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUWUnquantMoEMethod
+# NPUUnquantMoEMethod + integer online quantization
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
-    """Unquant MoE – all computations in BF16, no quantization."""
+    """BF16 MoE with optional online integer quantization."""
 
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = None
+        self._quant_mode = None
+        self.transposed = False
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
+        weight_name = f"{weight_prefix}_weight"
 
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight)
+        loader = getattr(layer, "_npu_online_moe_loader", None)
+        spec = (
+            loader.specs[weight_prefix]
+            if loader is not None
+            else get_npu_online_moe_integer_quant_spec(weight_prefix)
+        )
+        if spec is not None:
+            self._apply_online_integer(layer, weight_prefix, weight_name, spec)
+            self._quant_mode = spec.mode
+            return
+
+        weight: torch.Tensor = getattr(layer, weight_name)
+        copy_or_rebind_param(layer, weight_name, npu_format_cast(weight.data))
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
+        self._quant_mode = "bf16"
+
+    def _apply_online_integer(
+        self,
+        layer: torch.nn.Module,
+        weight_prefix: str,
+        weight_name: str,
+        spec: NPUOnlineIntegerQuantSpec,
+    ) -> None:
+        weight = getattr(layer, weight_name)
+        loader = getattr(layer, "_npu_online_moe_loader", None)
+        if loader is None:
+            raise RuntimeError(
+                "Ascend online integer MoE requires its completion-tracked "
+                "weight loader; direct, remote, and IPC-cache loading are not "
+                "supported."
+            )
+        loader._validate_complete(weight_prefix)
+        if (
+            loader.state[weight_prefix] == "ready_reload"
+            and weight.dtype == loader.params_dtype
+        ):
+            raise RuntimeError(
+                "Ascend online integer MoE hot reload must use the registered "
+                "completion-tracked weight loader."
+            )
+        if hasattr(layer, f"{weight_name}_scale") and loader.state[weight_prefix] in {
+            "converted",
+            "ready_reload",
+        }:
+            self._configure_online_integer(layer, weight_prefix, weight_name, spec)
+            loader.state[weight_prefix] = "ready_reload"
+            return
+
+        quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight.data, spec)
+        quantized_weight = npu_format_online_weight(quantized_weight, spec)
+        weight_scale = npu_format_online_moe_scale(
+            scale=weight_scale,
+            spec=spec,
+            weight_prefix=weight_prefix,
+            output_dtype=loader.params_dtype,
+        )
+
+        copy_or_rebind_param(layer, weight_name, quantized_weight)
+        copy_or_rebind_param(layer, f"{weight_name}_scale", weight_scale)
+        self._configure_online_integer(layer, weight_prefix, weight_name, spec)
+
+    def _configure_online_integer(
+        self,
+        layer: torch.nn.Module,
+        weight_prefix: str,
+        weight_name: str,
+        spec: NPUOnlineIntegerQuantSpec,
+    ) -> None:
+        setattr(self, weight_name, getattr(layer, weight_name))
+        setattr(
+            self,
+            f"{weight_name}_scale",
+            getattr(layer, f"{weight_name}_scale"),
+        )
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, spec.dispatcher_output_dtype)
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=spec.activation_dtype
+        )
+        self.transposed = True
 
     def apply(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,  # ignored
+        pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale_args = self._get_bias_args(quant_info, weight_prefix)
+        weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        if weight_scale is not None:
+            scale_args["scale"] = [weight_scale]
+            if self.hidden_states_quantizer is not None and pertoken_scale is None:
+                hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                    hidden_states
+                )
+            if pertoken_scale is not None:
+                scale_args["per_token_scale"] = [pertoken_scale]
+
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -1052,8 +1152,8 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=False,
-            **self._get_bias_args(quant_info, weight_prefix),
+            transposed=self.transposed,
+            **scale_args,
         )
 
 
