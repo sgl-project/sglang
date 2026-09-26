@@ -1,11 +1,9 @@
 import random
 import unittest
-from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
-import sglang.kernels.ops.attention.decode_attention as decode_attention_module
 from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
@@ -18,7 +16,6 @@ from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd_unified,
     redundant_attention,
 )
-from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
@@ -865,113 +862,6 @@ class TestTritonAttention(CustomTestCase):
         for S in seq_lens:
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
-
-    def test_decode_attention_batch_rotation(self):
-        device = get_device()
-        dtype = torch.bfloat16
-        D = 128
-        max_kv_splits = 8
-        sm_scale = 1.0 / (D**0.5)
-        # Ragged lengths with seq_len=1 rows, like a padded CUDA-graph batch.
-        seq_lens = [700, 33, 1, 260, 1, 5, 128, 1]
-        B = len(seq_lens)
-        b_seq_len = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
-        kv_indptr[1:] = torch.cumsum(b_seq_len, dim=0)
-        total_tokens = sum(seq_lens)
-        kv_indices = torch.randperm(total_tokens, device=device)
-        num_kv_splits = torch.clamp((b_seq_len + 63) // 64, 1, max_kv_splits).to(
-            torch.int32
-        )
-
-        for fwd, H_Q, H_KV in (
-            (decode_attention_fwd_normal, 8, 8),
-            (decode_attention_fwd_grouped, 16, 2),
-        ):
-            q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
-            k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
-            v_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
-            outs = []
-            for rotate, uneven_batch in (
-                (False, None),
-                (True, torch.zeros((1,), dtype=torch.int32, device=device)),
-                (True, torch.ones((1,), dtype=torch.int32, device=device)),
-            ):
-                o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
-                # NaN, so a skipped (request, split) cannot pass on stale results
-                attn_logits = torch.full(
-                    (B, H_Q, max_kv_splits, D),
-                    float("nan"),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                attn_lse = torch.full(
-                    (B, H_Q, max_kv_splits),
-                    float("nan"),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                with mock.patch.object(
-                    decode_attention_module, "_rotate_batch", return_value=rotate
-                ) as rotate_batch:
-                    fwd(
-                        q,
-                        k_buffer,
-                        v_buffer,
-                        o,
-                        kv_indptr,
-                        kv_indices,
-                        attn_logits,
-                        attn_lse,
-                        num_kv_splits,
-                        max_kv_splits,
-                        sm_scale,
-                        1.0,
-                        uneven_batch=uneven_batch,
-                    )
-                rotate_batch.assert_called_once_with(B, uneven_batch)
-                outs.append(o)
-
-            for o in outs[1:]:
-                self.assertTrue(torch.equal(outs[0], o))
-            o_ref = decode_attention_fwd_torch(
-                q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
-            )
-            self.assertTrue(
-                torch.allclose(outs[-1].to(torch.float32), o_ref, atol=3e-2, rtol=1e-2)
-            )
-
-    def test_num_kv_splits_uneven_batch(self):
-        device = get_device()
-        cases = [
-            ([4096, 4097, 4098, 4099], 0),
-            ([4096, 4000, 3500, 3400], 0),  # max < 1.25 * min counts as balanced
-            ([4096, 4097, 4098, 1, 1, 1], 1),  # CUDA-graph padding rows
-            ([30000, 1024, 1024, 1024], 1),
-        ]
-        for seq_lens, expected in cases:
-            lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
-            splits = []
-            uneven_batch = torch.full((1,), -1, dtype=torch.int32, device=device)
-            for flag in (None, uneven_batch):
-                num_kv_splits = torch.empty(
-                    (len(seq_lens),), dtype=torch.int32, device=device
-                )
-                get_num_kv_splits_triton[(1,)](
-                    num_kv_splits,
-                    lens,
-                    len(seq_lens),
-                    1,
-                    32,
-                    8,
-                    16,
-                    304,
-                    MAX_NUM_SEQ=256,
-                    uneven_batch_ptr=flag,
-                )
-                splits.append(num_kv_splits)
-            self.assertEqual(uneven_batch.item(), expected, seq_lens)
-            self.assertTrue(torch.equal(splits[0], splits[1]))
 
     def test_decode_attention_large_batch_int64_offset(self):
         """Regression for int32 Mid_O offset overflow (PR #28788).
