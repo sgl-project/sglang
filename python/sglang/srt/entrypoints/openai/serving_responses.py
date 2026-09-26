@@ -1462,6 +1462,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
 
+        # Preserve the history prefix when a later instruction is appended.
+        if self.supports_inline_system:
+            return messages
+
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
         system_chunks: list[str] = []

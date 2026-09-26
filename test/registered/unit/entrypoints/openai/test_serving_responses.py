@@ -14,7 +14,14 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
-from utils import StreamFixture, engine_chunk, event_payloads, make_serving
+from utils import (
+    MockTemplateManager,
+    MockTokenizerManager,
+    StreamFixture,
+    engine_chunk,
+    event_payloads,
+    make_serving,
+)
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
@@ -1601,6 +1608,61 @@ def test_active_stream_cancel_and_final_history(response_serving):
         assert len(serving.msg_store[request.request_id]) == 2
 
     asyncio.run(run())
+
+
+INLINE_SYSTEM_TEMPLATE = (
+    "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}{% endfor %}"
+)
+
+
+@pytest.mark.parametrize(
+    "encoding_spec, chat_template_name, jinja_template, preserve",
+    [
+        ("kimi_k3", None, None, True),
+        (None, None, INLINE_SYSTEM_TEMPLATE, True),
+        (None, "llama-3", INLINE_SYSTEM_TEMPLATE, False),
+        (None, None, "{{ messages[0]['content'] }}", False),
+    ],
+)
+def test_inline_instruction_keeps_history_prefix(
+    encoding_spec, chat_template_name, jinja_template, preserve
+):
+    """An appended developer instruction must stay in place when the renderer
+    that builds the prompt supports inline system messages; hoisting it into
+    the leading system message rewrites the prompt prefix and defeats KV reuse."""
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    tokenizer_manager = MockTokenizerManager()
+    tokenizer_manager.tokenizer.chat_template = jinja_template
+    template_manager = MockTemplateManager()
+    template_manager.chat_template_name = chat_template_name
+    with patch.object(
+        OpenAIServingResponses,
+        "_resolve_chat_encoding_spec",
+        return_value=encoding_spec,
+    ):
+        serving = OpenAIServingResponses(tokenizer_manager, template_manager)
+    history = [
+        {"role": "user", "content": "Existing conversation"},
+        {"role": "assistant", "content": "Previous answer"},
+    ]
+    appended = [
+        {"role": "developer", "content": "New instruction"},
+        {"role": "user", "content": "Next turn"},
+    ]
+    before = serving._construct_input_messages(
+        ResponsesRequest(model="x", instructions="Stable instructions", input=history)
+    )
+    after = serving._construct_input_messages(
+        ResponsesRequest(
+            model="x", instructions="Stable instructions", input=history + appended
+        )
+    )
+    if preserve:
+        assert after[: len(before)] == before
+        assert after[len(before)]["role"] == "system"
+        assert "New instruction" in after[len(before)]["content"]
+    else:
+        assert "New instruction" in after[0]["content"]
 
 
 @pytest.mark.parametrize("stream", [False, True])
