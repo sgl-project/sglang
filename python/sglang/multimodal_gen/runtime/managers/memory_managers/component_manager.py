@@ -346,6 +346,7 @@ class ComponentResidencyManager:
     def end_stage(self) -> None:
         """Close the component interval owned by the current stage."""
         self._record_warmup_phase_peak()
+        self._release_unconsumed_stage_prefetches()
         if self._active_use is None:
             return
         if self._active_use.stage_name != self.state.stage_name:
@@ -514,7 +515,10 @@ class ComponentResidencyManager:
         self.state.current_use = None
         self._begin_warmup_between_uses()
         if prefetch_next:
-            self._prefetch_next_memory_intensive_use()
+            # Stages call this when done with their components, so a later use
+            # declared by the same stage (e.g. transformer_2 on a warmup that
+            # only ran the high-noise expert) will not run in this request.
+            self._prefetch_next_memory_intensive_use(skip_stage=self.state.stage_name)
 
     def _prepare_forward_use(
         self, use: ComponentUse, module: nn.Module | None = None
@@ -890,14 +894,30 @@ class ComponentResidencyManager:
                 return index
         return None
 
-    def _prefetch_next_memory_intensive_use(self) -> None:
+    def _prefetch_next_memory_intensive_use(
+        self, *, skip_stage: str | None = None
+    ) -> None:
         for use in self._ordered_uses[self._current_use_index + 1 :]:
-            if not use.memory_intensive:
+            if not use.memory_intensive or use.stage_name == skip_stage:
                 continue
             if self._use_key(use) in self._prefetched_use_keys:
                 return
             self._prefetch_use(use)
             return
+
+    def _release_unconsumed_stage_prefetches(self) -> None:
+        """Release prefetched uses of the ending stage that never began."""
+        for use in self.state.future_uses:
+            key = self._use_key(use)
+            if use.stage_name != self.state.stage_name or (
+                key not in self._prefetched_use_keys
+            ):
+                continue
+            self._prefetched_use_keys.discard(key)
+            if self._active_use is None or (
+                self._active_use.component_name != use.component_name
+            ):
+                self._finish_use(use, keep_on_warmup=False, force=True)
 
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
         if self.state.future_uses and self._same_use(use, self.state.future_uses[0]):
