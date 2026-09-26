@@ -98,6 +98,9 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    Q=None,
+    S=None,
+    QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -192,8 +195,15 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
-    # Write output
-    tl.store(Y_base, y, mask=mask)
+    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(S + tl.program_id(0), y_s)
+    else:
+        # Write output
+        tl.store(Y_base, y, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -232,6 +242,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_heads: int = 0,
 ):
     M, N = x.shape
     if group_size is None:
@@ -273,6 +284,19 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    quant = {}
+    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+    if quant_heads:
+        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+        rows_per_block = quant_heads
+        q = torch.empty(
+            (M // quant_heads, quant_heads * N),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+        quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -318,8 +342,9 @@ def _layer_norm_fwd(
             num_warps=num_warps,
             ACTIVATION=activation,
             **pdl_kwargs,
+            **quant,
         )
-    return out, mean, rstd
+    return ((q, s) if quant_heads else out), mean, rstd
 
 
 if _is_npu:
