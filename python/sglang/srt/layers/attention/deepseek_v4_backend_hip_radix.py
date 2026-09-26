@@ -11,6 +11,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -109,6 +110,16 @@ class UnifiedKvMetadata:
     gasm_kv_indptr: Optional[torch.Tensor] = None
     gasm_qo_indptr: Optional[torch.Tensor] = None
 
+    # Grouped target-verify streams for the FlyDSL fp8 decode: one per request
+    # on HCA / SWA-only layers, with per-draft key ranges (q_kv_bounds).
+    grp_qo_indptr: Optional[torch.Tensor] = None
+    grp_hca_indices: Optional[torch.Tensor] = None
+    grp_hca_indptr: Optional[torch.Tensor] = None
+    grp_hca_bounds: Optional[torch.Tensor] = None
+    grp_swa_indices: Optional[torch.Tensor] = None
+    grp_swa_indptr: Optional[torch.Tensor] = None
+    grp_swa_bounds: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
@@ -137,6 +148,13 @@ class UnifiedKvMetadata:
                 "gasm_indices",
                 "gasm_kv_indptr",
                 "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -169,6 +187,13 @@ class UnifiedKvMetadata:
                 "gasm_indices",
                 "gasm_kv_indptr",
                 "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -619,6 +644,15 @@ class DeepseekV4HipRadixBackend(
             # DSpark draft workers verify gamma rows; the server arg keeps the
             # CUDA-side convention gamma + 1.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        self._fp8_decode_num_heads = (
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+        )
+        # output mode of the fp8 verify: deepseek_v4 fuses the fp8 wo_a quant into it
+        self._fp8_verify_epi = (
+            "invrope_mxfp8"
+            if any(getattr(m, "wo_a_fp8", False) for m in model_runner.model.modules())
+            else "bf16"
+        )
         # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
         # which frees the scratch its kernels read -- not capture-safe.
         self._fp4_graph_row_limit: Optional[int] = None
@@ -1486,6 +1520,7 @@ class DeepseekV4HipRadixBackend(
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
 
@@ -1560,6 +1595,43 @@ class DeepseekV4HipRadixBackend(
                 num_draft=num_draft,
                 block_q=_GROUPED_ASM_BLOCK_Q,
             )
+
+        u = core.unified
+        u.grp_qo_indptr = None
+        u.grp_hca_indices = u.grp_hca_indptr = u.grp_hca_bounds = None
+        u.grp_swa_indices = u.grp_swa_indptr = u.grp_swa_bounds = None
+        num_reqs = N // num_draft if num_draft > 1 and N % num_draft == 0 else 0
+        if self.is_dspark and num_reqs and is_unified_kv_fp8():
+            grouped = functools.partial(
+                runtime.build_grouped_verify_streams,
+                state_slot,
+                core.positions_casual,
+                num_draft=num_draft,
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+                swa_pages=pool.unified_swa_pages,
+            )
+            pays = functools.partial(
+                runtime.flydsl_grouped_verify_pays,
+                self._fp8_decode_num_heads,
+                num_draft,
+                num_reqs,
+                epi=self._fp8_verify_epi,
+            )
+            if pays(128):
+                (
+                    u.grp_hca_indices,
+                    u.grp_hca_indptr,
+                    u.grp_qo_indptr,
+                    u.grp_hca_bounds,
+                ) = grouped(hca_len, hca_page_indices)
+            if pays(0):
+                (
+                    u.grp_swa_indices,
+                    u.grp_swa_indptr,
+                    u.grp_qo_indptr,
+                    u.grp_swa_bounds,
+                ) = grouped(None, None)
 
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
@@ -1642,9 +1714,12 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        wo_a_quant_freqs: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """q_rope present: packed fp8 q over the two-pool fp8 layout (asm decode;
-        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton)."""
+        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton).
+        wo_a_quant_freqs (fp8 decode): return the inverse-RoPE'd wo_a mxfp8
+        operands instead of the attention output."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1718,9 +1793,44 @@ class DeepseekV4HipRadixBackend(
                     "the v4 nm asm kernel hardcodes 1/sqrt(512), this backend is "
                     f"at {self.softmax_scale}"
                 )
+                qo_indptr, max_seqlen_q, q_kv_bounds = None, 1, None
+                grp = {
+                    128: (
+                        unified_metadata.grp_hca_indices,
+                        unified_metadata.grp_hca_indptr,
+                        unified_metadata.grp_hca_bounds,
+                    ),
+                    0: (
+                        unified_metadata.grp_swa_indices,
+                        unified_metadata.grp_swa_indptr,
+                        unified_metadata.grp_swa_bounds,
+                    ),
+                }.get(compress_ratio)
+                if verify_as_decode and grp is not None and grp[0] is not None:
+                    kv_indices, kv_indptr, q_kv_bounds = grp
+                    qo_indptr = unified_metadata.grp_qo_indptr
+                    max_seqlen_q = self.target_verify_num_draft_tokens
+                if wo_a_quant_freqs is not None:
+                    return runtime.decode_fp8_2buff_wo_a_mxfp8(
+                        q=q,
+                        q_rope=q_rope,
+                        unified_kv=unified,
+                        unified_kv_rope=pool.get_unified_kv_rope(layer_id),
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        attn_sink=attn_sink,
+                        positions=positions,
+                        rope_freqs=wo_a_quant_freqs,
+                        compress_ratio=compress_ratio,
+                        qo_indptr=qo_indptr,
+                        max_seqlen_q=max_seqlen_q,
+                        q_kv_bounds=q_kv_bounds,
+                    )
                 gasm = (
                     unified_metadata.gasm_indices
-                    if compress_ratio == 128 and q.shape[1] == _GROUPED_ASM_GQA
+                    if compress_ratio == 128
+                    and q.shape[1] == _GROUPED_ASM_GQA
+                    and q_kv_bounds is None
                     else None
                 )
                 if gasm is not None:
@@ -1747,6 +1857,9 @@ class DeepseekV4HipRadixBackend(
                     attn_sink=attn_sink,
                     v_head_dim=layer.v_head_dim,
                     compress_ratio=compress_ratio,
+                    qo_indptr=qo_indptr,
+                    max_seqlen_q=max_seqlen_q,
+                    q_kv_bounds=q_kv_bounds,
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
                 _kv_splits_for_stream,
@@ -1941,8 +2054,9 @@ class DeepseekV4HipRadixBackend(
         attn_sink: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        wo_a_quant_freqs: Optional[torch.Tensor] = None,
         **_,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
@@ -1971,6 +2085,7 @@ class DeepseekV4HipRadixBackend(
                 save_kv_cache=save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                wo_a_quant_freqs=wo_a_quant_freqs,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
