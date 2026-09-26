@@ -702,12 +702,8 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
-        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-        if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
-        req.kv.mamba_pool_idx = dst[0]
+        dst = self._alloc_request_state_slot(req)
+        assert dst is not None, "Cannot alloc mamba for load_back"
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def finalize_load_back(
@@ -717,6 +713,42 @@ class MambaComponent(TreeComponent):
         if not success and prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+
+    # ---- Buffer-mode load-back handoff ----
+
+    def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is not None:
+            req.kv.mamba_pool_idx = dst[0]
+        return dst
+
+    def prepare_buffer_load_back(self, req: Req) -> Optional[PrepareLoadBackResult]:
+        """Ensure a request slot; None if eviction cannot free one."""
+        if req.kv.holds_mamba:
+            return PrepareLoadBackResult()
+        dst = self._alloc_request_state_slot(req)
+        if dst is None:
+            return None
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def finalize_buffer_load_back(
+        self, req: Req, prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        """Roll back on failure; on success the H2D supersedes replay and CoW/clear."""
+        if not success:
+            self.finalize_load_back(req, prep, success=False)
+            return
+        write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None and req.kv.mamba_pool_idx is not None:
+            slot = self.cache.req_to_token_pool.translate_mamba_indices(
+                req.kv.mamba_pool_idx.unsqueeze(0)
+            )
+            write_pos[slot] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
 
     def prepare_prefetch(
         self,

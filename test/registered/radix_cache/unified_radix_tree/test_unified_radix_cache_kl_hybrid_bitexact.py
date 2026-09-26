@@ -41,12 +41,18 @@ as tests.
 import os
 import random
 import re
+import shutil
+import tempfile
 import unittest
 
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
+    _extract_output_logprobs,
+    _flush_cache,
+    _generate,
+    _replay_and_compare_kl,
     make_mamba_decode_assert,
 )
 from sglang.test.kl_multiturn_utils import (
@@ -73,7 +79,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=2300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2800, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -95,6 +101,16 @@ PAGE_SIZE = 128
 # handover from prompt tokens to generated ones.
 MAX_NEW_TOKENS = 1024
 
+# flush_cache drains staged file-backend writes, which can exceed 30 seconds.
+_FLUSH_TIMEOUT_S = 600
+
+# Seed a checkpoint strictly inside the prompt: prefix reuse excludes its last
+# token. Keep file-backend writes bounded while decoding past the 512-token SWA.
+BUFFER_ONLY_SAMPLES = 8
+BUFFER_ONLY_SEED_TOKENS = 512
+BUFFER_ONLY_PROMPT_TOKENS = 768
+BUFFER_ONLY_MAX_NEW_TOKENS = 640
+
 
 def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     rng = random.Random(seed)
@@ -102,7 +118,10 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
 
 
 def _base_args(
-    mamba_strategy: str = "extra_buffer", *, mem_fraction_static: float = 0.6
+    mamba_strategy: str = "extra_buffer",
+    swa_full_tokens_ratio: str = "0.1",
+    *,
+    mem_fraction_static: float = 0.6,
 ) -> list[str]:
     return [
         "--trust-remote-code",
@@ -113,7 +132,7 @@ def _base_args(
         "--mamba-radix-cache-strategy",
         mamba_strategy,
         "--swa-full-tokens-ratio",
-        "0.1",
+        swa_full_tokens_ratio,
         "--mamba-full-memory-ratio",
         "0.1",
         # 0.85 was carried over from the 4-GPU B200 test and OOMs an 80 GB card:
@@ -414,6 +433,121 @@ class TestRustUnifiedHybridHiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
 
 class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
     tree_core_backend = "rust"
+
+
+class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
+    """Restore FULL/SWA/Mamba from L3 and compare against recomputed logprobs.
+
+    Flushing the device tree after seeding ensures hits come from storage.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.storage_dir = tempfile.mkdtemp(prefix="sgl-buffer-only-kl-")
+        # Keep all seed SWA windows resident until their backups are staged.
+        other_args = _base_args(swa_full_tokens_ratio="0.5") + [
+            "--enable-hierarchical-cache",
+            "--hicache-host-memory-mode",
+            "buffer_only",
+            "--hicache-storage-backend",
+            "file",
+            "--hicache-storage-backend-extra-config",
+            '{"enable_metadata_cache": true}',
+            "--hicache-write-policy",
+            "write_through",
+            "--hicache-io-backend",
+            "direct",
+            # The mamba host pool only supports page_first and page_first_direct.
+            "--hicache-mem-layout",
+            "page_first_direct",
+            # Partial fetches would make the hit assertions timing-dependent.
+            "--hicache-storage-prefetch-policy",
+            "wait_complete",
+            "--chunked-prefill-size",
+            "2048",
+            "--max-total-tokens",
+            "65536",
+            "--max-mamba-cache-size",
+            "500",
+            "--max-running-requests",
+            "4",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(
+                "python", SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.storage_dir
+            ),
+        )
+        cls.input_ids = [
+            ids[:BUFFER_ONLY_PROMPT_TOKENS]
+            for ids in get_input_ids(
+                tokenizer_path=cls.model,
+                num_samples=BUFFER_ONLY_SAMPLES,
+                trust_remote_code=True,
+            )
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        shutil.rmtree(cls.storage_dir, ignore_errors=True)
+
+    def test_prefill_cache_hit_from_storage(self):
+        full_ids = self.input_ids
+        seed_ids = [ids[:BUFFER_ONLY_SEED_TOKENS] for ids in full_ids]
+
+        # The second flush also waits for seed writes to reach L3.
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        _generate(self.base_url, seed_ids, max_new_tokens=0)
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+
+        results = _generate(
+            self.base_url,
+            full_ids,
+            BUFFER_ONLY_MAX_NEW_TOKENS,
+            return_logprob=True,
+        )
+        self.assertEqual(len(results), len(full_ids))
+
+        cached = [r["meta_info"]["cached_tokens"] for r in results]
+        print(f"buffer_only storage hits: {cached}")
+        for i, hit in enumerate(cached):
+            self.assertGreater(
+                hit,
+                0,
+                f"buffer_only[{i}] took no storage hit: the device tree was "
+                "flushed, so this run never exercised the buffer-mode read path",
+            )
+            self.assertEqual(
+                hit % TRACK_INTERVAL,
+                0,
+                f"buffer_only[{i}]: hit of {hit} tokens is off the "
+                f"{TRACK_INTERVAL}-token checkpoint grid",
+            )
+            self.assertLessEqual(hit, BUFFER_ONLY_SEED_TOKENS)
+
+        # Drain this pass's storage writes here: the replay's own flush uses
+        # the 30s default, which they can outlast.
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        _replay_and_compare_kl(
+            self.base_url,
+            self.model,
+            KL_DIV_THRESHOLD,
+            [full_ids[i] + results[i]["output_ids"] for i in range(len(results))],
+            [_extract_output_logprobs(r) for r in results],
+            label="buffer_only_prefill_cache_hit",
+            # One batch avoids repeated 30s flushes while replay writes drain.
+            batch_size=BUFFER_ONLY_SAMPLES,
+            sampling_temperature=0,
+        )
 
 
 if __name__ == "__main__":
