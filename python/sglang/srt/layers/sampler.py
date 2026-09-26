@@ -822,7 +822,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
         if need_min_p_sampling:
-            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1).values * min_ps
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
