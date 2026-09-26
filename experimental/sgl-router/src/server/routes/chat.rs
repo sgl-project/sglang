@@ -292,11 +292,443 @@ async fn lookup_prefix_matches(
     Ok(signal)
 }
 
-fn policy_selection_failed(
-    ctx: &AppContext,
-    model: &str,
-    reason: PolicySelectionFailureReason,
-) -> ApiError {
+    // Prefer exact ingress tokens; otherwise use the conservative estimate.
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let needs_load_snapshot = policy.needs_load_snapshot()
+        || workers
+            .iter()
+            .any(|worker| worker.mode() == WorkerMode::Prefill);
+    let load_snapshot =
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+    let needs_dispatch_timestamps = policy.needs_dispatch_timestamps();
+    let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+        (
+            parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
+            parse_optional_positive_f64_header(&headers, &X_SGL_TPS_SLO, "TPS SLO")?,
+        )
+    } else {
+        (None, None)
+    };
+
+    // Sticky-session routing key. When the sticky policy is configured,
+    // read the routing key from the operator-chosen header into the
+    // selection context; the policy pins it to a worker. Other policies
+    // leave `routing_key` `None` and ignore it.
+    let routing_key = ctx
+        .config
+        .model
+        .sticky
+        .as_ref()
+        .and_then(|s| headers.get(s.header_name.as_str()))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    // `select_prefill_worker` reduces this to `Bucket` when Bucket
+    // partitioning is off.
+    let session_affinity_mode = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.session_affinity_mode)
+        .unwrap_or(SessionAffinityMode::Bucket);
+    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
+    let worker = select_prefill_worker(&PrefillSelectionInputs {
+        policy: policy.as_ref(),
+        policy_kind: ctx.config.model.policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        metrics: ctx.metrics.as_ref(),
+        model_id: &model_id,
+        body: Some(&body),
+        routing_key,
+        session_id,
+        request_input_tokens,
+        request_tokens: request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        external_prefix: external_prefix.as_ref(),
+        load_snapshot: load_snapshot.as_ref(),
+        workers: &workers,
+        ttft_slo_ms,
+        tps_slo,
+        session_affinity_mode,
+    })
+    .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
+
+    // Decode selection starts after Final P.
+    //
+    // Plain-mode workers skip the decode resolution entirely (no
+    // decode peer to find). PD-mode requests that fail to resolve a
+    // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
+    // operators can alert on prefill-vs-decode pool imbalance.
+    let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
+        let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
+        Some(
+            select_decode_peer(&DecodeSelectionInputs {
+                decode_policy_kind: ctx.config.model.decode_policy,
+                bucket_selector: ctx.bucket_selector.as_ref(),
+                model_id: &model_id,
+                prefill_url: &worker.url,
+                decode_workers: &decode_workers,
+                request_input_tokens,
+                requested_max_output_tokens,
+                ttft_slo_ms,
+                tps_slo,
+                load_snapshot: load_snapshot.as_ref(),
+                metrics: Some(ctx.metrics.as_ref()),
+            })
+            .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            })?,
+        )
+    } else {
+        None
+    };
+    let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
+    let mut request_headers = headers;
+    if let Some(url) = &decode_hint_url {
+        match HeaderValue::from_str(url) {
+            Ok(v) => {
+                request_headers.insert(X_SGL_DECODE_URL, v);
+            }
+            Err(e) => {
+                // Discovery emits URLs the proxy has already used; a
+                // header-value parse failure here means the URL
+                // contains a control character (e.g. CR / LF) — drop
+                // the header but keep the request: bootstrap injection
+                // below carries the host/port the engine actually
+                // needs; the header is purely observability.
+                tracing::warn!(
+                    decode_url = %url,
+                    error = %e,
+                    "decode worker URL rejected by header parser; sending request without decode hint",
+                );
+            }
+        }
+    }
+    let headers = request_headers;
+
+    // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
+    // sits beside this one: both track in-flight load, but the
+    // ActiveLoadGuard entry is per-request (with timeout-based janitor)
+    // while the worker-scoped counter is what the cache-aware policy
+    // reads. Both must drop at the same time — when the response stream
+    // ends, the client disconnects, or the handler returns an error. In
+    // PD mode the pair moves into the spawned prefill task so prefill
+    // load is tracked for the full duration of the KV transfer; in plain
+    // mode the pair stays in this handler. Decode load is tracked on Final D.
+    let guard = if needs_dispatch_timestamps {
+        worker.timestamped_load_guard()
+    } else {
+        worker.load_guard()
+    };
+    let active_guard =
+        ctx.active_load
+            .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
+    // Snapshot the stale-request cancel token BEFORE moving the guard
+    // into the spawned prefill task / streaming pump / response future.
+    // The token is cheap to clone (it's an `Arc<...>` internally) and
+    // the chat handler races the client-facing fetch against
+    // `token.cancelled()` to surface a 504 `stale_request_expired` if
+    // the janitor expires the request mid-flight.
+    let stale_token = active_guard.cancel_token().clone();
+
+    // Snapshot the labels we need for metrics BEFORE moving the worker
+    // / model_str values into the per-branch fetch futures.
+    let metrics_worker_url = worker.url.clone();
+    let metrics_mode = match worker.mode() {
+        WorkerMode::Prefill => WorkerModeLabel::Prefill,
+        WorkerMode::Decode => WorkerModeLabel::Decode,
+        WorkerMode::Plain => WorkerModeLabel::Plain,
+    };
+    let metrics_model = model_str.clone();
+
+    // Builds the time-to-first-token hook the SSE pump fires when the first
+    // upstream chunk lands. Installed only on the streaming arms below —
+    // non-streaming "first token" equals total latency, already captured by
+    // `sgl_router_request_duration_seconds`. The proxy drops the hook for
+    // non-2xx responses so error bodies don't pollute TTFT.
+    let make_ttft_hook = || -> Box<dyn FnOnce() + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        let started = start;
+        Box::new(move || {
+            metrics.observe_ttft(&model, started.elapsed().as_secs_f64());
+        })
+    };
+
+    // Builds the end-to-end-latency guard for streaming requests. Packed into
+    // `stream_guards` so it records when the SSE pump finishes (stream end or
+    // client disconnect), not at response-headers time. Non-streaming records
+    // at the dispatch site instead (see below).
+    let make_duration_guard = || RecordDurationOnDrop {
+        metrics: Arc::clone(&ctx.metrics),
+        model: metrics_model.clone(),
+        start,
+    };
+
+    // Classifies a 2xx stream after its headers are committed. Takes the
+    // streaming worker's URL (Final D in PD mode).
+    let make_stream_end_hook = |worker_url: String| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |end| {
+            metrics.record_stream_outcome(&worker_url, &model, classify_stream_end(end));
+        })
+    };
+
+    // Forward the router-computed tokens to the engine as `input_ids` so it
+    // skips re-tokenizing the same prompt — but only when they are
+    // engine-equivalent (chat-encoder path) AND the request contains nothing
+    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
+    // Otherwise omit them and the engine tokenizes from `messages` as usual —
+    // a transparent, always-correct fallback (`messages` are always retained
+    // in the forwarded body). `forward_input_ids` is `Some` only when
+    // `request_value` is `Some` (a model the ingress tokenized for), so the
+    // predicate always has a parsed body to inspect.
+    let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
+    {
+        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
+            Some(t.ids.as_slice())
+        }
+        _ => None,
+    };
+
+    // Surface a broken offload: when the encoder SHOULD have produced
+    // engine-equivalent ids but didn't, the chat request silently fell back to
+    // engine-side tokenization. Count only that case (see
+    // `ingress_tokenize_offload_failed`); successful forwards and expected
+    // omissions are not problems.
+    if ingress_tokenize_offload_failed(
+        ctx.tokenizers.has_chat_encoder(&model_str),
+        request_value.as_ref(),
+        request_tokens.as_ref(),
+    ) {
+        ctx.metrics.record_ingress_tokenize_error(&metrics_model);
+    }
+
+    // PD-disagg bootstrap fields (prefill worker address + a per-request
+    // room). Present only when a decode peer was resolved.
+    let bootstrap = decode_peer.as_ref().map(|_| BootstrapFields {
+        host: worker.bootstrap_host().to_string(),
+        port: worker.bootstrap_port(),
+        room: generate_room_id(),
+    });
+    let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
+
+    // Build the body forwarded to the engine(s) exactly once — injecting the
+    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
+    // untouched when neither applies.
+    let outgoing_body =
+        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+
+    let result = if let Some(decode_worker) = decode_peer {
+        // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
+        //
+        // SGLang's HTTP-mode disagg-prefill requires three flat
+        // top-level fields on the request body: `bootstrap_host`,
+        // `bootstrap_port` (the prefill worker's bootstrap-server
+        // address) and `bootstrap_room` (a per-request 63-bit u64 ID
+        // used by both sides to pair up the KV transfer). We inject
+        // these here and fan the same modified body to both the
+        // prefill and decode workers concurrently.
+        //
+        // **Why spawn-and-forget for prefill instead of
+        // `tokio::join!`?** All three peer SGLang-HTTP-PD routers
+        // (Dynamo / llm-d / aibrix) converged on this shape: the
+        // prefill request must outlive the client connection because
+        // tying prefill to the client future opens a cancel-race
+        // window where the engine's NIXL RPC teardown can leak KV
+        // block refs (NVBugs 5969206 in Dynamo). The detached task
+        // also keeps the LoadGuard + ActiveLoadGuard alive for the full
+        // prefill duration — KV transfer can run for tens of seconds
+        // even when the client gave up.
+        //
+        // No watchdog for fail-fast on prefill 5xx: llm-d / aibrix both
+        // ship without one. On prefill failure the client experiences
+        // the SGLang decode-side bootstrap_room timeout (~30–60 s by
+        // default) instead of an immediate 502. A follow-up can wire a
+        // `tokio::sync::watch` channel if telemetry shows it matters.
+        //
+        // **Scope of the "detached" guarantee.** The spawn protects
+        // against client disconnect — the handler future being dropped
+        // does NOT cancel the prefill HTTP request. It does NOT protect
+        // against router shutdown: when `AppContext` tears down, the
+        // tokio runtime cancels all unfinished tasks including this
+        // one. A future follow-up could thread a `TaskTracker` /
+        // `JoinSet` through `AppContext` for graceful shutdown drain;
+        // the current implementation ships without one (matching SMG's
+        // shutdown behaviour).
+        let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
+
+        let prefill_url = worker.url.clone();
+        let prefill_breaker = Arc::clone(&worker.breaker);
+        let prefill_headers = headers.clone();
+        let prefill_body = outgoing_body.clone();
+        let prefill_proxy = Arc::clone(&ctx.proxy);
+        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        tokio::spawn(async move {
+            // The tuple binding extends both guards' lifetime to the
+            // end of this async block, which lasts until the prefill
+            // HTTP request returns (success / error / engine-side
+            // bootstrap_room timeout). The result is logged and
+            // swallowed — no channel back to the client. See the big
+            // comment above for the rationale.
+            let _hold = prefill_holds;
+            match prefill_proxy
+                .forward_json_to(
+                    &prefill_url,
+                    &prefill_breaker,
+                    "/v1/chat/completions",
+                    &prefill_headers,
+                    prefill_body,
+                )
+                .await
+            {
+                Ok(_) => tracing::debug!(
+                    prefill_url = %prefill_url,
+                    bootstrap_room,
+                    "prefill side completed",
+                ),
+                Err(e) => tracing::warn!(
+                    prefill_url = %prefill_url,
+                    bootstrap_room,
+                    error = %e,
+                    "prefill request failed; decode will time out on bootstrap_room",
+                ),
+            }
+        });
+
+        // Synchronously await the decode worker. Its response is what
+        // the client sees. The decode side gets its own LoadGuard so
+        // per-worker `active_requests` reflects load on Final D.
+        let decode_guard = decode_worker.load_guard();
+        let decode_active_guard =
+            ctx.active_load
+                .register(decode_worker.id.clone(), decode_worker.url.clone(), 0, 1);
+        if streaming {
+            let stream_guards: Box<dyn Send + 'static> =
+                Box::new((decode_guard, decode_active_guard, make_duration_guard()));
+            let fetch = ctx.proxy.forward_streaming_to(
+                &decode_worker.url,
+                &decode_worker.breaker,
+                "/v1/chat/completions",
+                &headers,
+                outgoing_body,
+                Some(stream_guards),
+                Some(make_ttft_hook()),
+                Some(make_stream_end_hook(decode_worker.url.clone())),
+            );
+            tokio::select! {
+                biased;
+                r = fetch => r,
+                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+            }
+        } else {
+            let _decode_hold = (decode_guard, decode_active_guard);
+            let fetch = ctx.proxy.forward_json_to(
+                &decode_worker.url,
+                &decode_worker.breaker,
+                "/v1/chat/completions",
+                &headers,
+                outgoing_body,
+            );
+            tokio::select! {
+                biased;
+                r = fetch => r,
+                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+            }
+        }
+    } else if streaming {
+        // Plain mode, streaming. Both guards ride the SSE pump until
+        // the body completes — see the matching comment in the
+        // non-streaming arm.
+        let stream_guards: Box<dyn Send + 'static> =
+            Box::new((guard, active_guard, make_duration_guard()));
+        let fetch = ctx.proxy.forward_streaming_to(
+            &worker.url,
+            &worker.breaker,
+            "/v1/chat/completions",
+            &headers,
+            outgoing_body,
+            Some(stream_guards),
+            Some(make_ttft_hook()),
+            Some(make_stream_end_hook(worker.url.clone())),
+        );
+        // Bias `fetch` over the cancellation branch: a successful
+        // response that completes in the same poll as the token firing
+        // MUST win (returning 504 for a request that already has
+        // headers is a correctness regression). The cancellation
+        // branch only matters when fetch is still pending — at that
+        // point biasing the order is a wash.
+        tokio::select! {
+            biased;
+            r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        }
+    } else {
+        // Plain mode, non-streaming. The handler awaits the full
+        // buffered response, so both guards live correctly in this
+        // scope. The tuple binding exists only to extend the guards'
+        // lifetime to the end of the function — the `forward_json_to`
+        // future does not need them (it does not return until the
+        // body is buffered).
+        let _holds: (LoadGuard, _) = (guard, active_guard);
+        let fetch = ctx.proxy.forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            "/v1/chat/completions",
+            &headers,
+            outgoing_body,
+        );
+        // Same `biased` order as the streaming arm.
+        tokio::select! {
+            biased;
+            r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        }
+    };
+
+    // Record the dispatch outcome AFTER we know whether the upstream
+    // accepted the request. A 504 from the stale-request branch counts as
+    // `cancelled` — semantically distinct from upstream errors that bubble
+    // through as `error`. The metric is per-worker so convergence tests
+    // can scrape `/metrics` and assert that ≥N requests landed on a
+    // single prefill worker.
+    let outcome = match &result {
+        Ok(_) => RequestOutcome::Success,
+        Err(ApiError::StaleRequestExpired { .. }) => {
+            // The janitor fired the stale-cancel and we observed it
+            // user-side; record both the per-request `cancelled` outcome
+            // AND the global `expired` count. The two views are useful for
+            // different alerts: per-worker request_total{cancelled} flags a
+            // worker that's hanging, while stale_requests_total{expired}
+            // tracks the global health of the janitor.
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            RequestOutcome::Cancelled
+        }
+        Err(_) => RequestOutcome::Error,
+    };
     ctx.metrics
         .record_policy_selection_failure(ctx.config.model.policy, reason);
     tracing::warn!(
