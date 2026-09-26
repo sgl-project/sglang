@@ -179,10 +179,12 @@ class TestSwaLoadAllocation(unittest.TestCase):
         }
         full_component = SimpleNamespace(
             component_type=ComponentType.FULL,
+            prepare_load_back_in_tree_core=lambda node: None,
             build_hicache_transfers=lambda *a, **k: [kv],
         )
         swa_component = SimpleNamespace(
             component_type=ComponentType.SWA,
+            prepare_load_back_in_tree_core=lambda node: None,
             build_hicache_transfers=lambda *a, **k: [swa],
         )
         core = SimpleNamespace(

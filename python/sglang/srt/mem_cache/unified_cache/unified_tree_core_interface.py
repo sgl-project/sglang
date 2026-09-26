@@ -526,7 +526,11 @@ class UnifiedTreeCoreInterface(ABC):
     def build_load_back_spec(
         self, node_id: NodeId, req: Optional[Req] = None
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
-        """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        """Build the H->D load-back KV transfer plus per-component aux transfers.
+
+        Components may first split nodes on the load path (SWA trims to one window),
+        so this reshapes the tree and is not a dry-run sizing probe.
+        """
         ...
 
     @abstractmethod

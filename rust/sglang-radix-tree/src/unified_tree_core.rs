@@ -3352,14 +3352,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Build the H->D load-back KV transfer plus per-component aux transfers.
+    /// Components may first split nodes on the load path (SWA trims to one window),
+    /// so this reshapes the tree and is not a dry-run sizing probe.
     pub fn build_load_back_spec(
-        &self,
+        &mut self,
         node_id: NodeId,
         req: Option<&Req>,
     ) -> Result<(PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>), TreeCoreRuntimeError>
     {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
+        // Splits must land before any transfer records node ids and lengths.
+        for i in 0..self.components.len() {
+            let component = Arc::clone(&self.components[i]);
+            component.prepare_load_back_in_tree_core(self, node_id);
+        }
         // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self

@@ -82,6 +82,47 @@ impl SwaComponent {
         Some(new_parent)
     }
 
+    /// Host-only SWA nodes a load-back from `node_id` restores, newest first, with
+    /// the tokens each contributes; only the oldest may contribute a page-aligned
+    /// tail, which `prepare_load_back_in_tree_core` splits off before the load.
+    fn window_host_loads_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Vec<(NodeIdx_, usize)> {
+        let page_size = tree_core.page_size;
+        let mut loads = Vec::new();
+        let mut n_swa = 0;
+        let mut cur_id = node_id;
+        loop {
+            let cur = tree_core.arena.node(cur_id);
+            if cur.is_root() || n_swa >= self.sliding_window_size {
+                break;
+            }
+            if cur.has_device_value(SWA) {
+                n_swa += cur.device_value_len(SWA);
+            } else if cur.has_host_value(SWA) {
+                let host_len = cur.host_value_len(SWA);
+                let mut tail_len =
+                    (self.sliding_window_size - n_swa).div_ceil(page_size) * page_size;
+                // A write-through-pending split emits an action the tree core
+                // cannot apply, so such a node is charged and loads whole.
+                if tail_len >= host_len
+                    || !(host_len - tail_len).is_multiple_of(page_size)
+                    || cur.write_through_pending_id.is_some()
+                {
+                    tail_len = host_len;
+                }
+                loads.push((cur_id, tail_len));
+                n_swa += tail_len;
+            } else {
+                break;
+            }
+            cur_id = cur.parent();
+        }
+        loads
+    }
+
     // Tier-selected SWA slot reads for the lock walks; `host` picks the host slot.
     fn has_value<K: ChildKeyType>(node: &Node<K>, host: bool) -> bool {
         if host {
@@ -431,28 +472,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         result.swa_branching_seqlen =
             (page_aligned_full_hit_len > swa_boundary_len).then_some(page_aligned_full_hit_len);
 
-        // Sum the SWA tokens backing the match, walking up from the best match
-        // until one sliding window is covered; host-resident chunks count
-        // toward the SWA host hit.
-        let mut n_swa = 0;
-        let mut swa_host_hit = 0;
-        let mut node = tree_core.arena.node(best_match_node_idx);
-        while !node.is_root() && n_swa < self.sliding_window_size {
-            if node.has_device_value(SWA) {
-                n_swa += node.device_value_len(SWA);
-            } else if node.has_host_value(SWA) {
-                // TODO(hzh): once load_back is constrained to fetch only one
-                // sliding window worth of pages, cap swa_host_hit at
-                // sliding_window_size so the scheduler budget matches the
-                // actual device-pool consumption.
-                let host_len = node.host_value_len(SWA);
-                swa_host_hit += host_len;
-                n_swa += host_len;
-            } else {
-                break;
-            }
-            node = tree_core.arena.node(node.parent());
-        }
+        let swa_host_hit: usize = self
+            .window_host_loads_(tree_core, best_match_node_idx)
+            .iter()
+            .map(|&(_, tail_len)| tail_len)
+            .sum();
         if swa_host_hit > 0 {
             result.swa_host_hit_length = result.swa_host_hit_length.max(swa_host_hit);
         }
@@ -916,6 +940,22 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 );
             }
             x = x_next;
+        }
+    }
+
+    fn prepare_load_back_in_tree_core(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) {
+        let Some(&(oldest_id, tail_len)) = self.window_host_loads_(tree_core, node_id).last()
+        else {
+            return;
+        };
+        let split_len = tree_core.arena.node(oldest_id).key.atom_len() - tail_len;
+        if split_len > 0 {
+            let (_, action) = tree_core.split_node_(oldest_id, split_len);
+            assert!(action.is_none(), "write-through-pending nodes load whole");
         }
     }
 

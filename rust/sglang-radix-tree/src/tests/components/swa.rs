@@ -451,7 +451,7 @@ fn finalize_stops_at_the_window_before_higher_host_chunks() {
 }
 
 #[test]
-fn finalize_counts_the_straddling_host_chunk_in_full() {
+fn finalize_charges_only_the_in_window_tail_of_a_straddling_host_chunk() {
     let mut tc = swa_core(/* window = */ 3, /* page_size = */ 1);
     let root = tc.arena.root();
     let h = tc
@@ -474,10 +474,119 @@ fn finalize_counts_the_straddling_host_chunk_in_full() {
         .unwrap();
     set_swa_host(&mut tc, h);
     set_swa_device(&mut tc, c);
-    // The host chunk straddles the window boundary (2 of its 4 tokens are
-    // in-window) and is counted in full, uncapped.
+    // The host chunk straddles the window boundary: load-back fetches only
+    // the 1 token the window still needs, so only that is charged.
     let out = finalize(&tc, &swa_component(3), c, /* prior = */ 0);
-    assert_eq!(out.swa_host_hit_length, 4);
+    assert_eq!(out.swa_host_hit_length, 1);
+}
+
+fn alloc_run(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    parent: NodeIdx_,
+    key: std::ops::RangeInclusive<i64>,
+) -> NodeIdx_ {
+    tc.arena
+        .alloc_child(
+            parent,
+            key.collect(),
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn load_back_splits_only_the_oldest_host_node_past_device_and_whole_host_nodes() {
+    let mut tc = swa_core(/* window = */ 5, /* page_size = */ 1);
+    let root = tc.arena.root();
+    let a = alloc_run(&mut tc, root, 1..=4);
+    let b = alloc_run(&mut tc, a, 5..=6);
+    let c = alloc_run(&mut tc, b, 7..=8);
+    tc.arena
+        .set_host_value(a, SWA, Tensor::from_slice(&[10i64, 11, 12, 13]));
+    tc.arena
+        .set_host_value(b, SWA, Tensor::from_slice(&[20i64, 21]));
+    set_swa_device(&mut tc, c);
+    let swa = swa_component(5);
+    // Device c covers 2 and host b loads whole; a supplies only the last 1.
+    assert_eq!(
+        finalize(&tc, &swa, c, /* prior = */ 0).swa_host_hit_length,
+        3
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    let head = tc.arena.node(a).parent();
+    assert_eq!(tc.arena.node(head).key.atom_len(), 3);
+    assert_eq!(tc.arena.node(a).key.atom_len(), 1);
+    assert_eq!(tc.arena.node(b).key.atom_len(), 2);
+    assert_eq!(tc.arena.node(b).parent(), a);
+    // The load moves exactly the charged 3 tokens: a's tail, then all of b.
+    let transfers = swa
+        .build_hicache_transfers(
+            &tc,
+            c,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        transfers[0]
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[13i64, 20, 21]))
+    );
+    assert_eq!(
+        transfers[0].nodes_to_load,
+        Some(vec![tc.arena.node(a).id, tc.arena.node(b).id])
+    );
+    // Re-running on the reshaped path is a no-op.
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    assert_eq!(tc.arena.node(a).parent(), head);
+}
+
+#[test]
+fn load_back_keeps_a_write_through_pending_host_node_whole() {
+    let mut tc = swa_core(/* window = */ 3, /* page_size = */ 1);
+    let root = tc.arena.root();
+    let h = alloc_run(&mut tc, root, 1..=4);
+    let c = alloc_run(&mut tc, h, 5..=6);
+    set_swa_host(&mut tc, h);
+    set_swa_device(&mut tc, c);
+    tc.arena.node_mut(h).write_through_pending_id = Some(7);
+    let swa = swa_component(3);
+    assert_eq!(
+        finalize(&tc, &swa, c, /* prior = */ 0).swa_host_hit_length,
+        4
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    assert_eq!(tc.arena.node(h).key.atom_len(), 4);
+    assert_eq!(tc.arena.node(h).parent(), root);
+}
+
+#[test]
+fn load_back_rounds_a_sub_page_window_up_to_one_page() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 4);
+    let root = tc.arena.root();
+    let n = alloc_run(&mut tc, root, 1..=8);
+    set_swa_host(&mut tc, n);
+    let swa = swa_component(2);
+    assert_eq!(
+        finalize(&tc, &swa, n, /* prior = */ 0).swa_host_hit_length,
+        4
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, n);
+    let head = tc.arena.node(n).parent();
+    assert_eq!(tc.arena.node(head).key.atom_len(), 4);
+    assert_eq!(tc.arena.node(n).key.atom_len(), 4);
 }
 
 #[test]
@@ -4445,6 +4554,74 @@ fn build_load_back_spec_includes_the_swa_transfers() {
         actions[0],
         CacheAction::RebuildFullToSwaMapping { .. }
     ));
+}
+
+#[test]
+fn build_load_back_spec_loads_one_page_aligned_swa_window_of_a_long_host_node() {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 2,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(3)
+        },
+        vec![FULL, SWA],
+    );
+    let root = tc.arena.root();
+    let n = tc
+        .arena
+        .alloc_child(
+            root,
+            /* key = */ (1..=8).collect(),
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    set_full_host(&mut tc, n);
+    tc.arena.set_host_value(
+        n,
+        SWA,
+        Tensor::from_slice(&[30i64, 31, 32, 33, 34, 35, 36, 37]),
+    );
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .expect("live test node");
+
+    // The window of 3 rounds up to 2 pages, so only the 4-token tail loads SWA
+    // while Full still loads both fragments.
+    let head = tc.arena.node(n).parent();
+    assert_eq!(tc.arena.node(head).key.atom_len(), 4);
+    assert_eq!(tc.arena.node(n).key.atom_len(), 4);
+    assert_eq!(
+        kv_xfer.nodes_to_load,
+        Some(vec![tc.arena.node(head).id, tc.arena.node(n).id])
+    );
+    let swa_xfers = comp_xfers.get_mut(&SWA).unwrap();
+    assert!(
+        swa_xfers[0]
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[34i64, 35, 36, 37]))
+    );
+    assert_eq!(swa_xfers[0].nodes_to_load, Some(vec![tc.arena.node(n).id]));
+
+    swa_xfers[0].device_indices = Some(Tensor::from_slice(&[60i64, 61, 62, 63]));
+    tc.commit_load_back(
+        tc.arena.node(n).id,
+        Tensor::arange(8, (Kind::Int64, tch::Device::Cpu)),
+        kv_xfer,
+        comp_xfers,
+    )
+    .expect("live test node");
+    // The head stays an SWA host tombstone, so the match still covers the window.
+    assert!(!tc.arena.has_device_value(head, SWA));
+    assert!(
+        tc.arena
+            .host_value(head, SWA)
+            .equal(&Tensor::from_slice(&[30i64, 31, 32, 33]))
+    );
+    assert!(tc.arena.has_device_value(n, SWA));
 }
 
 #[test]
