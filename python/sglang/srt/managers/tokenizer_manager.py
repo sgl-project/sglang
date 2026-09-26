@@ -289,11 +289,11 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
-    output_token_sampling_mask: List[List[int]] = dataclasses.field(
+    output_token_sampling_mask: List[Union[List[int], np.ndarray]] = dataclasses.field(
         default_factory=list
     )
-    output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
-        default_factory=list
+    output_token_sampling_logprobs: List[Union[float, List[float], np.ndarray]] = (
+        dataclasses.field(default_factory=list)
     )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
@@ -2400,7 +2400,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
-                    masks, logprobs = output_sampling_mask[i].to_lists(
+                    chunk = output_sampling_mask[i]
+                    to_rows = (
+                        chunk.to_arrays if state.obj.numpy_outputs else chunk.to_lists
+                    )
+                    masks, logprobs = to_rows(
                         support_logprobs=state.obj.sampling_logprobs_mode == "support"
                     )
                     state.output_token_sampling_mask.extend(masks)
