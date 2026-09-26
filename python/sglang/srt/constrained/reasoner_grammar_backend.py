@@ -21,7 +21,12 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    InklingDetector as InklingReasoningDetector,
+)
+from sglang.srt.parser.reasoning_parser import (
+    ReasoningParser,
+)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 from .base_grammar_backend import (
@@ -31,6 +36,23 @@ from .base_grammar_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+_canonical_inkling_auto_tool_schema: Optional[dict] = None
+
+
+def _get_canonical_inkling_auto_tool_schema() -> dict:
+    global _canonical_inkling_auto_tool_schema
+    if _canonical_inkling_auto_tool_schema is None:
+        # Lazy: inkling_detector imports xgrammar unconditionally, and XPU
+        # installs may not ship it.
+        from sglang.srt.function_call.inkling_detector import InklingDetector
+
+        _canonical_inkling_auto_tool_schema = (
+            InklingDetector()
+            .get_auto_tool_call_structural_tag()
+            .model_dump(by_alias=True)
+        )
+    return _canonical_inkling_auto_tool_schema
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -271,9 +293,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        think_end_ids = tokenizer.encode(
-            reasoning_parser.detector.think_end_token, add_special_tokens=False
-        )
+        think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if not think_end_ids:
             raise ValueError(
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
@@ -281,6 +301,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
+        self._is_inkling_detector = isinstance(
+            reasoning_parser.detector, InklingReasoningDetector
+        )
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
@@ -355,14 +378,12 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
-        if not self.enable_strict_thinking and key[0] == "structural_tag":
-            from sglang.srt.function_call.inkling_detector import InklingDetector
-
+        if (
+            not self.enable_strict_thinking
+            and key[0] == "structural_tag"
+            and self._is_inkling_detector
+        ):
             # Only this canonical schema owns the full turn; user restrictions may not.
-            if json.loads(key[1]) == (
-                InklingDetector()
-                .get_auto_tool_call_structural_tag()
-                .model_dump(by_alias=True)
-            ):
+            if json.loads(key[1]) == _get_canonical_inkling_auto_tool_schema():
                 return ret
         return self._make_grammar_object(ret, reasoning)
