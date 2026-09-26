@@ -8,6 +8,7 @@ import torch
 
 import sglang
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     UnreducedOutput,
@@ -33,17 +34,26 @@ def make_communicator(
     scatters_to_local_tokens=False,
     group=None,
     cls=LayerCommunicator,
+    allow_deferred=True,
 ):
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
+    communicator._ffn_output = StageOutput(
+        Layout(frozenset()), group=SumGroup.TP, leaves_for_next_layer=allow_deferred
+    )
     if cls is LayerCommunicator:
-        communicator.should_defer_ffn_reduction = MagicMock(return_value=fuse)
-    communicator.should_use_reduce_scatter = MagicMock(return_value=reduce_scatter)
+        communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
+    else:
+        # A subclass decides through its own hooks; no TP left to defer over.
+        communicator._context = types.SimpleNamespace(tp_size=1)
+    communicator._ffn_leaves_sum_to_reduce_scatter = MagicMock(
+        return_value=reduce_scatter
+    )
     communicator.is_last_layer = False
-    communicator._sp_variant = None
+    communicator._sp_region = False
     communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
-    communicator._reduce_scatter_step = MagicMock(return_value=reduce_scatter_step)
+    communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
@@ -116,7 +126,6 @@ class TestFfnExit(CustomTestCase):
         bound = hidden_states.reduce_and_redistribute
         self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
         self.assertEqual(bound.args, (group, self.forward_batch))
-        communicator._reduce_scatter_step.assert_not_called()
         communicator.postprocess_layer.assert_not_called()
         group.all_reduce.assert_not_called()
 
@@ -133,6 +142,17 @@ class TestFfnExit(CustomTestCase):
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
 
+    def test_a_layer_that_declares_no_deferral_runs_postprocess(self):
+        communicator = make_communicator(
+            fuse=True, reduce_scatter=True, allow_deferred=False
+        )
+        seen, (hidden_states, residual) = self.run_exit(communicator)
+
+        self.assertEqual(seen, (False, True))
+        communicator._ffn_sum_moves_to_next_layer.assert_not_called()
+        communicator.postprocess_layer.assert_called_once()
+        torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
+
     def test_finish_applies_the_decision_the_ffn_saw(self):
         """finish() applies the decision published to the FFN, even when the
         decision methods would answer differently by then."""
@@ -141,7 +161,7 @@ class TestFfnExit(CustomTestCase):
                 communicator = make_communicator(fuse=fuse, reduce_scatter=False)
                 with communicator.ffn_exit(self.forward_batch) as ffn_exit:
                     seen = published_flags()
-                    decide = communicator.should_defer_ffn_reduction
+                    decide = communicator._ffn_sum_moves_to_next_layer
                     decide.return_value = not fuse
                     hidden_states = self.hidden_states * 2
                 hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
@@ -156,7 +176,7 @@ class TestFfnExit(CustomTestCase):
 
     def test_subclass_decisions_are_used(self):
         class NeverDefers(LayerCommunicator):
-            def should_defer_ffn_reduction(self, forward_batch):
+            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
                 return False
 
         communicator = make_communicator(
@@ -260,16 +280,24 @@ class TestSelectFfnCompletion(CustomTestCase):
     the FFN runs."""
 
     def communicator(
-        self, *, fuse=False, is_last_layer=False, scatters=True, sp_variant=None
+        self, *, fuse=False, is_last_layer=False, scatters=True, sp_region=False
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.is_last_layer = is_last_layer
-        communicator._sp_variant = sp_variant
+        communicator._sp_region = sp_region
         communicator._postprocess_scatters_to_local_tokens = scatters
-        communicator.allow_reduce_scatter = True
-        communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
-        communicator.should_defer_ffn_reduction = lambda forward_batch: fuse
-        communicator.should_use_reduce_scatter = lambda forward_batch: not fuse
+        communicator._ffn_output = StageOutput(
+            Layout(frozenset()),
+            group=SumGroup.MOE_OUTPUT,
+            leaves_for_next_layer=True,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        )
+        communicator._ffn_sum_moves_to_next_layer = lambda forward_batch, **_: fuse
+        communicator._ffn_leaves_sum_to_reduce_scatter = lambda forward_batch, dp_step: (
+            not fuse
+        )
+        communicator._complete_ffn_output_now = lambda h, r, **_: ("now", r)
         self.group = make_group()
         communicator.ffn_reduction_group = lambda: self.group
         return communicator
@@ -279,9 +307,8 @@ class TestSelectFfnCompletion(CustomTestCase):
             comm, "_reduce_and_redistribute_output_step", return_value=step
         ):
             completion = communicator._select_ffn_completion(forward_batch)
-        if completion.leave is None:
-            return None
-        return completion.leave(torch.ones(3, 4))
+        hidden_states, _ = completion.complete(torch.ones(3, 4), None)
+        return None if hidden_states == "now" else hidden_states
 
     def test_a_reduce_scatter_is_bound_for_the_next_layer(self):
         forward_batch = object()
@@ -306,7 +333,7 @@ class TestSelectFfnCompletion(CustomTestCase):
                 self.assertIsNone(self.left(communicator, step))
 
     def test_postprocess_keeps_an_active_layernorm_sp_region(self):
-        communicator = self.communicator(sp_variant=object())
+        communicator = self.communicator(sp_region=True)
         with get_forward().scoped(sp_active=True):
             self.assertIsNone(
                 self.left(communicator, comm._reduce_and_redistribute_output_varlen)

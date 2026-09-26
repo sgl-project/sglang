@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,7 +62,11 @@ class TestPureSWARadixCache(CustomTestCase):
             cache_salt=None,
             last_node=None,
             priority=0,
-            kv=ReqKvInfo(req_pool_idx=0, swa_evict_floor=4, swa_evicted_seqlen=6),
+            kv=ReqKvInfo(
+                req_pool_idx=0,
+                swa_evict_floor=4,
+                component_evicted_seqlens={ComponentType.SWA: 6},
+            ),
         )
 
         cache.cache_finished_req(req, owned_kv_len=8)

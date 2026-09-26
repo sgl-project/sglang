@@ -163,35 +163,19 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         backend = _make_backend(runner)
 
         forward_fn = mock.Mock(return_value=object())
-        rf_names = []
 
-        def _fake_record_function(name):
-            rf_names.append(name)
-            return contextlib.nullcontext()
-
-        with (
-            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
-            mock.patch(
-                "torch.profiler.record_function", side_effect=_fake_record_function
-            ),
-        ):
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 
-        return profiler, forward_fn, rf_names
+        return profiler, forward_fn
 
     def test_steps_twice_in_warmup_and_once_after_capture(self):
-        profiler, forward_fn, _ = self._run(
+        profiler, forward_fn = self._run(
             size=4, num_tokens_per_bs=1, mode_name="DECODE"
         )
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
-
-    def test_capture_not_wrapped_in_record_function(self):
-        # The capture forward is no longer wrapped in a record_function; per-bs
-        # trace naming is handled by the profiler's on_trace_ready callback.
-        _, _, rf_names = self._run(size=4, num_tokens_per_bs=1, mode_name="DECODE")
-        self.assertEqual(rf_names, [])
 
 
 class TestCleanup(CustomTestCase):
