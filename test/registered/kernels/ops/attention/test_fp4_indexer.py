@@ -653,10 +653,12 @@ def test_hopper_indexer_backends_replay(ratio):
         for _ in range(3)
     ]
     captured_scores = []
+    captured_masks = []
 
     def record_scores(*args, **kwargs):
         result = fp4_index_logits_paged(*args, **kwargs)
         captured_scores.append(result)
+        captured_masks.append(args[-1])
         return result
 
     def run():
@@ -675,6 +677,8 @@ def test_hopper_indexer_backends_replay(ratio):
         len(captured_scores) == 3
     )  # all three runtime entrypoints took the paged path
     mask = published.decode_mask
+    assert captured_masks[:2] == [None, None]
+    assert captured_masks[2] is mask
     for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
@@ -689,7 +693,6 @@ def test_hopper_indexer_backends_replay(ratio):
             if out.raw_indices is not None:
                 out.raw_indices.fill_(12345)
         graph.replay()
-        assert published.decode_mask is mask
         current_slots = req_table[req.long(), : width * ratio : ratio].long() // ratio
         source_scores = _reference_logits(q, weights, current_slots, lens, table)
         consumer_scores = _reference_logits(
