@@ -4,6 +4,22 @@
   "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
   "cases": [
     {
+      "id": "anima_base_t2i_1024",
+      "model": "circlestone-labs/Anima-Base-v1.0-Diffusers",
+      "task": "text-to-image",
+      "prompt": "masterpiece, best quality, safe, watercolor landscape, a quiet seaside village at sunset",
+      "width": 1024,
+      "height": 1024,
+      "seed": 42,
+      "num_gpus": 1,
+      "frameworks": {
+        "sglang": {
+          "serve_args": "--warmup-mode server --performance-mode speed",
+          "extra_env": {}
+        }
+      }
+    },
+    {
       "id": "flux1_dev_t2i_1024",
       "model": "black-forest-labs/FLUX.1-dev",
       "task": "text-to-image",

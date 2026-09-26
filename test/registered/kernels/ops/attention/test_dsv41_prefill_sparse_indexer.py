@@ -7,11 +7,9 @@ from typing import NamedTuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import select_candidate_blocks
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    PrefillIndexerInputs,
-    select_candidate_blocks,
-)
+from sglang.srt.layers.attention.dsv4.candidate_indexer import PrefillIndexerInputs
 from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
     DenseCandidateIndexer,
 )

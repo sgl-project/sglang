@@ -2,7 +2,7 @@ import subprocess
 from types import SimpleNamespace
 
 from sglang.test.ascend.test_ascend_utils import write_results_to_github_step_summary
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 
 
 class TestMMLU:
@@ -15,7 +15,7 @@ class TestMMLU:
             "server": getattr(
                 self, "server_cmd", subprocess.list2cmdline(map(str, self.other_args))
             ),
-            "client": "simple_eval_mmlu",
+            "client": "sgl-eval",
             "accuracy_threshold": getattr(self, "accuracy_mmlu", "N/A"),
         }
 
@@ -28,7 +28,7 @@ class TestMMLU:
                 num_threads=32,
             )
             print("Starting mmlu test...")
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             model_metrics["accuracy"] = metrics["score"]
             model_metrics["latency"] = metrics.get("latency", "-")
             model_metrics["output_throughput"] = metrics.get("output_throughput", "-")
