@@ -360,8 +360,10 @@ class DataParallelController:
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
-                    lambda msg: self.add_elastic_workers(
-                        msg.slot_offset, msg.slot_count
+                    lambda msg: (
+                        self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+                        if msg.terminal and msg.success
+                        else None
                     ),
                 ),
             ]
