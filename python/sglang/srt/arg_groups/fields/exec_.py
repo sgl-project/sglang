@@ -326,6 +326,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dense_mx: A[
+        bool,
+        "Quantize the wide bf16 projections an MX checkpoint leaves unquantized (Qwen3.5's attention and GDN projections) to online MXFP6 on gfx950. Prefill only: below the model's token threshold those layers keep running bf16, so decode is unchanged.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):

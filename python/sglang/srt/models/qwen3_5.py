@@ -92,6 +92,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import qwen3_5_dense_mx
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
@@ -1678,6 +1679,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
+
+        # Must precede layer construction: quark consults the policy from
+        # get_quant_method as each linear is built.
+        qwen3_5_dense_mx.register(quant_config)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
