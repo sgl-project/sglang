@@ -207,6 +207,17 @@ class TestLastLayerCommunicator(CustomTestCase):
                         layer_id == NUM_LAYERS - 1,
                     )
 
+    def test_step3p5_dense_layers_never_defer_their_sum(self):
+        """A Step-3.5 dense layer's MLP all-reduces its own output unless
+        postprocess reduce-scatters it; its communicator is told it never leaves
+        the sum to the next layer. The MoE layers may."""
+        for layer_id in range(NUM_LAYERS):
+            with self.subTest(layer_id=layer_id):
+                passed, planned, _ = build("step3p5", NUM_LAYERS, layer_id)
+                self.assertIs(
+                    passed["allow_deferred_ffn_reduction"], planned["is_layer_sparse"]
+                )
+
     def test_draft_model_layer_is_last(self):
         """The single decoder layer of a NextN / MTP draft model is marked last,
         whatever layer id and layer count it is built with."""
