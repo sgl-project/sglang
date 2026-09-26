@@ -2225,7 +2225,7 @@ class AscendAttnBackend(AttentionBackend):
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
 
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa or self.use_fias_v2_bsnd:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
