@@ -227,12 +227,22 @@ if _is_cuda or _is_hip or _is_xpu:
             from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
         except ImportError:
             pass
+# None when aiter lacks the separate fused-shared-gate op (older build). The caller
+# (qwen2_moe) gates on this and falls back to the legacy routed-topk + shared-append
+# path, so a version mismatch degrades gracefully instead of hard-failing at import.
+aiter_topk_softmax_fused_shared_gate = None
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
         from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    try:
+        from aiter.ops.moe_op import (
+            topk_softmax_fused_shared_gate as aiter_topk_softmax_fused_shared_gate,
+        )
+    except ImportError:
+        aiter_topk_softmax_fused_shared_gate = None
 if _is_musa:
     try:
         from mate import moe_fused_gate
@@ -993,6 +1003,58 @@ def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
     )  # clear topk_weights as already applied
 
     return inputs, topk_weights
+
+
+def aiter_fused_softmax_topk_with_shared_gate(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    num_fused_shared_experts: int,
+    shared_expert_base: int,
+    gate_weight: torch.Tensor,
+    renormalize: bool,
+    shared_expert_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Option A single-launch routed softmax top-k + in-kernel shared-expert gate GEMV.
+
+    Calls aiter.topk_softmax_fused_shared_gate to compute the shared-expert weight
+    as sigmoid(hidden @ gate_weight.T) * shared_expert_scale (scale applied AFTER
+    the sigmoid) and write the shared id (shared_expert_base + s) inside the routed
+    softmax kernel, so no separate append pass / Python cat is needed. Returns
+    (topk_weights, topk_ids) of width top_k + num_fused_shared_experts.
+    """
+    assert _use_aiter, (
+        "aiter_fused_softmax_topk_with_shared_gate requires SGLANG_USE_AITER"
+    )
+    # One gate row per fused shared expert -- the kernel indexes gate_weight[0..S).
+    assert gate_weight.shape[0] == num_fused_shared_experts, (
+        f"gate_weight rows ({gate_weight.shape[0]}) must equal "
+        f"num_fused_shared_experts ({num_fused_shared_experts})"
+    )
+    M = hidden_states.shape[0]
+    total = top_k + num_fused_shared_experts
+    device = hidden_states.device
+
+    topk_weights = torch.empty(M, total, dtype=torch.float32, device=device)
+    topk_ids = torch.empty(M, total, dtype=torch.int32, device=device)
+    # Scratch source-row buffer; sized to `total` because the kernel addresses it with
+    # the same row stride as topk_ids.
+    token_expert_indices = torch.empty(M, total, dtype=torch.int32, device=device)
+
+    aiter_topk_softmax_fused_shared_gate(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        router_logits,
+        renormalize,
+        num_fused_shared_experts,
+        "sigmoid",
+        hidden_states,
+        gate_weight,
+        shared_expert_scale,
+        shared_expert_base,
+    )
+    return topk_weights, topk_ids
 
 
 def fused_topk(

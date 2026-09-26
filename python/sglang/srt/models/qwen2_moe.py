@@ -63,7 +63,13 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutputChecker,
+    aiter_fused_softmax_topk_with_shared_gate,
+    aiter_topk_softmax_fused_shared_gate,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -306,6 +312,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
         )
+
+        # Option A: on aiter, fold the shared-expert gate GEMV + append into the routed
+        # softmax top-k kernel (single launch), replacing the routed-topk + separate
+        # fused-append pair. Requires a per-token gated shared expert (shared_expert_gate)
+        # and an aiter build that ships the topk_softmax_fused_shared_gate op.
+        self.fuse_shared_experts_in_topk = (
+            self.enable_shared_expert_fusion
+            and _use_aiter
+            and aiter_topk_softmax_fused_shared_gate is not None
+        )
+        if (
+            self.enable_shared_expert_fusion
+            and _use_aiter
+            and aiter_topk_softmax_fused_shared_gate is None
+        ):
+            logger.warning_once(
+                "aiter lacks topk_softmax_fused_shared_gate; using the routed-topk + "
+                "separate shared-append path. Rebuild aiter to enable the "
+                "single-launch fused shared-expert gate."
+            )
+        self._routed_top_k = config.num_experts_per_tok
+        self._norm_topk_prob = config.norm_topk_prob
 
         # Disable inplace MoE when fused gate will need hidden_states after experts
         _needs_hidden_after_experts = (
@@ -709,6 +737,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        # Option A: single-launch routed softmax top-k with the shared-expert gate GEMV
+        # folded into the aiter kernel. Bypasses self.topk + _append_shared_to_topk_output.
+        if (
+            self.fuse_shared_experts_in_topk
+            and not defer_finalize
+            and self.shared_expert_gate is not None
+        ):
+            topk_weights, topk_ids = aiter_fused_softmax_topk_with_shared_gate(
+                hidden_states,
+                router_logits,
+                top_k=self._routed_top_k,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                shared_expert_base=self.num_experts,
+                gate_weight=self.shared_expert_gate.weight,
+                renormalize=self._norm_topk_prob,
+                shared_expert_scale=self._shared_expert_scale(),
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+            )
+            return self.experts(hidden_states, topk_output)
+
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
