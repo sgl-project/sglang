@@ -6,12 +6,12 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.ops.communication.all_reduce_mhc_hip import all_reduce_mhc_post
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 from sglang.srt.layers.moe.utils import post_experts_all_reduce
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     ALL_REDUCE_MHC_MAX_ROWS,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 def all_reduce_output(moe, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -26,7 +26,11 @@ def all_reduce_output(moe, hidden_states: torch.Tensor) -> torch.Tensor:
         and 1 <= hidden_states.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
     ):
         mhc.output = all_reduce_mhc_post(
-            hidden_states, mhc.residual, mhc.post, mhc.comb, get_tp_group().ca_comm
+            hidden_states,
+            mhc.residual,
+            mhc.post,
+            mhc.comb,
+            get_parallel().tp_group.ca_comm,
         )
         # the decoder reads mhc.output; the return keeps the DP wrapper's tensor contract
         return hidden_states

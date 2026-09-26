@@ -8,7 +8,6 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.distributed.parallel_state import get_attn_tp_group, get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion, use_mhc_post_fusion
@@ -526,7 +525,9 @@ def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
         and layer.self_attn.wo_b.reduce_results
     ):
         return None
-    return _make_mhc_fusion(residual, coefficients, get_attn_tp_group().ca_comm)
+    return _make_mhc_fusion(
+        residual, coefficients, get_parallel().attn_tp_group.ca_comm
+    )
 
 
 def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
@@ -537,12 +538,12 @@ def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
         and get_moe_a2a_backend().is_none()
     ):
         return None
-    return _make_mhc_fusion(residual, coefficients, get_tp_group().ca_comm)
+    return _make_mhc_fusion(residual, coefficients, get_parallel().tp_group.ca_comm)
 
 
 def apply_attention_mhc(x: torch.Tensor, state: MhcPostFusion) -> None:
     state.output = all_reduce_mhc_post(
-        x, state.residual, state.post, state.comb, get_attn_tp_group().ca_comm
+        x, state.residual, state.post, state.comb, get_parallel().attn_tp_group.ca_comm
     )
 
 
