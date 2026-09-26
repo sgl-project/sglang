@@ -353,6 +353,8 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
+        self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -2939,6 +2941,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            kv_format=self.flashmla_kv_format,
         )
 
         if target_q_heads != num_q_heads:
