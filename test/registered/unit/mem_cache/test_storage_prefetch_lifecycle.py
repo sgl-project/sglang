@@ -495,5 +495,22 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
 
 
+class TestStorageExistenceCacheCapacity(unittest.TestCase):
+    def test_capacity_comes_from_env_unless_given(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+            StorageExistenceCache,
+        )
+
+        with envs.SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES.override(3):
+            beliefs = StorageExistenceCache()
+        self.assertEqual(beliefs.max_entries, 3)
+        beliefs.add(PoolName.KV, ["a", "b", "c", "d"])
+        self.assertEqual(len(beliefs), 3)
+        self.assertFalse(beliefs.contains(PoolName.KV, "a"))
+        self.assertTrue(beliefs.contains(PoolName.KV, "d"))
+        self.assertEqual(StorageExistenceCache(max_entries=7).max_entries, 7)
+
+
 if __name__ == "__main__":
     unittest.main()
