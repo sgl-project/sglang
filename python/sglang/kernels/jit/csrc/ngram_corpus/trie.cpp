@@ -37,6 +37,7 @@ void Trie::insert(const int32_t* tokens, size_t len) {
       if (iter == cursor->child.end()) {
         iter = cursor->child.insert({token, getNode()}).first;
         auto node = iter->second;
+        ++growth_epoch_;
 
         cursor->lru.emplace_front(node);
         global_lru_.emplace_back(node);
@@ -118,6 +119,11 @@ bool Trie::validateMatchState_(const MatchState& state) const {
     return false;
   }
   for (const auto& ref : state.anchors) {
+    // A new edge can make a previously missing suffix matchable without
+    // changing the version of any live cached node.
+    if (ref.ptr == nullptr && state.growth_epoch != growth_epoch_) {
+      return false;
+    }
     if (ref.ptr && !resolve(state, ref)) {
       return false;
     }
@@ -128,6 +134,7 @@ bool Trie::validateMatchState_(const MatchState& state) const {
 void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const auto max_match_depth = std::min(len, param_.max_trie_depth);
   state.trie_epoch = trie_epoch_;
+  state.growth_epoch = growth_epoch_;
   state.processed_total_len = total_len;
   state.anchors.assign(max_match_depth, {});
   for (size_t match_depth = 1; match_depth <= max_match_depth; ++match_depth) {
@@ -186,6 +193,7 @@ bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t l
   }
 
   state.processed_total_len = total_len;
+  state.growth_epoch = growth_epoch_;
   return true;
 }
 
