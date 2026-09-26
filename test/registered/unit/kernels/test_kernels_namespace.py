@@ -290,6 +290,12 @@ def test_reclassified_public_entry_points_are_inventoried():
         ("attention.fused_rope_wo_a_bf16", (10, 0), True),
         ("attention.fused_rope_wo_a_bf16", (10, 3), True),
         ("attention.fused_rope_wo_a_bf16", (12, 0), False),
+        ("attention.deep_select_topk", (8, 0), False),
+        ("attention.deep_select_topk", (9, 0), True),
+        ("attention.deep_select_topk", (10, 0), True),
+        ("attention.deep_select_topk", (10, 1), False),
+        ("attention.deep_select_topk", (10, 3), True),
+        ("attention.deep_select_topk", (12, 0), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):
