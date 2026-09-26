@@ -68,7 +68,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable decode context parallelism for MLA models, add `--dcp-size N`. See [Decode Context Parallelism](./dcp).
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template). If the tokenizer has multiple named templates (e.g., 'default', 'tool_use'), you can select one using `--hf-chat-template-name tool_use`.
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
-- (Note: This feature is out of maintenance and might cause error) To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](../references/torch_compile_cache).
+
   ```bash Command
   # Node 0
   python -m sglang.launch_server \
@@ -86,6 +86,8 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
     --nnodes 2 \
     --node-rank 1
   ```
+
+- (Note: This feature is out of maintenance and might cause error) To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](../references/torch_compile_cache).
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
 
