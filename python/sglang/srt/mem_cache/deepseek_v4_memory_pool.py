@@ -158,16 +158,6 @@ def resolve_compressed_kv_layout(
     return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
 
 
-def flashmla_supports_v41_kv_layouts() -> bool:
-    """Whether the installed FlashMLA decode kernel reads the V41 / V41_FP4
-    formats; its docstring lists the bytes-per-token it detects."""
-    try:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-    except Exception:
-        return False
-    return "528" in (flash_mla_with_kvcache.__doc__ or "")
-
-
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA."""
@@ -181,17 +171,9 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         and torch.version.cuda is not None
         and torch.cuda.get_device_capability()[0] == 10
     )
-    supported = flashmla_supports_v41_kv_layouts()
-    if mode == "auto":
-        if is_sm100 and supported:
-            return KVLayout.V41, option
+    if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    if not supported:
-        logger.warning(
-            "SGLANG_DSV4_KV_LAYOUT=v41 but the installed FlashMLA does not advertise "
-            "the V4.1 KV cache formats; the attention kernel will reject the cache."
-        )
     return KVLayout.V41, option
 
 
