@@ -90,7 +90,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "auto",
     "--enable-metrics",
     "--dp-size",
-    16,
+    32,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--disable-radix-cache",
