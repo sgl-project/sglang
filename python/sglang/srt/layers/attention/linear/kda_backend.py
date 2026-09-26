@@ -10,6 +10,12 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_prefill_graph import (
+    KDAPrefillGraphMetadata,
+    KDAPrefillTrackRows,
+    build_track_rows,
+    kda_extend_in_graph,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
@@ -41,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_platform,
     get_spec,
+    mamba_cache_chunk_size,
 )
 
 
@@ -400,6 +407,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # force-flush path.
     needs_cpu_seq_lens: bool = False
 
+    # Set while a breakable prefill CUDA graph captures or replays a bucket:
+    # forward_extend then runs the graph-safe chain on these static tables.
+    prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
@@ -530,7 +541,120 @@ class KDAAttnBackend(MambaAttnBackendBase):
             metadata.fused_accept_num_accepted,
         )
 
+    def supports_prefill_graph_extend(self) -> bool:
+        return (
+            not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
+            # Only the Triton chain takes precomputed padded chunk tables.
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            # Fused-accept staging (flashinfer verify) writes per extend.
+            and self.accept_lens_pool is None
+        )
+
+    def prefill_graph_extend_active(self) -> bool:
+        return self.prefill_graph_metadata is not None
+
+    def can_run_prefill_graph_extend(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.extend_seq_lens_cpu is not None
+            and len(forward_batch.extend_seq_lens_cpu) == forward_batch.batch_size
+            and forward_batch.batch_size <= envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
+        )
+
+    def init_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> KDAPrefillGraphMetadata:
+        cache_indices = self._prefill_graph_cache_indices(forward_batch)
+        meta = KDAPrefillGraphMetadata.allocate(
+            num_tokens=forward_batch.positions.shape[0],
+            max_seqs_cap=envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get(),
+            # Same predicate that gives the prefill runner its track buffers:
+            # any replay of this bucket may carry prefix-cache snapshots.
+            track=(
+                get_exec().mamba.enable_mamba_extra_buffer
+                and not get_memory().disable_radix_cache
+            ),
+            cache_index_dtype=cache_indices.dtype,
+            device=self.device,
+        )
+        self._fill_prefill_graph_metadata(
+            meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
+        )
+        return meta
+
+    def refresh_prefill_graph_metadata(
+        self, meta: KDAPrefillGraphMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        self._fill_prefill_graph_metadata(
+            meta=meta,
+            forward_batch=forward_batch,
+            cache_indices=self._prefill_graph_cache_indices(forward_batch),
+        )
+
+    def _prefill_graph_cache_indices(self, forward_batch: ForwardBatch):
+        # Same slot resolution as MambaAttnBackendBase._forward_metadata.
+        cache_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        real_bs = forward_batch._original_batch_size
+        if real_bs is not None and real_bs < cache_indices.shape[0]:
+            cache_indices = cache_indices.clone()
+            cache_indices[real_bs:] = -1
+        return cache_indices
+
+    def _fill_prefill_graph_metadata(
+        self,
+        *,
+        meta: KDAPrefillGraphMetadata,
+        forward_batch: ForwardBatch,
+        cache_indices: torch.Tensor,
+    ) -> None:
+        if forward_batch.mamba_track_indices is not None:
+            # Same one-time in-place translation as the eager metadata path.
+            forward_batch.mamba_track_indices = self._translate_mamba_indices(
+                forward_batch.mamba_track_indices
+            )
+        track_rows = None
+        if forward_batch.mamba_track_mask is not None:
+            assert meta.track, (
+                "prefix-cache track batch replayed on a bucket captured without "
+                "track tables"
+            )
+            track_rows = self._prefill_graph_track_rows(forward_batch)
+        meta.fill(
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            cache_indices=cache_indices,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            track_rows=track_rows,
+        )
+        self.prefill_graph_metadata = meta
+
+    def _prefill_graph_track_rows(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[KDAPrefillTrackRows]:
+        bs = forward_batch.batch_size
+        if self._has_cpu_prefill_track_metadata(forward_batch):
+            track_mask = list(forward_batch.mamba_prefill_track_mask_cpu)
+            track_seq_lens = list(forward_batch.mamba_track_seqlens_cpu)
+            extend_prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
+        else:
+            # The same host copies the eager path takes without CPU metadata.
+            track_mask = forward_batch.mamba_track_mask[:bs].tolist()
+            track_seq_lens = forward_batch.mamba_track_seqlens[:bs].tolist()
+            extend_prefix_lens = forward_batch.extend_prefix_lens[:bs].tolist()
+        return build_track_rows(
+            track_mask=track_mask,
+            track_seq_lens=track_seq_lens,
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            extend_prefix_lens=extend_prefix_lens,
+            state_chunk_size=self.mamba_chunk_size,
+            cache_chunk_size=mamba_cache_chunk_size(),
+            conv_len=self.conv_states_shape[-1],
+            dst=forward_batch.mamba_track_indices,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # An eager forward never runs on a graph bucket's tables.
+        self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
@@ -806,6 +930,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
+        if self.prefill_graph_metadata is not None:
+            # Breakable prefill CUDA graph bucket: host-free chain on static
+            # tables refreshed before each replay.
+            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            return kda_extend_in_graph(
+                layer=layer,
+                meta=self.prefill_graph_metadata,
+                conv_pool=layer_cache.conv[0],
+                ssm_states=layer_cache.temporal,
+                kernel_dispatcher=self.kernel_dispatcher,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices

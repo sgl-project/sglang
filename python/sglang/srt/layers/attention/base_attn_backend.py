@@ -205,6 +205,10 @@ class AttentionBackend(ABC):
     def validate_elastic_cuda_graph_recapture(self) -> None:
         return
 
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether a prefill CUDA graph may replay this batch."""
+        return True
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,
