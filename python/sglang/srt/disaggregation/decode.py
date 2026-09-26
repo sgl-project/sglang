@@ -773,14 +773,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req):
-                decode_req.kv_receiver.init(0)
+                self._init_kv_receiver(decode_req, 0)
                 return
 
             # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                self._init_kv_receiver(decode_req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -824,6 +824,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return req.bootstrap_room % prefill_info.dp_size
 
         return None
+
+    def _init_kv_receiver(
+        self, decode_req: DecodeRequest, prefill_dp_rank: int
+    ) -> None:
+        """Bind the receiver to ``prefill_dp_rank`` and remember it on the Req.
+
+        ``KVReceiver.init`` fetches the bootstrap infos of -- and registers this
+        decode rank's kv_args with -- exactly this prefill DP rank's TP ranks,
+        so it is the prefill DP the request is actually talking to. Nothing
+        re-resolves it afterwards, and the rank otherwise only lives inside the
+        receiver, so record it where ``Req.build_rebootstrap_payload`` can read
+        it back and pin a retract rebootstrap onto the same rank. Fake transfer
+        is pinned to 0 for the same reason: that is the rank it binds to.
+        """
+        decode_req.req.pd_resolved_prefill_dp_rank = int(prefill_dp_rank)
+        decode_req.kv_receiver.init(prefill_dp_rank)
 
     def _create_receiver_and_enqueue(
         self, req: Req, is_rebootstrap: bool = False
@@ -1226,7 +1242,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            self._init_kv_receiver(decode_req, prefill_dp_rank)
 
     def pop_preallocated(
         self,

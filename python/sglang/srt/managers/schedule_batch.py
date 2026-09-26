@@ -1357,6 +1357,12 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        # Decode-local: the prefill DP rank this request's KV receiver is bound
+        # to, i.e. the value handed to ``KVReceiver.init``. Recorded by
+        # ``DecodePreallocQueue._init_kv_receiver`` and read back by
+        # ``build_rebootstrap_payload``. Unlike ``disagg_prefill_dp_rank`` it is
+        # never a client-supplied hint; it is the rank decode actually talks to.
+        self.pd_resolved_prefill_dp_rank: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -2075,6 +2081,26 @@ class Req(ReqDllmMixin):
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
         sp = self.sampling_params
+        # Pin the recompute to the prefill DP rank this request's decode KV
+        # receiver is already bound to. ``KVReceiver.init`` fetched that rank's
+        # bootstrap infos and registered this decode rank's kv_args with its TP
+        # ranks, and nothing re-resolves afterwards. Without the pin the prefill
+        # DP controller falls through ``maybe_external_dp_rank_routing`` into
+        # round-robin, so the recomputed KV can be offered by one DP while the
+        # receiver waits on another and both sides block until the KV waiting
+        # timeout. ``disagg_prefill_dp_rank`` carries the same value so the
+        # prefill ``CommonKVSender`` keeps skipping ``_register_prefill_dp_rank``
+        # and the bootstrap server's room -> dp_rank table is left alone.
+        #
+        # Falls back to the client/router-supplied hint (the pre-existing
+        # behaviour) when decode never resolved a rank of its own.
+        prefill_dp_rank = self.pd_resolved_prefill_dp_rank
+        if prefill_dp_rank is None:
+            prefill_dp_rank = self.disagg_prefill_dp_rank
+        if prefill_dp_rank is not None:
+            # Plain int: the payload is JSON-encoded and a rank resolved from the
+            # bootstrap-server query can arrive as a numpy integer.
+            prefill_dp_rank = int(prefill_dp_rank)
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
             + [int(x) for x in self.output_ids],
@@ -2102,8 +2128,8 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
-            "routed_dp_rank": self.disagg_prefill_dp_rank,
-            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            "routed_dp_rank": prefill_dp_rank,
+            "disagg_prefill_dp_rank": prefill_dp_rank,
         }
 
     def log_time_stats(self):
