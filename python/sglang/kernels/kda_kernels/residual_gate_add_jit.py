@@ -18,6 +18,9 @@ _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
 _FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
+# HIP tensors also report is_cuda, but this kernel only matches eager CUDA
+# rounding exactly.
+_IS_HIP = torch.version.hip is not None
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +136,7 @@ def can_use_residual_gate_add_cuda(
         and residual.dtype == update.dtype
         and residual.dtype == gate.dtype
         and residual.is_cuda
+        and not _IS_HIP
         and update.is_cuda
         and gate.is_cuda
         and residual.device == update.device == gate.device
