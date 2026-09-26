@@ -272,7 +272,7 @@ class TestChatTemplateCache(CustomTestCase):
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
@@ -2010,6 +2010,50 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
+
+    def test_lfm2_non_streaming_response_preserves_text_around_tool_calls(self):
+        """The final API message must retain prose after and between calls."""
+        self.chat.tool_call_parser = "lfm2"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Check the weather."}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+        )
+        text = (
+            'Before.\n<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>'
+            '\nBetween.\n<|tool_call_start|>[get_weather(city="London")]<|tool_call_end|>'
+            "\nAfter."
+        )
+        response = self.chat._build_chat_response(
+            request,
+            [
+                {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-lfm2",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 10,
+                        "weight_version": "default",
+                        "finish_reason": {"type": "stop", "matched": None},
+                    },
+                }
+            ],
+            created=1234567890,
+        )
+        choice = json.loads(response.model_dump_json())["choices"][0]
+        self.assertEqual(choice["message"]["content"], "Before.\n\nBetween.\n\nAfter.")
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(
+            [call["function"]["name"] for call in calls], ["get_weather"] * 2
+        )
+        self.assertEqual(
+            [json.loads(call["function"]["arguments"]) for call in calls],
+            [{"city": "Paris"}, {"city": "London"}],
+        )
+        self.assertEqual([call["index"] for call in calls], [0, 1])
+        self.assertEqual(len({call["id"] for call in calls}), 2)
+        self.assertEqual(choice["finish_reason"], "tool_calls")
 
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
         """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
