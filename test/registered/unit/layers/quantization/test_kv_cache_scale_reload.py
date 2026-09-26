@@ -169,9 +169,36 @@ class TestKVCacheScaleReload(unittest.TestCase):
                 self._write(layer, k_scale=0.125)
                 self._process(layer, (0.125 * factor, 0.75 * factor))
                 self._write(layer, v_scale=0.375)
+                self._process(layer, (0.125 * factor, 0.375 * factor))
                 layer.quant_method.restore_weights_before_loading(layer)
                 self._assert_scales(layer, (0.125, 0.375))
                 self._process(layer, (0.125 * factor, 0.375 * factor))
+
+    def test_restore_ignores_device_scales_lost_to_a_released_weights_region(self):
+        # Colocated RL releases the weights region without CPU backup and the
+        # trainer never resends k/v scales, so after resume the device copies
+        # are whatever the allocator hands back. Restore must not read them.
+        garbage = ((-3.0, 5.0), (7.0, 9.0), (0.0, 0.0))
+        for fnuz in (False, True):
+            for raw in ((-1.0, -1.0), (0.25, -1.0), (0.25, 0.75)):
+                for junk in garbage:
+                    with (
+                        self.subTest(fnuz=fnuz, raw=raw, junk=junk),
+                        patch(f"{MODULE}.is_fp8_fnuz", return_value=fnuz),
+                    ):
+                        layer = self._make(raw)
+                        factor = 2 if fnuz else 1
+                        expected = (
+                            (1.0, 1.0)
+                            if raw[0] <= 0
+                            else (raw[0] * factor, max(raw) * factor)
+                        )
+                        self._process(layer, expected)
+                        for name, value in zip(NAMES, junk):
+                            getattr(layer, name).data.fill_(value)
+                        layer.quant_method.restore_weights_before_loading(layer)
+                        self._assert_scales(layer, raw)
+                        self._process(layer, expected)
 
     def test_deprecated_single_kv_scale_keeps_missing_v_semantics(self):
         with patch(f"{MODULE}.is_fp8_fnuz", return_value=True):

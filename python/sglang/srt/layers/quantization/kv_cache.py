@@ -94,7 +94,11 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         """
         if layer._kv_scale_runtime is None:
             return  # Initial load, or already restored; keep any pending writes.
-        self._set_scales(layer, *self._checkpoint_scales(layer))
+        # From host-side state, not the device copies: loaders restore before
+        # writing, so no write is pending here, and a weights region released
+        # without CPU backup comes back uninitialized (trainers never resend
+        # these scales).
+        self._set_scales(layer, *layer._kv_scale_checkpoint)
         layer._kv_scale_runtime = None
 
     def process_weights_after_loading(self, layer) -> None:
