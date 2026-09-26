@@ -136,6 +136,7 @@ class SchedulerStats:
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_deferred_kv_release_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -530,6 +531,26 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:num_decode_host_receive_reqs_total",
             documentation="Total requests admitted to receive prefill KV in host memory.",
             labelnames=labels.keys(),
+        )
+        self.num_decode_deferred_kv_release_reqs = Gauge(
+            name="sglang:num_decode_deferred_kv_release_reqs",
+            documentation=(
+                "The number of failed decode requests whose KV allocations are "
+                "held pending transfer drain acknowledgement or timeout."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_deferred_kv_release_seconds = Histogram(
+            name="sglang:decode_deferred_kv_release_seconds",
+            documentation="Histogram of time spent holding deferred decode KV releases.",
+            labelnames=labels.keys(),
+            buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60),
+        )
+        self.decode_deferred_kv_release_total = Counter(
+            name="sglang:decode_deferred_kv_release_total",
+            documentation="Total deferred decode KV release resolution attempts.",
+            labelnames=list(labels.keys()) + ["outcome"],
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -1201,6 +1222,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_decode_host_receive_reqs(self) -> None:
         self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
 
+    def observe_decode_deferred_kv_release(
+        self, duration_seconds: float, outcome: str
+    ) -> None:
+        if outcome not in ("drained", "timeout", "error"):
+            raise ValueError(f"Invalid deferred KV release outcome: {outcome}")
+        self._log_histogram(self.decode_deferred_kv_release_seconds, duration_seconds)
+        self.decode_deferred_kv_release_total.labels(
+            **self.labels, outcome=outcome
+        ).inc(1)
+
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
@@ -1432,6 +1463,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_decode_host_receive_queue_reqs,
             stats.num_decode_host_receive_queue_reqs,
+        )
+        self._log_gauge(
+            self.num_decode_deferred_kv_release_reqs,
+            stats.num_decode_deferred_kv_release_reqs,
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
