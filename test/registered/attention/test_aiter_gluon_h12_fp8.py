@@ -317,5 +317,81 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         be._mla_decode_fwd_with_head_pad.assert_not_called()
 
 
+class TestMlaDcpAsmDecode(CustomTestCase):
+    def _make_backend(self):
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.use_mla_dcp_asm = True
+        be.dcp_world_size = 8
+        be.input_dtype = torch.bfloat16
+        be.max_split_per_batch = 64
+        be.forward_metadata = mock.Mock(
+            kv_indptr=torch.tensor([0, 2, 4], dtype=torch.int32),
+            kv_indices=torch.arange(4, dtype=torch.int32),
+            kv_last_page_len=torch.ones(2, dtype=torch.int32),
+            qo_indptr=torch.arange(3, dtype=torch.int32),
+            max_q_len=1,
+            work_metadata=torch.empty(1, dtype=torch.int32),
+            work_indptr=torch.empty(1, dtype=torch.int32),
+            work_info_set=torch.empty(1, dtype=torch.int32),
+            reduce_indptr=torch.empty(1, dtype=torch.int32),
+            reduce_final_map=torch.empty(1, dtype=torch.int32),
+            reduce_partial_map=torch.empty(1, dtype=torch.int32),
+            num_kv_splits=64,
+        )
+        return be
+
+    def _make_layer(self):
+        layer = mock.Mock()
+        layer.tp_q_head_num = 96
+        layer.qk_head_dim = 576
+        layer.v_head_dim = 512
+        layer.scaling = 0.125
+        layer.logit_cap = 0.0
+        return layer
+
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
+    def test_asm_quantizes_gathered_q_and_returns_lse(self, mock_quant, mock_mla):
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        be = self._make_backend()
+        layer = self._make_layer()
+        q = torch.zeros(2, 96, 576, dtype=torch.bfloat16)
+        q_fp8 = torch.zeros(2, 96 * 576, dtype=fp8_dtype)
+        q_scale = torch.tensor([0.25], dtype=torch.float32)
+        lse = torch.arange(2 * 96, dtype=torch.float32).view(2, 96)
+        mock_quant.return_value = (q_fp8, q_scale)
+        mock_mla.return_value = (None, lse)
+
+        out, actual_lse = be._forward_decode_dcp(
+            q,
+            torch.zeros(4, 576, dtype=fp8_dtype),
+            layer,
+            k_descale=1.0,
+        )
+
+        self.assertEqual(out.shape, (2, 96, 512))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(actual_lse, lse))
+        self.assertEqual(mock_mla.call_args.args[0].dtype, fp8_dtype)
+        self.assertIs(mock_mla.call_args.kwargs["q_scale"], q_scale)
+        self.assertTrue(mock_mla.call_args.kwargs["return_lse"])
+        self.assertFalse(mock_mla.call_args.kwargs["intra_batch_mode"])
+
+    def test_dcp_asm_uses_fast_persistent_metadata(self):
+        be = self._make_backend()
+        self.assertTrue(be._use_mla_decode_persist_metadata())
+        self.assertEqual(be._mla_decode_metadata_modes(), (True, False))
+
+    def test_default_gluon_dcp_skips_persist_like_main(self):
+        """DCP>1 without ASM must not allocate persist metadata (main default)."""
+        be = self._make_backend()
+        be.use_mla_dcp_asm = False
+        be.dcp_world_size = 8
+        self.assertFalse(be._use_mla_decode_persist_metadata())
+
+
 if __name__ == "__main__":
     unittest.main()
