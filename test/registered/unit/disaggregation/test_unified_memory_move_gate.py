@@ -169,6 +169,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
             self.grow_direction = "up"
             self.high_peer = peer
             self.low_peer = None
+            self._growth_neighbor_memo = None
 
         _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
 
