@@ -33,7 +33,7 @@ from sglang.srt.utils.async_probe import maybe_detect_oob
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -728,6 +728,93 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _sparse_rejection_max_top_k(
+    reqs: List[Req],
+    sampling_info: SamplingBatchInfo,
+) -> Optional[int]:
+    """Support width for rejection sampling on each row's top-k, or None for the dense path."""
+    if not (
+        _is_cuda
+        and sampling_info.need_top_k_sampling
+        and not sampling_info.need_min_p_sampling
+    ):
+        return None
+
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    max_top_k = max(req.sampling_params.top_k for req in reqs)
+    return max_top_k if max_top_k <= _SPARSE_TOP_K_LIMIT else None
+
+
+def _check_rejection_draft_probs(
+    draft_probs: Optional[torch.Tensor], vocab_size: int
+) -> None:
+    # Defense-in-depth behind the spec_hook startup allowlist: validate
+    # the actual kernel inputs before the Triton kernel.
+    if draft_probs is None or draft_probs.shape[-1] != vocab_size:
+        raise ValueError(
+            "Rejection sampling requires a target-vocab draft proposal "
+            "distribution; the current speculative algorithm/draft worker "
+            "does not produce one (draft_probs missing or vocab-mismatched)."
+        )
+
+
+def _sparse_rejection_sample(
+    *,
+    verify_input: EagleVerifyInput,
+    sampling_info: SamplingBatchInfo,
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_top_k: int,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+) -> None:
+    """Chain rejection sampling with the target restricted to each row's top-k.
+
+    Same accept/resample rule as the dense path, without the full-vocab softmax,
+    renorm passes and residual scans.
+    """
+    from flashinfer import top_k as flashinfer_top_k
+
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_topk_triton,
+        topk_support_width,
+    )
+
+    vocab_size = next_token_logits.shape[-1]
+    _check_rejection_draft_probs(verify_input.draft_probs, vocab_size)
+    topk_logits, topk_ids = flashinfer_top_k(
+        next_token_logits,
+        topk_support_width(max_top_k, vocab_size),
+        sorted=True,
+        deterministic=True,
+    )
+    coins, coins_for_final_sampling = _verify_coins(
+        sampling_info=sampling_info,
+        seq_lens=seq_lens,
+        draft_token_num=verify_input.draft_token_num,
+        candidates=candidates,
+        device=candidates.device,
+    )
+    chain_speculative_sampling_topk_triton(
+        predicts=predict,  # mutable
+        accept_index=accept_index,  # mutable
+        accept_token_num=num_correct_drafts,  # mutable
+        candidates=candidates,
+        retrive_index=verify_input.retrieve_index,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=coins_for_final_sampling,
+        topk_logits=topk_logits,
+        topk_ids=topk_ids,
+        temperatures=sampling_info.temperatures,
+        top_ks=sampling_info.top_ks,
+        top_ps=sampling_info.top_ps if sampling_info.need_top_p_sampling else None,
+        draft_probs=verify_input.draft_probs,
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -878,6 +965,33 @@ def eagle_sample(
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
+    elif use_rejection_sampling and (
+        sparse_max_top_k := _sparse_rejection_max_top_k(
+            reqs=batch.reqs, sampling_info=sampling_info
+        )
+    ):
+        _sparse_rejection_sample(
+            verify_input=verify_input,
+            sampling_info=sampling_info,
+            next_token_logits=next_token_logits,
+            candidates=candidates,
+            seq_lens=batch.seq_lens,
+            max_top_k=sparse_max_top_k,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+        )
+
+        # Same TP sync as the dense sampling branch below.
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if _is_npu:
             from sgl_kernel_npu.sample import (
@@ -949,16 +1063,8 @@ def eagle_sample(
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
+        if use_rejection_sampling:
+            _check_rejection_draft_probs(draft_probs, target_probs.shape[-1])
 
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
