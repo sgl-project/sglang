@@ -52,6 +52,30 @@ def test_npu_backend_selection_priority(
     assert backend == expected
 
 
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((9, 0), "fa3"),
+        ((10, 0), "fa4"),
+        ((10, 3), "fa4"),
+        ((12, 0), "triton_attn"),
+    ],
+)
+def test_cuda_default_backend_by_capability(monkeypatch, capability, expected):
+    monkeypatch.setattr(vision, "is_cuda", lambda: True)
+    monkeypatch.setattr(vision, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(
+        vision, "get_platform", lambda: SimpleNamespace(is_blackwell=False)
+    )
+    monkeypatch.setattr(
+        vision, "get_mm", lambda: SimpleNamespace(mm_attention_backend=None)
+    )
+
+    backend = vision.VisionAttention._determine_attention_backend(None, None)
+
+    assert backend == expected
+
+
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
     monkeypatch.setattr(
         vision,
