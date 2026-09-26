@@ -983,6 +983,11 @@ class Glm5NextModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if get_parallel().enable_prefill_cp:
+            raise ValueError(
+                "GLM-5.3-Flash does not support prefill context parallelism. "
+                "Remove --enable-prefill-cp."
+            )
         self.config = config
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
