@@ -23,6 +23,7 @@ class Spark2_5Config(PretrainedConfig):
         rope_parameters: Optional[dict[str, Any]] = None,
         layer_types: list[str] = None,
         tie_word_embeddings: Optional[bool] = None,
+        gate_attn_act_mode: str = "sigmoid",
         **kwargs,
     ) -> None:
         self.hidden_size = hidden_size
@@ -32,6 +33,7 @@ class Spark2_5Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.head_dim = head_dim
         self.headwise_attn_output_gate = headwise_attn_output_gate
+        self.gate_attn_act_mode = gate_attn_act_mode
         self.sliding_window = sliding_window
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
