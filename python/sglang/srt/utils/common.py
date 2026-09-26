@@ -230,6 +230,19 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_supa() -> bool:
+    # Biren exposes SUPA as the `supa` PrivateUse1 backend, registered by the
+    # `torch_br` plugin. Import it on demand; on machines without Biren the
+    # plugin is absent and this simply returns False.
+    if not hasattr(torch, "supa"):
+        try:
+            import torch_br  # noqa: F401
+        except ImportError:
+            return False
+    return hasattr(torch, "supa") and torch.supa.is_available()
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
     return torch.backends.mps.is_available()
 
@@ -942,6 +955,9 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.npu.get_device_name(device_id)
 
+    if is_supa():
+        return torch.supa.get_device_name(device_id)
+
 
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
@@ -1020,11 +1036,16 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
+    if is_supa():
+        if device_id is None:
+            return "supa"
+        return "supa:{}".format(device_id)
+
     try:
         return current_platform.get_device(device_id)
     except Exception:
         raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, SUPA, MPS) or platform plugin is available."
         )
 
 
@@ -1051,6 +1072,12 @@ def get_device_count() -> int:
         except (ImportError, RuntimeError):
             return 0
 
+    if is_supa():
+        try:
+            return torch.supa.device_count()
+        except RuntimeError:
+            return 0
+
     return 0  # No accelerators available
 
 
@@ -1059,6 +1086,8 @@ def get_device_core_count(device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_properties(device_id).gpu_eu_count
+    elif is_supa():
+        return torch.supa.get_device_properties(device_id).multi_processor_count
 
     return 0
 
@@ -1067,6 +1096,10 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
+
+    if is_supa():
+        props = torch.supa.get_device_properties(device_id)
+        major, minor = props.major, props.minor
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(

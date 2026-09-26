@@ -568,13 +568,15 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_supa_available")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, mock_is_supa_available, mock_is_cuda_available, mock_load
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_is_cuda_available.return_value = False
+        mock_is_supa_available.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, SRTPlatform)

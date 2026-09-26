@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu, is_supa
 
 
 def is_cuda_v2():
@@ -580,6 +580,116 @@ class MPSEnv(BaseEnv):
         return {}
 
 
+class SUPAEnv(BaseEnv):
+    """Environment checker for Biren SUPA GPUs"""
+
+    EXTRA_PACKAGE_LIST = ["torch_br", "sglang-br"]
+
+    def __init__(self):
+        super().__init__()
+        # Copy instead of extending the shared PACKAGE_LIST in place.
+        self.package_list = self.package_list + SUPAEnv.EXTRA_PACKAGE_LIST
+
+    def get_info(self):
+        supa_info = {"SUPA available": is_supa()}
+
+        if supa_info["SUPA available"]:
+            supa_info.update(self.get_device_info())
+            supa_info.update(self._get_supa_version_info())
+
+        return supa_info
+
+    def get_device_info(self):
+        """
+        Get information about available SUPA devices.
+        """
+        devices = defaultdict(list)
+        capabilities = defaultdict(list)
+        for k in range(torch.supa.device_count()):
+            devices[torch.supa.get_device_name(k)].append(str(k))
+            props = torch.supa.get_device_properties(k)
+            capabilities[f"{props.major}.{props.minor}"].append(str(k))
+
+        supa_info = {}
+        for name, device_ids in devices.items():
+            supa_info[f"GPU {','.join(device_ids)}"] = name
+
+        if len(capabilities) == 1:
+            cap, gpu_ids = list(capabilities.items())[0]
+            supa_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
+        else:
+            for cap, gpu_ids in capabilities.items():
+                supa_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
+
+        return supa_info
+
+    def _get_supa_version_info(self):
+        """
+        Get SUPA version information.
+        """
+        supa_info = {}
+        supa_home = os.environ.get("FULLSTACK_HOME") or os.environ.get("SUPA_PATH")
+        if supa_home:
+            supa_info["SUPA_HOME"] = supa_home
+
+        supa_info.update(self._get_brcc_info())
+        supa_info.update(self._get_supa_driver_version())
+        return supa_info
+
+    def _get_brcc_info(self):
+        """
+        Get Biren compiler (brcc) version information.
+        """
+        try:
+            output = subprocess.check_output(
+                ["brcc", "--version"], text=True, stderr=subprocess.STDOUT
+            )
+            brcc_version = output.strip().splitlines()[0].strip()
+            return {"BRCC": brcc_version}
+        except (subprocess.SubprocessError, OSError, IndexError):
+            return {"BRCC": "Not Available"}
+
+    def _get_supa_driver_version(self):
+        """
+        Get SUPA driver version via brsmi.
+        """
+        try:
+            output = subprocess.check_output(
+                ["brsmi", "--version"], text=True, stderr=subprocess.STDOUT
+            )
+            versions = {}
+            for line in output.splitlines():
+                if "Version" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if not value:
+                    continue
+                if not key.upper().startswith("SUPA"):
+                    key = f"SUPA {key}"
+                versions[key] = value
+            return versions or {"SUPA Driver Version": "Not Available"}
+        except (subprocess.SubprocessError, OSError):
+            return {"SUPA Driver Version": "Not Available"}
+
+    def get_topology(self):
+        """
+        Get SUPA GPU topology information.
+        """
+        try:
+            result = subprocess.run(
+                ["brsmi", "topo", "-m"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            return {"BIREN Topology": "\n" + result.stdout}
+        except (subprocess.SubprocessError, OSError):
+            return {}
+
+
 if __name__ == "__main__":
     if is_cuda_v2():
         env = GPUEnv()
@@ -591,4 +701,6 @@ if __name__ == "__main__":
         env = MUSAEnv()
     elif is_mps():
         env = MPSEnv()
+    elif is_supa():
+        env = SUPAEnv()
     env.check_env()
