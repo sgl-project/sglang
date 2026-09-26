@@ -2481,12 +2481,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
-                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
-                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
-                    if output_sampling_logprobs is not None:
-                        state.output_token_sampling_logprobs.extend(
-                            output_sampling_logprobs[i]
-                        )
+                    masks, logprobs = output_sampling_mask[i].to_lists(
+                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
+                    )
+                    state.output_token_sampling_mask.extend(masks)
+                    state.output_token_sampling_logprobs.extend(logprobs)
                     meta_info["output_token_sampling_mask"] = (
                         state.output_token_sampling_mask
                     )
