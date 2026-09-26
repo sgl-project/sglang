@@ -1,11 +1,5 @@
-"""The candidate scheme carried by dense block ids.
-
-A source scores its whole context, keeps its own top-k and publishes the ids of
-its best blocks; a consumer scores its whole context too, gathers the scores of
-the published blocks only and takes its top-k among them. Scores come from
-DeepGEMM's flattened-K logits or from torch, per backend configuration; the
-block math is the torch one in ``candidate_blocks``.
-"""
+"""The candidate scheme carried by dense block ids: a source publishes the ids of
+its best blocks, a consumer takes its top-k among them."""
 
 from __future__ import annotations
 
@@ -238,8 +232,6 @@ def _publish_prefill_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The source layer's own plain top-k, plus the ids of each row's best blocks:
-    ``[rows, min(topk_blocks, ceil(max lc / block_size))]`` int32, -1 padded."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     selected = data.empty_selection(topk)
@@ -300,8 +292,6 @@ def _consume_prefill_blocks(
     blocks: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """A consumer's top-k among the published blocks of its dense scores, as
-    flattened-K columns, ``-1`` padded, unordered."""
     selected = data.empty_selection(topk)
     for tile, logits in score_tiles(data, kv, width_align=4):
         _consume_tile_blocks(
@@ -343,8 +333,6 @@ def _consume_tile_blocks(
 
 
 def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):
-    """``(rows, lc)`` of each request with a visible position and rows in
-    ``tile``: its rows within the tile and its context length."""
     start = 0
     for num_rows, lc in zip(data.rows_per_request, data.lens_per_request):
         end = start + num_rows

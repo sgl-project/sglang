@@ -80,9 +80,8 @@ def skip_low_ratio_indexer(compress_ratio: int) -> bool:
 
 
 def skip_candidate_filtering() -> bool:
-    """Whether the captured candidate variant serves only contexts inside the
-    candidate window, where every block is a candidate and the candidate layers
-    select like dense ones."""
+    """Whether the captured variant stays inside the candidate window, where every
+    block is a candidate."""
     return _capture_attention_variant in (
         "candidate_all",
         "candidate_c2_all",

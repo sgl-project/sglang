@@ -1,9 +1,5 @@
-"""The full top-k of the DeepSeek V4.1 ratio-1/2 index layers outside the
-candidate scheme: score every visible compressed position, keep the best.
-
-DeepGEMM on SM100; elsewhere the torch path, whose decode runs the fp4 decode
-logits kernel (the Hopper indexer).
-"""
+"""The full top-k of the ratio-1/2 index layers outside the candidate scheme:
+DeepGEMM on SM100, torch elsewhere."""
 
 from __future__ import annotations
 
@@ -96,7 +92,6 @@ class FullTopKIndexer:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         if isinstance(metadata.deep_gemm_metadata, list):
-            # An eager forward whose dense logits are bounded by row chunks.
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):

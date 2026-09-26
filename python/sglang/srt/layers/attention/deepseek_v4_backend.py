@@ -3081,8 +3081,6 @@ class DeepseekV4AttnBackend(
         *,
         rows_per_request=None,  # NOTE: only used in CP
     ) -> None:
-        """Select this index layer's compressed positions: a layer outside the
-        candidate scheme on the full top-k, a source or consumer on its backend."""
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
@@ -3132,8 +3130,7 @@ class DeepseekV4AttnBackend(
         )
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         if indexer.uses_candidates or indexer.is_candidate_source:
-            # Every reachable block is a candidate inside the window, so the
-            # two-level selection collapses to the plain top-k.
+            # Inside the window every block is a candidate: the full top-k applies.
             width = metadata.max_compressed_seq_len
             assert (
                 width <= indexer.candidate_topk_blocks * indexer.candidate_block_size

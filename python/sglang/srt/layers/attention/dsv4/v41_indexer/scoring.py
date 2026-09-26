@@ -1,13 +1,6 @@
-"""Index scores shared by the dense layers and both candidate schemes.
-
-DeepGEMM (SM100): on prefill the chunk's index-K slots, fp4 queries and head
-weights, the tiled ``fp8_fp4_mqa_logits`` scores over the flattened index K, the
-plain top-k, and the write of a selection back into the pool-slot layout
-attention reads; on decode the fp4 queries and the paged pool.
-
-Torch (elsewhere): bf16 scores per request on prefill, the fp4 decode logits
-kernel on decode, and the writes of a ``torch.topk`` back into pool slots.
-"""
+"""Index scores shared by the full top-k and both candidate schemes: the DeepGEMM
+operands and flattened-K scores, the torch per-request scores, and the writes of
+a selection back into pool slots."""
 
 from __future__ import annotations
 
@@ -42,9 +35,8 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
-    """One index layer's operands on a prefill chunk; the rows of one request are
-    consecutive, and a selection is a flattened-K column, request start plus
-    compressed position."""
+    """The rows of one request are consecutive; a selection is a flattened-K
+    column, request start plus compressed position."""
 
     k_slots: torch.Tensor  # [columns] index-K pool slot of each flattened-K column
     request_starts: torch.Tensor  # [rows] int32, first column of the row's request
@@ -66,7 +58,6 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
         return out
 
     def write_selection(self, selected: torch.Tensor, out: Selection) -> None:
-        # write_prefill_selection(out=out, data=self, selected=selected)
         num_tokens, topk = selected.shape
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
@@ -81,8 +72,6 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
 
 
 def quantize_index_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``q`` ``[rows, heads, 128]`` bf16 to fp4 ``[rows, heads, 64]`` int8 and its
-    scales ``[rows, heads]`` int32 (packed ue8m0)."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         quantize_fp4_indexer_tensor,
     )
@@ -111,8 +100,6 @@ def get_flat_index_k(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     layer_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The chunk's index K gathered in flattened-K column order: int8
-    ``[columns, 64]`` and int32 ``[columns]``; a copy, for dense scoring only."""
     return token_to_kv_pool.get_low_ratio_index_k_fp4(layer_id, data.k_slots)
 
 
@@ -163,8 +150,7 @@ def get_deep_gemm_decode_data(
 def get_deep_gemm_prefill_data(
     inputs: PrefillInputs, req_to_token: torch.Tensor
 ) -> Optional[DeepGEMMPrefillData]:
-    """None when the chunk has no row or no visible compressed position, which is
-    the same for every index layer of the forward."""
+    """None when the chunk has no row or no visible compressed position."""
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     pos = inputs.positions
@@ -175,8 +161,7 @@ def get_deep_gemm_prefill_data(
         and inputs.rows_per_request_device is not None
     ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
-    # Visible compressed positions per request at its newest token; the
-    # per-token count (pos + 1) // ratio bounds each row below.
+    # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
     lc_per_req = [s // ratio for s in seq_lens_cpu]
     req_pool_indices = inputs.req_pool_indices.to(torch.int64)
     slot_chunks, starts, start = [], [], 0
@@ -220,11 +205,6 @@ def score_tiles(
     *,
     width_align: int,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
-    """The dense scores of ``data`` row tile by row tile under the budget:
-    ``(rows, logits)`` with fp32 ``logits[i, j]`` the score of query row
-    ``rows.start + i`` against ``kv[request_starts + j]``, garbage past the row's
-    ``compress_lens``; the width is the batch's largest context aligned to
-    ``width_align`` columns."""
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -243,8 +223,7 @@ def dense_prefill_topk(
     *,
     topk: int,
 ) -> torch.Tensor:
-    """The plain top-``topk`` of each row as flattened-K columns, ``-1`` padded,
-    unordered."""
+    """Flattened-K columns, ``-1`` padded, unordered."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     selected = data.empty_selection(topk)
@@ -268,8 +247,6 @@ _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
 class RequestScores(msgspec.Struct, frozen=True):
-    """One request of a prefill chunk, scored row chunk by row chunk."""
-
     index: int  # position among the chunk's requests, empty ones included
     lc: int  # compressed positions visible at its newest row; 0 scores nothing
     k: int
@@ -301,8 +278,7 @@ def prefill_requests(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
-    """Each request of the chunk with its row chunks' scores; an empty request
-    comes with no chunk."""
+    """An empty request comes with no chunk."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -345,8 +321,7 @@ def _score_chunks(
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Every step is per query row; chunk rows so the [rows, heads, lc] bf16
-    # scores stay under the budget (16 GiB at once for a 16k-token prompt).
+    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)

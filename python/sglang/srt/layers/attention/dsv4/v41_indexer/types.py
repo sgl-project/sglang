@@ -1,5 +1,4 @@
-"""What the attention backend hands the V4.1 indexer backends, and what it gets
-back."""
+"""The inputs and outputs of the V4.1 indexer backends."""
 
 from __future__ import annotations
 
@@ -18,8 +17,7 @@ def get_tail_row_indices(
     tail_rows_per_request: List[int],
     device: torch.device,
 ) -> torch.Tensor:
-    """int64 indices of each request's last ``tail_rows_per_request[b]`` rows, in
-    row order, copied without a host sync (pinned staging, non-blocking)."""
+    """Row indices of each request's tail, copied without a host sync."""
     rows, start = [], 0
     for n, t in zip(full_rows_per_request, tail_rows_per_request):
         rows.extend(range(start + n - t, start + n))
@@ -47,8 +45,7 @@ class Selection(msgspec.Struct, frozen=True):
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
-    """An eager extend: the backend projects the queries itself and gathers the
-    index K it needs."""
+    """An eager extend: the backend projects the queries and gathers the index K."""
 
     indexer: DeepseekV41Indexer
     layer_id: int
@@ -88,8 +85,7 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
-    """An extend under the prefill graph: the queries and head weights come
-    projected, and the index K is read paged, as on decode."""
+    """An extend under the prefill graph: projected queries, paged index K."""
 
     indexer: DeepseekV41Indexer
     layer_id: int
@@ -102,8 +98,7 @@ Metadata = TypeVar("Metadata", bound=CandidateMetadata)
 
 
 class PrefillCandidates(Protocol[Metadata]):
-    """The candidate scheme on prefill: what a publish carries is the backend's
-    own; the attention backend keeps it alive and hands it back unread."""
+    """The attention backend keeps a publish alive and hands it back unread."""
 
     def publish_prefill(
         self,

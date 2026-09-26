@@ -1,12 +1,6 @@
-"""The top-k selection of the DeepSeek V4.1 ratio-1/2 index layers.
-
-The index layers outside the candidate scheme go through the ``FullTopKIndexer``
-of ``make_full_topk_indexer``; a
-candidate source and its consumers go through the prefill / decode backends of
-``make_candidate_indexer``: a DeepGEMM sparse table (``sparse_table``) or dense
-block ids (``dense_blocks``). All three share only ``scoring``. Nothing else in
-this package is meant to be named from outside it.
-"""
+"""The top-k selection of the DeepSeek V4.1 ratio-1/2 index layers: the full top-k
+(``full_topk``), and the candidate schemes split by what a source publishes, a
+DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."""
 
 from __future__ import annotations
 
@@ -64,8 +58,7 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    """Whether an eager prefill scores on DeepGEMM rather than torch. A CP rank
-    scores rank-local rows, which only DeepGEMM serves, so CP ignores the env."""
+    # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_parallel
 
@@ -100,8 +93,6 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
-    """(prefill, decode): the sparse table where SM100 can page the rows, dense
-    block ids elsewhere."""
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend

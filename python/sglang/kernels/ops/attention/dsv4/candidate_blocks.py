@@ -1,10 +1,7 @@
-"""Candidate blocks of the two-level indexer: a candidate source keeps whole
-blocks of ``block_size`` compressed positions, its newest block always, and a
-consumer selects among the kept blocks only.
-
-The per-row block counts and sparse-row lengths, the block keys, the block
-selection (the JIT chain on SM100, torch elsewhere), and the torch top-k among
-chosen blocks."""
+"""Candidate blocks of the two-level indexer: a source keeps whole blocks of
+``block_size`` compressed positions, its newest block always, and a consumer
+selects among them. Block counts, block keys, the block top-k (JIT / torch), and
+the torch top-k among chosen blocks."""
 
 from typing import Optional, Union
 
@@ -152,11 +149,10 @@ def select_candidate_block_ids(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """The torch block selection: per row the ids of the ``topk_blocks`` blocks
-    with the largest maximum score, the block holding position
-    ``compress_lens - 1`` always kept; int32 ``[rows, min(topk_blocks, blocks)]``,
-    unordered, ``-1`` where a row has fewer finite blocks. ``logits`` must already
-    be ``-inf`` past each row's causal length."""
+    """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
+    block of position ``compress_lens - 1`` always kept: int32
+    ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
+    ``logits`` must be ``-inf`` past each row's causal length."""
     width = logits.size(-1)
     padding = -width % block_size
     scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
@@ -177,11 +173,9 @@ def topk_among_blocks(
     k: int,
     block_size: int,
 ) -> torch.Tensor:
-    """The torch top-``k`` of each row among its chosen blocks: ``scores``
-    ``[rows, width]`` indexed by position, ``lens`` ``[rows]`` the causal length,
-    ``blocks`` ``[rows, n]`` block ids with ``-1`` padding. Returns int64
-    ``[rows, k]`` positions, unordered, ``-1`` where a row has fewer than ``k``
-    finite candidates; positions at or past ``lens`` never count."""
+    """Top-``k`` of each row of ``scores`` ``[rows, width]`` within its ``blocks``
+    ``[rows, n]`` (``-1`` padded) and its causal ``lens``: int64 ``[rows, k]``
+    positions, unordered, ``-1`` where fewer than ``k`` candidates are finite."""
     rows, width = scores.shape
     if width == 0:
         return torch.full((rows, k), -1, dtype=torch.int64, device=scores.device)

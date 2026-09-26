@@ -1,9 +1,6 @@
-"""The candidate scheme carried by a DeepGEMM sparse table (SM100).
-
-A source publishes the block ids it kept plus the pool slots and the schedule
-``fp8_fp4_paged_sparse_mqa_logits`` needs for them, and a consumer scores only
-those blocks straight out of the index-K pool.
-"""
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100): a source
+publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` needs,
+a consumer scores only those blocks out of the index-K pool."""
 
 from __future__ import annotations
 
@@ -61,9 +58,8 @@ class _SparseTable(CandidateMetadata, msgspec.Struct):
     blocks: torch.Tensor
     # DeepGEMM's schedule metadata (uint8) for them
     schedule: torch.Tensor
-    # [rows, topk_blocks] int32: the same blocks as pool slots / 8, so a consumer's
-    # top-k maps column j of the sparse row to slot phys_blocks[b, j // 8] * 8 + j % 8
-    # with the plain page-table transform at page size 8
+    # [rows, topk_blocks] int32: the same blocks as pool slots / 8; column j of the
+    # sparse row maps to slot phys_blocks[b, j // 8] * 8 + j % 8
     phys_blocks: torch.Tensor
     # [rows] int32: length of each row of the sparse logits: the published blocks
     # laid out block by block, the newest possibly partial (`candidate_row_lens`)
@@ -73,9 +69,8 @@ class _SparseTable(CandidateMetadata, msgspec.Struct):
 
 
 class _SparsePrefillTable(_SparseTable):
-    """Published by a prefill chunk's candidate source: one row per query token.
-    The inputs stay attached so the late-layer tail can rebuild the table for
-    its rows (the DeepGEMM schedule is per row set, it cannot be sliced)."""
+    """The inputs stay attached so the late-layer tail can rebuild the table for
+    its rows: the DeepGEMM schedule is per row set, it cannot be sliced."""
 
     compress_lens: torch.Tensor  # [rows] int32
     page_table: torch.Tensor  # [rows, index pages] int32
@@ -162,7 +157,6 @@ class SparseTableBackend:
         out: Selection,
     ) -> None:
         out.reset()
-        # Scores only the published blocks, straight out of the pool.
         data = self._get_prefill_data(inputs)
         if data is None:
             return
@@ -183,7 +177,6 @@ class SparseTableBackend:
         data.write_selection(selected=selected, out=out)
 
     def publish_decode(self, inputs: DecodeInputs, out: Selection):
-        """The source layer's own plain top-k, plus the table for the consumers."""
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
@@ -251,9 +244,7 @@ class SparseTableBackend:
         seq_lens: torch.Tensor,
         out: Selection,
     ) -> _SparseTable:
-        """Publish an eager forward whose dense logits are bounded by row chunks.
-        It stays on the current stream so each chunk's full logits can be released
-        before the next; CUDA-graph metadata always carries one schedule."""
+        """On the current stream, so each chunk's logits are released before the next."""
         metadata = inputs.paged_metadata
         block_chunks = []
         phys_block_chunks = []
@@ -401,10 +392,8 @@ def publish_prefill_table(
     topk_blocks: int,
     out_positions: torch.Tensor,
 ) -> _SparsePrefillTable:
-    """The source layer's own top-``k`` (``k = out_positions.shape[1]``) as
-    flattened-K columns, ``-1`` padded, unordered, and the chunk's table: both
-    from one pass over its dense scores, tile by tile. ``index_page_table`` is
-    ``[rows, index pages]`` at ``index_page_size`` slots."""
+    """The source's own top-k into ``out_positions`` and the chunk's table, from one
+    pass over its dense scores; ``index_page_table`` is at ``index_page_size`` slots."""
     rows = data.num_rows
     device = data.q_fp4.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
@@ -456,9 +445,6 @@ def select_prefill_table(
     k_cache: torch.Tensor,
     out_positions: torch.Tensor,
 ) -> None:
-    """A consumer's top-``k`` over the published blocks, in the layout
-    ``publish_prefill_table`` writes; ``k_cache`` is the layer's index-K pool,
-    ``[pages, page_size, 1, 68]`` uint8."""
     rows, heads = data.q_sf.shape
     logits = sparse_logits(
         data.q_fp4.view(rows, 1, heads, 64),
