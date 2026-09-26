@@ -37,7 +37,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix, make_layers
 
 _GATED_NORM_LOW_RANK = 16
@@ -438,8 +438,13 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
             post_layernorm=self.post_self_attn_layernorm,
         )
-        self.layer_communicator.input_layernorm = attn_prepare_layernorm
-        self.layer_communicator.post_attention_layernorm = mlp_prepare_layernorm
+        # The communicator chooses its fused steps from its norms when built.
+        self.layer_communicator = self._build_layer_communicator(
+            input_layernorm=attn_prepare_layernorm,
+            post_attention_layernorm=mlp_prepare_layernorm,
+            qkv_latent_func=self.layer_communicator.qkv_latent_func,
+            allow_deferred_ffn_reduction=False,
+        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         if is_nextn:
@@ -482,24 +487,16 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             hidden_states, residual, forward_batch
         )
 
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
         # Unlike deepseek_v2, no moe_output_buffer_ctx here: non-inplace MoE
         # runners then allocate their output per forward instead of recycling
         # the layer-input buffer. The default (inplace) runners are unaffected.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
 
         if self.post_feedforward_layernorm is not None:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 

@@ -31,6 +31,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import msgspec
@@ -577,6 +578,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # This process's slot in the target's DP sync while a draft scope narrows
+    # attention; dp_gather_width() also reads it as the in-scope marker.
+    scoped_gather_slot: Optional[int] = None
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
@@ -636,6 +640,13 @@ class Resources(_FlagGroupBase):
     trace_level: Any = None
 
 
+class LoRABatchLayout(Enum):
+    """Token layout used by LoRA kernels in the current model section."""
+
+    DP_LOCAL = auto()
+    TP_GLOBAL = auto()
+
+
 class ForwardFlags:
     """Scoped per-forward flags.
 
@@ -665,6 +676,9 @@ class ForwardFlags:
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         "defer_moe_finalize": False,
+        # Attention runs on a DP-local token batch. The MLP runs after the DP
+        # gather and therefore uses the TP-global token batch.
+        "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
     }
@@ -682,6 +696,7 @@ class ForwardFlags:
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "defer_moe_finalize",
+            "lora_batch_layout",
             "sp_active",
         }
     )

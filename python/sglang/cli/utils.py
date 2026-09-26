@@ -43,15 +43,13 @@ def _is_diffusion_model_from_registry(model_path: str) -> bool:
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
-    """Check if a local directory contains a valid diffusers model_index.json."""
-    config_path = os.path.join(model_dir, "model_index.json")
-    if not os.path.exists(config_path):
-        return False
-
-    with open(config_path) as f:
-        config = json.load(f)
-
-    return "_diffusers_version" in config
+    """Check for a standard or modular Diffusers pipeline index."""
+    for filename in ("model_index.json", "modular_model_index.json"):
+        config_path = os.path.join(model_dir, filename)
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                return "_diffusers_version" in json.load(f)
+    return False
 
 
 def _is_gated_diffusion_repo(repo_id: str) -> bool:

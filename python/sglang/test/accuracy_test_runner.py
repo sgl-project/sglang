@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -31,9 +32,6 @@ class AccuracyTestParams:
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
     seed: Optional[int] = None  # pin for reproducibility when temperature > 0
-    # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
-    # of letting _run_sgl_eval infer it from the model name.
-    sgl_eval_thinking: Optional[bool] = None
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
 
@@ -56,13 +54,7 @@ def write_accuracy_github_summary(
     dataset: str,
     results: List[AccuracyTestResult],
 ) -> None:
-    """Write accuracy test results to GitHub step summary.
-
-    Args:
-        test_name: Name of the test
-        dataset: Dataset name used for evaluation
-        results: List of AccuracyTestResult objects
-    """
+    """Write accuracy test results to GitHub step summary."""
     summary = f"#### {test_name} - Accuracy ({dataset})\n"
     summary += "| config | status | score | baseline | error |\n"
     summary += "| ------ | ------ | ----- | -------- | ----- |\n"
@@ -95,13 +87,8 @@ def _run_simple_eval(
     repeat: Optional[int] = None,
     api: Optional[str] = None,
     seed: Optional[int] = None,
-    sgl_eval_thinking: Optional[bool] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
-    """Run evaluation using simple_eval backend (run_eval.py).
-
-    Returns:
-        Tuple of (success, error_message, metrics_dict)
-    """
+    """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval."""
     process = None
     try:
         process = popen_launch_server(
@@ -150,10 +137,8 @@ def _run_simple_eval(
         if seed is not None:
             args.seed = seed
 
-        if sgl_eval_thinking is not None:
-            args.sgl_eval_thinking = sgl_eval_thinking
-
-        result = run_eval(args)
+        evaluate = run_sgl_eval if dataset in SGL_EVAL_BENCHMARKS else run_eval
+        result = evaluate(args)
 
         # Handle result format (run_eval can return metrics or (metrics, latency))
         if return_latency and isinstance(result, tuple):
@@ -177,16 +162,7 @@ def run_accuracy_test(
     params: AccuracyTestParams,
     base_url: Optional[str] = None,
 ) -> AccuracyTestResult:
-    """Run accuracy test for a single model.
-
-    Args:
-        model: ModelLaunchSettings with model config
-        params: AccuracyTestParams with dataset, baseline, and optional settings
-        base_url: Server base URL (default: DEFAULT_URL_FOR_TEST)
-
-    Returns:
-        AccuracyTestResult with test outcome
-    """
+    """Run accuracy test for a single model."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
     print(f"\n{'=' * 60}")
@@ -211,7 +187,6 @@ def run_accuracy_test(
         repeat=params.repeat,
         api=params.api,
         seed=params.seed,
-        sgl_eval_thinking=params.sgl_eval_thinking,
     )
 
     if not success:
