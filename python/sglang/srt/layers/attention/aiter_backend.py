@@ -4022,7 +4022,7 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
-                    softcap=0,
+                    softcap=layer.logit_cap,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,

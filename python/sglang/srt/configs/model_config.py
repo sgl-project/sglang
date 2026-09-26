@@ -2464,6 +2464,9 @@ def is_hybrid_swa_model(
         "Step3p5ForCausalLM",
         "Step3p5MTP",
         "Step3p7ForConditionalGeneration",
+        "Gemma2ForCausalLM",
+        "Gemma3ForCausalLM",
+        "Gemma3ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
@@ -2482,6 +2485,20 @@ def is_hybrid_swa_model(
             "LagunaForCausalLM" in model_architectures
             and hf_text_config is not None
             and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
+        # Only treat Gemma2/3 as hybrid SWA when they have a sliding window.
+        if any(
+            arch
+            in (
+                "Gemma2ForCausalLM",
+                "Gemma3ForCausalLM",
+                "Gemma3ForConditionalGeneration",
+            )
+            for arch in model_architectures
+        ) and not (
+            hf_text_config is not None
+            and getattr(hf_text_config, "sliding_window", None)
         ):
             return False
         return True
@@ -2544,8 +2561,14 @@ def get_hybrid_layer_ids(
     elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
+    elif "Gemma2ForCausalLM" in model_architectures:
+        # Same rule as models/gemma2.py, which does not read layer_types.
+        swa_attention_layer_ids = [i for i in range(num_hidden_layers) if i % 2 == 0]
+        full_attention_layer_ids = [i for i in range(num_hidden_layers) if i % 2 == 1]
     elif (
-        "Gemma4ForCausalLM" in model_architectures
+        "Gemma3ForCausalLM" in model_architectures
+        or "Gemma3ForConditionalGeneration" in model_architectures
+        or "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "DiffusionGemmaForBlockDiffusion" in model_architectures

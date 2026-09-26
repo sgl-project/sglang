@@ -5,13 +5,14 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import LlamaConfig
+from transformers import Gemma2Config, Gemma3TextConfig, LlamaConfig
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
@@ -47,6 +48,73 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+    def test_gemma2_windows_the_even_layers(self):
+        config = SimpleNamespace(num_hidden_layers=6, sliding_window=4096)
+        self.assertTrue(is_hybrid_swa_model(["Gemma2ForCausalLM"], config))
+        self.assertEqual(
+            get_hybrid_layer_ids(["Gemma2ForCausalLM"], config),
+            ([0, 2, 4], [1, 3, 5]),
+        )
+
+    def test_gemma3_splits_layers_by_layer_types(self):
+        config = SimpleNamespace(
+            num_hidden_layers=12,
+            sliding_window=1024,
+            layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 2,
+        )
+        for architecture in ("Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                self.assertEqual(
+                    get_hybrid_layer_ids([architecture], config),
+                    ([0, 1, 2, 3, 4, 6, 7, 8, 9, 10], [5, 11]),
+                )
+
+    def test_gemma2_gemma3_hf_configs_are_hybrid(self):
+        cases = {
+            "Gemma2ForCausalLM": Gemma2Config(num_hidden_layers=4),
+            "Gemma3ForCausalLM": Gemma3TextConfig(num_hidden_layers=6),
+        }
+        for architecture, config in cases.items():
+            with self.subTest(architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                swa, full = get_hybrid_layer_ids([architecture], config)
+                self.assertEqual(
+                    full,
+                    [
+                        i
+                        for i, t in enumerate(config.layer_types)
+                        if t == "full_attention"
+                    ],
+                )
+                self.assertEqual(
+                    sorted(swa + full), list(range(config.num_hidden_layers))
+                )
+
+    def test_gemma2_gemma3_without_sliding_window_are_not_hybrid(self):
+        config = SimpleNamespace(
+            num_hidden_layers=4,
+            sliding_window=None,
+            layer_types=["full_attention"] * 4,
+        )
+        for architecture in (
+            "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertFalse(is_hybrid_swa_model([architecture], config))
+
+    def test_gemma3n_is_not_hybrid(self):
+        config = SimpleNamespace(
+            num_hidden_layers=4,
+            sliding_window=512,
+            layer_types=["sliding_attention"] * 3 + ["full_attention"],
+        )
+        for architecture in ("Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                self.assertFalse(is_hybrid_swa_model([architecture], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
