@@ -213,7 +213,11 @@ template <bool kFuseRealSin, bool kCopyV>
 struct Kernel {
   /// \brief Single tensor, out of place: `out = rope(rmsnorm(x))` for a contiguous [B, S, H, 128] bf16 tensor.
   static void
-  run(tvm::ffi::TensorView x, tvm::ffi::TensorView out, tvm::ffi::TensorView weight, tvm::ffi::TensorView rope, double eps) {
+  run(tvm::ffi::TensorView x,
+      tvm::ffi::TensorView out,
+      tvm::ffi::TensorView weight,
+      tvm::ffi::TensorView rope,
+      double eps) {
     using namespace host;
     auto B = SymbolicSize{"batch"};
     auto S = SymbolicSize{"seq"};
@@ -275,15 +279,14 @@ struct Kernel {
     device.set_options<kDLCUDA>();
     // TensorMatcher is not copyable, so verify inside the lambda; the member
     // template call on a dependent expression needs `template`.
-    const auto verify_rows =
-        [&](const tvm::ffi::TensorView& t, auto& rows, auto& batch_stride, auto& token_stride) {
-          TensorMatcher({B, rows, H, kHeadDim})
-              .with_strides({batch_stride, token_stride, kHeadDim, 1})
-              .template with_dtype<bf16_t>()
-              .with_device(device)
-              .ensure_alignment(kVecAlignBytes)
-              .verify(t);
-        };
+    const auto verify_rows = [&](const tvm::ffi::TensorView& t, auto& rows, auto& batch_stride, auto& token_stride) {
+      TensorMatcher({B, rows, H, kHeadDim})
+          .with_strides({batch_stride, token_stride, kHeadDim, 1})
+          .template with_dtype<bf16_t>()
+          .with_device(device)
+          .ensure_alignment(kVecAlignBytes)
+          .verify(t);
+    };
     verify_rows(q, S, Bq, Tq);
     verify_rows(k_src, S, Bk, Tk);
     verify_rows(k_out, PS, Bko, Tko);

@@ -147,6 +147,7 @@ tensor copy per residual site.
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for contiguous FP16/BF16 inputs; Qwen-Image 2.1 verifies its first call |
+| `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; the pack variant normalizes Q and K in place behind a prefix, copies prefix K/V (and optionally V) in the same launch, and accepts token-strided views of a packed QKV buffer; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
 | `ltx2_qknorm_split_rope_cuda` | KDA (JIT CUDA) | close; **validated on B200** |

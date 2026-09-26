@@ -476,7 +476,8 @@ class QwenImage21Attention(nn.Module):
             and get_sp_world_size() == 1
             and _QKV_PACK_FUSION.can_attempt_once()
             and all(can_project_into(layer, x) for layer in layers)
-            and tuple(layer.weight.data_ptr() for layer in layers) == self.qkv_weight_ptrs
+            and tuple(layer.weight.data_ptr() for layer in layers)
+            == self.qkv_weight_ptrs
         ):
             return None
         cache = caches[0]
@@ -486,12 +487,17 @@ class QwenImage21Attention(nn.Module):
         buffer = x.new_empty(1, prefix + seq, 3 * rows)
         torch.mm(x.view(seq, x.shape[-1]), self.qkv_weight.t(), out=buffer[0, prefix:])
         q = buffer[:, prefix:, :rows].view(1, seq, self.heads, self.head_dim)
-        k_out = buffer[:, :, rows : 2 * rows].view(1, prefix + seq, self.heads, self.head_dim)
-        v_out = buffer[:, :, 2 * rows :].view(1, prefix + seq, self.heads, self.head_dim)
+        k_out = buffer[:, :, rows : 2 * rows].view(
+            1, prefix + seq, self.heads, self.head_dim
+        )
+        v_out = buffer[:, :, 2 * rows :].view(
+            1, prefix + seq, self.heads, self.head_dim
+        )
         k, v = k_out[:, prefix:], v_out[:, prefix:]
         if not _QKV_PACK_FUSION.verified:
             reference = tuple(
-                layer(x)[0].unflatten(-1, (self.heads, self.head_dim)) for layer in layers
+                layer(x)[0].unflatten(-1, (self.heads, self.head_dim))
+                for layer in layers
             )
             accepted = _QKV_PACK_FUSION.accept_or_fallback(
                 (q, k, v), reference, equal=tensors_equal, logger=logger
@@ -530,7 +536,17 @@ class QwenImage21Attention(nn.Module):
         return k, v, k_out, v_out
 
     def attend_sample(
-        self, q, k, v, rope, prefix, prefix_rope, segments, cache, k_out=None, v_out=None
+        self,
+        q,
+        k,
+        v,
+        rope,
+        prefix,
+        prefix_rope,
+        segments,
+        cache,
+        k_out=None,
+        v_out=None,
     ):
         if cache:
             kp, vp = cache["key"], cache["value"]

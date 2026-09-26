@@ -7,6 +7,7 @@ multiply), wrong FMA orientation for this GPU, wrong prefix/token row placement
 in the packed K/V buffers, and predicates admitting layouts the kernel cannot
 address.
 """
+
 import pytest
 import torch
 
@@ -94,7 +95,9 @@ def _pack_inputs(batch, seq, prefix, heads):
     q = torch.randn(batch, seq, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    kp = torch.randn(batch, prefix, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    kp = torch.randn(
+        batch, prefix, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
     vp = torch.randn_like(kp)
     rope = make_rope(seq)
     return q, k, v, kp, vp, rope
@@ -109,7 +112,9 @@ def test_pack_matches_eager(batch, seq, prefix, heads, in_place):
     expected_k = torch.cat([kp, eager_norm_rope(k, norm_k, rope)], dim=1)
     expected_v = torch.cat([vp, v], dim=1)
 
-    k_out = torch.empty(batch, prefix + seq, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k_out = torch.empty(
+        batch, prefix + seq, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
     v_out = torch.empty_like(k_out)
     if in_place:
         # the projection wrote raw K and V into the token rows already
@@ -123,7 +128,17 @@ def test_pack_matches_eager(batch, seq, prefix, heads, in_place):
         q_work, k_out, v_out, norm_q.weight, norm_k.weight, rope, kp, vp, k_src, v_src
     )
     qknorm_complex_rope_pack_(
-        q_work, k_out, v_out, norm_q.weight, norm_k.weight, rope, kp, vp, k_src, v_src, EPS
+        q_work,
+        k_out,
+        v_out,
+        norm_q.weight,
+        norm_k.weight,
+        rope,
+        kp,
+        vp,
+        k_src,
+        v_src,
+        EPS,
     )
     assert_bits_equal(q_work, expected_q)
     assert_bits_equal(k_out, expected_k)
@@ -135,7 +150,9 @@ def test_pack_accepts_padded_token_stride():
     batch, seq, prefix, heads = 1, 33, 4, 8
     q, k, v, kp, vp, rope = _pack_inputs(batch, seq, prefix, heads)
     norm_q, norm_k = make_norm(), make_norm()
-    wide = torch.empty(batch, prefix + seq, 3 * heads * HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    wide = torch.empty(
+        batch, prefix + seq, 3 * heads * HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
     hd = heads * HEAD_DIM
     q_view = wide[:, prefix:, :hd].view(batch, seq, heads, HEAD_DIM)
     k_out = wide[:, :, hd : 2 * hd].view(batch, prefix + seq, heads, HEAD_DIM)
@@ -147,7 +164,17 @@ def test_pack_accepts_padded_token_stride():
         q_view, k_out, v_out, norm_q.weight, norm_k.weight, rope, kp, vp, None, None
     )
     qknorm_complex_rope_pack_(
-        q_view, k_out, v_out, norm_q.weight, norm_k.weight, rope, kp, vp, None, None, EPS
+        q_view,
+        k_out,
+        v_out,
+        norm_q.weight,
+        norm_k.weight,
+        rope,
+        kp,
+        vp,
+        None,
+        None,
+        EPS,
     )
     assert_bits_equal(q_view, eager_norm_rope(q, norm_q, rope))
     assert_bits_equal(k_out, torch.cat([kp, eager_norm_rope(k, norm_k, rope)], dim=1))
@@ -161,10 +188,14 @@ def test_predicates_reject_unsupported_layouts():
     assert can_use_qknorm_complex_rope_cuda(x, norm.weight, rope)
     assert not can_use_qknorm_complex_rope_cuda(x.cpu(), norm.weight.cpu(), rope.cpu())
     assert not can_use_qknorm_complex_rope_cuda(x.half(), norm.weight.half(), rope)
-    assert not can_use_qknorm_complex_rope_cuda(x[..., :64], norm.weight[:64], rope[:, :32])
+    assert not can_use_qknorm_complex_rope_cuda(
+        x[..., :64], norm.weight[:64], rope[:, :32]
+    )
     assert not can_use_qknorm_complex_rope_cuda(x.transpose(1, 2), norm.weight, rope)
     assert not can_use_qknorm_complex_rope_cuda(x, norm.weight, rope[:-1])
-    assert not can_use_qknorm_complex_rope_cuda(x, norm.weight, rope.to(torch.complex128))
+    assert not can_use_qknorm_complex_rope_cuda(
+        x, norm.weight, rope.to(torch.complex128)
+    )
     assert not can_use_qknorm_complex_rope_cuda(x, norm.weight.float(), rope)
     k_out = torch.empty(1, 17 + 3, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     kp = torch.randn(1, 3, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
@@ -173,13 +204,40 @@ def test_predicates_reject_unsupported_layouts():
     )
     # wrong prefix + seq length, batch mismatch, non-contiguous prefix, short K source
     assert not can_use_qknorm_complex_rope_pack(
-        x, k_out[:, :-1], k_out.clone(), norm.weight, norm.weight, rope, kp, kp, None, None
+        x,
+        k_out[:, :-1],
+        k_out.clone(),
+        norm.weight,
+        norm.weight,
+        rope,
+        kp,
+        kp,
+        None,
+        None,
     )
     assert not can_use_qknorm_complex_rope_pack(
-        x, k_out, k_out.clone(), norm.weight, norm.weight, rope, kp.expand(2, -1, -1, -1), kp, None, None
+        x,
+        k_out,
+        k_out.clone(),
+        norm.weight,
+        norm.weight,
+        rope,
+        kp.expand(2, -1, -1, -1),
+        kp,
+        None,
+        None,
     )
     assert not can_use_qknorm_complex_rope_pack(
-        x, k_out, k_out.clone(), norm.weight, norm.weight, rope, kp.transpose(1, 2), kp, None, None
+        x,
+        k_out,
+        k_out.clone(),
+        norm.weight,
+        norm.weight,
+        rope,
+        kp.transpose(1, 2),
+        kp,
+        None,
+        None,
     )
     assert not can_use_qknorm_complex_rope_pack(
         x, k_out, k_out.clone(), norm.weight, norm.weight, rope, kp, kp, x[:, :-1], None
@@ -191,18 +249,40 @@ def test_pack_graph_capture_and_replay():
     q, k, v, kp, vp, rope = _pack_inputs(batch, seq, prefix, heads)
     norm_q, norm_k = make_norm(), make_norm()
     q_work = q.clone()
-    k_out = torch.empty(batch, prefix + seq, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k_out = torch.empty(
+        batch, prefix + seq, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
     v_out = torch.empty_like(k_out)
     k_out[:, prefix:].copy_(k)
     v_out[:, prefix:].copy_(v)
     # warm the JIT module outside the capture
     qknorm_complex_rope_pack_(
-        q_work.clone(), k_out.clone(), v_out.clone(), norm_q.weight, norm_k.weight, rope, kp, vp, None, None, EPS
+        q_work.clone(),
+        k_out.clone(),
+        v_out.clone(),
+        norm_q.weight,
+        norm_k.weight,
+        rope,
+        kp,
+        vp,
+        None,
+        None,
+        EPS,
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         qknorm_complex_rope_pack_(
-            q_work, k_out, v_out, norm_q.weight, norm_k.weight, rope, kp, vp, None, None, EPS
+            q_work,
+            k_out,
+            v_out,
+            norm_q.weight,
+            norm_k.weight,
+            rope,
+            kp,
+            vp,
+            None,
+            None,
+            EPS,
         )
     # new inputs through the captured buffers
     q2, k2, v2, kp2, vp2, _ = _pack_inputs(batch, seq, prefix, heads)

@@ -411,7 +411,12 @@ def inputs_hd128(seed, edit):
         prefix_caches=[[{} for _ in range(2)]],
         timestep=torch.tensor([700.0], device="cuda"),
     )
-    for key in ("hidden_states", "encoder_hidden_states", "condition_latents", "timestep"):
+    for key in (
+        "hidden_states",
+        "encoder_hidden_states",
+        "condition_latents",
+        "timestep",
+    ):
         if kwargs[key] is not None:
             kwargs[key] = kwargs[key].bfloat16()
     return kwargs
@@ -504,7 +509,9 @@ def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch)
 
 
 @torch.no_grad()
-def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(bf16_model_hd128):
+def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(
+    bf16_model_hd128,
+):
     # pack_qkv_weights must keep parameter names/values and alias the packed buffer,
     # so a merge-mode LoRA delta written into to_q.weight is what the packed GEMM sees.
     attn = bf16_model_hd128.transformer_blocks[0].attn
@@ -520,4 +527,7 @@ def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(bf16_mode
     attn.to_q.weight.add_(1.0)
     assert torch.equal(attn.qkv_weight[:rows], before + 1.0)
     attn.to_q.weight.sub_(1.0)
-    assert tuple(layer.weight.data_ptr() for layer in (attn.to_q, attn.to_k, attn.to_v)) == attn.qkv_weight_ptrs
+    assert (
+        tuple(layer.weight.data_ptr() for layer in (attn.to_q, attn.to_k, attn.to_v))
+        == attn.qkv_weight_ptrs
+    )

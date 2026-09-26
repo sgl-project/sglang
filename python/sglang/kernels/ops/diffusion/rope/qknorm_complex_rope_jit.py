@@ -138,7 +138,8 @@ def can_use_qknorm_complex_rope_pack(
         and v_prefix.shape == k_prefix.shape
         and v_prefix.is_contiguous()
         and all(
-            t.dtype is torch.bfloat16 and t.device == device for t in (k_prefix, v_prefix)
+            t.dtype is torch.bfloat16 and t.device == device
+            for t in (k_prefix, v_prefix)
         )
     ):
         return False
