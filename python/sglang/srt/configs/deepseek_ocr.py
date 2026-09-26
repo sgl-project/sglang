@@ -294,6 +294,21 @@ class DeepseekOCRProcessor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
+    @classmethod
+    def from_args_and_dict(cls, args, processor_dict: Dict[str, Any], **kwargs):
+        # Jina OCR reuses the DeepSeek-OCR encoder but ships the
+        # `processing_deepseek_ocr.py` processor schema: its processor_config.json
+        # carries none of the DeepSeek-VL2 keys and its reference tiles up to 9 crops.
+        if "candidate_resolutions" not in processor_dict:
+            processor_dict = {
+                "candidate_resolutions": ((BASE_SIZE, BASE_SIZE),),
+                "patch_size": 16,
+                "downsample_ratio": 4,
+                "max_crops": 9,
+                **processor_dict,
+            }
+        return super().from_args_and_dict(args, processor_dict, **kwargs)
+
     def __init__(
         self,
         tokenizer: LlamaTokenizerFast,
@@ -310,6 +325,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
         mask_prompt: bool = True,
         ignore_id: int = -100,
         ocr2_mode: bool = False,
+        max_crops: int = MAX_CROPS,
+        add_bos_token: Optional[bool] = None,
         **kwargs,
     ):
 
@@ -360,6 +377,13 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
         self.ocr2_mode = ocr2_mode
+        self.max_crops = max_crops
+        # Follow the checkpoint's tokenizer (Jina OCR sets add_bos_token=false).
+        self.add_bos_token = (
+            getattr(tokenizer, "add_bos_token", True)
+            if add_bos_token is None
+            else add_bos_token
+        )
 
         super().__init__(
             tokenizer,
@@ -387,7 +411,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ) = self.tokenize_with_images(
             messages,
             pil_images[image_index : image_index + image_token_cnt],
-            bos=True,
+            bos=self.add_bos_token,
             eos=True,
             cropping=len(pil_images) <= 2,
         )
@@ -579,7 +603,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=self.image_size
+                        image, image_size=self.image_size, max_num=self.max_crops
                     )
                 else:
                     crop_ratio = [1, 1]
