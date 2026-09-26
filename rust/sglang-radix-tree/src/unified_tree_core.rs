@@ -27,6 +27,22 @@ use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strate
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
 const COEXIST_RECLAIM_DIGEST_MASK: i64 = (1 << 42) - 1;
+const COMPONENT_UUID_RANGE_SIZE: i64 = 100_000_000_000_000;
+
+const fn component_uuid_initial_value(component_type: ComponentType) -> i64 {
+    let range_index = match component_type {
+        ComponentType::Swa => 0,
+        ComponentType::Full => 1,
+        ComponentType::Mamba => 2,
+    };
+    (range_index + 1) * COMPONENT_UUID_RANGE_SIZE
+}
+
+const COMPONENT_UUID_INITIAL_VALUES: [i64; NUM_COMPONENT_TYPES] = [
+    component_uuid_initial_value(FULL),
+    component_uuid_initial_value(SWA),
+    component_uuid_initial_value(MAMBA),
+];
 
 fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usize) -> i64 {
     let event = (node_id as i64 + 1) * NUM_COMPONENT_TYPES as i64 + component_idx as i64;
@@ -37,10 +53,9 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 /// Result of `inc_lock_ref`, handed back to the matching `dec_lock_ref`.
 ///
-/// The receipt a release needs is per-component lock evidence: the SWA
-/// segment boundary uuid (None means the segment reached the root) and
-/// whether the single-node Mamba lock was taken (the decode hold opts
-/// out). Locks count every node in their contiguous segment, so no
+/// The receipt a release needs is per-component lock evidence: SWA and Full
+/// host segment boundary uuids, plus the components deliberately left
+/// untaken. Locks count every node in their contiguous segment, so no
 /// per-node skip state exists. Receipt fields default to nothing-acquired;
 /// `inc_lock_ref` stamps what it actually took.
 #[derive(Default)]
@@ -55,6 +70,8 @@ pub struct IncLockRefResult {
     pub swa_uuid_for_host_lock: Option<i64>,
     /// Components the acquire left untaken; the release skips them too.
     pub skipped_lock_components: ComponentSet,
+    /// Boundary UUID for the Full host-lock segment.
+    pub full_uuid_for_host_lock: Option<i64>,
 }
 
 /// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
@@ -71,6 +88,20 @@ pub struct DecLockRefParams {
     pub swa_uuid_for_host_lock: Option<i64>,
     /// Components the matching acquire left untaken.
     pub skipped_lock_components: ComponentSet,
+    /// Full host-lock segment boundary UUID from the matching acquire.
+    pub full_uuid_for_host_lock: Option<i64>,
+}
+
+impl From<&IncLockRefResult> for DecLockRefParams {
+    fn from(receipt: &IncLockRefResult) -> Self {
+        Self {
+            node_id: receipt.node_id,
+            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+            skipped_lock_components: receipt.skipped_lock_components,
+            full_uuid_for_host_lock: receipt.full_uuid_for_host_lock,
+        }
+    }
 }
 
 /// Result of `dec_lock_ref`.
@@ -569,8 +600,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
 
-    /// Monotonic source for SWA lock-window uuids.
-    pub(crate) swa_uuid_counter: i64,
+    /// Per-component monotonic sources for lock-segment UUIDs.
+    pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
     /// Device the KV indices live on.
     pub(crate) device: Device,
     /// Shared empty device-index tensor (an empty match's indices).
@@ -747,7 +778,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
-            swa_uuid_counter: 1,
+            component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
@@ -826,10 +857,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         new_node_id
     }
 
-    /// Mint the next SWA lock-window uuid.
-    pub(crate) fn next_swa_uuid_(&mut self) -> i64 {
-        self.swa_uuid_counter += 1;
-        self.swa_uuid_counter
+    /// Mint the next lock-segment UUID for a component.
+    pub(crate) fn next_component_uuid_(&mut self, component_type: ComponentType) -> i64 {
+        let counter = &mut self.component_uuid_counters[component_type.idx()];
+        *counter += 1;
+        *counter
     }
 
     /// Bump the reference count on a node's component locks. Components in
@@ -4595,6 +4627,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node_id = self.arena.resolve(node_id)?;
         self.assert_component_enabled_(component_type);
         Ok(self.arena.node(node_id).device_lock_ref(component_type))
+    }
+
+    /// A component's host lock count on a node.
+    pub fn inspect_get_component_host_lock_ref(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Result<u32, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        self.assert_component_enabled_(component_type);
+        Ok(self.arena.node(node_id).host_lock_ref(component_type))
     }
 
     /// A node's accumulated match count.

@@ -131,27 +131,6 @@ impl SwaComponent {
         }
     }
 
-    /// The node's SWA lock-window uuid for the tier, stamping a fresh one if absent.
-    fn ensure_swa_uuid<K: ChildKeyType>(
-        tree_core: &mut UnifiedTreeCore<K>,
-        node_id: NodeIdx_,
-        host: bool,
-    ) -> i64 {
-        match Self::swa_uuid(tree_core.arena.node(node_id), host) {
-            Some(uuid) => uuid,
-            None => {
-                let minted = tree_core.next_swa_uuid_();
-                let node = tree_core.arena.node_mut(node_id);
-                if host {
-                    node.swa_host_uuid = Some(minted);
-                } else {
-                    node.swa_uuid = Some(minted);
-                }
-                minted
-            }
-        }
-    }
-
     /// Nodes whose SWA data needs a host backup, deepest first. Buffer mode
     /// stages one node per FIFO backup intent; cache mode backs up every
     /// device-only node within one sliding window of `node_id`.
@@ -1227,7 +1206,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             covered += key_len;
             if covered >= sliding_window_size {
-                swa_uuid = Some(Self::ensure_swa_uuid(tree_core, cur, lock_host));
+                swa_uuid = Some(self.get_or_fill_uuid(tree_core, cur, lock_host));
             }
             cur = parent;
         }
