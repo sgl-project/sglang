@@ -558,7 +558,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         normed = k3_sp_collective.attn_res_all_gather(
             prefix,
@@ -595,7 +595,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         return k3_sp_collective.reduce_scatter_attn_res(
             hidden_states,
