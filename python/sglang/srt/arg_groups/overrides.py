@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    mxfp8_block_convert_required,
     xpu_has_xmx_support,
 )
 
@@ -1411,17 +1412,19 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
+        # gfx942 converts MXFP8 experts to block-fp8 at load; only triton runs them
+        is_hip_mxfp8 = is_gfx95_mxfp8 or mxfp8_block_convert_required()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        if is_hip_mxfp8:
             allowed.append("triton")
             # the aiter MXFP8 MoE quant info is built only when aiter is enabled
-            if envs.SGLANG_USE_AITER.get():
+            if is_gfx95_mxfp8 and envs.SGLANG_USE_AITER.get():
                 allowed.append("aiter")
 
         if view.moe_a2a_backend == "flashinfer_megamoe":
             mxfp8_default = "flashinfer_megamoe"
         else:
-            mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+            mxfp8_default = "triton" if is_hip_mxfp8 else "flashinfer_trtllm"
 
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
