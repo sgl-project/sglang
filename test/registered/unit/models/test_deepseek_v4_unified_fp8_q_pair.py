@@ -137,7 +137,7 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             deepseek_v4, "get_parallel", return_value=SimpleNamespace(tp_size=8)
         ),
         patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
-        patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=cp),
+        patch.object(deepseek_v4, "is_cp_active", return_value=cp),
         patch.object(deepseek_v4, "fused_rope_inplace", return_value=None),
         patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
         patch.object(deepseek_v4, "_is_gfx942_supported", False),

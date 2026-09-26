@@ -44,6 +44,15 @@ def handle_context_parallelism(server_args: Any):
         model_arch = hf_config.architectures[0]
         if (
             cfg.enable_prefill_cp
+            and get_platform().is_hip
+            and model_arch != "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError(
+                "Prefill CP on HIP is only supported for "
+                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+            )
+        if (
+            cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
             and cfg.cp_strategy == "zigzag"
         ):
@@ -657,10 +666,10 @@ def handle_expert_distribution_metrics(server_args: Any):
 
 
 def validate_prefill_cp_platform(server_args: Any):
-    """Reject deprecated platform CP before resolving models or CP topology."""
+    """Reject platforms whose prefill CP paths have not migrated."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
+    if cfg.enable_prefill_cp and platform.is_musa:
         raise ValueError(
-            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )
