@@ -74,12 +74,36 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         }
 
         // Determine model_id: config > served_model_name > model_path > UNKNOWN_MODEL_ID
-        let model_id = config
+        let discovered_model_id = config
             .model_id
             .clone()
             .or_else(|| final_labels.get("served_model_name").cloned())
-            .or_else(|| final_labels.get("model_path").cloned())
-            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+            .or_else(|| final_labels.get("model_path").cloned());
+
+        // In IGW mode routing selects workers by model name, so a worker whose
+        // identity we never learned can never be picked: registering it under
+        // UNKNOWN_MODEL_ID hides a lost worker behind a healthy-looking entry
+        // that nothing later corrects, because the service-discovery resync
+        // only re-submits pods with no registered worker at all. Failing here
+        // leaves the pod unregistered, which is the state that resync retries.
+        // Outside IGW the model filter is off and an unnamed worker still
+        // serves, so the fallback stays for backends that expose no metadata.
+        let model_id = match discovered_model_id {
+            Some(model_id) => model_id,
+            None if app_context.router_config.enable_igw => {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message: format!(
+                        "Worker {} has no model identity: /model_info and /server_info \
+                         did not answer, and IGW routing cannot select a worker whose \
+                         model is unknown. Leaving it unregistered for the \
+                         service-discovery resync to retry.",
+                        config.url
+                    ),
+                });
+            }
+            None => UNKNOWN_MODEL_ID.to_string(),
+        };
 
         if model_id != UNKNOWN_MODEL_ID {
             debug!("Using model_id: {}", model_id);
