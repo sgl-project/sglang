@@ -892,6 +892,53 @@ class LoRAMemoryPool:
         self.eviction_policy.remove(uid)
         return buffer_id
 
+    def _drop_colliding_weights(
+        self,
+        layer_weights: Dict[str, torch.Tensor],
+        cur_layer_modules: Dict[str, torch.nn.Module],
+        dropped_weight_names: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        """Resolve adapter tensors that compete for the same buffer slot.
+
+        Adapter tensors are bucketed by the layer index in their name, so a
+        multimodal adapter that also carries tower weights (e.g. PEFT's
+        ``vision_tower.encoder.layers.N.self_attn.o_proj``) puts them in the
+        same bucket as ``language_model.layers.N.self_attn.o_proj``. Both map
+        to the ``o_proj`` slot, and whichever comes last silently wins. When
+        several standard tensors compete for one slot, keep the ones whose
+        module path matches a LoRA-wrapped module on this layer and drop the
+        rest: LoRA is only applied to the language model.
+        """
+        slots: Dict[Tuple[str, str], List[str]] = {}
+        for name in layer_weights:
+            if "experts" in name:
+                continue  # MoE tensors legitimately share a slot per expert.
+            try:
+                target_module = get_target_module_name(name, self.target_modules)
+            except ValueError:
+                continue
+            kind = "lora_A" if "lora_A" in name else "lora_B"
+            slots.setdefault((target_module, kind), []).append(name)
+
+        dropped = set()
+        for names in slots.values():
+            if len(names) < 2:
+                continue
+            kept = [
+                name
+                for name in names
+                if any(
+                    name.rsplit(".lora_", 1)[0].endswith(module_name)
+                    for module_name in cur_layer_modules
+                )
+            ]
+            if kept and len(kept) < len(names):
+                dropped.update(name for name in names if name not in kept)
+        if not dropped:
+            return layer_weights
+        dropped_weight_names.extend(sorted(dropped))
+        return {k: v for k, v in layer_weights.items() if k not in dropped}
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
@@ -957,11 +1004,14 @@ class LoRAMemoryPool:
             else:
                 logger.warning(msg)
 
+        dropped_weight_names: List[str] = []
         for layer_id in range(self.num_layer):
             layer = lora_adapter.layers[layer_id]
-            layer_weights = layer.weights
             pinned_layer_weights = layer.pinned_weights
             cur_layer_modules = lora_modules[layer_id]
+            layer_weights = self._drop_colliding_weights(
+                layer.weights, cur_layer_modules, dropped_weight_names
+            )
             has_shared_moe_module = any(
                 getattr(
                     getattr(module, "base_layer", module), "is_shared_fused_moe", False
@@ -1379,6 +1429,17 @@ class LoRAMemoryPool:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
+
+        if dropped_weight_names:
+            logger.warning(
+                "LoRA adapter '%s': ignored %d weight(s) that target modules "
+                "outside the LoRA-enabled language layers (e.g. vision/audio "
+                "towers); SGLang applies LoRA to the language model only. "
+                "First few: %s",
+                uid,
+                len(dropped_weight_names),
+                dropped_weight_names[:3],
+            )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
