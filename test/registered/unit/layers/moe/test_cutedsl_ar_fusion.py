@@ -1,6 +1,6 @@
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -11,6 +11,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     UnreducedOutput,
     _attention_input_step,
+    reduce_output,
 )
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
@@ -282,11 +283,107 @@ def test_the_handoff_views_the_producer_storage():
         ),
         gated_shared_output=torch.empty(m, 16, dtype=torch.bfloat16),
         m=m,
+        reduce=lambda h: h,
     )
 
     assert handoff.routed_output.data_ptr() == gemm2_out.data_ptr()
     assert handoff.permuted_indices.data_ptr() == permuted_indices.data_ptr()
     assert tuple(handoff.expert_weights.shape) == (m, top_k)
+
+
+def _handoff(finish):
+    rows = torch.zeros(2, 8)
+    return MoeFinalizeHandoff(
+        routed_output=rows,
+        expert_weights=rows,
+        permuted_indices=rows,
+        gated_shared_output=rows,
+        m=2,
+        finish=finish,
+    )
+
+
+def test_its_producer_completes_a_handoff_for_any_other_reader():
+    """Only the fused kernel reads the handoff's parts; everything else gets
+    the MoE's own unfused tail, run once."""
+    finished = torch.full((2, 8), 3.0)
+    finish = MagicMock(return_value=finished)
+    assert reduce_output(_handoff(finish)) is finished
+    finish.assert_called_once_with()
+
+
+def test_from_flashinfer_completes_with_the_moe_s_own_sum():
+    deferred = SimpleNamespace(
+        gemm2_out=torch.zeros(4, 8),
+        expert_weights=torch.zeros(2, 2),
+        expanded_idx_to_permuted_idx=torch.zeros(2, 2, dtype=torch.int32),
+        top_k=2,
+    )
+    shared = torch.ones(2, 8)
+    with patch(
+        "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+        "finalize_flashinfer_trtllm_deferred_output",
+        side_effect=lambda d, s: s + 1,
+    ) as finalize:
+        handoff = MoeFinalizeHandoff.from_flashinfer(
+            deferred, gated_shared_output=shared, m=2, reduce=lambda h: h * 10
+        )
+        finalize.assert_not_called()
+        torch.testing.assert_close(handoff.complete(), torch.full((2, 8), 20.0))
+    finalize.assert_called_once_with(deferred, shared)
+
+
+def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
+    """The consumer asks only whether its own kernel takes the batch; when it
+    does not, the handoff is completed and the input read as usual."""
+
+    class AddNorm(torch.nn.Module):
+        def forward(self, x, residual=None, post_residual_addition=None):
+            residual.add_(x)
+            return residual * 2, residual
+
+    comm = _communicator()
+    comm.input_layernorm = AddNorm()
+    comm.fusion_service = SimpleNamespace(
+        finalize=lambda **kw: pytest.fail("the kernel does not take this batch")
+    )
+    finish = MagicMock(return_value=torch.ones(2, 8))
+    with (
+        # A norm the kernel could fold in, on a batch it does not take.
+        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_should_use_finalize", return_value=False
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=False
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator,
+            "_finish_prepare_attn",
+            lambda self, *, hidden_states, residual, forward_batch: (
+                hidden_states,
+                residual,
+            ),
+        ),
+    ):
+        hidden, residual = comm.prepare_attn(
+            _handoff(finish), torch.full((2, 8), 2.0), _DECODE
+        )
+    finish.assert_called_once_with()
+    torch.testing.assert_close(residual, torch.full((2, 8), 3.0))
+    torch.testing.assert_close(hidden, torch.full((2, 8), 6.0))
+
+
+def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
+    comm = LayerCommunicator.__new__(LayerCommunicator)
+    for takes, completed in ((True, 0), (False, 1)):
+        finish = MagicMock(return_value=torch.ones(2, 8))
+        handoff = _handoff(finish)
+        hidden, _ = comm.finish_layer_stack(
+            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
+        )
+        assert finish.call_count == completed
+        assert (hidden is handoff) == takes
 
 
 def test_early_shared_load_touches_only_the_finalize_routes():

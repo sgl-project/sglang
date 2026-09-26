@@ -865,6 +865,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=num_tokens,
+                reduce=reduce_moe_output,
             )
 
         if shared_output is not None:

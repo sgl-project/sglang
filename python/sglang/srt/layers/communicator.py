@@ -761,14 +761,28 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
+class HandoffOutput(msgspec.Struct, frozen=True):
+    """A layer output that still owes work only its producer knows how to do (a
+    MoE's finalize and sum), left for the next layer's input. A fused kernel
+    there may do that work together with its own; anything else passes it
+    through reduce_output(), which calls ``complete()``."""
+
+    def complete(self) -> torch.Tensor:
+        """Do the owed work, unfused, and return the complete output."""
+        raise NotImplementedError
+
+
 def reduce_output(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, None],
+    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput, None],
 ) -> Optional[torch.Tensor]:
-    """Run the reduction an UnreducedOutput still owes; pass anything else through."""
+    """Run the work an UnreducedOutput or a HandoffOutput still owes; pass
+    anything else through."""
     if isinstance(hidden_states, UnreducedOutput):
         if hidden_states.reduce_and_redistribute is not None:
             return hidden_states.reduce_and_redistribute(hidden_states.partial)
         return hidden_states.group.all_reduce(hidden_states.partial)
+    if isinstance(hidden_states, HandoffOutput):
+        return hidden_states.complete()
     return hidden_states
 
 
@@ -1622,13 +1636,19 @@ class LayerCommunicator:
 
     def finish_layer_stack(
         self,
-        hidden_states: Union[torch.Tensor, UnreducedOutput],
+        hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        *,
+        final_norm_takes_handoff: bool = False,
+    ) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
         """Complete what this layer left for a next layer. Call it on the last
         layer of this rank before its output reaches the final norm, the next
-        pipeline rank, or any other consumer outside the layers."""
+        pipeline rank, or any other consumer outside the layers. A final norm
+        that does a producer's handoff together with its own work
+        (``final_norm_takes_handoff``) receives it as it is."""
+        if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
+            return hidden_states, residual
         return reduce_output(hidden_states), residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
@@ -2421,7 +2441,11 @@ def _attention_input_step(
             result = fused(owed, residual, forward_batch, post_residual_addition)
             if result is not None:
                 return result
-        hidden_states = owed.partial
+        if isinstance(owed, HandoffOutput):
+            # No fused kernel took the handoff: its producer completes it.
+            hidden_states, owed = reduce_output(owed), None
+        else:
+            hidden_states = owed.partial
     if layer_input is not None:
         hidden_states, residual = layer_input(hidden_states, residual, context)
     if enters:

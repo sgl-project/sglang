@@ -1113,6 +1113,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
+                reduce=post_experts_all_reduce,
             )
 
         all_reduce_done = False

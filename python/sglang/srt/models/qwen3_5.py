@@ -1856,7 +1856,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         last_layer = self.layers[self.end_layer - 1]
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            # The final norm below finalizes a deferred MoE output in its kernel.
+            final_norm_takes_handoff=self.flashinfer_mnnvl_cutedsl_fusion is not None
+            and self.pp_group.is_last_rank,
         )
 
         # Return intermediate tensors for pipeline parallelism

@@ -10,12 +10,12 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional, Sequence
 
-import msgspec
 import torch
 
 from sglang.srt.layers.boundary_layout import SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     FusedMlpInput,
+    HandoffOutput,
     LayerCommunicator,
     UnreducedOutput,
     get_attn_tp_context,
@@ -73,14 +73,20 @@ def _resolve_max_m(*, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-class MoeFinalizeHandoff(msgspec.Struct, frozen=True):
-    """Unfinalized routed output plus the separately gated shared contribution."""
+class MoeFinalizeHandoff(HandoffOutput, frozen=True):
+    """Unfinalized routed output plus the separately gated shared contribution.
+    The next layer's fused finalize + AR + add + norm takes it; ``finish`` is
+    the MoE's own unfused tail, for any other reader."""
 
     routed_output: torch.Tensor
     expert_weights: torch.Tensor
     permuted_indices: torch.Tensor
     gated_shared_output: torch.Tensor
     m: int
+    finish: Callable[[], torch.Tensor]
+
+    def complete(self) -> torch.Tensor:
+        return self.finish()
 
     @classmethod
     def from_flashinfer(
@@ -89,7 +95,13 @@ class MoeFinalizeHandoff(msgspec.Struct, frozen=True):
         *,
         gated_shared_output: torch.Tensor,
         m: int,
+        reduce: Callable[[torch.Tensor], torch.Tensor],
     ) -> MoeFinalizeHandoff:
+        """``reduce`` is the MoE's own sum of its finalized output."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            finalize_flashinfer_trtllm_deferred_output,
+        )
+
         top_k = int(deferred_output.top_k)
         return cls(
             routed_output=deferred_output.gemm2_out.view(
@@ -101,6 +113,11 @@ class MoeFinalizeHandoff(msgspec.Struct, frozen=True):
             )[:m],
             gated_shared_output=gated_shared_output,
             m=int(m),
+            finish=lambda: reduce(
+                finalize_flashinfer_trtllm_deferred_output(
+                    deferred_output, gated_shared_output
+                )
+            ),
         )
 
 
@@ -197,19 +214,13 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         self, owed, residual, forward_batch, post_residual_addition
     ):
         """Finish a deferred MoE finalize with the all-reduce, residual add and
-        input norm."""
+        input norm, when this layer's kernel takes the batch; otherwise the
+        handoff is completed by its producer's own tail."""
         if not isinstance(owed, MoeFinalizeHandoff):
             return None
-        if not self._should_use_finalize(forward_batch, owed.m):
-            raise RuntimeError(
-                "received deferred MoE output on an ineligible path "
-                f"(M={owed.m}, mode={forward_batch.forward_mode})"
-            )
         gamma = _fused_norm_gamma(self.input_layernorm)
-        if gamma is None:
-            raise RuntimeError(
-                "deferred MoE finalize requires a fusable RMSNorm flavour"
-            )
+        if gamma is None or not self._should_use_finalize(forward_batch, owed.m):
+            return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
         assert self.fusion_service is not None
