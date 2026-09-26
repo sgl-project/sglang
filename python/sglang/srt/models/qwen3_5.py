@@ -2328,7 +2328,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        # A packed lm_head has no dense weight; the draft shares the module instead.
+        head = None
+        if self.pp_group.is_last_rank and hasattr(self.lm_head, "weight"):
+            head = self.lm_head.weight
         return embed, head
 
     def set_embed_and_head(self, embed, head):
@@ -2498,7 +2501,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        # A packed lm_head has no dense weight; the draft shares the module instead.
+        head = None
+        if self.pp_group.is_last_rank and hasattr(self.lm_head, "weight"):
+            head = self.lm_head.weight
         return embed, head
 
     def set_embed_and_head(self, embed, head):

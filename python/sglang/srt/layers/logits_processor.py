@@ -959,12 +959,22 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
+        has_dense_weight = hasattr(lm_head, "weight")
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
-            logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
-        elif hasattr(lm_head, "weight"):
+            if self.use_fp32_lm_head and not has_dense_weight:
+                # A head without a dense weight (GGUF qweight, compressed-tensors
+                # weight_packed) gets fp32 activations under --enable-fp32-lm-head;
+                # the dense branch below casts the weight instead.
+                with torch.amp.autocast("cuda", enabled=False):
+                    logits = quant_method.apply(
+                        lm_head, hidden_states.to(torch.float32), embedding_bias
+                    )
+            else:
+                logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif has_dense_weight:
             # Normal linear layer
             if self.use_fp32_lm_head:
                 # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
@@ -1003,17 +1013,11 @@ class LogitsProcessor(nn.Module):
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                 )
         else:
-            # GGUF models
-            # TODO: use weight_packed_linear for GGUF models
-            if self.use_fp32_lm_head:
-                with torch.cuda.amp.autocast(enabled=False):
-                    logits = lm_head.quant_method.apply(
-                        lm_head, hidden_states.to(torch.float32), embedding_bias
-                    )
-            else:
-                logits = lm_head.quant_method.apply(
-                    lm_head, hidden_states, embedding_bias
-                )
+            raise ValueError(
+                f"{type(lm_head).__name__} has neither a dense weight nor a "
+                f"quant_method that can produce logits "
+                f"(quant_method={type(quant_method).__name__})."
+            )
         return logits
 
     def _gather_dp_attn_hidden_states(
@@ -1386,16 +1390,26 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
 
 
+# Quant methods whose admission depends on the layout of `lm_head.weight`.
+_MODELOPT_LM_HEAD_METHODS = {
+    "ModelOptFp4LinearMethod",
+    "ModelOptNvFp4A16LinearMethod",
+    "ModelOptFp8LinearMethod",
+}
+
+
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
+    if quant_method is None or not callable(getattr(quant_method, "apply", None)):
         return False
 
     method_name = type(quant_method).__name__
     if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
+    # A head that stores its weight packed (compressed-tensors `weight_packed`,
+    # GGUF `qweight`) has no `.weight`; its quant method is the only way to get
+    # logits out of it. Only the ModelOpt layout checks below need the tensor.
+    if method_name in _MODELOPT_LM_HEAD_METHODS and not hasattr(lm_head, "weight"):
         return False
 
     # Some draft models share an unquantized target lm_head tensor while still

@@ -107,6 +107,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_sample,
     get_plan_stream,
+    lm_head_is_packed,
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
@@ -424,8 +425,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     load_config=target_runner.load_config,
                 )
                 embed.weight_loader(embed, loaded_embed)
-            head = self.target_worker.model_runner.model.lm_head.weight
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            target_lm_head = self.target_worker.model_runner.model.lm_head
+            if lm_head_is_packed(target_lm_head):
+                raise ValueError(
+                    "The target lm_head stores its weight packed; PP+spec shares "
+                    "the head tensor only."
+                )
+            self.draft_runner.model.set_embed_and_head(embed, target_lm_head.weight)
             return
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -441,6 +447,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 and hasattr(self.draft_runner.model, "set_lm_head_from_target")
             ):
                 self.draft_runner.model.set_lm_head_from_target(target_lm_head)
+            elif lm_head_is_packed(target_lm_head):
+                # A packed head has no tensor to hand out, so the draft would
+                # keep whatever head it loaded on its own.
+                if not hasattr(self.draft_runner.model, "set_lm_head_from_target"):
+                    reason = (
+                        f"{type(self.draft_runner.model).__name__} has no "
+                        "set_lm_head_from_target"
+                    )
+                else:
+                    reason = "a hot-token map rules out reusing the whole module"
+                raise ValueError(
+                    "The target lm_head stores its weight packed, so the draft can "
+                    f"only reuse it as a whole module, but {reason}."
+                )
 
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head

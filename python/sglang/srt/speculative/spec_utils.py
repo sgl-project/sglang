@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -67,6 +68,18 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
+
+
+def lm_head_is_packed(lm_head) -> bool:
+    """Whether a target lm_head stores its weight packed (compressed-tensors
+    `weight_packed`, for example) and so has no `.weight` tensor to share. A
+    pipeline stage without the head (`PPMissingLayer`) is not packed."""
+    return (
+        lm_head is not None
+        and not isinstance(lm_head, PPMissingLayer)
+        and not hasattr(lm_head, "weight")
+    )
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
