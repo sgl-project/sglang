@@ -89,8 +89,11 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            (
+                adapted_request,
+                processed_request,
+            ) = await self.tokenizer_manager.request_preprocessor.run(
+                self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):

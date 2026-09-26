@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.request_preprocessor import RequestPreprocessor
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -273,6 +274,7 @@ class _MockChunkTokenizerManager:
             asr_max_concurrent_sessions=32,
         )
         self.request_logger = Mock(log_requests=False)
+        self.request_preprocessor = RequestPreprocessor()
         self.tokenizer = Mock()
         self.requests: List[GenerateReqInput] = []
         self.aborted: List[str] = []
