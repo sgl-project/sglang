@@ -1,5 +1,9 @@
 import itertools
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.boundary_layout import (
@@ -163,15 +167,61 @@ class TestNonAlternatingEdges(CustomTestCase):
         step = make_boundary(complete, reads=InputRead.FFN).prepare
         self.assertIs(step.func, comm._mlp_input_dp_replicate)
         self.assertFalse(step.keywords["reduces_attention_tp"])
-        # An FFN that leaves its TP sum to the next FFN is not supported yet.
+        # An FFN that may leave its TP sum for a batch hands it on with the
+        # value, which completes onto the rows the layer hands on; the next
+        # FFN's input completes it, then goes on as for a complete output.
         leaves = EdgeDecl(
-            produced=StageOutput(full, group=SumGroup.TP, leaves_for_next_layer=True),
+            produced=StageOutput(
+                attention, group=SumGroup.TP, leaves_for_next_layer=True
+            ),
+            need=StageInput(full),
+            residual=attention,
+            residual_to=attention,
+        )
+        step = make_boundary(leaves, reads=InputRead.FFN).prepare
+        self.assertIs(step.func, comm._mlp_input_completing_owed)
+        self.assertIs(step.keywords["step"].func, comm._mlp_input_dp_replicate)
+        # A producer that always leaves a sum other than the attention TP's is
+        # not supported.
+        always = EdgeDecl(
+            produced=StageOutput(attention, group=SumGroup.TP, always_leaves=True),
             need=StageInput(full),
             residual=attention,
             residual_to=attention,
         )
         with self.assertRaises(NotImplementedError):
-            make_boundary(leaves, reads=InputRead.FFN)
+            make_boundary(always, reads=InputRead.FFN)
+
+    def test_the_next_ffn_completes_a_sum_left_for_it_once(self):
+        full = rows(sizes(tp=2))
+        edge = EdgeDecl(
+            produced=StageOutput(full, group=SumGroup.TP, leaves_for_next_layer=True),
+            need=StageInput(full),
+            residual=full,
+            residual_to=full,
+        )
+        step = make_boundary(edge, reads=InputRead.FFN).prepare
+        group = SimpleNamespace(all_reduce=MagicMock(side_effect=lambda h: h * 2))
+
+        def norm(hidden, residual):
+            # The add and norm: hidden + residual.
+            return hidden + residual, hidden + residual
+
+        residual = torch.full((3, 4), 5.0)
+        hidden, _ = step(
+            comm.UnreducedOutput(torch.ones(3, 4), group=group),
+            residual,
+            None,
+            norm,
+            None,
+        )
+        group.all_reduce.assert_called_once()
+        torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
+        # A complete output is not reduced again.
+        group.all_reduce.reset_mock()
+        hidden, _ = step(torch.full((3, 4), 2.0), residual, None, norm, None)
+        group.all_reduce.assert_not_called()
+        torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
 
     def test_the_producer_half_ends_on_the_rows_it_hands_on(self):
         axis_sizes = sizes(dp=2, tp=2)

@@ -1378,7 +1378,7 @@ class LayerCommunicator:
 
     def prepare_mlp(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, UnreducedOutput],
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
@@ -2557,6 +2557,25 @@ def _select_ffn_input(
     only when nothing is gathered or sliced, and only if it completes the sum
     the attention output owes. A write-back that is not a plain add runs only
     after the sum completes."""
+    if produced.leaves_for_next_layer and produced.group not in (
+        None,
+        SumGroup.ATTN_TP,
+    ):
+        # A producer that leaves its sum only for some batches (an FFN before
+        # this one) hands that sum on with the value: complete it, then the
+        # input is a complete output.
+        step, fused = _select_ffn_input(
+            StageOutput(produced.layout),
+            residual=residual,
+            residual_to=residual_to,
+            need=need,
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            fusions=fusions,
+            residual_joins_sum=residual_joins_sum,
+            cp_moves=cp_moves,
+            residual_ops=residual_ops,
+        )
+        return partial(_mlp_input_completing_owed, step=step), fused
     # What the attention output owes decides the steps: the attention-TP sum,
     # always left by the output projection, or nothing.
     owes_attention_tp = produced.group is SumGroup.ATTN_TP
@@ -2784,6 +2803,22 @@ def mlp_input_kind(
             return MlpInputKind.ATTN_TP_ALL_REDUCE
     raise NotImplementedError(
         f"{hidden_in=} {residual_in=} {hidden_out=} {residual_out=}"
+    )
+
+
+def _mlp_input_completing_owed(
+    hidden_states: Union[torch.Tensor, "UnreducedOutput"],
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
+    context: CommunicateContext,
+    *,
+    step: Callable,
+):
+    """An FFN input whose producer may have left its sum: complete what the
+    value owes, then run ``step`` on the complete output."""
+    return step(
+        reduce_output(hidden_states), residual, forward_batch, layernorm, context
     )
 
 
