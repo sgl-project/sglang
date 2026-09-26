@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import blake2b
 from queue import Empty, Queue
 from typing import Any, Callable
 
@@ -24,6 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
     get_model,
     get_parallel,
@@ -40,6 +43,18 @@ CHUNK_PAGES = 64
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
+
+# Bound retained lookup metadata and the CPU page-agreement buffer.
+SPLIT_LOOKUP_CACHE = 128
+SPLIT_MAX_PAGES = 65536
+
+
+def _split_windows(pages: int, world: int) -> tuple[tuple[int, int], ...]:
+    width = -(-pages // world)
+    return tuple(
+        (min(rank * width, pages), min((rank + 1) * width, pages))
+        for rank in range(world)
+    )
 
 
 def _storage_suffix(
@@ -82,8 +97,9 @@ def _ordered_layers(entry) -> list[int]:
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, on_group_ready=None):
         self.num_layers = num_layers
+        self._on_group_ready = on_group_ready
         self._producer_index = -1
         self.consumer_index = -1
         self._futures: dict[int, list[Future]] = {}
@@ -111,6 +127,8 @@ class LayerWiseLoadCounter:
             return
         try:
             futures[threshold].result()
+            if self._on_group_ready is not None:
+                self._on_group_ready(index, threshold)
         except BaseException as error:
             raise RuntimeError("UMBP layer-wise KV load failed.") from error
         finally:
@@ -131,6 +149,29 @@ class _PoolRangePlan:
     keys: list[str]
     locations: list[int]
     entries_per_page: int
+    # Only common pages, in the agreed order; I/O also includes local remainders.
+    all_locations: list[int] | None = None
+    windows: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass
+class _SplitShare:
+    common: list[list[str]]
+    owned: list[set[str]]
+    windows: tuple[tuple[int, int], ...]
+
+
+@dataclass
+class _SplitLoad:
+    plans: dict[PoolName, _PoolRangePlan]
+    exchanged: int = -1
+    failure: BaseException | None = None
+    # Batch-level agreement, accumulated on device and read once, at the last
+    # layer group. Reading it per group blocks the forward thread behind every
+    # kernel already queued on the stream, which costs far more than the
+    # exchange itself.
+    status: torch.Tensor | None = None
+    rows: dict[tuple[PoolName, int], torch.Tensor] = field(default_factory=dict)
 
 
 # One queued offload: the pools it resolved to, and the event guarding its KV.
@@ -203,11 +244,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._offload_coalesce_pages = max(
             1, int(os.getenv("UMBP_OFFLOAD_COALESCE_PAGES", "1024"))
         )
-        if _config_bool(os.getenv("UMBP_LOAD_SPLIT") or "0", "UMBP_LOAD_SPLIT"):
-            raise ValueError(
-                "UMBP_LOAD_SPLIT is not supported by the dedup-after-insert "
-                "load flow: ranks may receive different page sets and deadlock."
-            )
+        split_requested = _config_bool(
+            os.getenv("UMBP_LOAD_SPLIT") or "0", "UMBP_LOAD_SPLIT"
+        )
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self._async_offload_index_snapshot = True
@@ -247,6 +286,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
+        self._split_load = False
+        self._split_state: dict[int, _SplitLoad] = {}
+        self._lookup_pages: dict[str, list[str]] = {}
+        self._pending_pages: dict[str, list[str] | None] = {}
+        if split_requested:
+            self._init_split(params, tp_rank)
         extra_config = _parse_storage_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
@@ -386,11 +431,23 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.close()
             raise
 
-        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self.layer_done_counter = LayerWiseLoadCounter(
+            self.num_layers,
+            self._exchange_ready_groups if self._split_load else None,
+        )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
+        # 0 disables the gate. A positive value vetoes split batches while the
+        # tier is too idle for the split to pay for itself; the opening minutes
+        # are ignored because warmup is not the steady state it calibrates to.
+        self._split_min_rate = float(os.getenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0"))
+        self._split_rate_min_seconds = float(
+            os.getenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
+        )
+        self._split_rate_start = time.monotonic()
+        self._split_loads_seen = 0
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
         self._load_queue: Queue[
@@ -406,6 +463,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
         }
+        if self._split_load:
+            self._stats.update(
+                split_batches=0,
+                # Rank-local: only nonempty candidate batches count as skipped.
+                split_skipped_batches=0,
+                split_divergent_pages=0,
+                split_local_pages=0,
+                # Kept apart from split_skipped_batches so a deliberate veto
+                # never reads as a failure.
+                split_rate_gated=0,
+                split_rate_milli=0,
+            )
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -419,6 +488,75 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
+
+    def _init_split(self, params: CacheInitParams, tp_rank: int) -> None:
+        parallel = get_parallel()
+        # rank_replicated is the same predicate the platform's other MLA paths
+        # use to share bytes across ranks. CP/DP/PP and disagg decode are
+        # rejected for rank numbering and lockstep, not for replication.
+        if (
+            not self.pool_group.rank_replicated
+            or parallel.attn_cp_size != 1
+            or parallel.enable_dp_attention
+            or parallel.pp_size != 1
+            or get_disagg().disaggregation_mode == "decode"
+        ):
+            raise ValueError(
+                "UMBP_LOAD_SPLIT requires rank-replicated KV, CP=PP=1, "
+                "no DP attention, and no disaggregation decode."
+            )
+        # KV-source pools only: resolve_transfers forces ALL_PAGES on exactly
+        # these, so every page in the agreed prefix exists. A SWA-source pool
+        # holds a trailing window, and reading before it fails the restore.
+        self._split_pools = [
+            name
+            for name, entry in self.pools.items()
+            if entry.indices_from_pool == PoolName.KV
+        ]
+        from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+        self._split_pg = get_attn_tp_group().device_group
+        self._split_rank = torch.distributed.get_rank(self._split_pg)
+        self._split_world = torch.distributed.get_world_size(self._split_pg)
+        if (self._split_rank, self._split_world) != (tp_rank, parallel.tp_size):
+            raise ValueError("UMBP split exchange group must match the TP keyspace.")
+        if self._split_world == 1:
+            return
+        self._split_cpu_group = (
+            params.attn_tp_cache_group
+            if params.attn_tp_cache_group is not None
+            else params.tp_cache_group
+        )
+        self._split_min_pages = max(
+            1, int(os.getenv("UMBP_LOAD_SPLIT_MIN_PAGES", "16"))
+        )
+        self._split_max_rids = max(1, int(os.getenv("UMBP_LOAD_SPLIT_MAX_RIDS", "8")))
+        capacity = int(os.getenv("UMBP_LOAD_SPLIT_STAGING_MIB", "512")) << 20
+        if capacity <= 0:
+            raise ValueError("UMBP_LOAD_SPLIT_STAGING_MIB must be positive.")
+        for name in self._split_pools:
+            for component in self.pools[name].buffer_meta:
+                for _, stride, size in component:
+                    if stride <= 0 or size % stride:
+                        raise ValueError(
+                            f"UMBP split pool {name} has invalid row geometry."
+                        )
+        device = self.pools[self._split_pools[0]].components[0][0].device
+        # Only forward touches this buffer, on its compute stream. It is never
+        # an I/O destination, so it needs neither registration nor loader fences.
+        self._split_recv = torch.empty(capacity, dtype=torch.uint8, device=device)
+        self._split_status = torch.empty(1, dtype=torch.int64, device=device)
+        self._split_agreement = torch.empty(
+            1 + 4 * self._split_max_rids, dtype=torch.int64
+        )
+        self._split_load = True
+        logger.info(
+            "UMBP split load requested: rank=%d/%d min_pages=%d staging=%.1f MiB",
+            self._split_rank,
+            self._split_world,
+            self._split_min_pages,
+            capacity / (1 << 20),
+        )
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -507,6 +645,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys or [])
         if not page_keys:
             return []
+        if self._split_load:
+            self._lookup_pages.pop(rid, None)
+            # Retain the existing snapshot. A match need not queue a load;
+            # build their inverse map only after admission, before the vote.
+            self._lookup_pages[rid] = page_keys
+            if len(self._lookup_pages) > SPLIT_LOOKUP_CACHE:
+                self._lookup_pages.pop(next(iter(self._lookup_pages)))
 
         valid_pages = list(range(1, len(page_keys) + 1))
         for transfer in expanded:
@@ -530,6 +675,23 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return valid_pages
 
+    def _restore_rate(self) -> float:
+        """Cumulative restores per second, the signal behind the split gate.
+
+        Not the load wait: splitting is what shortens the wait, so gating on it
+        would oscillate. The restore rate is invariant to the split yet still
+        separates the working points where splitting pays from those where it
+        does not.
+
+        Cumulative rather than trailing, because this is reached only while
+        loads are pending: a trailing window would sample the bursts and never
+        the quiet stretches between them.
+        """
+        elapsed = time.monotonic() - self._split_rate_start
+        if elapsed < self._split_rate_min_seconds:
+            return float("inf")  # too early to judge
+        return self._split_loads_seen / elapsed
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates
         # resident pages. The remaining transfer can therefore contain only a
@@ -542,6 +704,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if rid in self._pending:
             raise RuntimeError(f"UMBP load for rid={rid} is already queued.")
         self._pending[rid] = expanded
+        if self._split_load:
+            self._split_loads_seen += 1
+            self._pending_pages[rid] = self._lookup_pages.pop(rid, None)
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -556,31 +721,131 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return self._completed_loads.get_nowait()
 
     def start_layer_wise_loading(self) -> int:
+        # Even a rank whose COMMIT discarded every transfer must vote.
+        share = self._prepare_split_share() if self._split_load else None
+        self._pending_pages.clear()
         if not self._pending:
             return -1
         self._freeze_gc_once()
         pending = self._pending
         rids = list(pending)
-        plans = self._build_load_plans(list(pending.values()))
+        plans = self._build_load_plans(list(pending.values()), share=share)
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
+        if share is not None:
+            self._split_state[counter_index] = _SplitLoad(
+                {plan.name: plan for plan in plans if plan.all_locations is not None}
+            )
         self._load_queue.put((counter_index, rids, plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
+
+    def _prepare_split_share(self) -> _SplitShare | None:
+        agreed = self._split_agreement
+        agreed.zero_()
+        page_lists: list[list[str]] = []
+        positions: list[list[int]] = []
+        mask = None
+        try:
+            if not 0 < len(self._pending) <= self._split_max_rids:
+                raise ValueError("empty or oversized split batch")
+            # Rank-local, but it feeds the existing agreement, so one rank's
+            # veto makes every rank skip: no protocol change, no new collective.
+            if self._split_min_rate > 0:
+                rate = self._restore_rate()
+                # Recorded so a run shows what the gate saw, not just what it did.
+                self._stats["split_rate_milli"] = int(min(rate, 1e6) * 1000)
+                if rate < self._split_min_rate:
+                    self._stats["split_rate_gated"] += 1
+                    raise ValueError("restore rate below the split gate")
+            total = 0
+            for index, (rid, transfers) in enumerate(self._pending.items()):
+                lookup_keys = self._pending_pages[rid]
+                if lookup_keys is None:
+                    raise ValueError("split lookup metadata was evicted")
+                n = len(lookup_keys)
+                if total + n > SPLIT_MAX_PAGES:
+                    raise ValueError("split page mask exceeds its capacity")
+                page_map = {key: index for index, key in enumerate(lookup_keys)}
+                # Each logical source fans out to pools with the same keys.
+                sources = {self.pools[t.name].indices_from_pool: t for t in transfers}
+                for transfer in sources.values():
+                    for key in transfer.keys:
+                        page_map[key]  # Unknown keys veto the batch, on every rank.
+                kv = sources.get(PoolName.KV)
+                keys = list(kv.keys) if kv is not None else []
+                page_lists.append(keys)
+                positions.append([total + page_map[key] for key in keys])
+                # Stable across Python processes; leave the sign bit clear so
+                # both h and -h are representable in the agreement tensor.
+                h = int.from_bytes(
+                    blake2b(rid.encode(), digest_size=8).digest(), "little"
+                )
+                h &= (1 << 63) - 1
+                slot = 1 + 4 * index
+                agreed[slot], agreed[slot + 1] = h, -h
+                agreed[slot + 2], agreed[slot + 3] = n, -n
+                total += n
+            # Allocate and fill before voting: a local preparation failure must
+            # not leave peers entering the second collective without this rank.
+            mask = torch.zeros(2 * total, dtype=torch.int32)
+            for indices in positions:
+                mask[indices] = 1
+                mask[[total + index for index in indices]] = -1
+            agreed[0] = 1
+        except (KeyError, ValueError, MemoryError, RuntimeError):
+            agreed[0] = 0
+
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MIN, group=self._split_cpu_group
+        )
+        slots = agreed[1:].view(-1, 4)
+        if not agreed[0].item() or not torch.equal(slots[:, ::2], -slots[:, 1::2]):
+            if self._pending:
+                self._stats["split_skipped_batches"] += 1
+            return None
+        torch.distributed.all_reduce(
+            mask, op=torch.distributed.ReduceOp.MIN, group=self._split_cpu_group
+        )
+        common = mask[:total].nonzero().flatten().tolist()
+        count = len(common)
+        self._stats["split_divergent_pages"] += int(-mask[total:].sum()) - count
+        self._stats["split_local_pages"] += sum(map(len, positions)) - count
+        if count < self._split_min_pages or any(
+            self._split_layout(count, group)[1] * self._split_world
+            > self._split_recv.numel()
+            for group in self._layer_groups()
+        ):
+            self._stats["split_skipped_batches"] += 1
+            return None
+        windows = _split_windows(count, self._split_world)
+        start, end = windows[self._split_rank]
+        owned = set(common[start:end])
+        common = set(common)
+        ordered = [
+            sorted(zip(indices, keys)) for indices, keys in zip(positions, page_lists)
+        ]
+        self._stats["split_batches"] += 1
+        return _SplitShare(
+            [[key for index, key in pages if index in common] for pages in ordered],
+            [{key for index, key in pages if index in owned} for pages in ordered],
+            windows,
+        )
 
     def _build_load_plans(
         self,
         request_transfers: list[list[PoolTransfer]],
         *,
         materialize_indices: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        share: _SplitShare | None = None,
     ) -> list[_PoolRangePlan]:
         """Build a batch plan shared by load and offload."""
-        grouped: dict[PoolName, list[PoolTransfer]] = {}
-        for transfers in request_transfers:
+        grouped: dict[PoolName, list[tuple[int, PoolTransfer]]] = {}
+        for request_index, transfers in enumerate(request_transfers):
             for transfer in transfers:
-                grouped.setdefault(transfer.name, []).append(transfer)
+                grouped.setdefault(transfer.name, []).append((request_index, transfer))
 
         plans = []
         # One logical source can fan out to several physical pools (for
@@ -592,7 +857,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             entries_per_page = 1 if entry.packed else len(entry.components)
             keys: list[str] = []
             locations: list[int] = []
-            for transfer in transfers:
+            common_locations = (
+                []
+                if share is not None and entry.indices_from_pool == PoolName.KV
+                else None
+            )
+            for request_index, transfer in transfers:
                 page_keys = list(transfer.keys or [])
                 transfer_keys, multiplier = self._object_keys_for_pages(
                     page_keys, transfer
@@ -608,7 +878,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         f"UMBP pool {name} key count mismatch: "
                         f"keys={len(transfer_keys)} pages={len(page_keys)}."
                     )
-                keys.extend(transfer_keys)
                 indices = transfer.host_indices
                 if indices is None:
                     raise ValueError(f"UMBP pool {name} transfer has no indices.")
@@ -621,15 +890,48 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         else _materialize_cpu_indices(indices)
                     )
                     cpu_indices[source_id] = prepared_indices
-                locations.extend(entry.prepare_locations(prepared_indices))
+                rows = entry.prepare_locations(prepared_indices)
+                if len(rows) != len(page_keys):
+                    raise ValueError(
+                        f"UMBP pool {name} has different key and row counts."
+                    )
+                if common_locations is not None:
+                    by_key = dict(zip(page_keys, rows))
+                    common_keys = share.common[request_index]
+                    common_locations.extend(by_key[key] for key in common_keys)
+                    common_set = set(common_keys)
+                    keep = [
+                        index
+                        for index, key in enumerate(page_keys)
+                        if key not in common_set or key in share.owned[request_index]
+                    ]
+                    rows = [rows[index] for index in keep]
+                    transfer_keys = [
+                        key
+                        for index in keep
+                        for key in transfer_keys[
+                            index * multiplier : (index + 1) * multiplier
+                        ]
+                    ]
+                keys.extend(transfer_keys)
+                locations.extend(rows)
             if len(keys) != len(locations) * entries_per_page:
                 raise ValueError(
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "
                     f"rows={len(locations)} per_page={entries_per_page}."
                 )
-            plans.append(_PoolRangePlan(name, keys, locations, entries_per_page))
+            plans.append(
+                _PoolRangePlan(
+                    name,
+                    keys,
+                    locations,
+                    entries_per_page,
+                    common_locations,
+                    share.windows if common_locations is not None else (),
+                )
+            )
 
-        if not plans or not plans[0].keys:
+        if not plans or (share is None and not plans[0].keys):
             raise ValueError("Layer-wise UMBP load has no object keys.")
         return plans
 
@@ -845,6 +1147,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
     ) -> None:
+        released = 0
         try:
             ready_event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
@@ -886,8 +1189,17 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
+                released = group[-1] + 1
         except BaseException as error:
-            self.layer_done_counter.fail(counter_index, error)
+            state = self._split_state.get(counter_index)
+            if state is None:
+                self.layer_done_counter.fail(counter_index, error)
+            else:
+                # Let forward reach the next group vote even if this rank's
+                # read failed; failing its Future would bypass that collective.
+                state.failure = error
+                for layer in range(released, self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
             logger.exception("UMBP layer-wise load batch failed")
 
     def _layer_groups(self) -> list[list[int]]:
@@ -895,6 +1207,143 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             list(range(start, min(start + self.layer_group, self.num_layers)))
             for start in range(0, self.num_layers, self.layer_group)
         ]
+
+    def _split_layout(self, pages: int, group: list[int]):
+        layout = []
+        offset = 0
+        width = -(-pages // self._split_world)
+        # Static pool order, independent of rank-local COMMIT de-duplication.
+        for name in self._split_pools:
+            entry = self.pools[name]
+            for layer in group:
+                index = entry.layer_mapping.get(layer)
+                if index is None:
+                    continue
+                for component, meta in zip(entry.components, entry.buffer_meta):
+                    _, stride, size = meta[index]
+                    layout.append((name, component[index], size // stride, offset))
+                    offset += -(-(width * size) // 256) * 256
+        return layout, offset
+
+    def _split_rows(
+        self, state: _SplitLoad, name: PoolName, rank: int, span: int, device
+    ):
+        key = (name, rank)
+        if key not in state.rows:
+            plan = state.plans[name]
+            start, end = plan.windows[rank]
+            rows = torch.tensor(
+                plan.all_locations[start:end], dtype=torch.int64, device=device
+            )
+            if span > 1:
+                rows = (rows[:, None] + torch.arange(span, device=device)).reshape(-1)
+            state.rows[key] = rows
+        return state.rows[key]
+
+    @staticmethod
+    def _split_view(buffer: torch.Tensor, offset: int, rows: int, like: torch.Tensor):
+        size = rows * like.stride(0) * like.element_size()
+        return (
+            buffer[offset : offset + size].view(like.dtype).view(rows, *like.shape[1:])
+        )
+
+    def _exchange_ready_groups(self, counter_index: int, layer: int) -> None:
+        state = self._split_state.get(counter_index)
+        if state is None:
+            return
+        groups = self._layer_groups()
+        target = layer // self.layer_group
+        try:
+            while state.exchanged < target:
+                self._exchange_group(state, groups[state.exchanged + 1])
+                state.exchanged += 1
+            if target == len(groups) - 1 and state.status is not None:
+                # The one host read per batch. A rank that failed at group k is
+                # reported here rather than at k, so a few more layers run
+                # against KV that is discarded anyway; nothing can hang,
+                # because the allgather is issued unconditionally.
+                if not state.status.item():
+                    raise RuntimeError(
+                        "UMBP split load failed on at least one rank."
+                    ) from state.failure
+        finally:
+            if target == len(groups) - 1:
+                self._split_state.pop(counter_index, None)
+
+    def _exchange_group(self, state: _SplitLoad, group: list[int]) -> None:
+        failure = state.failure
+        # Deliberately outside the failure guard: `pages` comes from the plan
+        # agreed at prepare time, so every rank derives the same layout whether
+        # or not its own load succeeded. A rank returning early here would
+        # strand its peers in the allgather below. Anything raised here is
+        # symmetric, so it still propagates before any collective.
+        if self._split_recv.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("UMBP split load cannot run inside CUDA graph capture.")
+        pages = len(next(iter(state.plans.values())).all_locations)
+        layout, slot_bytes = self._split_layout(pages, group)
+        if failure is None:
+            try:
+                # Prepare *all* ranks' scatter indices before voting. Nothing
+                # that can fail locally may strand peers in the allgather.
+                for name, tensor, span, _ in layout:
+                    for rank in range(self._split_world):
+                        self._split_rows(state, name, rank, span, tensor.device)
+                base = self._split_rank * slot_bytes
+                for name, tensor, _, offset in layout:
+                    rows = state.rows[name, self._split_rank]
+                    if rows.numel():
+                        torch.index_select(
+                            tensor,
+                            0,
+                            rows,
+                            out=self._split_view(
+                                self._split_recv, base + offset, rows.numel(), tensor
+                            ),
+                        )
+            except BaseException as error:
+                failure = error
+
+        # The vote still runs every group -- it is what keeps a locally failed
+        # rank from stranding its peers -- but its result is read once, at the
+        # end of the batch, instead of draining the stream per group.
+        self._split_status.fill_(int(failure is None))
+        torch.distributed.all_reduce(
+            self._split_status, op=torch.distributed.ReduceOp.MIN, group=self._split_pg
+        )
+        if state.status is None:
+            state.status = self._split_status.clone()
+        else:
+            torch.minimum(state.status, self._split_status, out=state.status)
+        if failure is not None and state.failure is None:
+            # Keep the first local cause so the deferred raise can report it.
+            state.failure = failure
+        if not layout:
+            return
+        base = self._split_rank * slot_bytes
+        torch.distributed.all_gather_into_tensor(
+            self._split_recv[: slot_bytes * self._split_world],
+            self._split_recv[base : base + slot_bytes],
+            group=self._split_pg,
+        )
+        if failure is not None:
+            # Our rows are untrustworthy; the deferred check fails the batch.
+            return
+        for rank in range(self._split_world):
+            if rank == self._split_rank:
+                continue
+            for name, tensor, _, offset in layout:
+                rows = state.rows[name, rank]
+                if rows.numel():
+                    tensor.index_copy_(
+                        0,
+                        rows,
+                        self._split_view(
+                            self._split_recv,
+                            rank * slot_bytes + offset,
+                            rows.numel(),
+                            tensor,
+                        ),
+                    )
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
@@ -1040,6 +1489,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending.clear()
         self._load_queue.join()
         self._offload_queue.join()
+        self._lookup_pages.clear()
+        self._pending_pages.clear()
+        self._split_state.clear()
         while True:
             try:
                 self._offload_results.get_nowait()
