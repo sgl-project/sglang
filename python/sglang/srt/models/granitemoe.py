@@ -146,6 +146,10 @@ class GraniteMoeMoE(nn.Module):
             params_dtype=params_dtype,
             reduce_results=True,
             quant_config=quant_config,
+            # granitemoe_load_split_experts maps llmcompressor's per-expert
+            # tensors onto the `_packed` param names, which Mxfp4MoEMethod
+            # does not register.
+            serves_fused_mxfp4=False,
             prefix=f"{prefix}.experts",
         )
 
