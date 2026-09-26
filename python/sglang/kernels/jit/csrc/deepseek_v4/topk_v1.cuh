@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -14,8 +15,8 @@ namespace sglang {
 // `topk` is a *runtime* value (<= kMaxTopK), so one module serves every k. It
 // used to be baked in via -DSGL_TOPK, which built a separate module per k --
 // and because `kTopK` came from a macro rather than a template parameter, both
-// modules exported identically mangled symbols. The function-local static in
-// setup_kernel_smem_once() is emitted as STB_GNU_UNIQUE, which the loader
+// modules exported identically mangled symbols. The function-local static that
+// guarded the smem opt-in is emitted as STB_GNU_UNIQUE, which the loader
 // merges across every loaded object, so whichever module was used second
 // skipped its cudaFuncSetAttribute opt-in and then failed to launch with 64 KB
 // of dynamic shared memory ("invalid argument").
@@ -270,16 +271,6 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <auto* f, size_t kMaxDynamicSMEM>
-void setup_kernel_smem_once(host::DebugInfo where = {}) {
-  [[maybe_unused]]
-  static const auto result = [] {
-    const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-  }();
-  host::RuntimeDeviceCheck(result, where);
-}
-
 template <bool kUsePDL>
 struct TopKKernel {
   static constexpr auto kernel = topk_transform_kernel<kUsePDL>;
@@ -344,7 +335,7 @@ struct TopKKernel {
         .topk = topk,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
-    setup_kernel_smem_once<kernel, kSMEM_>();
+    runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap(), kSMEM_);
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }
 };
