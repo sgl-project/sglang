@@ -446,9 +446,11 @@ class TestSelectFfnCompletion(CustomTestCase):
 
 SRT_DIR = Path(sglang.__file__).resolve().parent / "srt"
 # Attributes a decoder layer holds its FFN, or parts of it, in. A layer that is
-# one FFN stage holds it in ``mixer``.
+# one FFN stage holds it in ``mixer``; a layer with several dense FFNs, in
+# ``mlps``.
 FFN_ATTRS = {
     "mlp",
+    "mlps",
     "moe",
     "shared_expert",
     "shared_experts",
@@ -493,17 +495,34 @@ class SourceIndex:
 
 
 def submodule_constructions(cls):
-    """(attribute, class name, call) for each `self.attr = Name(...)`."""
+    """(attribute, class name, call) for each `self.attr = Name(...)`, and for
+    each `Name(...)` in `self.attr = nn.ModuleList([...])`."""
     for node in ast.walk(cls):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-            func = node.value.func
             for target in node.targets:
                 if (
-                    isinstance(func, ast.Name)
-                    and isinstance(target, ast.Attribute)
+                    isinstance(target, ast.Attribute)
                     and getattr(target.value, "id", None) == "self"
                 ):
-                    yield target.attr, func.id, node.value
+                    for call in constructed(node.value):
+                        yield target.attr, call.func.id, call
+
+
+def constructed(call):
+    """The `Name(...)` calls a call builds: itself, or the elements of the list
+    an `nn.ModuleList` holds."""
+    if isinstance(call.func, ast.Name):
+        yield call
+    elif getattr(call.func, "attr", None) == "ModuleList" and call.args:
+        items = call.args[0]
+        elements = (
+            [items.elt]
+            if isinstance(items, ast.ListComp)
+            else getattr(items, "elts", [])
+        )
+        for element in elements:
+            if isinstance(element, ast.Call) and isinstance(element.func, ast.Name):
+                yield element
 
 
 def attention_tp_reductions(cls):
@@ -596,6 +615,10 @@ class TestFfnExitUsersOweATpSum(CustomTestCase):
         nemotron = "sglang.srt.models.nemotron_h"
         self.assertLessEqual(
             {(nemotron, "NemotronHMLP"), (nemotron, "NemotronHMoE")}, ffn_classes
+        )
+        # A layer with two dense FFNs holds them in an nn.ModuleList.
+        self.assertIn(
+            ("sglang.srt.models.longcat_flash", "LongcatFlashMLP"), ffn_classes
         )
         self.assertEqual(sorted(set(offenders)), [])
 
