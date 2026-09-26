@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-from typing import Iterator, List, Optional
+from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    candidate_block_mask,
+    mask_topk_scores,
+    select_candidate_block_ids,
+)
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_rows_per_tile,
+)
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateIndexer,
     CandidateMetadata,
     PrefillCandidateBlocks,
     PrefillIndexerInputs,
-    candidate_block_mask,
-    mask_topk_scores,
-    select_candidate_block_ids,
-)
-from sglang.srt.layers.attention.mqa_logits_utils import (
-    mqa_logits_row_bytes,
-    mqa_logits_rows_per_chunk,
 )
 from sglang.srt.utils.common import ceil_align
 
@@ -63,7 +64,9 @@ def dense_prefill_topk(
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
         return selected, published
-    rows_per_chunk = _rows_per_chunk(row, width, heads=q[0].shape[1])
+    rows_per_chunk = flat_index_logits_rows_per_tile(
+        row, width, heads=q[0].shape[1], budget_bytes=_SCORE_BUDGET_BYTES
+    )
     for offset in range(0, row, rows_per_chunk):
         rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
@@ -81,52 +84,6 @@ def dense_prefill_topk(
             consume=candidates,
         )
     return selected, published
-
-
-def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
-    """Query rows per logits tile so one fp32 [rows, width] tile fits the
-    budget; the row count stays a multiple of the kernel's row alignment."""
-    row_alignment = 128 // heads
-    rows_per_chunk = mqa_logits_rows_per_chunk(
-        num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_SCORE_BUDGET_BYTES,
-    )
-    if rows_per_chunk is None:
-        return rows
-    return max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
-
-
-def score_tiles(
-    inputs: PrefillIndexerInputs, *, width_align: int = 4
-) -> Iterator[tuple[slice, torch.Tensor]]:
-    """The dense scores of ``inputs`` row tile by row tile under the budget:
-    ``(rows, logits)`` with fp32 ``logits[i, j]`` the score of query row
-    ``rows.start + i`` against ``kv[request_starts + j]``, garbage past the row's
-    ``compress_lens``; the width is the batch's largest context aligned to
-    ``width_align`` columns."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
-    rows = inputs.num_rows
-    width = ceil_align(max(inputs.lens_per_request, default=0), width_align)
-    if rows == 0 or width == 0:
-        return
-    rows_per_chunk = _rows_per_chunk(rows, width, heads=inputs.q_fp4.shape[1])
-    for offset in range(0, rows, rows_per_chunk):
-        tile = slice(offset, min(offset + rows_per_chunk, rows))
-        starts = inputs.request_starts[tile]
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
-                (inputs.q_fp4[tile], inputs.q_sf[tile]),
-                inputs.kv,
-                inputs.weights[tile],
-                starts,
-                starts + inputs.compress_lens[tile],
-                False,
-                width,
-            ),
-        )
 
 
 def _dense_topk(
@@ -235,7 +192,7 @@ def _select_tile(
 ) -> None:
     from deep_gemm import fp8_fp4_mqa_logits
 
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
     logits = fp8_fp4_mqa_logits(q, kv, weights, starts, starts + lengths, False, width)
     if publish is not None or consume is not None:

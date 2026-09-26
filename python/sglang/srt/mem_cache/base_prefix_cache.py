@@ -89,10 +89,12 @@ class InsertParams:
 
     # SWA specific
     prev_prefix_len: int = 0
-    swa_evicted_seqlen: int = 0
     swa_branching_seqlen: Optional[int] = None
 
     # General
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
     chunked: bool = False
     priority: int = 0
     session_id: Optional[str] = None
@@ -102,6 +104,12 @@ class InsertParams:
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        self.component_evicted_seqlens[component_type] = length
 
 
 @dataclasses.dataclass
@@ -164,24 +172,41 @@ class IncLockRefResult:
     """Receipt returned by ``inc_lock_ref``.
 
     ``node_id`` is the anchor the lock was taken on; a release replays the
-    receipt on that node only. The SWA UUID marks the segment boundary;
-    ``None`` means root. ``skipped_lock_components`` records the components
-    the acquire left untaken, so the release leaves them untouched.
+    receipt on that node only. A recorded UUID marks a segment boundary;
+    ``None`` means root, while an absent entry means no receipt.
+    ``skipped_lock_components`` records the components the acquire left
+    untaken, so the release leaves them untouched.
     """
 
     delta: Optional[int] = None
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def set_lock_uuid(
+        self,
+        component_type: ComponentType,
+        uuid: Optional[int],
+        *,
+        lock_host: bool = False,
+    ) -> None:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        uuids[component_type] = uuid
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             node_id=self.node_id,
-            swa_uuid_for_lock=self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skipped_lock_components=tuple(self.skipped_lock_components),
+            component_lock_uuids=dict(self.component_lock_uuids),
+            component_host_lock_uuids=dict(self.component_host_lock_uuids),
         )
 
 
@@ -189,16 +214,28 @@ class IncLockRefResult:
 class DecLockRefParams:
     """Receipt required by unified-tree ``dec_lock_ref``.
 
-    Fields default to nothing-acquired, so a lost receipt under-releases (a
-    leak the sanity checks report) instead of releasing another holder's
-    lock. ``node_id`` is ``None`` only for receipts that never came from a
-    unified-tree acquire (legacy caches, session sentinels).
+    A segment release requires its component's boundary entry; a missing
+    entry must not be treated as a lock reaching the root. ``node_id`` is
+    ``None`` only for receipts that never came from a unified-tree acquire
+    (legacy caches, session sentinels).
     """
 
     node_id: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def get_lock_uuid(
+        self, component_type: ComponentType, *, lock_host: bool = False
+    ) -> Optional[int]:
+        uuids = (
+            self.component_host_lock_uuids if lock_host else self.component_lock_uuids
+        )
+        return uuids[component_type]
 
 
 @dataclasses.dataclass
@@ -444,7 +481,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
-            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
             swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 

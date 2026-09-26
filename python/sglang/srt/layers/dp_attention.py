@@ -518,6 +518,7 @@ def get_dp_local_slice_cpu(
 
 
 from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.srt.distributed.utils import all_gather_single
 
 
 # TODO: write c++ kernel for cpu
@@ -606,7 +607,7 @@ def _dp_gather_via_all_gather(
 
     if get_parallel().attn_tp_size == 1:
         if use_world:
-            torch.distributed.all_gather_into_tensor(
+            all_gather_single(
                 global_tokens,
                 local_tokens,
                 group=torch.distributed.group.WORLD,
@@ -625,7 +626,7 @@ def _dp_gather_via_all_gather(
         scattered_local_tokens, local_tokens
     )
     if use_world:
-        torch.distributed.all_gather_into_tensor(
+        all_gather_single(
             global_tokens,
             scattered_local_tokens,
             group=torch.distributed.group.WORLD,

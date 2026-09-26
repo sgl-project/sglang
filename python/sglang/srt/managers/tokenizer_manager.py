@@ -740,6 +740,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
+        # Preserve the adapter ID across incomplete cleanup retries.
+        self.pending_lora_unloads: Dict[str, str] = {}
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
@@ -2397,12 +2399,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
-                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
-                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
-                    if output_sampling_logprobs is not None:
-                        state.output_token_sampling_logprobs.extend(
-                            output_sampling_logprobs[i]
-                        )
+                    masks, logprobs = output_sampling_mask[i].to_lists(
+                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
+                    )
+                    state.output_token_sampling_mask.extend(masks)
+                    state.output_token_sampling_logprobs.extend(logprobs)
                     meta_info["output_token_sampling_mask"] = (
                         state.output_token_sampling_mask
                     )

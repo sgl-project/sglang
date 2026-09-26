@@ -480,6 +480,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        self.publish_attn_lora_layout()
         if self.is_first_layer:
             if get_attn_tp_context().input_scattered:
                 hidden_states, _ = tp_reduce_scatter(
@@ -525,6 +526,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        self.publish_mlp_lora_layout()
         if cache is not None:
             self._context.cache = cache
 

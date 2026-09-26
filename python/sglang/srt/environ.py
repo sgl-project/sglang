@@ -576,6 +576,16 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
+    # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
+    # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
+    # nothing else; at any other page size the view is never built and this
+    # flag does nothing whichever way it is set. Where it does apply the win
+    # grows with context (~1-2% throughput and 3-7% TTFT at 60k and above) and
+    # is flat to marginally negative at moderate ISL, so this is a per-workload
+    # switch rather than a pure kill-switch. Off falls back to the contiguous
+    # gather path. Default on.
+    SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
@@ -978,10 +988,6 @@ class Envs:
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
-    # Write K and V into the FIA paged KV cache with a single
-    # npu_scatter_pa_kv_cache call instead of two npu_scatter_nd_update_
-    # kernels (one write kernel launch instead of two per layer).
-    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
