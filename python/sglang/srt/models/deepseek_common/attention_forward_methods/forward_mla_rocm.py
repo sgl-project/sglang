@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -141,6 +142,40 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         fused_fp8_bmm_rope_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
+    )
+    from sglang.srt.models.deepseek_common.utils import (
+        flatten_fp8_per_token_quant,
+        fused_rms_fp8_per_token_quant,
+    )
+
+
+def _run_ptpc_qk_norm(
+    attn: DeepseekV2AttentionMLA,
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    q_quanted, q_unquantized, k_nope, _ = fused_rms_fp8_per_token_quant(
+        q,
+        attn.q_a_layernorm.weight,
+        attn.q_a_layernorm.variance_epsilon,
+        k_nope,
+        attn.kv_a_layernorm.weight,
+        attn.kv_a_layernorm.variance_epsilon,
+        dtype_quant=torch.float8_e4m3fn,
+        output_unquantized_inp1=attn.use_dsa,
+    )
+    return q_quanted, q_unquantized, k_nope
+
+
+def _maybe_quant_ptpc_o_proj_input(
+    attn: DeepseekV2AttentionMLA,
+    attn_output: torch.Tensor,
+):
+    if not fp8_proj_gemm_active(attn.o_proj):
+        return attn_output
+    return flatten_fp8_per_token_quant(
+        attn_output.contiguous(),
+        dtype_quant=torch.float8_e4m3fn,
     )
 
 
@@ -485,6 +520,12 @@ class DeepseekMLARocmForwardMixin:
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
+            elif (
+                _use_aiter_gfx95
+                and not q_replicate_active
+                and fp8_proj_gemm_active(self.q_b_proj)
+            ):
+                q, q_lora, k_nope = _run_ptpc_qk_norm(self, q, k_nope)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                     q,
@@ -1028,6 +1069,7 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        attn_bmm_output = _maybe_quant_ptpc_o_proj_input(self, attn_bmm_output)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
