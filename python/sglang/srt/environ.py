@@ -1537,9 +1537,11 @@ class Envs:
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
-    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
-    # anonymous mapping per rank holding only its rows, gathered with the
-    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    # lookup all-reduce (the ranks must share a PID namespace); "numa_shared" is
+    # one complete copy per GPU NUMA node, MPOL_BIND'd before first touch, also
+    # with no all-reduce (experimental: host memory scales with the node count);
+    # "per_rank" is one anonymous mapping per rank holding only its rows, gathered
+    # with the all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
