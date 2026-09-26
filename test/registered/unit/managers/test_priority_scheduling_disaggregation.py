@@ -3,7 +3,7 @@ import sys
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
@@ -407,6 +407,47 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.release_aborted_prefill_waiting_req.assert_called_once()
         scheduler.tree_cache.finish.assert_called_once()
         release.assert_not_called()
+
+    def test_decode_waiting_abort_releases_hisparse_slots_first(self):
+        """A PD-decode waiting request already holds a HiSparse device buffer and
+        host slots; abort must hand them back before its KV row is freed."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+        req = MagicMock(rid="req")
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_req = None
+        scheduler.mm_receiver = None
+        scheduler.waiting_queue = [req]
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hicache_storage = False
+        scheduler.ipc_channels = MagicMock()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.enable_hisparse = True
+        scheduler.hisparse_coordinator = MagicMock()
+        scheduler.dllm_config = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.collect_inflight_reqs = MagicMock(return_value=set())
+        scheduler.tree_cache = MagicMock()
+
+        order = MagicMock()
+        with (
+            patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
+            patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
+        ):
+            order.attach_mock(scheduler.hisparse_coordinator.request_finished, "finish")
+            order.attach_mock(release, "release")
+            get_serving.return_value.weight_version = None
+            scheduler.abort_request(AbortReq(rid="req"))
+
+        self.assertEqual(
+            order.mock_calls[:2],
+            [call.finish(req), call.release(req, scheduler.tree_cache)],
+        )
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
