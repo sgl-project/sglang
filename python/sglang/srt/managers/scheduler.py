@@ -17,6 +17,7 @@ import dataclasses
 import faulthandler
 import logging
 import math
+import operator
 import os
 import signal
 import sys
@@ -377,6 +378,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_SCHEDULE_BATCH_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(ScheduleBatch))
+_SCHEDULE_BATCH_FIELD_GETTER = operator.attrgetter(*_SCHEDULE_BATCH_FIELD_NAMES)
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -4257,16 +4260,21 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, batch: ScheduleBatch):
+    def record_batch_in_overlap(self, batch: ScheduleBatch, field_snapshot=None):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        if field_snapshot is not None:
+            attr_snapshot = (field_snapshot, batch.sampling_info)
+        elif type(batch) is ScheduleBatch:
+            attr_snapshot = _SCHEDULE_BATCH_FIELD_GETTER(batch)
+        else:
+            attr_snapshot = [
+                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
@@ -4292,11 +4300,18 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        sched_snapshot = None
+        if snapshot_v2_full:
+            if type(batch) is ScheduleBatch:
+                sched_snapshot = dict(
+                    zip(
+                        _SCHEDULE_BATCH_FIELD_NAMES, _SCHEDULE_BATCH_FIELD_GETTER(batch)
+                    )
+                )
+            else:
+                sched_snapshot = {
+                    f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)
+                }
         sched_sampling_info = batch.sampling_info
 
         # 2. sampling_info substitute
@@ -4305,14 +4320,17 @@ class Scheduler(
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:
-            self.record_batch_in_overlap(batch)
+            self.record_batch_in_overlap(batch, sched_snapshot)
 
         try:
             yield
         finally:
             if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
+                if type(batch) is ScheduleBatch:
+                    batch.__dict__.update(sched_snapshot)
+                else:
+                    for name, value in sched_snapshot.items():
+                        setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
 
