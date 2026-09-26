@@ -197,6 +197,10 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         if _is_cpu:
+            if not layer.use_intel_amx_backend:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A8 INT8 requires AMX-packed weights."
+                )
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
