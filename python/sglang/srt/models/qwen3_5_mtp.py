@@ -98,6 +98,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     # excluded attention projection is not recognised as excluded.
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
