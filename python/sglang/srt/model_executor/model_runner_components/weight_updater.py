@@ -16,7 +16,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_context, get_model, get_spec
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -47,6 +47,15 @@ def _unsupported_derived_weight_cache_error(
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
+    if (
+        get_context().is_config_namespace_published("spec")
+        and get_spec().speculative_dspark_lora_paths is not None
+    ):
+        return (
+            "Online weight updates are not supported with per-request DSpark "
+            "draft adapters. Restart the server to rebuild the adapter bank "
+            "from the new base weights."
+        )
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None

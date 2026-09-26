@@ -191,6 +191,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
+        if get_spec().speculative_dspark_lora_path and not getattr(
+            self.draft_model, "_dspark_lora_loaded", False
+        ):
+            raise ValueError(
+                "--speculative-dspark-lora-path requires a dense DSpark draft "
+                "loaded through DSparkDraftMixin.load_weights; this architecture "
+                "or checkpoint loader does not support it."
+            )
+        self._draft_adapter_bank = getattr(self.draft_model, "draft_adapter_bank", None)
+        if (
+            get_spec().speculative_dspark_lora_paths is not None
+            and self._draft_adapter_bank is None
+        ):
+            raise ValueError(
+                "The draft architecture/loader did not load the adapter bank."
+            )
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -570,6 +586,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             return batch_output
+        if self._draft_adapter_bank is not None and batch.reqs:
+            from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+                homogeneous_draft_adapter,
+            )
+
+            adapter = homogeneous_draft_adapter(
+                [req.draft_adapter for req in batch.reqs]
+            )
+            self._draft_adapter_bank.activate(adapter)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()

@@ -119,6 +119,21 @@ def _resolve_speculative_algorithm_alias(
 
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    if cfg.speculative_dspark_lora_paths is not None:
+        from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+            validate_draft_adapter_server_config,
+        )
+
+        validate_draft_adapter_server_config(cfg)
+    if cfg.speculative_dspark_lora_path:
+        from sglang.srt.speculative.dspark_components.dspark_lora import (
+            validate_dspark_lora_args,
+        )
+
+        validate_dspark_lora_args(
+            algorithm=cfg.speculative_algorithm,
+            draft_load_format=cfg.speculative_draft_load_format or cfg.load_format,
+        )
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None

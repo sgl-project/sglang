@@ -1254,6 +1254,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
             lora_path=lora_path,
+            draft_adapter=request.draft_adapter,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
