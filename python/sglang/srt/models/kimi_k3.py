@@ -9,6 +9,7 @@
 import logging
 import os
 import re
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -2013,7 +2014,7 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
 
                 if (
                     _is_hip
@@ -2029,7 +2030,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2295,7 +2297,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
                     gate = self._compute_output_gate(gate_input)
-                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
+                    from sglang.kernels.ops.attention import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
@@ -3149,6 +3151,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
+        # taps already capture here, so reuse them without the usual +1 shift.
+        self.set_dspark_layers_to_capture(layer_ids)
+
     @torch.no_grad()
     def forward(
         self,
@@ -3605,6 +3612,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return 0
         return self.language_model.get_pp_proxy_dspark_hidden_size()
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
             raise AttributeError(
@@ -3814,7 +3828,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

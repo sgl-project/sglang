@@ -106,9 +106,23 @@ fn without_forwarding(mut cfg: Config, policy: PolicyKind) -> Config {
     cfg
 }
 
+fn without_minted_rid(mut body: Value) -> Value {
+    let rid = body
+        .as_object_mut()
+        .expect("a forwarded chat body is an object")
+        .remove("rid");
+    assert!(
+        rid.as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(crate::common::is_engine_shaped_rid),
+        "plain mode must mint an abort rid; got {rid:?}",
+    );
+    body
+}
+
 async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
     assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
-    assert_eq!(captured(mock), *request);
+    assert_eq!(without_minted_rid(captured(mock)), *request);
     assert!(!ctx
         .metrics
         .render()
@@ -428,6 +442,6 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
         } else {
             assert!(ids.is_none());
         }
-        assert_eq!(captured(&mock), request);
+        assert_eq!(without_minted_rid(captured(&mock)), request);
     }
 }

@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_xpu
 
+from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
 
 
@@ -121,6 +122,30 @@ def topk_transform_paged(
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
+
+
+def topk_transform_paged_torch(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """The torch ``topk_transform_paged``: top-``k`` (``k = out_page_indices.shape[1]``)
+    of each row within its first ``seq_lens[b]`` columns, ascending, as pool slots
+    through ``page_tables`` and as positions when given; ``-1`` padded."""
+    topk = out_page_indices.shape[1]
+    columns = torch.arange(scores.shape[1], device=seq_lens.device)
+    lens_c = seq_lens.unsqueeze(-1)
+    # Columns past a row's length hold garbage.
+    s = scores.masked_fill(columns[None, :] >= lens_c, -torch.inf)
+    idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+    reach = idx < lens_c
+    slots = page_tables.gather(-1, idx // page_size) * page_size + (idx % page_size)
+    out_page_indices.copy_(torch.where(reach, slots, -1).to(torch.int32))
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
 
 
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
@@ -300,4 +325,19 @@ def topk_transform_packed_v2(
         out_page_indices,
         page_size,
         row_to_batch,
+    )
+
+
+def topk_transform_sparse(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    phys_blocks: torch.Tensor,
+    page_indices: torch.Tensor,
+) -> None:
+    """Top-``k`` (``k = page_indices.shape[1]``) of each row of the bf16 sparse
+    ``logits`` within its first ``valid_lens[b]`` columns, as pool slots through
+    ``phys_blocks`` (the published blocks as pool slots / 8); ``-1`` padded,
+    unordered."""
+    topk_transform_bf16_small(
+        logits, valid_lens, phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
     )

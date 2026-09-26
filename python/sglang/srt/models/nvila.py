@@ -1,5 +1,6 @@
 import itertools
 import math
+from array import array
 from collections.abc import Iterable
 from typing import Any
 
@@ -218,9 +219,7 @@ class NVILAForConditionalGeneration(nn.Module):
                 )
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
