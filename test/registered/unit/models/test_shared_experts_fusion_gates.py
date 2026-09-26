@@ -21,6 +21,7 @@ import unittest.mock
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -58,17 +59,26 @@ class _FusionGateCase(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def _reason(self, model_class, hf_config, quant_config=None, moe_ep_size=1):
+    def _reason(
+        self,
+        model_class,
+        hf_config,
+        quant_config=None,
+        moe_ep_size=1,
+        tp_size=None,
+    ):
         # The gates consult the live EP size; without a group installed the
         # canonical getter asserts, so every case states a topology.
+        explicit_tp_size = tp_size is not None
+        tp_size = moe_ep_size if tp_size is None else tp_size
         with get_parallel().override(
-            tp_size=moe_ep_size,
-            attn_tp_size=moe_ep_size,
+            tp_size=tp_size,
+            attn_tp_size=tp_size,
             attn_dp_size=1,
             attn_cp_size=1,
             moe_ep_size=moe_ep_size,
             moe_dp_size=1,
-            moe_tp_size=1,
+            moe_tp_size=tp_size // moe_ep_size if explicit_tp_size else 1,
         ):
             return model_class.shared_experts_fusion_disable_reason(
                 hf_config, quant_config
@@ -270,6 +280,181 @@ class TestGlmMoeGate(_FusionGateCase):
             GlmMoeDsaForCausalLM.fused_shared_experts_architecture,
             "GlmMoeDsaForCausalLM",
         )
+
+
+class TestGlm5NextGate(_FusionGateCase):
+    def _config(self, **kw):
+        base = dict(
+            model_type="glm5_next_text",
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            n_routed_experts=288,
+            n_shared_experts=1,
+            num_experts_per_tok=8,
+            hidden_act="silu",
+            swiglu_limit=10.0,
+            first_k_dense_replace=3,
+            num_hidden_layers=46,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _fp8(self, **kw):
+        base = dict(
+            get_name=lambda: "fp8",
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            activation_scheme="dynamic",
+            ignored_layers=[],
+            packed_modules_mapping={},
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _reason_on_gfx950(self, *, tp_size=4, config=None, quant=None, ep_size=1):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", False),
+            unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", True),
+        ):
+            return self._reason(
+                glm5_next.Glm5NextForConditionalGeneration,
+                config or self._config(),
+                quant or self._fp8(),
+                moe_ep_size=ep_size,
+                tp_size=tp_size,
+            )
+
+    def test_exact_tp4_and_tp8_contract_is_admitted(self):
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIsNone(self._reason_on_gfx950(tp_size=tp_size))
+
+    def test_unvalidated_tp_and_expert_geometry_are_rejected(self):
+        self.assertIn("TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+        self.assertIn(
+            "E=288/topk=8",
+            self._reason_on_gfx950(config=self._config(n_routed_experts=256)),
+        )
+        self.assertIn(
+            "E=288/topk=8",
+            self._reason_on_gfx950(config=self._config(num_experts_per_tok=4)),
+        )
+
+    def test_activation_and_block_fp8_contracts_are_rejected_independently(self):
+        self.assertIn(
+            "clamped SiLU G1U1",
+            self._reason_on_gfx950(config=self._config(swiglu_limit=None)),
+        )
+        self.assertIn(
+            "128x128 block-FP8",
+            self._reason_on_gfx950(quant=self._fp8(weight_block_size=[1, 128])),
+        )
+        self.assertIn(
+            "128x128 block-FP8",
+            self._reason_on_gfx950(quant=_quant("compressed-tensors")),
+        )
+
+    def test_mixed_routed_or_shared_expert_precision_is_rejected(self):
+        for suffix in ("experts", "shared_experts"):
+            with self.subTest(suffix=suffix):
+                quant = self._fp8(ignored_layers=[f"model.layers.3.mlp.{suffix}"])
+                self.assertIn(
+                    "same block-FP8 layout",
+                    self._reason_on_gfx950(quant=quant),
+                )
+
+    def test_ep_and_a2a_topologies_are_rejected(self):
+        import sglang.srt.models.glm5_next as glm5_next
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+
+        self.assertIn(
+            "expert parallelism",
+            self._reason_on_gfx950(tp_size=4, ep_size=2),
+        )
+        with unittest.mock.patch.object(
+            glm5_next, "get_moe_a2a_backend", return_value=MoeA2ABackend.MORI
+        ):
+            self.assertIn("A2A backend", self._reason_on_gfx950())
+
+    def test_hip_without_aiter_gfx950_is_rejected(self):
+        import sglang.srt.models.glm5_next as glm5_next
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(glm5_next, "_is_cuda", False),
+            unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", False),
+        ):
+            reason = self._reason(
+                glm5_next.Glm5NextForConditionalGeneration,
+                self._config(),
+                self._fp8(),
+                tp_size=4,
+            )
+        self.assertIn("AITER on a gfx950", reason)
+
+    def test_shared_checkpoint_weights_load_into_appended_expert_288(self):
+        """Enabling fusion must not silently drop the separately named shared
+        tensors; all three projections must reach the appended physical slot."""
+        from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+            DeepseekV2WeightLoaderMixin,
+        )
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        loaded = []
+
+        class Param:
+            def weight_loader(
+                self,
+                _param,
+                loaded_weight,
+                candidate,
+                *,
+                shard_id,
+                expert_id,
+            ):
+                loaded.append((loaded_weight, candidate, shard_id, expert_id))
+
+        class Model:
+            config = SimpleNamespace(n_routed_experts=288)
+            num_fused_shared_experts = 1
+            quant_config = None
+            encoder_only = False
+            language_only = True
+
+            def named_parameters(self):
+                return [
+                    ("model.layers.3.mlp.experts.w13_weight", Param()),
+                    ("model.layers.3.mlp.experts.w2_weight", Param()),
+                ]
+
+        weights = [
+            (
+                f"model.layers.3.mlp.shared_experts.{projection}.weight",
+                torch.full((1,), value),
+            )
+            for value, projection in enumerate(
+                ("gate_proj", "down_proj", "up_proj"), start=1
+            )
+        ]
+        with unittest.mock.patch.object(
+            DeepseekV2WeightLoaderMixin, "post_load_weights"
+        ):
+            Glm5NextForConditionalGeneration.load_weights(Model(), weights)
+
+        self.assertEqual([entry[2] for entry in loaded], ["w1", "w2", "w3"])
+        self.assertEqual([entry[3] for entry in loaded], [288, 288, 288])
+        self.assertEqual(
+            [entry[1] for entry in loaded],
+            [
+                "model.layers.3.mlp.experts.w13_weight",
+                "model.layers.3.mlp.experts.w2_weight",
+                "model.layers.3.mlp.experts.w13_weight",
+            ],
+        )
+        self.assertEqual([entry[0].item() for entry in loaded], [1, 2, 3])
 
 
 class TestMiniMaxGates(_FusionGateCase):
