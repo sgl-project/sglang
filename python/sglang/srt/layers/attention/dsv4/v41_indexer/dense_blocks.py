@@ -293,7 +293,7 @@ def _consume_prefill_blocks(
     block_size: int,
 ) -> torch.Tensor:
     selected = data.empty_selection(topk)
-    for tile, logits in score_tiles(data, kv, width_align=4):
+    for tile, logits in score_tiles(data, kv, width_align=block_size):
         _consume_tile_blocks(
             data=data,
             tile=tile,
@@ -320,8 +320,9 @@ def _consume_tile_blocks(
     starts = data.request_starts[tile]
     for rows, lc in _requests_in_tile(data, tile):
         # Columns past a row's length hold garbage; topk_among_blocks drops them.
+        # The slice is block-aligned (the tile is), so the op gathers in place.
         positions = topk_among_blocks(
-            logits[rows, :lc],
+            logits[rows, : -(-lc // block_size) * block_size],
             lens[rows],
             blocks[rows],
             out.shape[1],

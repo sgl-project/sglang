@@ -177,19 +177,30 @@ def topk_among_blocks(
     ``[rows, n]`` (``-1`` padded) and its causal ``lens``: int64 ``[rows, k]``
     positions, unordered, ``-1`` where fewer than ``k`` candidates are finite."""
     rows, width = scores.shape
-    if width == 0:
+    n = blocks.shape[1]
+    if width == 0 or n == 0:
         return torch.full((rows, k), -1, dtype=torch.int64, device=scores.device)
-    offsets = torch.arange(block_size, device=scores.device)
-    columns = (blocks.to(torch.int64)[:, :, None] * block_size + offsets).flatten(1)
-    valid = (
-        (blocks >= 0).repeat_interleave(block_size, dim=1)
-        & (columns < lens.to(torch.int64)[:, None])
-        & (columns < width)
+    if width % block_size:
+        # A block-aligned width lets the gather below index blocks, not columns;
+        # callers on the DeepGEMM path slice their tile to one so this is a no-op.
+        scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
+    num_blocks = scores.shape[1] // block_size
+    by_block = scores.unflatten(1, (num_blocks, block_size))
+    ids = blocks.to(torch.int64).clamp_(0, num_blocks - 1)
+    # [rows, n, block_size], the only scratch of the row count's size
+    candidates = by_block.gather(1, ids[:, :, None].expand(rows, n, block_size))
+    # column j of block b is position b * block_size + j, kept if b is a real
+    # block and the position is causal: j < lens - b * block_size
+    offsets = torch.arange(block_size, device=scores.device, dtype=torch.int32)
+    room = lens.to(torch.int32)[:, None] - blocks.to(torch.int32) * block_size
+    valid = (blocks >= 0)[:, :, None] & (offsets[None, None, :] < room[:, :, None])
+    candidates.masked_fill_(~valid, -torch.inf)
+    flat = candidates.flatten(1)
+    top = flat.topk(min(k, flat.shape[1]), dim=-1, sorted=False)
+    picked = blocks.to(torch.int64).gather(1, top.indices // block_size) * block_size
+    picked = (picked + top.indices % block_size).masked_fill(
+        ~(top.values > -torch.inf), -1
     )
-    candidates = scores.gather(1, columns.clamp(0, width - 1))
-    candidates = candidates.masked_fill(~valid, -torch.inf)
-    top = candidates.topk(min(k, candidates.shape[1]), dim=-1, sorted=False)
-    picked = columns.gather(1, top.indices).masked_fill(~(top.values > -torch.inf), -1)
     if picked.shape[1] < k:
         picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
     return picked
