@@ -86,6 +86,19 @@ class _FakeNonStreamingErrorOpenAI:
         )
 
 
+class _FakeRaisingOpenAI:
+    """Raises a configurable exception from ``_convert_to_internal_request``."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        raise self._exc
+
+
 class _FakeNonStreamingOpenAI:
     """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
 
@@ -531,6 +544,50 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "context length exceeded")
 
+    def test_template_rejection_returns_400(self):
+        """A template that rejects the request is a client error, not a 500."""
+        message = (
+            "Unexpected reasoning effort high. "
+            "Supported types are xhigh (default), medium, and low."
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        for stream, handler_name in [
+            (False, "_handle_non_streaming"),
+            (True, "_handle_streaming"),
+        ]:
+            with self.subTest(stream=stream):
+                serving = AnthropicServing(_FakeRaisingOpenAI(ValueError(message)))
+                handler = getattr(serving, handler_name)
+                anthropic_request = self._anthropic_request(stream=stream)
+                response = asyncio.run(
+                    handler(chat_request, anthropic_request, object())
+                )
+                payload = json.loads(response.body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+                self.assertIn("Supported types are xhigh", payload["error"]["message"])
+
+    def test_unexpected_exception_still_returns_500(self):
+        """Only ValueError is reclassified; other failures stay server faults."""
+        serving = AnthropicServing(_FakeRaisingOpenAI(RuntimeError("boom")))
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        response = asyncio.run(
+            serving._handle_non_streaming(
+                chat_request, self._anthropic_request(stream=False), object()
+            )
+        )
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(payload["error"]["message"], "Internal server error")
+
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
     # ------------------------------------------------------------------
@@ -887,7 +944,7 @@ class TestAnthropicServing(unittest.TestCase):
             ("low", "low"),
             ("medium", "medium"),
             ("high", "high"),
-            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            ("xhigh", "xhigh"),
             ("max", "max"),
         ]:
             with self.subTest(anthropic_effort=anthropic_effort):
