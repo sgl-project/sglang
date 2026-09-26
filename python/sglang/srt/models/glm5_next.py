@@ -989,7 +989,12 @@ class Glm5NextModel(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_parallel().pp_group
 
-        if self.pp_group.is_first_rank:
+        # The first stage embeds inputs; with speculative decoding the last stage
+        # also holds the embedding, which the NextN draft hosted there shares
+        # (as DeepseekV2Model does, see pp_stage_needs_embedding).
+        if self.pp_group.is_first_rank or (
+            self.pp_group.is_last_rank and get_spec().speculative_algorithm is not None
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
