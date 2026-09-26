@@ -48,6 +48,8 @@ def communicator(norm):
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
     c._communicate_simple_fn = lambda hidden_states, **_: hidden_states
+    # Construction picks the fused entries; call it under the platform patches.
+    c._attn_input_fusions = c._select_attn_input_fusions()
     return c
 
 
