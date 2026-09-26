@@ -15,14 +15,11 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Must match INPUT_/OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT in vendor/structs.h; the
-# kernel's TMA descriptor depends on them and `entry.cuh` rejects a row that
-# misses one.
-_INPUT_STRIDE_ALIGNMENT_BYTES = 1024
+# NOTE: see the comments in `entry.cuh`
+_INPUT_STRIDE_ALIGNMENT_BYTES = 128
 _OUTPUT_STRIDE_ALIGNMENT_BYTES = 32
 _CLUSTER_MAX_TOPK = 1024
 _CLUSTER_MAX_BATCH_SIZE = 6
-_SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 
 
 class _Config(NamedTuple):
@@ -41,6 +38,7 @@ class _Config(NamedTuple):
         sorted_value: bool,
         sorted_index: bool,
         return_value: bool,
+        page_transform: bool,
     ) -> str:
         template_args = make_cpp_args(
             value_dtype,
@@ -56,6 +54,7 @@ class _Config(NamedTuple):
             self.tma_buffer_depth,
             512,  # elements_per_segment, fixed upstream
             self.cluster_size,
+            page_transform,
         )
         return f"TopkSelectConfig<{template_args}>"
 
@@ -77,6 +76,7 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
     (torch.float32, 1024): (_Config(1024, 512, 1, 8192, 4096, 3),),
     (torch.float32, 4096): (_Config(4096, 256, 1, 4096, 4096, 3),),
 }
+SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 
 
 @cache_once
@@ -95,20 +95,31 @@ def _jit_deep_select_module(
     return_value: bool,
     max_topk: int,
     cluster_size: int,
+    page_transform: bool,
 ) -> Module:
-    assert value_dtype in (torch.bfloat16, torch.float32)
-    assert index_dtype in (torch.int32, torch.int64)
+    # Validates the call signature; `cache_once` runs this once per valid signature
+    if value_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"input dtype must be bfloat16 or float32, got {value_dtype}")
+    if index_dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"indices_type must be int32 or int64, got {index_dtype}")
     if sorted_value:
-        assert value_dtype == torch.float32
-        assert return_value and not sorted_index
+        if value_dtype != torch.float32:
+            raise ValueError("sorted is only supported for float32 input")
+        if not return_value or sorted_index:
+            raise ValueError("sorted requires return_value and excludes sorted_index")
+    if page_transform:
+        if index_dtype != torch.int32 or return_value or sorted_value:
+            raise ValueError("the page transform takes int32 indices without values")
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
         # the 512 and 1024 buckets share this module.
-        assert value_dtype == torch.bfloat16
-        assert max_topk == _CLUSTER_MAX_TOPK
+        if value_dtype != torch.bfloat16 or max_topk != _CLUSTER_MAX_TOPK:
+            raise ValueError(
+                "the cluster kernel is tuned for bfloat16 at max_topk 1024 only"
+            )
         configs = [_Config(max_topk, 256, 1, 4096, 4096, 16, cluster_size)]
         host_dispatch = "TopkCluster"
     classes = [
@@ -118,6 +129,7 @@ def _jit_deep_select_module(
             sorted_value=sorted_value,
             sorted_index=sorted_index,
             return_value=return_value,
+            page_transform=page_transform,
         )
         for config in configs
     ]
@@ -134,6 +146,7 @@ def _jit_deep_select_module(
             return_value,
             max_topk,
             cluster_size,
+            page_transform,
         ),
         cuda_files=["deep_select/entry.cuh"],
         cuda_wrappers=[("topk", f"deep_select::{host_dispatch}<{classes}>::topk")],
@@ -161,54 +174,27 @@ def get_input_stride_alignment_bytes() -> int:
     return _INPUT_STRIDE_ALIGNMENT_BYTES
 
 
-def get_stride_requirement() -> Tuple[int, int]:
-    """Return the input and output row-stride requirements in bytes."""
-    return _INPUT_STRIDE_ALIGNMENT_BYTES, _OUTPUT_STRIDE_ALIGNMENT_BYTES
+def get_output_stride_alignment_bytes() -> int:
+    return _OUTPUT_STRIDE_ALIGNMENT_BYTES
 
 
-def get_deepselect_supported_architectures() -> Tuple[int, ...]:
-    """Return the CUDA compute capabilities supported by the JIT kernel."""
-    return tuple(major * 10 + minor for major, minor in _SUPPORTED_CAPABILITIES)
-
-
-def is_deep_select_supported(device=None) -> bool:
+@cache_once
+def is_deep_select_supported() -> bool:
     """Return whether DeepSelect JIT supports a CUDA device."""
     if torch.version.cuda is None or not torch.cuda.is_available():
         return False
-    try:
-        normalized_device = (
-            torch.device("cuda", device)
-            if isinstance(device, int)
-            else (
-                torch.device("cuda", torch.cuda.current_device())
-                if device is None
-                else torch.device(device)
-            )
-        )
-        if normalized_device.type != "cuda":
-            return False
-        return (
-            torch.cuda.get_device_capability(normalized_device)
-            in _SUPPORTED_CAPABILITIES
-        )
-    except (RuntimeError, TypeError, ValueError):
-        return False
-
-
-def _needs_output_staging(output: torch.Tensor, topk: int) -> bool:
-    return (
-        output.data_ptr() % _OUTPUT_STRIDE_ALIGNMENT_BYTES != 0
-        or topk * output.element_size() % _OUTPUT_STRIDE_ALIGNMENT_BYTES != 0
-    )
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) in SUPPORTED_CUDA_ARCHS
 
 
 def topk(
     input: torch.Tensor,
     topk: int,
+    *,
     sorted: bool = False,
     begin: Optional[torch.Tensor] = None,
     end: Optional[torch.Tensor] = None,
-    indices_type: torch.dtype = torch.int64,
+    indices_type: torch.dtype = torch.int32,
     sorted_index: bool = False,
     hint: Optional[torch.Tensor] = None,
     output_idx: Optional[torch.Tensor] = None,
@@ -220,41 +206,95 @@ def topk(
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Select the largest ``topk`` values of every row of ``input``.
 
-    This follows the public DeepSelect interface. ``end`` is the per-row
-    exclusive valid length; ``begin`` and ``hint`` are reserved but unsupported.
-
     Returns ``(values, indices)``; ``values`` is None when ``return_value`` is
     False, which skips writing them and is about 10% faster.
     """
-    if hint is not None:
-        raise ValueError("hint is not supported currently")
-    if input.dtype not in (torch.bfloat16, torch.float32):
-        raise RuntimeError("input dtype must be bfloat16 or float32")
-    if indices_type not in (torch.int32, torch.int64):
-        raise RuntimeError("indices_type must be int32 or int64")
-    if output_idx is not None and output_idx.dtype != indices_type:
-        raise ValueError("output_idx dtype must match indices_type")
-    if input.device.type != "cuda":
-        raise RuntimeError("input must be a CUDA tensor")
-    if input.ndim != 2:
-        raise RuntimeError("input must be a 2D tensor")
-    if not 0 < topk <= 4096:
-        raise RuntimeError(f"topk must be in [1, 4096], got {topk}")
-    if sorted and not return_value:
-        raise RuntimeError("return_value must be enabled when sorted is True")
-    if sorted and sorted_index:
-        raise RuntimeError("sorted and sorted_index cannot both be True")
-    if sorted and input.dtype is torch.bfloat16:
-        raise RuntimeError("sorted is only supported for float32 input")
+    assert hint is None, "hint is not supported"
+    return _launch_topk_impl(
+        input,
+        topk,
+        sorted=sorted,
+        begin=begin,
+        end=end,
+        indices_type=indices_type,
+        sorted_index=sorted_index,
+        output_idx=output_idx,
+        output_idx_offset=output_idx_offset,
+        page_table=None,
+        page_size=0,
+        idx_oob_fill_value=idx_oob_fill_value,
+        value_oob_fill_value=value_oob_fill_value,
+        return_value=return_value,
+        abort_when_nan_found=abort_when_nan_found,
+    )
 
+
+def topk_page_transform(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    page_table: torch.Tensor,
+    page_size: int,
+    end: Optional[torch.Tensor] = None,
+    sorted_index: bool = False,
+    output_idx: Optional[torch.Tensor] = None,
+    idx_oob_fill_value: int = -1,
+    abort_when_nan_found: bool = True,
+) -> torch.Tensor:
+    """Top-k indices of every row of ``input``, written through a page table.
+
+    A selected column ``i`` of row ``r`` is stored as
+    ``page_table[r, i // page_size] * page_size + i % page_size``; slots past a
+    row's ``end`` hold ``idx_oob_fill_value``. ``page_size`` must be a power of
+    2, and ``page_table`` (int32, ``[rows, num_pages]``, unit column stride)
+    must cover the whole row: ``num_pages * page_size >= input.shape[1]``.
+
+    This is the narrow case of :func:`topk`: int32 indices, no values, no
+    value sort. Returns the int32 ``[rows, topk]`` indices.
+    """
+    _, indices = _launch_topk_impl(
+        input,
+        topk,
+        sorted=False,
+        begin=None,
+        end=end,
+        indices_type=torch.int32,
+        sorted_index=sorted_index,
+        output_idx=output_idx,
+        output_idx_offset=None,
+        page_table=page_table,
+        page_size=page_size,
+        idx_oob_fill_value=idx_oob_fill_value,
+        value_oob_fill_value=0.0,
+        return_value=False,
+        abort_when_nan_found=abort_when_nan_found,
+    )
+    return indices
+
+
+def _launch_topk_impl(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    sorted: bool,
+    begin: Optional[torch.Tensor],
+    end: Optional[torch.Tensor],
+    indices_type: torch.dtype,
+    sorted_index: bool,
+    output_idx: Optional[torch.Tensor],
+    output_idx_offset: Optional[torch.Tensor],
+    page_table: Optional[torch.Tensor],
+    page_size: int,
+    idx_oob_fill_value: int,
+    value_oob_fill_value: float,
+    return_value: bool,
+    abort_when_nan_found: bool,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     rows, vocab_size = input.shape
     device_capability = torch.cuda.get_device_capability(input.device)
-    if device_capability not in _SUPPORTED_CAPABILITIES:
-        major, minor = device_capability
-        raise RuntimeError(f"DeepSelect does not support SM{major}{minor}")
     cluster_size, cluster_min_vocab_size = _cluster_tuning(device_capability)
     use_cluster = (
-        input.dtype is torch.bfloat16
+        input.dtype == torch.bfloat16
         and rows <= _CLUSTER_MAX_BATCH_SIZE
         and vocab_size >= cluster_min_vocab_size
         and topk <= _CLUSTER_MAX_TOPK
@@ -265,26 +305,14 @@ def topk(
             (rows, topk),
             input.dtype,
             input.device,
-            alignment=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
+            alignment_bytes=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
         )
     if output_idx is None:
         output_idx = aligned_new_empty(
             (rows, topk),
             indices_type,
             input.device,
-            alignment=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
-        )
-        kernel_output_idx = output_idx
-    else:
-        kernel_output_idx = (
-            aligned_new_empty(
-                (rows, topk),
-                indices_type,
-                input.device,
-                alignment=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
-            )
-            if _needs_output_staging(output_idx, topk)
-            else output_idx
+            alignment_bytes=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
         )
     module = _jit_deep_select_module(
         input.dtype,
@@ -294,6 +322,7 @@ def topk(
         return_value,
         _get_max_topk_bucket(topk, use_cluster),
         cluster_size if use_cluster else 1,
+        page_table is not None,
     )
     input_storage_bytes = (
         input.untyped_storage().nbytes() - input.storage_offset() * input.element_size()
@@ -302,19 +331,15 @@ def topk(
         input,
         values,
         output_idx,
-        kernel_output_idx,
         begin,
         end,
         output_idx_offset,
+        page_table,
+        page_size,
         topk,
         input_storage_bytes,
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found,
     )
-    if kernel_output_idx is not output_idx:
-        output_idx.copy_(kernel_output_idx)
     return values, output_idx
-
-
-deepselect_topk = topk

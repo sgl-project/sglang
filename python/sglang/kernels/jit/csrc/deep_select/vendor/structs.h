@@ -36,4 +36,10 @@ struct TopkSelectArgs {
 
     uint64_t shared_memory_size_per_sm;
     cudaStream_t stream;
+
+    // [SGLang] Page transform, read only when `Config::page_transform` is set:
+    // index `i` is written as `(page_table[i >> page_bits] << page_bits) | (i & ((1 << page_bits) - 1))`
+    const int* page_table;
+    uint64_t stride_page_table_batch;
+    uint32_t page_bits;
 };
