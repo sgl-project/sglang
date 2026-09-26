@@ -690,6 +690,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         capture_metadata.sparse_prefill_cache = object()
         capture_metadata.prefill_shared_reads_snapshotted = True
+        capture_metadata.prefill_indexer_budget.bytes = 2 << 30
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
@@ -719,6 +720,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
         self.assertFalse(capture_metadata.prefill_shared_reads_snapshotted)
+        self.assertIs(
+            capture_metadata.prefill_indexer_budget,
+            replay_metadata.prefill_indexer_budget,
+        )
+        self.assertIsNone(capture_metadata.prefill_indexer_budget.bytes)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,

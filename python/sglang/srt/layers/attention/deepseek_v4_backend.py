@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
+    PrefillIndexerBudget,
     PrefillIndexerInputs,
     cut_request_masks,
     expand_index_page_table,
@@ -984,6 +985,9 @@ class DSV4Metadata:
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
     candidate_metadata: Optional[CandidateMetadata] = None
+    prefill_indexer_budget: PrefillIndexerBudget = field(
+        default_factory=PrefillIndexerBudget
+    )
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -1008,8 +1012,10 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.prefill_indexer_budget = other.prefill_indexer_budget
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        self.prefill_indexer_budget = static_metadata.prefill_indexer_budget
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
@@ -1590,6 +1596,7 @@ class DeepseekV4AttnBackend(
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
+        metadata.prefill_indexer_budget = self.forward_metadata.prefill_indexer_budget
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc
             if self.token_to_kv_pool.request_window is not None
@@ -3268,6 +3275,7 @@ class DeepseekV4AttnBackend(
             kv_page_table=self.forward_metadata.core_metadata.page_table[:num_tokens],
             kv_page_size=self.page_size,
             compress_ratio=ratio,
+            budget=self.forward_metadata.prefill_indexer_budget,
         )
 
     def _tail_lens_to_publish(self) -> Optional[List[int]]:

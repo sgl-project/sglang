@@ -1,15 +1,21 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     PrefillCandidateBlocks,
+    PrefillIndexerBudget,
     candidate_block_mask,
     select_candidate_block_ids,
     select_candidate_blocks,
 )
+from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import _rows_per_chunk
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -80,6 +86,101 @@ class TestPrefillCandidateBlocks(CustomTestCase):
             candidate_block_mask(blocks=blocks, width=24, block_size=8),
             select_candidate_blocks(**kwargs),
         )
+
+
+class TestPrefillIndexerBudget(CustomTestCase):
+    def test_free_memory_is_sampled_once_and_refreshed_next_forward(self):
+        maybe_stub_sgl_kernel()
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+
+        first = DSV4Metadata(core_attn_metadata=None, indexer_metadata=None)
+        following = DSV4Metadata(core_attn_metadata=None, indexer_metadata=None)
+        with (
+            get_context().override_server_args(mem_fraction_static=0.75),
+            envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.override(0.25),
+            patch(
+                "sglang.srt.layers.attention.mqa_logits_utils.get_device_module",
+                return_value=torch.cuda,
+            ),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(total_memory=64 << 30),
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.mem_get_info", return_value=(32 << 30, 64 << 30)) as free,
+        ):
+            budget = first.prefill_indexer_budget
+            args = dict(
+                rows=16384, width=1048576, heads=32, device=torch.device("cuda:0")
+            )
+            self.assertEqual(_rows_per_chunk(**args, budget=budget), 1024)
+            free.return_value = (4 << 30, 64 << 30)
+            self.assertEqual(_rows_per_chunk(**args, budget=budget), 1024)
+            self.assertEqual(
+                _rows_per_chunk(**args, budget=following.prefill_indexer_budget), 256
+            )
+            self.assertEqual(free.call_count, 2)
+
+    def test_capture_uses_static_budget_without_free_memory_query(self):
+        with (
+            get_context().override_server_args(mem_fraction_static=0.75),
+            envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.override(0.25),
+            patch(
+                "sglang.srt.layers.attention.mqa_logits_utils.get_device_module",
+                return_value=torch.cuda,
+            ),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(total_memory=64 << 30),
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            patch(
+                "torch.cuda.mem_get_info", side_effect=AssertionError("capture sync")
+            ),
+        ):
+            self.assertEqual(
+                _rows_per_chunk(
+                    16384,
+                    1048576,
+                    heads=32,
+                    device=torch.device("cuda:0"),
+                    budget=PrefillIndexerBudget(),
+                ),
+                1024,
+            )
+
+    def test_small_inputs_do_not_query_or_fix_the_forward_budget(self):
+        budget = PrefillIndexerBudget()
+        with patch("torch.cuda.mem_get_info", side_effect=AssertionError("small sync")):
+            self.assertEqual(
+                _rows_per_chunk(
+                    31, 8192, heads=32, device=torch.device("cuda:0"), budget=budget
+                ),
+                31,
+            )
+        self.assertIsNone(budget.bytes)
+
+    def test_padded_rows_and_columns_include_scratch(self):
+        for limit, expected in (
+            (45056, 13),
+            (45055, 12),
+            (24576, 8),
+            (24575, 4),
+            (1, 4),
+        ):
+            with self.subTest(limit=limit):
+                self.assertEqual(
+                    _rows_per_chunk(
+                        13,
+                        257,
+                        heads=32,
+                        device=torch.device("cuda:0"),
+                        budget=PrefillIndexerBudget(bytes=limit),
+                        scratch_row_bytes=512,
+                        scratch_bytes=4096,
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

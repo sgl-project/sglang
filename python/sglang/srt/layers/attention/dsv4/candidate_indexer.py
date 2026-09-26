@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.mqa_logits_utils import mqa_logits_budget_bytes
 from sglang.srt.runtime_context import get_parallel, get_platform
 
 
@@ -36,6 +37,18 @@ class IndexerInputs:
         return self.q_fp4.shape[0]
 
 
+class PrefillIndexerBudget(msgspec.Struct):
+    bytes: Optional[int] = None
+
+    def resolve(self, device: torch.device) -> int:
+        if self.bytes is None:
+            self.bytes = mqa_logits_budget_bytes(
+                device_index=device.index,
+                allow_sync=not torch.cuda.is_current_stream_capturing(),
+            )
+        return self.bytes
+
+
 class PrefillIndexerInputs(msgspec.Struct, frozen=True):
     """One index layer's operands on the dense fp4 prefill path: the chunk's query
     rows, one request's rows consecutive."""
@@ -59,6 +72,7 @@ class PrefillIndexerInputs(msgspec.Struct, frozen=True):
     kv_page_table: torch.Tensor
     kv_page_size: int
     compress_ratio: int
+    budget: PrefillIndexerBudget
 
     @property
     def num_rows(self) -> int:
