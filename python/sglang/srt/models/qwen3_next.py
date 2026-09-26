@@ -803,18 +803,33 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = None
+        if self.attn_output_gate and _is_hip:
+            # gfx950 + aiter backend + decode only: a single kernel does the
+            # paged attention and the sigmoid gate together. It returns None --
+            # and never raises -- whenever it does not apply, in which case the
+            # block below runs exactly as it does without it. CUDA is untouched.
+            from sglang.srt.layers.attention.aiter_paged_attention_output_gate import (
+                fused_gated_decode_attention,
+            )
 
-        if self.attn_output_gate:
-            if _is_hip:
-                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                    sigmoid_gate_mul,
-                )
+            attn_output = fused_gated_decode_attention(
+                self.attn, q, k, v, gate, forward_batch
+            )
 
-                attn_output = sigmoid_gate_mul(attn_output, gate)
-            else:
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+        if attn_output is None:
+            attn_output = self.attn(q, k, v, forward_batch)
+
+            if self.attn_output_gate:
+                if _is_hip:
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                        sigmoid_gate_mul,
+                    )
+
+                    attn_output = sigmoid_gate_mul(attn_output, gate)
+                else:
+                    gate = torch.sigmoid(gate)
+                    attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
