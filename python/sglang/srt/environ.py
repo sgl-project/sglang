@@ -1661,6 +1661,9 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in GLM MLA absorbed-BMM backend that keeps w_kc/w_vc in packed
+    # MXFP4 and dispatches the matching AITER FP4 kernels.
+    SGLANG_USE_MXFP4_MLA_BMM = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
     # Separate from the CUDA flag: that one also packs wk+weights_proj.
