@@ -975,6 +975,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def set_quick_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
+
+        # Emit before `set_completion_time()`, which calls `TraceReqContext.abort()`
+        # and clears the thread context; slices recorded after it are dropped.
+        stage = RequestStage.DECODE_QUICK_FINISH
+        self.observe_per_stage_req_latency(stage, ts - self.last_forward_entry_time)
+        self.trace_slice(stage, self.last_forward_entry_time, ts)
+
         self.set_completion_time(ts)
         self.forward_entry_time = ts
 
