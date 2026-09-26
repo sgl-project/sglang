@@ -76,6 +76,33 @@ def test_cuda_default_backend_by_capability(monkeypatch, capability, expected):
     assert backend == expected
 
 
+@pytest.mark.parametrize("graph_env", ["0", "1"])
+def test_fa4_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
+    # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; tensors must keep
+    # working even when SGLANG_VIT_ENABLE_CUDA_GRAPH is set for another model.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", graph_env)
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    calls = []
+
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn_func, raising=False)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    backend = vision.VisionFlash4Attention()
+
+    backend(q, q, q, cu_seqlens=[cu_seqlens, 4], bsz=1, seq_len=6)
+    backend(q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4)
+
+    for kwargs in calls:
+        assert kwargs["ver"] == 4
+        assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+
+
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
     monkeypatch.setattr(
         vision,

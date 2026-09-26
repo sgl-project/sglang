@@ -614,6 +614,11 @@ class VisionFlash4Attention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
+            cu_seqlens_gpu = cu_seqlens[0]
+            max_seqlen = cu_seqlens[1]
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
