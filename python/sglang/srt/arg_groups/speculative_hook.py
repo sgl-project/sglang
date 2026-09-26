@@ -119,6 +119,13 @@ def _resolve_speculative_algorithm_alias(
 
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    if str(cfg.speculative_algorithm).upper() != "DSPARK":
+        for name in ("markov_topk", "markov_bias_topk"):
+            if getattr(cfg, f"speculative_dspark_{name}") is not None:
+                raise ValueError(
+                    f"--speculative-dspark-{name.replace('_', '-')} requires "
+                    "--speculative-algorithm DSPARK."
+                )
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None
@@ -693,17 +700,32 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         DEFAULT_DSPARK_GAMMA,
         read_draft_checkpoint_config,
+        resolve_markov_candidate_config,
     )
 
     draft_config = None
     try:
         draft_config = read_draft_checkpoint_config(server_args=server_args)
-    except Exception as e:
+    except (OSError, ConnectionError) as e:
         logger.warning(
             "Failed to read DSpark draft config; preserving explicit/default "
             "gamma resolution. Error: %s",
             e,
         )
+
+    candidates = resolve_markov_candidate_config(
+        draft_config,
+        markov_topk=cfg.speculative_dspark_markov_topk,
+        markov_bias_topk=cfg.speculative_dspark_markov_bias_topk,
+    )
+    logger.info(
+        "DSpark requested Markov candidates K=%s M=%s; configured effective K=%s M=%s "
+        "(device/head capabilities are checked after weight loading).",
+        candidates.requested_topk,
+        candidates.requested_bias_topk,
+        candidates.effective_topk,
+        candidates.effective_bias_topk,
+    )
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:

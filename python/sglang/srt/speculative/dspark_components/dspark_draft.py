@@ -136,6 +136,7 @@ def sample_draft_block(
     markov_head,
     device: torch.device,
     tp_sync: SpecTpSync,
+    candidate_sampler=None,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -147,6 +148,22 @@ def sample_draft_block(
     else:
         temperatures = (
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+        )
+
+    if candidate_sampler is not None:
+        # TP>1 is rejected when this sampler is initialized. The dense path
+        # below retains its per-step SpecTpSync contract on those deployments.
+        result = candidate_sampler.sample(
+            base_logits,
+            anchor_tokens.contiguous(),
+            temperatures.contiguous(),
+            greedy_mask.contiguous(),
+        )
+        return DraftBlockResult(
+            draft_tokens=result.tokens,
+            corrected_logits=result.corrected_logits,
+            greedy_mask=greedy_mask,
+            temperatures=temperatures,
         )
 
     if not any_sampling:
@@ -252,7 +269,8 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if getattr(self.draft_model, "has_own_embed_tokens", False)
+            or not self.sample_from_anchor
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
@@ -328,6 +346,9 @@ class DraftBlockProposer:
                 markov_head=self.draft_model.markov_head,
                 device=device,
                 tp_sync=self._tp_sync,
+                candidate_sampler=getattr(
+                    self.draft_model, "markov_candidate_sampler", None
+                ),
             )
         proposal_block_ids = (
             draft_block_ids
