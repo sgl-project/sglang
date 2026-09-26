@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4KWriteMetadata,
     _decode_cta_count,
@@ -33,14 +34,29 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    index_q_rope_pack_weights_flydsl,
+    indexer_head_weights,
+    pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    read_fp4_index_k_split,
+    store_fp4_index_k_cache_split,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
+    index_k_norm_rope_pack_store_split,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+    build_decode_schedule,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+    rope_tail_fake_quant_fp4,
+)
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -280,6 +296,42 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
+def test_index_q_pack_weights_matches_standalone() -> None:
+    """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
+    weights) is bitwise the three standalone launches it replaces."""
+
+    torch.manual_seed(0)
+    num_tokens, num_heads = 16, 32
+    rope_dim, hidden, max_pos = 64, 5120, 4096
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    x = torch.randn(num_tokens, hidden, device="cuda").bfloat16()
+    w = (torch.randn(num_heads, hidden, device="cuda") * 0.02).bfloat16()
+    scale = 128**-0.5 * num_heads**-0.5
+
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(num_tokens, num_heads, 128), freqs[pos], rope_dim
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    ref_w = indexer_head_weights(x, w, scale)
+
+    partials = rocm_router_gemv_split_k(x, w)
+    q_fp4, q_scale, weights = index_q_rope_pack_weights_flydsl(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    # torch.equal ignores dtype
+    assert q_fp4.dtype == ref_fp4.dtype and q_scale.dtype == ref_scale.dtype
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+    assert torch.equal(weights, ref_w)
+    exact_weights = (x.double() @ w.double().T * scale).bfloat16()
+    ulps = (
+        weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()
+    ).abs()
+    assert int(ulps.max()) <= 1
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     """Scattered slots land in the paged layout and touch nothing else."""
@@ -443,6 +495,36 @@ def test_decode_cta_count_stays_within_available_chunks(
 
     assert 1 <= cta_count <= num_queries * chunks_per_seq
     assert cta_count <= max(1024, num_queries * 4)
+
+
+@pytest.mark.parametrize("num_queries", [1, 1536])
+def test_decode_schedule_matches_aiter_varctx_schedule(num_queries: int) -> None:
+    """The in-tree decode schedule writes AITER compute_varctx_schedule's cta_info rows and
+    split factor, including zero-length rows and prefix sums carried across row blocks."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
+
+    torch.manual_seed(num_queries)
+    max_seq_len = 65536
+    c4_seq_lens = torch.randint(
+        0, max_seq_len, (num_queries,), device=get_device(), dtype=torch.int32
+    )
+    c4_seq_lens[::7] = 0
+    cta_count = _decode_cta_count(num_queries, max_seq_len)
+    ref_safe, ref, _ = compute_varctx_schedule(
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=max_seq_len,
+        next_n=1,
+    )
+    cta_info = torch.empty_like(ref)
+    scratch = build_decode_schedule(
+        c4_seq_lens, cta_info_out=cta_info, max_seq_len=max_seq_len
+    )
+    assert torch.equal(scratch[:1], ref_safe)
+    assert torch.equal(cta_info, ref)
 
 
 def _decode_plan(seq_lens: torch.Tensor, compress_ratio: int) -> CompressorDecodePlan:
@@ -823,6 +905,154 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
                 full[start + row, :ctx],
                 msg=f"row {start + row} (ctx={ctx})",
             )
+
+
+def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The three-launch form of pack_fp4_query_flydsl: the shared quantizer, then
+    zeros and a permuted copy into the scale layout."""
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+    q_fp4 = q_fp4.view(num_tokens, heads, 64)
+    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
+    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
+    return q_fp4, q_scale
+
+
+def test_pack_fp4_query_flydsl_single_launch():
+    torch.manual_seed(17)
+    heads, dtype = 32, torch.bfloat16
+    q = torch.randn(40, heads, 128, device=get_device(), dtype=dtype) * 4
+    # exact fp4 grid points and tie values, zeros and a huge group
+    q[0, 0, :32] = torch.tensor(
+        [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 4,
+        device=get_device(),
+        dtype=dtype,
+    )
+    q[0, 0, 32:64] = 0.0
+    q[0, 0, 64:96] = 3.0e4
+    ref_fp4, ref_scale = pack_fp4_query_flydsl_torch(q)
+    fp4, scale = pack_fp4_query_flydsl(q)
+    assert fp4.dtype is ref_fp4.dtype and scale.dtype is ref_scale.dtype
+    assert torch.equal(fp4, ref_fp4)
+    assert torch.equal(scale, ref_scale)
+    empty = torch.empty(0, heads, 128, device=get_device(), dtype=dtype)
+    fp4, scale = pack_fp4_query_flydsl(empty)
+    assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
+
+
+@pytest.mark.parametrize("compressed_kv", [False, True], ids=["False", "True"])
+def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
+
+    torch.manual_seed(19)
+    table = torch.polar(
+        torch.ones(4096, 32, device=get_device()),
+        torch.rand(4096, 32, device=get_device()) * 6.283,
+    )
+    x = torch.randn(17, 32, 128, device=get_device(), dtype=torch.bfloat16) * 3
+    for pos_dtype in (torch.int64, torch.int32):
+        pos = torch.randint(0, 4096, (17,), device=get_device(), dtype=pos_dtype)
+        ref = rope_tail_fake_quant_fp4(x, table[pos], 64, compressed_kv=compressed_kv)
+        out = rope_tail_fake_quant_fp4(
+            x, table, 64, compressed_kv=compressed_kv, positions=pos
+        )
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_index_k_split_writer_matches_the_triton_chain(ratio: int) -> None:
+    """index_k_norm_rope_pack_store_split writes the bytes of RMSNorm, then the Triton
+    rope_tail_fake_quant_fp4 and store_fp4_index_k_cache_split (rne); slot 0 stays empty."""
+
+    torch.manual_seed(ratio)
+    num_tokens, page_size, num_pages, max_pos = 100, 64, 4, 4096
+    x = (torch.randn(num_tokens, 128, device="cuda") * 3).bfloat16()
+    x[3] = 0
+    norm_weight = (1 + 0.1 * torch.randn(128, device="cuda")).bfloat16()
+    freqs_cis = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    freqs = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(0, max_pos, (num_tokens,), device="cuda")
+    loc = torch.randperm(num_pages * page_size - 1, device="cuda")[:num_tokens] + 1
+    loc[:3] = 0
+
+    payload = torch.zeros(
+        num_pages, 1, 4, page_size, 16, dtype=torch.uint8, device="cuda"
+    )
+    scale = torch.zeros(num_pages, 1, 4, page_size, dtype=torch.uint8, device="cuda")
+    index_k_norm_rope_pack_store_split(
+        x, norm_weight, 1e-6, freqs, positions, loc, payload, scale, ratio=ratio
+    )
+
+    xf = x.float()
+    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+    normed = (normed * norm_weight.float()).bfloat16()
+    # a compressed row takes the rope of its group's first position
+    roped = rope_tail_fake_quant_fp4(normed, freqs_cis[positions & ~(ratio - 1)], 64)
+    ref_payload, ref_scale = torch.zeros_like(payload), torch.zeros_like(scale)
+    store_fp4_index_k_cache_split(
+        roped[3:], ref_payload, ref_scale, loc[3:], page_size=page_size, rne=True
+    )
+    assert torch.equal(payload, ref_payload)
+    assert torch.equal(scale, ref_scale)
+
+
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+TIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+RNE = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
+
+
+def _tie_row(scale: float, values) -> torch.Tensor:
+    """[128]: four 32-blocks of [6, +values, -values, 0...] times a power-of-two scale."""
+    block = [6.0] + values + [-v for v in values]
+    block += [0.0] * (32 - len(block))
+    return (torch.tensor(block) * scale).repeat(4)
+
+
+def _unpack(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 nibbles [..., 64] (low nibble first) -> values [..., 128]."""
+    p = packed.view(torch.uint8).to(torch.int64).cpu()
+    codes = torch.stack([p & 0xF, p >> 4], dim=-1).flatten(-2)
+    mag = E2M1[codes & 7]
+    return torch.where((codes & 8) != 0, -mag, mag)
+
+
+def test_low_ratio_triton_paths_round_half_to_even_like_cuda() -> None:
+    """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
+
+    scale = 2.0**-3
+    e8m0 = 127 + int(torch.log2(torch.tensor(scale)))
+    expected = _tie_row(scale, RNE)
+
+    def check(name, got):
+        assert torch.equal(got.float().cpu(), expected), f"{name}: {got[1:8].tolist()}"
+
+    row = _tie_row(scale, TIES).cuda().to(torch.bfloat16)
+    assert torch.equal(row.float().cpu(), _tie_row(scale, TIES))
+
+    fp4, sf = quantize_fp4_indexer_tensor(row.view(1, 128), rne=True)
+    assert (sf.cpu() & 0xFF).item() == e8m0
+    check("quantize_fp4_indexer_tensor(rne=True)", _unpack(fp4)[0] * scale)
+
+    q_fp4, q_scale = pack_fp4_query_flydsl(
+        row.view(1, 1, 128).expand(1, 16, 128).contiguous()
+    )
+    assert q_scale.unique().tolist() == [0, e8m0]
+    check("pack_fp4_query_flydsl", _unpack(q_fp4)[0, 0] * scale)
+
+    payload = torch.zeros((1, 1, 4, 64, 16), dtype=torch.uint8, device="cuda")
+    k_scale = torch.zeros((1, 1, 4, 64), dtype=torch.uint8, device="cuda")
+    loc = torch.tensor([5], dtype=torch.int64, device="cuda")
+    store_fp4_index_k_cache_split(
+        row.view(1, 128), payload, k_scale, loc, page_size=64, rne=True
+    )
+    k_fp4, k_sf = read_fp4_index_k_split(payload, k_scale, loc, page_size=64)
+    assert (k_sf.cpu() & 0xFF).item() == e8m0
+    check("store_fp4_index_k_cache_split", _unpack(k_fp4)[0] * scale)
+
+    freqs = torch.ones(1, 32, dtype=torch.complex64, device="cuda")
+    fq = rope_tail_fake_quant_fp4(row.view(1, 128), freqs, 64)
+    check("rope_tail_fake_quant_fp4", fq[0])
 
 
 if __name__ == "__main__":
