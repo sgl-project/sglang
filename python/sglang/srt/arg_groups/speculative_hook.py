@@ -39,11 +39,11 @@ def _should_auto_enable_hip_rejection_sampling(
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
-    Rejection sampling still cannot consume a reduced / hot draft vocab
-    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
-    would crash configs that previously ran greedy on HIP, including EAGLE3
-    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
-    EAGLE3 and any EAGLE run that already has a token map.
+    Rejection sampling can now consume a reduced / hot draft vocab --
+    ``eagle_worker_v2`` scatters ``q`` onto the target vocab through the d2t map
+    -- but that path is not validated on ROCm, so auto-enabling is still withheld
+    for EAGLE3 and for any EAGLE run that already has a token map. Passing the
+    flag explicitly works.
 
     Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
     runs the real EAGLE verify then overwrites accept length, so the Triton

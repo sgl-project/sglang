@@ -110,10 +110,12 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
+    scatter_draft_probs_to_target_vocab,
     select_top_k_tokens,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
@@ -319,19 +321,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+            self.target_vocab_size = self.target_worker.model_config.vocab_size
+            if (
+                self.hot_token_id is not None
+                and self.hot_token_id.shape[0] != self.target_vocab_size
+            ):
+                logger.info(
+                    "Rejection sampling with a reduced draft vocabulary "
+                    f"({self.hot_token_id.shape[0]} -> {self.target_vocab_size}): q is "
+                    "scattered onto the target vocab through the d2t map, so non-hot "
+                    "target tokens are always rejected and resampled from the residual."
                 )
 
     def init_attention_backends(self):
@@ -808,8 +807,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        draft_probs_list: Optional[List[torch.Tensor]] = None
         if get_spec().speculative_use_rejection_sampling:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_probs_list = [spec_info.draft_probs]
 
         topk1_chain_fits = (
             self.topk == 1
@@ -928,31 +928,79 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
 
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
-            else None
-        )
-
         # Organize the results
         if draft_tokens_topk1 is not None:
             bs = draft_tokens_topk1.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+            return (
+                parent_list,
+                top_scores_index,
+                draft_tokens_topk1,
+                self._build_verify_draft_probs(draft_probs_list, draft_tokens_topk1),
+            )
 
         if topk1_chain_fits:
             bs = token_list[0].shape[0]
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens, draft_probs
+            return (
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                self._build_verify_draft_probs(draft_probs_list, draft_tokens),
+            )
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            self._build_verify_draft_probs(draft_probs_list, draft_tokens),
+        )
+
+    def _build_verify_draft_probs(
+        self,
+        draft_probs_list: Optional[List[torch.Tensor]],
+        draft_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Stack the per-step q into the (bs, num_steps, vocab) verify input.
+
+        Row i is the proposal distribution the draft token at chain slot i + 1 was
+        sampled from; the verify kernel reads row ``step - 1`` for slot ``step``,
+        so the list order must not be disturbed.
+
+        The kernel indexes q by target token id, so a reduced draft vocabulary is
+        scattered into the target vocabulary here -- once, at the kernel boundary,
+        rather than on every producer.
+        """
+        if not get_spec().speculative_use_rejection_sampling:
+            return None
+        draft_probs = torch.stack(draft_probs_list, dim=1)
+        if self.hot_token_id is None:
+            return draft_probs
+        draft_probs = scatter_draft_probs_to_target_vocab(
+            draft_probs, self.hot_token_id, self.target_vocab_size
+        )
+        # Every proposed token was drawn from its own row of q, so q > 0 there. A
+        # misaligned or mis-scattered q shows up as q == 0, which makes the
+        # `coin * q < p` accept test vacuously true: accept length pins to
+        # num_steps while the text degrades. Gated so this never runs in
+        # production.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_q = draft_probs.gather(
+                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
+            )
+            maybe_assert_async(
+                (proposed_q > 0).all(),
+                "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
+                "are misaligned with the chain slots or the d2t scatter is wrong",
+            )
+        return draft_probs
 
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
