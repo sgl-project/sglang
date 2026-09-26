@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -373,8 +374,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
-        linear
+    return (
+        isinstance(linear, LinearBase)
+        and linear.quant_method is not None
+        and linear.quant_method.accepts_mxfp8_input(linear)
     )
 
 
