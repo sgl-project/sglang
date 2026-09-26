@@ -3974,7 +3974,7 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     graph buffer registration: registered graph-pool temporaries deadlock the
     exchange under DP-rank ramps."""
 
-    def _resolve(self, **kwargs):
+    def _resolve(self, decode_backend=Backend.FULL, **kwargs):
         # The handler reads the DP-adjusted prefill knobs the pipeline would
         # have settled by then; the dummy-model pipeline itself returns early.
         server_args = ServerArgs(
@@ -3984,7 +3984,8 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
             dp_size=2,
             chunked_prefill_size=8192,
             cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(backend=Backend.DISABLED)
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+                decode=PhaseConfig(backend=decode_backend),
             ),
             **kwargs,
         )
@@ -4009,14 +4010,15 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 
     def test_without_all_to_all_env_is_untouched(self):
         # Unified serving keeps the all-to-all off by default, and a decode
-        # node with the DP LM head never takes the all-to-all.
+        # node with the DP LM head never takes the all-to-all. Eager decode
+        # keeps the DP-attention decode-graph rule out of this check.
         for kwargs in (
             {},
             {"disaggregation_mode": "decode", "enable_dp_lm_head": True},
         ):
             with self.subTest(**kwargs), patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("NCCL_GRAPH_REGISTER", None)
-                server_args = self._resolve(**kwargs)
+                server_args = self._resolve(decode_backend=Backend.DISABLED, **kwargs)
                 self.assertFalse(
                     resolution_result(server_args, "enable_tp_lm_head_all_to_all")
                 )
