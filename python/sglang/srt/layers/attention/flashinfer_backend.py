@@ -66,6 +66,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_CUTLASS_RAGGED_SUPPORTED_HEAD_DIMS = {
+    (64, 64),
+    (128, 128),
+    (192, 128),
+}
+
+
+def _select_ragged_fmha_backend(
+    *,
+    is_sm100: bool,
+    device_sm: int,
+    is_dllm_model: bool,
+    decode_cuda_graph_enabled: bool,
+    piecewise_prefill_graph_enabled: bool,
+    head_dims: tuple[int, int],
+) -> str:
+    """Select the FlashInfer backend for the ragged prefill wrapper."""
+    if not is_sm100:
+        return "auto"
+
+    # FlashInfer's SM103 CUTLASS ragged planner allocates new plan buffers on
+    # every plan() call. A dLLM decode CUDA graph can therefore replay stale
+    # plan/TMA addresses and raise an illegal instruction. FA2 supports this
+    # path without those transient buffers. Keep CUTLASS for eager dLLM runs,
+    # ordinary models, and SM100 (B200).
+    if device_sm == 103 and is_dllm_model and decode_cuda_graph_enabled:
+        return "fa2"
+
+    # Piecewise CUDA graphs also cannot use this CUTLASS path because its TMA
+    # descriptors are initialized outside the captured region.
+    if piecewise_prefill_graph_enabled:
+        return "fa2"
+
+    if head_dims in _CUTLASS_RAGGED_SUPPORTED_HEAD_DIMS:
+        return "cutlass"
+    return "fa2"
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -471,28 +509,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        fmha_backend = "auto"
-        if get_platform().is_sm100:
-            fmha_backend = "fa2"
-            # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs. The
-            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
-            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
-            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
-            cutlass_supported_head_dims = {
-                (64, 64),
-                (128, 128),
-                (192, 128),
-            }
-            head_dims = (
+        fmha_backend = _select_ragged_fmha_backend(
+            is_sm100=get_platform().is_sm100,
+            device_sm=get_platform().device_sm,
+            is_dllm_model=self.is_dllm_model,
+            decode_cuda_graph_enabled=not check_cuda_graph_backend(
+                Phase.DECODE, Backend.DISABLED
+            ),
+            piecewise_prefill_graph_enabled=check_cuda_graph_backend(
+                Phase.PREFILL, Backend.TC_PIECEWISE
+            ),
+            head_dims=(
                 model_runner.model_config.head_dim,
                 model_runner.model_config.v_head_dim,
-            )
-            if (
-                head_dims in cutlass_supported_head_dims
-                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            ):
-                fmha_backend = "cutlass"
+            ),
+        )
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
