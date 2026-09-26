@@ -1126,6 +1126,37 @@ class TestResolveAutoParsers(CustomTestCase):
                 self.assertEqual(_declared(args, "reasoning_parser"), "ling3")
                 self.assertEqual(_declared(args, "tool_call_parser"), "ling3")
 
+    def test_minimax_architectures_and_model_types_use_minimax_parsers(self):
+        cases = (
+            (["MiniMaxM3SparseForCausalLM"], "", "minimax-m3", "minimax-m3"),
+            (
+                ["MiniMaxM3SparseForConditionalGeneration"],
+                "",
+                "minimax-m3",
+                "minimax-m3",
+            ),
+            (None, "minimax_m3_vl", "minimax-m3", "minimax-m3"),
+            (["MiniMaxM2ForCausalLM"], "", "minimax", "minimax-m2"),
+            (None, "minimax_m2", "minimax", "minimax-m2"),
+        )
+        for architectures, model_type, reasoning, tool_call in cases:
+            with self.subTest(architectures=architectures, model_type=model_type):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer([])
+                config = SimpleNamespace(
+                    architectures=architectures, model_type=model_type
+                )
+
+                with _patch_hf_transformers_utils(
+                    Mock(return_value=tokenizer), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
         config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
