@@ -270,6 +270,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     kwargs = {
         "prompt": request.prompt,
+        "task_type": request.task_type,
+        "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
         "size": request.size,
         "width": request.width,
@@ -475,6 +477,7 @@ async def create_video(
     video_url: Optional[str] = Form(None),
     video_path: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
     seconds: Optional[int] = Form(None),
@@ -509,7 +512,6 @@ async def create_video(
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
-    task_type = server_args.pipeline_config.task_type
     is_multipart = "multipart/form-data" in content_type
     raw_form: Any = None
     extra_from_form: Dict[str, Any] = {}
@@ -567,12 +569,6 @@ async def create_video(
             video_input_path = reference_url
             image_sources = merge_image_input_list(input_reference)
 
-        # Validate image input based on model task type
-        if task_type.requires_image_input() and not image_sources:
-            raise HTTPException(
-                status_code=400,
-                detail="input_reference or reference_url is required for image-to-video generation",
-            )
         input_path = None
         if image_sources:
             try:
@@ -616,6 +612,7 @@ async def create_video(
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
             model=form_value("model", model),
+            task_type=form_text_value("task_type", task_type),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
                 "num_outputs_per_prompt", num_outputs_per_prompt
@@ -688,18 +685,6 @@ async def create_video(
             if _is_probably_video_source(payload.get("input_reference")):
                 payload.setdefault("video_path", payload.get("input_reference"))
 
-            has_image_input = (
-                payload.get("reference_url")
-                and not _is_probably_video_source(payload.get("reference_url"))
-            ) or (
-                payload.get("input_reference")
-                and not _is_probably_video_source(payload.get("input_reference"))
-            )
-            if task_type.requires_image_input() and not has_image_input:
-                raise HTTPException(
-                    status_code=400,
-                    detail="input_reference or reference_url is required for image-to-video generation",
-                )
             # for non-multipart/form-data type
             if payload.get("reference_url") and not _is_probably_video_source(
                 payload.get("reference_url")
