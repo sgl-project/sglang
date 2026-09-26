@@ -583,6 +583,7 @@ class ModelRunner:
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             get_model=lambda: self.model,
             gpu_id=self.gpu_id,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def init_ngram_embedding_manager(self):
