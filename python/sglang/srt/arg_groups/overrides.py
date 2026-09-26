@@ -1847,3 +1847,136 @@ def max_speculative_num_draft_tokens(server_args: Any) -> Optional[int]:
     if getattr(server_args, "_resolution_finished", False):
         server_args._max_speculative_num_draft_tokens = result
     return result
+
+
+@register_post_process
+def _wq_dsa_dcp_validation(view: Any) -> dict:
+    """WQ Hopper DCP for DSA models (DeepSeek-V3.2 / GLM-5.x on SM90).
+
+    Invoked from ``ServerArgs._set_default_dsa_backends`` right after
+    ``_dsa_split_backend_resolution`` (passes run at explicit slots;
+    ``POST_PROCESS_PASSES`` is only a registry), so it reads the RESOLVED DSA
+    split backends and kv-cache dtype. Without this pass a DSA model accepts ``--dcp-size > 1`` (no rule
+    rejects it), boots, and then either crashes in the first decode (the
+    ``flashmla_kv`` wrapper used to discard the LSE the DCP merge needs) or
+    silently reads the wrong KV rows (top-k slots are VIRTUAL under DCP).
+    The supported composition on this fork is exactly:
+
+    * fp8_e4m3 KV with ``flashmla_kv`` for BOTH prefill and decode — the only
+      SM90 DSA impl that owner-filters its top-k slots and returns the LSE
+      (``dsa_backend.dcp_localize_topk_slots`` / ``_forward_flashmla_kv``);
+    * index_kpool == 1 (tail tokens are appended past the fixed top-k columns
+      and would need their own owner filtering);
+    * HiCache as the host (L2) tier only: the anchor MLA host pool stripes
+      per rank like the device pool and the DSA indexer host pool keeps the
+      replicated index-K in the logical slot space (pool_host/dsa.py); no L3
+      storage backend (page keys are not dcp_rank-scoped), no LMCache, no
+      HiSparse;
+    * speculative decoding only as EAGLE chain drafting (``eagle_topk == 1``,
+      the NextN/MTP head): the draft pool is owner-striped by the shared write
+      kernel and every draft phase localizes + LSE-merges like the target. Tree
+      drafting (``eagle_topk > 1``) relocates accepted KV with
+      ``move_kv_cache``, which is not DCP-aware; DSPARK has no GLM-5.3
+      speculator and is untested here;
+    * no prefill CP, no mixed chunk (DSA EXTEND rides the decode LSE-merge
+      path, which assumes pure EXTEND batches), no PD disaggregation;
+    * gathered Q (``--no-dcp-replicate-q-proj``: the fp8 q_b_proj has no
+      replicated-weight path).
+    """
+    if view.dcp_size <= 1:
+        return {}
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
+
+    hf_config = view.get_model_config().hf_config
+    if not is_deepseek_dsa(hf_config):
+        return {}
+    platform = get_platform()
+    if not platform.is_cuda or platform.is_blackwell:
+        # Blackwell DSA runs trtllm-gen sparse MLA with native enable_dcp;
+        # leave the upstream composition untouched there.
+        return {}
+
+    problems = []
+    if view.kv_cache_dtype != "fp8_e4m3":
+        problems.append(
+            f"kv_cache_dtype={view.kv_cache_dtype!r} (need 'fp8_e4m3' so the "
+            "DSA split backends resolve to flashmla_kv)"
+        )
+    for attr in ("dsa_prefill_backend", "dsa_decode_backend"):
+        val = getattr(view, attr)
+        if val != "flashmla_kv":
+            problems.append(f"{attr}={val!r} (need 'flashmla_kv')")
+    if get_dsa_index_kpool(hf_config) > 1:
+        problems.append("index_kpool > 1 (tail-token owner filtering not implemented)")
+    # The a2a / LSE merge splits attention heads across the DCP ranks and
+    # asserts num_heads % dcp_size at the first decode; reject it at config time
+    # instead. (Page alignment needs no check: the DCP allocator widens its page
+    # to page_size * dcp_size, so every run start is owner-aligned for any
+    # dcp_size.) Only power-of-two dcp_size has been validated.
+    num_heads = getattr(hf_config, "num_attention_heads", None)
+    if num_heads is not None and num_heads % view.dcp_size != 0:
+        problems.append(
+            f"num_attention_heads={num_heads} is not divisible by dcp_size={view.dcp_size}"
+        )
+    if view.enable_hierarchical_cache and view.hicache_storage_backend is not None:
+        problems.append(
+            f"hicache_storage_backend={view.hicache_storage_backend!r} (HiCache "
+            "L3 storage page keys are not dcp_rank-scoped; only the host tier is "
+            "supported with DSA + DCP)"
+        )
+    for attr, label in (
+        ("enable_lmcache", "--enable-lmcache"),
+        ("enable_hisparse", "--enable-hisparse"),
+        ("enable_prefill_cp", "--enable-prefill-cp"),
+        ("enable_dsa_prefill_context_parallel", "DSA prefill context parallel"),
+        ("enable_mixed_chunk", "--enable-mixed-chunk"),
+    ):
+        if getattr(view, attr):
+            problems.append(f"{label} is not supported with DSA + DCP yet")
+    spec_algo = view.speculative_algorithm
+    if spec_algo is not None:
+        # This pass runs before handle_speculative_decoding collapses the NEXTN
+        # alias onto EAGLE, so accept both spellings of the packed MTP draft.
+        if str(spec_algo).upper() not in ("EAGLE", "NEXTN"):
+            problems.append(
+                f"speculative_algorithm={spec_algo!r} (only EAGLE/NEXTN chain "
+                "drafting is supported with DSA + DCP)"
+            )
+        else:
+            topk = view.speculative_eagle_topk
+            if topk is not None and int(topk) > 1:
+                problems.append(
+                    f"speculative_eagle_topk={topk} (tree drafting relocates "
+                    "accepted KV via move_kv_cache, which is not DCP-aware; "
+                    "use --speculative-eagle-topk 1)"
+                )
+    if view.disaggregation_mode != "null":
+        problems.append("PD disaggregation is not supported with DSA + DCP")
+    if view.dcp_replicate_q_proj:
+        problems.append(
+            "--dcp-replicate-q-proj (fp8 q_b_proj has no replicated-weight "
+            "path; use --no-dcp-replicate-q-proj)"
+        )
+    if view.page_size != 64:
+        problems.append(f"page_size={view.page_size} (DSA flashmla_kv needs 64)")
+    if problems:
+        raise ValueError(
+            "DSA model with --dcp-size > 1 on SM90 (WQ Hopper DCP) rejected:\n  - "
+            + "\n  - ".join(problems)
+        )
+    logger.info(
+        "WQ Hopper DCP enabled for DSA model: dcp_size=%d, comm=%s, "
+        "flashmla_kv prefill+decode with owner-localized top-k and LSE merge; "
+        "index-K replicated over the virtual loc space; speculative=%s; "
+        "hicache=%s.",
+        view.dcp_size,
+        view.dcp_comm_backend,
+        spec_algo or "off",
+        (
+            f"host tier, write_policy={view.hicache_write_policy}, "
+            f"size_gb={view.hicache_size}"
+            if view.enable_hierarchical_cache
+            else "off"
+        ),
+    )
+    return {}
