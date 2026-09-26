@@ -1,0 +1,29 @@
+[package]
+name = "sglang-launch"
+version = "0.1.0"
+edition = "2024"
+description = "Replayable CUDA kernel launches for launch-bound diffusion steps"
+license = "Apache-2.0"
+repository = "https://github.com/sgl-project/sglang"
+
+[package.metadata.sglang]
+python-module = "sglang.kernels.ops.diffusion.norm.sgl_launch"
+debug = false
+
+[lib]
+name = "sgl_launch"
+crate-type = ["cdylib"]
+
+# Kept out of the root workspace for the same reason as sglang-radix-tree: this
+# crate is on PyO3 0.22, which cannot share a dependency graph with the
+# workspace's native `links = "python"` crates.
+[workspace]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

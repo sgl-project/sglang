@@ -6,12 +6,15 @@ members = [
     "sglang-renderer",
     "sglang-server"
 ]
-exclude = ["sglang-radix-tree"]
+exclude = ["sglang-radix-tree", "sglang-launch"]
 
 [workspace.metadata.sglang]
 # Extension crates that intentionally cannot share this workspace's dependency
 # graph (sglang-radix-tree currently uses the tch-compatible PyO3 0.22 API).
-extension-manifests = ["sglang-radix-tree/Cargo.toml"]
+extension-manifests = [
+    "sglang-radix-tree/Cargo.toml",
+    "sglang-launch/Cargo.toml",
+]
 
 [workspace.package]
 version = "0.1.0"
