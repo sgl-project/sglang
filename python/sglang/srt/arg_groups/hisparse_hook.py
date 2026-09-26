@@ -76,6 +76,17 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     )
 
 
+def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
+
+    cfg = resolving_view(server_args)
+    # Both crash on the first request: the draft pool has no HiSparse mapping,
+    # and a mixed batch cannot merge the HiSparse decode batch.
+    if cfg.speculative_algorithm is not None:
+        raise ValueError("--enable-hisparse does not support speculative decoding yet.")
+    if cfg.enable_mixed_chunk:
+        raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -101,6 +112,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     assert cfg.disable_radix_cache, (
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
+    validate_hisparse_feature_combos(server_args)
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

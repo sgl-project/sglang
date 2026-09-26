@@ -35,6 +35,7 @@ from sglang.srt.arg_groups.hicache_hook import (
 )
 from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse_dsa_backend,
+    validate_hisparse_feature_combos,
     validate_hisparse_kv_cache_dtype,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
@@ -1332,6 +1333,19 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    def test_hisparse_rejects_speculative_decoding_and_mixed_chunk(self):
+        validate_hisparse_feature_combos(
+            ServerArgs(model_path="dummy", enable_hisparse=True)
+        )
+        for kwargs in (
+            {"speculative_algorithm": "EAGLE"},
+            {"enable_mixed_chunk": True},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                validate_hisparse_feature_combos(
+                    ServerArgs(model_path="dummy", enable_hisparse=True, **kwargs)
+                )
 
     def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
         server_args = ServerArgs(
