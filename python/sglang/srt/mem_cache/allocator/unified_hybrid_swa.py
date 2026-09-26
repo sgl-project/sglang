@@ -1085,36 +1085,35 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             <= max(0, gap_bytes)
         )
 
-    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
-        """Gate one allocation and compact both sides on shortfall."""
+    def _fit_state(self, full_tokens: int, swa_tokens: int) -> Tuple[bool, bool]:
+        """(fits as the pool stands, fits only once both sides are compacted)."""
         if full_tokens < 0 or swa_tokens < 0:
-            return False
+            return False, False
         if full_tokens == 0 and swa_tokens == 0:
-            return True
+            return True, False
         page_size = self.page_size
         num_full_pages = (int(full_tokens) + page_size - 1) // page_size
         num_swa_pages = (int(swa_tokens) + page_size - 1) // page_size
-        if self._fits_page_demand(
-            num_full_pages,
-            num_swa_pages,
-            compacted=False,
-        ):
-            return True
-        if not self.lazy_compaction or not self._compaction_allowed():
-            return False
-        if not self._fits_page_demand(
-            num_full_pages,
-            num_swa_pages,
-            compacted=True,
-        ):
-            return False
+        if self._fits_page_demand(num_full_pages, num_swa_pages, compacted=False):
+            return True, False
+        return False, (
+            self.lazy_compaction
+            and self._compaction_allowed()
+            and self._fits_page_demand(num_full_pages, num_swa_pages, compacted=True)
+        )
+
+    def allocation_fits(self, full_tokens: int, swa_tokens: int) -> bool:
+        """Whether `ensure_capacity` would succeed; never compacts."""
+        return any(self._fit_state(full_tokens, swa_tokens))
+
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        """Gate one allocation and compact both sides on shortfall."""
+        fits_now, fits_compacted = self._fit_state(full_tokens, swa_tokens)
+        if not fits_compacted:
+            return fits_now
         self.full_attn_allocator.flush_for_allocation()
         self.swa_attn_allocator.flush_for_allocation()
-        return self._fits_page_demand(
-            num_full_pages,
-            num_swa_pages,
-            compacted=False,
-        )
+        return self._fit_state(full_tokens, swa_tokens)[0]
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
@@ -1185,11 +1184,14 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
-            # The shared-byte plan returns cumulative eviction quotas.
-            # Per-component capacity targets can count the same shared bytes
-            # independently and stop before the joint allocation fits.
-            tree_cache.evict(
-                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
+            # One eviction frees bytes on both sides, so neither side's view can
+            # say when to stop; the allocation's own fit check does.
+            tree_cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=full_reclaim,
+                    swa_num_tokens=swa_reclaim,
+                    alloc_demand=(int(num_tokens), int(required_swa)),
+                )
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
         return self.ensure_capacity(num_tokens, required_swa)
