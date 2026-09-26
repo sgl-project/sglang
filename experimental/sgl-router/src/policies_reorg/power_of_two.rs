@@ -7,7 +7,6 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::Rng;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
@@ -54,13 +53,56 @@ impl Policy for PowerOfTwoPolicy {
                         j += 1;
                     }
                     let (left, right) = (&engines[i], &engines[j]);
-                    let pressure = match request.stage {
-                        Stage::Plain | Stage::Prefill => {
-                            compare_prefill_pressure(left, right, Some(&load))
+                    let reports = [left, right]
+                        .map(|engine| load.fresh_native_cache_load_for_url(&engine.url));
+                    let use_reported = reports.iter().all(Option::is_some);
+                    let use_queue_time = reports.iter().all(|report| {
+                        report.is_some_and(|r| r.estimated_prefill_queue_ms.is_some())
+                    });
+                    // A common denominator keeps the two KV fractions exact.
+                    let kv_capacity: u128 = reports
+                        .iter()
+                        .flatten()
+                        .map(|report| u128::from(report.max_total_num_tokens))
+                        .product();
+                    // Lower wins; array elements are compared left to right.
+                    let score = |engine: &Worker| -> [u128; 5] {
+                        let inflight = engine.router_inflight_load() as u128;
+                        let Some(report) = load
+                            .fresh_native_cache_load_for_url(&engine.url)
+                            .filter(|_| use_reported)
+                        else {
+                            return [0, 0, 0, 0, inflight];
+                        };
+                        match request.stage {
+                            Stage::Plain | Stage::Prefill => [
+                                // Nonnegative f64 bits preserve queue-time order.
+                                if use_queue_time {
+                                    report.estimated_prefill_queue_ms.unwrap().to_bits() as u128
+                                } else {
+                                    0
+                                },
+                                report.num_waiting_uncached_tokens.into(),
+                                report.num_waiting_reqs.into(),
+                                report.num_running_reqs.into(),
+                                inflight,
+                            ],
+                            Stage::Decode => [
+                                report.num_waiting_reqs.into(),
+                                report.num_running_reqs.into(),
+                                u128::from(report.num_used_tokens)
+                                    * (kv_capacity
+                                        / u128::from(report.max_total_num_tokens.max(1))),
+                                report.num_used_tokens.into(),
+                                inflight,
+                            ],
                         }
-                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
                     };
-                    Arc::clone(if pressure.is_gt() { right } else { left })
+                    Arc::clone(if score(left) > score(right) {
+                        right
+                    } else {
+                        left
+                    })
                 }
             };
             let metrics = EngineMetrics::observe(&engine, &load);

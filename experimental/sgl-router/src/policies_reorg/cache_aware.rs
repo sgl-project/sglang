@@ -17,7 +17,6 @@ use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixOutcome};
 use tokio::sync::OnceCell;
 
 use crate::config::AffinityConfig;
-use crate::policies::admission::{fleet_is_all_queued, queue_gate_admits, FreshLoadLookup};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::ExternalPrefixSignal;
 use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle};
@@ -122,14 +121,76 @@ impl PrefixMemo {
 struct Candidate<'a> {
     engine: &'a Arc<Worker>,
     uncached_tokens: u64,
+    score: [u128; 5],
 }
 
 /// Less uncached work first, then lower prefill pressure, then worker id.
-fn rank(loads: &FreshLoadLookup<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
+fn rank(left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(left.engine, right.engine))
+        .then_with(|| left.score.cmp(&right.score))
         .then_with(|| left.engine.id.0.cmp(&right.engine.id.0))
+}
+
+fn score_candidates(candidates: &mut [Candidate<'_>], load: &EngineReportedLoadSnapshot) {
+    let use_reported = candidates.iter().all(|c| {
+        load.fresh_native_cache_load_for_url(&c.engine.url)
+            .is_some()
+    });
+    let use_queue_time = candidates.iter().all(|c| {
+        load.fresh_native_cache_load_for_url(&c.engine.url)
+            .is_some_and(|report| report.estimated_prefill_queue_ms.is_some())
+    });
+    // Prefix work is ranked separately; this key breaks ties by prefill pressure.
+    let score = |engine: &Worker| -> [u128; 5] {
+        let inflight = engine.router_inflight_load() as u128;
+        let Some(report) = load
+            .fresh_native_cache_load_for_url(&engine.url)
+            .filter(|_| use_reported)
+        else {
+            return [0, 0, 0, 0, inflight];
+        };
+        [
+            // Nonnegative f64 bits preserve queue-time order.
+            if use_queue_time {
+                report.estimated_prefill_queue_ms.unwrap().to_bits() as u128
+            } else {
+                0
+            },
+            report.num_waiting_uncached_tokens.into(),
+            report.num_waiting_reqs.into(),
+            report.num_running_reqs.into(),
+            inflight,
+        ]
+    };
+    for candidate in candidates {
+        candidate.score = score(candidate.engine);
+    }
+}
+
+/// Unknown queues pass this soft gate; the boundary for a known queue is `<`.
+fn queue_gate_admits(
+    load: &EngineReportedLoadSnapshot,
+    engine: &Worker,
+    limit: Option<u64>,
+) -> bool {
+    limit.is_none_or(|limit| {
+        load.fresh_load_for_url(&engine.url)
+            .is_none_or(|load| load.num_waiting_reqs < limit)
+    })
+}
+
+/// An unknown queue cannot establish that the entire group is queued.
+fn fleet_is_all_queued(
+    load: &EngineReportedLoadSnapshot,
+    engines: &[Arc<Worker>],
+    limit: Option<u64>,
+) -> bool {
+    limit.is_some()
+        && !engines.is_empty()
+        && engines
+            .iter()
+            .all(|engine| !queue_gate_admits(load, engine, limit))
 }
 
 #[derive(Debug)]
@@ -218,6 +279,7 @@ impl CacheAwarePolicy {
                 hit.then_some(Candidate {
                     engine,
                     uncached_tokens,
+                    score: [0; 5],
                 })
             })
             .collect();
@@ -226,8 +288,8 @@ impl CacheAwarePolicy {
             .len()
             .min(config.cache_candidate_max_workers)
             .min(config.cache_candidate_min_workers.max(proportional));
-        let loads = FreshLoadLookup::new(Some(load), candidates.iter().map(|c| c.engine));
-        candidates.sort_by(|left, right| rank(&loads, left, right));
+        score_candidates(&mut candidates, load);
+        candidates.sort_by(rank);
         candidates.truncate(limit);
         candidates
     }
@@ -317,7 +379,7 @@ impl CacheAwarePolicy {
         load: &EngineReportedLoadSnapshot,
     ) -> Result<Option<Pick>, PickError> {
         let limit = self.config.worker_queue_limit;
-        let (mut evaluated, gated): (Vec<Candidate<'_>>, Vec<_>) = candidates
+        let (mut evaluated, mut gated): (Vec<Candidate<'_>>, Vec<_>) = candidates
             .iter()
             .partition(|c| queue_gate_admits(load, c.engine, limit));
         // Diverting off an all-queued group buys nothing, so keep the prefix.
@@ -329,10 +391,10 @@ impl CacheAwarePolicy {
         if saturated {
             evaluated.extend(&gated);
         }
+        score_candidates(&mut evaluated, load);
         let mut rejections = Vec::new();
         let admitted = self.admit(&evaluated, load, &mut rejections)?;
         if let Some(&least) = admitted.iter().min_by_key(|c| c.uncached_tokens) {
-            let loads = FreshLoadLookup::new(Some(load), evaluated.iter().map(|c| c.engine));
             let guarded = self.config.pressure_guard
                 && evaluated.iter().all(|c| {
                     load.fresh_native_cache_load_for_url(&c.engine.url)
@@ -352,7 +414,7 @@ impl CacheAwarePolicy {
                     let guard = (guarded && near_tie)
                         .then(|| self.guard(winner.engine, candidate.engine, load))
                         .flatten();
-                    match guard.unwrap_or_else(|| rank(&loads, &winner, &candidate)) {
+                    match guard.unwrap_or_else(|| rank(&winner, &candidate)) {
                         Ordering::Greater => candidate,
                         _ => winner,
                     }
@@ -372,13 +434,13 @@ impl CacheAwarePolicy {
             !load.any_fresh_queue_below(engines.iter().map(|e| e.url.as_str()), floor)
         });
         if pinned {
-            let loads = FreshLoadLookup::new(Some(load), gated.iter().map(|c| c.engine));
+            score_candidates(&mut gated, load);
             let owner = self
                 .admit(&gated, load, &mut rejections)?
                 .into_iter()
                 .min_by(|left, right| {
-                    loads
-                        .compare_prefill_pressure(left.engine, right.engine)
+                    left.score
+                        .cmp(&right.score)
                         .then_with(|| left.engine.id.0.cmp(&right.engine.id.0))
                 });
             if let Some(owner) = owner {
