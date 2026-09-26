@@ -4471,6 +4471,60 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+class TestEncodeArgumentsToDsml(unittest.TestCase):
+    """DSV4 history tool-call arguments expand to one DSML parameter per key.
+
+    Assistant history reaches the encoder after
+    normalize_assistant_tool_call_arguments() has already turned
+    function.arguments into a dict. Collapsing it into a single parameter named
+    "arguments" makes the model imitate that shape, so the next turn's tool call
+    comes back double-wrapped as {"arguments": {...}}.
+    """
+
+    def test_dict_arguments_expand_per_key(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        dsml = encoding_dsv4.encode_arguments_to_dsml(
+            {"name": "mv", "arguments": {"src": "a.py", "dst": "b.py"}}
+        )
+        self.assertIn('parameter name="src" string="true">a.py<', dsml)
+        self.assertIn('parameter name="dst" string="true">b.py<', dsml)
+        self.assertNotIn('name="arguments"', dsml)
+
+    def test_json_string_arguments_expand_per_key(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        dsml = encoding_dsv4.encode_arguments_to_dsml(
+            {"name": "read_file", "arguments": '{"path": "/proj/a.py"}'}
+        )
+        self.assertIn('parameter name="path" string="true">/proj/a.py<', dsml)
+        self.assertNotIn('name="arguments"', dsml)
+
+    def test_non_string_values_marked_not_string(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        dsml = encoding_dsv4.encode_arguments_to_dsml(
+            {"name": "create", "arguments": {"count": 3, "tags": ["a"]}}
+        )
+        self.assertIn('parameter name="count" string="false">3<', dsml)
+        self.assertIn('parameter name="tags" string="false">["a"]<', dsml)
+
+    def test_empty_arguments_produce_no_parameters(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        self.assertEqual(
+            encoding_dsv4.encode_arguments_to_dsml({"name": "now", "arguments": {}}), ""
+        )
+
+    def test_non_object_arguments_rejected(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        with self.assertRaises(ValueError):
+            encoding_dsv4.encode_arguments_to_dsml(
+                {"name": "read_file", "arguments": "[1, 2]"}
+            )
+
+
 class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
 
