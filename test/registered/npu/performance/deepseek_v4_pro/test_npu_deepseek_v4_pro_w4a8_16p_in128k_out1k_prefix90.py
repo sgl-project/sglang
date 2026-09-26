@@ -41,7 +41,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "TRANSFORMERS_VERBOSITY": "error",
-    # DSPARK
+    # dspark
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
@@ -54,7 +54,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
 # Server launch arguments for DSV4-Pro W4A8 single-node 16p PD-mix.
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
-    16,
+    32,
     "--trust-remote-code",
     "--attention-backend",
     "ascend",

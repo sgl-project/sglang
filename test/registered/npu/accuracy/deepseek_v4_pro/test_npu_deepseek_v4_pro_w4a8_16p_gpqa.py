@@ -54,7 +54,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
 
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
-    16,
+    32,
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
