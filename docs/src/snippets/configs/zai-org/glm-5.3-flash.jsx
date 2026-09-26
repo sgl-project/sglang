@@ -179,8 +179,7 @@ python3 -m sglang.bench_serving \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --request-rate inf --temperature 0 --seed 42 \\
   --flush-cache`,
-    // num_prompts = 5 × concurrency (measured floor 16).
-    numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
+    numPromptsByConc: { 1: 8, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install sgl-eval
@@ -267,6 +266,8 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
+            disabled: (s) => s.quant === "nvfp4",
+            disableReason: "DeepGemm has no NVFP4 W4A4 kernel path for this checkpoint; keep flashinfer_cutlass.",
           },
         ],
       },
@@ -399,7 +400,7 @@ sgl-eval run gsm8k \\
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Validated on
     // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
-    // carry measured speed for both pairings on the current release image.
+    // carry measured speed for both pairings on the release image at tree fe236ea6c3.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
@@ -425,7 +426,6 @@ sgl-eval run gsm8k \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -476,7 +476,6 @@ sgl-eval run gsm8k \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -517,7 +516,6 @@ sgl-eval run gsm8k \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -558,7 +556,6 @@ sgl-eval run gsm8k \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -615,7 +612,7 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -663,7 +660,7 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        s.hicache === "off" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -705,7 +702,7 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "in-progress" : "unverified",
+        s.hicache === "off" ? "in-progress" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -746,7 +743,7 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "in-progress" : "unverified",
+        s.hicache === "off" ? "in-progress" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
