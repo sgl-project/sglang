@@ -879,8 +879,10 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: dict[int, int],
         reasoning_tokens: dict[int, int],
         completion_tokens: dict[int, int],
+        response_id: str,
+        created: int,
     ) -> AsyncGenerator[str, None]:
-        """Generate SSE chunks for streaming content."""
+        """Generate SSE chunks with the response ID and timestamp for this stream."""
         offset = stream_offsets.get(index, 0)
         if get_serving().incremental_streaming_output:
             delta = content["text"]
@@ -914,8 +916,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    chunk_id=response_id,
+                    created=created,
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
@@ -927,13 +929,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle tool calls
         if self._tool_call_parsing_active(request):
             async for chunk in self._process_tool_call_stream(
-                index,
-                delta,
-                parser_dict,
-                content,
-                request,
-                has_tool_calls,
-                continuous_usage_stats,
+                index=index,
+                delta=delta,
+                parser_dict=parser_dict,
+                content=content,
+                request=request,
+                has_tool_calls=has_tool_calls,
+                response_id=response_id,
+                created=created,
+                continuous_usage_stats=continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
             ):
                 if chunk:
@@ -943,7 +947,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
+                    parser=parser,
+                    request=request,
+                    index=index,
+                    response_id=response_id,
+                    created=created,
                 )
                 if remaining_chunk:
                     yield remaining_chunk
@@ -961,8 +969,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     ).model_dump()
 
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    chunk_id=response_id,
+                    created=created,
                     model=request.model,
                     index=index,
                     content=delta,
@@ -989,8 +997,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 ).model_dump()
 
             yield build_sse_content(
-                chunk_id=content["meta_info"]["id"],
-                created=int(time.time()),
+                chunk_id=response_id,
+                created=created,
                 model=request.model,
                 index=index,
                 logprobs=remaining_logprobs,
@@ -1934,6 +1942,11 @@ class OpenAIServingChat(OpenAIServingBase):
         input_ids: list[int] | None = None
         output_ids: dict[int, list[int]] = {}
 
+        # All chunks share one timestamp and the first result's ID.
+        # choices[].index identifies each candidate.
+        created = int(time.time())
+        response_id: Optional[str] = None
+
         stream_started = False
         error_aborted = False
         try:
@@ -1954,6 +1967,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+
+                if response_id is None:
+                    response_id = content["meta_info"]["id"]
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]
@@ -2043,8 +2059,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     yield build_sse_content(
-                        chunk_id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        chunk_id=response_id,
+                        created=created,
                         model=request.model,
                         index=index,
                         role="assistant",
@@ -2067,6 +2083,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    response_id=response_id,
+                    created=created,
                 ):
                     yield chunk
 
@@ -2081,8 +2099,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 matched_stop = finish_reason_data.get("matched")
                 yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    chunk_id=response_id,
+                    created=created,
                     model=request.model,
                     index=idx,
                     finish_reason=final_finish_reason,
@@ -2097,8 +2115,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
+                            id=response_id,
+                            created=created,
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
@@ -2165,8 +2183,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 # the other sglext fields keep the plain data-chunk shape.
                 if sglext_non_ids is not None:
                     sglext_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        id=response_id,
+                        created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_non_ids,
@@ -2174,8 +2192,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {sglext_chunk.model_dump_json()}\n\n"
                 if sglext_ids is not None:
                     sglext_ids_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        id=response_id,
+                        created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_ids,
@@ -2183,8 +2201,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
             elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    id=response_id,
+                    created=created,
                     choices=[],  # sglext is at response level
                     model=request.model,
                     sglext=sglext_full,
@@ -2216,8 +2234,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_tokens=total_video_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    id=response_id,
+                    created=created,
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
@@ -2983,6 +3001,8 @@ class OpenAIServingChat(OpenAIServingBase):
         content: dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: dict[int, bool],
+        response_id: str,
+        created: int,
         continuous_usage_stats: bool = False,
         flush: bool = False,
     ):
@@ -3045,8 +3065,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
+                id=response_id,
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )
@@ -3098,8 +3118,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
+                id=response_id,
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )
@@ -3121,9 +3141,10 @@ class OpenAIServingChat(OpenAIServingBase):
     def _check_for_unstreamed_tool_args(
         self,
         parser: FunctionCallParser | JsonArrayParser,
-        content: dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
+        response_id: str,
+        created: int,
     ) -> str | None:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -3184,8 +3205,8 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
+                id=response_id,
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )

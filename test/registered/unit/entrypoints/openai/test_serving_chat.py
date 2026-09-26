@@ -272,7 +272,7 @@ class TestChatTemplateCache(CustomTestCase):
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
 
 
-class ServingChatTestCase(unittest.TestCase):
+class ServingChatTestCase(CustomTestCase):
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
@@ -1735,12 +1735,6 @@ class ServingChatTestCase(unittest.TestCase):
         ]
         mock_parser.detector = mock_detector
 
-        content = {
-            "meta_info": {
-                "id": "chatcmpl-test123",
-            }
-        }
-
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "What's the weather?"}],
@@ -1750,9 +1744,10 @@ class ServingChatTestCase(unittest.TestCase):
         # Test the completion method
         result = self.chat._check_for_unstreamed_tool_args(
             parser=mock_parser,
-            content=content,
             request=request,
             index=0,
+            response_id="chatcmpl-test123",
+            created=1700000000,
         )
 
         # Should return a chunk with remaining arguments
@@ -1761,6 +1756,7 @@ class ServingChatTestCase(unittest.TestCase):
         # Parse the result to verify content
         self.assertTrue(result.startswith("data: "))
         chunk = json.loads(result[6:])
+        self._assert_stream_metadata([chunk], "chatcmpl-test123")
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
@@ -1788,12 +1784,6 @@ class ServingChatTestCase(unittest.TestCase):
         ]
         mock_parser.detector = mock_detector
 
-        content = {
-            "meta_info": {
-                "id": "chatcmpl-test123",
-            }
-        }
-
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "What's the weather?"}],
@@ -1803,9 +1793,10 @@ class ServingChatTestCase(unittest.TestCase):
         # Test the completion method
         result = self.chat._check_for_unstreamed_tool_args(
             parser=mock_parser,
-            content=content,
             request=request,
             index=0,
+            response_id="chatcmpl-test123",
+            created=1700000000,
         )
 
         # Should return None since no completion is needed
@@ -1822,12 +1813,6 @@ class ServingChatTestCase(unittest.TestCase):
         mock_detector.streamed_args_for_tool = ["{}"]
         mock_parser.detector = mock_detector
 
-        content = {
-            "meta_info": {
-                "id": "chatcmpl-test123",
-            }
-        }
-
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "commit"}],
@@ -1841,9 +1826,10 @@ class ServingChatTestCase(unittest.TestCase):
 
         result = self.chat._check_for_unstreamed_tool_args(
             parser=mock_parser,
-            content=content,
             request=request,
             index=0,
+            response_id="chatcmpl-test123",
+            created=1700000000,
         )
 
         self.assertIsNone(result, "Should not append encoded quotes")
@@ -1862,12 +1848,6 @@ class ServingChatTestCase(unittest.TestCase):
         mock_detector.streamed_args_for_tool = ['{"location": "San Francisco"']
         mock_parser.detector = mock_detector
 
-        content = {
-            "meta_info": {
-                "id": "chatcmpl-test123",
-            }
-        }
-
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "What's the weather?"}],
@@ -1876,13 +1856,15 @@ class ServingChatTestCase(unittest.TestCase):
 
         result = self.chat._check_for_unstreamed_tool_args(
             parser=mock_parser,
-            content=content,
             request=request,
             index=0,
+            response_id="chatcmpl-test123",
+            created=1700000000,
         )
 
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
         chunk = json.loads(result[6:])
+        self._assert_stream_metadata([chunk], "chatcmpl-test123")
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(tool_calls[0]["function"]["arguments"], ', "unit": "celsius"}')
 
@@ -1896,12 +1878,6 @@ class ServingChatTestCase(unittest.TestCase):
         mock_detector.streamed_args_for_tool = []
         mock_parser.detector = mock_detector
 
-        content = {
-            "meta_info": {
-                "id": "chatcmpl-test123",
-            }
-        }
-
         request = ChatCompletionRequest(
             model="test",
             messages=[{"role": "user", "content": "What's the weather?"}],
@@ -1911,9 +1887,10 @@ class ServingChatTestCase(unittest.TestCase):
         # Test the completion method
         result = self.chat._check_for_unstreamed_tool_args(
             parser=mock_parser,
-            content=content,
             request=request,
             index=0,
+            response_id="chatcmpl-test123",
+            created=1700000000,
         )
 
         # Should return None since there's no parser data
@@ -2298,9 +2275,11 @@ class ServingChatTestCase(unittest.TestCase):
                     index=0,
                     delta="irrelevant",
                     parser_dict={},
-                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    content={"meta_info": {"id": "rid-candidate-1"}},
                     request=req,
                     has_tool_calls={},
+                    response_id="chatcmpl-test",
+                    created=1700000000,
                 )
                 # Get first yielded SSE line
                 line = None
@@ -2315,6 +2294,7 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertTrue(line.startswith("data: "))
 
             payload = json.loads(line[len("data: ") :])
+            self._assert_stream_metadata([payload], "chatcmpl-test")
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
@@ -2918,6 +2898,184 @@ class ServingChatTestCase(unittest.TestCase):
             "usage chunk dropped after error abort",
         )
 
+    def test_streaming_keeps_one_id_and_one_created(self):
+        """Text, finish, usage, and extension chunks share the stream metadata."""
+
+        def _chunk(index, text, finish_reason):
+            return {
+                "text": text,
+                "prompt_token_ids": [1, 2],
+                "output_ids": [3, 4],
+                "meta_info": {
+                    "id": f"rid-candidate-{index}",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "cached_tokens_details": {"device": 0, "host": 0},
+                    "hidden_states": [[0.5, 1.0]],
+                    "finish_reason": finish_reason,
+                },
+                "index": index,
+            }
+
+        for indices in ((0,), (0, 1), (1, 0)):
+            for framed in (False, True):
+                with self.subTest(indices=indices, framed=framed):
+
+                    async def _mock_generate():
+                        for index in indices:
+                            yield _chunk(index, "Hello", None)
+                        for index in indices:
+                            yield _chunk(index, "Hello there", {"type": "stop"})
+
+                    self.tm.generate_request.return_value = _mock_generate()
+                    self.fastapi_request.headers = (
+                        {"x-sglext-ids-framed": "1"} if framed else {}
+                    )
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        n=len(indices),
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        return_hidden_states="last",
+                        return_cached_tokens_details=True,
+                        return_input_ids_in_sglext=True,
+                        return_output_ids_in_sglext=True,
+                    )
+                    with patch(
+                        "sglang.srt.entrypoints.openai.serving_chat.time"
+                    ) as clock:
+                        # Each clock read crosses a second boundary.
+                        clock.time.side_effect = range(1_700_000_000, 1_700_000_200)
+                        chunks = self._run_chat_stream(Mock(), req)
+
+                    # Include both plain data chunks and named sglext_ids events.
+                    parsed = [
+                        json.loads(line[len("data: ") :])
+                        for chunk in chunks[:-1]
+                        for line in chunk.splitlines()
+                        if line.startswith("data: ")
+                    ]
+                    self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                    self._assert_stream_metadata(parsed, f"rid-candidate-{indices[0]}")
+                    choices = [choice for c in parsed for choice in c["choices"]]
+                    self.assertEqual({c["index"] for c in choices}, set(indices))
+                    self.assertEqual(
+                        sum(c.get("finish_reason") == "stop" for c in choices),
+                        len(indices),
+                    )
+                    self.assertEqual(
+                        sum(
+                            c["delta"].get("hidden_states") is not None for c in choices
+                        ),
+                        len(indices),
+                    )
+                    for index in indices:
+                        self.assertEqual(
+                            sum(
+                                c["delta"].get("role") == "assistant"
+                                for c in choices
+                                if c["index"] == index
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            "".join(
+                                c["delta"].get("content") or ""
+                                for c in choices
+                                if c["index"] == index
+                            ),
+                            "Hello there",
+                        )
+                    self.assertIsNotNone(parsed[-1]["usage"])
+                    self.assertEqual(
+                        sum("sglext" in c for c in parsed), 2 if framed else 1
+                    )
+
+    def test_streaming_tool_chunks_keep_stream_metadata(self):
+        """Tool text, calls, and final argument deltas share the stream metadata."""
+        self.chat.tool_call_parser = "hermes"
+        partial_args = '{"location": "Paris"'
+        expected_args = {"location": "Paris", "unit": "celsius"}
+        call = Mock(tool_index=0, parameters=partial_args)
+        call.name = "get_weather"
+
+        plain_parser = Mock()
+        plain_parser.parse_stream_chunk.return_value = ("", [])
+        plain_parser.parse_stream_end.return_value = ("", [])
+        plain_parser.detector.prev_tool_call_arr = []
+        tool_parser = Mock()
+        tool_parser.parse_stream_chunk.return_value = ("Let me check.", [call])
+        tool_parser.parse_stream_end.return_value = ("", [])
+        tool_parser.detector.prev_tool_call_arr = [
+            {"name": "get_weather", "arguments": expected_args}
+        ]
+        tool_parser.detector.streamed_args_for_tool = [partial_args]
+
+        async def _mock_generate():
+            for index in (0, 1):
+                yield {
+                    "text": "tool response",
+                    "index": index,
+                    "meta_info": {
+                        "id": f"rid-candidate-{index}",
+                        "prompt_tokens": 2,
+                        "completion_tokens": 2,
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+
+        self.tm.generate_request.return_value = _mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            n=2,
+            stream=True,
+        )
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser",
+                side_effect=[plain_parser, tool_parser],
+            ),
+            patch("sglang.srt.entrypoints.openai.serving_chat.time") as clock,
+        ):
+            clock.time.side_effect = range(1_700_000_000, 1_700_000_200)
+            chunks = self._run_chat_stream(Mock(), req)
+
+        parsed = self._parse_chunks(chunks)
+        self._assert_stream_metadata(parsed, "rid-candidate-0")
+        choices = [choice for chunk in parsed for choice in chunk["choices"]]
+        tool_choices = [choice for choice in choices if choice["index"] == 1]
+        self.assertEqual(
+            [c["delta"]["content"] for c in tool_choices if c["delta"].get("content")],
+            ["Let me check."],
+        )
+        calls = [
+            call
+            for choice in tool_choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["id"])
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(calls[0]["function"]["arguments"], partial_args)
+        self.assertIsNone(calls[1]["id"])
+        self.assertIsNone(calls[1]["function"]["name"])
+        self.assertEqual(calls[1]["function"]["arguments"], ', "unit": "celsius"}')
+        self.assertEqual(
+            json.loads("".join(call["function"]["arguments"] for call in calls)),
+            expected_args,
+        )
+        self.assertEqual(tool_choices[-1]["finish_reason"], "tool_calls")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def _assert_stream_metadata(self, chunks, response_id):
+        self.assertTrue(chunks)
+        self.assertEqual({c["id"] for c in chunks}, {response_id})
+        self.assertEqual({c["created"] for c in chunks}, {1_700_000_000})
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []
@@ -2952,8 +3110,11 @@ class ServingChatTestCase(unittest.TestCase):
             prompt_tokens={0: 5},
             reasoning_tokens={0: 0},
             completion_tokens={0: 1},
+            response_id="chatcmpl-test",
+            created=1700000000,
         ):
             chunks.append(chunk)
+        self._assert_stream_metadata(self._parse_chunks(chunks), "chatcmpl-test")
         return chunks
 
     def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
@@ -3826,6 +3987,8 @@ class ServingChatTestCase(unittest.TestCase):
                 prompt_tokens={0: 10},
                 reasoning_tokens={0: 0},
                 completion_tokens={0: 2},
+                response_id="chatcmpl-test",
+                created=1700000000,
             ):
                 chunks.append(chunk)
             return chunks
