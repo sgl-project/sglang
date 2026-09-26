@@ -936,6 +936,8 @@ class SchedulerPPMixin:
         async_send: bool = True,
         msg_type: str = "default",
         ready_event: Optional[torch.Event] = None,
+        batch_p2p: bool = False,
+        tag: int = 0,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -945,14 +947,21 @@ class SchedulerPPMixin:
             )
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
+        pp_group = (
+            self._pp_vpp_activation_group(self.pp_group.rank_in_group)
+            if msg_type == "vpp_proxy"
+            else self.pp_group
+        )
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
                 self.device_module.current_stream().wait_event(ready_event)
             p2p_work.extend(
-                self.pp_group.send_tensor_dict(
+                pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
                     all_gather_group=(self.attn_tp_group),
                     async_send=async_send,
+                    batch_p2p=batch_p2p,
+                    tag=tag,
                 )
             )
         return p2p_work
@@ -973,6 +982,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        batch_p2p: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -988,7 +998,8 @@ class SchedulerPPMixin:
         while True:
             with self.pp_comm_stream_ctx:
                 tensor_dict = self.pp_group.recv_tensor_dict(
-                    all_gather_group=all_gather_group
+                    all_gather_group=all_gather_group,
+                    batch_p2p=batch_p2p,
                 )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")

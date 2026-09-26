@@ -130,10 +130,9 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
-    # Global ids of the layers this runner owns; None when the model has no split.
+    layer_ids: tuple[int, ...]
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
-    # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
     is_hybrid_swa_mtp_draft: bool = False
 
 
@@ -151,7 +150,12 @@ def resolve_layer_indices(
         model=model, model_config=model_config, is_draft_worker=is_draft_worker
     )
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
-    num_effective_layers = pp_range.end_layer - pp_range.start_layer
+    layer_ids = (
+        tuple(model.layer_ids)
+        if hasattr(model, "layer_ids")
+        else tuple(range(pp_range.start_layer, pp_range.end_layer))
+    )
+    num_effective_layers = len(layer_ids)
 
     # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
     loop_num = _get_loop_num(model_config.hf_config)
@@ -167,7 +171,7 @@ def resolve_layer_indices(
     owned_layers = (
         range(draft_model_idx, draft_model_idx + 1)
         if is_hybrid_swa_mtp_draft
-        else range(pp_range.start_layer, pp_range.end_layer)
+        else layer_ids
     )
     swa_attention_layer_ids, full_attention_layer_ids = (
         _resolve_local_hybrid_swa_layer_ids(
@@ -179,6 +183,7 @@ def resolve_layer_indices(
         start_layer=pp_range.start_layer,
         end_layer=pp_range.end_layer,
         num_effective_layers=num_effective_layers,
+        layer_ids=layer_ids,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
         is_hybrid_swa_mtp_draft=is_hybrid_swa_mtp_draft,
@@ -188,9 +193,9 @@ def resolve_layer_indices(
 def _resolve_local_hybrid_swa_layer_ids(
     *,
     model_config: ModelConfig,
-    owned_layers: range,
+    owned_layers,
 ) -> tuple[Optional[list[int]], Optional[list[int]]]:
-    if model_config.swa_attention_layer_ids is None:
+    if getattr(model_config, "swa_attention_layer_ids", None) is None:
         return None, None
     return (
         [i for i in model_config.swa_attention_layer_ids if i in owned_layers],
