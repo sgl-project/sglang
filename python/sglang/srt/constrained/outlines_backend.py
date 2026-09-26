@@ -17,7 +17,10 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
-import interegular
+try:
+    import interegular
+except ImportError:
+    interegular = None
 import torch
 from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
@@ -29,7 +32,13 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
+    build_fsm_with_budget,
+    check_regex_ast_complexity,
     validate_outlines_json_schema,
+    validate_schema_bounds,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
@@ -147,14 +156,21 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
 
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
+            # Tier 1+2: Validate regex complexity and compile with budget
+            check_regex_ast_complexity(regex)
+            build_fsm_with_budget(regex)
+
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1
                 guide = RegexGuide.from_regex(regex, self.outlines_tokenizer)
             else:
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
-        except interegular.patterns.InvalidSyntax as e:
+        except interegular.patterns.InvalidSyntax if interegular else Exception as e:
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            return InvalidGrammarObject(str(e))
+        except JSONSchemaStateExplosion as e:
+            logger.error(f"Hit regex state explosion: {regex=}, {e=}")
             return InvalidGrammarObject(str(e))
 
         jump_forward_map = None
@@ -168,13 +184,18 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
 
     def dispatch_json(self, key_string: str):
         try:
-            validate_outlines_json_schema(json.loads(key_string))
+            schema = json.loads(key_string)
+            validate_outlines_json_schema(schema)
+            validate_schema_bounds(schema)
             regex = build_regex_from_object(
                 key_string,
                 whitespace_pattern=self.whitespace_pattern,
             )
         except (
             NotImplementedError,
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
+            JSONSchemaCircularRef,
             json.decoder.JSONDecodeError,
             ValueError,
         ) as e:
