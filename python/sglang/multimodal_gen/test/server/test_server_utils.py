@@ -1720,6 +1720,9 @@ def get_generate_fn(
         action_dim = int(extra.get("action_dim", 32))
         state_dim = int(extra.get("state_dim", action_dim))
         image_size = int(extra.get("image_size", 64))
+        # Policies with a fixed camera resolution (e.g. DROID 360x640) set both.
+        image_height = int(extra.get("image_height", image_size))
+        image_width = int(extra.get("image_width", image_size))
         camera_order = tuple(
             extra.get(
                 "camera_order",
@@ -1735,8 +1738,8 @@ def get_generate_fn(
             }
 
         def image_payload(camera_index: int):
-            y = np.arange(image_size, dtype=np.uint16)[:, None]
-            x = np.arange(image_size, dtype=np.uint16)[None, :]
+            y = np.arange(image_height, dtype=np.uint16)[:, None]
+            x = np.arange(image_width, dtype=np.uint16)[None, :]
             image = np.stack(
                 (
                     (x + camera_index * 17) % 256 + np.zeros_like(y),

@@ -299,6 +299,12 @@ class PipelineConfig:
 
         return False
 
+    def action_metadata(self, server_args: Any) -> dict[str, Any] | None:
+        """Model-owned ``GET /v1/actions/metadata`` payload; None uses the generic one."""
+
+        del server_args
+        return None
+
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 
