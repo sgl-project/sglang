@@ -221,6 +221,8 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
+    // Pro Official's DSpark PD + UMBP pairs ran end-to-end on this build.
+    "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
     mi300x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260914",
     mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914",
   },
@@ -259,7 +261,8 @@ sgl-eval run mmmu_pro \\
           ] },
         { id: "dpAttn", label: "DP-Attention",
           // The low-latency and balanced PD roles run TP-only. That is what lets
-          // their decode ladders run to the full ceiling (8 and 96): the ceiling
+          // their decode ladders run to the full ceiling (8, 32 on Pro Official
+          // low-latency, and 96): the ceiling
           // is server-wide and floor-divided by attn_dp_size, so only at dp_size
           // 1 is it also the per-rank batch. Forced rather than left to the
           // reader, because switching DP on would cut the slots per rank without
@@ -269,7 +272,8 @@ sgl-eval run mmmu_pro \\
           forceOff: [
             { when: { hw: ["mi355x"], strategy: ["low-latency", "balanced"],
                       pdMode: ["prefill", "decode"] },
-              stripEnv: ["SGLANG_DP_SHARED_EXPERT_LOCAL",
+              stripEnv: ["SGLANG_SHARED_EXPERT_TP1",
+                         "SGLANG_DP_SHARED_EXPERT_LOCAL",
                          "SGLANG_DP_USE_GATHERV",
                          "SGLANG_DP_USE_REDUCE_SCATTER"],
               reason: "The low-latency and balanced PD roles are TP-only, which is what makes --cuda-graph-bs-decode equal the full ceiling. --max-running-requests is server-wide and floor-divided by attn_dp_size, so DP would cut the per-rank batch below the captured graphs." },
@@ -341,10 +345,9 @@ sgl-eval run mmmu_pro \\
         { id: "current",    label: "Inherited from base" },
         { id: "off",        label: "Off (greedy)" },
         // Shown on pro-official as well as the originals: the 0813 checkpoint
-        // bundles a DSpark head but keeps its MTP head, and DSpark cannot run
-        // under PD disaggregation (§3.8), so this shape is the speculative
-        // option a PD role actually has. The 1-1-2 shape stays hidden there —
-        // off PD, DSpark is the better pick, so only one fallback is offered.
+        // bundles a DSpark head but keeps its MTP head, so this shape stays
+        // available as the MTP fallback. The 1-1-2 shape stays hidden there —
+        // DSpark is the better pick, so only one fallback is offered.
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
@@ -375,7 +378,6 @@ sgl-eval run mmmu_pro \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
-      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
         // The AMD role flags are the MI355X 1P x 1D agentic recipe. Both roles
@@ -428,6 +430,7 @@ sgl-eval run mmmu_pro \\
         // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
         { id: "mori",     label: "MORI",
           hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] },
+          defaultWhen: { hw: ["mi300x", "mi355x"] },
           // Transport-wide only. The per-rank dispatch budget is sized per role
           // (see `modes` above), so it lives on the role, not here.
           env: [
@@ -448,6 +451,7 @@ sgl-eval run mmmu_pro \\
         { id: "mlx5_7", label: "mlx5_7", hide: { hw: ["mi300x", "mi355x"] } },
         { id: "rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5",
           label: "rdma0-7 (all NICs)",
+          defaultWhen: { hw: ["mi355x"] },
           hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] } },
       ],
       // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
@@ -476,7 +480,96 @@ sgl-eval run mmmu_pro \\
       // pool or high-throughput's UMBP. It re-sizes more of the base cell than
       // the other two because the balanced cell is a DP recipe for aggregated
       // serving — its 0.90 / 0.15 / 65536 sizing does not carry over.
+      // Low-latency on Pro Official (0813) is its own pair: an asymmetric TP4
+      // prefill / TP8 decode that keeps the bundled DSpark head on both roles
+      // (gamma 6; steps / topk / draft tokens are derived from it), with a
+      // 32-request ceiling and a UMBP tier under the prefill role (see the umbp
+      // roleOverride below). The base cell's --prefill-decode-interval and the
+      // decode role's --chunked-prefill-size are aggregated-serving knobs, so
+      // the roles drop them.
       roleOverrides: [
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--tp 4",
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--speculative-dspark-block-size 6",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 32",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--tokenizer-worker-num 8",
+            "--stream-interval 20",
+            "--speculative-dspark-block-size 6",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 32",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // Balanced on Pro Official is the same asymmetric TP4 / TP8 DSpark pair
+        // re-sized for a 96-request ceiling, at gamma 3 rather than 6: the
+        // larger batch leaves less verify headroom per request. The balanced
+        // base cell is a target-only DP recipe, so the roles add DSpark back.
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--tp 4",
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--chunked-prefill-size 16384",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["balanced"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--mem-fraction-static 0.86",
+            "--max-running-requests 96",
+            "--swa-full-tokens-ratio 0.1",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
         { mode: "prefill",
           when: { hw: ["mi355x"], strategy: ["balanced"] },
           env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
@@ -502,6 +595,45 @@ sgl-eval run mmmu_pro \\
             "--max-running-requests 96",
             "--swa-full-tokens-ratio 0.1",
             "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96",
+            "--context-length 1048576",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+          ] },
+        // High-throughput on Pro Official keeps the base cell's TP8 / DP8 on both
+        // roles and adds DSpark at gamma 3, as balanced does. A 512-request
+        // ceiling is 64 per DP rank, which is where the decode ladder stops.
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384"],
+          stripFlags: ["--prefill-decode-interval"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--enable-dp-lm-head",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 512",
+            "--disable-cuda-graph",
+            "--context-length 1048576",
+            "--optimistic-prefill-attempts 2",
+            "--watchdog-timeout 3600",
+            "--enable-metrics",
+            "--enable-cache-report",
+          ] },
+        { mode: "decode",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["high-throughput"] },
+          env: ["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+          stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
+          flags: [
+            "--load-balance-method round_robin",
+            "--speculative-algorithm DSPARK",
+            "--speculative-dspark-block-size 3",
+            "--enable-dp-lm-head",
+            "--mem-fraction-static 0.92",
+            "--max-running-requests 512",
+            "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64",
             "--context-length 1048576",
             "--watchdog-timeout 3600",
             "--enable-metrics",
@@ -534,7 +666,8 @@ sgl-eval run mmmu_pro \\
       ],
       // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
       // than the default round-robin: consistent_hashing keeps a conversation on
-      // the worker that already holds its prefix, and the tight balance
+      // the prefill worker that already holds its prefix (decode holds no
+      // reusable prefix, so it stays round-robin), and the tight balance
       // thresholds stop that affinity from starving the peer at the small
       // running-request ceiling the roles above use. Health checking stays
       // enabled here (unlike the default's 999999s interval) because a long
@@ -549,6 +682,7 @@ sgl-eval run mmmu_pro \\
   --decode http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy consistent_hashing --dp-aware \\
+  --decode-policy round_robin \\
   --cache-threshold 0.3 \\
   --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
   --disable-circuit-breaker --health-failure-threshold 100 \\
@@ -578,7 +712,8 @@ sgl-eval run mmmu_pro \\
         // Balanced on Pro Official: the same shape at a smaller ratio. 2.5 is
         // what the 96-request ceiling leaves room for once mem-fraction-static
         // drops to 0.86 — the host tier competes with the KV pool for the
-        // headroom the prefill role gives up.
+        // headroom the prefill role gives up. The role defaults to UMBP
+        // instead; this applies once the UMBP card is switched off.
         {
           when: {
             hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
@@ -648,6 +783,21 @@ sgl-eval run mmmu_pro \\
       // KV — a tier an eighth the size its byte budget suggests. DP attention
       // collapses the keys onto one shared keyspace.
       requiresDpAttention: true,
+      // The Pro Official prefill roles ship with UMBP on. Low-latency and
+      // balanced are TP-only: at TP4 the store holds four copies rather than
+      // eight, and that shape is the one that ran end-to-end. The tier lives
+      // in a standalone umbp_standalone_server on the prefill node (cookbook
+      // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
+      roleOverrides: [
+        { mode: "prefill",
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+                  strategy: ["low-latency", "balanced", "high-throughput"] },
+          enable: true,
+          allowTp: true,
+          env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
+          flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
+          note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
+      ],
       defaultBackend: "mori",
       backends: [
         { id: "mori",     label: "MORI (UMBP)" },
@@ -1724,7 +1874,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1743,7 +1893,7 @@ sgl-eval run mmmu_pro \\
       // DSpark is incompatible with DP attention -> target-only.
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1762,7 +1912,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2064,7 +2214,8 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
+      // DSpark + DP Attention is documented in cookbook §3.7 and in the PD roles
+      // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
