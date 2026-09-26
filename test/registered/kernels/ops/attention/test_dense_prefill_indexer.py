@@ -3,7 +3,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import dense_prefill
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -169,7 +168,9 @@ class TestDensePrefillIndexer(CustomTestCase):
                     consumer_inputs["kv"] = inputs["kv"]
                     consumer_inputs["candidate_topk_blocks"] = 128
                     consumer_scores = dense_scores(consumer_inputs)
-                    with patch.object(dense_prefill, "_SCORE_BUDGET_BYTES", 128 << 10):
+                    with patch.object(
+                        scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 128 << 10
+                    ):
                         selected, candidates = run_dense(
                             inputs, publish_candidates=True, candidates=None
                         )
@@ -308,7 +309,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return logits
 
                 with (
-                    patch.object(dense_prefill, "_SCORE_BUDGET_BYTES", budget),
+                    patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", budget),
                     patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
                 ):
                     selected, _ = run_dense(
