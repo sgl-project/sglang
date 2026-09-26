@@ -207,6 +207,34 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
+def test_hc_mix_stats_sinkhorn_matches_fp64_and_is_batch_invariant():
+    """The coefficients track fp64 statistics, and a row's result is independent of the batch around it."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the mHC mixing kernel")
+    hc_mult, hidden_size, iters, rms_eps, hc_eps = 4, 5120, 20, 1e-20, 1e-6
+    mix = (2 + hc_mult) * hc_mult
+    g = torch.Generator(device="cpu").manual_seed(0)
+    hc_fn = (torch.randn(mix, hc_mult * hidden_size, generator=g) * 0.02).cuda()
+    hc_scale = torch.tensor([0.7, 1.3, 0.9]).cuda()
+    hc_base = (torch.randn(mix, generator=g) * 0.3).cuda()
+    args = (hc_fn, hc_scale, hc_base, hc_mult, iters, rms_eps, hc_eps)
+    torch.manual_seed(1)
+    residual = torch.randn(300, hc_mult * hidden_size, device="cuda").bfloat16()
+    full = mhc.hc_mix_stats_sinkhorn(residual, *args)
+
+    x = residual.double()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = ((x @ hc_fn.double().T) * rsqrt).float().unsqueeze(1)
+    ref = mhc._hc_split_sinkhorn_torch(mixes, hc_scale, hc_base, hc_mult, iters, hc_eps)
+    for got, want in zip(full, ref):
+        assert (got - want.squeeze(1)).abs().max().item() < 1e-4
+
+    for rows in ([0], list(range(0, 300, 7))):
+        idx = torch.tensor(rows, device="cuda")
+        sub = mhc.hc_mix_stats_sinkhorn(residual[idx].contiguous(), *args)
+        assert all(torch.equal(u, v[idx]) for u, v in zip(sub, full)), rows
+
+
 if __name__ == "__main__":
     import sys
 
