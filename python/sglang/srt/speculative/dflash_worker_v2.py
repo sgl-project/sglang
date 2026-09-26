@@ -25,6 +25,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -613,6 +614,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         ):
             self._draft_worker.init_attention_backends()
+        translator = self.draft_model_runner.kv_index_translator
+        if translator.is_translating:
+            translator.bind_and_verify_backends([self.draft_model_runner.attn_backend])
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -1827,6 +1831,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         with (
             torch.inference_mode(),
             self.draft_tp_context(
@@ -1968,9 +1977,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
             else:
+                # Translated above (physical by allocation on a plain pool).
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    ctx_cache_loc,
+                    KVWriteLoc(ctx_cache_loc, id_space="kernel"),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2516,6 +2526,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Hand-built draft batch bypasses ForwardBatch.init_new: under the
+        # unified pool the write loc must be rebound to the draft's
+        # kernel-facing ids here (no-op on plain pools).
+        self.draft_model_runner.kv_index_translator.rebind_write_loc(forward_batch)
 
         if self.selector is not None:
             self._selector_sample = None
