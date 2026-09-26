@@ -1032,10 +1032,10 @@ class TestChunkedPagedDecode(CustomTestCase):
         event.record.assert_called_once_with(stream)
 
     def test_dense_decode_takes_one_schedule_per_call(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import plain as mod
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
 
         inputs, data = self._inputs()
-        indexer = object.__new__(mod.PlainIndexer)
+        indexer = object.__new__(mod.FullTopKIndexer)
         indexer.token_to_kv_pool = None
         indexer.use_deep_gemm_decode = True
         deep_gemm, topk = self._mocks()

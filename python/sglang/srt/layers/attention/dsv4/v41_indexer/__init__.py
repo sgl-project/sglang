@@ -1,6 +1,7 @@
 """The top-k selection of the DeepSeek V4.1 ratio-1/2 index layers.
 
-The plain index layers go through the ``PlainIndexer`` of ``make_plain_indexer``; a
+The index layers outside the candidate scheme go through the ``FullTopKIndexer``
+of ``make_full_topk_indexer``; a
 candidate source and its consumers go through the prefill / decode backends of
 ``make_candidate_indexer``: a DeepGEMM sparse table (``sparse_table``) or dense
 block ids (``dense_blocks``). All three share only ``scoring``. Nothing else in
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from .plain import PlainIndexer
+from .full_topk import FullTopKIndexer
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -33,14 +34,14 @@ __all__ = [
     "CapturedPrefillInputs",
     "DecodeCandidates",
     "DecodeInputs",
-    "PlainIndexer",
+    "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
     "Selection",
     "has_dense_fp4_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
-    "make_plain_indexer",
+    "make_full_topk_indexer",
 ]
 
 
@@ -78,12 +79,12 @@ def _use_deep_gemm_prefill() -> bool:
     )
 
 
-def make_plain_indexer(
+def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
-) -> PlainIndexer:
-    return PlainIndexer(
+) -> FullTopKIndexer:
+    return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),

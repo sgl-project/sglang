@@ -1,4 +1,4 @@
-"""The plain top-k of the DeepSeek V4.1 ratio-1/2 index layers outside the
+"""The full top-k of the DeepSeek V4.1 ratio-1/2 index layers outside the
 candidate scheme: score every visible compressed position, keep the best.
 
 DeepGEMM on SM100; elsewhere the torch path, whose decode runs the fp4 decode
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 
-class PlainIndexer:
+class FullTopKIndexer:
     def __init__(
         self,
         *,

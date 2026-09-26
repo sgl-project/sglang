@@ -86,7 +86,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
-    make_plain_indexer,
+    make_full_topk_indexer,
 )
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -1132,7 +1132,7 @@ class DeepseekV4AttnBackend(
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
-        self.plain_indexer = make_plain_indexer(
+        self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
@@ -3081,8 +3081,8 @@ class DeepseekV4AttnBackend(
         *,
         rows_per_request=None,  # NOTE: only used in CP
     ) -> None:
-        """Select this index layer's compressed positions: a plain layer on the
-        plain indexer, a candidate source or consumer on the candidate backends."""
+        """Select this index layer's compressed positions: a layer outside the
+        candidate scheme on the full top-k, a source or consumer on its backend."""
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
@@ -3109,7 +3109,7 @@ class DeepseekV4AttnBackend(
             elif is_consumer:
                 self.decode_candidates.consume_decode(inputs, published, out)
             else:
-                self.plain_indexer.topk_decode(inputs, out)
+                self.full_topk_indexer.topk_decode(inputs, out)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
                 layer, x, q_lora, req, pos, forward_batch, rows_per_request
@@ -3120,7 +3120,7 @@ class DeepseekV4AttnBackend(
             elif is_consumer:
                 self.prefill_candidates.consume_prefill(inputs, published, out)
             else:
-                self.plain_indexer.topk_prefill(inputs, out)
+                self.full_topk_indexer.topk_prefill(inputs, out)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
         ratio = layer.compress_ratio
@@ -3146,7 +3146,7 @@ class DeepseekV4AttnBackend(
             paged_metadata=metadata,
         )
         out = self._get_low_ratio_selection(ratio)
-        self.plain_indexer.topk_prefill_captured(inputs, out)
+        self.full_topk_indexer.topk_prefill_captured(inputs, out)
 
     def _get_low_ratio_selection(self, compress_ratio: int) -> Selection:
         core = self.forward_metadata.core_metadata
