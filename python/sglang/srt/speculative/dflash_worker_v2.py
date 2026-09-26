@@ -25,6 +25,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -603,6 +604,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if (draft_pool := self.full_draft_kv_pool) is not None:
+            token_to_kv_pool_allocator.register_full_draft_kv_pool(draft_pool)
+
+    @property
+    def full_draft_kv_pool(self) -> Optional[MHATokenToKVPool]:
+        """The draft pool when it holds full draft KV: MHA tensors of its own,
+        indexed by the target's logical token ids rather than a compact table."""
+        # MLA pools localize token ids to DCP rows; only MHA rows stay logical.
+        draft_pool = self.draft_model_runner.token_to_kv_pool
+        if self.use_compact_draft_cache or not isinstance(draft_pool, MHATokenToKVPool):
+            return None
+        return draft_pool
 
     def init_attention_backends(self):
         with (
