@@ -1,0 +1,89 @@
+name: Nightly Test (MLU)
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 2:00 a.m. Beijing Time every day
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-test-mlu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  nightly-test-mlu:
+    name: MLU / ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - nightly-test-2-mlu
+    runs-on:
+      group: mlu-ci
+      labels: mlu-nightly
+    timeout-minutes: 480
+    steps:
+      - name: Resolve MLU CI ref to commit SHA
+        id: resolve-ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          DEFAULT_SHA: ${{ github.sha }}
+          REPO_URL: ${{ format('{0}/{1}.git', github.server_url, github.repository) }}
+        run: |
+          if [[ -z "${INPUT_REF}" ]]; then
+            resolved_sha="${DEFAULT_SHA}"
+          elif [[ "${INPUT_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            resolved_sha="${INPUT_REF}"
+          else
+            resolved_sha="$(git ls-remote "${REPO_URL}" "refs/heads/${INPUT_REF}" | cut -f1)"
+            if [[ -z "${resolved_sha}" ]]; then
+              resolved_sha="$(git ls-remote "${REPO_URL}" "refs/tags/${INPUT_REF}^{}" | cut -f1)"
+            fi
+            if [[ -z "${resolved_sha}" ]]; then
+              resolved_sha="$(git ls-remote "${REPO_URL}" "refs/tags/${INPUT_REF}" | cut -f1)"
+            fi
+            if [[ -z "${resolved_sha}" ]]; then
+              echo "::error::Could not resolve Git ref '${INPUT_REF}' in ${REPO_URL}"; exit 1
+            fi
+          fi
+          echo "Resolved ${INPUT_REF} to ${resolved_sha}"
+          echo "commit_sha=${resolved_sha}" >> "${GITHUB_OUTPUT}"
+      - name: Submit nightly MLU CI task to Cambricon Runner
+        env:
+          SGLANG_MLU_CI_REPO_NAME: sglang
+          SGLANG_MLU_CI_REPO_URL: ${{ format('{0}/{1}.git', github.server_url, github.repository) }}
+          SGLANG_MLU_CI_GIT_REF: ${{ inputs.ref || github.ref_name }}
+          SGLANG_MLU_CI_COMMIT_SHA: ${{ steps.resolve-ref.outputs.commit_sha }}
+          SGLANG_MLU_CI_TRIGGER_TYPE: ${{ matrix.suite }}
+          SGLANG_MLU_CI_BRIDGE_URL: http://127.0.0.1:14547
+          SGLANG_MLU_CI_TIMEOUT_SECONDS: "27000"
+          SGLANG_MLU_CI_LOG_DIR: ${{ runner.temp }}/mlu-ci-logs
+        run: |
+          if ! command -v sglang-mlu-ci >/dev/null 2>&1; then
+            echo "::error::The runner does not provide the sglang-mlu-ci client"
+            exit 1
+          fi
+          sglang-mlu-ci
+
+      - name: Upload MLU Jenkins log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlu-jenkins-log-nightly-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.suite }}
+          path: ${{ runner.temp }}/mlu-ci-logs/
+          if-no-files-found: warn
