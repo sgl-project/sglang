@@ -82,7 +82,7 @@ def _run_gsm8k(test_case):
         temperature=1.0,
         top_p=0.95,
         base_url=test_case.base_url,
-        host="http://127.0.0.1",
+        host="127.0.0.1",
         port=int(test_case.base_url.split(":")[-1]),
     )
     metrics = run_eval(args)

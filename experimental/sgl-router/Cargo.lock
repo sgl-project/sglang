@@ -918,9 +918,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.1.2"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae2eaa139651c535aeaad8856c5546709608931ccd4d24d3a529f6c5233c4b6"
+checksum = "d4609cdbd65f8bd15c74f4531c1560d04496e8737dfb6b65b45487644b878963"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2072,7 +2072,6 @@ dependencies = [
  "memo-map",
  "percent-encoding",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2887,6 +2886,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3283,8 +3283,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bytes",
- "chrono",
  "clap",
  "criterion",
  "dashmap",
@@ -3293,16 +3293,19 @@ dependencies = [
  "dynamo-tokenizers",
  "futures",
  "hf-hub",
+ "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "minijinja",
- "minijinja-contrib",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "sgl-kv-indexer",
@@ -3826,6 +3829,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "mime",
  "pin-project-lite",
  "tokio",

@@ -9,12 +9,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -27,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -48,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PdRoleSwitchReqInput,
+    PdRoleSwitchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -77,6 +84,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_lora,
     get_parallel,
     get_serving,
@@ -115,6 +123,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -126,6 +135,8 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
+    ("begin_weight_update", BeginWeightUpdateReqOutput),
+    ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -150,6 +161,15 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         success=False,
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
+    )
+
+
+def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) -> bool:
+    # Rank replies include pre-existing adapters, not only the attempted ID.
+    # Callers must exclude registered names before checking for partial loads.
+    return any(
+        result.success or lora_name in (result.loaded_adapters or {})
+        for result in results
     )
 
 
@@ -444,6 +464,38 @@ class TokenizerControlMixin:
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
+    async def _weight_update_session_call(
+        self: TokenizerManager, communicator, obj
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            # whoever paused the engine holds the writer lock; taking it again deadlocks
+            if is_paused:
+                results = await communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def begin_weight_update(
+        self: TokenizerManager,
+        obj: BeginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.begin_weight_update_communicator, obj
+        )
+
+    async def end_weight_update(
+        self: TokenizerManager,
+        obj: EndWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.end_weight_update_communicator, obj
+        )
+
     async def update_weights_from_distributed(
         self: TokenizerManager,
         obj: UpdateWeightsFromDistributedReqInput,
@@ -556,13 +608,12 @@ class TokenizerControlMixin:
             async with self.is_pause_cond:
                 is_paused = self.is_pause
                 if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
 
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
@@ -584,9 +635,11 @@ class TokenizerControlMixin:
             "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
         )
 
-        # Unregister the LoRA adapter from the registry to stop new requests for this adapter
-        # from being started.
-        lora_id = await self.lora_registry.unregister(obj.lora_name)
+        lora_id = self.pending_lora_unloads.get(obj.lora_name)
+        if lora_id is None:
+            # Stop new requests from using this adapter before unloading it.
+            lora_id = await self.lora_registry.unregister(obj.lora_name)
+            self.pending_lora_unloads[obj.lora_name] = lora_id
         obj.lora_id = lora_id
 
         # Initiate the actual unloading operation at the backend processes only after all
@@ -595,7 +648,8 @@ class TokenizerControlMixin:
         result = _merge_lora_update_results(
             await self.update_lora_adapter_communicator(obj)
         )
-
+        if result.success:
+            self.pending_lora_unloads.pop(obj.lora_name)
         return result
 
     async def load_lora_adapter(
@@ -621,6 +675,12 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -630,14 +690,16 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = _merge_lora_update_results(
-                    await self.update_lora_adapter_communicator(obj)
-                )
-
-                # Register the LoRA adapter only after loading is successful.
+                rank_results = await self.update_lora_adapter_communicator(obj)
+                result = _merge_lora_update_results(rank_results)
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
 
                 if get_lora().max_loaded_loras is not None:
                     while (
@@ -702,19 +764,29 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = _merge_lora_update_results(
-                    await self.update_lora_adapter_communicator(obj)
-                )
-
+                rank_results = await self.update_lora_adapter_communicator(obj)
+                result = _merge_lora_update_results(rank_results)
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                elif (
+                    obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+                ):
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
+
                 if get_lora().max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
@@ -840,6 +912,42 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def pd_role_switch(
+        self: TokenizerManager,
+        obj: PdRoleSwitchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PdRoleSwitchReqOutput:
+        self.auto_create_handle_loop()
+        if not self.server_args.enable_pd_role_switch:
+            return PdRoleSwitchReqOutput(
+                success=False,
+                message="--enable-pd-role-switch is not set on this server",
+                old_role=get_disagg().disaggregation_mode,
+                new_role=obj.new_role,
+                safe_to_restore=True,
+            )
+        results = await self.pd_role_switch_communicator(obj)
+        all_success = all(r.success for r in results)
+        safe_to_restore = bool(results) and all(r.safe_to_restore for r in results)
+        if all_success:
+            # Keep the tokenizer-manager's view of the role in sync so future
+            # control ops and bootstrap routing behave consistently.
+            self.record_config_updates(
+                "tokenizer.pd_role_switch", disaggregation_mode=obj.new_role
+            )
+            self.disaggregation_mode = DisaggregationMode(obj.new_role)
+            msg = "ok"
+        else:
+            # Surface only the failing workers' messages.
+            msg = "; ".join(r.message for r in results if not r.success)
+        return PdRoleSwitchReqOutput(
+            success=all_success,
+            message=msg,
+            old_role=results[0].old_role if results else "",
+            new_role=obj.new_role,
+            safe_to_restore=safe_to_restore,
+        )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

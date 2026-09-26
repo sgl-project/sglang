@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
+    RESIDENCY_LIFETIMES,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
@@ -187,7 +190,9 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "anima-base-v1.0-diffusers",
         "black-forest-labs/flux.1-dev",
+        "circlestone-labs/anima-base-v1.0-diffusers",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -209,14 +214,21 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
+        "meituan-longcat/longcat-image-edit-turbo",
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
         "minimaxai/minimax-h3",
+        "inclusionai/ming-image-0.1-design",
+        "inclusionai/ming-image-0.1-design-layer",
+        "ming-image-0.1-design",
+        "ming-image-0.1-design-layer",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -227,6 +239,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "AnimaPipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -234,8 +247,12 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
+        "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MingImagePipelineConfig",
+        "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
@@ -415,13 +432,19 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
-    # Per-component overrides of the three knobs above; an entry wins for that
+    # How long they stay: while the DiT runs for a request, or for the life of
+    # the server.
+    dit_layerwise_residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD
+    # Per-component overrides of the four knobs above; an entry wins for that
     # component.
     layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
     layerwise_resident_layers: dict[str, float] | str | None = field(
         default_factory=dict
     )
     layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_lifetime: dict[str, str] | str | None = field(
         default_factory=dict
     )
     offload_during_compile: bool = True
@@ -507,6 +530,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -589,6 +613,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -597,6 +622,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
+    prompt_enhancer_config: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -770,9 +796,10 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
-            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Qwen/Qwen-Image-2.1, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
             "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
@@ -1203,8 +1230,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def layerwise_tuning_for(
         self, component_name: str | None, *, dit_group: bool
-    ) -> tuple[float, float, str]:
-        """Prefetch size, resident layers and residency policy for one component."""
+    ) -> tuple[float, float, str, str]:
+        """Prefetch size, resident layers, residency policy and lifetime for one component."""
         prefetch_map = self._parse_component_value_map(
             self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
         )
@@ -1213,6 +1240,9 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         policy_map = self._parse_component_value_map(
             self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+        lifetime_map = self._parse_component_value_map(
+            self.layerwise_residency_lifetime, option="--layerwise-residency-lifetime"
         )
 
         def _pick(mapping: dict[str, str], group_default, aux_default):
@@ -1234,7 +1264,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"unknown residency policy {policy!r} for component "
                 f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
             )
-        return prefetch, resident, policy
+        lifetime = str(
+            _pick(
+                lifetime_map,
+                self.dit_layerwise_residency_lifetime,
+                RESIDENCY_LIFETIME_FORWARD,
+            )
+        )
+        if lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"unknown residency lifetime {lifetime!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_LIFETIMES}"
+            )
+        return prefetch, resident, policy, lifetime
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -1365,9 +1407,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
@@ -1896,6 +1937,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -2538,14 +2580,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --dit-layerwise-offload, keep this many DiT layers "
-            "permanently resident on GPU (retained across denoise steps) and stream "
-            "the rest with --dit-offload-prefetch-size; which layers stay resident "
-            "is --dit-layerwise-residency-policy. 0.0 = off (pure "
+            help="With --dit-layerwise-offload, keep this many DiT layers on the GPU "
+            "across the denoise steps of a request and stream the rest with "
+            "--dit-offload-prefetch-size; which layers stay is "
+            "--dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
-            "once (not re-streamed every step), so this trades VRAM for lower denoise "
-            "latency when memory is available.",
+            "once per request rather than once per step, so this trades VRAM for "
+            "lower denoise latency when memory is available. How long they stay on "
+            "the GPU is --dit-layerwise-residency-lifetime: released when the "
+            "request finishes by default, or kept for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-prefetch-size",
@@ -2564,11 +2608,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             help="Per-component override of --dit-layerwise-resident-layers, as "
             "component=value entries, e.g. --layerwise-resident-layers "
-            "text_encoder=4. Resident layers are transferred once at startup "
-            "rather than streamed, so they cut the transfer of every pass "
-            "including the first -- an auxiliary component that runs once per "
-            "request still benefits, it just recovers the VRAM once per request "
-            "instead of once per denoising step.",
+            "video_vae=36. The layers are held on the GPU while that component "
+            "does its work for a request and released when it finishes, so this "
+            "pays for a component that runs its layers many times per request -- "
+            "a DiT across the denoise steps, a video VAE across the latent chunks. "
+            "A component that runs its layers once per request, such as a text "
+            "encoder, transfers the whole set again every request, so setting "
+            "this for one has no effect unless --layerwise-residency-lifetime "
+            "keeps the layers for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",
@@ -2577,6 +2624,17 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Per-component override of --dit-layerwise-residency-policy, as "
             "component=value entries, e.g. --layerwise-residency-policy "
             "text_encoder=strided.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-lifetime",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-lifetime, as "
+            "component=value entries, e.g. --layerwise-residency-lifetime "
+            "transformer=permanent,video_vae=forward. 'forward' releases a "
+            "component's resident layers when it finishes running for a request; "
+            "'permanent' places them on the GPU at load time and never releases "
+            "them.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",
@@ -2591,6 +2649,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "schedule. Worth trying when weight streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-lifetime",
+            type=str,
+            choices=RESIDENCY_LIFETIMES,
+            default=ServerArgs.dit_layerwise_residency_lifetime,
+            help="How long the DiT layers kept by --dit-layerwise-resident-layers "
+            "stay on the GPU. 'forward' (default): placed when the DiT starts its "
+            "denoise steps for a request and released when they finish, so they "
+            "are transferred once per request and keep a copy in host memory. "
+            "'permanent': placed at load time, no host copy, never released -- "
+            "one transfer for the life of the server. Choose 'permanent' when the "
+            "resident layers of every component fit on the GPU together; with "
+            "'forward' only the running component holds its set, so the peak is "
+            "the largest set rather than their sum.",
         )
 
         # offload flags
@@ -2793,6 +2866,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -2894,6 +2973,13 @@ class ServerArgs(DisaggServerArgsMixin):
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
+        )
+        parser.add_argument(
             "--log-requests",
             action="store_true",
             help="Log user-facing fields of all requests (default: False). "
@@ -2977,6 +3063,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+        parser.add_argument(
+            "--prompt-enhancer-config",
+            type=str,
+            default=ServerArgs.prompt_enhancer_config,
+            help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
         return parser
@@ -3601,6 +3693,27 @@ class ServerArgs(DisaggServerArgsMixin):
                     "--dit-layerwise-residency-policy has no effect because "
                     "--dit-layerwise-resident-layers is 0: every layer is streamed, "
                     "so there is no resident set to place."
+                )
+
+        if self.dit_layerwise_residency_lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-lifetime "
+                f"{self.dit_layerwise_residency_lifetime!r}; expected one of "
+                f"{RESIDENCY_LIFETIMES}."
+            )
+        if self.dit_layerwise_residency_lifetime == RESIDENCY_LIFETIME_PERMANENT:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because the "
+                    "DiT is not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because "
+                    "--dit-layerwise-resident-layers is 0: there is no resident "
+                    "set to keep."
                 )
 
         # validate layerwise offload conflicts
