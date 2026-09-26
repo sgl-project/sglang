@@ -190,7 +190,9 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "anima-base-v1.0-diffusers",
         "black-forest-labs/flux.1-dev",
+        "circlestone-labs/anima-base-v1.0-diffusers",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -237,6 +239,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "AnimaPipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -793,7 +796,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
             "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
             "Qwen/Qwen-Image-2.1, SANA1.5, "
