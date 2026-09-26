@@ -52,7 +52,6 @@ from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -339,6 +338,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    get_parent_process,
     is_cuda,
     is_hip,
     is_mps,
@@ -6046,7 +6046,7 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    parent_process = psutil.Process().parent()
+    parent_process = get_parent_process()
 
     # Set up tracing
     if get_observability().enable_trace:

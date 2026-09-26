@@ -3364,6 +3364,15 @@ def human_readable_int(value: str) -> int:
         )
 
 
+def get_parent_process() -> psutil.Process:
+    """The process that started this one. multiprocessing records who called
+    Process.start(); under a forkserver that is not the OS parent."""
+    parent = parent_process()
+    if parent is None:
+        return psutil.Process().parent()
+    return psutil.Process(parent.pid)
+
+
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies

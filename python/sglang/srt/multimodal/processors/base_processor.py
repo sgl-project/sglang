@@ -37,11 +37,11 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
-    MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
+    mm_feature_cache_size,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -430,8 +430,9 @@ class BaseMultimodalProcessor(ABC):
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
             worker_num = get_serving().tokenizer_worker_num
+            cache_size = mm_feature_cache_size()
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-                MM_FEATURE_CACHE_SIZE, worker_num
+                cache_size, worker_num
             )
             total_pool_size = per_worker_pool_size * worker_num
             logger.info(
@@ -442,7 +443,7 @@ class BaseMultimodalProcessor(ABC):
                 self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                cache_size / (1024 * 1024),
             )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,

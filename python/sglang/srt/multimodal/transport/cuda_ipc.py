@@ -13,7 +13,13 @@ from sglang.srt.multimodal.transport.memory_pool import (
 
 logger = logging.getLogger(__name__)
 
-MM_FEATURE_CACHE_SIZE = envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
+
+def mm_feature_cache_size() -> int:
+    # Read when used: the Qwen3-VL override raises the budget while resolving
+    # the arguments, which may be after this module was imported (forkserver
+    # preload).
+    return envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
+
 
 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()

@@ -288,15 +288,15 @@ def slice_nvfp4_output(
     return out
 
 
-# TODO make it true by default when the DeepEP PR is merged
-MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
 
 def _use_nvfp4_dispatch() -> bool:
     if not get_moe_a2a_backend().is_flashinfer():
-        return MOE_NVFP4_DISPATCH
+        # Read when used: moe_hook sets it while resolving the arguments, which
+        # may be after this module was imported (forkserver preload).
+        return envs.SGLANG_MOE_NVFP4_DISPATCH.get()
     return get_flashinfer_a2a_dispatch_type() == FlashinferA2ADispatchType.NVFP4
 
 
@@ -2652,6 +2652,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
+        if use_nvfp4_dispatch != self.moe_nvfp4_dispatch:
+            raise RuntimeError(
+                "NVFP4 dispatch changed between building the MoE runner "
+                f"({self.moe_nvfp4_dispatch}) and loading weights ({use_nvfp4_dispatch})"
+            )
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -3014,6 +3019,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        # Resolved once, when the layer is built; the weight-processing path
+        # checks that the answer has not changed underneath it.
+        self.moe_nvfp4_dispatch = _use_nvfp4_dispatch()
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -3187,7 +3195,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     w2_alpha=layer.g2_alphas,
                     a1_scale=layer.w13_input_scale_quant,
                     a2_scale=layer.w2_input_scale_quant,
-                    use_nvfp4_dispatch=MOE_NVFP4_DISPATCH,
+                    use_nvfp4_dispatch=self.moe_nvfp4_dispatch,
                     down_gemm_overlap_args=getattr(
                         self.runner, "down_gemm_overlap_args", None
                     ),
