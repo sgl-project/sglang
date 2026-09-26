@@ -140,6 +140,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 self.remote_buffer,
                 layer_id,
                 src_tensor=src_tensor,
+                row_index=self.pool.broadcast_read_index_pages,
             )
             self.remote_layer_id = layer_id
         return self.remote_buffer
@@ -208,6 +209,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        self.broadcast_read_token_slots: Optional[torch.Tensor] = None
+        self.broadcast_read_index_pages: Optional[torch.Tensor] = None
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
@@ -248,6 +251,23 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             f"partitions={'; '.join(partitions)}"
         )
 
+    def set_layer_split_broadcast_read_set(
+        self,
+        token_slots: Optional[torch.Tensor] = None,
+        index_pages: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Restrict owner broadcasts to the rows the current forward reads.
+
+        ``token_slots`` (1-D int64) applies to the latent KV buffer and
+        ``index_pages`` (1-D int64) to the indexer buffer; both are the union
+        of the batch's page table. All CP ranks run identical batches with
+        identical page tables, so every rank derives the same read set and
+        per-layer broadcast shapes agree without extra synchronization.
+        Called once per forward; ``None`` restores full-buffer broadcasts.
+        """
+        self.broadcast_read_token_slots = token_slots
+        self.broadcast_read_index_pages = index_pages
+
     # ---- broadcast plumbing -----------------------------------------------
 
     def _init_layer_broadcast_comm(self) -> None:
@@ -274,12 +294,22 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_id: int,
         src_tensor: Optional[torch.Tensor] = None,
         use_layer_broadcast_comm: bool = False,
-    ) -> torch.Tensor:
+        row_index: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Broadcast ``layer_id``'s buffer contents from the owner rank.
+
+        With ``row_index=None`` the whole buffer is broadcast (legacy behavior).
+        With a ``row_index`` (the per-forward read set, see
+        ``set_layer_split_broadcast_read_set``) only those rows move: the owner
+        gathers them into a compact tensor, the compact tensor is broadcast,
+        and every rank scatters it back into the addressed rows of ``tensor``.
+        Consumers keep addressing ``tensor`` by absolute pool slot, so rows
+        outside the read set are never touched.
+        """
         owner_rank = self._get_layer_owner_rank(layer_id)
-        if self.layer_shard_rank == owner_rank:
-            assert src_tensor is not None
-            if tensor.data_ptr() != src_tensor.data_ptr():
-                tensor.copy_(src_tensor)
+
+        if row_index is not None and row_index.numel() == 0:
+            row_index = None
 
         cp_group = get_parallel().attn_cp_group
         comm = (
@@ -287,19 +317,38 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if use_layer_broadcast_comm and self.layer_broadcast_comm is not None
             else cp_group.pynccl_comm
         )
-        if comm is not None:
-            # PyNcclCommunicator defaults to disabled=True (it is only enabled
-            # inside CUDA-graph capture via change_state). Without re-enabling it
-            # here, comm.broadcast() is a silent no-op and non-owner CP ranks read
-            # stale remote buffers, corrupting layer-split attention. Mirror the
-            # standard usage in parallel_state.py.
-            with comm.change_state(enable=True):
-                comm.broadcast(tensor, src=owner_rank)
+
+        def _do_broadcast(buf: torch.Tensor) -> None:
+            if comm is not None:
+                with comm.change_state(enable=True):
+                    comm.broadcast(buf, src=owner_rank)
+            else:
+                torch.distributed.broadcast(
+                    buf, src=owner_rank, group=cp_group.cpu_group
+                )
+
+        if row_index is None:
+            # Full-buffer broadcast (legacy path)
+            if self.layer_shard_rank == owner_rank:
+                assert src_tensor is not None
+                if tensor.data_ptr() != src_tensor.data_ptr():
+                    tensor.copy_(src_tensor)
+            _do_broadcast(tensor)
+            return None
+
+        # On-demand broadcast: only transfer the rows in row_index
+        if self.layer_shard_rank == owner_rank:
+            assert src_tensor is not None
+            compact = src_tensor[row_index]
         else:
-            torch.distributed.broadcast(
-                tensor, src=owner_rank, group=cp_group.cpu_group
+            compact = torch.empty(
+                (row_index.numel(),) + tuple(tensor.shape[1:]),
+                dtype=tensor.dtype,
+                device=tensor.device,
             )
-        return tensor
+        _do_broadcast(compact)
+        tensor[row_index] = compact
+        return compact
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
@@ -486,6 +535,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 layer_id,
                 src_tensor=src_tensor,
                 use_layer_broadcast_comm=True,
+                row_index=self.broadcast_read_token_slots,
             )
             self.remote_kv_layer_id = layer_id
             return
@@ -499,6 +549,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 layer_id,
                 src_tensor=src_tensor,
                 use_layer_broadcast_comm=True,
+                row_index=self.broadcast_read_token_slots,
             )
         self.pending_remote_kv_layer_id = layer_id
         self.pending_remote_kv_broadcast = True
@@ -518,6 +569,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 layer_id,
                 src_tensor=src_tensor,
                 use_layer_broadcast_comm=True,
+                row_index=self.broadcast_read_token_slots,
             )
             self.remote_kv_layer_id = layer_id
         return self.remote_kv_buffer
