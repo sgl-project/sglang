@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -89,10 +90,6 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
 
 @dataclass
 class UnifiedKvMetadata:
-    """
-    unified-kv per-forward metadata
-    """
-
     # SWA ring write target (req_slot*ring + pos%ring)
     swa_loc: Optional[torch.Tensor] = None
 
@@ -104,16 +101,22 @@ class UnifiedKvMetadata:
     csa_indices: Optional[torch.Tensor] = None
     csa_indptr: Optional[torch.Tensor] = None
 
+    # Grouped target-verify streams for the asm decode: one per (request,
+    # draft group), laid out [compressed tail][that group's window slice] so
+    # the kernel's own causal bound and band mask land on each draft's real
+    # cutoff.
+    gasm_indices: Optional[torch.Tensor] = None
+    gasm_kv_indptr: Optional[torch.Tensor] = None
+    gasm_qo_indptr: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
 
-    # Per-token req-slot map used by the SWA ring store, precomputed once per
-    # step so the forward store does not recompute a repeat_interleave per layer.
-    # Read by the target-verify store (num_draft*bs tokens); for plain decode it
-    # equals req_pool_indices and is unused (the decode store reads that live).
+    # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
+    # tokens); unused by plain decode, whose store reads req_pool_indices live.
     verify_store_state_slot: Optional[torch.Tensor] = None
 
     # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
@@ -131,6 +134,9 @@ class UnifiedKvMetadata:
                 "swa_indptr",
                 "hca_indices",
                 "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -160,6 +166,9 @@ class UnifiedKvMetadata:
                 "swa_indptr",
                 "hca_indices",
                 "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -426,9 +435,8 @@ class DSV4Metadata:
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
-    # FP4 indexer buffers that captured kernels bind by address. Deliberately
-    # absent from copy_: the addresses must stay pinned across replays, and the
-    # workspace builders refresh their contents instead.
+    # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
+    # so addresses stay pinned across replays (the builders refresh contents).
     fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
         default=None, repr=False
@@ -511,6 +519,24 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+_GROUPED_ASM_BLOCK_Q = 4
+
+# aiter serves gqa*msq off one 64-row q tile and only whitelists msq above 1
+# at gqa=16 -- the TP-only shape. DP attention gives a rank all 128 heads, so
+# the tile is full of heads with no room to group, and none is needed either:
+# one kv read already feeds 128 heads rather than 16. An unsupported pair does
+# not downgrade, it fails aiter's kernel lookup outright.
+_GROUPED_ASM_GQA = 16
+_GROUPED_ASM_MIN_REQS = 16
+
+
+def _grouped_asm_enabled() -> bool:
+    """
+    Grouped target-verify decode through the asm kernel, off by default.
+    """
+    return os.environ.get("SGLANG_DSV4_GROUPED_ASM", "0") == "1"
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -530,12 +556,8 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
-    # DSV4 TBO runs ONLY in eager prefill (prefill cuda-graph is disabled);
-    # decode/target-verify graphs are non-TBO (primary backend only). So the TBO
-    # child backends must not be driven through cuda-graph capture/replay — doing
-    # so rebuilds this backend's compressor/indexer metadata per replay step on
-    # both children and leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
-    # TboAttnBackend reads this to skip children in the *_graph paths only.
+    # DSV4 TBO runs only in eager prefill; driving TBO children through graph
+    # capture/replay leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
@@ -559,7 +581,6 @@ class DeepseekV4HipRadixBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.swa_page_size = 128
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
@@ -567,6 +588,8 @@ class DeepseekV4HipRadixBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        # The C4 state ring is addressed per SWA page, so a page holds whole windows.
+        assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
@@ -587,16 +610,14 @@ class DeepseekV4HipRadixBackend(
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
         self.is_dspark_draft = self.is_draft_worker and self.is_dspark
         # Draft layers are all COMPRESS_RATIO_NEXTN_LAYER (0), so the draft pool
-        # has neither compressed kv nor an indexer pool. Settled here rather than
-        # per forward: it cannot change after construction.
+        # has neither compressed kv nor an indexer pool.
         self.need_compress = not self.is_draft_worker
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
             assert self.speculative_num_draft_tokens > 1
-            # DSpark draft workers verify gamma rows. The server arg keeps the
-            # CUDA-side convention gamma + 1, so use an explicit effective value
-            # instead of mutating speculative_num_draft_tokens in place.
+            # DSpark draft workers verify gamma rows; the server arg keeps the
+            # CUDA-side convention gamma + 1.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
         # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
         # which frees the scratch its kernels read -- not capture-safe.
@@ -668,8 +689,7 @@ class DeepseekV4HipRadixBackend(
         )
 
         # extend_start_loc and the CPU mirrors below only feed the torch
-        # fallback; the triton kernel cumsums extend_seq_lens on device, so
-        # every caller can share it instead of dropping to a per-request loop.
+        # fallback; the triton kernel cumsums extend_seq_lens on device.
         _expanded = ExpandPrefillCausally.execute(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -709,12 +729,12 @@ class DeepseekV4HipRadixBackend(
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
         )
         if attach_decode_streams:
-            # Target-verify runs through the unified_kv DECODE kernel, so build
-            # per-token decode streams here. req_pool_indices_repeated is the
-            # per-token (num_draft*bs -> bs) req-slot map produced by the prefill
-            # expansion above.
+            # Verify runs the unified_kv DECODE kernel; req_pool_indices_repeated
+            # is the per-token (num_draft*bs -> bs) req-slot map.
             self._attach_unified_kv_decode_streams(
-                core_attn_metadata, req_pool_indices_repeated
+                core_attn_metadata,
+                req_pool_indices_repeated,
+                num_draft=self.target_verify_num_draft_tokens,
             )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -776,12 +796,9 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         ragged_layout=None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        # DSPARK verifies a uniform num_draft block, exactly what
-        # make_forward_metadata_from_raw_verify expands, so the build can be
-        # deferred into the graph. Graph path only: the upgrade sizes its page
-        # table by MAX_SEQ_LEN_FOR_CAPTURE, far wider than the live max_seq_len
-        # an eager caller passes. EAGLE and ragged layouts stay eager -- no raw
-        # expansion, and EAGLE's fixed-tier plan trips planner invariants.
+        # Only DSPARK's uniform draft block defers into the graph; EAGLE's fixed-tier
+        # plan trips planner invariants. Graph path only: the upgrade sizes page_table
+        # by MAX_SEQ_LEN_FOR_CAPTURE, wider than an eager caller's max_seq_len.
         if (
             use_prefill_cuda_graph
             and self.is_dspark
@@ -834,10 +851,8 @@ class DeepseekV4HipRadixBackend(
             )
             extend_seq_lens = verify_lens_dev
             seq_lens = seq_lens + verify_lens_dev.to(seq_lens.dtype)
-            # Total verify tokens to expand. For the graph path the padded layout
-            # sets total_verify_tokens == graph_num_tokens (tier); the eager path
-            # resolves a device-assembled layout whose total_verify_tokens is None,
-            # so fall back to sum(verify_lens) (== real total; padded == tier).
+            # Graph path: total_verify_tokens is the padded tier; an eager
+            # device-assembled layout leaves it None, so use sum(verify_lens).
             num_tokens = ragged_layout.total_verify_tokens
             if num_tokens is None:
                 num_tokens = int(verify_lens_dev.sum().item())
@@ -923,7 +938,9 @@ class DeepseekV4HipRadixBackend(
             num_draft_tokens * bs,
         )
         self._attach_unified_kv_decode_streams(
-            core_attn_metadata, req_pool_indices_repeated
+            core_attn_metadata,
+            req_pool_indices_repeated,
+            num_draft=self.target_verify_num_draft_tokens,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1083,14 +1100,12 @@ class DeepseekV4HipRadixBackend(
             )
 
         if upgraded_verify:
-            # The out-graph refresh saw raw metadata and skipped. Without this
-            # the logits kernel builds its own schedule -- the variant that
-            # frees the scratch it reads, which every replay would re-read.
+            # The out-graph refresh saw raw metadata and skipped; otherwise the
+            # logits kernel builds a schedule that frees scratch replays re-read.
             self._refresh_fp4_prefill_workspace(forward_batch)
 
-        # Decode's schedule builder is capture-safe because the workspace pins
-        # the scratch it reads, so it can stay next to the metadata it consumes.
-        # Prefill/target-verify cannot; see _refresh_fp4_prefill_workspace.
+        # Decode's schedule builder is capture-safe (the workspace pins its scratch);
+        # prefill/target-verify's is not, see _refresh_fp4_prefill_workspace.
         if self._fp4_workspaces_enabled(metadata) and (
             forward_batch.forward_mode.is_decode()
         ):
@@ -1107,9 +1122,8 @@ class DeepseekV4HipRadixBackend(
     def _fp4_workspaces_enabled(self, metadata) -> bool:
         return (
             self.enable_deepseek_v4_fp4_indexer
-            # Draft-step backends drive the NextN layer, which is built with
-            # compress_ratio_override=0 and so owns no C4 indexer. Their
-            # workspaces would be built, scheduled, and never read.
+            # Draft-step backends drive the NextN layer, built with
+            # compress_ratio_override=0, so it owns no C4 indexer.
             and self.speculative_num_steps == 0
             and isinstance(metadata, DSV4Metadata)
             and metadata.indexer_metadata is not None
@@ -1117,13 +1131,8 @@ class DeepseekV4HipRadixBackend(
         )
 
     def _refresh_fp4_prefill_workspace(self, forward_batch: ForwardBatch) -> None:
-        """Rebuild the FP4 prefill schedule outside CUDA-graph capture.
-
-        AITER's prefill scheduler frees the scratch that its schedule kernel
-        reads, so recording the build into a graph would leave every replay
-        reading recycled graph-pool memory. Only the pinned buffers it fills
-        (cta_info / logits / guarded page table) may be read from the graph.
-        """
+        """Must run outside graph capture: AITER's scheduler frees the scratch its
+        kernel reads, so only the pinned buffers it fills may be read from a graph."""
         metadata = self.forward_metadata
         if not self._fp4_workspaces_enabled(metadata):
             return
@@ -1300,7 +1309,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
+        assert self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = (
             max_seq_len_override
@@ -1462,14 +1471,17 @@ class DeepseekV4HipRadixBackend(
             core.c4_flashmla_metadata = _create_flashmla_metadata()
             core.c128_flashmla_metadata = _create_flashmla_metadata()
 
-        # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
+        # Warmup upgraded raw->full on the host;
         # restore raw so capture re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
 
     def _attach_unified_kv_decode_streams(
-        self, core: DSV4AttnMetadata, state_slot: torch.Tensor
+        self,
+        core: DSV4AttnMetadata,
+        state_slot: torch.Tensor,
+        num_draft: int = 0,
     ) -> None:
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
@@ -1492,8 +1504,7 @@ class DeepseekV4HipRadixBackend(
         hca_page_indices = core.c128_page_indices
         c4_page_indices = core.c4_sparse_page_indices
         # A draft pool carries no c4/c128 metadata, but its verify store still
-        # reads the swa half below, so build these with an empty compressed tail
-        # rather than skipping the call.
+        # reads the swa half below, so build these with an empty compressed tail.
         if hca_len is None:
             hca_len = torch.zeros_like(swa_len)
         if csa_len is None:
@@ -1521,15 +1532,43 @@ class DeepseekV4HipRadixBackend(
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
+        core.unified.gasm_indices = None
+        core.unified.gasm_kv_indptr = None
+        core.unified.gasm_qo_indptr = None
+        if (
+            _grouped_asm_enabled()
+            and num_draft > 1
+            and N % num_draft == 0
+            and N // num_draft >= _GROUPED_ASM_MIN_REQS
+        ):
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import (
+                grouped_verify_streams,
+            )
+
+            (
+                core.unified.gasm_indices,
+                core.unified.gasm_kv_indptr,
+                core.unified.gasm_qo_indptr,
+            ) = grouped_verify_streams.build_grouped_verify_streams(
+                state_slot=state_slot,
+                positions=core.positions_casual,
+                hca_len=hca_len,
+                hca_page_indices=hca_page_indices,
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+                swa_pages=pool.unified_swa_pages,
+                num_draft=num_draft,
+                block_q=_GROUPED_ASM_BLOCK_Q,
+            )
+
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
         core.unified.swa_loc = (
             req_slot * pool.unified_swa_ring_size
             + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
         ).to(torch.int32)
-        # Per-token req-slot map for the SWA ring store, read directly by the
-        # forward store (target-verify) instead of recomputing a repeat_interleave
-        # per layer. Harmless for plain decode (its store reads req_pool_indices).
+        # Per-token req-slot map for the target-verify SWA ring store; plain
+        # decode's store reads req_pool_indices instead.
         core.unified.verify_store_state_slot = state_slot
 
     def _attach_unified_kv_prefill_meta(
@@ -1604,14 +1643,8 @@ class DeepseekV4HipRadixBackend(
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """unified_kv paged-attention path over the unified_kv pool.
-
-        ``q_rope`` is what tells the two layouts apart: present means ``q`` is a
-        packed fp8 row and the pool is the two-pool fp8 one, so decode goes to
-        the asm reader; absent means both are plain bf16 and it goes to Triton.
-        Prefill needs ``k_rope`` alongside it, because there the current chunk is
-        a KV source of its own and not just something to store.
-        """
+        """q_rope present: packed fp8 q over the two-pool fp8 layout (asm decode;
+        prefill also needs k_rope). Absent: plain bf16 q and pool (Triton)."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
@@ -1637,18 +1670,14 @@ class DeepseekV4HipRadixBackend(
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
         if is_decode:
             if verify_as_decode:
-                # Per-token (num_draft*bs -> bs) req-slot map, precomputed once
-                # per step in _attach_unified_kv_decode_streams. Writing every
-                # draft token's K into the ring is safe: spec_extra room prevents
-                # clobbering the window history same-step tokens still read.
+                # Writing every draft token's K into the ring is safe: spec_extra
+                # room prevents clobbering the history same-step tokens still read.
                 state_slot = core_attn_metadata.unified.verify_store_state_slot[:T]
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
-                # Only verify reaches this under fp8 -- plain decode's rows are
-                # written by the fused kernel itself, which leaves kv None. The
-                # pair arrives already packed, so this is the same scatter with
-                # a second pool hanging off it.
+                # Only verify reaches this under fp8; plain decode's rows are
+                # written by the fused kernel itself, which leaves kv None.
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
@@ -1683,14 +1712,31 @@ class DeepseekV4HipRadixBackend(
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
             if q_rope is not None:
-                # softmax_scale is not passed on: the asm kernel hardcodes
-                # 1/sqrt(512), which is what self.softmax_scale already is for
-                # V4's head_dim=512. The other readers here take it explicitly,
-                # so a head_dim change would leave only this one mis-scaled.
+                # The asm kernel hardcodes softmax scale 1/sqrt(512) (V4 head_dim)
+                # and takes no softmax_scale, unlike the other readers here.
                 assert self.softmax_scale == 512**-0.5, (
                     "the v4 nm asm kernel hardcodes 1/sqrt(512), this backend is "
                     f"at {self.softmax_scale}"
                 )
+                gasm = (
+                    unified_metadata.gasm_indices
+                    if compress_ratio == 128 and q.shape[1] == _GROUPED_ASM_GQA
+                    else None
+                )
+                if gasm is not None:
+                    return runtime.decode_fp8_2buff(
+                        q=q,
+                        q_rope=q_rope,
+                        unified_kv=unified,
+                        unified_kv_rope=pool.get_unified_kv_rope(layer_id),
+                        kv_indices=gasm,
+                        kv_indptr=unified_metadata.gasm_kv_indptr,
+                        qo_indptr=unified_metadata.gasm_qo_indptr,
+                        attn_sink=attn_sink,
+                        v_head_dim=layer.v_head_dim,
+                        max_seqlen_q=_GROUPED_ASM_BLOCK_Q,
+                        compress_ratio=compress_ratio,
+                    )
                 return runtime.decode_fp8_2buff(
                     q=q,
                     q_rope=q_rope,
@@ -1724,20 +1770,12 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified.pf_cu_q
         final_pos = core_attn_metadata.unified.pf_final_pos
 
-        # DSA CP (round-robin/interleave): unified_pf_* are built over the GLOBAL
-        # token layout, but under CP each rank owns only 1/cp_size of the queries
-        # (q/positions are local) while kv was all-gathered to the full sequence.
-        # Slice the per-query fields to this rank's tokens so their length matches
-        # the local query count T; values stay global so each local query still
-        # attends over the full all-gathered KV.
+        # DSA CP: unified_pf_* cover the GLOBAL token layout while q is local and
+        # kv all-gathered; slice per-query fields to this rank, values stay global.
         from sglang.srt.layers.attention.dsa.utils import (
             is_dsa_prefill_cp_round_robin_split,
         )
 
-        # NOTE (AMD/HIP only): this whole DSA-CP prefill handling lives in the
-        # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
-        # The NVIDIA path uses DeepseekV4AttnBackend and never reaches here, so
-        # these CP changes do not affect B200/H200 execution.
         _cp_size = get_parallel().attn_cp_size
         _cp_active = (
             _cp_size > 1
@@ -1754,15 +1792,11 @@ class DeepseekV4HipRadixBackend(
             chunk_start = chunk_start[_sl].contiguous()
             cu_q = cu_q[_sl].contiguous()
             final_pos = final_pos[_sl].contiguous()
-            # positions for the local queries are this rank's round-robin global
-            # positions {r, r+cp, r+2cp, ...}; forward_batch.positions is the full
-            # (padded) global layout, so slice it the same way instead of taking
-            # the first T entries (which would be the wrong, sequential 0..T-1).
+            # Local queries sit at this rank's round-robin global positions
+            # {r, r+cp, r+2cp, ...}, not the first T entries of the global layout.
             positions = forward_batch.positions.to(torch.int64)[_sl].contiguous()
-            # The SWA ring must hold the FULL window on EVERY rank (decode and
-            # later chunks read this rank's ring). kv was all-gathered to the full
-            # sequence, so write the full kv with full global positions/state_slot
-            # instead of only this rank's 1/cp_size tokens.
+            # Every rank's SWA ring must hold the full window (decode and later
+            # chunks read it), so the store uses the full all-gathered kv.
             positions_full = forward_batch.positions.to(torch.int64)[
                 : state_slot_full.shape[0]
             ].contiguous()
@@ -1789,10 +1823,8 @@ class DeepseekV4HipRadixBackend(
                 "fp8 prefill needs the extend rope half beside the packed nope; "
                 "q_rope came through but k_rope did not"
             )
-            # No empty-segment mask on the result, unlike decode: this kernel
-            # returns zeros for a token with neither region where the asm decode
-            # reader leaves the row NaN. Chunk 0 tokens have an empty prefix and
-            # a non-empty extend, which both readers handle.
+            # No empty-segment mask, unlike decode: this kernel returns zeros for
+            # a token with neither region where the asm decode reader leaves NaN.
             o = runtime.prefill_fp8_2buff(
                 q=q,
                 q_rope=q_rope,
@@ -1824,9 +1856,6 @@ class DeepseekV4HipRadixBackend(
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
         if save_kv_cache:
-            # Under CP, write the FULL all-gathered window so every rank's ring is
-            # complete (decode / later chunks read the local ring). Without CP this
-            # is just the local kv + local metadata as before.
             _ring_state_slot = state_slot_full if _cp_active else state_slot
             _ring_final_pos = final_pos_full if _cp_active else final_pos
             _ring_positions = positions_full if _cp_active else positions
@@ -2060,8 +2089,6 @@ class DeepseekV4HipRadixBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
     ) -> DSV4AttnMetadata:
-        assert self.swa_page_size == SWA_WINDOW
-
         seq_lens_casual = seq_lens_casual.to(torch.int32)
 
         swa_page_indices = self.get_swa_page_indices(
