@@ -110,6 +110,9 @@ def _runner(result=(True, "ok")):
         "load_weights_from_distributed",
     ):
         getattr(runner.weight_updater, method).return_value = result
+    runner.weight_updater.receive_weights_from_distributed.return_value = [
+        ("model.layers.0.weight", None)
+    ]
     return runner
 
 
@@ -170,8 +173,10 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
     def test_successful_update_records_the_version(self):
-        """A refit that reports success advances the scheduler-side version."""
-        output = self._manager(_runner()).update_weights_from_disk(_request())
+        """A disk refit runs outside a session and advances the scheduler-side version at once."""
+        output = self._manager(_runner(), session=False).update_weights_from_disk(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
@@ -194,11 +199,17 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
-    def test_successful_distributed_update_records_the_version(self):
-        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        output = self._manager(_runner()).update_weights_from_distributed(_request())
+    def test_successful_distributed_update_records_the_version_at_commit(self):
+        """A refit spans many buckets; the version they carry must not name a
+        half-applied update, so it is held until end_weight_update commits."""
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(manager._session.pending_version, "v2")
+
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
@@ -210,16 +221,22 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
-    def test_successful_tensor_update_records_the_version(self):
-        """The tensor refit records the version once the load reports success."""
-        output = self._manager(_runner()).update_weights_from_tensor(_request())
+    def test_successful_tensor_update_records_the_version_at_commit(self):
+        """Like the distributed path: the version rides the session and lands at commit."""
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_successful_ipc_update_records_the_version(self):
-        """The checkpoint-engine IPC refit records the version like every other path."""
-        output = self._manager(_runner()).update_weights_from_ipc(_request())
+        """The checkpoint-engine IPC refit runs outside a session and records at once."""
+        output = self._manager(_runner(), session=False).update_weights_from_ipc(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])

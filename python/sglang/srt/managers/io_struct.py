@@ -274,6 +274,8 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1217,6 +1219,8 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # {lora_name: disk path}: backfill source when this engine does not hold the adapter
+    lora_backfill_paths: Optional[Dict[str, str]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -2097,6 +2101,10 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
+    # Session scope: False = no base bytes will land this session (adapter-only
+    # sync), so the quant unpack/repack round-trip is skipped and a base-named
+    # tensor arriving in-session is an error.
+    sync_base: bool = True
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2105,7 +2113,15 @@ class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
 
 
 class EndWeightUpdateReqInput(BaseReq, kw_only=True):
-    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+    """Close the weight-update session opened by BeginWeightUpdateReqInput:
+    re-finalize base weights (sync_base sessions only) and apply the streamed
+    LoRA stash accumulated by update_weights_from_* during the session."""
+
+    # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
+    # (set equality + per-tensor checksum) before it is applied.
+    expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
+    abort: bool = False
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2452,15 +2468,49 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
         )
 
 
+class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Create-or-refresh an adapter's identity and config (control plane).
+
+    Weights are untouched by the caller: a new adapter starts zeroed, and
+    re-registering an existing name re-zeroes it — a slot's new tenant must
+    not serve its predecessor's weights. The weight bytes arrive later as
+    ``{lora_name}:{hf_key}``-prefixed tensors in the ordinary
+    update_weights_from_* stream and are applied at end_weight_update."""
+
+    lora_name: str
+    # The PEFT adapter_config.json fields (r, lora_alpha, target_modules, ...).
+    config_dict: Dict[str, Any]
+    # Unpinned: the pool refills a registered adapter lazily from its CPU copy,
+    # and pinning every slot would trip the anti-starvation check.
+    pinned: bool = False
+    lora_id: Optional[str] = None
+    # Disk artifact holding the same adapter (PEFT dir). With a path the
+    # adapter is reloadable: it may be LRU-evicted and refilled from disk.
+    lora_path: Optional[str] = None
+    # keep the name unservable until end_weight_update commits its session; fresh names only
+    defer_publish: bool = False
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path or "__stream__",
+            pinned=self.pinned,
+            reloadable=self.lora_path is not None,
+        )
+
+
 class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    # acks a defer_publish registration; the trainer fails closed without it
+    pending: bool = False
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
     LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
+) = RegisterLoRAAdapterReqOutput = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):

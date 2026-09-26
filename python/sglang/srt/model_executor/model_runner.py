@@ -1381,11 +1381,27 @@ class ModelRunner:
         return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+        self,
+        lora_ref: LoRARef,
+        tensors,
+        config_dict,
+        added_tokens_config=None,
+        upsert: bool = False,
     ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
         )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
