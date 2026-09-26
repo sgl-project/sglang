@@ -309,12 +309,20 @@ class SchedulerBatchResultProcessor:
                     and not req.is_retracted
                     and req.inflight_middle_chunks <= 0
                 )
-                sampling_mask_finish_reason = None
-                if should_commit_output and req.return_sampling_mask:
+                # A reason here finishes the request without committing this
+                # forward's output: a failed KV load or an unusable sampling mask.
+                discard_finish_reason = (
+                    req.discard_output_reason if should_commit_output else None
+                )
+                if (
+                    should_commit_output
+                    and discard_finish_reason is None
+                    and req.return_sampling_mask
+                ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
-                    sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                    discard_finish_reason = self.get_sampling_mask_finish_reason(
                         status=status
                     )
                 if (
@@ -328,9 +336,7 @@ class SchedulerBatchResultProcessor:
                         hidden_state_offset=hidden_state_offset,
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
-                        store=(
-                            should_commit_output and sampling_mask_finish_reason is None
-                        ),
+                        store=(should_commit_output and discard_finish_reason is None),
                     )
 
                 if (
@@ -344,8 +350,8 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if sampling_mask_finish_reason is not None:
-                        req.to_finish = sampling_mask_finish_reason
+                    if discard_finish_reason is not None:
+                        req.to_finish = discard_finish_reason
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
@@ -370,13 +376,13 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
-                        if sampling_mask_finish_reason is None:
+                        if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
+                            is_insert=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -384,7 +390,7 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    if sampling_mask_finish_reason is None:
+                    if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
@@ -396,10 +402,10 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
-                            store=sampling_mask_finish_reason is None,
+                            store=discard_finish_reason is None,
                         )
 
-                    if sampling_mask_finish_reason is not None:
+                    if discard_finish_reason is not None:
                         continue
 
                     if req.return_sampling_mask:
@@ -456,6 +462,16 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
+                    continue
+
+                if (
+                    req.discard_output_reason is not None
+                    and req.inflight_middle_chunks <= 0
+                ):
+                    req.to_finish = req.discard_output_reason
+                    req.update_finish_state(0)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.time_stats.set_completion_time()
                     continue
 
                 req.embedding = embeddings[i]

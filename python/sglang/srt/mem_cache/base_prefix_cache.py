@@ -560,6 +560,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the indices ``init_load_back`` returns belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
+
     def finish_storage_prefetch_admission(
         self,
         handle: CacheRequestHandle,

@@ -165,6 +165,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.discard_output_reason = None
 
     def finished(self):
         return False

@@ -1372,7 +1372,8 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.kv.cache_protected_len = len(req.prefix_indices)
+                if self.tree_cache.load_back_is_cache_owned():
+                    req.kv.cache_protected_len = len(req.prefix_indices)
 
             # Successful materialization has no remaining admission gates.
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)

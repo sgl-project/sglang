@@ -3548,8 +3548,9 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        prepare_abort(req, reason.message, reason.status_code)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -3563,7 +3564,11 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=finished_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4624,6 +4629,13 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
+
+        if self.enable_unified_cache_external_linker:
+            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+            if self.chunked_req in failed:
+                # Result processing finishes the others; a chunked one is
+                # released like a client abort so its next chunk never runs.
+                self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
 
