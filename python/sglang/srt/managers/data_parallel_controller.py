@@ -815,6 +815,24 @@ def run_data_parallel_controller_process(
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)
+
+    sigquit_forwarded = False
+
+    def forward_sigquit_to_parent(signum, frame):
+        nonlocal sigquit_forwarded
+        # Multiple ranks can report the same distributed failure.
+        if sigquit_forwarded:
+            return
+        sigquit_forwarded = True
+        logger.error(
+            "DataParallelController received SIGQUIT from a scheduler. "
+            "Forwarding it to the parent process."
+        )
+        # Keep the controller alive so parent cleanup can still traverse its schedulers.
+        parent_process.send_signal(signal.SIGQUIT)
+
+    signal.signal(signal.SIGQUIT, forward_sigquit_to_parent)
+
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
