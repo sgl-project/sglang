@@ -934,6 +934,10 @@ class Envs:
     # at load. bf16 by default: K3 GSM8K scores 0.947 vs fp4's 0.908, for
     # ~3% decode throughput. Ignored off ROCm (both paths are aiter kernels).
     SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT = EnvStr("bf16")
+    # Dequantize Quark MXFP4 shared experts before the MoE front merge so they
+    # join it. Needs SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT=bf16. Shared down stays
+    # BF16: PTPC on that dequantized weight scored GSM8K 0.937.
+    SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT = EnvBool(True)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)

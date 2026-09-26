@@ -704,7 +704,7 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if _is_npu:
             return
-        if _is_hip:
+        if _is_hip and envs.SGLANG_ROCM_K3_QUARK_SHARED_FULL_FRONT.get():
             from sglang.srt.models.kimi_k3_rocm_quant import (
                 _k3_densify_quark_shared_experts,
             )
