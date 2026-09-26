@@ -1222,7 +1222,7 @@ class GemmaRMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -1357,6 +1357,8 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+            return self.forward_native(x, residual)
         if residual is not None:
             return self.forward_native(x, residual)
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)

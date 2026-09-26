@@ -5,7 +5,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -700,6 +700,228 @@ class TestCommonTemplate(unittest.TestCase):
         backend.common_template(forward_batch, call_fn)
         for call in call_fn.call_args_list:
             self.assertIs(call.args[1], forward_batch)
+
+
+class TestMlaPrefixFia(unittest.TestCase):
+    @staticmethod
+    def _fia_reference(**kwargs):
+        q, k, v = (kwargs[name] for name in ("query", "key", "value"))
+        for name in ("query", "key", "value", "query_rope", "key_rope"):
+            assert kwargs[name].is_contiguous(), name
+        assert kwargs["input_layout"] == "TND"
+        assert kwargs["return_softmax_lse"]
+        assert kwargs["num_query_heads"] == q.shape[1]
+        assert kwargs["num_key_value_heads"] == k.shape[1]
+        q = torch.cat((q, kwargs["query_rope"]), dim=-1).float()
+        k = torch.cat((k, kwargs["key_rope"]), dim=-1).float()
+        output = v.new_empty(q.shape[0], q.shape[1], v.shape[-1])
+        lse = q.new_empty(q.shape[0], q.shape[1], 1)
+        q_start = kv_start = 0
+        for q_end, kv_end in zip(kwargs["actual_seq_qlen"], kwargs["actual_seq_kvlen"]):
+            if kv_start == kv_end:
+                output[q_start:q_end] = float("nan")
+                lse[q_start:q_end] = float("inf")
+            else:
+                scores = (
+                    torch.einsum("thd,shd->hts", q[q_start:q_end], k[kv_start:kv_end])
+                    * kwargs["softmax_scale"]
+                )
+                if kwargs["sparse_mode"] == 3:
+                    assert kwargs["next_tokens"] == 0
+                    assert kwargs["atten_mask"].dtype == torch.bool
+                    mask = torch.ones_like(scores, dtype=torch.bool).triu(1)
+                    scores.masked_fill_(mask, -float("inf"))
+                else:
+                    assert kwargs["sparse_mode"] == 0
+                    assert kwargs.get("atten_mask") is None
+                output[q_start:q_end] = torch.einsum(
+                    "hts,shd->thd", scores.softmax(-1), v[kv_start:kv_end].float()
+                ).to(v.dtype)
+                lse[q_start:q_end] = scores.logsumexp(-1).T.unsqueeze(-1)
+            q_start, kv_start = q_end, kv_end
+        assert q_start == q.shape[0]
+        assert kv_start == k.shape[0]
+        return output, lse
+
+    @staticmethod
+    def _update_reference(lse, outputs, update_type):
+        assert update_type == 0
+        assert all(x.ndim == 1 and x.dtype == torch.float32 for x in lse)
+        assert all(x.ndim == 2 and x.dtype == torch.float32 for x in outputs)
+        assert all(x.is_contiguous() for x in (*lse, *outputs))
+        weights = torch.stack(lse).softmax(0).unsqueeze(-1)
+        return (torch.stack(outputs) * weights).sum(0), None
+
+    @classmethod
+    def _ring_reference(cls, **kwargs):
+        first_ring = kwargs["calc_type"] == "calc_type_first_ring"
+        lengths = kwargs["seqlen"]
+        q_lens = lengths if first_ring else lengths[0]
+        kv_lens = lengths if first_ring else lengths[1]
+        assert kwargs["kernel_type"] == "kernel_type_high_precision"
+        assert kwargs["mask_type"] == ("mask_type_triu" if first_ring else "no_mask")
+        output, lse = cls._fia_reference(
+            query=kwargs["q_nope"].contiguous(),
+            key=kwargs["k_nope"].contiguous(),
+            value=kwargs["value"].contiguous(),
+            query_rope=kwargs["q_rope"].contiguous(),
+            key_rope=kwargs["k_rope"].contiguous(),
+            input_layout="TND",
+            num_query_heads=kwargs["head_num"],
+            num_key_value_heads=kwargs["kv_head_num"],
+            actual_seq_qlen=q_lens.cumsum(0).tolist(),
+            actual_seq_kvlen=kv_lens.cumsum(0).tolist(),
+            softmax_scale=kwargs["qk_scale"],
+            sparse_mode=3 if first_ring else 0,
+            next_tokens=0,
+            atten_mask=kwargs["mask"].bool() if first_ring else None,
+            return_softmax_lse=True,
+        )
+        if first_ring:
+            assert kwargs["pre_out"] is None and kwargs["prev_lse"] is None
+        else:
+            start = 0
+            for q_len, kv_len in zip(q_lens.tolist(), kv_lens.tolist()):
+                if kv_len == 0:
+                    output[start : start + q_len].zero_()
+                    lse[start : start + q_len].fill_(-float("inf"))
+                start += q_len
+            previous_lse = kwargs["prev_lse"].T.unsqueeze(-1)
+            merged_lse = torch.logaddexp(previous_lse, lse)
+            output = (
+                kwargs["pre_out"].float() * (previous_lse - merged_lse).exp()
+                + output.float() * (lse - merged_lse).exp()
+            )
+            lse = merged_lse
+        kwargs["output"].copy_(output)
+        kwargs["softmax_lse"].copy_(lse.squeeze(-1).T)
+
+    def _check_prefix(
+        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=True
+    ):
+        torch.manual_seed(47)
+        tokens, prefix_tokens = sum(query_lens), sum(prefix_lens)
+        q = torch.randn(tokens + padding, heads, 208, dtype=dtype)[..., :192]
+        k = torch.randn(tokens + padding, heads, 208, dtype=dtype)[..., :192]
+        v = torch.randn(tokens + padding, heads, 144, dtype=dtype)[..., :128]
+        q.mul_(magnitude)
+        k.mul_(magnitude)
+        cached = torch.randn(prefix_tokens + 3, 1, 32, dtype=dtype)
+        cached_rope = torch.randn(prefix_tokens + 3, 1, 1, 64, dtype=dtype)
+        indices = torch.randperm(prefix_tokens + 3)[:prefix_tokens]
+        weight = torch.randn(32, heads * 256, dtype=dtype) / 32**0.5
+
+        def project(x):
+            return x @ weight, None
+
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = True
+        backend.use_fia = use_fia
+        backend.is_dllm_model = False
+        backend.qk_nope_head_dim = 128
+        backend.qk_rope_head_dim = 64
+        backend.fia_mask = torch.ones(2048, 2048, dtype=torch.bool).triu(1)
+        backend.ringmla_mask = torch.ones(512, 512, dtype=dtype).triu(1)
+        backend.forward_metadata = ForwardMetadata(
+            extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
+            prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+            flatten_prefix_block_tables=indices,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cached,
+            get_value_buffer=lambda _: cached_rope,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            tp_k_head_num=heads,
+            qk_head_dim=192,
+            v_head_dim=128,
+            kv_b_proj=project,
+            scaling=192**-0.5,
+        )
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=tokens,
+            extend_prefix_lens_cpu=prefix_lens,
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+        )
+        module_name = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        with (
+            patch(f"{module_name}.is_mla_preprocess_enabled", return_value=False),
+            patch(
+                f"{module_name}.torch_npu.npu_fused_infer_attention_score_v2",
+                side_effect=self._fia_reference,
+            ) as fia,
+            patch(
+                f"{module_name}.torch_npu.npu_attention_update",
+                side_effect=self._update_reference,
+            ) as update,
+            patch(
+                f"{module_name}.torch_npu.atb.npu_ring_mla",
+                side_effect=self._ring_reference,
+            ) as ring,
+        ):
+            actual = backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
+        self.assertEqual(fia.call_count, 2 if use_fia else 0)
+        self.assertEqual(update.call_count, 1 if use_fia else 0)
+        self.assertEqual(ring.call_count, 0 if use_fia else 2)
+
+        prefix_k, prefix_v = (
+            project(cached[indices])[0]
+            .view(prefix_tokens, heads, 256)
+            .split(128, dim=-1)
+        )
+        prefix_k = torch.cat(
+            (prefix_k, cached_rope[indices].flatten(0, 1).expand(-1, heads, -1)),
+            dim=-1,
+        )
+        expected = torch.zeros(tokens + padding, heads, 128, dtype=dtype)
+        q_start = prefix_start = 0
+        for q_len, prefix_len in zip(query_lens, prefix_lens):
+            q_end, prefix_end = q_start + q_len, prefix_start + prefix_len
+            full_k = torch.cat((prefix_k[prefix_start:prefix_end], k[q_start:q_end]))
+            full_v = torch.cat((prefix_v[prefix_start:prefix_end], v[q_start:q_end]))
+            allowed = torch.arange(prefix_len + q_len)[None, :] <= (
+                prefix_len + torch.arange(q_len)[:, None]
+            )
+            expected[q_start:q_end] = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[q_start:q_end].float().transpose(0, 1),
+                    full_k.float().transpose(0, 1),
+                    full_v.float().transpose(0, 1),
+                    attn_mask=allowed,
+                    scale=layer.scaling,
+                )
+                .transpose(0, 1)
+                .to(dtype)
+            )
+            q_start, prefix_start = q_end, prefix_end
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(torch.isfinite(actual).all())
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+        self.assertEqual(torch.count_nonzero(actual[tokens:]).item(), 0)
+
+    def test_prefix_matches_dense_attention(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for queries, prefixes, padding, heads in (
+                ([3, 1, 2], [0, 5, 2], 3, 4),
+                ([2, 4, 1], [5, 0, 0], 0, 2),
+                ([1, 1], [2, 3], 2, 4),
+                ([4], [7], 0, 2),
+            ):
+                with self.subTest(dtype=dtype, queries=queries, prefixes=prefixes):
+                    self._check_prefix(queries, prefixes, dtype, padding, heads)
+
+    def test_large_logits_merge_stably(self):
+        self._check_prefix([3, 2], [4, 7], torch.bfloat16, 1, 4, magnitude=8)
+
+    def test_fia_disabled_keeps_ring_mla(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_prefix([3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=False)
 
 
 if __name__ == "__main__":
