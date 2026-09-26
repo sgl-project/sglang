@@ -6,7 +6,15 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.utils import is_xpu
 from sglang.srt.utils.custom_op import register_custom_op
+
+_fused_qk_norm_rope_xpu = None
+if is_xpu():
+    try:
+        from sgl_kernel import fused_qk_norm_rope as _fused_qk_norm_rope_xpu
+    except ImportError:
+        pass
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -101,14 +109,15 @@ def fused_qk_norm_rope_out(
 def can_use_fused_qk_norm_rope(
     head_dim: int, is_neox: bool, dtype: torch.dtype, yarn: bool = False
 ) -> bool:
-    """Return True if the JIT fused QK-Norm + RoPE kernel can be used.
+    """Return True if the fused QK-Norm + RoPE kernel can be used.
 
     Args:
         head_dim: head dimension; supported values are 64, 128, 256
         dtype: tensor dtype; only bfloat16 is supported
         yarn: whether YaRN scaling is active (factor != 1.0); prebuilds the
-              correct kernel variant so no extra JIT compile occurs on the
-              first real call.
+              correct CUDA kernel variant so no extra JIT compile occurs on the
+              first real call. Unused on XPU, where the kernel is AOT and
+              branches on the scaling factor at runtime.
     """
     logger = logging.getLogger(__name__)
     if head_dim not in (64, 128, 256):
@@ -119,6 +128,8 @@ def can_use_fused_qk_norm_rope(
     if dtype != torch.bfloat16:
         logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
         return False
+    if _fused_qk_norm_rope_xpu is not None:
+        return True
     try:
         _jit_fused_qknorm_rope_module(head_dim, is_neox, yarn)
         return True
@@ -170,6 +181,27 @@ def fused_qk_norm_rope(
     """
     if rotary_dim is None:
         rotary_dim = head_dim
+
+    if _fused_qk_norm_rope_xpu is not None:
+        return _fused_qk_norm_rope_xpu(
+            qkv=qkv,
+            num_heads_q=num_heads_q,
+            num_heads_k=num_heads_k,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            eps=eps,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            base=base,
+            is_neox=is_neox,
+            position_ids=position_ids,
+            factor=factor,
+            low=low,
+            high=high,
+            attention_factor=attention_factor,
+            rotary_dim=rotary_dim,
+        )
+
     fused_qk_norm_rope_out(
         qkv,
         q_weight,
