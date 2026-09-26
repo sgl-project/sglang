@@ -224,5 +224,57 @@ class TestHiCacheMetrics(unittest.TestCase):
         )
 
 
+class TestRequestTimePerOutputToken(unittest.TestCase):
+    """Request-level TPOT is one observation per finished request (request-
+    weighted, unlike the token-weighted ITL histogram). It is only observed
+    when the caller could measure a decode period, and it carries the same
+    is_streaming split as the e2e latency histogram."""
+
+    def _collector(self, labels):
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            return _RecordingTokenizerMetricsCollector(labels=labels)
+
+    def _finish(self, collector, labels, **kwargs):
+        collector.observe_one_finished_request(
+            labels=labels,
+            prompt_tokens=20,
+            generation_tokens=101,
+            cached_tokens=0,
+            e2e_latency=2.5,
+            has_grammar=False,
+            **kwargs,
+        )
+
+    def test_observed_with_streaming_label(self):
+        labels = {"model_name": "test"}
+        collector = self._collector(labels)
+
+        self._finish(collector, labels, is_streaming=True, time_per_output_token=0.02)
+        self._finish(collector, labels, is_streaming=False, time_per_output_token=0.08)
+
+        self.assertEqual(
+            collector.histogram_request_time_per_output_token.observations,
+            [
+                ({**labels, "is_streaming": "true"}, 0.02),
+                ({**labels, "is_streaming": "false"}, 0.08),
+            ],
+        )
+
+    def test_not_observed_when_undefined(self):
+        labels = {"model_name": "test"}
+        collector = self._collector(labels)
+
+        self._finish(collector, labels, is_streaming=True, time_per_output_token=None)
+        self._finish(collector, labels, is_streaming=True)
+
+        self.assertEqual(
+            collector.histogram_request_time_per_output_token.observations, []
+        )
+        # The rest of the finished-request bookkeeping is unaffected.
+        self.assertEqual(len(collector.histogram_e2e_request_latency.observations), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
