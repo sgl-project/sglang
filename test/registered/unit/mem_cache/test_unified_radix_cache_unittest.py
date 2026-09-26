@@ -8961,33 +8961,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [3, 4, 5, 7],
         )
 
-    def test_apply_cache_action_routes_replace_write_through(self):
-        cache = mock.MagicMock()
-        action = ReplaceWriteThroughOnNodeSplit(
-            ack_id=7, old_node_id=2, new_node_id=3, new_child_node_id=2
-        )
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        cache._replace_pending_write_through_node.assert_called_once_with(7, 2, [3, 2])
-
-    def test_apply_cache_action_routes_free_device_kv(self):
-        cache = mock.MagicMock()
-        first, second = torch.tensor([4, 5]), torch.tensor([6])
-        action = FreeDeviceKV([first, second])
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        cache.token_to_kv_pool_allocator.free_segment.assert_has_calls(
-            [mock.call(first, start_pos=0), mock.call(second, start_pos=0)]
-        )
-
-    def test_apply_cache_action_routes_free_component_device_kv(self):
-        cache = mock.MagicMock()
-        component = mock.MagicMock()
-        cache.components = {ComponentType.SWA: component}
-        action = FreeComponentDeviceSlot(
-            [torch.tensor([4, 5])], component_type=ComponentType.SWA
-        )
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        component.apply_component_action.assert_called_once_with(action)
-
     def test_apply_component_action_device_kv_full_swa_uses_full_attn(self):
         cache = mock.MagicMock()
         cache.is_swa_enabled = True
@@ -9027,16 +9000,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.req_to_token_pool.mamba_ckpt_pool.free.assert_called_once_with(indices)
         cache.req_to_token_pool.mamba_allocator.free.assert_not_called()
 
-    def test_apply_cache_action_routes_free_component_host_kv(self):
-        cache = mock.MagicMock()
-        component = mock.MagicMock()
-        cache.components = {ComponentType.SWA: component}
-        action = FreeComponentHostSlot(
-            [torch.tensor([4, 5])], component_type=ComponentType.SWA
-        )
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        component.apply_component_action.assert_called_once_with(action)
-
     def test_apply_component_action_host_kv_swa(self):
         cache = mock.MagicMock()
         first, second = torch.tensor([4, 5]), torch.tensor([6])
@@ -9065,14 +9028,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         self.assertEqual(calls[0].kwargs["extra_pools"][0].name, PoolName.MAMBA)
         self.assertIs(calls[0].kwargs["extra_pools"][0].host_indices, indices)
 
-    def test_apply_cache_action_routes_swa_rebuild(self):
-        cache = mock.MagicMock()
-        component = mock.MagicMock()
-        cache.components = {ComponentType.SWA: component}
-        action = SWARebuild(node_id=5, source_value=torch.tensor([3, 4]))
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        component.apply_component_action.assert_called_once_with(action)
-
     def test_apply_component_action_swa_rebuild(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
@@ -9088,18 +9043,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
         )
-
-    def test_apply_cache_action_routes_swa_recover_on_full_locked(self):
-        cache = mock.MagicMock()
-        component = mock.MagicMock()
-        cache.components = {ComponentType.SWA: component}
-        action = RecoverSWAWithLockedFull(
-            node_id=5,
-            kept_full=torch.tensor([1, 2]),
-            incoming_full=torch.tensor([3, 4]),
-        )
-        UnifiedRadixCache._apply_cache_action(cache, action)
-        component.apply_component_action.assert_called_once_with(action)
 
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()

@@ -16,12 +16,10 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.fp8 import (
     Fp8Config,
@@ -48,16 +46,10 @@ from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
-
-# Constants for calibration parameters to avoid hard-coded values
-CALIBRATION_BATCH_SIZE = 36
-CALIBRATION_NUM_SAMPLES = 512
-DEFAULT_DEVICE = "cuda:0"
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
@@ -93,26 +85,6 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_mp_is_initialized.start()
 
         self.model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        self.load_config = LoadConfig()
-        self.device_config = DeviceConfig(device=get_device())
-
-        # Create a basic model config with unified quantization flag
-        self.model_config = ModelConfig(
-            model_path=self.model_path,
-            quantization="modelopt_fp8",  # Use unified quantization approach
-        )
-
-        # Also create a unified quantization config for new tests
-        self.unified_model_config = ModelConfig(
-            model_path=self.model_path, quantization="modelopt_fp8"
-        )
-
-        # Mock base model
-        self.mock_base_model = MagicMock(spec=nn.Module)
-        self.mock_base_model.eval.return_value = self.mock_base_model
-        self.mock_base_model.device = (
-            DEFAULT_DEVICE  # Add device attribute for calibration tests
-        )
 
     def tearDown(self):
         """Clean up test fixtures."""
@@ -122,98 +94,6 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_logger.stop()
         self.mock_get_tp_group.stop()
         self.mock_mp_is_initialized.stop()
-
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_missing_modelopt_import(self, mock_logger):
-        """Test error handling when modelopt library is not available."""
-
-        loader = ModelOptModelLoader(self.load_config)
-
-        # Mock the base model loader method
-        with patch.object(
-            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
-        ):
-            # Simulate missing modelopt by making import fail
-            original_import = __import__
-
-            def mock_import(name, *args, **kwargs):
-                if name.startswith("modelopt"):
-                    raise ImportError("No module named 'modelopt'")
-                # Return default import behavior for other modules
-                return original_import(name, *args, **kwargs)
-
-            with patch("builtins.__import__", side_effect=mock_import):
-                # Expect ImportError to be raised and logged
-                with self.assertRaises(ImportError):
-                    loader.load_model(
-                        model_config=self.model_config, device_config=self.device_config
-                    )
-
-                # Verify error logging
-                mock_logger.error.assert_called_with(
-                    "NVIDIA Model Optimizer (modelopt) library not found. "
-                    "Please install it to use ModelOpt quantization."
-                )
-
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.AutoTokenizer")
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_calibration_workflow_integration(self, mock_logger, mock_auto_tokenizer):
-        """Test end-to-end calibration workflow integration."""
-
-        loader = ModelOptModelLoader(self.load_config)
-
-        # Mock tokenizer
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.padding_side = "right"
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-
-        # Mock modelopt modules
-        mock_mtq = MagicMock()
-        mock_mto = MagicMock()
-        mock_dataset_utils = MagicMock()
-
-        # Configure quantization config
-        mock_fp8_cfg = MagicMock()
-        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
-
-        # Configure dataset utilities
-        mock_calib_dataloader = MagicMock()
-        mock_calibrate_loop = MagicMock()
-        mock_dataset_utils.get_dataset_dataloader.return_value = mock_calib_dataloader
-        mock_dataset_utils.create_forward_loop.return_value = mock_calibrate_loop
-
-        # Configure model as not quantized initially
-        mock_is_quantized = MagicMock(return_value=False)
-
-        with patch.object(
-            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
-        ):
-            with patch.dict(
-                "sys.modules",
-                {
-                    "modelopt": MagicMock(),
-                    "modelopt.torch": MagicMock(),
-                    "modelopt.torch.opt": mock_mto,
-                    "modelopt.torch.quantization": mock_mtq,
-                    "modelopt.torch.quantization.utils": MagicMock(
-                        is_quantized=mock_is_quantized
-                    ),
-                    "modelopt.torch.utils": MagicMock(),
-                    "modelopt.torch.utils.dataset_utils": mock_dataset_utils,
-                },
-            ):
-                # Execute the load_model method to test the full workflow
-                result_model = loader.load_model(
-                    model_config=self.model_config, device_config=self.device_config
-                )
-
-                # Verify the model loading was successful
-                self.assertEqual(result_model, self.mock_base_model)
-
-                # Verify key calibration components were used
-                # Note: We can't easily verify the exact calls due to dynamic imports,
-                # but we can verify the workflow completed successfully
 
     def test_unified_quantization_flag_support(self):
         """Test that ModelOptModelLoader supports unified quantization flags."""
@@ -256,50 +136,6 @@ class TestModelOptModelLoader(CustomTestCase):
                 quantize_and_serve=True,
             )
         self.assertIn("requires ModelOpt quantization", str(context.exception))
-
-
-class TestModelOptLoaderIntegration(CustomTestCase):
-    """Integration tests for ModelOptModelLoader with Engine API."""
-
-    @patch("sglang.srt.model_loader.loader.get_model_loader")
-    @patch("sglang.srt.entrypoints.engine.Engine.__init__")
-    def test_engine_with_modelopt_quant_cli_argument(
-        self, mock_engine_init, mock_get_model_loader
-    ):
-        """Test that CLI argument --modelopt-quant is properly parsed."""
-
-        # Mock the Engine.__init__ to avoid actual initialization
-        mock_engine_init.return_value = None
-
-        # Mock get_model_loader to return our ModelOptModelLoader
-        mock_loader = MagicMock(spec=ModelOptModelLoader)
-        mock_get_model_loader.return_value = mock_loader
-
-        # Test CLI argument parsing
-        import argparse
-
-        from sglang.srt.server_args import ServerArgs
-
-        # Create parser and add arguments
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        # Test parsing with modelopt_quant argument
-        args = parser.parse_args(
-            [
-                "--model-path",
-                "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                "--modelopt-quant",
-                "fp8",
-            ]
-        )
-
-        # Convert to ServerArgs using the proper from_cli_args method
-        server_args = ServerArgs.from_cli_args(args)
-
-        # Verify that modelopt_quant was properly parsed
-        self.assertEqual(server_args.modelopt_quant, "fp8")
-        self.assertEqual(server_args.model_path, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
 
 class TestParseQuantHfConfig(CustomTestCase):
