@@ -267,6 +267,8 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.wait_for_result_copy_done()
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -340,6 +342,8 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.wait_for_result_copy_done()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -572,6 +576,31 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        self._result_copy_done_event = None
+        self._result_copy_pending = False
+
+    def record_result_copy_done(self) -> None:
+        """Fence D2H reads of persistent accept outputs on the copy stream."""
+        if self._result_copy_pending:
+            raise RuntimeError(
+                "DSpark folded result buffer was copied again before its prior "
+                "reuse dependency was consumed."
+            )
+        device_module = torch.get_device_module(self.correct_len_buf.device)
+        if self._result_copy_done_event is None:
+            self._result_copy_done_event = device_module.Event()
+        self._result_copy_done_event.record()
+        self._result_copy_pending = True
+
+    def wait_for_result_copy_done(self) -> None:
+        """Gate the next target replay, leaving the preceding draft overlapped."""
+        if not self._result_copy_pending:
+            return
+        device_module = torch.get_device_module(self.correct_len_buf.device)
+        device_module.current_stream(self.correct_len_buf.device).wait_event(
+            self._result_copy_done_event
+        )
+        self._result_copy_pending = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (

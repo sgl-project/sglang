@@ -981,6 +981,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            persistent_result_copy_owner=epilogue if folded_accept else None,
         )
 
     def _commit_target_mamba_states_after_verify(
