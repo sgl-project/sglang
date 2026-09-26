@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import k3_ar_fusion
+from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
