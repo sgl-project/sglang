@@ -122,9 +122,9 @@ export const config = {
       },
     },
 
-    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: both
-    // ROCm cells run `--disable-radix-cache`, which the server rejects alongside
-    // `--enable-hierarchical-cache`.
+    // GPU → CPU KV offload (L2 only; no storage tier). Keep hidden on MI350X
+    // until HiCache is validated for these ROCm recipes. Default GPU prefix
+    // caching does not establish support for hierarchical caching.
     hicache: {
       excludesHw: ["mi350x"],
       writePolicies: [
@@ -343,13 +343,13 @@ export const config = {
       ],
     },
 
-    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. Speculative decoding is
-    // rejected on ROCm, so there is one recipe. ----------
+    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. ----------
     {
       // DSpark runs on MI350X but is off by default; this cell turns it on.
       match: { hw: "mi350x", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
+      verificationStatus: "in-progress",
       env: [
         // Load-bearing: without it the fp4 experts land in the Triton
         // fused-experts runner and assert on the hidden size.
@@ -365,7 +365,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--disable-radix-cache",
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
@@ -384,6 +383,7 @@ export const config = {
       match: { hw: "mi350x", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
+      verificationStatus: "in-progress",
       env: [
         // Load-bearing: without it the fp4 experts land in the Triton
         // fused-experts runner and assert on the hidden size.
@@ -399,7 +399,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--ep-size 4",
-        "--disable-radix-cache",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-max-bs-prefill 4096",
         "--reasoning-parser auto",
