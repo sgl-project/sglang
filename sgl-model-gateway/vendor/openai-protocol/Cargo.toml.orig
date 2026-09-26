@@ -1,0 +1,29 @@
+[package]
+name = "openai-protocol"
+version = "1.0.0"
+edition = "2021"
+description = "OpenAI-compatible API protocol definitions and types"
+license = "Apache-2.0"
+repository = "https://github.com/lightseekorg/smg"
+authors = [
+    "Simo Lin <linsimo.mark@gmail.com>",
+    "Chang Su <mckvtl@gmail.com>",
+    "Keyang Ru <rukeyang@gmail.com>",
+]
+keywords = ["openai", "llm", "api", "protocol", "types"]
+categories = ["api-bindings", "data-structures"]
+
+[features]
+default = []
+axum = ["dep:axum"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+chrono.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+tracing.workspace = true
+# Only used by protocols
+validator = { version = "0.20.0", features = ["derive"] }
