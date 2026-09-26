@@ -1231,11 +1231,12 @@ class GroupCoordinator:
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             return self._deterministic_reduce_scatterv(input_, output, sizes)
 
+        # `disabled` is on by default and change_state(enable=True) clears it, so
+        # only `available` says whether a communicator was really created.
+        assert pynccl_comm is not None and pynccl_comm.available, (
+            "pynccl is required for reduce_scatterv"
+        )
         with pynccl_comm.change_state(enable=True):
-            assert pynccl_comm is not None and not pynccl_comm.disabled, (
-                "pynccl is required for reduce_scatterv"
-            )
-
             if sizes is not None:
                 assert len(sizes) == world_size
                 assert input_.shape[0] == sum(sizes)
@@ -1425,10 +1426,10 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
+        assert pynccl_comm is not None and pynccl_comm.available, (
+            "pynccl is required for all_gatherv"
+        )
         with pynccl_comm.change_state(enable=True):
-            assert pynccl_comm is not None and not pynccl_comm.disabled, (
-                "pynccl is required for all_gatherv"
-            )
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
