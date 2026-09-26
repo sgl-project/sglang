@@ -322,7 +322,6 @@ class TestDeferFfnReduction(CustomTestCase):
     ):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
-        communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
         communicator._sp_variant = object() if sp_active else None
         communicator.allow_reduce_scatter = True
@@ -379,7 +378,9 @@ class TestDeferFfnReduction(CustomTestCase):
                 moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
             ),
         ):
-            return communicator.should_defer_ffn_reduction(forward_batch)
+            return communicator._ffn_sum_moves_to_next_layer(
+                forward_batch, mlp_reduce_scatter=reduce_scatter, dp_step=step
+            )
 
     def test_defers_whether_or_not_the_fused_kernel_takes_the_batch(self):
         self.assertTrue(self._should_defer(fused=True))
