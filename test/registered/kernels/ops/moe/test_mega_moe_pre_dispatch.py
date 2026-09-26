@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")

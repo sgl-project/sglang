@@ -939,7 +939,7 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    component_names = ["tokenizer", "text_tokenizer"]
+    component_names = ["tokenizer", "text_tokenizer", "t5_tokenizer"]
     expected_library = "transformers"
 
     def load_customized(

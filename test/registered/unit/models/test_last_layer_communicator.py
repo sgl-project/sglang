@@ -158,20 +158,41 @@ CASES = {
 }
 
 
-def is_last_layer_passed(case, num_layers, layer_id, **kwargs):
+def build(case, num_layers, layer_id, config=None, **kwargs):
+    """Construct one decoder layer with its submodules stubbed. Returns the
+    LayerCommunicator kwargs, the LayerScatterModes.init_new kwargs, and the
+    names of the stubbed submodules it built."""
     module_name, class_name, make_config, stubs, _ = CASES[case]
     module = import_model(module_name)
     communicator = MagicMock()
-    patches = dict(LayerCommunicator=communicator, LayerScatterModes=MagicMock())
-    patches.update({name: stub for name in stubs})
+    scatter_modes = MagicMock()
+    built = []
+
+    def recording_stub(name):
+        def make(*args, **kwargs):
+            built.append(name)
+            return StubModule()
+
+        return make
+
+    patches = dict(LayerCommunicator=communicator, LayerScatterModes=scatter_modes)
+    patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
     with patch.multiple(module, **patches):
         getattr(module, class_name)(
-            make_config(num_layers), layer_id=layer_id, **kwargs
+            config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    return communicator.call_args.kwargs.get("is_last_layer", False)
+    return communicator.call_args.kwargs, scatter_modes.init_new.call_args.kwargs, built
+
+
+def planned_as_last(case, num_layers, layer_id, **kwargs):
+    """Whether the layer's layout plan makes it the model's last layer, the one
+    fact the communicator reads the last layer from."""
+    passed, planned, _ = build(case, num_layers, layer_id, **kwargs)
+    assert "is_last_layer" not in passed, "the plan is the only source"
+    return planned["layer_id"] == planned["num_layers"] - 1
 
 
 class TestLastLayerCommunicator(CustomTestCase):
@@ -182,7 +203,7 @@ class TestLastLayerCommunicator(CustomTestCase):
             for layer_id in range(NUM_LAYERS):
                 with self.subTest(case=case, layer_id=layer_id):
                     self.assertEqual(
-                        is_last_layer_passed(case, NUM_LAYERS, layer_id),
+                        planned_as_last(case, NUM_LAYERS, layer_id),
                         layer_id == NUM_LAYERS - 1,
                     )
 
@@ -195,8 +216,71 @@ class TestLastLayerCommunicator(CustomTestCase):
             num_layers, layer_id = draft
             with self.subTest(case=case):
                 self.assertTrue(
-                    is_last_layer_passed(case, num_layers, layer_id, is_nextn=True)
+                    planned_as_last(case, num_layers, layer_id, is_nextn=True)
                 )
+
+    def test_draft_model_layer_is_planned_as_a_one_layer_model(self):
+        """The layout plan of a NextN / MTP draft layer treats it as the first and
+        the last layer, so it takes the model's input layout and returns the
+        model's output layout even when its MLP runs on SCATTERED tokens."""
+        for case, (*_, draft) in CASES.items():
+            if draft is None:
+                continue
+            num_layers, layer_id = draft
+            with self.subTest(case=case):
+                _, planned, _ = build(case, num_layers, layer_id, is_nextn=True)
+                self.assertEqual((planned["layer_id"], planned["num_layers"]), (0, 1))
+
+    def test_bailing_draft_layer_builds_an_moe(self):
+        """The Bailing V2 NextN checkpoint holds expert weights, so the NextN
+        layer builds the sparse MoE block, also when the model's first layers
+        are dense."""
+        config = bailing_moe_config(NUM_LAYERS)
+        config.first_k_dense_replace = 1
+        _, planned, built = build(
+            "bailing_moe", NUM_LAYERS, 0, config=config, is_nextn=True
+        )
+        self.assertIn("BailingMoESparseMoeBlock", built)
+        self.assertNotIn("BailingMoEMLP", built)
+        self.assertTrue(planned["is_layer_sparse"])
+
+    def test_bailing_hybrid_draft_layer_is_planned_as_sparse(self):
+        """The Bailing hybrid NextN layer builds an MoE, so its layout plan is
+        that of a sparse layer, also when the model's first layers are dense."""
+        config = bailing_hybrid_config(NUM_LAYERS)
+        config.first_k_dense_replace = 1
+        _, planned, built = build(
+            "bailing_moe_linear", NUM_LAYERS, 0, config=config, is_nextn=True
+        )
+        self.assertIn("BailingMoE", built)
+        self.assertTrue(planned["is_layer_sparse"])
+
+
+class TestLayerScatterModesLastLayer(CustomTestCase):
+    def test_the_plan_marks_the_last_layer(self):
+        from sglang.srt.layers import communicator as comm
+
+        with (
+            patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
+            patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=False),
+            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
+            patch.object(comm, "is_mla_cp_enabled", return_value=False),
+        ):
+            for num_layers, layer_id in (
+                (NUM_LAYERS, 0),
+                (NUM_LAYERS, 2),
+                (NUM_LAYERS, 3),
+                (1, 0),
+            ):
+                with self.subTest(num_layers=num_layers, layer_id=layer_id):
+                    modes = comm.LayerScatterModes.init_new(
+                        layer_id=layer_id,
+                        num_layers=num_layers,
+                        is_layer_sparse=False,
+                        is_previous_layer_sparse=False,
+                        is_next_layer_sparse=False,
+                    )
+                    self.assertEqual(modes.is_last_layer, layer_id == num_layers - 1)
 
 
 if __name__ == "__main__":

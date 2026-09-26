@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
