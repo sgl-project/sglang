@@ -1114,6 +1114,10 @@ class Envs:
     # MI300X (gfx942) and MI355X (gfx950) — 2.0 oversubscribed the CUs and regressed high-batch
     # decode. Exposed as a knob (e.g. set 2.0) for grid A/B tuning without a rebuild.
     SGLANG_FORCE_LEAN_GRID_CU_MULT = EnvFloat(1.0)
+    # Tri-state tensor-descriptor path in the Triton extend-attention kernel.
+    # Unset -> auto, on only where descriptor loads reach a hardware fast path;
+    # True/False force it, which is how the two paths are A/B-ed on one device.
+    SGLANG_USE_TRITON_ATTN_TENSOR_DESC = EnvBool(None)
 
     # Torch Compile
     # Compact extend-attention query-tile grid: AMD/HIP-only optimization
