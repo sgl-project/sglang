@@ -654,6 +654,13 @@ ${IT_SHARE_MOUNT}-v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 # validation). Empty by default so the docker argv is byte-identical otherwise.
 [[ -n "${EXTRA_DOCKER_ARGS:-}" ]] && DOCKER_COMMON="$DOCKER_COMMON ${EXTRA_DOCKER_ARGS}"
 
+# Checkpoint paths whose trust_remote_code modules are pre-loaded in the entry
+# script (see warm_remote_code.sh). Colon-separated, draft appended only when a
+# recipe uses an external draft model.
+WARM_MODEL_PATHS="$MODEL_PATH"
+[[ -n "${DRAFT_RESOLVED:-}" ]] && WARM_MODEL_PATHS="$WARM_MODEL_PATHS:$DRAFT_RESOLVED"
+DOCKER_COMMON="$DOCKER_COMMON -e WARM_MODEL_PATHS=$WARM_MODEL_PATHS"
+
 # Spur compute nodes run prolog/epilog hooks that reap any container not tagged
 # with the owning job, so an untagged server is SIGKILLed (rc=137) seconds after
 # it starts. Single-quoted so the literal $SPUR_JOB_ID survives into the
@@ -783,6 +790,101 @@ if not actual.startswith(expected):
 PY
 EOF
 
+# Pre-populate the HuggingFace dynamic-module cache.
+#
+# transformers copies a trust_remote_code checkpoint's .py files into
+# HF_MODULES_CACHE and then imports them. The copy is a plain shutil.copy,
+# which truncates the destination before writing, and every scheduler on the
+# node does it concurrently against one cache. A scheduler that imports while
+# another is mid-copy sees a partial module and dies on a class that is
+# plainly there:
+#
+#   AttributeError: module 'transformers_modules...tokenization_kimi'
+#   has no attribute 'TikTokenTokenizer'
+#
+# On Kimi-K2.6 EP16 that took down two ranks of sixteen during init. Doing it
+# once here, before launch_server starts, leaves the schedulers nothing to
+# copy: transformers guards the copy with filecmp, so a cache that is already
+# correct turns every later call into a read. Measured on the Kimi checkpoint
+# with 16 concurrent loaders over 5 trials: 10 copies from a cold cache, 0
+# after this script has run.
+#
+# Best effort. A failure here is not fatal -- the schedulers still do their own
+# load and will report a real problem with their own traceback.
+cat > "$WORKDIR/warm_remote_code.sh" <<'EOF'
+#!/bin/bash
+# Never abort the server on a warm-up failure.
+set -uo pipefail
+
+if [[ -z "${WARM_MODEL_PATHS:-}" ]]; then
+  exit 0
+fi
+
+python3 - <<'PY' || echo "[warm-remote-code] skipped (non-fatal)"
+import json
+import os
+
+paths = [p for p in os.environ.get("WARM_MODEL_PATHS", "").split(":") if p]
+
+try:
+    # The function that does the copying, so it is the one to pre-run. Warming
+    # the class instead would also import it, which can fail on a checkpoint
+    # that ships modules the installed transformers cannot import -- a copy
+    # that succeeded would still be reported as an error.
+    from transformers.dynamic_module_utils import get_cached_module_file
+except Exception as e:
+    print(f"[warm-remote-code] transformers unavailable: {e}")
+    raise SystemExit(0)
+
+# auto_map lives in more than one file: the model classes are in config.json,
+# while the tokenizer and processor declare their own in tokenizer_config.json
+# and preprocessor_config.json. Kimi-K2.6 raced on the tokenizer, reached
+# through the processor's entry.
+CONFIGS = (
+    "config.json",
+    "tokenizer_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+warmed = missing = 0
+for path in paths:
+    done = set()
+    for name in CONFIGS:
+        try:
+            with open(os.path.join(path, name)) as f:
+                auto_map = json.load(f).get("auto_map") or {}
+        except (OSError, ValueError):
+            continue
+        for ref in auto_map.values():
+            for one in ref if isinstance(ref, (list, tuple)) else [ref]:
+                # "repo--module.Class" resolves against a different repo; leave
+                # those to the normal path rather than guessing where it lives.
+                if not one or "--" in one:
+                    continue
+                module_file = one.rsplit(".", 1)[0] + ".py"
+                if not os.path.exists(os.path.join(path, module_file)):
+                    # A checkpoint can list auto_map entries whose source is
+                    # not shipped -- Kimi-K2.6 still points at K2.5 files.
+                    # Nothing to warm, and not a problem.
+                    missing += 1
+                    continue
+                if module_file in done:
+                    continue
+                done.add(module_file)
+                try:
+                    get_cached_module_file(path, module_file)
+                    warmed += 1
+                except Exception as e:
+                    print(f"[warm-remote-code] could not pre-load {module_file}: {e}")
+
+print(
+    f"[warm-remote-code] warmed {warmed} module(s) from {len(paths)} path(s)"
+    + (f"; {missing} auto_map entr(ies) had no source file" if missing else "")
+)
+PY
+EOF
+
 cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -871,6 +973,7 @@ bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -894,6 +997,7 @@ bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -948,6 +1052,7 @@ bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
@@ -963,6 +1068,7 @@ bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
