@@ -363,7 +363,9 @@ class RustMmProcessor:
         shm_buffers = shm_feature_buffers(buffers)
         stubs: list = []
         try:
-            meta = msgspec.msgpack.decode(buffers["mm.meta"].tobytes())
+            # Decoded straight from the numpy buffer (a memoryview over the
+            # Rust-owned bytes), not from a `.tobytes()` copy of it.
+            meta = msgspec.msgpack.decode(memoryview(buffers["mm.meta"]))
             items = [
                 RustMmProcessor._wrap_item(
                     index=index, item=item, buffers=buffers, stubs=stubs
