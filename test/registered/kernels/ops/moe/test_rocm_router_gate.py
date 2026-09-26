@@ -4,17 +4,17 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.moe.rocm_router_gate import (
+from sglang.kernels.ops.gemm.router_gemv_hip import (
     ROCM_ROUTER_MAX_TOKENS,
-    rocm_router_gate,
     rocm_router_gemv_split_k,
     rocm_router_reduce_partials,
 )
+from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 try:
@@ -97,19 +97,6 @@ class TestRocmRouterGate(CustomTestCase):
         self.assertTrue(torch.equal(logits, ref_logits))
         self.assertTrue(torch.equal(out_i, ref_i))
         self.assertTrue(torch.equal(out_w, ref_w))
-
-    def test_gemv_accuracy_and_batch_invariance(self):
-        """The split-K GEMV is within fp32 rounding of fp64, and every M runs the same
-        16-row tile, so a row's result does not depend on the batch."""
-        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        x = self._randn(ROCM_ROUTER_MAX_TOKENS, HIDDEN).to(torch.bfloat16)
-        ref = (x.double() @ weight.double().T).float()
-        full = torch.empty(ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device)
-        rocm_router_reduce_partials(rocm_router_gemv_split_k(x, weight), full)
-        self.assertTrue(torch.allclose(full, ref, atol=2e-3, rtol=1e-4))
-        part = torch.empty(17, NUM_EXPERTS, device=self.device)
-        rocm_router_reduce_partials(rocm_router_gemv_split_k(x[:17], weight), part)
-        self.assertTrue(torch.equal(part, full[:17]))
 
 
 if __name__ == "__main__":

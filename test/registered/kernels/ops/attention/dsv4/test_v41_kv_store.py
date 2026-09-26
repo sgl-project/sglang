@@ -30,8 +30,8 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
     quantize_k_cache_v41,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
 from sglang.test.test_utils import CustomTestCase
 
 # the V4.1 store kernels are the SM100 / gfx950 JIT kernels; the only Blackwell runner
