@@ -73,6 +73,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
@@ -106,6 +107,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
+                    "disable_aiter_allreduce_fusion_in_prefill",
+                    "disable_aiter_allreduce_fusion_in_decode",
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
@@ -590,6 +593,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
+
+    def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "needs mamba state"):
+            self._construct(
+                "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
+            )
+
+    def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_radix_cache=True,
+        )
+        self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -1703,6 +1721,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # V4.1 leaves the ratio unset (cap-mode SWA sizing).
+        hf41 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
+        )
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
+        )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(
             "moe_runner_backend",
@@ -2635,6 +2661,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        # gfx950 accepts --moe-runner-backend aiter for MXFP8 only with aiter enabled
+        with (
+            override_platform(is_hip=True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+        ):
+            aiter_view = dict(quantization="mxfp8", moe_runner_backend="aiter")
+            with envs.SGLANG_USE_AITER.override(True):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)), {}
+                )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)),
+                    {"moe_runner_backend": "triton"},
+                )
         with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
