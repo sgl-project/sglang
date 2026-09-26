@@ -2,10 +2,11 @@
 //! and hand each request back with the expanded ids and the named feature
 //! buffers that ride the ring with it.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_mm::driver::{self, Output};
+use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
+use sglang_mm::registry::build_pipeline;
 
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
@@ -69,13 +70,13 @@ pub trait MmProcessor: Send + Sync {
 }
 
 struct QwenMmProcessor {
-    family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
+    family: Box<dyn MmFamilyProcessor>,
 }
 
 impl QwenMmProcessor {
     fn new(spec: MmSpec) -> Result<Self, String> {
         Ok(Self {
-            family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
+            family: build_pipeline(spec.pipeline)?,
         })
     }
 }
@@ -83,43 +84,70 @@ impl QwenMmProcessor {
 impl MmProcessor for QwenMmProcessor {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
         let input = super::payload::to_mm_input(input_ids, mm)?;
-        let output = sglang_mm::driver::process(self.family.as_ref(), input)?;
-        let packed = sglang_mm::qwen_vl::pack_output(output)?;
-        let items = packed
-            .features
-            .into_iter()
-            .zip(packed.grids)
-            .zip(packed.hashes)
-            .zip(packed.offsets)
-            .map(|(((feature, [t, h, w]), hash), offsets)| {
-                let rows = (t * h * w) as usize;
-                let dim = if rows == 0 { 0 } else { feature.len() / rows };
-                MmEncodedItem {
-                    modality: MmModality::Image,
-                    feature: Tensor {
-                        shape: vec![rows, dim],
-                        data: TensorData::F32(feature),
-                    },
-                    hash,
-                    offsets: vec![offsets],
-                    model_specific_data: BTreeMap::from([(
-                        "image_grid_thw".to_owned(),
-                        MmMetaValue::Ints(vec![t as i64, h as i64, w as i64]),
-                    )]),
-                }
+        let output = driver::process(self.family.as_ref(), input)?;
+        encode_driver_output(output)
+    }
+}
+
+/// Map the driver's output straight onto the common encoded result: each
+/// feature tensor is moved with its own shape and dtype, the per-item span
+/// and hash ride along, and every auxiliary tensor is translated once into
+/// the sidecar's metadata form. Nothing is reconstructed from lengths.
+fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
+    let Output {
+        input_ids,
+        items,
+        offsets,
+        positions,
+    } = output;
+    if items.len() != offsets.len() {
+        return Err(format!(
+            "mm: {} items but {} spans",
+            items.len(),
+            offsets.len()
+        ));
+    }
+    let items = items
+        .into_iter()
+        .zip(offsets)
+        .map(|(item, span)| {
+            Ok(MmEncodedItem {
+                modality: MmModality::Image,
+                feature: item.feature,
+                hash: item.hash,
+                offsets: vec![span],
+                model_specific_data: item
+                    .aux
+                    .into_iter()
+                    .map(|(name, tensor)| Ok((name.clone(), aux_meta(&name, tensor)?)))
+                    .collect::<Result<_, String>>()?,
             })
-            .collect();
-        Ok(MmProcessOutput {
-            input_ids: packed.input_ids,
-            result: MmEncodedEntry {
-                items,
-                token_ids: None,
-                mrope: Some(MRope {
-                    positions: packed.mrope,
-                    delta: packed.mrope_delta,
-                }),
-            },
         })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mrope = match positions {
+        PositionOutput::Rope1D => None,
+        PositionOutput::MRope { positions, delta } => Some(MRope { positions, delta }),
+    };
+    Ok(MmProcessOutput {
+        input_ids,
+        result: MmEncodedEntry {
+            items,
+            token_ids: None,
+            mrope,
+        },
+    })
+}
+
+/// An auxiliary tensor as sidecar metadata. Only integer tensors have a
+/// metadata form (a grid, a count); anything else is a processor bug, not
+/// something to approximate.
+fn aux_meta(name: &str, tensor: Tensor) -> Result<MmMetaValue, String> {
+    match tensor.data {
+        TensorData::I64(values) if values.len() == 1 && tensor.shape.is_empty() => {
+            Ok(MmMetaValue::Int(values[0]))
+        }
+        TensorData::I64(values) => Ok(MmMetaValue::Ints(values)),
+        _ => Err(format!("mm: aux tensor {name:?} has no metadata form")),
     }
 }
 
@@ -318,6 +346,9 @@ impl Runnable for MmWorker {
 
 #[cfg(test)]
 mod tests {
+    use sglang_mm::driver::OutputItem;
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::message::buffers::find;
     use crate::utils::shm::{shm_path, unique_name};
@@ -352,6 +383,96 @@ mod tests {
                 },
             })
         }
+    }
+
+    /// The driver's output maps onto the encoded result without any
+    /// reconstruction: feature tensors keep their shape and dtype, spans and
+    /// hashes ride per item, integer aux tensors become metadata, and M-RoPE
+    /// carries over; 1-D positions leave `mrope` empty.
+    #[test]
+    fn driver_output_maps_directly() {
+        let item = |shape: Vec<usize>, hash| OutputItem {
+            feature: Tensor {
+                shape,
+                data: TensorData::F32(vec![0.5; 12]),
+            },
+            aux: vec![
+                (
+                    "image_grid_thw".into(),
+                    Tensor {
+                        shape: vec![3],
+                        data: TensorData::I64(vec![1, 2, 3]),
+                    },
+                ),
+                (
+                    "clip_index".into(),
+                    Tensor {
+                        shape: vec![],
+                        data: TensorData::I64(vec![7]),
+                    },
+                ),
+            ],
+            hash,
+        };
+        let output = Output {
+            input_ids: vec![1, 2, 2, 3],
+            items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
+            offsets: vec![(1, 2), (3, 3)],
+            positions: PositionOutput::MRope {
+                positions: vec![0; 12],
+                delta: -2,
+            },
+        };
+        let encoded = encode_driver_output(output).unwrap();
+        assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
+        let items = &encoded.result.items;
+        assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
+        assert_eq!(items[1].feature.shape, [2, 6]);
+        assert_eq!((items[0].hash, items[1].hash), (11, 22));
+        assert_eq!(items[0].offsets, [(1, 2)]);
+        assert_eq!(items[1].offsets, [(3, 3)]);
+        assert_eq!(
+            items[0].model_specific_data["image_grid_thw"],
+            MmMetaValue::Ints(vec![1, 2, 3])
+        );
+        assert_eq!(
+            items[0].model_specific_data["clip_index"],
+            MmMetaValue::Int(7)
+        );
+        let mrope = encoded.result.mrope.as_ref().unwrap();
+        assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
+
+        let plain = Output {
+            input_ids: vec![1],
+            items: vec![],
+            offsets: vec![],
+            positions: PositionOutput::Rope1D,
+        };
+        assert!(encode_driver_output(plain).unwrap().result.mrope.is_none());
+
+        let bad = Output {
+            input_ids: vec![1],
+            items: vec![OutputItem {
+                feature: Tensor {
+                    shape: vec![1],
+                    data: TensorData::F32(vec![1.0]),
+                },
+                aux: vec![(
+                    "scale".into(),
+                    Tensor {
+                        shape: vec![1],
+                        data: TensorData::F32(vec![1.0]),
+                    },
+                )],
+                hash: 1,
+            }],
+            offsets: vec![(0, 0)],
+            positions: PositionOutput::Rope1D,
+        };
+        let Err(err) = encode_driver_output(bad) else {
+            panic!("an f32 aux tensor must be rejected");
+        };
+        assert!(err.contains("no metadata form"), "{err}");
     }
 
     /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
