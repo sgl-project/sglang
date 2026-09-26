@@ -1,5 +1,6 @@
-"""gfx950 small-M W8A8 FP8 GEMM and fused output-side FP8 quant at the Qwen3.5 AttnFP8 TP4 shapes."""
+"""gfx950 small-M W8A8 FP8 GEMM (Qwen3.5 AttnFP8 TP4 shapes) and fused output-side FP8 quant (TP4 and TP2)."""
 
+import itertools
 import os
 import types
 import unittest
@@ -88,36 +89,37 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             with patch.dict(os.environ, _OFF):
                 self.assertFalse(fp8_in(types.SimpleNamespace(scheme=scheme), 4))
 
-    def producers(self, t, trial=0):
+    def producers(self, t, trial=0, tp=4):
         from sglang.kernels.ops.attention.fla.layernorm_gated import (
             _layer_norm_fwd,
             rms_norm_gated,
         )
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
-        # GDN RMSNormGated over 16 heads x 128 per rank; attention gate over 8 heads x 256 per rank
-        x = torch.randn(t * 16, 128, device="cuda", dtype=torch.bfloat16) * (1 + trial)
+        # per rank: GDN RMSNormGated over 64 / tp heads x 128; attention gate over 32 / tp heads x 256
+        nv, na = 64 // tp, 32 // tp
+        x = torch.randn(t * nv, 128, device="cuda", dtype=torch.bfloat16) * (1 + trial)
         z = torch.randn_like(x) * 3
         w = torch.randn(128, device="cuda", dtype=torch.bfloat16) * 0.5 + 1
-        a = torch.randn(t, 2048, device="cuda", dtype=torch.bfloat16) * (1 + trial)
-        g = torch.randn(t, 8, 512, device="cuda", dtype=torch.bfloat16)[:, :, 256:]
+        a = torch.randn(t, na * 256, device="cuda", dtype=torch.bfloat16) * (1 + trial)
+        g = torch.randn(t, na, 512, device="cuda", dtype=torch.bfloat16)[:, :, 256:]
         fused = (
             lambda: _layer_norm_fwd(
-                x, w, None, 1e-6, z=z, is_rms_norm=True, quant_heads=16
+                x, w, None, 1e-6, z=z, is_rms_norm=True, quant_heads=nv
             )[0],
             lambda: fused_sigmoid_mul(a, g, quant=True),
         )
         norm = rms_norm_gated(x=x, weight=w, bias=None, z=z, eps=1e-6, is_rms_norm=True)
         unfused = (
-            self.quant(norm.view(t, 2048), group_size=2048),
-            self.quant(fused_sigmoid_mul(a.clone(), g), group_size=2048),
+            self.quant(norm.view(t, nv * 128), group_size=nv * 128),
+            self.quant(fused_sigmoid_mul(a.clone(), g), group_size=na * 256),
         )
         return fused, unfused
 
     def test_fused_quant_bit_exact(self):
-        for t in (1, 4, 16, 33, 40):
+        for tp, t in itertools.product((4, 2), (1, 4, 16, 33, 40)):
             for trial in range(5):
-                fused, unfused = self.producers(t, trial)
+                fused, unfused = self.producers(t, trial, tp)
                 for f, (rq, rs) in zip(fused, unfused):
                     q, s = f()
                     self.assertTrue(
