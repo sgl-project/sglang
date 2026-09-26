@@ -511,6 +511,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         shared_output = None
         if self.shared_expert is not None:
+            if (
+                _is_npu
+                and apply_gate
+                and self.shared_expert_gate is not None
+                and envs.SGLANG_NPU_FUSED_SHARED_EXPERT.get()
+                and self.shared_expert_gate.bias is None
+                and self.shared_expert.gate_up_proj.bias is None
+                and self.shared_expert.down_proj.bias is None
+            ):
+                # Fused Triton path: gate_up GEMM + SwiGLU + down GEMM +
+                # sigmoid gate in three kernel launches. Rounding points and
+                # formulas match the eager chain (see sgl-kernel-npu
+                # tests/python/sgl_kernel_npu/test_fused_shared_expert.py).
+                from sgl_kernel_npu.fused.fused_shared_expert import (
+                    fused_shared_expert_mlp,
+                )
+
+                shared_output = fused_shared_expert_mlp(
+                    hidden_states,
+                    self.shared_expert.gate_up_proj.weight,
+                    self.shared_expert.down_proj.weight,
+                    self.shared_expert_gate.weight,
+                )
+                return shared_output
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
