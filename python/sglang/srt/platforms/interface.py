@@ -119,6 +119,10 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
+    def supports_mxfp8_kv_cache(self) -> bool:
+        """Whether this platform supports an MXFP8 KV cache."""
+        return self.is_blackwell
+
     def supports_speculative_algorithm(self, algorithm: str) -> bool:
         """Whether this platform supports the named speculative algorithm."""
         return False
