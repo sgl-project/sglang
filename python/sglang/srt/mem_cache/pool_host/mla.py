@@ -355,6 +355,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
+                # This mirror is sized from the device pool's sharded `size`,
+                # but the device's index-K spans the replicated `index_buf_size`.
+                # transfer_kv_dim_exchange checks layer counts, not page counts.
+                device_index_pages = (
+                    getattr(self.device_pool, "index_buf_size", self.device_pool.size)
+                    // self.device_pool.page_size
+                    + 1
+                )
+                assert device_index_pages <= self.page_num, (
+                    f"host index-K mirror holds {self.page_num} pages but the "
+                    f"device index-K spans {device_index_pages}; hierarchical "
+                    "cache cannot mirror a DCP-widened indexer. Raise "
+                    "--hicache-ratio to at least the DCP size, or run without "
+                    "hierarchical cache."
+                )
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, self.device_pool.index_head_dim),
                     dtype=self.dtype,

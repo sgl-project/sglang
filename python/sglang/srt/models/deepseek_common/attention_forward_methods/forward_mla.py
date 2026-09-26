@@ -99,7 +99,9 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+    # Backends whose attention returns a natural-log LSE. A mismatch degrades
+    # acceptance without failing -- test_the_wrong_log_base_is_not_silently_fine.
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "ascend"}
 
 
 if _is_cuda:

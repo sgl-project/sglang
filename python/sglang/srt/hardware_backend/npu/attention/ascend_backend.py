@@ -25,7 +25,18 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_cp import (
+    dsa_cp_cumulative_lens,
+    dsa_cp_multi_request_enabled,
+    get_dsa_cp_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.dcp.layout import (
+    dcp_crop_free_extend,
+    dcp_local_kv_block_table,
+    get_dcp_lens,
+    remap_dcp_local_topk_indices,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -69,6 +80,31 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices
 
 
+def _dcp_lse_from_softmax(
+    softmax_max: torch.Tensor, softmax_sum: torch.Tensor
+) -> torch.Tensor:
+    """The operator's two softmax halves -> the ``[T, H]`` LSE the merge takes.
+
+    ``npu_sparse_flash_attention_lse`` returns the two halves separately,
+    matching vLLM-Ascend's vendored operator, and the caller reconstructs.
+    Under ``layout_query="TND"`` both come back as ``(N2, T, G)`` while
+    ``cp_lse_ag_out_rs_mla`` wants ``[B, H]``, so the head axes are flattened
+    in the order the query uses.
+
+    The result is a **natural** log, because CANN defines ``softmax_sum`` as
+    ``sum(exp(qk - max))``; that is what puts ``"ascend"`` in
+    ``is_mla_dcp_lse_base_on_e``, and getting it wrong does not fail loudly.
+
+    No epsilon on ``softmax_sum``: a row whose indices are all ``-1`` comes
+    back with the kernel's ``-2e38`` sentinel and a sum equal to the slot
+    count, never zero, so nothing evaluates ``log(0)`` and the combine
+    underflows it to the zero weight an empty shard should contribute.
+    """
+    lse = softmax_max + torch.log(softmax_sum)
+    n2, t, g = lse.shape
+    return lse.permute(1, 0, 2).reshape(t, n2 * g)
+
+
 def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
 ) -> torch.Tensor:
@@ -106,6 +142,10 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # The second page table DCP needs: block_tables above is the indexer's
+    # replicated full-span view, this one addresses this rank's KV shard.
+    dcp_local_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -506,12 +546,18 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max += self.speculative_step_id + 1
         else:
             seq_lens_max = forward_batch.seq_lens.max()
+        loc_rows = self.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :seq_lens_max
+        ]
+        # Unchanged on purpose: dividing by the unscaled page_size already gives
+        # page ids over the whole virtual span, which is the indexer's view.
         self.forward_metadata.block_tables = (
-            self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
+            loc_rows[:, :: self.page_size] // self.page_size
         )
+        if get_parallel().dcp_enabled:
+            self.forward_metadata.dcp_local_block_tables = dcp_local_kv_block_table(
+                loc_rows, self.page_size
+            )
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -639,6 +685,16 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if get_parallel().dcp_enabled:
+            # A captured graph needs persistent storage for the rank-local table
+            # too, or the operator refuses the call at capture time. Strided by
+            # page_size * dcp_size, so 1/dcp_size the width of the table above.
+            stride = self.page_size * get_parallel().attn_dcp_size
+            self.graph_metadata["dcp_local_block_tables"] = torch.empty(
+                (max_bs, (total_context_len + stride - 1) // stride),
+                dtype=torch.int32,
+                device=self.device,
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -694,6 +750,10 @@ class AscendAttnBackend(AttentionBackend):
                 torch.npu.current_stream(self.device), self.device
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if get_parallel().dcp_enabled:
+            metadata.dcp_local_block_tables = self.graph_metadata[
+                "dcp_local_block_tables"
+            ][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
@@ -827,6 +887,17 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        if get_parallel().dcp_enabled:
+            # Same refill at the rank-local stride, using the arithmetic
+            # dcp_local_kv_block_table applies on the eager path.
+            stride = self.page_size * get_parallel().attn_dcp_size
+            max_local_pages = (max_len + stride - 1) // stride
+            metadata.dcp_local_block_tables[:bs, :max_local_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0:max_len:stride] // stride
+            )
+            metadata.dcp_local_block_tables[:bs, max_local_pages:].fill_(0)
+            metadata.dcp_local_block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
@@ -1171,8 +1242,19 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # DSA-CP replaces both length vectors. Built once per forward: they do
+        # not vary by layer, and each build is a blocking host-to-device copy.
+        dsa_cp_plan = get_dsa_cp_plan(forward_batch)
+        dsa_cp_qlen = dsa_cp_kvlen = None
+        if dsa_cp_plan is not None:
+            dsa_cp_qlen, dsa_cp_kvlen = dsa_cp_cumulative_lens(
+                forward_batch, dsa_cp_plan, q.device
+            )
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_cp_qlen is not None:
+                actual_seq_qlen = dsa_cp_qlen
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1224,8 +1306,89 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+            # Must keep mirroring is_dcp_mla_decode_phase (forward_mla.py),
+            # where the caller decides to unpack (attn_output, lse). Restated
+            # rather than imported: a backend importing a model inverts layering.
+            dcp_decode = get_parallel().dcp_enabled and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+
+            # The mirror image of decode: the query stays rank-local and the
+            # context was gathered by _dcp_gather_extend_kv_npu, whose condition
+            # this one must match exactly.
+            dcp_meta = forward_batch.attn_dcp_metadata
+            dcp_extend = (
+                get_parallel().dcp_enabled
+                and forward_batch.forward_mode.is_extend()
+                and not dcp_decode
+                and dcp_meta is not None
+            )
+
+            key_nope, key_rope = k_nope, k_pe
+            layout_kv = "PA_BSND"
+
+            if dcp_decode:
+                # Global positions from the replicated view -> this rank's KV
+                # coordinates, non-owned entries marked -1.
+                topk_indices = remap_dcp_local_topk_indices(topk_indices)
+                block_table = self.forward_metadata.dcp_local_block_tables
+                seq_lengths_kv = get_dcp_lens(
+                    actual_seq_lengths_kv,
+                    get_parallel().attn_dcp_size,
+                    get_parallel().attn_dcp_rank,
+                )
+                # 0, not 3: rank-local KV length and global query length share no
+                # coordinate system, so the crop must go. Safe at decode only --
+                # every key in the buffer is already a past token.
+                sparse_mode = 0
+            elif dcp_extend:
+                # Indices relative to each request's KV start, cumulative KV
+                # lengths. Three of the four index/length conventions run and
+                # return plausible garbage, so re-probe before changing this.
+                gathered = getattr(forward_batch, "npu_dcp_extend_kv", None)
+                assert gathered is not None, (
+                    "DCP extend reached the sparse operator without the model "
+                    "gathering this layer's context"
+                )
+                key_nope, key_rope = gathered
+                block_table = None
+                seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
+                if (
+                    dsa_cp_plan is not None
+                    and dsa_cp_multi_request_enabled()
+                    and dcp_crop_free_extend(
+                        forward_batch,
+                        topk_indices.shape[-1] if topk_indices is not None else None,
+                    )
+                ):
+                    # The lift: keep the full per-request KV lengths so no
+                    # request's start moves, and drop the crop the shortening
+                    # existed for. dcp_crop_free_extend has checked the bound.
+                    sparse_mode = 0
+                else:
+                    if dsa_cp_plan is not None:
+                        # This rank's queries end partway through the request.
+                        # Cumulative lengths double as request boundaries, so
+                        # shortening is only safe for a single request.
+                        seq_lengths_kv = dsa_cp_kvlen
+                    sparse_mode = 3
+                # layout_kv must equal layout_query unless it is PA_BSND.
+                layout_kv = "TND"
+            else:
+                block_table = self.forward_metadata.block_tables
+                seq_lengths_kv = actual_seq_lengths_kv
+                sparse_mode = 3
+
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.kv_cache_dtype == torch.float8_e4m3fn:
+                # DCP does not compose with an FP8 KV cache: this branch does not
+                # read the gathered buffer and the LSE port has no quant form.
+                assert not (dcp_decode or dcp_extend), (
+                    "FP8 KV cache with decode context parallelism is not "
+                    "supported: the DCP gathered/LSE paths are bf16-only."
+                )
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
                 packed = k_nope.view(torch.float8_e4m3fn)
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
@@ -1255,27 +1418,43 @@ class AscendAttnBackend(AttentionBackend):
                     rope_head_dim=self.qk_rope_head_dim,
                 )
             else:
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                call = dict(
                     query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
+                    key=key_nope,
+                    value=key_nope,
                     query_rope=q_pe,
-                    key_rope=k_pe,
+                    key_rope=key_rope,
                     sparse_indices=topk_indices,
                     scale_value=layer.scaling,
                     actual_seq_lengths_query=actual_seq_qlen.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                    actual_seq_lengths_kv=seq_lengths_kv.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
                     layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
+                    layout_kv=layout_kv,
+                    sparse_mode=sparse_mode,
                     attention_mode=2,
-                    return_softmax_lse=False,
+                )
+                # Omitted rather than passed as None: to a tiling function the two
+                # are not always the same thing.
+                if block_table is not None:
+                    call["block_table"] = block_table
+
+                if dcp_decode:
+                    # CANN refuses return_softmax_lse under PA_BSND, its only
+                    # paged layout, so DCP calls the vendored port instead.
+                    attn_out, softmax_max, softmax_sum = (
+                        torch.ops.npu.npu_sparse_flash_attention_lse(
+                            **call, return_softmax_lse=True
+                        )
+                    )
+                    return attn_out, _dcp_lse_from_softmax(softmax_max, softmax_sum)
+
+                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                    **call, return_softmax_lse=False
                 )
 
         return attn_out

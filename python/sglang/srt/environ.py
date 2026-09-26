@@ -984,6 +984,23 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: shard the attention block's tokens across attention-TP, so
+    # every rank computes every head for its own slice, with the query
+    # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
+    SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
+    # DSA-CP: also shard batches carrying more than one request, by passing
+    # full per-request KV lengths and dropping the operator's causal crop.
+    # Only engages where every request's prefix reaches index_topk.
+    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
+    # the scratch a layer holds beside the gathered context. The default is
+    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

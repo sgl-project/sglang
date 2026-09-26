@@ -104,6 +104,59 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def dcp_virtual_loc_extent(
+    max_total_num_tokens: int, attn_dcp_size: int, loc_space_scale: int
+) -> int:
+    """How many token rows span the whole DCP virtual location space.
+
+    A replicated buffer -- the LightningIndexer's index-K, and a draft worker's
+    pools -- is addressed at a raw, untranslated ``loc``, so it must cover every
+    location the allocator can issue: ``max_total * dcp_size``. A sharded buffer
+    translates ``// dcp_size`` and stays at ``max_total``.
+
+    The subtlety this exists for: ``max_total_num_tokens`` reaches the pool
+    builders *already* multiplied by ``loc_space_scale`` (``_derive_pool_sizes``),
+    which is ``attn_dcp_size`` on a draft worker and 1 on the target. Multiplying
+    unconditionally therefore double-counts on the draft and asks for
+    ``max_total * dcp_size**2`` rows -- at 1M tokens and DCP16 that is sixteen
+    times the intended buffer, and it is invisible in every configuration CI runs
+    because both scales are 1 without DCP.
+    """
+    assert loc_space_scale in (1, attn_dcp_size), (
+        f"loc_space_scale {loc_space_scale} is neither 1 nor attn_dcp_size "
+        f"{attn_dcp_size}; the virtual extent below assumes one of the two"
+    )
+    return max_total_num_tokens * attn_dcp_size // loc_space_scale
+
+
+def dcp_index_buf_widening_factor(
+    attn_dcp_size: int, *, index_buf_is_replicated: bool
+) -> int:
+    """How many times the index-K buffer exceeds a per-rank token budget.
+
+    The companion to ``dcp_virtual_loc_extent`` above, for the *memory budget*
+    rather than the allocation. Both have to agree, and when they did not the
+    failure was a bare ``NPU out of memory`` during pool construction with
+    nothing naming DCP as the cause.
+
+    The asymmetry: under DCP the latent KV **shards** -- each rank stores
+    ``max_total`` rows and translates ``// dcp_size`` on the way in -- while the
+    LightningIndexer's index-K is **replicated** and spans the whole virtual
+    space, ``max_total * dcp_size``. A per-token cost that counts the indexer
+    once is therefore short by exactly ``attn_dcp_size`` on that term, so the
+    derived ``max_total`` overshoots and the pool cannot fit what the budget
+    promised. Measured on A3 at DCP16: 1.08 GiB budgeted against 17.35 GiB
+    allocated, a 16.27 GiB overshoot per die.
+
+    Returns 1 wherever the widening does not happen, so callers can multiply
+    unconditionally. Note this is invisible to CI, which runs at
+    ``dcp_size == 1`` where the factor collapses to 1 either way.
+    """
+    if not index_buf_is_replicated or attn_dcp_size <= 1:
+        return 1
+    return attn_dcp_size
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1555,10 +1608,14 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        # Deliberately not gated on `is_arch35`. Which layers own an Indexer is a
+        # property of the model config -- `dsa_layer_skips_topk` reads
+        # `index_topk_freq` and `index_skip_topk_offset` -- not of the die, and a
+        # layer with `self.indexer is None` (deepseek_v2.py) never writes index-K
+        # on any hardware. The arch test only ever described where the layout had
+        # been exercised.
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:
@@ -1593,6 +1650,14 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            # The replicated indexer spans the whole virtual range where the
+            # sharded latent KV keeps max_total rows. Not a bare multiply -- see
+            # dcp_virtual_loc_extent for the draft worker.
+            index_buf_size=dcp_virtual_loc_extent(
+                max_total_num_tokens,
+                get_parallel().attn_dcp_size,
+                self.loc_space_scale,
+            ),
         )
         return token_to_kv_pool
 
@@ -2046,9 +2111,12 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
