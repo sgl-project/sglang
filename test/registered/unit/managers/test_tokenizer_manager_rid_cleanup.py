@@ -24,6 +24,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
@@ -451,6 +452,51 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestRequestTpotGating(CustomTestCase):
+    """Request TPOT is observed once, only for requests with a real decode
+    interval that ran to completion on a non-prefill worker."""
+
+    def _run(self, batches, disaggregation_mode=DisaggregationMode.NULL):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_metrics = True
+        tm.enable_priority_scheduling = False
+        tm.disaggregation_mode = disaggregation_mode
+        tm.metrics_collector = MagicMock(labels={})
+        rid = "tpot_rid"
+        state = _make_req_state(rid)
+        state.obj.log_metrics = True
+        state.obj.sampling_params = {}
+        state.obj.custom_labels = None
+        tm.rid_to_state[rid] = state
+        for completion_tokens, finished_reason in batches:
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.completion_tokens = [completion_tokens]
+            asyncio.run(tm._handle_batch_output(batch_output))
+        (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
+        return call.kwargs["time_per_output_token"]
+
+    def test_single_batch_finish_records_nothing(self):
+        """First and final output in one batch leave no decode interval."""
+        self.assertIsNone(self._run([(40, {"type": "stop"})]))
+
+    def test_multi_batch_records_only_completed_decode(self):
+        cases = [
+            ("stop", {"type": "stop"}, DisaggregationMode.NULL, True),
+            ("abort", {"type": "abort"}, DisaggregationMode.NULL, False),
+            ("prefill", {"type": "stop"}, DisaggregationMode.PREFILL, False),
+        ]
+        for name, finished_reason, mode, recorded in cases:
+            with self.subTest(name):
+                tpot = self._run(
+                    [(1, _NOT_FINISHED), (3, finished_reason)],
+                    disaggregation_mode=mode,
+                )
+                if recorded:
+                    self.assertGreater(tpot, 0.0)
+                else:
+                    self.assertIsNone(tpot)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
