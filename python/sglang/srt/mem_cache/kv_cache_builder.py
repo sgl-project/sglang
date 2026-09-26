@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
@@ -286,16 +287,26 @@ def build_kv_cache(
 
     # Hybrid memory pool
     token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa and (
-        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        or token_to_kv_pool.needs_paged_swa_allocator
+    # The bounded draft's KV lives on the SWA side of the allocator, so the
+    # cache maintains it like a hybrid-SWA pool.
+    bounded_draft_kv = tp_worker.model_runner.draft_kv_ratio < 1
+    is_hybrid_swa = bounded_draft_kv or (
+        tp_worker.is_hybrid_swa
+        and (
+            not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            or token_to_kv_pool.needs_paged_swa_allocator
+        )
     )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
     if is_hybrid_swa:
-        sliding_window_size = tp_worker.sliding_window_size
+        sliding_window_size = (
+            get_spec().speculative_draft_window_size
+            if bounded_draft_kv
+            else tp_worker.sliding_window_size
+        )
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )

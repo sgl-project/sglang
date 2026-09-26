@@ -1648,6 +1648,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-draft-kv-ratio`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The draft KV pool as a fraction of the target's token capacity. At 1.0 the draft holds one slot per target token. Below 1.0 the draft's KV lives in a sliding-window pool. Requires DFLASH. The window defaults to the draft's `sliding_window` unless `--speculative-draft-window-size` is set. Drafts with full-attention layers and targets with sliding-window layers are not supported yet.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
 </tbody>
 </table>
 

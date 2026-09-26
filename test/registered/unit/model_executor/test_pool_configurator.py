@@ -84,6 +84,8 @@ def _make_model_runner(
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
     swa_qk_rope_head_dim=32,
+    speculative_draft_window_size=None,
+    speculative_draft_kv_ratio=1.0,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -143,6 +145,8 @@ def _make_model_runner(
         speculative_algorithm=speculative_algorithm,
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
+        speculative_draft_window_size=speculative_draft_window_size,
+        speculative_draft_kv_ratio=speculative_draft_kv_ratio,
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
@@ -173,11 +177,13 @@ def _make_model_runner(
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
+    mr.draft_kv_ratio = speculative_draft_kv_ratio
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_cell_size_per_token=None,
     )
 
     return mr
@@ -1392,6 +1398,116 @@ class TestSWAPoolFloor(CustomTestCase):
         slots = cfg._get_num_req_slots(mrr)
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
+
+
+class TestDFlashDraftKVRatioConfigurator(CustomTestCase):
+    """--speculative-draft-kv-ratio: the draft holds its share of the target's
+    tokens, priced into the cell size, and must still cover running requests."""
+
+    WINDOW = 64
+    DRAFT_CELL = 48  # bytes/token of the draft KV
+    MAX_RUNNING = 2
+
+    def _make(self, ratio, **kwargs):
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            speculative_algorithm="DFLASH",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=8,
+            disable_overlap_schedule=True,
+            max_running_requests=self.MAX_RUNNING,
+            chunked_prefill_size=32,
+            speculative_draft_window_size=self.WINDOW,
+            speculative_draft_kv_ratio=ratio,
+            **kwargs,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 5
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = self.DRAFT_CELL
+        return mr
+
+    def _run(self, ratio, available_bytes=10_000_000, page_size=1, **kwargs):
+        mr = self._make(ratio, page_size=page_size, **kwargs)
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, page_size)
+        return mr, cfg, config
+
+    def test_draft_pool_is_ratio_of_target(self):
+        _, _, config = self._run(0.5)
+        self.assertEqual(config.full_max_total_num_tokens, config.max_total_num_tokens)
+        self.assertEqual(
+            config.swa_max_total_num_tokens, int(config.max_total_num_tokens * 0.5)
+        )
+
+    def test_ratio_is_priced_into_cell_size(self):
+        mr, cfg, _ = self._run(0.5)
+        target_cell = _full_per_token(mr) * 4
+        self.assertEqual(cfg._cell_size, target_cell + self.DRAFT_CELL // 2)
+
+    def test_memory_utilization(self):
+        available = 10_000_000
+        mr, _, config = self._run(0.5, available_bytes=available)
+        used = (
+            config.max_total_num_tokens * _full_per_token(mr) * 4
+            + config.swa_max_total_num_tokens * self.DRAFT_CELL
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
+    def test_page_alignment(self):
+        _, _, config = self._run(0.5, page_size=16)
+        self.assertEqual(config.max_total_num_tokens % 16, 0)
+        self.assertEqual(config.swa_max_total_num_tokens % 16, 0)
+
+    def test_constraint_keeps_ratio(self):
+        _, cfg, _ = self._run(0.5)
+        with mock_cpu_env():
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(1000, page_size=1)
+        self.assertEqual(constrained.max_total_num_tokens, 1000)
+        self.assertEqual(constrained.swa_max_total_num_tokens, 500)
+
+    def test_ratio_below_request_cap_raises_a_usable_minimum(self):
+        """The minimum the error names must itself pass, which the ratio the
+        target pool was sized at does not give. This ratio also rounds the
+        draft's share below one byte, which the pool still prices at one."""
+        import re
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(0.001)
+        message = str(raised.exception)
+        self.assertRegex(message, r"below the \d+ its running requests need")
+        minimum = float(re.search(r"Use at least ([0-9.]+)", message).group(1))
+        _, _, config = self._run(minimum)
+        self.assertGreaterEqual(
+            config.swa_max_total_num_tokens,
+            int(config.max_total_num_tokens * minimum) - 1,
+        )
+
+    def test_ratio_of_one_leaves_the_pool_config_alone(self):
+        mr, cfg, config = self._run(1.0)
+        self.assertIsNone(config.swa_max_total_num_tokens)
+        self.assertEqual(cfg._cell_size, _full_per_token(mr) * 4 + self.DRAFT_CELL)
+
+    def test_unresolved_draft_cell_size_raises(self):
+        """Without the draft's bytes/token the budget scales by layer count,
+        which prices neither the draft's geometry nor the ratio."""
+        mr = self._make(0.25, page_size=1)
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            with self.assertRaisesRegex(ValueError, "KV bytes/token"):
+                create_memory_pool_configurator(mr)
 
 
 if __name__ == "__main__":

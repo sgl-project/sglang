@@ -565,6 +565,11 @@ Relevant parameters:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft KV sliding-window size. Must be <code>&gt;= speculative-num-draft-tokens</code> when set.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-kv-ratio</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The draft KV pool as a fraction of the target's token capacity. Below 1.0 the draft's KV lives in a sliding-window pool. Drafts with full-attention layers and targets with sliding-window layers are not supported yet.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
+    </tr>
   </tbody>
 </table>
 

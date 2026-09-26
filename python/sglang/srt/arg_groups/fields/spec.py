@@ -159,6 +159,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",
     ] = None
+    speculative_draft_kv_ratio: A[
+        float,
+        "The draft KV pool as a fraction of the target's token capacity. It should be between 0 and 1. At 1.0 (the default) the draft holds one slot per target token. Below 1.0 the draft's KV lives in a sliding-window pool whose out-of-window slots are freed. Requires DFLASH. The window defaults to the draft's sliding_window unless --speculative-draft-window-size is set. Drafts with full-attention layers and targets with sliding-window layers are not supported yet. The pool must still cover the running requests, or startup fails with the smallest usable ratio.",
+    ] = 1.0
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
