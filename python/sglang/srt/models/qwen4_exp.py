@@ -2,9 +2,11 @@
 
 import math
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
+import numpy as np
 import sympy
 import torch
 import torch.nn.functional as F
@@ -66,19 +68,26 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_ple_rows import PageCacheRowSource, hash_contexts_numpy
+from sglang.srt.models.qwen4_exp_ple_staging import EagerHashKey, PleHostStaging
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
+    device_uses_host_page_tables,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+_PLE_LOGGED_DEVICES = set()
 
 
 def _ple_table_is_fp8(
@@ -134,6 +143,22 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+def _ple_context_window(batch: _PLEBatch, ngram_size: int) -> torch.Tensor:
+    """Share context extraction across PLE layers for the same batch."""
+    pool = get_req_to_token_pool()
+    cached = pool.ple_window_cache
+    if cached is not None and cached[0] is batch:
+        return cached[1]
+    contexts = batch.ngram_context
+    if not batch.use_decode_fast_path:
+        contexts = contexts.unfold(1, ngram_size, 1)[
+            batch.req_indices, batch.token_offsets
+        ]
+    contexts = contexts.to(torch.long)
+    pool.ple_window_cache = (batch, contexts, None)
+    return contexts
 
 
 def _prepare_ple_batch(
@@ -538,6 +563,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 table_dir=getattr(config, "ple_offload_dir", None),
             )
         self.ngram_embedding = ngram_embedding
+        self.uses_host_staging = (
+            getattr(ngram_embedding, "host_staging", None) is not None
+        )
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -722,27 +750,55 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         batch: _PLEBatch,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        ngram_ids = self.compute_ngram_ids(batch)
-        embeddings = self._embed_ngram_ids(
-            ngram_ids, forward_batch, batch.physical_tokens
-        )
+        if self.uses_host_staging:
+            self.verify_ids_once(batch)
+            embeddings = self.ngram_embedding.reduce(
+                self.ngram_embedding.gather_staged(
+                    rows=batch.processed_tokens * self.ngram_heads,
+                    device=forward_batch.input_ids.device,
+                )
+            ).unflatten(0, (batch.processed_tokens, self.ngram_heads))
+            embeddings = embeddings * self.ngram_embedding.weight_scale
+        else:
+            embeddings = self._embed_ngram_ids(
+                self.compute_ngram_ids(batch), forward_batch, batch.physical_tokens
+            )
         return embeddings.flatten(start_dim=-2)
+
+    @cached_property
+    def host_hash_metadata(self):
+        return (
+            self.layer_multipliers.cpu().numpy(),
+            self.ngram_heads_vocab_sizes.cpu().numpy(),
+            self.ngram_heads_offsets.cpu().numpy(),
+            self.eos_token_id,
+        )
+
+    def verify_ids_once(self, batch: _PLEBatch) -> None:
+        staging = self.ngram_embedding.host_staging
+        contexts = _ple_context_window(batch, self.ngram_size)
+        if get_is_capture_mode():
+            staging.capture_contexts(contexts)
+            return
+        from sglang.kernels.ops.qwen4_ple import can_fuse_qwen4_ngram_hash
+
+        fused = (
+            self.enable_ple_fusion
+            and (batch.mode.is_decode() or batch.mode.is_target_verify())
+            and can_fuse_qwen4_ngram_hash(
+                contexts,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+        )
+        key = EagerHashKey(batch.mode, batch.use_decode_fast_path, fused)
+        if key not in staging.verified_modes:
+            staging.verify(self.compute_ngram_ids(batch), key)
 
     def compute_ngram_ids(self, batch: _PLEBatch) -> torch.Tensor:
         assert batch.ngram_context is not None
-        pool = get_req_to_token_pool()
-        cached = pool.ple_window_cache
-        if cached is not None and cached[0] is batch:
-            contexts = cached[1]
-        else:
-            if batch.use_decode_fast_path:
-                contexts = batch.ngram_context
-            else:
-                contexts = batch.ngram_context.unfold(1, self.ngram_size, 1)[
-                    batch.req_indices, batch.token_offsets
-                ]
-            contexts = contexts.to(torch.long)
-            pool.ple_window_cache = (batch, contexts, None)
+        contexts = _ple_context_window(batch, self.ngram_size)
         return self._hash_contexts(
             contexts,
             decode_sized=batch.mode.is_decode() or batch.mode.is_target_verify(),
@@ -783,7 +839,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from host memory (pinned, or a file-backed mmap).
+    """PLE table in pinned memory or a file-backed mmap.
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -849,8 +905,41 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
         )
-        # Only the file backend has anything to prefetch (rows live on storage).
-        self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        self.host_staging = None
+        direct = True
+        if backend == "file":
+            device_index = torch.cuda.current_device()
+            supported = device_uses_host_page_tables(device_index)
+            if supported is None:
+                raise RuntimeError(
+                    "--ple-offload-backend file: could not query "
+                    "cudaDevAttrPageableMemoryAccessUsesHostPageTables; use "
+                    "--ple-offload-backend pinned"
+                )
+            direct = supported is True
+            if device_index not in _PLE_LOGGED_DEVICES:
+                _PLE_LOGGED_DEVICES.add(device_index)
+                logger.info(
+                    "PLE file table: device %d host page tables=%s; using %s",
+                    device_index,
+                    "yes" if supported else "no",
+                    "direct access" if direct else "pinned host staging",
+                )
+        if not direct:
+            source = PageCacheRowSource(
+                host_table._sglang_ple_file_path,
+                self.embedding_dim * host_table.element_size(),
+                host_table.view(torch.uint8).numpy(),
+            )
+            self.host_staging = PleHostStaging(
+                source,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+            )
+        # Host staging issues page hints from its row-fetch worker.
+        self._file_prefetcher = (
+            make_ple_file_prefetcher(host_table) if self.host_staging is None else None
+        )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
@@ -877,9 +966,36 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # The gather kernel emits bf16 rows regardless of the table dtype.
             return torch.empty(shape, dtype=torch.bfloat16, device=device)
 
+    def gather_staged(
+        self, rows: int, device: torch.device, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if out is None:
+            out = self.allocate_output((rows, self.embedding_dim), device)
+
+        def convert(raw, start, end):
+            out.view(-1, self.embedding_dim)[start:end].copy_(
+                raw.view(self.weight.dtype)
+            )
+
+        if get_is_capture_mode():
+            raw = self.host_staging.buffer(rows, device, graph=True)
+            if rows:
+                convert(raw, 0, rows)
+        else:
+            staged_rows = self.host_staging.pending_rows
+            if staged_rows != rows:
+                raise RuntimeError(
+                    "PLE host staging row count does not match the gather: "
+                    f"{staged_rows} staged, {rows} requested"
+                )
+            self.host_staging.finish(convert)
+        return out
+
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if self.host_staging is not None:
+            raise RuntimeError("this PLE table is host-staged; use gather_staged")
         expected_shape = (*input_ids.shape, self.embedding_dim)
         if out is None:
             output = self.allocate_output(expected_shape, input_ids.device)
@@ -1132,26 +1248,26 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embedding.forward_idle(forward_batch)
 
     def _allocate_prefetch_buffer(
-        self, lookup_tokens: int, lookup_ids: torch.Tensor
+        self, lookup_tokens: int, device: torch.device
     ) -> torch.Tensor:
         offloaded_embedding = self.ple_embedding.ngram_embedding
         return offloaded_embedding.allocate_output(
-            (lookup_tokens, self.ple_embed_dim), lookup_ids.device
+            (lookup_tokens, self.ple_embed_dim), device
         )
 
     def _get_prefetch_buffer(
-        self, lookup_tokens: int, lookup_ids: torch.Tensor
+        self, lookup_tokens: int, device: torch.device
     ) -> torch.Tensor:
         if get_is_capture_mode():
             buffer = self._graph_prefetch_buffers.get(lookup_tokens)
             if buffer is None:
-                buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+                buffer = self._allocate_prefetch_buffer(lookup_tokens, device)
                 self._graph_prefetch_buffers[lookup_tokens] = buffer
             return buffer
 
         buffer = self._eager_prefetch_buffer
         if buffer is None or buffer.shape[0] < lookup_tokens:
-            buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+            buffer = self._allocate_prefetch_buffer(lookup_tokens, device)
             self._eager_prefetch_buffer = buffer
         return buffer[:lookup_tokens]
 
@@ -1174,23 +1290,40 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         else:
             physical_tokens = batch.physical_tokens
-            ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+            ngram_ids = None
 
-        lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
-            ngram_ids, forward_batch, physical_tokens
-        )
-        lookup_tokens = lookup_ids.shape[0]
+        if self.ple_embedding.uses_host_staging:
+            self.ple_embedding.verify_ids_once(batch)
+            lookup_ids = None
+            semantic_tokens = lookup_tokens = batch.processed_tokens
+        else:
+            if batch is not None:
+                ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+            lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
+                ngram_ids, forward_batch, physical_tokens
+            )
+            lookup_tokens = lookup_ids.shape[0]
         if lookup_tokens == 0:
             return
-        prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
+        prefetched = self._get_prefetch_buffer(
+            lookup_tokens, forward_batch.input_ids.device
+        )
         output_view = prefetched.view(lookup_tokens, self.ple_embedding.ngram_heads, -1)
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
         stream.wait_stream(torch.cuda.current_stream())
-        lookup_ids.record_stream(stream)
+        if lookup_ids is not None:
+            lookup_ids.record_stream(stream)
         with torch.cuda.stream(stream):
-            offloaded_embedding.gather(lookup_ids, out=output_view)
+            if self.ple_embedding.uses_host_staging:
+                offloaded_embedding.gather_staged(
+                    lookup_tokens * self.ple_embedding.ngram_heads,
+                    forward_batch.input_ids.device,
+                    out=output_view,
+                )
+            else:
+                offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
@@ -1688,6 +1821,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        self._ple_staged_layers = None
+        self._ple_ready_event = None
+        self._ple_host_contexts = None
         self.has_ple = any(
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
@@ -1711,6 +1847,70 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+
+    def prepare_ple_rows(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        ple_batch: Optional[_PLEBatch],
+        graph: bool = False,
+    ) -> None:
+        staged = self._ple_staged_layers
+        if staged is None:
+            staged = self._ple_staged_layers = [
+                layer.ple.ple_embedding
+                for layer in self.layers[self.start_layer : self.end_layer]
+                if getattr(layer, "ple", None) is not None
+                and layer.ple.ple_embedding.uses_host_staging
+            ]
+        if not staged:
+            return
+        # Drain the previous batch before reusing its pinned context buffer and event.
+        for embedding in staged:
+            embedding.ngram_embedding.host_staging.check_replay()
+            embedding.ngram_embedding.host_staging.discard()
+        if ple_batch is None:
+            return
+        contexts = _ple_context_window(ple_batch, self.ple_ngram_size)
+        if self._ple_host_contexts is None or len(self._ple_host_contexts) < len(
+            contexts
+        ):
+            self._ple_host_contexts = torch.empty_like(
+                contexts, device="cpu", pin_memory=True
+            )
+        host_contexts = self._ple_host_contexts[: len(contexts)]
+        host_contexts.copy_(contexts, non_blocking=True)
+        if self._ple_ready_event is None:
+            self._ple_ready_event = staged[
+                0
+            ].ngram_embedding.host_staging.device_module.Event(blocking=True)
+        ready = self._ple_ready_event
+        ready.record()
+        for embedding in staged:
+            metadata = embedding.host_hash_metadata
+
+            def prepare_ids(metadata=metadata):
+                ready.synchronize()
+                return hash_contexts_numpy(host_contexts.numpy(), *metadata)
+
+            staging = embedding.ngram_embedding.host_staging
+            ids = np.empty(
+                ple_batch.processed_tokens * embedding.ngram_heads, dtype=np.int64
+            )
+            staging.begin(
+                ids,
+                forward_batch.input_ids.device,
+                graph=graph,
+                prepare_ids=prepare_ids,
+            )
+        # Replay skips Python forward, so populate every layer's graph buffer here.
+        if graph:
+            staging_layers = [e.ngram_embedding.host_staging for e in staged]
+            for staging in staging_layers:
+                staging.finish()
+            for staging in staging_layers:
+                staging.expect_replay(host_contexts.numpy())
+            get_req_to_token_pool().ple_window_cache = None
 
     def forward(
         self,
@@ -1748,6 +1948,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
+        if not get_is_capture_mode():
+            self.prepare_ple_rows(forward_batch, ple_batch=ple_batch)
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1847,6 +2049,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
+        self.needs_replay_prepare = any(
+            isinstance(module, Qwen4ExpPinnedHostEmbedding)
+            and module.host_staging is not None
+            for module in self.modules()
+        )
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
@@ -1861,6 +2068,55 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def validate_runner_support(self, runner: "BaseRunner") -> None:
+        if not self.needs_replay_prepare:
+            return
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+        graph = get_exec().graph
+        cfg = graph.cuda_graph_config
+        reason = None
+        if not isinstance(runner, (EagerRunner, DecodeCudaGraphRunner)):
+            reason = (
+                "runs only on the eager and decode graph runners "
+                "(pass --disable-prefill-cuda-graph)"
+            )
+        elif is_dp_attention_enabled():
+            reason = "does not support --enable-dp-attention"
+        elif get_disagg().enable_pdmux:
+            reason = "does not support --enable-pdmux"
+        elif get_exec().overlap.enable_two_batch_overlap:
+            reason = "does not support --enable-two-batch-overlap"
+        elif graph.enable_torch_compile:
+            reason = "does not support --enable-torch-compile"
+        elif isinstance(runner, DecodeCudaGraphRunner):
+            if get_exec().dllm.dllm_algorithm is not None:
+                reason = "does not support --dllm-algorithm decode graphs"
+            elif runner.ragged_verify_mode:
+                reason = "requires SGLANG_RAGGED_VERIFY_MODE=static"
+            elif cfg is not None and cfg.decode.backend == "breakable":
+                reason = "does not support --cuda-graph-backend-decode breakable"
+        if reason is not None:
+            raise ValueError(
+                f"Host-staged PLE {reason}; use --ple-offload-backend pinned"
+            )
+
+    def prepare_cuda_graph_replay(self, forward_batch: ForwardBatch) -> None:
+        model = self.model
+        model.prepare_ple_rows(
+            forward_batch,
+            ple_batch=_prepare_ple_batch(
+                forward_batch.input_ids,
+                forward_batch,
+                ngram_size=model.ple_ngram_size,
+                ngram_eos_token_id=model.ple_ngram_eos_token_id,
+            ),
+            graph=True,
+        )
 
     @torch.no_grad()
     def forward(

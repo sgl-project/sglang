@@ -150,6 +150,7 @@ class EagerRunner(BaseRunner):
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
         )
+        self.validate_model_support()
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         if run_warmup:
             self.warmup()
