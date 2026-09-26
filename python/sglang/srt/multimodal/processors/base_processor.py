@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import re
 import threading
+import traceback
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -816,7 +817,23 @@ class BaseMultimodalProcessor(ABC):
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
-        """Release fast-processor CUDA temporaries after CPU feature transport."""
+        """Release fast-processor CUDA temporaries after CPU feature transport.
+
+        Yields whether the pool is released on exit. When it is, callers must
+        drop every tensor allocated inside the block before it exits, because
+        a block that is still live then keeps its segment reserved until the
+        process empties its cache, so each call that leaks one strands a
+        segment on the serving GPU. For the same reason an exception clears
+        the finished frames of its traceback before the pool is released.
+        One exception remains, bounded only while at most 10 keys are in use.
+        transformers keeps its fused mean and std tensors in a process wide
+        lru cache of 10 entries keyed by the image or video processor
+        instance, its normalize and rescale settings and the device. The first
+        call for each key builds them inside this pool and pins one small
+        segment while the entry lives. With more than 10 keys in rotation, for
+        example many processor worker threads on the GPU path, each eviction
+        of an entry that holds tensors strands one segment.
+        """
         can_release = (
             device is not None
             and torch.device(device).type == "cuda"
@@ -824,13 +841,20 @@ class BaseMultimodalProcessor(ABC):
             and not self.precompute_hash_before_cpu_transfer
         )
         if not can_release:
-            yield
+            yield False
             return
 
         with torch.cuda.device(device):
             pool = torch.cuda.MemPool()
         with torch.cuda.use_mem_pool(pool, device=device):
-            yield
+            try:
+                yield True
+            except BaseException as error:
+                # A processor that raises leaves pool tensors in the finished
+                # frames of the traceback. Clearing them frees those blocks
+                # while the pool is live. Frames still running are skipped.
+                traceback.clear_frames(error.__traceback__)
+                raise
 
     def process_mm_data(
         self,
@@ -900,16 +924,22 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        with self._temporary_fast_processor_cuda_pool(processor_device):
+        with self._temporary_fast_processor_cuda_pool(processor_device) as releases:
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
                 return_tensors="pt",
                 **kwargs,
             )
+            if releases:
+                # Any device output, not only the features, would keep its
+                # block live after the pool is released, for example
+                # image_position_ids (Gemma4) or aspect_ratio_ids (Mllama).
+                for key in list(result.keys()):
+                    result[key] = self._move_feature_to_cpu(result[key])
             # Deferred: the hash is computed on the GPU tensor first, and
             # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-            if (
+            elif (
                 not self.keep_mm_features_on_device
                 and not self.precompute_hash_before_cpu_transfer
             ):

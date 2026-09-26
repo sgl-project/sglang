@@ -817,6 +817,15 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 and not self.precompute_hash_before_cpu_transfer
             ):
                 features = features.cpu()
+            if (
+                isinstance(image_grid_thw, torch.Tensor)
+                and image_grid_thw.device.type != "cpu"
+            ):
+                image_grid_thw = image_grid_thw.cpu()
+            # The processor output still holds the device pixel_values. A block
+            # of the private pool that is live when the pool is released stays
+            # reserved until the process empties its cache, so drop it here.
+            del result
 
         if not isinstance(features, torch.Tensor):
             raise TypeError("Qwen-VL image processor must return pixel_values")
