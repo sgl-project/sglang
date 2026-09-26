@@ -164,6 +164,21 @@ class BaseFormatDetector(ABC):
                 # Might be partial bot_token, keep buffering
                 return StreamingParseResult()
 
+        # A coalesced increment (stream_interval > 1, speculative decoding, or
+        # the final flush) can carry normal text and the bot_token together,
+        # e.g. "Sure. <tool_call>\n{...". Emit the text preceding the first
+        # bot_token as normal_text instead of silently dropping it, then parse
+        # the tool call from the bot_token onwards.
+        if self.current_tool_id == -1 and not self.current_tool_name_sent:
+            bot_pos = current_text.find(self.bot_token)
+            if bot_pos > 0:
+                normal_text = current_text[:bot_pos]
+                self._buffer = current_text[bot_pos:]
+                result = self.parse_streaming_increment("", tools)
+                if result.normal_text:
+                    normal_text += result.normal_text
+                return StreamingParseResult(normal_text=normal_text, calls=result.calls)
+
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
