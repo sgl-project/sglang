@@ -236,6 +236,69 @@ def test_gemm_all_gather():
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_gemm_all_gather_split8_with_c(num_tokens):
+    # split 8 is the Rubin dispatch; call it directly so every arch covers it
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
+        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
+    comm = _init_comm()
+    generator = torch.Generator().manual_seed(60 + num_tokens)
+    x = (
+        (torch.randn(num_tokens, gemm_ag.K, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .to(_device())
+    )
+    weight = (
+        (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .to(_device())
+    )
+    bias, third = (
+        torch.randn(num_tokens, gemm_ag.N, generator=generator).to(
+            device=_device(), dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    output = torch.empty(num_tokens, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
+    expected = (x.float() @ weight.float().t() + bias.float() + third.float()).to(
+        torch.bfloat16
+    )
+
+    module = gemm_ag._jit_module(8)
+    for _ in range(3):
+        output.zero_()
+        module.run(
+            all_reduce._COMM_MAP[comm.world_size], x, weight, bias, third, output
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+
+
+@torch.inference_mode()
+def test_gemm_all_reduce():
+    _require_sm100()
+    _init_gemm_ar()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    local_k = _GEMM_AR_K_TOTAL // world_size
+    generator = torch.Generator().manual_seed(40 + rank)
+    x = torch.randn(1, local_k, generator=generator).to(
+        device=_device(), dtype=torch.bfloat16
+    )
+    weight = torch.randn(gemm_ar.N, local_k, generator=generator).to(
+        device=_device(), dtype=torch.bfloat16
+    )
+    expected = (x.float() @ weight.float().t()).to(torch.bfloat16).float()
+    _, nccl_group = _init_world()
+    dist.all_reduce(expected, group=nccl_group)
+
+    output = gemm_ar.o_proj_gemm_ar(x, weight)
+    torch.cuda.synchronize()
+    bad = ((output.float() - expected).abs() > 0.05 + 0.02 * expected.abs()).sum()
+    assert bad.item() <= output.numel() / 1000
+
+
+@torch.inference_mode()
 def test_attention_residual_direct_all_gather():
     _require_sm100()
     comm = _init_comm()
@@ -309,6 +372,7 @@ def _precompile(num_gpus):
         sp_collective._jit_module(world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
+        gemm_ag._jit_module(8)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 

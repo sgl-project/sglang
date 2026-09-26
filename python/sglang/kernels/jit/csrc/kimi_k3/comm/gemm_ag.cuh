@@ -37,6 +37,85 @@ struct ProducerParams {
   uint32_t rank;
 };
 
+// Tensor-core producer (N_SPLIT = 8, 4 <= M <= 8): A = the block's 8 weight rows,
+// B = the M tokens. K is permuted within each 32-wide chunk (same map for A and
+// B) so every thread issues 16B loads.
+SGL_DEVICE void mma_bf16_m16n8k16(float (&d)[4], uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
+}
+
+template <uint32_t K, uint32_t N, uint32_t M, bool kUsePDL>
+SGL_DEVICE void
+gemm_ag_mma_producer(const ProducerParams& params, const bf16_t* __restrict__ x, const bf16_t* __restrict__ weight) {
+  using namespace device;
+  constexpr uint32_t kNSplit = 8;
+  constexpr uint32_t kNLocal = N / kWorld;
+  constexpr uint32_t kWarps = (K / kVecSize) / kWarpThreads;
+  constexpr uint32_t kChunks = K / 32;
+  static_assert(M <= 8);
+  static_assert(kChunks % kWarps == 0, "K chunks must split evenly over the warps");
+  constexpr uint32_t kChunksPerWarp = kChunks / kWarps;
+
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t lane = tx % kWarpThreads;
+  const uint32_t warp = tx / kWarpThreads;
+  const uint32_t g = lane / 4;
+  const uint32_t t = lane % 4;
+  const bf16_t* w_row = weight + static_cast<int64_t>(params.rank * kNLocal + bx * kNSplit + g) * K;
+
+  // weight prefetch before the PDL wait (input-independent addresses)
+  uint4 w_vec[kChunksPerWarp];
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    w_vec[c] = *reinterpret_cast<const uint4*>(w_row + (warp * kChunksPerWarp + c) * 32 + 8 * t);
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+  const uint32_t phase = params.counter[0].get() & 1;
+
+  uint4 x_vec[kChunksPerWarp];
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    x_vec[c] = g < M ? *reinterpret_cast<const uint4*>(x + g * K + (warp * kChunksPerWarp + c) * 32 + 8 * t)
+                     : make_uint4(0, 0, 0, 0);
+  }
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    mma_bf16_m16n8k16(acc, w_vec[c].x, w_vec[c].y, x_vec[c].x, x_vec[c].y);
+    mma_bf16_m16n8k16(acc, w_vec[c].z, w_vec[c].w, x_vec[c].z, x_vec[c].w);
+  }
+
+  // D[g][2t, 2t + 1] = out[token 2t, 2t + 1][column g]
+  __shared__ float s_part[kWarps][8][kNSplit];
+  s_part[warp][2 * t][g] = acc[0];
+  s_part[warp][2 * t + 1][g] = acc[1];
+  __syncthreads();
+  constexpr uint32_t kNumPairs = M * kNSplit / 2;
+  if (tx < kNumPairs) {
+    const uint32_t m = (2 * tx) / kNSplit;
+    const uint32_t n = (2 * tx) % kNSplit;
+    float lo = 0.f, hi = 0.f;
+#pragma unroll
+    for (uint32_t w = 0; w < kWarps; ++w) {
+      lo += s_part[w][m][n];
+      hi += s_part[w][m][n + 1];
+    }
+    const auto pair = cast<bf16x2_t>(fp32x2_t{lo, hi});
+    auto bits = *reinterpret_cast<const uint32_t*>(&pair);
+    if (bits == 0) bits = 0x8000u;  // -0.0 in the first element: never all-zero
+    const uint32_t elem = (params.rank * M + m) * kNLocal + bx * kNSplit + n;
+    const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
+    ptx::multimem_store_relaxed(reinterpret_cast<uint32_t*>(base + elem), bits);
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL, bool kFP32 = false>
 __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const __grid_constant__ ProducerParams params,
@@ -55,6 +134,12 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   static_assert(M * N_SPLIT <= kGemvBlock, "output tile must fit one thread each for the final reduce");
   static_assert(N_SPLIT % 2 == 0, "epilogue stores adjacent column pairs");
 
+  // Note(kpham-sgl): the tensor-core path targets the spec-decode verify batch
+  // (4 <= M <= 8). Plain decode (M <= 2) stays on CUDA cores, where tensor cores
+  // measured 0.1-0.3 us slower on Rubin.
+  if constexpr (N_SPLIT == 8 && !kFP32 && M >= 4 && M <= 8) {
+    return gemm_ag_mma_producer<K, N, M, kUsePDL>(params, x, weight);
+  }
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   // this rank's rows of the replicated [N, K] weight, sliced HERE (the
