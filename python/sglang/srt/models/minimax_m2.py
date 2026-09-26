@@ -544,6 +544,7 @@ class MiniMaxM2MoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             renormalize=True,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
