@@ -30,16 +30,19 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -48,6 +51,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.common import Range
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -593,6 +597,57 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertFalse(req.swa_prefix_lock_released)
         self.assertIsNone(decode_req.hicache_restored_node)
         self.assertIsNone(decode_req.hicache_restore_lock_receipt)
+
+    def test_resumed_retracted_req_keeps_other_holders_lock(self):
+        """A retracted request resumed through the prebuilt batch must not release
+        a prefix lock it never took, and must hand its own prefix copy back."""
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        cache, req_to_token = _make_cache_with_pools()
+        prefix, prefix_vals = [1, 2, 3], [10, 20, 30]
+        self._populate_prefix(cache, prefix, prefix_vals)
+        shared = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+        cache.inc_lock_ref(shared)  # a running request holds the shared prefix
+
+        # Resumed from retraction: a fresh own row, last_node cleared.
+        req = Req(
+            rid="resumed",
+            origin_input_text="",
+            origin_input_ids=array("q", prefix + [4]),
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
+        req.output_ids = array("q", [5])
+        req.reset_for_retract()
+        req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = 4
+        req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
+
+        scheduler = SimpleNamespace(
+            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+            waiting_queue=[req],
+            enable_priority_scheduling=False,
+            req_to_token_pool=SimpleNamespace(size=4),
+            max_running_requests=4,
+            token_to_kv_pool_allocator=None,
+            tree_cache=cache,
+            model_config=None,
+            enable_overlap=False,
+            spec_algorithm=None,
+        )
+        with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
+            SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                scheduler, SimpleNamespace(batch_size=lambda: 0)
+            )
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(shared.lock_ref, 2)
+        self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
