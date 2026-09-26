@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 _is_hip = is_hip()
 
@@ -235,12 +235,26 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
 
 
 def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
+    if backends.decode.is_flydsl() or backends.verify.is_flydsl():
+        raise ValueError(
+            "The FlyDSL GDN backend supports prefill only. Set "
+            "--linear-attn-prefill-backend flydsl and keep decode/verify on Triton."
+        )
     if (
         get_exec().deterministic.enable_deterministic_inference
         and backends.prefill.is_flashinfer()
     ):
         raise ValueError(
             "FlashInfer GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flydsl()
+    ):
+        raise ValueError(
+            "FlyDSL GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
@@ -335,6 +349,14 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_flydsl():
+            if not is_gfx95_supported():
+                raise ValueError("The FlyDSL GDN prefill backend requires AMD gfx95")
+            from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+                FlyDSLGDNKernel,
+            )
+
+            self.extend_kernel = FlyDSLGDNKernel()
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -521,6 +543,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
+        self.kernel_prefill_metadata = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -549,6 +572,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        # Graph replay must not reuse an eager batch's schedule.
+        self.kernel_prefill_metadata = None
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
@@ -556,6 +581,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
+        self.kernel_prefill_metadata = None
+        build = getattr(
+            self.kernel_dispatcher.extend_kernel, "build_prefill_metadata", None
+        )
+        if (
+            build is not None
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_mixed()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            self.kernel_prefill_metadata = build(
+                forward_batch.extend_seq_lens_cpu,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+            )
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
@@ -1116,6 +1156,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                prefill_metadata=self.kernel_prefill_metadata,
             )
 
             if is_npu() and last_recurrent_state is not None:
