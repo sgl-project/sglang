@@ -287,7 +287,8 @@ def _layer_norm_fwd(
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
-        num_warps *= quant_heads // rows_per_block
+        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
         rows_per_block = quant_heads
         q = torch.empty(
             (M // quant_heads, quant_heads * N),
