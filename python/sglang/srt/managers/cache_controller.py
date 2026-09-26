@@ -268,6 +268,7 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.host_capacity_retries = 0
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
