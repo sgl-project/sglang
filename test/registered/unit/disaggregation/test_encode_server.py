@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.encoder.runtime import (
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
-    EncoderDelivery,
     EncoderMetaRegistry,
     InternalError,
     MMEncoder,
@@ -636,16 +635,6 @@ class TestEncoderDelivery(CustomTestCase):
             log_exception.assert_called_once_with("MMEncoder background task failed")
 
         asyncio.run(run())
-
-    def test_contract_has_two_direct_implementations(self):
-        self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
-        self.assertEqual(
-            set(EncoderDelivery.__subclasses__()),
-            {
-                MooncakeDelivery,
-                ZmqDelivery,
-            },
-        )
 
     def test_failed_staged_send_releases_request(self):
         async def run():

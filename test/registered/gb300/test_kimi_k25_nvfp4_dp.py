@@ -62,7 +62,6 @@ class TestKimiK25Nvfp4Dp(CustomTestCase):
                 max_tokens=32768,
                 temperature=0.7,
                 seed=0,
-                sgl_eval_thinking=False,
             ),
             performance_params=PerformanceTestParams(
                 batch_sizes=[16],

@@ -305,7 +305,19 @@ def gelu_quick(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch
     return _GELU_QUICK(input, out)
 
 
+def situ_and_mul(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    beta: float,
+    linear_beta: Optional[float],
+) -> torch.Tensor:
+    from ._jit_situ_and_mul import situ_and_mul as impl
+
+    return impl(input, out, beta, linear_beta)
+
+
 __all__ = [
+    "situ_and_mul",
     "SiluAndMulOp",
     "GeluAndMulOp",
     "GeluTanhAndMulOp",
@@ -330,3 +342,14 @@ for _fn in ("softcap_out", "softcap_inplace_logits"):
         )
     )
 del _fn
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+register_kernel(
+    KernelSpec(
+        op="activation.situ_and_mul",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation._jit_situ_and_mul:situ_and_mul",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)

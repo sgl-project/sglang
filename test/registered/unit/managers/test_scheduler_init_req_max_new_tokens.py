@@ -43,9 +43,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
-        # The scheduler scales the budget by the live DCP size
-        # (`get_parallel().attn_dcp_size`), so the double states a topology
-        # rather than publishing a config it does not otherwise need.
+        # Tests use an unsharded topology unless they explicitly override it.
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
@@ -162,6 +160,13 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 self._init_and_check(scheduler, req),
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
+
+    def test_dcp_budget_is_already_in_logical_tokens(self):
+        with get_parallel().override(attn_dcp_size=4):
+            scheduler = self._new_scheduler(max_total_num_tokens=24, page_size=4)
+            req = self._new_req(max_new_tokens=64, input_len=8)
+
+            self.assertEqual(self._init_and_check(scheduler, req), 11)
 
     def test_sharded_budget_reserves_one_page_per_shard(self):
         max_total_num_tokens, page_size, input_len, shard_widening = 8, 4, 8, 3
