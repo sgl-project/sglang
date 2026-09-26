@@ -4055,7 +4055,8 @@ def get_cuda_graph_batch_size_alignment() -> int:
         alignment *= 2
     if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
