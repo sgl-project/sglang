@@ -224,6 +224,13 @@ class StreamingSession(BasePrefixCache):
                 self.release_session(req.session.session_id)
                 return None
 
+        # Decoder SWA bounded replay caps the prefix match so the last window is
+        # recomputed. If that cap lands inside the tree-owned prefix, the slot
+        # cannot rewind that far. Release it and use the radix match instead.
+        if min(slot.kv.kv_committed_len, len(params.key)) < slot.kv.cache_protected_len:
+            self.release_session(req.session.session_id)
+            return None
+
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
