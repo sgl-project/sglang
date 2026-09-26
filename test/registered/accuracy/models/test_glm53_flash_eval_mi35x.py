@@ -10,10 +10,14 @@ attention kinds -- MLA, DSA sparse, and KDA linear -- behind mHC residuals, so
 it exercises engine paths no other AMD nightly covers. The KDA state pool is a
 second memory pool alongside the paged KV pool, and the mHC pre/post ops sit on
 every layer boundary. A single-arch gate would not be enough: gfx950 takes the
-AITER MoE runner, which applies the SwiGLU clamp itself, and the AITER mHC
-pre/post, while gfx942 takes the Triton MoE runner and the generic mHC path.
+AITER mHC pre/post kernels, while gfx942 falls back to the generic mHC path.
 This file gates the gfx950 half; the gfx942 half is
 test_glm53_flash_eval_mi30x.py.
+
+Measured on current main: 0.9750 (1286/1319) on the rocm10 image, HF snapshot
+eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, with a 312 s weight load, a 473 s
+eval and 1040 s of wall clock (run 36011039824). That is the full GSM8K split
+the cookbook's MI355X cell was still missing.
 
 Threshold: #36607 measured the full 1319-question GSM8K split at
 1288/1319 = 97.65% on MI355X (97.35% on MI300X). 0.92 follows this repo's
