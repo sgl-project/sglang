@@ -34,7 +34,7 @@ env:
   NCCL_NVLS_ENABLE: "0"
   # Must match TORCH_VER in docker/sgl-deep-gemm.Dockerfile — the wheel's
   # pre-compiled _C.so links against this torch ABI.
-  TORCH_VER: "2.13.0"
+  TORCH_VER: "2.14.0"
 
 jobs:
   build-cu130-matrix:
@@ -117,7 +117,7 @@ jobs:
           - arch_label: sm100-aarch64
             runner: 4-gpu-gb300
             wheel_arch: aarch64
-            timeout: 60
+            timeout: 120
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
@@ -146,20 +146,26 @@ jobs:
           # deep_gemm imports torch before loading _C.so, so torch must preload the
           # libcudart the cu130 wheel links. Pin the CUDA-matched torch (see sgl-deep-gemm.Dockerfile).
           python3 -m pip install "torch==${TORCH_VER}" --index-url "https://download.pytorch.org/whl/${CU_TAG}" --force-reinstall
-          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.2"
-          python3 -m pip install dist/*.whl
-          # Torch pins NCCL 2.29.7, but this DeepEP wheel requires 2.30.7.
-          # Override it after every dependency-resolving pip command.
+          # sgl-deep-ep's own torch pin overrides the line above; it must pin TORCH_VER.
+          python3 -m pip install numpy "tilelang==0.1.9" "tile-kernels==1.0.0" "sgl-deep-ep==0.1.3rc1"
+          # --force-reinstall: a base image may already carry this exact version,
+          # in which case pip skips the wheel and the job tests a stale _C.so.
+          python3 -m pip install dist/*.whl --force-reinstall --no-deps
+          # This DeepEP wheel requires NCCL 2.30.7, which Torch 2.14 also pins;
+          # reinstall it after every dependency-resolving pip command.
           python3 -m pip install "nvidia-nccl-cu13==2.30.7" --force-reinstall --no-deps
           nccl_lib=$(python3 -c "from importlib.metadata import distribution; print(distribution('nvidia-nccl-cu13').locate_file('nvidia/nccl/lib'))")
           export LD_LIBRARY_PATH="${nccl_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
           python3 -c "import deep_gemm; print('deep_gemm:', deep_gemm.__file__)"
-          python3 - <<'PY'
+          # tvm-ffi loads _C.so lazily and a later RTLD_NOW dlopen resolves nothing,
+          # so bind eagerly to fail here on any missing symbol.
+          LD_BIND_NOW=1 python3 - <<'PY'
           import ctypes
           import sys
           import torch
           import deep_ep
+          import deep_gemm
           from tile_kernels.moe import top2_sum_gate
 
           # torch.cuda.nccl.version() reports Torch's compiled version, not the loaded library.
