@@ -1743,7 +1743,15 @@ class TestPrefillCP(CustomTestCase):
                 False,
             ),
             ("CP under attention DP", dp_cp, False, True, False, False),
-            ("a MoE under attention DP and GQA CP", dp_cp, True, False, False, False),
+            ("a MoE under attention DP and GQA CP", dp_cp, True, True, False, False),
+            (
+                "a MoE dispatched per DP shard under attention DP and GQA CP",
+                dp_cp,
+                True,
+                False,
+                False,
+                True,
+            ),
             (
                 "a MoE-CP group narrower than CP",
                 parallel_of(

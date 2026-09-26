@@ -1015,12 +1015,14 @@ class LayerCommunicator:
 
         if not (
             (parallel.attn_cp_size == 1 or _cp_on_declarations())
-            # MoE layers under attention DP and GQA prefill CP keep the
-            # scatter-mode steps.
+            # A MoE dispatched per DP shard under attention DP and GQA prefill
+            # CP keeps the scatter-mode steps: it would dispatch each rank's CP
+            # shard of the tokens, which is not covered.
             and not (
                 parallel.attn_cp_size > 1
                 and parallel.attn_dp_size > 1
                 and modes.is_layer_sparse
+                and moe_on_local_rows
                 and not _gathers_over_attention_cp()
             )
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)

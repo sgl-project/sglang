@@ -134,6 +134,7 @@ class TestDpCpGather(CustomTestCase):
         norm_rows=lambda rows: rows,
         force_layernorm_before_dp_gather=False,
         ffn_input=None,
+        sparse=False,
     ):
         """Gather on every rank, check the FFN input and residual, then take back
         an FFN output of three times the input and check each rank's rows.
@@ -237,14 +238,14 @@ class TestDpCpGather(CustomTestCase):
                     ),
                 ]:
                     stack.enter_context(patch.object(*target, value))
-                # A dense layer in the middle of the model: its steps come from
-                # the declarations, the modes only give the layer facts.
+                # A layer in the middle of the model: its steps come from the
+                # declarations, the modes only give the layer facts.
                 communicator = comm.LayerCommunicator(
                     layer_scatter_modes=SimpleNamespace(
                         is_first_layer=False,
                         is_last_layer=False,
-                        is_layer_sparse=False,
-                        is_previous_layer_sparse=False,
+                        is_layer_sparse=sparse,
+                        is_previous_layer_sparse=sparse,
                         is_next_layer_sparse=False,
                     ),
                     input_layernorm=norm,
@@ -331,6 +332,14 @@ class TestDpCpGather(CustomTestCase):
             "shards of unequal token rows",
         )
         self.run_ranks(groups, [ceil_align(12, 2), ceil_align(9, 2)], attn_tp_size=2)
+
+    def test_a_moe_layer_takes_the_same_gather(self):
+        """A MoE on the TP group gathers and takes back its rows like a dense
+        MLP: only its sum group differs, and under CP it completes that sum."""
+        groups = [cp_active([7, 5], seed=0), cp_active([9], seed=1)]
+        self.run_ranks(
+            groups, [ceil_align(12, 2), ceil_align(9, 2)], attn_tp_size=2, sparse=True
+        )
 
     def test_prefill_beside_an_idle_dp_group(self):
         groups = [
