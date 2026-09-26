@@ -1,6 +1,6 @@
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -10,6 +10,9 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.cache import conditioning
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -38,6 +41,38 @@ class FullHiddenStateEncoder(TextEncoder):
         )
 
 
+def make_text_config(output_type="tensor"):
+    def postprocess(output, text_inputs, return_attention_mask=False):
+        embedding = output.hidden_states[9]
+        mask = text_inputs["attention_mask"].bool()
+        if output_type == "tuple":
+            return embedding, mask
+        if output_type == "structured":
+            return TextConditioningOutput(embedding, mask, [2])
+        return embedding
+
+    def tokenize(texts, _tokenizer, _kwargs):
+        return BatchEncoding(
+            {
+                "input_ids": torch.tensor([[len(text), 2] for text in texts]),
+                "attention_mask": torch.ones((len(texts), 2), dtype=torch.long),
+            }
+        )
+
+    return SimpleNamespace(
+        text_encoder_configs=[SimpleNamespace(tokenizer_kwargs={})],
+        preprocess_text_funcs=[None],
+        postprocess_text_funcs=[postprocess],
+        text_encoder_extra_args=[],
+        is_flux_v1=lambda: False,
+        tokenize_prompt=tokenize,
+        get_text_encoder_attention_mask=lambda inputs, _: inputs["attention_mask"],
+        get_text_encoder_pooler_output=lambda outputs, _: outputs.pooler_output,
+        build_text_conditioning_mask=lambda inputs, mask, embeds, _: mask.bool(),
+        seq_lens_from_text_conditioning_mask=lambda mask: mask.sum(-1).tolist(),
+    )
+
+
 @pytest.mark.parametrize("output_type", ["tensor", "tuple", "structured"])
 @pytest.mark.parametrize(
     "device",
@@ -63,35 +98,7 @@ def test_cache_stores_only_consumed_text_conditioning(output_type, device, monke
 
     monkeypatch.setattr(conditioning, "_fingerprint", fingerprint_host_inputs)
 
-    def postprocess(output, text_inputs, return_attention_mask=False):
-        embedding = output.hidden_states[9]
-        mask = text_inputs["attention_mask"].bool()
-        if output_type == "tuple":
-            return embedding, mask
-        if output_type == "structured":
-            return TextConditioningOutput(embedding, mask, [2])
-        return embedding
-
-    def tokenize(texts, _tokenizer, _kwargs):
-        return BatchEncoding(
-            {
-                "input_ids": torch.tensor([[len(text), 2] for text in texts]),
-                "attention_mask": torch.ones((len(texts), 2), dtype=torch.long),
-            }
-        )
-
-    config = SimpleNamespace(
-        text_encoder_configs=[SimpleNamespace(tokenizer_kwargs={})],
-        preprocess_text_funcs=[None],
-        postprocess_text_funcs=[postprocess],
-        text_encoder_extra_args=[],
-        is_flux_v1=lambda: False,
-        tokenize_prompt=tokenize,
-        get_text_encoder_attention_mask=lambda inputs, _: inputs["attention_mask"],
-        get_text_encoder_pooler_output=lambda outputs, _: outputs.pooler_output,
-        build_text_conditioning_mask=lambda inputs, mask, embeds, _: mask.bool(),
-        seq_lens_from_text_conditioning_mask=lambda mask: mask.sum(-1).tolist(),
-    )
+    config = make_text_config(output_type)
     args = make_server_args(pipeline_config=config)
 
     def make_stage():
@@ -118,6 +125,7 @@ def test_cache_stores_only_consumed_text_conditioning(output_type, device, monke
         torch.testing.assert_close(restored[2][0], expected_pooled, rtol=0, atol=0)
         assert restored[4] == [[2]]
         assert encoder.calls == 1
+        stage._begin_text_encoder_use.assert_called_once_with(0)
         assert cache.stats()["entries"] == 1
         assert cache.bytes < 32  # two embeddings, one pooled value, optional mask
         stage.encode_text("changed", args, device=device, return_attention_mask=True)
@@ -221,3 +229,87 @@ def test_negative_text_encoding_warmup_does_not_seed_a_private_cache():
     stage = DummyTextEncodingStage()
     get_negative_embedding_twice(stage, make_server_args(), make_req(is_warmup=True))
     assert stage.calls == 2
+
+
+@pytest.mark.parametrize("encoder_count", [1, 2])
+@torch.no_grad()
+def test_cache_hit_skips_encoder_residency_and_input_preparation(encoder_count):
+    encoders = [FullHiddenStateEncoder().eval() for _ in range(encoder_count)]
+    config = make_text_config()
+    config.text_encoder_configs *= encoder_count
+    config.preprocess_text_funcs *= encoder_count
+    config.postprocess_text_funcs *= encoder_count
+    config.supports_auto_residency = False
+    config.get_text_encoder_attention_mask = Mock(
+        wraps=config.get_text_encoder_attention_mask
+    )
+    config.seq_lens_from_text_conditioning_mask = Mock(
+        wraps=config.seq_lens_from_text_conditioning_mask
+    )
+    args = make_server_args(
+        pipeline_config=config,
+        component_precisions={},
+        enable_layerwise_nvtx_marker=False,
+    )
+    with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+        stage = TextEncodingStage(encoders, [object()] * encoder_count)
+    stage._text_encode_dp_group = Mock(return_value=None)
+    pipeline = SimpleNamespace(
+        modules={
+            "text_encoder" if i == 0 else f"text_encoder_{i + 1}": encoder
+            for i, encoder in enumerate(encoders)
+        },
+        _stage_name_mapping={"text": stage},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = False
+    manager.strategy_for = Mock(return_value=strategy)
+    stage.set_component_residency_manager(manager)
+    cache = ConditioningCache(4096)
+
+    def request(prompt, *, refresh=False, enabled=True, dtype=None):
+        batch = make_req(is_warmup=refresh)
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        with (cache if enabled else ConditioningCache(0)).scope(refresh=refresh):
+            result = stage.encode_text(
+                prompt,
+                args,
+                encoder_index=list(range(encoder_count)),
+                device="cpu",
+                dtype=dtype,
+                return_attention_mask=True,
+            )
+        manager.end_stage()
+        manager.finish_request()
+        return result
+
+    first = request("hello")
+    expected = first[0][0].clone()
+    first[0][0].zero_()
+    first[1][0].zero_()
+    first[3][0].zero_()
+    first[4][0][0] = 0
+    strategy.reset_mock()
+    restored = request("hello")
+    strategy.prepare_for_use.assert_not_called()
+    strategy.wait_for_use.assert_not_called()
+    assert config.get_text_encoder_attention_mask.call_count == encoder_count
+    assert config.seq_lens_from_text_conditioning_mask.call_count == encoder_count
+    torch.testing.assert_close(restored[0][0], expected, rtol=0, atol=0)
+    assert restored[1][0].tolist() == [[1, 1]]
+    assert restored[3][0].tolist() == [[True, True]]
+    assert restored[4][0] == [2]
+
+    # dtype is part of the consumed conditioning contract
+    cast = request("hello", dtype=torch.float64)
+    assert cast[0][0].dtype == torch.float64
+    assert encoders[0].calls == 2
+    request("hello", refresh=True)
+    request("changed")
+    request("hello", enabled=False)
+    assert all(encoder.calls == 5 for encoder in encoders)
+    assert strategy.prepare_for_use.call_count == 4 * encoder_count
