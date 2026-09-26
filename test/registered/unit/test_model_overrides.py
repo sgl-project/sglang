@@ -2646,6 +2646,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
+        def _block_convert(required):
+            return patch(
+                "sglang.srt.arg_groups.overrides.mxfp8_block_convert_required",
+                return_value=required,
+            )
+
         with override_platform(is_sm100=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
@@ -2657,13 +2663,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online", moe_runner_backend="triton")
                 )
-        self.assertEqual(
-            _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
-            {"moe_runner_backend": "flashinfer_trtllm"},
-        )
+        with _block_convert(False):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+        # gfx942 runs its block-converted MXFP8 experts on triton only
+        with (
+            override_platform(is_hip=True),
+            _block_convert(True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=False,
+            ),
+            envs.SGLANG_USE_AITER.override(True),
+        ):
+            for backend, expected in (
+                ("auto", {"moe_runner_backend": "triton"}),
+                ("triton", {}),
+                ("aiter", {"moe_runner_backend": "triton"}),
+            ):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(
+                        _view(quantization="mxfp8", moe_runner_backend=backend)
+                    ),
+                    expected,
+                )
         # gfx950 accepts --moe-runner-backend aiter for MXFP8 only with aiter enabled
         with (
             override_platform(is_hip=True),
+            _block_convert(False),
             patch(
                 "sglang.srt.arg_groups.overrides.is_gfx95_supported",
                 return_value=True,
