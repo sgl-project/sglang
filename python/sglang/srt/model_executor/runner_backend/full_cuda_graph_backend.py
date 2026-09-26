@@ -123,7 +123,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
         # past the two warmup runs so only the capture run is recorded, and each
-        # batch size produces its own trace via the profiler's on_trace_ready.
+        # captured shape produces its own trace via the profiler's on_trace_ready.
         # With --enable-profile-cuda-graph alone the runner leaves _profiler None
         # (its unscheduled profiler records the whole capture in one pass), so no
         # stepping happens here.
