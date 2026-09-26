@@ -25,6 +25,7 @@ import unittest
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
+from sglang.srt.parser.chat_parsing.response_templates import load_response_template
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -830,6 +831,33 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             parse_response("<resp>hello world", spec, prefix=""),
             {"role": "assistant", "content": "hello world"},
         )
+
+    def test_mutable_defaults_do_not_leak_across_parsers(self):
+        """A `repeats` field appends into its default list; one parse must not leak into the next
+        parse sharing the template, nor into the caller's spec dict."""
+        spec = {
+            "defaults": {"role": "assistant", "tool_calls": []},
+            "start_anchor": "<|assistant|>",
+            "fields": {
+                "tool_calls": {
+                    "open": "<t>",
+                    "close": "</t>",
+                    "repeats": True,
+                    "content": "json",
+                },
+                "content": {"content": "text"},
+            },
+        }
+        template = load_response_template(spec)
+        self.assertEqual(
+            parse_response('<t>{"a": 1}</t>', template, prefix="")["tool_calls"],
+            [{"a": 1}],
+        )
+        self.assertEqual(
+            parse_response("hello", template, prefix=""),
+            {"role": "assistant", "tool_calls": [], "content": "hello"},
+        )
+        self.assertEqual(spec["defaults"]["tool_calls"], [])
 
 
 # Fixtures shared by the streaming tests: one representative input per template,
