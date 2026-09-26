@@ -1535,6 +1535,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
