@@ -207,8 +207,33 @@ class DSparkVerifyPlanner:
                     )
 
     @property
+    def _confidence_is_observed(self) -> bool:
+        """Consumers that read the confidence head even though the schedule
+        does not, and so must keep it alive.
+
+        STS collection is how the SPS table that ends verify-all gets built, so
+        switching it off under verify-all would remove the only way out of
+        verify-all. The confidence-metrics probe measures static and cap-accept
+        (it refuses to run under compact, where padded verify rows corrupt its
+        per-position labels), so it only counts outside compact.
+        """
+        if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get():
+            return True
+        return (
+            bool(envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get())
+            and not self.is_compact_mode
+        )
+
+    @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        if self._confidence_head is None:
+            return False
+        # Verify-all hands every request the full verify window, so nothing
+        # reads the confidence: skip the head (and, via schedules_verify_budget,
+        # its host relay) instead of computing a tensor the schedule discards.
+        if self._is_verify_all and not self._confidence_is_observed:
+            return False
+        return True
 
     @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
@@ -218,7 +243,12 @@ class DSparkVerifyPlanner:
 
     @property
     def schedules_verify_budget(self) -> bool:
-        return self._budget_planner is not None
+        if self._budget_planner is None:
+            return False
+        # A verify-all layout ignores the budget, so neither the per-step
+        # scheduler prepare hook nor the sync budget computation earns its
+        # device->host round trip.
+        return not self._is_verify_all
 
     @property
     def is_compact_mode(self) -> bool:
