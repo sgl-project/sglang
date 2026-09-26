@@ -285,6 +285,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
+    _use_draft_input_embeds = False
     _backend_can_run_prefill_cuda_graph = None
 
     def __init__(self, model_runner: ModelRunner):
@@ -354,6 +355,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and is_eagle
             and model_runner.is_draft_worker
         )
+        # A multimodal target prepares the EAGLE3 draft inputs as a merged
+        # embedding sequence, so capture that path instead of baking
+        # embed_tokens(input_ids). EAGLE(MTP) drafts are excluded since
+        # they handle embeds in their own forward and reject an explicit
+        # input_embeds argument.
+        self._use_draft_input_embeds = (
+            is_breakable_eagle_draft and model_runner.spec_algorithm.is_eagle3()
+        )
         if is_breakable_eagle_draft:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
         elif (is_eagle and not model_runner.is_draft_worker) or (
@@ -381,6 +390,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            enable_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
             pp_size=self.pp_size,
             is_first_pp_rank=self.model_runner.pp_group.is_first_rank,
             hc_hidden_size=getattr(
@@ -415,6 +425,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(is_dsa_enable_prefill_cp() or is_mla_cp_enabled()),
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
+            register_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
             source=self.buffers,
         )
 
@@ -1731,6 +1742,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
 
+        if self._use_draft_input_embeds:
+            # Keep one address-stable embedding input for the captured draft
+            # body. Multimodal requests use the target-composed embeds with
+            # the tail-token row replaced, and text requests use an
+            # embed_tokens lookup.
+            draft_input_embeds = forward_batch.mm_input_embeds
+            if draft_input_embeds is not None:
+                # Replace each request's last row with the embedding of its
+                # sampled tail token, mirroring the native EAGLE drafts.
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                draft_input_embeds[last_indices] = self.layer_model.embed_tokens(
+                    forward_batch.input_ids[last_indices]
+                )
+            else:
+                draft_input_embeds = self.layer_model.embed_tokens(
+                    forward_batch.input_ids
+                )
+            self.buffer_registry.get_slot("input_embeds").buffer[:num_tokens].copy_(
+                draft_input_embeds
+            )
+
         registry = self.buffer_registry
 
         def _slot(name):
@@ -2011,6 +2045,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
+        model_kwargs = kwargs
+        if self._use_draft_input_embeds:
+            # Draft forwards that accept `input_embeds` (all current EAGLE
+            # draft classes) route it into the draft transformer, selecting
+            # the same explicit-embedding branch as capture instead of
+            # replaying the captured token lookup.
+            model_kwargs = {
+                **kwargs,
+                "input_embeds": static_forward_batch.input_embeds,
+            }
         try:
             with self._prefill_forward_context(
                 static_forward_batch,
@@ -2021,7 +2065,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     tail_batch.input_ids,
                     tail_batch.positions,
                     tail_batch,
-                    **kwargs,
+                    **model_kwargs,
                 )
         finally:
             self.layer_model.forward = original_layer_forward

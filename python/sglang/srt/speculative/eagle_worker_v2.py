@@ -1158,6 +1158,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
