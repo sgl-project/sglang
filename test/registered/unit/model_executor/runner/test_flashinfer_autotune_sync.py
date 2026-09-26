@@ -102,10 +102,15 @@ class TestAutotuneCacheDigest(CustomTestCase):
             self._digest(cache), self._digest(cache, {**ENV, "gpu": "NVIDIA B200"})
         )
 
-    def test_key_order_does_not_matter(self):
-        # Pins sort_keys: the same tactics must digest alike in any order.
-        rank0 = self._write("rank0.json", {"a": 1, "b": 2})
-        rank1 = self._write("rank1.json", {"b": 2, "a": 1})
+    def test_disjoint_shape_sets_digest_alike_when_env_matches(self):
+        # The consistency requirement is that every rank agrees on whether it
+        # would load its cache under the current env -- not on the tactic
+        # entries themselves. Under EP the per-rank shape sets are legitimately
+        # disjoint, and the digest must let those caches through so tactics
+        # survive across boots.
+        meta = {"_metadata": {"cublas": "12.8"}}
+        rank0 = self._write("rank0.json", {**meta, "shape_(192, 2304, 320)": "tac_a"})
+        rank1 = self._write("rank1.json", {**meta, "shape_(64, 2304, 320)": "tac_b"})
         self.assertEqual(self._digest(rank0), self._digest(rank1))
 
 
@@ -145,13 +150,6 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
         entries = {"_metadata": {"cublas": "12.8"}, "op": 7}
         self.assertEqual(self._run_gate([entries, entries]), [True, True])
 
-    def test_diverged_caches_are_dropped_on_every_rank(self):
-        # A rank that kept its cache would skip profiles its peer still runs.
-        meta = {"_metadata": {"cublas": "12.8"}}
-        self.assertEqual(
-            self._run_gate([{**meta, "op": 7}, {**meta, "op": 8}]), [False, False]
-        )
-
     def test_caches_diverging_only_in_metadata_are_dropped(self):
         # Same desync, reached through the stamp instead of the tactics.
         self.assertEqual(
@@ -162,6 +160,22 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
                 ]
             ),
             [False, False],
+        )
+
+    def test_disjoint_shape_sets_with_matching_env_are_kept(self):
+        # EP shards experts across ranks, so each rank tunes a different set of
+        # MoE shapes. Both caches load fine under the same env (each rank's
+        # tactics are only for shapes it owns), so the gate must keep them.
+        # Digesting file bytes would drop the caches every boot and re-tune.
+        meta = {"_metadata": {"cublas": "12.8"}}
+        self.assertEqual(
+            self._run_gate(
+                [
+                    {**meta, "shape_(192, 2304, 320)": "tactic_a"},
+                    {**meta, "shape_(64, 2304, 320)": "tactic_b"},
+                ]
+            ),
+            [True, True],
         )
 
 
