@@ -3294,6 +3294,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
+        # HiSparse frees the request's host pool indices, its device buffer
+        # slots and its full->hisparse index mapping inside
+        # `hisparse_coordinator.retract_req`, which `release_req` runs *before*
+        # the retraction backup. A backup taken afterwards would copy freed KV,
+        # and the HiSparse allocator has no `get_cpu_copy` to take it with, so
+        # skip it: these requests are recomputed by the prefill worker instead
+        # (see `DecodePreallocQueue.add`).
+        offload_kv = self.hisparse_coordinator is None
+
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
         first_iter = True
@@ -3326,7 +3335,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(idx, len(sorted_indices), offload_kv=offload_kv):
                 retracted_reqs.append(req)
             else:
                 # No backup exists and the device KV is already freed, so the

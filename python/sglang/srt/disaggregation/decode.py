@@ -750,8 +750,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
-        if is_retracted and dsv41_dspark_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
+        # A retracted request can only join `retracted_queue` if it owns a host
+        # KV backup to resume from. HiSparse has none: `release_req` frees the
+        # request's KV through `hisparse_coordinator.retract_req` and the
+        # HiSparse allocator cannot offload it (`retract_decode` therefore skips
+        # the backup). Like V4.1 DSPARK, those requests are rebootstrapped so
+        # the prefill worker recomputes their prefix KV.
+        if is_retracted and (
+            self.scheduler.hisparse_coordinator is not None
+            or dsv41_dspark_needs_rebootstrap(self.token_to_kv_pool_allocator)
         ):
             if req.output_ids:
                 req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
