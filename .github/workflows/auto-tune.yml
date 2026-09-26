@@ -2,9 +2,108 @@ name: Auto tune
 
 on:
   workflow_dispatch:
+    inputs:
+      model_list:
+        description: "Comma-separated list of models to tune"
+        type: string
+        default: "Qwen/Qwen3-30B-A3B-Instruct-2507,DeepSeek-V3,Qwen/Qwen2.5-7B-Instruct"
+      runner_list:
+        description: "Comma-separated list of runner names (h100, h200, b200, gb200, h20)"
+        type: string
+        default: "h100,h200"
+      tp_size:
+        description: "Tensor parallelism size"
+        type: string
+        default: "8"
+      skip_moe:
+        description: "Skip MoE kernel tuning"
+        type: boolean
+        default: false
+      enable_allreduce:
+        description: "Enable allreduce algorithm tuning"
+        type: boolean
+        default: false
+      enable_spec:
+        description: "Enable speculative decoding parameter tuning"
+        type: boolean
+        default: false
+      draft_model_path:
+        description: "Draft model path for spec decoding"
+        type: string
+        default: ""
 
 jobs:
   auto-tune-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint auto_tune module
+        run: |
+          pip install ruff
+          ruff check python/sglang/auto_tune/
+
+  auto-tune-model:
+    needs: auto-tune-lint
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(format('[{0}]', inputs.model_list)) }}
+        runner: ${{ fromJSON(format('[{0}]', inputs.runner_list)) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install sglang
+        run: |
+          pip install -e "python[all]"
+
+      - name: Run auto-tune
+        id: tune
+        run: |
+          MODEL_NAME=$(echo "${{ matrix.model }}" | tr '/' '_')
+          OUTPUT_DIR="auto_tune_configs/${MODEL_NAME}_${{ matrix.runner }}"
+          mkdir -p "${OUTPUT_DIR}"
+
+          ARGS="--model-path ${{ matrix.model }} --tp ${{ inputs.tp_size }} --output-dir ${OUTPUT_DIR}"
+
+          if [ "${{ inputs.skip_moe }}" = "true" ]; then
+            ARGS="${ARGS} --skip-moe"
+          fi
+
+          if [ "${{ inputs.enable_allreduce }}" = "true" ]; then
+            ARGS="${ARGS} --allreduce"
+          fi
+
+          if [ "${{ inputs.enable_spec }}" = "true" ] && [ -n "${{ inputs.draft_model_path }}" ]; then
+            ARGS="${ARGS} --spec --draft-model-path ${{ inputs.draft_model_path }}"
+          fi
+
+          python -m sglang.auto_tune ${ARGS}
+
+      - name: Upload configs
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-tune-configs-${{ matrix.model }}-${{ matrix.runner }}
+          path: auto_tune_configs/
+          retention-days: 30
+
+  summary:
+    needs: auto-tune-model
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Auto Tune Results" >> $GITHUB_STEP_SUMMARY
+          echo "Models: ${{ inputs.model_list }}" >> $GITHUB_STEP_SUMMARY
+          echo "Runners: ${{ inputs.runner_list }}" >> $GITHUB_STEP_SUMMARY
+          echo "TP: ${{ inputs.tp_size }}" >> $GITHUB_STEP_SUMMARY
+          echo "Configs uploaded as artifacts." >> $GITHUB_STEP_SUMMARY
