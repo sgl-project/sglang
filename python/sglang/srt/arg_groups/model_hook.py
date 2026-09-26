@@ -462,6 +462,23 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+        elif get_platform().is_sm89:
+            # SM89 (Ada / RTX 4090 / L4 / L40S / L20): same Hopper-only
+            # features unavailable as SM120. TileLang indexer is SM120-only,
+            # so leave it off; the Torch SM120 fallback handles multi-dim
+            # seq_lens via fp8_paged_mqa_logits_torch_sm120.
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            # FlashInfer's SM120 sparse-MLA kernels are Blackwell-only, so the
+            # default backend would fail on SM89; the Triton fallback handles
+            # both prefill and decode. flash_mla_sm120 reads this env at module
+            # import, which happens lazily during forward, so setting it here
+            # (startup) is safe.
+            if not envs.SGLANG_SM120_FLASHMLA_BACKEND.is_set():
+                envs.SGLANG_SM120_FLASHMLA_BACKEND.set("triton")
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)

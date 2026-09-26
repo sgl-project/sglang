@@ -1778,6 +1778,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
     "is_sm120": "is_sm120_supported",
+    "is_sm89": "is_sm89",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
     "has_amx": "cpu_has_amx_support",
