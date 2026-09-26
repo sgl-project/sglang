@@ -1389,11 +1389,6 @@ def per_group_transpose(
     return trans_a
 
 
-# input  - [M, K]
-# weight - [K, N]
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
-
-
 @triton.jit
 def _dequant_group_fp8_kernel(
     X, S, Y, M, K: tl.constexpr, SS: tl.constexpr, BLOCK: tl.constexpr

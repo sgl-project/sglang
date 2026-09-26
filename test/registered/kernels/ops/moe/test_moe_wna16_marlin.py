@@ -684,6 +684,16 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+def _dequant_mxfp4_reference(packed, scales):
+    fp4 = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+    return fp4[codes.long()] * scales.double().repeat_interleave(32, -1)
+
+
 @pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 decode tile")
 @pytest.mark.parametrize("m", [1, 4])
 def test_mxfp4_tp8_gate_decode(m):
@@ -716,13 +726,7 @@ def test_mxfp4_tp8_gate_decode(m):
             s, input_dtype=torch.bfloat16
         ),
     )
-    fp4 = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device="cuda",
-        dtype=torch.float64,
-    )
-    codes = torch.stack((raw & 15, raw >> 4), dim=-1).reshape(e, n, k)
-    weights = fp4[codes.long()] * scale.double().repeat_interleave(32, -1)
+    weights = _dequant_mxfp4_reference(raw, scale)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     ids = torch.rand(m, e, device="cuda").topk(topk, dim=1).indices.int()
     topk_weights = torch.full((m, topk), 1 / topk, device="cuda")
@@ -807,11 +811,6 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
         quant_method=method,
         quant_config=None,
     )
-    fp4 = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device="cuda",
-        dtype=torch.float64,
-    )
     references = {}
     for shard in ("w1", "w3", "w2"):
         down = shard == "w2"
@@ -844,8 +843,7 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
             expected.append(selected)
         packed, sf = expected
         packed = packed.view(torch.uint8)
-        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
-        references[shard] = fp4[codes.long()] * sf.double().repeat_interleave(32, -1)
+        references[shard] = _dequant_mxfp4_reference(packed, sf)
 
     prepare_moe_mxfp4_layer_for_marlin(layer)
     assert layer.w13_weight_scale.shape[-1] == 640

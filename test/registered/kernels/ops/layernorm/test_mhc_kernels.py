@@ -207,6 +207,21 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
+def _hopper_mhc_layer(norm, w):
+    return SimpleNamespace(
+        input_layernorm=norm,
+        post_attention_layernorm=norm,
+        config=SimpleNamespace(model_type="deepseek_v41"),
+        hc_pre_from_prev_sublayer=True,
+        hc_attn_fn=w,
+        hc_ffn_fn=-w,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
 def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
@@ -221,18 +236,7 @@ def test_hopper_compensated_mhc(num_tokens):
     scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
     base = torch.randn(24, device="cuda")
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
-    layer = SimpleNamespace(
-        input_layernorm=norm,
-        post_attention_layernorm=norm,
-        config=SimpleNamespace(model_type="deepseek_v41"),
-        hc_pre_from_prev_sublayer=True,
-        hc_attn_fn=w,
-        hc_ffn_fn=-w,
-        hc_mult=4,
-        hc_sinkhorn_iters=20,
-        rms_norm_eps=1e-6,
-        hc_eps=1e-6,
-    )
+    layer = _hopper_mhc_layer(norm, w)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is not None
@@ -295,19 +299,8 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
     base = torch.randn(24, device="cuda")
     pre = torch.rand(num_tokens, 4, device="cuda")
     norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
-    layer = SimpleNamespace(
-        input_layernorm=norm,
-        post_attention_layernorm=norm,
-        config=SimpleNamespace(model_type="deepseek_v41"),
-        hc_pre_from_prev_sublayer=True,
-        hc_attn_fn=w,
-        hc_ffn_fn=-w,
-        hc_mult=4,
-        hc_sinkhorn_iters=20,
-        rms_norm_eps=1e-6,
-        hc_eps=1e-6,
-        hc_stats_stream=torch.cuda.Stream(),
-    )
+    layer = _hopper_mhc_layer(norm, w)
+    layer.hc_stats_stream = torch.cuda.Stream()
     DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
     stream = DeepseekV4DecoderLayer._get_hc_stats_stream(
         layer, x, SimpleNamespace(forward_mode=ForwardMode.DECODE)

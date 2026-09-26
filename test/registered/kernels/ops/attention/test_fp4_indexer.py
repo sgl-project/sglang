@@ -479,7 +479,7 @@ def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
     ],
 )
 def test_fp4_paged_logits_replay(batch, ratio, width, masked):
-    from sglang.kernels.ops.attention.dsv4.candidate_table import amax_topk_blocks
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax_topk_blocks
     from sglang.kernels.ops.attention.dsv4.topk import (
         plan_topk_v2,
         topk_transform_paged_v2,
