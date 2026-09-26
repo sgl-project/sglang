@@ -183,6 +183,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -2651,7 +2652,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4832,6 +4834,13 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (
+        backend.is_megamoe() and get_disagg().disaggregation_mode == "decode"
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4857,14 +4866,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "MoE A2A is supported only with MegaMoE on a PD decode node"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
