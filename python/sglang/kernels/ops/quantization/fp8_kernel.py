@@ -1389,6 +1389,25 @@ def per_group_transpose(
     return trans_a
 
 
-# input  - [M, K]
-# weight - [K, N]
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+@triton.jit
+def _dequant_group_fp8_kernel(
+    X, S, Y, M, K: tl.constexpr, SS: tl.constexpr, BLOCK: tl.constexpr
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows, cols = offsets // K, offsets % K
+    value = tl.load(X + offsets, offsets < M * K, 0.0).to(tl.float32)
+    scale = tl.load(S + rows * SS + cols // 32, rows < M, 0.0)
+    tl.store(Y + offsets, value * scale, offsets < M * K)
+
+
+def dequant_group_fp8_to_bf16(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Expand row-wise group32 FP8 values; UE8M0 scaling is exact in BF16."""
+    m, k = x.shape
+    assert x.is_contiguous() and k % 32 == 0
+    assert scale.shape == (m, k // 32) and scale.stride(1) == 1
+    out = torch.empty_like(x, dtype=torch.bfloat16)
+    if m:
+        _dequant_group_fp8_kernel[(triton.cdiv(m * k, 1024),)](
+            x, scale, out, m, k, scale.stride(0), 1024
+        )
+    return out

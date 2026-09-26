@@ -684,5 +684,216 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+def _dequant_mxfp4_reference(packed, scales):
+    fp4 = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+    return fp4[codes.long()] * scales.double().repeat_interleave(32, -1)
+
+
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 decode tile")
+@pytest.mark.parametrize("m", [1, 4])
+def test_mxfp4_tp8_gate_decode(m):
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        _permute_moe_fp4_scales_for_marlin,
+        _repack_moe_fp4_weight_for_marlin,
+        mxfp4_marlin_process_scales,
+    )
+
+    torch.manual_seed(741 + m)
+    e, n, k, topk = 8, 640, 5120, 6
+    raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+    scale = torch.randint(
+        120, 126, (e, n, k // 32), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
+    packed = _repack_moe_fp4_weight_for_marlin(
+        raw,
+        num_experts=e,
+        size_n=n,
+        size_k=k,
+        perm=torch.empty(0, device="cuda", dtype=torch.int32),
+    )
+    sf = _permute_moe_fp4_scales_for_marlin(
+        scale.bfloat16(),
+        num_experts=e,
+        size_n=n,
+        size_k=k,
+        group_size=32,
+        process_scales=lambda s: mxfp4_marlin_process_scales(
+            s, input_dtype=torch.bfloat16
+        ),
+    )
+    weights = _dequant_mxfp4_reference(raw, scale)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.rand(m, e, device="cuda").topk(topk, dim=1).indices.int()
+    topk_weights = torch.full((m, topk), 1 / topk, device="cuda")
+    sorted_ids, expert_ids, count = moe_align_block_size(ids, 8, e)
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties(0).multi_processor_count * 4,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def run():
+        return _run_single_gemm(
+            moe_wna16_marlin_gemm,
+            x,
+            None,
+            packed,
+            sf,
+            None,
+            None,
+            None,
+            workspace,
+            sorted_ids,
+            expert_ids,
+            count,
+            topk_weights,
+            scalar_types.float4_e2m1f,
+            8,
+            topk,
+            m,
+            n,
+            k,
+            False,
+            True,
+            False,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(2):
+        x.neg_()
+        graph.replay()
+        expected = torch.stack(
+            [
+                x[row].double() @ weights[expert].T
+                for row in range(m)
+                for expert in ids[row].tolist()
+            ]
+        )
+        torch.testing.assert_close(
+            actual.double(),
+            expected,
+            rtol=1 / 128,
+            atol=expected.square().mean().sqrt().item() * 1e-4,
+        )
+
+
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 weight loading")
+@pytest.mark.parametrize("tp_rank", [0, 7])
+def test_mxfp4_tp8_load_before_padding(tp_rank):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    torch.manual_seed(325 + tp_rank)
+    e, h, intermediate, tp, m = 2, 256, 288, 8, 4
+    method = Mxfp4MarlinMoEMethod(None, "test")
+    layer = torch.nn.Module()
+    layer.hidden_size = h
+    with torch.device("cuda"):
+        method.create_weights(layer, e, h, intermediate, torch.bfloat16)
+    assert layer.w13_weight.shape == (e, 2 * intermediate, h // 2)
+    loader = SimpleNamespace(
+        moe_tp_size=tp,
+        use_padded_loading=False,
+        use_presharded_weights=False,
+        use_triton_kernels=False,
+        moe_runner_config=SimpleNamespace(is_gated=True),
+        quant_method=method,
+        quant_config=None,
+    )
+    references = {}
+    for shard in ("w1", "w3", "w2"):
+        down = shard == "w2"
+        n, k = (h, intermediate * tp) if down else (intermediate * tp, h)
+        raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+        scale = torch.randint(
+            119, 123, (e, n, k // 32), device="cuda", dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu)
+        prefix = "w2" if down else "w13"
+        load = FusedMoE._load_w2 if down else FusedMoE._load_w13
+        axis = 1 if down else 0
+        expected = []
+        for data, suffix in [
+            (raw.view(torch.int8), "weight"),
+            (scale, "weight_scale_inv"),
+        ]:
+            parameter = getattr(layer, f"{prefix}_{suffix}")
+            for expert in range(e):
+                load(loader, parameter[expert], axis, shard, data[expert], tp_rank)
+            width = data.shape[axis + 1] // tp
+            selected = data.narrow(axis + 1, tp_rank * width, width)
+            actual = (
+                parameter
+                if down
+                else parameter[:, :intermediate]
+                if shard == "w1"
+                else parameter[:, intermediate:]
+            )
+            torch.testing.assert_close(actual.float(), selected.float(), rtol=0, atol=0)
+            expected.append(selected)
+        packed, sf = expected
+        packed = packed.view(torch.uint8)
+        references[shard] = _dequant_mxfp4_reference(packed, sf)
+
+    prepare_moe_mxfp4_layer_for_marlin(layer)
+    assert layer.w13_weight_scale.shape[-1] == 640
+    assert layer.w2_weight_scale.shape[1] == 10
+    x = torch.randn(m, h, device="cuda", dtype=torch.bfloat16)
+    ids = (
+        torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        .expand(m, -1)
+        .contiguous()
+    )
+    weights = torch.tensor([[0.25, 0.75]], device="cuda").expand(m, -1).contiguous()
+
+    def run():
+        return fused_marlin_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            torch.empty(m, e, device="cuda"),
+            weights,
+            ids,
+            workspace=layer.workspace,
+            num_bits=4,
+            clamp_limit=10.0,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        expected = []
+        for expert in range(e):
+            gate = (x.double() @ references["w1"][expert].T).bfloat16().clamp(max=10)
+            up = (x.double() @ references["w3"][expert].T).bfloat16().clamp(-10, 10)
+            activated = torch.nn.functional.silu(gate) * up
+            projected = activated.double() @ references["w2"][expert].T
+            # Marlin rounds GEMM2 before multiplying its BF16 routing weight.
+            expected.append(projected.bfloat16() * weights[:, expert, None].bfloat16())
+        reference = torch.stack(expected).float().sum(0).bfloat16()
+        torch.testing.assert_close(
+            actual,
+            reference,
+            rtol=0.03,
+            atol=reference.float().square().mean().sqrt().item() * 0.002,
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
