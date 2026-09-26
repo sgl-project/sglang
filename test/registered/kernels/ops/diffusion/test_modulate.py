@@ -359,6 +359,46 @@ def test_ltx2_ada_values9(batch, seq, hidden, table_dtype, compiled):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("hidden", [256, 1280, 8192])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_ltx2_ada_values9_strided_table_graph_replay(hidden, table_dtype):
+    # Padded rows and a nonzero storage offset must survive column tiling.
+    table_storage = torch.randn(9, hidden + 32, device=DEVICE, dtype=table_dtype)
+    table = table_storage[:, 16 : 16 + hidden]
+    timestep = torch.randn(2, 3, 9 * hidden, device=DEVICE, dtype=torch.bfloat16)
+    fn = ltx2_ada_values9
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        fn(table, timestep)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fn(table, timestep)
+
+    for _ in range(2):
+        table.normal_()
+        timestep.normal_()
+        before_table, before_timestep = table.clone(), timestep.clone()
+        graph.replay()
+        expected = _ltx2_reference(table, timestep)
+        assert len(actual) == 9
+        storage = actual[0].untyped_storage()
+        for index, (got, want) in enumerate(zip(actual, expected, strict=True)):
+            assert got.is_contiguous()
+            assert torch.equal(got, want)
+            assert got.untyped_storage().data_ptr() == storage.data_ptr()
+            assert (
+                got.storage_offset()
+                == index * timestep.shape[0] * timestep.shape[1] * hidden
+            )
+        assert torch.equal(table, before_table)
+        assert torch.equal(timestep, before_timestep)
+
+
+@torch.no_grad()
 def test_ltx2_ada_values9_rejects_unsupported_shape():
     scale_shift_table = torch.randn(8, 4096, device=DEVICE, dtype=torch.bfloat16)
     timestep = torch.randn(1, 1, 9 * 4096, device=DEVICE, dtype=torch.bfloat16)
