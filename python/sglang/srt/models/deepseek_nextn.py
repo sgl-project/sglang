@@ -25,7 +25,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -227,6 +226,11 @@ class DeepseekModelNextN(nn.Module):
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
+            hidden_states, residual = (
+                self.decoder.layer_communicator.finish_layer_stack(
+                    hidden_states, residual, forward_batch
+                )
+            )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
@@ -281,7 +285,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 

@@ -1,12 +1,14 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::LazyLock;
 
 use bytes::Bytes;
 use itertools::izip;
-use serde::Deserialize;
+use serde::de::{DeserializeOwned, SeqAccess, Visitor, value::SeqAccessDeserializer};
+use serde::{Deserialize, Deserializer};
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
@@ -44,24 +46,60 @@ const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
 /// the wire form does not); 8 is the ceiling of that range, not a worst case.
 const JSON_TO_HEAP_FACTOR: usize = 8;
 
+/// Top-level fields in this namespace belong to the selected multimodal
+/// processor. Everything else unknown to [`GenerateBody`] keeps Python's
+/// accepted-but-ignored behavior.
+const PROCESSOR_EXTENSION_PREFIX: &str = "multimodal_";
+
+/// Model-owned request fields. The shared server preserves and batches their
+/// MessagePack value representation; the selected processor deserializes that
+/// map into its own concrete schema.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ProcessorExtensions(BTreeMap<String, rmpv::Value>);
+
+impl ProcessorExtensions {
+    /// Deserialize the model-agnostic value tree directly into the selected
+    /// processor's schema. This does not encode or decode MessagePack bytes.
+    pub fn deserialize<T: DeserializeOwned>(self) -> Result<T, String> {
+        let fields = self
+            .0
+            .into_iter()
+            .map(|(name, value)| (rmpv::Value::from(name), value))
+            .collect();
+        rmpv::ext::from_value(rmpv::Value::Map(fields))
+            .map_err(|error| format!("invalid processor extensions: {error}"))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &rmpv::Value> {
+        self.0.values()
+    }
+}
+
+impl FromIterator<(String, rmpv::Value)> for ProcessorExtensions {
+    fn from_iter<T: IntoIterator<Item = (String, rmpv::Value)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
 /// [`into_requests`](GenerateBody::into_requests).
 ///
-/// Unknown keys are IGNORED, matching Python: FastAPI builds `GenerateReqInput`
-/// as a pydantic dataclass, which drops extras. `deny_unknown_fields` here turned
-/// every `GenerateReqInput` field this server has not ported — `priority`,
-/// `extra_key`, `session_id`, `session_params`, `return_sampling_mask`,
-/// `custom_logit_processor`, and ~40 more — into a 400, so a client that worked
-/// against the Python server broke against this one. The cost of dropping it is
-/// that a typo (`temperature`) is silently ignored rather than reported; that is
-/// the same trade Python already makes.
+/// Unknown keys are ignored, matching Python, except `multimodal_*` fields. Those
+/// are opaque processor extensions: this layer only fans them out with the
+/// request batch and passes them to the selected multimodal processor.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
     pub rid: Option<OneOrMany<String>>,
     pub text: Option<OneOrMany<String>>,
+    #[serde(default, deserialize_with = "deserialize_input_ids")]
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
@@ -105,6 +143,103 @@ pub struct GenerateBody {
     pub mm_hashes: Option<OneOrMany<Vec<String>>>,
     pub video_data: Option<MmDataInput>,
     pub audio_data: Option<MmDataInput>,
+    /// Model-specific multimodal fields, retained without teaching the shared
+    /// request schema their contents. Other unknown fields remain ignored.
+    #[serde(flatten)]
+    processor_extensions: ProcessorExtensions,
+}
+
+/// Decode `input_ids` directly into token vectors. The first element selects
+/// flat vs. batched input, avoiding the untagged enum's intermediate value tree.
+fn deserialize_input_ids<'de, D>(deserializer: D) -> Result<Option<OneOrMany<TokenIds>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct InputIds(OneOrMany<TokenIds>);
+
+    enum FirstElement {
+        Token(i32),
+        Tokens(TokenIds),
+    }
+
+    impl<'de> Deserialize<'de> for FirstElement {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct FirstVisitor;
+
+            impl<'de> Visitor<'de> for FirstVisitor {
+                type Value = FirstElement;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("an i32 token or a list of i32 tokens")
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                    i32::try_from(value)
+                        .map(FirstElement::Token)
+                        .map_err(E::custom)
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                    i32::try_from(value)
+                        .map(FirstElement::Token)
+                        .map_err(E::custom)
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    TokenIds::deserialize(SeqAccessDeserializer::new(sequence))
+                        .map(FirstElement::Tokens)
+                }
+            }
+
+            deserializer.deserialize_any(FirstVisitor)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for InputIds {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct TokensVisitor;
+
+            impl<'de> Visitor<'de> for TokensVisitor {
+                type Value = InputIds;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a token list or a list of token lists")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let tokens = match sequence.next_element::<FirstElement>()? {
+                        // Preserve OneOrMany's first-variant choice for [].
+                        None => OneOrMany::One(Vec::new()),
+                        Some(FirstElement::Token(first)) => {
+                            let mut tokens = vec![first];
+                            while let Some(token) = sequence.next_element::<i32>()? {
+                                tokens.push(token);
+                            }
+                            OneOrMany::One(tokens)
+                        }
+                        Some(FirstElement::Tokens(first)) => {
+                            let mut prompts = vec![first];
+                            while let Some(tokens) = sequence.next_element::<TokenIds>()? {
+                                prompts.push(tokens);
+                            }
+                            OneOrMany::Many(prompts)
+                        }
+                    };
+                    Ok(InputIds(tokens))
+                }
+            }
+
+            deserializer.deserialize_seq(TokensVisitor)
+        }
+    }
+
+    Option::<InputIds>::deserialize(deserializer).map(|value| value.map(|tokens| tokens.0))
 }
 
 impl GenerateBody {
@@ -150,9 +285,7 @@ impl GenerateBody {
             video_data,
             audio_data,
             mm_hashes,
-            // Unported `GenerateReqInput` fields land here and are dropped, as they
-            // are on the Python path.
-            ..
+            processor_extensions,
         } = self;
 
         // Cap the batch BEFORE the columns below allocate anything. Reading the
@@ -359,6 +492,7 @@ impl GenerateBody {
         let images = multimodal::fan_out(image_data, n, is_batch, "image_data")?;
         let videos = multimodal::fan_out(video_data, n, is_batch, "video_data")?;
         let audios = multimodal::fan_out(audio_data, n, is_batch, "audio_data")?;
+        let processor_extensions = split_extension_columns(processor_extensions, n, is_batch)?;
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
@@ -380,6 +514,7 @@ impl GenerateBody {
             images,
             videos,
             audios,
+            processor_extensions,
         )
         .map(
             |(
@@ -400,11 +535,12 @@ impl GenerateBody {
                 image_data,
                 video_data,
                 audio_data,
+                processor_extensions,
             )| GenerateRequest {
                 rid,
                 text,
                 input_ids,
-                // Native text prompts keep the post-processor specials; the
+                // Plain text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
                 skip_special_tokens: false,
                 sampling_params,
@@ -426,7 +562,7 @@ impl GenerateBody {
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
-                mm: pack_mm(image_data, video_data, audio_data),
+                mm: pack_mm(image_data, video_data, audio_data, processor_extensions),
             },
         )
         .collect();
@@ -445,16 +581,70 @@ fn pack_mm(
     image_data: Vec<MmItem>,
     video_data: Vec<MmItem>,
     audio_data: Vec<MmItem>,
+    processor_extensions: ProcessorExtensions,
 ) -> Option<Box<MmData>> {
-    if image_data.is_empty() && video_data.is_empty() && audio_data.is_empty() {
+    if image_data.is_empty()
+        && video_data.is_empty()
+        && audio_data.is_empty()
+        && processor_extensions.is_empty()
+    {
         return None;
     }
     Some(Box::new(MmData {
         image_data,
         video_data,
         audio_data,
+        processor_extensions,
         ..Default::default()
     }))
+}
+
+fn split_extension_columns(
+    fields: ProcessorExtensions,
+    n: usize,
+    is_batch: bool,
+) -> Result<Vec<ProcessorExtensions>, Error> {
+    let mut requests = vec![ProcessorExtensions::default(); n];
+    for (name, value) in fields.0 {
+        if !name.starts_with(PROCESSOR_EXTENSION_PREFIX) || value.is_nil() {
+            continue;
+        }
+        if !is_batch {
+            requests[0].0.insert(name, value);
+            continue;
+        }
+        let rmpv::Value::Array(values) = value else {
+            return Err(Error::Validation(format!(
+                "{name} must be a list for batch processing"
+            )));
+        };
+        if values.is_empty() {
+            for request in &mut requests {
+                request
+                    .0
+                    .insert(name.clone(), rmpv::Value::Array(Vec::new()));
+            }
+            continue;
+        }
+        if values.len() != n {
+            return Err(Error::Validation(format!(
+                "{name} list length {} does not match batch size {n}",
+                values.len()
+            )));
+        }
+        for (request, value) in requests.iter_mut().zip(values) {
+            request.0.insert(name.clone(), value);
+        }
+    }
+    Ok(requests)
+}
+
+fn extension_value_present(value: &rmpv::Value) -> bool {
+    match value {
+        rmpv::Value::Nil => false,
+        rmpv::Value::Array(values) => values.iter().any(extension_value_present),
+        _ => true,
+    }
 }
 
 /// One request handed to the MM worker pool: the rid to correlate the result,
@@ -474,6 +664,7 @@ pub struct MmWorkItem {
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
+    pub processor_extensions: ProcessorExtensions,
     /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
     /// See [`GenerateBody::mm_hashes`].
@@ -606,6 +797,7 @@ pub struct MmData {
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
+    pub processor_extensions: ProcessorExtensions,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
     /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
@@ -625,7 +817,13 @@ impl GenerateRequest {
     /// Python `GenerateReqInput.contains_mm_input()`.
     pub fn has_multimodal(&self) -> bool {
         self.mm.as_ref().is_some_and(|mm| {
-            !mm.image_data.is_empty() || !mm.video_data.is_empty() || !mm.audio_data.is_empty()
+            !mm.image_data.is_empty()
+                || !mm.video_data.is_empty()
+                || !mm.audio_data.is_empty()
+                || mm
+                    .processor_extensions
+                    .values()
+                    .any(extension_value_present)
         })
     }
 
@@ -642,6 +840,7 @@ impl GenerateRequest {
             work.image_data = std::mem::take(&mut m.image_data);
             work.video_data = std::mem::take(&mut m.video_data);
             work.audio_data = std::mem::take(&mut m.audio_data);
+            work.processor_extensions = std::mem::take(&mut m.processor_extensions);
             work.prefetched = std::mem::take(&mut m.prefetched);
             work.mm_hashes = std::mem::take(&mut m.mm_hashes);
         }
@@ -751,6 +950,17 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
 mod tests {
     use super::*;
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestProcessorExtensions {
+        multimodal_custom: TestProcessorExtension,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct TestProcessorExtension {
+        value: i64,
+    }
+
     /// Vocab size for tests that aren't about the vocab bound (see
     /// `sampling::tests::TEST_VOCAB`).
     const TEST_VOCAB: u64 = 1000;
@@ -817,6 +1027,71 @@ mod tests {
         assert!(is_batch);
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].input_ids, Some(vec![3]));
+    }
+
+    #[test]
+    fn input_ids_deserialization_matches_untagged() {
+        assert!(
+            serde_json::from_str::<GenerateBody>(r#"{"text":"hi"}"#)
+                .unwrap()
+                .input_ids
+                .is_none()
+        );
+        for value in [
+            "null",
+            "[]",
+            "[0]",
+            "[-2147483648,2147483647]",
+            "[[]]",
+            "[[],[1,-2]]",
+            "[[1,2],[3]]",
+            "[[-2147483648],[2147483647]]",
+            "1",
+            "true",
+            "{}",
+            r#""1""#,
+            "[null]",
+            "[true]",
+            r#"["1"]"#,
+            "[1.0]",
+            "[1e0]",
+            "[-0]",
+            "[2147483648]",
+            "[-2147483649]",
+            "[18446744073709551616]",
+            "[0,2147483648]",
+            "[0,-0]",
+            "[1,[2]]",
+            "[[1],2]",
+            "[[[1]]]",
+            "[[1.0]]",
+            "[[0],[2147483648]]",
+        ] {
+            let expected = serde_json::from_str::<Option<OneOrMany<TokenIds>>>(value);
+            let body = format!(r#"{{"input_ids":{value}}}"#);
+            let actual = serde_json::from_str::<GenerateBody>(&body).map(|body| body.input_ids);
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "{value}"),
+                (Err(_), Err(_)) => {}
+                (expected, actual) => panic!("{value}: expected {expected:?}, got {actual:?}"),
+            }
+        }
+
+        for (body, path) in [
+            (r#"{"input_ids":[true]}"#, "input_ids[0]"),
+            (r#"{"input_ids":[[1,true]]}"#, "input_ids[0][1]"),
+            (r#"{"input_ids":[[1],[2,true]]}"#, "input_ids[1][1]"),
+        ] {
+            let error = axum::Json::<GenerateBody>::from_bytes(body.as_bytes()).unwrap_err();
+            assert!(error.body_text().contains(path), "{error}");
+        }
+        for body in [
+            r#"{"input_ids":null,"input_ids":[1]}"#,
+            r#"{"input_ids":[1],"input_ids":[2]}"#,
+            r#"{"input_ids":[1]} {}"#,
+        ] {
+            assert!(axum::Json::<GenerateBody>::from_bytes(body.as_bytes()).is_err());
+        }
     }
 
     /// Both / neither of text+input_ids is a 400.
@@ -970,6 +1245,89 @@ mod tests {
         let (ps, _) = requests(r#"{"text": ["a", "b"], "video_data": "v"}"#).unwrap();
         assert_eq!(ps[1].mm.as_ref().unwrap().video_data, vec![src("v")]);
         assert!(ps[1].has_multimodal());
+    }
+
+    #[test]
+    fn multimodal_extensions_follow_request_batch_shape() {
+        let single = r#"{"input_ids":[9],"image_data":"u","multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        let (reqs, is_batch) = requests(single).unwrap();
+        assert!(!is_batch);
+        let value = reqs[0]
+            .mm
+            .as_ref()
+            .unwrap()
+            .processor_extensions
+            .0
+            .get("multimodal_placeholders")
+            .unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+
+        let batched = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[[{"type":"image","token_index":0,"item_index":0}],[{"type":"image","token_index":0,"item_index":0}]]}"#;
+        let (reqs, is_batch) = requests(batched).unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(GenerateRequest::has_multimodal));
+        assert!(reqs.iter().all(|request| {
+            request
+                .mm
+                .as_ref()
+                .and_then(|mm| mm.processor_extensions.0.get("multimodal_placeholders"))
+                .and_then(rmpv::Value::as_array)
+                .is_some_and(|placeholders| placeholders.len() == 1)
+        }));
+
+        let invalid = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        assert!(requests(invalid).is_err());
+
+        let generic = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_custom":[{"value":1},{"value":2}]}"#;
+        let (reqs, _) = requests(generic).unwrap();
+        assert_eq!(
+            reqs[1]
+                .mm
+                .as_ref()
+                .unwrap()
+                .processor_extensions
+                .0
+                .get("multimodal_custom")
+                .unwrap()
+                .as_map()
+                .unwrap()[0]
+                .1
+                .as_i64(),
+            Some(2)
+        );
+
+        let extensions: TestProcessorExtensions =
+            requests(r#"{"input_ids":[9],"multimodal_custom":{"value":3}}"#)
+                .unwrap()
+                .0
+                .pop()
+                .unwrap()
+                .mm
+                .unwrap()
+                .processor_extensions
+                .deserialize()
+                .unwrap();
+        assert_eq!(extensions.multimodal_custom.value, 3);
+
+        for fields in [
+            r#"{"multimodal_custom":{"value":true}}"#,
+            r#"{"multimodal_custom":{"value":"3"}}"#,
+            r#"{"multimodal_custom":{"value":3,"unknown":0}}"#,
+            r#"{"multimodal_custom":{}}"#,
+        ] {
+            let extensions: ProcessorExtensions = serde_json::from_str(fields).unwrap();
+            assert!(
+                extensions.deserialize::<TestProcessorExtensions>().is_err(),
+                "{fields}"
+            );
+        }
+
+        let (reqs, _) = requests(r#"{"text":"hi","totally_made_up":1}"#).unwrap();
+        assert!(reqs[0].mm.is_none());
+
+        let (reqs, _) = requests(r#"{"input_ids":[9],"multimodal_custom":null}"#).unwrap();
+        assert!(!reqs[0].has_multimodal());
     }
 
     /// A scalar broadcast is budget-checked before the deep clones (16 MiB ×
