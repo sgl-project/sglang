@@ -22,6 +22,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.moe_model_registry import (
+    model_deepep_v2_prefill_dispatch_tokens,
+    model_supports_deepep_v2,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -201,6 +205,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "Qwen2MoeForCausalLM",
@@ -539,6 +544,17 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         )
 
 
+def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
+    """Largest prefill dispatch on one rank, after model-specific sharding."""
+    view = resolved_view(server_args)
+    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    return model_deepep_v2_prefill_dispatch_tokens(
+        hf_config=model_config_of(server_args).hf_config,
+        cfg=view,
+        default_tokens=tokens,
+    )
+
+
 def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
     """Check the configured prefill and decode-graph buffer bounds."""
     view = resolved_view(server_args)
@@ -547,9 +563,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
-        prefill_tokens = max_prefill_buffer_tokens(server_args) or (
-            view.max_prefill_tokens or 0
-        )
+        prefill_tokens = required_deepep_v2_prefill_tokens_per_rank(server_args)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "
@@ -587,7 +601,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
-    """Allow DeepEP v2 only where its model workflow is validated."""
+    """Allow DeepEP v2 only for registered model architectures."""
 
     if (
         parse_connector_type(resolved_view(server_args).model_path)
@@ -599,24 +613,15 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
             "--moe-a2a-backend deepep."
         )
 
-    architectures = (
-        getattr(model_config_of(server_args).hf_config, "architectures", None) or []
-    )
-
-    architecture = architectures[0] if architectures else None
-    # These architectures take the A2A MoE path and skip post-expert
-    # all-reduce.
-    validated_architectures = (
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    )
-    if architecture not in validated_architectures:
+    hf_config = model_config_of(server_args).hf_config
+    if not model_supports_deepep_v2(hf_config):
+        architectures = getattr(hf_config, "architectures", None) or []
+        architecture = architectures[0] if architectures else None
         raise ValueError(
-            f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-            f"architectures are {sorted(validated_architectures)}. "
-            "Other model workflows may require an all-reduce after A2A "
-            "combine. Use --moe-a2a-backend deepep."
+            f"DeepEP v2 MoE is not validated for {architecture!r}. The model "
+            "package must register its architecture with "
+            "register_deepep_v2_model, because its combine and post-expert "
+            "reduction semantics must be validated first."
         )
 
 

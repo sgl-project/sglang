@@ -118,6 +118,7 @@ mod tests {
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,
@@ -135,7 +136,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            active_load: crate::config::ActiveLoadConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(

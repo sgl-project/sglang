@@ -17,7 +17,6 @@ import subprocess
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List
 
 import requests
@@ -43,10 +42,6 @@ SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 ACCURACY_THRESHOLD = 0.94
 
-# bench_sglang.py lives at the repo root (this file is 5 levels below), not under
-# test/. Resolve it absolutely so it works regardless of the CI working directory.
-REPO_ROOT = Path(__file__).resolve().parents[5]
-GSM8K_BENCH_SCRIPT = REPO_ROOT / "benchmark" / "gsm8k" / "bench_sglang.py"
 GSM8K_DATA_URL = (
     "https://raw.githubusercontent.com/openai/grade-school-math/"
     "master/grade_school_math/data/test.jsonl"
@@ -145,7 +140,8 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
         port = int(base_url.rsplit(":", 1)[-1])
         command = [
             "python3",
-            str(GSM8K_BENCH_SCRIPT),
+            "-m",
+            "sglang.test.few_shot_gsm8k",
             "--num-questions",
             str(GSM8K_NUM_QUESTIONS),
             "--parallel",
