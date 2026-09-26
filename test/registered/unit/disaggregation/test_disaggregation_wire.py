@@ -122,6 +122,43 @@ class TestDisaggregationWire(unittest.TestCase):
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
 
+    def test_mooncake_registration_parses_minimax_index_layout(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 0x1000),
+            b"",
+            pack_int_lists([[0x2000]], "Q"),
+            b"3",
+            b"8",
+            b"128",
+            pack_int_lists([[64]], "I"),
+            b"",
+            b"",
+            pack_int_lists([[61]], "I"),
+            struct.pack("Q", 0),
+            b"0",
+            b"1",
+            b"0",
+            b"",
+            struct.pack("Q", 128),
+            pack_int_lists([[640]], "Q"),
+            b"4",
+            b"1",
+            b"4",
+            b"nhd",
+        ]
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.dst_state_data_lens, [[640]])
+        self.assertEqual(info.dst_page_size, 4)
+        self.assertEqual(info.dst_minimax_index_head_num, 1)
+        self.assertEqual(info.dst_minimax_global_index_head_num, 4)
+        self.assertEqual(info.dst_minimax_index_k_layout, "nhd")
+
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),

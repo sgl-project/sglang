@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     build_transfer_entry_pairs,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MHATokenToKVPool,
+    MiniMaxSparseKVPool,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,6 +33,13 @@ class _Pool(MHATokenToKVPool):
 class _Wrapper(HybridLinearKVPool):
     def __init__(self, inner):
         self.full_kv_pool = inner
+
+
+def _minimax_pool(main_pool, layer_ids):
+    pool = object.__new__(MiniMaxSparseKVPool)
+    pool.main_pool = main_pool
+    pool.main_kv_layer_ids = list(layer_ids)
+    return pool
 
 
 def _kv_layer_ids(target_ids, draft_ids):
@@ -96,6 +107,20 @@ class TestStagingDraftKvSlots(CustomTestCase):
         )
         self.assertEqual(k_buffers, ["tK87", "tK91", "dK92"])
         self.assertEqual(slot_ids, [87, 91, 92, 87, 91, 92])
+
+    def test_minimax_staging_uses_main_pool_buffers(self):
+        all_layers = [1, 3, 7, 11]
+        target = [3, 7, 11]
+        k_buffers, v_buffers, slot_ids = build_staging_slot_metadata(
+            kv_layer_ids=_kv_layer_ids(target, []),
+            num_draft_entries=0,
+            kv_pool=_minimax_pool(_Pool("main", all_layers), all_layers),
+            draft_kv_pool=None,
+        )
+
+        self.assertEqual(k_buffers, ["mainK3", "mainK7", "mainK11"])
+        self.assertEqual(v_buffers, ["mainV3", "mainV7", "mainV11"])
+        self.assertEqual(slot_ids, _kv_layer_ids(target, []))
 
     def test_undescribable_draft_still_yields_target_buffers(self):
         # Returning nothing here left the caller skipping set_kv_buffer_tensors
