@@ -544,7 +544,7 @@ def _cat_grid(dims, flatten_items=False):
 
     def _to_tensor(g):
         if isinstance(g, torch.Tensor):
-            return g.cpu() if g.is_cuda else g
+            return g.cpu()
         if isinstance(g, np.ndarray):
             return torch.from_numpy(g)
         return torch.as_tensor(g)
@@ -1358,6 +1358,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         zmq_context,
         embeddings_engine,
         dtype,
+        device_type: str,
         gpu_id=0,
         model_type: Optional[str] = None,
         embedding_pool=None,
@@ -1377,6 +1378,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
+        self.device_type = device_type
         self.gpu_id = gpu_id
         # The receive thread owns the buffer while _receive_running; once
         # _terminal latches, it releases the buffer itself on exit so the
@@ -1509,7 +1511,9 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     )
                 else:
                     gpu_buffer = torch.empty(
-                        total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                        total_bytes,
+                        dtype=torch.uint8,
+                        device=f"{self.device_type}:{self.gpu_id}",
                     )
                     self.embeddings_engine.register(
                         gpu_buffer.data_ptr(), gpu_buffer.nbytes
@@ -1672,11 +1676,11 @@ class EmbeddingPool:
 
     _ALIGN = 256
 
-    def __init__(self, gpu_id: int, size_bytes: int, engine=None):
+    def __init__(self, *, device_type: str, gpu_id: int, size_bytes: int, engine=None):
         self.gpu_id = gpu_id
         self.size_bytes = size_bytes
         self.buffer = torch.empty(
-            size_bytes, dtype=torch.uint8, device=f"cuda:{gpu_id}"
+            size_bytes, dtype=torch.uint8, device=f"{device_type}:{gpu_id}"
         )
         self.base = self.buffer.data_ptr()
         self.engine = engine
@@ -1922,6 +1926,7 @@ class MMReceiverBase(ABC):
                 self.scheduler_embedding_port,
             )
         self.scheduler = scheduler
+        self.device_type = get_device().device
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
@@ -1950,8 +1955,9 @@ class MMReceiverBase(ABC):
             if pool_mb and pool_mb > 0 and scheduler is not None:
                 try:
                     self.embedding_pool = EmbeddingPool(
-                        self.gpu_id,
-                        pool_mb * 1024 * 1024,
+                        device_type=self.device_type,
+                        gpu_id=self.gpu_id,
+                        size_bytes=pool_mb * 1024 * 1024,
                         engine=self.embeddings_engine,
                     )
                 except Exception:
@@ -1971,7 +1977,9 @@ class MMReceiverBase(ABC):
                 if pool_mb and pool_mb > 0:
                     try:
                         self.embedding_pool = EmbeddingPool(
-                            self.gpu_id, pool_mb * 1024 * 1024
+                            device_type=self.device_type,
+                            gpu_id=self.gpu_id,
+                            size_bytes=pool_mb * 1024 * 1024,
                         )
                     except Exception:
                         logger.exception(
@@ -2699,6 +2707,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 WaitingRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
+                device_type=self.device_type,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
             )

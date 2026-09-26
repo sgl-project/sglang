@@ -576,6 +576,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
 
     def _init_staging_allocator(self):
@@ -586,6 +587,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
 
     def _register_staging_memory(self, ptr: int, size: int):
@@ -598,15 +600,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(ptr=0x{ptr:x}, size={size})"
             )
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
-        # NOTE: matches mooncake behavior -- staging buffers are now
-        # created in __init__ (per-worker), independent of the kv
-        # tensors. This setter only stashes the tensor metadata used by
-        # send_kvcache_staged().
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
+        # Staging buffers are created per-worker in __init__, independent of the
+        # kv tensors; this only stashes metadata used by send_kvcache_staged().
+        # slot_layer_ids is kept for signature parity with mooncake; NIXL staging
+        # is pp_size == 1 only (see prefill.py), so nothing reads it back.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
@@ -1234,6 +1243,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     self._staging_outstanding.pop(room, None)
                     continue
+
+                # Blocks this worker, bounded by the prior step's forward. Must
+                # precede the staging gather below, which reads the pages too.
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -2112,16 +2126,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
             [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
+            dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
@@ -2735,6 +2748,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2766,6 +2780,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -3139,6 +3154,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
             num_kv_tokens,
+            wait_event=self._take_early_send_wait_event(),
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1

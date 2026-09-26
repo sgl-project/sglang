@@ -68,6 +68,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_memory,
     get_observability,
     get_schedule,
@@ -490,6 +491,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -501,6 +503,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -723,7 +726,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         if pairs is None:
@@ -2134,6 +2136,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
+                # Blocks this worker, bounded by the prior step's forward. Must
+                # precede the staging gather below, which reads the pages too.
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -2650,6 +2657,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2689,6 +2697,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                wait_event=wait_event,
             )
         )
 
@@ -2795,6 +2804,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if should_skip:
             return
 
+        wait_event = self._take_early_send_wait_event()
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -2803,6 +2813,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2814,6 +2825,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
