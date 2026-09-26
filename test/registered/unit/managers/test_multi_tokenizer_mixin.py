@@ -1,5 +1,8 @@
 import unittest
 
+import numpy as np
+
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -69,8 +72,18 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_token_ids_logprobs_val=[[], []],
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=[0.0, 0.0],
-        output_token_sampling_mask=[[[7, 8]], [[9]]],
-        output_token_sampling_logprobs=[[[-0.5, -1.0]], [[0.0]]],
+        output_token_sampling_mask=[
+            SamplingMaskChunk(
+                lengths=np.array([2], np.int32),
+                token_ids=np.array([7, 8], np.int32),
+                logprobs=np.array([-0.5, -1.0], np.float32),
+            ),
+            SamplingMaskChunk(
+                lengths=np.array([1], np.int32),
+                token_ids=np.array([9], np.int32),
+                logprobs=np.array([0.0], np.float32),
+            ),
+        ],
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
@@ -123,10 +136,9 @@ class TestMultiTokenizerMixin(unittest.TestCase):
 
         single_output = _handle_output_by_index(output, 0)
 
-        self.assertEqual(single_output.output_token_sampling_mask, [[[7, 8]]])
+        (chunk,) = single_output.output_token_sampling_mask
         self.assertEqual(
-            single_output.output_token_sampling_logprobs,
-            [[[-0.5, -1.0]]],
+            chunk.to_lists(support_logprobs=True), ([[7, 8]], [[-0.5, -1.0]])
         )
 
     def test_batch_str_output_without_weight_versions_stays_none(self):

@@ -146,22 +146,30 @@ def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
         node_id=result.node_id,
-        swa_uuid_for_lock=result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
         skipped_lock_components=tuple(
             ComponentType(ct) for ct in result.skipped_lock_components
         ),
+        component_lock_uuids={
+            ComponentType(ct): uuid for ct, uuid in result.component_lock_uuids.items()
+        },
+        component_host_lock_uuids={
+            ComponentType(ct): uuid
+            for ct, uuid in result.component_host_lock_uuids.items()
+        },
     )
 
 
 def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
-    """Build the binding's params from the module that owns the core's binding
-    (the inspection build is a distinct extension module with its own types)."""
+    """Use the owning module's type for both production and inspection bindings."""
     return bindings_module.DecLockRefParamsBinding(
         node_id=params.node_id,
-        swa_uuid_for_lock=params.swa_uuid_for_lock,
-        swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
         skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
+        component_lock_uuids={
+            int(ct): uuid for ct, uuid in params.component_lock_uuids.items()
+        },
+        component_host_lock_uuids={
+            int(ct): uuid for ct, uuid in params.component_host_lock_uuids.items()
+        },
     )
 
 
@@ -619,7 +627,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
-                swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,

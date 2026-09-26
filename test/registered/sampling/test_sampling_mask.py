@@ -203,8 +203,8 @@ class TestSamplingMaskCapture(CustomTestCase):
                         simple_sampling_case=False,
                     )
                 output = self._materialize(sampled, capture, requested_rows=[0, 1])
-                support = output.next_token_sampling_mask_idx[0]
-                sampling_logprobs = output.next_token_sampling_logprobs[0]
+                support = output.next_token_sampling_mask_idx[0].tolist()
+                sampling_logprobs = output.next_token_sampling_logprobs[0].tolist()
                 self.assertEqual(set(support), {0, 1, 3})
                 self.assertIn(int(sampled[0]), support)
                 expected = original[0, sampled[0]] - original[0, support].logsumexp(0)
@@ -280,9 +280,13 @@ class TestSamplingMaskCapture(CustomTestCase):
 
         output = self._materialize(sampled, capture, requested_rows)
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[1].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[3].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertIsNotNone(output.next_token_sampling_logprobs[1])
         self.assertIsNone(output.next_token_sampling_logprobs[2])
@@ -714,8 +718,20 @@ class TestSamplingMaskPacking(CustomTestCase):
             ],
             output,
         )
-        self.assertEqual(output.next_token_sampling_mask_idx, [[3], None, [5]])
-        self.assertEqual(output.next_token_sampling_logprobs, [[0.0], None, [0.0]])
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[3], None, [5]],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
+            [[0.0], None, [0.0]],
+        )
 
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
@@ -779,6 +795,61 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             output = response.json()
             outputs.append((output["output_ids"], output["text"]))
         self.assertEqual(outputs[0], outputs[1])
+
+    def test_modes_and_streaming_return_identical_sampling_masks(self):
+        """For the same seeded tokens, selected and support mode report the same
+        supports, each selected logprob is the sampled token's support logprob, and a
+        stream that emits every token matches the response emitted every 50 tokens."""
+        sampling_params = {
+            "top_k": _TOP_K,
+            "top_p": 1.0,
+            "sampling_seed": _SAMPLING_SEED,
+            "max_new_tokens": 64,
+        }
+        responses = {}
+        for mode, stream in (
+            ("support", False),
+            ("selected", False),
+            ("support", True),
+        ):
+            response = self._post_generate(
+                sampling_params, sampling_logprobs_mode=mode, stream=stream
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            if stream:
+                chunks = [
+                    json.loads(line[6:])
+                    for line in response.iter_lines()
+                    if line.startswith(b"data: ") and line[6:] != b"[DONE]"
+                ]
+                responses[mode, stream] = chunks[-1]
+            else:
+                responses[mode, stream] = response.json()
+
+        support = responses["support", False]
+        output_ids = support["output_ids"]
+        masks = self._assert_sampling_masks(output_ids, support["meta_info"])
+        support_logprobs = support["meta_info"]["output_token_sampling_logprobs"]
+
+        selected = responses["selected", False]
+        self.assertEqual(selected["output_ids"], output_ids)
+        self.assertEqual(selected["meta_info"]["output_token_sampling_mask"], masks)
+        self.assertEqual(
+            selected["meta_info"]["output_token_sampling_logprobs"],
+            [
+                logprobs[mask.index(token)]
+                for token, mask, logprobs in zip(output_ids, masks, support_logprobs)
+            ],
+        )
+
+        streamed = responses["support", True]
+        self.assertEqual(streamed["output_ids"], output_ids)
+        for key in (
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+            "output_token_sampling_mask_length",
+        ):
+            self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):
