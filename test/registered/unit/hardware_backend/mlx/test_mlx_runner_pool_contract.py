@@ -23,7 +23,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,12 +36,46 @@ _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.model_runner_stub import MlxModelRunnerStub
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxRunnerPoolContract(CustomTestCase):
     """Guard the stub's scheduler-facing ``ModelRunner`` contracts."""
+
+    def test_worker_startup_uses_mlx_token_capacity(self):
+        """MLX startup must report its own pool capacity without a Torch configurator."""
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.max_total_num_tokens = 64
+        runner.max_running_requests = 2
+        runner.is_hybrid_swa = False
+        runner.forward_stream = None
+        runner.req_to_token_pool = ReqToTokenPool(
+            size=2,
+            max_context_len=128,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        runner.token_to_kv_pool = SimpleNamespace(size=64)
+        worker = object.__new__(TpModelWorker)
+        worker._model_runner = runner
+        worker.model_runner_list = [runner]
+        worker.model_config = SimpleNamespace(context_len=128)
+        worker.dllm_algorithm = None
+        worker.random_seed = 0
+        worker.device = "cpu"
+
+        with get_context().override_server_args(
+            max_prefill_tokens=128, max_queued_requests=None
+        ):
+            worker.alloc_memory_pool()
+            info = worker.get_worker_info()
+
+        self.assertEqual(info[0], 64)
+        self.assertEqual(info[4], 63)
+        self.assertEqual(info[5], 58)
 
     def test_stub_reports_no_preloaded_torch_weights(self):
         runner = object.__new__(MlxModelRunnerStub)
