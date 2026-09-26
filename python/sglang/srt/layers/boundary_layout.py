@@ -144,13 +144,17 @@ def scattered_residual_layer_sides(
     ffn_group: SumGroup,
     is_first_layer: bool,
     is_last_layer: bool,
+    leaves_for_reduce_scatter: bool,
 ) -> DecoderLayerSides:
     """A decoder layer on an input-scattered batch whose residual stays on
     each attention-TP rank's slice (MHC). The attention and the FFN compute on
-    the full rows; the boundary brings them those rows and reduce-scatters
-    their outputs, partial sums over TP, back onto the slice, which completes
-    the sums. The first layer's input is the embedding's partial sum on the
-    full rows; the last layer hands on the full rows again."""
+    the full rows. The attention takes the slice and gathers it itself (its
+    QKV hook, or the handoff before an attention that needs the rows); the
+    boundary brings the FFN its rows and moves both outputs back onto the
+    slice: the attention output's TP sum by a reduce-scatter, the FFN's too
+    when it leaves it (``leaves_for_reduce_scatter``). The first layer's input
+    is the embedding's partial sum on the full rows; the last layer hands on
+    the full rows again."""
     attention = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
     )
@@ -162,13 +166,17 @@ def scattered_residual_layer_sides(
     )
     return DecoderLayerSides(
         input_rows=attention if is_first_layer else local,
-        attention=StageInput(attention),
+        attention=StageInput(
+            attention, gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER})
+        ),
         attention_output=StageOutput(
             attention, group=SumGroup.ATTN_TP, always_leaves=True
         ),
         ffn=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
         ffn_output=StageOutput(
-            attention, group=ffn_group, leaves_for_reduce_scatter=True
+            attention,
+            group=ffn_group,
+            leaves_for_reduce_scatter=leaves_for_reduce_scatter,
         ),
         ffn_residual_rows=local,
         output_rows=attention if is_last_layer else local,

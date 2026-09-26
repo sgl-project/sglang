@@ -795,7 +795,6 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.config.mhc:
             mhc_kwargs: Dict[str, Any] = dict(
-                is_first_layer=(self.layer_id == 0),
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,

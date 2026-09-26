@@ -59,7 +59,7 @@ class TestLongcatShortcut(CustomTestCase):
             patch.object(
                 comm,
                 "get_local_dp_buffer",
-                side_effect=lambda group: torch.empty(rows, 3),
+                side_effect=lambda group, hidden_size=None: torch.empty(rows, 3),
             ),
             patch.object(
                 comm,
