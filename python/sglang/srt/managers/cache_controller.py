@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _should_skip_rank_replicated_backup(
+    is_rank_replicated: bool, attn_tp_rank: int
+) -> bool:
+    """Keep one writer per attention-TP replica group, not per global TP group."""
+    return is_rank_replicated and attn_tp_rank != 0
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -550,11 +557,12 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
+        # Rank-replicated KV is identical only within an attention-TP group.
+        # Context-parallel ranks own distinct physical shards, so rank 0 of
+        # every attention-TP group must back up its shard independently.
+        self.backup_skip = _should_skip_rank_replicated_backup(
+            self.storage_config.is_mla_model,
+            get_parallel().attn_tp_rank,
         )
 
         # Use storage backend factory for dynamic backend creation
