@@ -805,7 +805,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 && tree_core.is_write_back
                 && tree_core.has_swa_host_pool
                 && !node.has_host_value(SWA)
-                && !node.has_host_value(FULL)
                 && node.has_device_value(FULL)
             {
                 // Backup may include several unbacked ancestors. Let the

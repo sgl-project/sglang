@@ -754,7 +754,6 @@ class SWAComponent(TreeComponent):
             and self.tree_core.is_write_back
             and self.tree_core.has_swa_host_pool
             and cd.host_value is None
-            and not x.backuped
             and x.component_data[BASE_COMPONENT_TYPE].value is not None
         ):
             # Reserve the whole unbacked window, not just this victim, before
