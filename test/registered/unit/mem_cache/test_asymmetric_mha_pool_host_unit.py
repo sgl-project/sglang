@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
@@ -84,7 +84,14 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         host = _make_host("page_first")
         host.page_num = 4
         host.v_head_dim = 8
-        host.device_pool = SimpleNamespace(device="cuda")
+        host.device_pool = SimpleNamespace(
+            device="cuda",
+            head_num=host.head_num,
+            head_dim=host.head_dim,
+            v_head_dim=host.v_head_dim,
+            store_dtype=host.dtype,
+            hicache_write_back_staging=None,
+        )
         cpu_empty = torch.empty
 
         def _cpu_empty(shape, *, dtype, device):

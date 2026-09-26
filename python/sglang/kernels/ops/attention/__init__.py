@@ -6,8 +6,21 @@ The Triton kernels migrated here live in this package
 KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
+
+if TYPE_CHECKING:
+    import torch
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
@@ -16,6 +29,7 @@ _TRITON_KERNELS = [
     ("extend_attention", "build_unified_kv_indices"),
     ("prefill_attention", "context_attention_fwd"),
     ("merge_state", "merge_state_triton"),
+    ("suffix_attention_merge", "merge_suffix_attention_in_place"),
     ("metadata", "get_num_kv_splits_triton"),
     ("metadata", "prepare_swa_spec_page_table_triton"),
     ("metadata", "normal_decode_set_metadata"),
@@ -44,7 +58,78 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
-__all__ = []
+register_kernel(
+    KernelSpec(
+        op="attention.kda_qwen38_qsa_sm121",
+        backend=KernelBackend.TRITON,
+        target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description=(
+                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, 1 <= q_rows <= 128"
+            ),
+        ),
+        description=(
+            "SM121 Qwen3.8 QSA decode optimized by Codex/Kimi K3 through KDA-1.5."
+        ),
+    )
+)
+
+
+def can_use_kda_qwen38_qsa_sm121(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_k: int,
+) -> bool:
+    """Check the exact E2E-qualified Qwen3.8/SM121 QSA contract."""
+    from sglang.kernels.kda_kernels.qwen38_qsa_sm121 import (
+        can_use_qwen38_qsa_sm121,
+    )
+
+    return can_use_qwen38_qsa_sm121(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k)
+
+
+def qwen38_qsa_sm121_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int = 1,
+    max_seqlen_k: int = 0,
+    softmax_scale: float = 1.0,
+    causal: bool = True,
+    **_: object,
+) -> torch.Tensor:
+    """Run the only SM121 packed-QSA kernel for its qualified contract."""
+    del causal
+    if max_seqlen_q != 1:
+        raise ValueError(f"QSA requires max_seqlen_q=1, got {max_seqlen_q}")
+    if not can_use_kda_qwen38_qsa_sm121(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k
+    ):
+        raise ValueError(
+            "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
+            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
+        )
+    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        softmax_scale,
+    )
+
+
+__all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated
@@ -95,10 +180,10 @@ for _mod, _fn in [
     ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
-    ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
+    ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
+    ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
-    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
 ]:
     register_kernel(
         KernelSpec(
@@ -149,3 +234,128 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+for _mod, _fn, _backend, _device in [
+    ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
+    (
+        "attn_res",
+        "attn_res_fused_pull_rs",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "attn_res",
+        "attn_res_fused_direct_ag",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
+    (
+        "mla_output_gate",
+        "kimi_k3_mla_output_gate",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_decode_mtp",
+        "fused_kda_decode_mtp_dspark",
+        KernelBackend.CUTE_DSL,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({_device}),
+        )
+    )
+del _mod, _fn, _backend, _device
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="attention.get_block_table",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_kpool_topk_transform_fused",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fast_topk:fast_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.deep_select_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.deep_select:topk",
+        # Mirrors deep_select._SUPPORTED_CAPABILITIES: exactly SM90, SM100, SM103.
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((9, 0), (10, 0), (10, 3))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope_store",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope_store",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_rope_wo_a_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp4_index_logits_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.fp4_indexer:fp4_index_logits_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)

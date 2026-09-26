@@ -92,7 +92,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -107,7 +107,6 @@ logger = logging.getLogger(__name__)
 
 
 class LongcatFlashDenseDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -150,6 +149,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            reduce_results=True,
             prefix=add_prefix(f"mlps", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -284,7 +284,6 @@ class LongcatFlashModelNextN(nn.Module):
 
 
 class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
-
     def __init__(
         self,
         config: LongcatFlashConfig,

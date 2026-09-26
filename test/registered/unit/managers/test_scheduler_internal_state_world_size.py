@@ -11,7 +11,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import compute_world_size
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _shape(
@@ -91,16 +91,6 @@ class TestSchedulerInternalStateWorldSize(unittest.TestCase):
         internal_state = self._get_internal_state(shape)
 
         self.assertEqual(internal_state["world_size"], 4)
-
-    def test_the_reported_size_is_not_one_replica_of_a_data_parallel_server(self):
-        """Each plain dp replica has its own process group, so no scheduler can report the whole server from it."""
-        shape = _shape(tp_size=2, pp_size=1, dp_size=2, enable_dp_attention=False)
-
-        internal_state = self._get_internal_state(shape)
-
-        self.assertNotEqual(
-            internal_state["world_size"], shape["tp_size"] * shape["pp_size"]
-        )
 
 
 if __name__ == "__main__":

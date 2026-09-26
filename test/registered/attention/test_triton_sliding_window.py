@@ -5,7 +5,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=93, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=80, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -42,9 +42,12 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         cls.short_context_prompt = "The capital of France is"
 
         # Test prompt longer than window size
-        cls.long_context_prompt = """
+        cls.long_context_prompt = (
+            """
         Once upon a time, there was a mountain. In the mountain, there was a temple. In the temple, there was an old monk telling a story. The story was:
-        """ * 100
+        """
+            * 100
+        )
         cls.long_context_prompt += "\nNow, summarize the story in one sentence:"
 
     def _test_mmlu(self):
@@ -56,7 +59,7 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"MMLU metrics with sliding window: {metrics}")
 
         # gemma-3-4b-it scores 0.59 over 256 questions under sgl-eval's grader,

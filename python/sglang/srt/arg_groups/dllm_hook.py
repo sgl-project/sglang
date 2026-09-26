@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import is_hip
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +24,14 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
+
     # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
     # resolution moved to the pipeline: arg_groups/overrides.py
     # _dllm_attention_backend, invoked below at its legacy slot).
-    if is_hip():
+    if get_platform().is_hip:
         if (
             cfg.cuda_graph_config.decode.backend != Backend.DISABLED
             or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED

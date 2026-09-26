@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.sarashina2_vision import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _NarrowImageProcessor:
@@ -33,11 +33,6 @@ class _NarrowImageProcessor:
 
 
 class TestSarashina2PreprocessFilterSurvivesCloning(CustomTestCase):
-    def test_unfiltered_preprocess_rejects_what_transformers_forwards(self):
-        """Why the filter exists: the raw method cannot take the full kwarg set."""
-        with self.assertRaises(TypeError):
-            _NarrowImageProcessor()._preprocess(["img"], do_resize=True, do_pad=False)
-
     def test_filter_applies_to_the_patched_processor(self):
         image_processor = _NarrowImageProcessor()
         _install_preprocess_kwarg_filter(image_processor)

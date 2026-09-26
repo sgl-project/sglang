@@ -14,39 +14,30 @@
 
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
-    LayerScatterModes,
     ScatterMode,
+    _mlp_input_norm,
 )
+from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel
-
-
-def dsa_enable_prefill_cp():
-    # After using cp, the communication mode of this part changes.
-    # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
-    # no longer require additional communication for reduce, scatter, etc.
-    return is_dsa_enable_prefill_cp()
 
 
 def maybe_prefetch_next_full_attention_kv(
@@ -93,41 +84,18 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
-    def __init__(
-        self,
-        layer_scatter_modes: LayerScatterModes,
-        input_layernorm: torch.nn.Module,
-        post_attention_layernorm: torch.nn.Module,
-        # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
-        allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
-        qkv_latent_func: Optional[Callable] = None,
-    ):
-        super().__init__(
-            layer_scatter_modes,
-            input_layernorm,
-            post_attention_layernorm,
-            allow_reduce_scatter,
-            is_last_layer,
-            qkv_latent_func,
-        )
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
 
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
-            assert (
-                self._context.attn_dp_size == 1
-            ), f"dp_size should be 1 when moe_runner_backend is none"
+            assert self._context.attn_dp_size == 1, (
+                f"dp_size should be 1 when moe_runner_backend is none"
+            )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
-            context=self._context,
-        )
-        self._communicate_with_all_reduce_and_layer_norm_fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode=ScatterMode.SCATTERED,
-            residual_input_mode=ScatterMode.SCATTERED,
-            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
         self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
@@ -136,6 +104,16 @@ class DSACPLayerCommunicator(LayerCommunicator):
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+
+    def _select_mlp_input(self):
+        fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+            hidden_states_input_mode=ScatterMode.SCATTERED,
+            residual_input_mode=ScatterMode.SCATTERED,
+            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+            residual_output_mode=ScatterMode.SCATTERED,
+            context=self._context,
+        )
+        return fn, False
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
@@ -151,9 +129,7 @@ class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
-class DSACPCommunicateWithAllReduceAndLayerNormFn(
-    CommunicateWithAllReduceAndLayerNormFn
-):
+class DSACPCommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
     2. Apply layer norm
@@ -171,7 +147,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         assert residual_input_mode == ScatterMode.SCATTERED
         assert residual_output_mode == ScatterMode.SCATTERED
         if hidden_states_output_mode == ScatterMode.SCATTERED:
-            return DSACPCommunicateWithAllReduceAndLayerNormFn._simple
+            return _mlp_input_norm
 
         if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
@@ -197,7 +173,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
@@ -239,9 +215,10 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        **kwargs,
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual

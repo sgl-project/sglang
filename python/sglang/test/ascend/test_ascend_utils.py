@@ -1,14 +1,6 @@
-"""
-Common utilities for testing and benchmarking on NPU.
+"""Common utilities for testing and benchmarking on NPU.
 
-This file contains the following weight path categories:
-- LLM model weights path
-- VLM model weights path
-- Embedding model weights path
-- Rerank model weights path
-- Reward model weights path
-
-Please remember to sort by variable name within each section.
+Keep the weight-path constants sorted by variable name within each section.
 """
 
 import asyncio
@@ -26,7 +18,7 @@ import requests
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -116,6 +108,9 @@ KIMI_K2_5_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.5-
 KIMI_K2_5_EAGLE3_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.5-eagle3"
 )
+KIMI_K3_W4A8_INT_MOE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Kimi/Kimi-K3-w4a8-int-moe"
+)
 LING_LITE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "inclusionAI/Ling-lite")
 LLAMA_2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-2-7B")
 LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -149,6 +144,12 @@ META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
 MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
+MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
+)
+MIMO_V2_5_PRO_FP4_DFLASH_DRAFT_WEIGHTS_PATH = os.path.join(
+    MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH, "dflash"
+)
 MIMO_V2_5_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "solinliu/MiMo-V2.5-W8A8")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(
@@ -386,15 +387,7 @@ CONFIG_YAML_PATH = (
 
 
 class ModelTestConfig(NamedTuple):
-    """
-    Configuration for model testing.
-
-    Attributes:
-        model_path: Path to the model weights directory
-        mmlu_score: Weight for MMLU benchmark score
-        gsm8k_accuracy: Weight for GSM8K benchmark score
-        mmmu_accuracy: Weight for MMMU benchmark score
-    """
+    """Model weights path and the expected MMLU / GSM8K / MMMU scores."""
 
     model_path: str
     mmlu_score: Optional[float] = None
@@ -427,16 +420,7 @@ DEFAULT_WEIGHTS_FOR_TEST = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_FOR_TEST
 
 
 def run_command(cmd, shell=True):
-    """Execute system command and return stdout
-
-    parameter:
-        cmd: command to execute
-        shell:
-        True, Execute command in shell
-        False, Commands are invoked directly without shell parsing
-    return:
-        The result of executing the command
-    """
+    """Run ``cmd`` and return its stdout."""
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, text=True, check=True
@@ -547,37 +531,7 @@ def run_bench_serving(
     lora_name: Optional[str] = None,
     timeout_for_server_launch=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 ):
-    """Start the service and obtain the inference results.
-
-    Parameters:
-        model: Model name
-        num_prompts: Total number of test requests
-        request_rate: Request rate
-        other_server_args: Additional configuration when starting the service
-        dataset_name: Data set name
-        dataset_path: Dataset path
-        tokenizer: tokenizer
-        random_input_len: The length of the randomly generated input prompt
-        random_output_len: The length of the randomly generated output prompt
-        sharegpt_context_len: Sharegpt dataset context length
-        disable_stream: Disable streaming output
-        disable_ignore_eos: Should eos_token be ignored?
-        need_warmup: Preheating required
-        seed: random seed
-        device: Device type
-        gsp_num_groups: Grouped Sequence Parallelism
-        gsp_prompts_per_group: Number of parallel prompts within each group
-        gsp_system_prompt_len: GSP system prompts length
-        gsp_question_len: GSP question length
-        gsp_output_len: GSP output length
-        max_concurrency: Maximum number of concurrent requests
-        background_task: Background tasks
-        lora_name: LoRA fine-tuning model path
-        timeout_for_server_launch: Raise the service timeout period
-    Returns:
-        res: Number of requests successfully completed
-
-    """
+    """Launch the server, run bench_serving against it, and return the result."""
 
     if device == "auto":
         device = auto_config_device()
@@ -649,17 +603,7 @@ def run_bench_serving(
 
 # hook factory
 def create_attention_monitor_hook_factory(config):
-    """
-    Factory function to create a forward hook for monitoring self-attention layer states.
-    This hook records input/output statistics during model forward propagation.
-
-    Args:
-        config (dict): Configuration dictionary containing hook parameters
-            layer_index (int): Index of the target attention layer to monitor
-
-    Returns:
-        function: Forward hook function to be registered on the target module
-    """
+    """Return a forward hook that logs self-attention states of ``config["layer_index"]``."""
     # Get target layer index from config, default to 0 if not specified
     layer_index = config.get("layer_index", 0)
 
@@ -672,18 +616,7 @@ def create_attention_monitor_hook_factory(config):
         )
 
     def attention_monitor_hook(module, inputs, output):
-        """
-        Forward hook function that monitors and logs the internal states of a self-attention layer.
-        Executed automatically during the forward pass of the module it is registered to.
-
-        Args:
-            module (torch.nn.Module): The module this hook is attached to
-            inputs (tuple): Input tensors passed to the module's forward method
-            output (torch.Tensor): Output tensor returned by the module's forward method
-
-        Returns:
-            torch.Tensor: Unmodified output tensor to preserve model computation flow
-        """
+        """Log the attention layer's input/output statistics; returns ``output`` unchanged."""
         # Record current timestamp for time-series tracking
         timestamp = time.time()
 
@@ -823,7 +756,7 @@ def run_mmlu_test(
         )
 
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
@@ -847,26 +780,10 @@ def send_concurrent_requests(
     temperature: float = 0.0,
     request_timeout: int = 60,
 ) -> list:
-    """Send multiple concurrent HTTP POST requests to the /generate endpoint.
+    """Send ``num_requests`` concurrent POSTs to /generate; returns one result dict per request.
 
-    Uses threading (NOT asyncio + blocking calls) to achieve true concurrency.
-    asyncio.gather() combined with synchronous requests.post() does not produce
-    real parallelism; threading is required for concurrent blocking I/O.
-
-    Parameters:
-        base_url: Server base URL, e.g. "http://127.0.0.1:30000"
-        num_requests: Total number of requests to send
-        num_concurrent: Maximum in-flight requests at any given time (semaphore)
-        input_text: Text prompt sent to every request
-        max_new_tokens: Maximum new tokens to generate per request
-        temperature: Sampling temperature (0 = greedy / deterministic)
-        request_timeout: Per-request HTTP timeout in seconds; raises on exceed
-
-    Returns:
-        Unsorted list of result dicts, one per request, each with:
-          task_id (int)    -- zero-based request index
-          status_code (int)-- HTTP status code, or -1 on exception
-          text (str)       -- response body, or exception message on failure
+    Uses threads: asyncio.gather() over synchronous requests.post() gives no real
+    parallelism for blocking I/O.
     """
 
     results: list = []

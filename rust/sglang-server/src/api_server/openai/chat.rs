@@ -24,6 +24,7 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -34,8 +35,8 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -48,11 +49,21 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
+#[derive(Deserialize)]
+struct ChatRequest {
+    #[serde(flatten)]
+    request: CreateChatCompletionRequest,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let ChatRequest {
+        request,
+        chat_template_kwargs,
+    } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -141,10 +152,11 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
+    let (request, prompt) =
+        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
 
     let sampling = match chat_sampling(
         &request,
@@ -178,6 +190,11 @@ async fn chat_completions(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
+    // V4 prefills <think>, so the generated stream has no opening marker.
+    let starts_in_reasoning = matches!(
+        reasoning_parser.as_deref(),
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
+    ) && prompt.ends_with("<think>");
     let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -221,6 +238,7 @@ async fn chat_completions(
             include_usage,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -254,6 +272,7 @@ async fn chat_completions(
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
+    kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -267,7 +286,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
+    let prompt = formatter.render(&request, kwargs).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -516,6 +535,7 @@ pub(super) fn chat_event_stream(
     include_usage: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -534,7 +554,7 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning))
                     .collect()
             } else {
                 vec![]
@@ -1120,6 +1140,7 @@ mod tests {
             true,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             None,
             false,
@@ -1166,6 +1187,7 @@ mod tests {
             true,
             None,
             None,
+            false,
             None,
             None,
             false,
