@@ -604,6 +604,8 @@ class SRTRunner:
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
         lora_drain_wait_threshold: float = 0.0,
+        load_format: str = "auto",
+        model_loader_extra_config: Optional[dict[str, Any]] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -630,6 +632,8 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
+            load_format=load_format,
+            model_loader_extra_config=json.dumps(model_loader_extra_config or {}),
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,
