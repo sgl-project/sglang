@@ -98,10 +98,10 @@ def handle_int8_mamba_checkpoint(server_args: Any):
         )
 
 
-def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
+def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
 
-    assert supports_mamba_cache_extra_buffer(view, model_arch), (
-        f"extra_buffer is not supported for {model_arch}; use no_buffer."
+    assert supports_mamba_cache_extra_buffer(view, hf_config), (
+        f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
     assert (
         get_platform().is_cuda
