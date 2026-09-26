@@ -174,7 +174,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        moe.num_fused_shared_experts > 0
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
+        and get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and _device_sm != 90
         and _mega_moe_mma_type() == "fp8xfp4"
