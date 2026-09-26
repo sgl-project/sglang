@@ -844,7 +844,10 @@ class PrefillAdder:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
         else:
-            if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
+            if (
+                self.rem_chunk_tokens is not None
+                and self.rem_chunk_tokens < self.page_size
+            ):
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
