@@ -598,7 +598,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(ptr=0x{ptr:x}, size={size})"
             )
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
         # NOTE: matches mooncake behavior -- staging buffers are now
         # created in __init__ (per-worker), independent of the kv
         # tensors. This setter only stashes the tensor metadata used by
@@ -607,6 +613,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
@@ -2516,6 +2523,63 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
 
+    def _send_swa_state_slice(
+        self,
+        peer_name: str,
+        prefill_swa_page_indices: List[int],
+        src_state_data_ptrs: List[int],
+        src_state_item_lens: List[int],
+        dst_state_data_ptrs: List[int],
+        dst_swa_page_indices: List[int],
+        dst_state_item_lens: List[int],
+        dst_gpu_id: int,
+        notif: str,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+    ):
+        blocks = self._get_mha_head_slice_blocks(
+            src_ptrs=src_state_data_ptrs,
+            src_item_lens=src_state_item_lens,
+            dst_ptrs=dst_state_data_ptrs,
+            dst_item_lens=dst_state_item_lens,
+            src_page_indices=np.asarray(prefill_swa_page_indices),
+            dst_page_indices=np.asarray(dst_swa_page_indices),
+            dst_attn_tp_size=decode_tp_size,
+            dst_tp_rank=decode_tp_rank,
+        )
+        logger.warning_once(
+            "Using SWA state head-slice transfer for different attention TP sizes: "
+            f"prefill={self.attn_tp_size}, decode={decode_tp_size}."
+        )
+        src_reqs, dst_reqs = [], []
+        for src_addrs, dst_addrs, length in blocks:
+            lengths = np.full(src_addrs.size, length, dtype=np.uint64)
+            src_reqs.append(
+                np.column_stack(
+                    [src_addrs, lengths, np.full_like(lengths, self.kv_args.gpu_id)]
+                )
+            )
+            dst_reqs.append(
+                np.column_stack([dst_addrs, lengths, np.full_like(lengths, dst_gpu_id)])
+            )
+        if not src_reqs:
+            return None
+        src_descs = self.agent.get_xfer_descs(np.vstack(src_reqs), "VRAM")
+        dst_descs = self.agent.get_xfer_descs(np.vstack(dst_reqs), "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            src_descs,
+            dst_descs,
+            peer_name,
+            notif.encode("ascii"),
+        )
+        if not xfer_handle:
+            raise Exception("Failed to create SWA state slice transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("Failed to post SWA state slice transfer")
+        return xfer_handle
+
     def maybe_send_extra(
         self,
         peer_name: str,
@@ -2650,6 +2714,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notif=comp_notif,
                     state_type=st,
                     force_flat=True,
+                )
+            elif (
+                st == StateType.SWA
+                and not self.is_mla_backend
+                and self.attn_tp_size != decode_tp_size
+            ):
+                h = self._send_swa_state_slice(
+                    peer_name=peer_name,
+                    prefill_swa_page_indices=src_indices,
+                    src_state_data_ptrs=src_ptrs,
+                    src_state_item_lens=src_lens,
+                    dst_state_data_ptrs=dst_ptrs,
+                    dst_swa_page_indices=dst_indices,
+                    dst_state_item_lens=dst_lens,
+                    dst_gpu_id=dst_gpu_id,
+                    notif=comp_notif,
+                    decode_tp_size=decode_tp_size,
+                    decode_tp_rank=decode_tp_rank,
                 )
             elif st in (
                 StateType.SWA,

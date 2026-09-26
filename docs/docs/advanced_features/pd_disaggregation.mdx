@@ -297,6 +297,8 @@ Enable the staging buffer when prefill and decode use **different TP sizes** wit
 
 > **Note:** The staging buffer is designed for non-MLA models (e.g. GQA, MHA). MLA models (e.g. DeepSeek-V2/V3) should not enable this flag.
 
+> **Note:** You can use different attention TP sizes for hybrid sliding-window models (e.g. `openai/gpt-oss-120b`) with Mooncake or NIXL. For unequal TP, both backends transfer the sliding-window KV by token and KV-head slice. The staging buffer carries only full-attention KV. Use `--pp-size 1` and leave `--enable-unified-memory` disabled for this configuration.
+
 ### Environment Variables
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
