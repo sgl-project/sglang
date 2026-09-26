@@ -1766,7 +1766,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
-                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
+                if is_qwen4_qsa_state and target_rank_registration_info is not None:
+                    # Reject QSA state layout mismatches up front.
                     if len(dst_item_lens) != len(dst_data_ptrs):
                         raise RuntimeError(
                             f"Replicated {st.upper()} destination pointer/item-length "
@@ -1791,6 +1792,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "prefill and decode entries: "
                             f"{layout_mismatches}"
                         )
+                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
                     local_tp_rank_in_group = (
                         self.kv_args.engine_rank % self.attn_tp_size
                     )

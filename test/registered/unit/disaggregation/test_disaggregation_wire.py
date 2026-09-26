@@ -456,6 +456,51 @@ class TestQwen4StateWire(unittest.TestCase):
             [(0, 2), (1, 3)],
         )
 
+    def _qsa_compressed_manager(self, *, src_item_len):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 4
+        manager.pp_size = 1
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            state_types=[StateType.QSA_COMPRESSED],
+            state_data_ptrs=[[1000]],
+            state_item_lens=[[src_item_len]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[24]],
+        )
+        manager.sent = []
+        manager._send_kvcache_generic = lambda **kw: manager.sent.append(kw) or 0
+        return manager
+
+    def test_qsa_compressed_layout_mismatch_rejected_before_transfer(self):
+        """Equal attention TP with fp8 on one peer only halves that peer's
+        compressed item length. The transfer uses the source length as the
+        destination stride, so the mismatch must be rejected before any write."""
+        req = SimpleNamespace(mooncake_session_id="session", dst_state_indices=[[3]])
+        decode_info = SimpleNamespace(
+            dst_attn_tp_size=4,
+            dst_state_data_ptrs=[[2000]],
+            dst_state_item_lens=[[16]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[24]],
+        )
+        manager = self._qsa_compressed_manager(src_item_len=32)
+        with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
+            MooncakeKVManager.maybe_send_extra(
+                manager, req, [[3]], None, target_rank_registration_info=decode_info
+            )
+        self.assertEqual(manager.sent, [])
+
+        manager = self._qsa_compressed_manager(src_item_len=16)
+        rc = MooncakeKVManager.maybe_send_extra(
+            manager, req, [[3]], None, target_rank_registration_info=decode_info
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(manager.sent), 1)
+        self.assertEqual(manager.sent[0]["item_lens"], [16])
+
     def test_replicated_state_tp_policy(self):
         for src_tp, dst_tp, rank, expected in (
             (4, 1, 0, True),
