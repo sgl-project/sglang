@@ -105,40 +105,25 @@ For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/h
 
 #### Execute Accuracy Evaluation
 
-EvalScope connects to the SGLang server via OpenAI-compatible API. The following example uses the GSM8K dataset:
+Use sgl-eval for GSM8K and MMLU. It owns the datasets, chat prompts and graders. EvalScope remains available for the other benchmarks below:
 
 ```shell Command
-evalscope eval \
+pip install sgl-eval
+sgl-eval run gsm8k \
  --model /home/weights/Qwen2.5-7B-Instruct \
- --api-url http://localhost:30000/v1 \
- --api-key EMPTY \
- --eval-type openai_api \
- --datasets gsm8k \
- --limit 10
+ --base-url http://localhost:30000/v1 \
+ --num-examples 10 --max-tokens 2048
 ```
 
-Upon completion, results similar to the following will be displayed:
-
-```text
-+---------------------+-----------+----------+----------+-------+---------+---------+
-| Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
-+=====================+===========+==========+==========+=======+=========+=========+
-| Qwen2.5-7B-Instruct | gsm8k     | mean_acc | main     |     5 |     1.0 | default |
-+---------------------+-----------+----------+----------+-------+---------+---------+
-```
-
-> **Note**: Output format may vary slightly across different EvalScope versions. The above example is from EvalScope 1.6.x. Ensure the `--model` parameter matches the model name returned by the SGLang server's `/v1/models` endpoint. When starting the server with an HF path (e.g., `Qwen/Qwen2.5-7B-Instruct`), use that path directly. For local paths, pass the full path or the model name returned by `/v1/models`.
+The run directory contains `metrics.json` and per-example predictions. Use the model name reported by `/v1/models`.
 
 #### Common Datasets for Online Evaluation
 
 ```shell Command
 # MMLU
-evalscope eval \
+sgl-eval run mmlu \
  --model /home/weights/Qwen2.5-7B-Instruct \
- --api-url http://localhost:30000/v1 \
- --api-key EMPTY \
- --eval-type openai_api \
- --datasets mmlu
+ --base-url http://localhost:30000/v1 --max-tokens 2048
 
 # CEval (Chinese evaluation)
 evalscope eval \
@@ -241,7 +226,7 @@ When using EvalScope commands without specifying a dataset or model path, it wil
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/adapters.py", line 676, in send
     raise SSLError(e, request=request)
-requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
+requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/ceval (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
 **Temporary workaround (test only):**

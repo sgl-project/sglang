@@ -37,8 +37,10 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
-from sglang.kernels.ops.attention.dsv4.gemm import mark_hpc_bf16xfp32_gemm_enabled
+from sglang.kernels.ops.gemm.bf16_fp32 import (
+    linear_bf16_fp32,
+    mark_hpc_bf16xfp32_gemm_enabled,
+)
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
@@ -749,7 +751,6 @@ class LongcatFlashForCausalLM(nn.Module):
         )
 
     def post_load_weights(self, weight_names=None):
-
         # Perform post-processing after loading weights
         if weight_names is None:
             layer_ids = range(self.config.num_hidden_layers)
@@ -961,7 +962,6 @@ class LongcatFlashForCausalLM(nn.Module):
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

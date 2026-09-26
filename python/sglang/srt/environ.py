@@ -576,6 +576,16 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
+    # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
+    # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
+    # nothing else; at any other page size the view is never built and this
+    # flag does nothing whichever way it is set. Where it does apply the win
+    # grows with context (~1-2% throughput and 3-7% TTFT at 60k and above) and
+    # is flat to marginally negative at moderate ISL, so this is a per-workload
+    # switch rather than a pure kill-switch. Off falls back to the contiguous
+    # gather path. Default on.
+    SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
@@ -698,8 +708,9 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Off by default (no behavior/perf impact when disabled).
-    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    # below fires. Only applies to backends that ack the drain
+    # (supports_deferred_decode_kv_release).
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
@@ -908,6 +919,12 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
+    SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
+    SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
@@ -971,10 +988,6 @@ class Envs:
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
-    # Write K and V into the FIA paged KV cache with a single
-    # npu_scatter_pa_kv_cache call instead of two npu_scatter_nd_update_
-    # kernels (one write kernel launch instead of two per layer).
-    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
@@ -1000,6 +1013,9 @@ class Envs:
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
+    # since the block-scale MoE kernel lacks SwiGLU-OAI
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
@@ -1008,7 +1024,7 @@ class Envs:
     # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
     # default CUTLASS path. Only takes effect on a GPU with a matching
     # dtype=fp8_w8a8_channelwise config JSON under
-    # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
+    # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
@@ -1244,6 +1260,9 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
+    # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
+    SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1735,22 +1754,18 @@ class Envs:
     # output and the latent|shared MoE reduce; everything else falls back to
     # the regular all-reduce path. Auto-enabled on SM100/SM103 when
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
-    # either direction. See srt/layers/k3_ar_fusion.py.
+    # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
     # TP8 GB300 configuration; set 0/1 to override. See
-    # srt/layers/k3_sp_collective.py.
+    # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
-    # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
-    # kernel computes the TP-local o_proj partial and the cross-rank sum over
-    # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
-    SGLANG_K3_GEMM_AR = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -1769,13 +1784,6 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
-    SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
-    SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
-    # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
-    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
-    # Distinct workspace configurations allowed in one process. Production
-    # uses one model/configuration per rank, so fail closed on accidental reuse.
-    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
 
     # ===================================================================
     # Plugin system
@@ -1887,10 +1895,22 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
+        note=(
+            "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "
+            "Without it an eligible model auto-enables the legacy mnnvl "
+            "backend rather than the CuTe DSL fusion."
+        )
+    ),
+    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
+        note="One workspace per process is now an invariant, not a limit."
+    ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
+    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
         note="Buffer-mode anchor pinning is always on; set "
         "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."

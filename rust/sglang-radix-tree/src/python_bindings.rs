@@ -677,26 +677,26 @@ impl InsertResultBinding {
 #[derive(Clone, Default)]
 pub struct DecLockRefParamsBinding {
     pub node_id: Option<NodeId>,
-    pub swa_uuid_for_lock: Option<i64>,
-    pub swa_uuid_for_host_lock: Option<i64>,
     pub skipped_lock_components: Vec<u8>,
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
 }
 
 #[pymethods]
 impl DecLockRefParamsBinding {
     #[new]
-    #[pyo3(signature = (node_id = None, swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skipped_lock_components = Vec::new()))]
+    #[pyo3(signature = (node_id = None, skipped_lock_components = Vec::new(), *, component_lock_uuids = None, component_host_lock_uuids = None))]
     fn new(
         node_id: Option<NodeId>,
-        swa_uuid_for_lock: Option<i64>,
-        swa_uuid_for_host_lock: Option<i64>,
         skipped_lock_components: Vec<u8>,
+        component_lock_uuids: Option<HashMap<u8, Option<i64>>>,
+        component_host_lock_uuids: Option<HashMap<u8, Option<i64>>>,
     ) -> Self {
         DecLockRefParamsBinding {
             node_id,
-            swa_uuid_for_lock,
-            swa_uuid_for_host_lock,
             skipped_lock_components,
+            component_lock_uuids: component_lock_uuids.unwrap_or_default(),
+            component_host_lock_uuids: component_host_lock_uuids.unwrap_or_default(),
         }
     }
 }
@@ -706,9 +706,9 @@ impl DecLockRefParamsBinding {
     fn to_dec_lock_ref_params(&self) -> PyResult<DecLockRefParams> {
         Ok(DecLockRefParams {
             node_id: self.node_id,
-            swa_uuid_for_lock: self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: self.swa_uuid_for_host_lock,
             skipped_lock_components: component_set_from_py(&self.skipped_lock_components)?,
+            component_lock_uuids: self.component_lock_uuids.clone(),
+            component_host_lock_uuids: self.component_host_lock_uuids.clone(),
         })
     }
 }
@@ -719,9 +719,9 @@ impl DecLockRefParamsBinding {
 pub struct IncLockRefResultBinding {
     delta: Option<usize>,
     node_id: Option<NodeId>,
-    swa_uuid_for_lock: Option<i64>,
-    swa_uuid_for_host_lock: Option<i64>,
     skipped_lock_components: Vec<u8>,
+    component_lock_uuids: HashMap<u8, Option<i64>>,
+    component_host_lock_uuids: HashMap<u8, Option<i64>>,
 }
 
 impl IncLockRefResultBinding {
@@ -729,8 +729,8 @@ impl IncLockRefResultBinding {
         Self {
             delta: result.delta,
             node_id: result.node_id,
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
+            component_lock_uuids: result.component_lock_uuids,
+            component_host_lock_uuids: result.component_host_lock_uuids,
             skipped_lock_components: result
                 .skipped_lock_components
                 .iter()
