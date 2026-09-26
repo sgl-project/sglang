@@ -761,7 +761,15 @@ class _NonIntrusiveDumper:
             return {"": value}
 
         if isinstance(value, (tuple, list)):
-            tensors = [t for t in value if isinstance(t, torch.Tensor)]
+            tensors = []
+            for item in value:
+                if isinstance(item, (tuple, list)):
+                    continue
+                tensor = _NonIntrusiveDumper._convert_value(
+                    item, skip_forward_batch=skip_forward_batch
+                ).get("")
+                if isinstance(tensor, torch.Tensor):
+                    tensors.append(tensor)
             if len(tensors) == 1:
                 return {"": tensors[0]}
             return {str(i): t for i, t in enumerate(tensors)}
@@ -1709,6 +1717,7 @@ class _SGLangPlugin(_FrameworkPlugin):
     try:
         from sglang.srt import distributed as _dist
         from sglang.srt.layers import dp_attention as _dp_attn
+        from sglang.srt.layers.communicator import UnreducedOutput
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.model_executor.forward_batch_info import (
             ForwardBatch,
@@ -1779,6 +1788,11 @@ class _SGLangPlugin(_FrameworkPlugin):
             return result
         if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
+        if isinstance(value, self.UnreducedOutput):
+            # Anonymous key keeps the caller's sub-name (e.g. layers.N.inputs.1);
+            # the payload is still unreduced by design, so dump it as-is rather
+            # than running the owed collective from inside a hook.
+            return {"": value.partial}
 
         return None
 
