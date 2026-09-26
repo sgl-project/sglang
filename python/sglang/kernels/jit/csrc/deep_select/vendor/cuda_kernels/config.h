@@ -8,7 +8,8 @@ template<
     uint32_t max_topk_,
     uint32_t num_threads_, uint32_t target_occupancy_,
     uint32_t elements_per_round_, uint32_t reconstruct_threshold_, uint32_t tma_buffer_depth_, uint32_t elements_per_segment_ = 512,
-    uint32_t cluster_size_ = 1
+    uint32_t cluster_size_ = 1,
+    bool page_transform_ = false    // [SGLang] map indices through `TopkSelectArgs::page_table` in the epilogue
 >
 struct TopkSelectConfig {
     using ValueT = ValueT_;
@@ -24,4 +25,5 @@ struct TopkSelectConfig {
     static constexpr uint32_t tma_buffer_depth = tma_buffer_depth_;
     static constexpr uint32_t elements_per_segment = elements_per_segment_;
     static constexpr uint32_t cluster_size = cluster_size_; // (1 = not a cluster variant)
+    static constexpr bool page_transform = page_transform_;
 };
