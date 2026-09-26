@@ -655,6 +655,38 @@ class TestMhcOnTheDeclarations(CustomTestCase):
             last._steps.ffn_output_move, MHCCommunicateSummableTensorPairFn._gather
         )
 
+    def test_an_input_scattered_batch_keeps_the_residual_on_the_slice(self):
+        parallel = parallel_of(
+            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+        )
+        for layer_id in range(3):
+            with self.subTest(layer_id=layer_id):
+                communicator = build_mhc(
+                    layer_facts(layer_id, 3), parallel, allow_reduce_scatter=True
+                )
+                steps = communicator._input_scattered_steps
+                self.assertIs(
+                    steps.ffn_input.func,
+                    MHCCommunicateWithAllReduceAndLayerNormFn._reduce_scatter_update_and_gather,
+                )
+                # The reduce-scatter onto the slice completes the FFN's sum.
+                self.assertIs(
+                    steps.ffn_output_move,
+                    MHCCommunicateSummableTensorPairFn._reduce_scatter_and_combine,
+                )
+                self.assertTrue(steps.ffn_output_move_completes_sum)
+                # Only the first layer's input, the embedding's partial sum,
+                # is completed onto the slice.
+                self.assertIs(
+                    steps.layer_input,
+                    comm.tp_reduce_scatter if layer_id == 0 else None,
+                )
+                # Other batches run the ordinary steps.
+                self.assertIs(
+                    communicator._steps.ffn_output_move,
+                    MHCCommunicateSummableTensorPairFn._trivial,
+                )
+
     def test_two_batch_overlap_keeps_the_scatter_modes(self):
         # A dense layer before a sparse one gathers its output for the split,
         # so dense layers on every rank keep their scatter-mode steps.

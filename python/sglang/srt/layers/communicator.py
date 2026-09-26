@@ -786,14 +786,7 @@ class LayerCommunicator:
         # The steps a batch with input-scattered attention runs; None where it
         # cannot run or the steps come from the scatter modes.
         self._input_scattered_steps = (
-            _select_boundary_steps(
-                input_scattered_layer_sides(
-                    axis_sizes=_token_axis_sizes(),
-                    ffn_group=sides.ffn_output.group,
-                    hands_on_partial=allow_reduce_scatter
-                    and not layer_scatter_modes.is_last_layer,
-                )
-            )
+            self._steps_for_input_scattered(sides)
             if sides is not None and self._input_can_be_scattered()
             else None
         )
@@ -941,6 +934,17 @@ class LayerCommunicator:
             not in (ScatterMode.MOE_FULL, ScatterMode.SCATTERED),
             fused=fused,
             layer_input=_complete_scattered_input,
+        )
+
+    def _steps_for_input_scattered(self, sides: DecoderLayerSides) -> "BoundarySteps":
+        """The steps a batch with input-scattered attention runs at this layer,
+        for the layer's ordinary declarations ``sides``."""
+        return _select_boundary_steps(
+            input_scattered_layer_sides(
+                axis_sizes=_token_axis_sizes(),
+                ffn_group=sides.ffn_output.group,
+                hands_on_partial=self.allow_reduce_scatter and not self.is_last_layer,
+            )
         )
 
     def _steps_from_declarations(
