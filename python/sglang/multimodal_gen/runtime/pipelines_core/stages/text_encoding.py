@@ -9,16 +9,21 @@ This module contains implementations of prompt encoding stages for diffusion pip
 
 import inspect
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    prefer_conditioning_cache,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
+    get_tp_group,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -102,18 +107,6 @@ def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
     )
 
 
-@lru_cache(maxsize=1)
-def get_model_default_negative_prompt(
-    model_path: str, backend: Any, model_id: str | None
-):
-    from sglang.multimodal_gen.registry import get_model_info
-
-    model_info = get_model_info(model_path, backend=backend, model_id=model_id)
-    if model_info is None:
-        return None
-    return model_info.sampling_param_cls().negative_prompt
-
-
 @dataclass(frozen=True)
 class TextEncodingFingerprint:
     prompt: Any
@@ -165,8 +158,6 @@ class TextEncodingStage(ConditionEncodingStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
-        self._negative_text_cache_key = None
-        self._negative_text_cache_value = None
         self._dp_choice_logged = False
 
     def component_uses(
@@ -189,100 +180,14 @@ class TextEncodingStage(ConditionEncodingStage):
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
-        """Get the cached text embedding result or compute
-
-        this is a one-slot cache for the model-default negative prompt:
-        most requests don't override the negative prompt, the cache hit rate is considerably high
-
-        invariant: hit/miss must match across ranks -- a miss runs encode_text,
-        which may issue collectives (folding, dp encoding), so a split would
-        deadlock; keep any future eviction rank-global
-        """
-        negative_cache_key = self._build_negative_text_cache_key(
-            batch, server_args, all_indices
-        )
-        cached_negative = self._get_cached_negative_text_embedding(negative_cache_key)
-        if cached_negative is not None:
-            return cached_negative
-
-        negative_text_outputs = self.encode_text(
-            batch.negative_prompt,
-            server_args,
-            encoder_index=all_indices,
-            return_attention_mask=True,
-        )
-        self._maybe_cache_negative_text_embedding(
-            negative_cache_key, negative_text_outputs
-        )
-        return negative_text_outputs
-
-    def _should_cache_negative_text_embedding(
-        self, batch: Req, server_args: ServerArgs
-    ) -> bool:
-        if not batch.is_warmup:
-            return True
-        return self._uses_model_default_negative_prompt(batch, server_args)
-
-    def _get_cached_negative_text_embedding(self, negative_cache_key):
-        if negative_cache_key is None:
-            return None
-        if self._negative_text_cache_key == negative_cache_key:
-            return self._negative_text_cache_value
-        return None
-
-    def _maybe_cache_negative_text_embedding(
-        self,
-        negative_cache_key,
-        negative_text_outputs,
-    ) -> None:
-
-        # skip caching if None
-        if negative_cache_key is None:
-            return
-        self._negative_text_cache_key = negative_cache_key
-        self._negative_text_cache_value = tuple(
-            tuple(value) for value in negative_text_outputs
-        )
-
-    def _build_negative_text_cache_key(
-        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
-    ):
-        """if the current req doesn't worth caching, returns None"""
-        # skip if we don't cache for current req
-        if not self._should_cache_negative_text_embedding(batch, server_args):
-            return None
-
-        # Negative text encoding changes when the template or max length changes,
-        # even if the visible negative prompt string is the same.
-        return (
-            tuple(encoder_indices),
-            self.freeze_for_dedup(batch.negative_prompt),
-            self.freeze_for_dedup(batch.prompt_template),
-            batch.max_sequence_length,
-        )
-
-    def _uses_model_default_negative_prompt(
-        self, batch: Req, server_args: ServerArgs
-    ) -> bool:
-        default_negative_prompt = self._get_model_default_negative_prompt(server_args)
-        if default_negative_prompt is None:
-            return False
-        return self._normalize_negative_prompt_for_default_match(
-            batch.negative_prompt
-        ) == self._normalize_negative_prompt_for_default_match(default_negative_prompt)
-
-    def _get_model_default_negative_prompt(self, server_args: ServerArgs) -> str | None:
-        return get_model_default_negative_prompt(
-            server_args.model_path,
-            server_args.backend,
-            server_args.model_id,
-        )
-
-    @staticmethod
-    def _normalize_negative_prompt_for_default_match(value):
-        if isinstance(value, str) and not value.isspace():
-            return value.strip()
-        return value
+        """Encode negative conditioning through the shared encoder cache."""
+        with prefer_conditioning_cache():
+            return self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+            )
 
     def _append_positive_text_outputs(
         self,
@@ -696,7 +601,10 @@ class TextEncodingStage(ConditionEncodingStage):
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
-            ).to(target_device)
+            )
+            # hash the CPU tokens, without waiting for preceding GPU encoders
+            cache_inputs = dict(text_inputs)
+            text_inputs = text_inputs.to(target_device, non_blocking=True)
 
             input_ids = text_inputs["input_ids"]
             attention_mask = (
@@ -716,16 +624,6 @@ class TextEncodingStage(ConditionEncodingStage):
             dp_group = self._text_encode_dp_group(
                 server_args, encoder_config, input_ids.shape[0], text_encoder
             )
-            if dp_group is not None:
-                outputs = _data_parallel_text_encode(
-                    lambda kw: self._forward_text_encoder(text_encoder, kw),
-                    encoder_forward_kwargs,
-                    dp_group,
-                )
-            else:
-                outputs = self._forward_text_encoder(
-                    text_encoder, encoder_forward_kwargs
-                )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
@@ -734,9 +632,48 @@ class TextEncodingStage(ConditionEncodingStage):
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
             if "return_attention_mask" in postprocess_sig.parameters:
                 postprocess_kwargs["return_attention_mask"] = return_attention_mask
-            postprocess_result = postprocess_func(
-                outputs, text_inputs, **postprocess_kwargs
-            )
+
+            def encode_conditioning():
+                if dp_group is not None:
+                    outputs = _data_parallel_text_encode(
+                        lambda kw: self._forward_text_encoder(text_encoder, kw),
+                        encoder_forward_kwargs,
+                        dp_group,
+                    )
+                else:
+                    outputs = self._forward_text_encoder(
+                        text_encoder, encoder_forward_kwargs
+                    )
+                return (
+                    postprocess_func(outputs, text_inputs, **postprocess_kwargs),
+                    server_args.pipeline_config.get_text_encoder_pooler_output(
+                        outputs, i
+                    ),
+                )
+
+            if dp_group is None and isinstance(text_encoder, TextEncoder):
+                cache_group = text_encoder._encoder_tp_group
+                if cache_group is None and model_parallel_is_initialized():
+                    cache_group = get_tp_group()
+                # Cache the consumed conditioning, not every intermediate layer.
+                # The stage namespace separates pipeline postprocessing contracts.
+                postprocess_result, pooled_output = cached_encoder_call(
+                    text_encoder,
+                    (cache_inputs,),
+                    {
+                        "encoder_index": i,
+                        "return_attention_mask": return_attention_mask,
+                        "device": str(target_device),
+                    },
+                    encode_conditioning,
+                    cache_group,
+                    namespace=self,
+                    nested=False,
+                )
+            else:
+                # Batch-DP keeps caching inside each encoder copy so every rank
+                # still enters the output gather, including on a cache hit.
+                postprocess_result, pooled_output = encode_conditioning()
             prompt_embeds_mask = None
             prompt_seq_lens = None
             if isinstance(postprocess_result, TextConditioningOutput):
@@ -764,9 +701,6 @@ class TextEncodingStage(ConditionEncodingStage):
 
             embeds_list.append(prompt_embeds)
 
-            pooled_output = server_args.pipeline_config.get_text_encoder_pooler_output(
-                outputs, i
-            )
             if pooled_output is not None:
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 

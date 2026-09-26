@@ -13,6 +13,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -484,12 +486,16 @@ class NEOChatModel(PreTrainedModel):
                 grid_hw=grid_hw,
             ).last_hidden_state
         else:
-            return self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True,
-                grid_hw=grid_hw,
-            ).last_hidden_state
+            return self._reference_image_features(pixel_values, grid_hw)
+
+    @cached_conditioning
+    def _reference_image_features(self, pixel_values, grid_hw):
+        return self.vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+            grid_hw=grid_hw,
+        ).last_hidden_state
 
     def batch_chat(
         self,
