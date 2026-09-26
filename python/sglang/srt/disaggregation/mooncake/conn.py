@@ -2818,26 +2818,32 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
-        if self.conclude_state is None:
-            status = self.kv_mgr.check_status(self.bootstrap_room)
-            # Hold Success until all staging chunks transferred: a deferred
-            # chunk can still be pending, and concluding now would drop it.
-            if (
-                status == KVPoll.Success
-                and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-            ):
-                return KVPoll.Transferring
-            if status in (KVPoll.Success, KVPoll.Failed):
-                self.conclude_state = status
-                self.trace_ctx.trace_req_finish()
-            elif status == KVPoll.Bootstrapping:
-                timeout_result = self._check_bootstrap_timeout()
-                if timeout_result is not None:
-                    return timeout_result
+        return self._poll_with_status(self.kv_mgr.check_status)
 
-            return status
-        else:
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
+        if self.conclude_state is not None:
             return self.conclude_state
+
+        status = check_status(self.bootstrap_room)
+        # Hold Success until all staging chunks transferred: a deferred
+        # chunk can still be pending, and concluding now would drop it.
+        if (
+            status == KVPoll.Success
+            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+        ):
+            return KVPoll.Transferring
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+            self.trace_ctx.trace_req_finish()
+        elif status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
+
+        return status
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
