@@ -129,9 +129,18 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len. Size the buffer from the gather group itself:
+        # all_gather_into_tensor needs world_size x input elements, and with
+        # context parallelism attn_tp_size is 1 while the group spans every
+        # CP rank. Where dp_size_dim * attn_tp_size equals the group size (no
+        # CP) the shape is unchanged.
+        group_world_size = torch.distributed.get_world_size(group=self._gather_group)
+        assert group_world_size % dp_size_dim == 0, (
+            f"PrefillDelayer gather group size {group_world_size} is not "
+            f"divisible by dp_size_dim {dp_size_dim}"
+        )
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, parallel.attn_tp_size, 5),
+            (dp_size_dim, group_world_size // dp_size_dim, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
