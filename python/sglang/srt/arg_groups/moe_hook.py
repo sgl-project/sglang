@@ -180,6 +180,11 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
 
 def validate_flashinfer_megamoe_envs() -> None:
     combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() and combine_dtype != "bf16":
+        raise ValueError(
+            "FlashInfer MegaMOE NVFP4 W4A16 requires "
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=bf16."
+        )
     if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
         raise ValueError(
             "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
@@ -223,13 +228,18 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     quantization = resolved_view(server_args).quantization
     supports_megamoe_quantization = (
         quantization in ("mxfp8", "modelopt_fp4")
+        or (
+            quantization == "nvfp4_online"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
     )
     if not supports_megamoe_quantization:
         raise ValueError(
             "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
-            "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
+            "NVFP4, FP4-expert, hybrid NVFP4 MoE checkpoints, or nvfp4_online "
+            "with SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1; got "
             f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
             "are not supported."
         )
@@ -269,6 +279,13 @@ def handle_a2a_moe(server_args: Any):
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
         validate_flashinfer_megamoe_envs()
+        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+            import torch
+
+            if model_config_of(server_args).dtype != torch.bfloat16:
+                raise ValueError(
+                    "FlashInfer MegaMOE NVFP4 W4A16 requires --dtype bfloat16."
+                )
         assert cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size, (
             "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
         )
@@ -284,6 +301,26 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MegaMOE currently requires an SM100-family "
                 "CUDA device for all supported quantization formats."
             )
+        if (
+            cfg.nnodes == 1
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and resolved_view(server_args).quantization
+            in ("modelopt_fp4", "nvfp4_online")
+            and (
+                cfg.speculative_algorithm is None
+                or cfg.speculative_moe_a2a_backend == "none"
+            )
+        ):
+            # This kernel uses directly mapped peer memory. Avoid the NVSHMEM
+            # 3.4.5 proxy's uninitialized global-exit request (cudaMallocHost
+            # does not zero memory). Disable remote transports as well: the
+            # local-only flag cannot disable a full transport proxy.
+            # Device-side global_exit and proxy timeout polling are unavailable
+            # with these defaults. Preserve explicit NVSHMEM configuration and
+            # exclude drafts with their own A2A backend: these are process-wide.
+            os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+            os.environ.setdefault("NVSHMEM_IB_ENABLE_IBGDA", "0")
+            os.environ.setdefault("NVSHMEM_DISABLE_LOCAL_ONLY_PROXY", "1")
         logger.info(
             "FlashInfer MegaMOE is enabled. The expert parallel size is "
             "adjusted to be the same as the tensor parallel size[%s].",

@@ -3992,6 +3992,11 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
         elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
         ):

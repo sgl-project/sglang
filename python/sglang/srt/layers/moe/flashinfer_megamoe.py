@@ -140,7 +140,10 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
     import inspect
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+    if (
+        getattr(mega, "supports_output_view", True)
+        and "return_workspace_view" in inspect.signature(mega.forward).parameters
+    ):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -287,26 +290,46 @@ def _ensure_flashinfer_megamoe_layer(
         layer.hidden_size,
     )
 
+    process_group = None
+    if world_size > 1:
+        from sglang.srt.distributed import get_moe_ep_group
+
+        process_group = get_moe_ep_group().device_group
+    bootstrap = BootstrapConfig(
+        world_size=world_size,
+        rank=rank,
+        device=torch.cuda.current_device(),
+        process_group=process_group,
+    )
+    fleet_params = FleetParams(
+        num_experts=layer.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        token_hidden_size=layer.hidden_size,
+    )
+    backend = MegaConfig(
+        megakernel=megakernel_config,
+        preprocess_weights=False,
+        transformed_weights=transformed_weights,
+    )
     mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(
-            world_size=world_size, rank=rank, device=torch.cuda.current_device()
-        ),
-        fleet_params=FleetParams(
-            num_experts=layer.num_experts,
-            max_tokens_per_rank=max_tokens_per_rank,
-            token_hidden_size=layer.hidden_size,
-        ),
+        bootstrap=bootstrap,
+        fleet_params=fleet_params,
         # weights already preprocessed in prepare_*; with transformed_weights set
         # the kernel never reads `weights` (see MoEEpMegaLayer), so pass None.
         weights=None,
-        backend=MegaConfig(
-            megakernel=megakernel_config,
-            preprocess_weights=False,
-            transformed_weights=transformed_weights,
-        ),
+        backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+    if hasattr(megakernel_config, "knobs"):
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            MegaMoeTunedForward,
+        )
+
+        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
+            bootstrap, fleet_params, backend
+        )
+    else:
+        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
 
@@ -334,6 +357,21 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+        from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+        return _ensure_flashinfer_megamoe_layer(
+            layer,
+            megakernel_config=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=layer.intermediate_size_per_partition,
+                top_k=layer.top_k,
+                gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+                enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            ),
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        )
+
     from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
 
     input_norm_const = layer._flashinfer_megamoe_input_norm_const
@@ -360,12 +398,9 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
-            fc1_alpha=layer.g1_alphas,
-            fc2_alpha=layer.g2_alphas,
-            fc1_norm_const=layer.w2_input_scale_quant,
         ),
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
@@ -386,7 +421,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -428,31 +463,61 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     )
 
 
+def make_nvfp4_megamoe_weight_loader(
+    layer: FusedMoE, weight_loader: Callable
+) -> Callable:
+    def load_weights(*args, **kwargs):
+        # Reload into canonical views of the existing prepared allocations.
+        # The online loader also writes block scales through its inner loader,
+        # so restore all four planes before handing it the first source tensor.
+        for name, (load_view, _) in getattr(
+            layer, "_flashinfer_megamoe_weight_views", {}
+        ).items():
+            getattr(layer, name).data = load_view
+        return weight_loader(*args, **kwargs)
+
+    return load_weights
+
+
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    _init_flashinfer_megamoe_layer_state(layer)
+    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    if use_w4a16:
+        # Reload preserves the transformed-weight storage and kernel geometry.
+        # Keep the live layer and its pooled workspace reference for CUDA graphs.
+        _get_or_init_flashinfer_megamoe_layer_state(layer)
+    else:
+        _init_flashinfer_megamoe_layer_state(layer)
 
-    from flashinfer.moe_ep import (
-        MoEWeightPack,
-        preprocess_nvfp4_cutedsl_mega_weights,
-    )
+    from flashinfer.moe_ep import MoEWeightPack
 
-    if layer.hidden_size % 128 != 0:
+    if use_w4a16 and (
+        not layer.moe_runner_config.is_gated
+        or layer.moe_runner_config.activation != "silu"
+    ):
+        raise ValueError("FlashInfer W4A16 MegaMOE only supports SwiGLU (gated SiLU).")
+    if use_w4a16 and layer.moe_runner_config.apply_router_weight_on_input:
+        raise ValueError("FlashInfer W4A16 MegaMOE applies routing weights after FC2.")
+
+    hidden_alignment = 32 if use_w4a16 else 128
+    intermediate_alignment = 64 if use_w4a16 else 128
+    if layer.hidden_size % hidden_alignment != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
-            f"of 128, got {layer.hidden_size}."
+            f"of {hidden_alignment}, got {layer.hidden_size}."
         )
-    if layer.quant_config.use_per_token_activation:
+    if layer.quant_config.use_per_token_activation and not use_w4a16:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE does not support per-token activation "
             "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
             "ModelOpt NVFP4 per-token activation."
         )
-    if layer.intermediate_size_per_partition % 128 != 0:
+    if layer.intermediate_size_per_partition % intermediate_alignment != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires intermediate_size_per_partition "
-            f"to be a multiple of 128, got {layer.intermediate_size_per_partition}."
+            f"to be a multiple of {intermediate_alignment}, "
+            f"got {layer.intermediate_size_per_partition}."
         )
     if layer.num_experts % layer.moe_ep_size != 0:
         raise ValueError(
@@ -461,31 +526,56 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         )
 
     _validate_nvfp4_fc1_alpha(layer)
-    layer._flashinfer_megamoe_input_norm_const = _scalar_float(
-        layer.w13_input_scale_quant
-    )
-
-    gate_up_clamp = layer.moe_runner_config.swiglu_limit
-
     weights = MoEWeightPack(
         w13=layer.w13_weight.data,
         w2=layer.w2_weight.data,
         w13_scale=layer.w13_weight_scale.data,
         w2_scale=layer.w2_weight_scale.data,
     )
-    transformed_weights = preprocess_nvfp4_cutedsl_mega_weights(
-        weights,
-        intermediate_size=layer.intermediate_size_per_partition,
-        hidden_size=layer.hidden_size,
-        gate_up_clamp=gate_up_clamp,
-        activation_clamp=None,
-    )
+    if use_w4a16:
+        from flashinfer.moe_ep import preprocess_bf16_nvfp4_cutedsl_mega_weights
+
+        load_layouts = {}
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            param = getattr(layer, name)
+            load_layouts[name] = (param.shape, param.stride(), param.dtype)
+        transformed_weights = preprocess_bf16_nvfp4_cutedsl_mega_weights(
+            weights,
+            intermediate_size=layer.intermediate_size_per_partition,
+            hidden_size=layer.hidden_size,
+        )
+    else:
+        from flashinfer.moe_ep import preprocess_nvfp4_cutedsl_mega_weights
+
+        layer._flashinfer_megamoe_input_norm_const = _scalar_float(
+            layer.w13_input_scale_quant
+        )
+        transformed_weights = preprocess_nvfp4_cutedsl_mega_weights(
+            weights,
+            intermediate_size=layer.intermediate_size_per_partition,
+            hidden_size=layer.hidden_size,
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            activation_clamp=None,
+        )
+    if use_w4a16:
+        weight_views = getattr(layer, "_flashinfer_megamoe_weight_views", None)
+        if weight_views is not None:
+            for name, (_, prepared_view) in weight_views.items():
+                getattr(layer, name).data = prepared_view
     _bind_transformed_weights(
         layer,
         transformed_weights,
         w13_scale_name="w13_weight_scale",
         w2_scale_name="w2_weight_scale",
     )
+    if use_w4a16 and weight_views is None:
+        # Padded scale storage can exceed the canonical load shape. as_strided
+        # exposes only the original extent without allocating another copy.
+        layer._flashinfer_megamoe_weight_views = {}
+        for name, (shape, stride, dtype) in load_layouts.items():
+            prepared_view = getattr(layer, name).data
+            load_view = torch.as_strided(prepared_view.view(dtype), shape, stride)
+            layer._flashinfer_megamoe_weight_views[name] = (load_view, prepared_view)
 
 
 def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
@@ -536,49 +626,6 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
-def _ensure_shared_workspace(mega: Any) -> None:
-    """Share this layer's workspace across MegaMOE layers with identical
-    fleet/kernel geometry.
-    FlashInfer's own workspace pool keys by fc1_alpha/fc2_alpha/fc1_norm_const
-    tensor identity, but sglang binds distinct tensor objects per layer, so
-    its pool never hits across layers; key on geometry instead, since those
-    values are re-staged into the workspace per forward rather than baked
-    into the compiled kernel. Creation is collective, so it must only happen
-    on a layer's first forward, under warmup's cross-rank lockstep.
-    """
-    if mega._workspace is not None:
-        return
-    fp = mega._fleet_params
-    kc = mega._megakernel_config
-    mc = mega._mega_config
-    from sglang.srt.runtime_context import get_resources
-
-    key = (
-        getattr(kc, "kernel_name", kc.__class__.__name__),
-        mega._bootstrap.world_size,
-        fp.num_experts,
-        fp.max_tokens_per_rank,
-        fp.token_hidden_size,
-        kc.top_k,
-        kc.intermediate_size,
-        getattr(kc, "gate_up_clamp", None),
-        getattr(kc, "activation_clamp", None),
-        getattr(kc, "apply_topk_in_fc1", None),
-        getattr(kc, "kind", None),
-        getattr(kc, "in_kernel_fc2_reduce", None),
-        getattr(kc, "combine_dtype", None),
-        getattr(kc, "token_back_by_dispatch", None),
-        getattr(kc, "fast_math", None),
-        mc.quantize_input,
-    )
-    workspaces = get_resources().flashinfer_megamoe_workspaces
-    shared = workspaces.get(key)
-    if shared is None:
-        workspaces[key] = mega._ensure_workspace()
-    else:
-        mega._workspace = shared
-
-
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
@@ -599,7 +646,6 @@ def run_flashinfer_megamoe(
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
-    _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
@@ -607,6 +653,8 @@ def run_flashinfer_megamoe(
         # directly into its final int64 workspace buffer. Keep this path copy-free.
         topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
+        # Stage per-layer scales on every call so FlashInfer can share its
+        # reference-counted workspace across layers and observe weight reloads.
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,

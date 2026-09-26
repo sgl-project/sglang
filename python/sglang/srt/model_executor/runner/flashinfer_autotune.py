@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -34,8 +35,10 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -94,6 +97,7 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_megamoe",
     ]
 
     from sglang.srt.layers.quantization.fp4_utils import (
@@ -169,10 +173,20 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return (
-        cache_dir
-        / f"rank_tp{mr.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.dp_rank or 0}.json"
-    )
+    rank_key = f"rank_tp{mr.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.dp_rank or 0}"
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+        and not mr.is_draft_worker
+    ):
+        from sglang.srt.platforms import current_platform
+
+        # Ordinary FlashInfer tactics use best-effort merging, but MegaMoE's
+        # namespaced records currently require one writer per file. Follow the
+        # P2P cache's device isolation, using physical UUIDs for stable identity
+        # across CUDA index remapping and restarts. Engines sharing physical GPUs
+        # must use separate SGLANG_CACHE_DIRs.
+        rank_key += f"_gpu{current_platform.get_device_uuid(mr.gpu_id)}"
+    return cache_dir / f"{rank_key}.json"
 
 
 def _autotune_tactic_sync_group(
@@ -265,7 +279,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         runs_dir = cache_path.parent / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
-        autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+        autotune_cache = runs_dir / (
+            f"{cache_path.stem}.{timestamp}.{uuid.uuid4().hex}{cache_path.suffix}"
+        )
         logger.info(
             "Running FlashInfer autotune (cache reuse DISABLED via "
             "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
@@ -277,6 +293,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            megamoe_autotune_context,
+        )
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
@@ -284,6 +303,30 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+        mega_context = empty_context()
+        if (
+            get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+            and not mr.is_draft_worker
+            and "flashinfer_megamoe" not in skip_ops
+        ):
+            # The chunk size is already per DP rank. Prepare one prefill profile
+            # independently of the optional full-model EXTEND autotune pass.
+            schedule = get_schedule()
+            prefill_num_tokens = (
+                schedule.chunked_prefill_size
+                if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+                else schedule.max_prefill_tokens
+            )
+            mega_context = megamoe_autotune_context(
+                decode_num_tokens=max(
+                    mr.max_decode_logits_rows(),
+                    get_eager_max_batch_size(mr.max_running_requests)
+                    * mr.decode_num_tokens_per_req(
+                        num_draft_tokens=max_speculative_num_draft_tokens()
+                    ),
+                ),
+                prefill_num_tokens=prefill_num_tokens,
+            )
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -291,6 +334,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
+            mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield

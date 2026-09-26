@@ -1051,9 +1051,10 @@ class Envs:
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
-    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
-    # region and can win at large batch, but makes the output accumulation order
-    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # cutedsl mega kernels (NVFP4 W4A4 / W4A16 and MXFP8). Permits in-kernel
+    # reduction; FlashInfer's tuning profile may still select external reduction.
+    # BF16 atomic accumulation is nondeterministic -- keep off for
+    # bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
     # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
@@ -1064,7 +1065,8 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
-    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
+    # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
+    # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.

@@ -14,6 +14,7 @@ register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-l
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import traceback
 import unittest
@@ -62,6 +63,146 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
+
+
+class TestMegaMoEAutotuneStartup(CustomTestCase):
+    def test_context_bridges_profile_limits(self):
+        from sglang.srt.layers.moe import flashinfer_megamoe_autotune as mega_autotune
+
+        runner = SimpleNamespace(
+            device="cuda",
+            tp_group=SimpleNamespace(world_size=1),
+            forward_stream=Mock(),
+            max_decode_logits_rows=Mock(),
+            decode_num_tokens_per_req=Mock(),
+            max_running_requests=256,
+            is_draft_worker=False,
+        )
+        general = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
+        modules = {
+            "flashinfer.autotuner": SimpleNamespace(
+                AutoTuner=SimpleNamespace(
+                    get=lambda: SimpleNamespace(
+                        get_namespaced_records=lambda _: {},
+                        load_configs=lambda _: None,
+                        save_configs=lambda _: None,
+                        publish_namespaced_records=lambda *_: None,
+                    )
+                ),
+                _collect_metadata=lambda: ENV,
+                autotune=general,
+                get_autotune_process_group=lambda: None,
+                set_autotune_process_group=lambda _: None,
+            ),
+            "sglang.srt.layers.logits_processor": SimpleNamespace(
+                autotune_dummy_run_mode=lambda **_: nullcontext()
+            ),
+        }
+        # The resolved chunk size is already per DP rank. Disabled chunking
+        # uses the scheduler's prefill ceiling; skip-op suppresses the bridge.
+        # (chunk, skip, draft, graph rows, maximum MTP width, decode, prefill)
+        cases = [
+            (4096, False, False, 128 * 6, 6, 256 * 6, 4096),
+            (-1, False, False, 8192, 6, 8192, 16384),
+            (4096, False, False, 4096, 32, 8192, 4096),
+            (4096, True, False, 128 * 6, 6, None, None),
+            (4096, False, True, 128 * 6, 6, None, None),
+        ]
+        previous = mega_autotune._active_context
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "rank.json"
+            for chunk_size, skip, draft, graph_rows, width, decode, prefill in cases:
+                runner.is_draft_worker = draft
+                runner.max_decode_logits_rows.return_value = graph_rows
+                runner.decode_num_tokens_per_req.return_value = width
+                skip_ops = {"flashinfer_megamoe"} if skip else set()
+                with (
+                    self.subTest(chunk_size=chunk_size, skip=skip, draft=draft),
+                    patch.dict(sys.modules, modules),
+                    patch.dict(
+                        os.environ,
+                        SGLANG_FLASHINFER_AUTOTUNE_CACHE="1",
+                    ),
+                    patch.multiple(
+                        autotune,
+                        flashinfer_autotune_cache_path=lambda _: cache_path,
+                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_exec=lambda: SimpleNamespace(
+                            moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
+                        ),
+                        get_eager_max_batch_size=lambda bs: bs,
+                        max_speculative_num_draft_tokens=lambda: width,
+                        get_schedule=lambda: SimpleNamespace(
+                            chunked_prefill_size=chunk_size, max_prefill_tokens=16384
+                        ),
+                    ),
+                    patch.object(
+                        autotune.torch.cuda,
+                        "current_stream",
+                        return_value=Mock(),
+                    ),
+                    patch.object(
+                        autotune.torch,
+                        "get_device_module",
+                        return_value=SimpleNamespace(stream=lambda _: nullcontext()),
+                    ),
+                ):
+                    general.reset_mock()
+                    with autotune.flashinfer_autotune_context(
+                        runner, run_lm_head=False
+                    ):
+                        general.assert_called_once_with(
+                            True,
+                            cache=None,
+                            skip_ops=skip_ops,
+                        )
+                        context = mega_autotune._active_context
+                        if prefill is None:
+                            self.assertIs(context, previous)
+                        else:
+                            self.assertIsNot(context, previous)
+                            runner.max_decode_logits_rows.assert_called_with()
+                            runner.decode_num_tokens_per_req.assert_called_with(
+                                num_draft_tokens=width
+                            )
+                            self.assertEqual(context.decode_num_tokens, decode)
+                            self.assertEqual(context.prefill_num_tokens, prefill)
+                    self.assertIs(mega_autotune._active_context, previous)
+
+            # Cache-disabled startups in the same second must still write to
+            # different files, even if they use the same device and rank.
+            with (
+                patch.dict(sys.modules, modules),
+                patch.dict(os.environ, SGLANG_FLASHINFER_AUTOTUNE_CACHE="0"),
+                patch.multiple(
+                    autotune,
+                    flashinfer_autotune_cache_path=lambda _: cache_path,
+                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_exec=lambda: SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="triton")
+                    ),
+                ),
+                patch.object(autotune.datetime, "datetime") as clock,
+                patch.object(
+                    autotune.torch.cuda, "current_stream", return_value=Mock()
+                ),
+                patch.object(
+                    autotune.torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(stream=lambda _: nullcontext()),
+                ),
+            ):
+                clock.now.return_value.strftime.return_value = "20260922_010000"
+                paths = []
+                for _ in range(2):
+                    with autotune.flashinfer_autotune_context(
+                        runner, run_lm_head=False
+                    ):
+                        paths.append(Path(general.call_args.kwargs["cache"]))
+                self.assertNotEqual(*paths)
+                for path in paths:
+                    self.assertEqual(path.parent, cache_path.parent / "runs")
+                    self.assertTrue(path.name.startswith("rank.20260922_010000."))
 
 
 class TestAutotuneCacheDigest(CustomTestCase):
@@ -251,6 +392,13 @@ class TestAutotuneCachePhases(CustomTestCase):
                 ),
                 patch.object(
                     autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
+                ),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
+                    ),
                 ),
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
             ):
