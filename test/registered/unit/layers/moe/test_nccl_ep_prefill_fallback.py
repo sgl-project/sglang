@@ -79,6 +79,113 @@ class TestNcclEpStageStateMachine(unittest.TestCase):
             dispatcher.combine_a(MagicMock())
 
 
+class TestNcclEpRankMajorContract(unittest.TestCase):
+    """CPU-only checks for the rank-major metadata contract.
+
+    These are deliberately independent of nccl4py: they lock down the
+    ownership mapping and weighted pre-reduction required by NCCL EP's
+    rank-major combine API.
+    """
+
+    def test_rank_major_format_is_distinct_from_deepep_ll(self):
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            CombineInputFormat,
+            DispatchOutputFormat,
+        )
+
+        self.assertEqual(
+            DispatchOutputFormat.NCCL_EP_RANK_MAJOR.value, "nccl_ep_rank_major"
+        )
+        self.assertEqual(
+            CombineInputFormat.NCCL_EP_RANK_MAJOR.value, "nccl_ep_rank_major"
+        )
+
+    def test_local_expert_mapping_filters_nonlocal_routes(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            rank_major_local_expert_ids,
+        )
+
+        # NCCL RM already returns local ids; -1 is padding/nonlocal routing.
+        recv_ids = torch.tensor([[[0, 1, -1, 2], [1, -1, 4, 0]]], dtype=torch.int32)
+        actual = rank_major_local_expert_ids(recv_ids, num_local_experts=2)
+        expected = torch.tensor([[[0, 1, -1, -1], [1, -1, -1, 0]]])
+        self.assertTrue(torch.equal(actual.cpu(), expected))
+
+    def test_rank_major_pre_reduce_weights_each_local_route(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            reduce_rank_major_expert_outputs,
+        )
+
+        # Two slots, each with two local routes. src2dst indexes an [E, M, H]
+        # packed output flattened as [E*M, H].
+        expert_outputs = torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        )
+        src2dst = torch.tensor([0, 2, 1, 3], dtype=torch.int32)
+        local_ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
+
+        actual = reduce_rank_major_expert_outputs(
+            expert_outputs, src2dst, local_ids, weights, (1, 2)
+        )
+        expected = torch.tensor([[[2.5, 25.0], [3.0, 30.0]]])
+        self.assertTrue(torch.equal(actual.cpu(), expected))
+
+    def test_rank_major_preprocess_emits_fp8_without_second_quantize(self):
+        """RM packing must produce the CUTLASS FP8 input directly.
+
+        A separate BF16 packed tensor followed by ``_quantize_fp8`` adds a
+        full HBM pass for every MoE layer.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+        dispatcher = object.__new__(NcclEpDispatcher)
+        recv_ids = torch.full((1, 8, 2), -1, dtype=torch.int32)
+        recv_ids[0, :2, 0] = 0
+        dispatcher._dispatch_intermediate_state = (
+            torch.zeros((1, 8, 4), dtype=torch.bfloat16),
+            recv_ids,
+            torch.ones((1, 8, 2), dtype=torch.float32),
+            torch.tensor([2], dtype=torch.int32),
+            2,
+        )
+        dispatcher.handle = MagicMock()
+        dispatcher.num_local_experts = 1
+        dispatcher.router_topk = 2
+        dispatcher.hidden_size = 4
+        dispatcher._dispatched_t = None
+        dispatcher._quantize_fp8 = MagicMock()
+
+        packed = torch.zeros((1, 256, 4), dtype=torch.float8_e4m3fn)
+        scales = torch.ones((1, 256, 1), dtype=torch.float32)
+        with patch("torch.cuda.current_stream", return_value=MagicMock(cuda_stream=0)):
+            with patch(
+                "sglang.kernels.ops.moe.ep_moe_kernels.moe_ep_deepgemm_preprocess",
+                return_value=(
+                    torch.tensor([2], dtype=torch.int32),
+                    2,
+                    torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+                    packed,
+                    scales,
+                ),
+            ) as preprocess:
+                output = dispatcher._dispatch_b_rank_major()
+
+        self.assertEqual(output.hidden_states.dtype, torch.float8_e4m3fn)
+        self.assertIs(output.hidden_states, packed)
+        self.assertIs(output.hidden_states_scale, scales)
+        self.assertEqual(
+            preprocess.call_args.kwargs["output_dtype"], torch.float8_e4m3fn
+        )
+        self.assertEqual(preprocess.call_args.args[0].shape, (2, 2))
+        self.assertEqual(preprocess.call_args.args[2].shape, (2, 4))
+        self.assertEqual(output.slot_shape, (1, 2))
+        dispatcher._quantize_fp8.assert_not_called()
+
+
 class TestNcclEpDispatchHooks(unittest.TestCase):
     """Test the DeepEPPDispatchHooks mechanism for SBO."""
 
@@ -106,9 +213,7 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
         dispatcher._dispatch_hooks = DeepEPPDispatchHooks()
 
         called = []
-        handle = dispatcher.register_deepep_dispatch_hook(
-            lambda d: called.append(d)
-        )
+        handle = dispatcher.register_deepep_dispatch_hook(lambda d: called.append(d))
         self.assertEqual(len(called), 0)
 
         dispatcher._dispatch_hooks(dispatcher)
@@ -145,9 +250,7 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
         dispatcher.dispatch_a = mock_dispatch_a.__get__(dispatcher)
         dispatcher.dispatch_b = mock_dispatch_b.__get__(dispatcher)
 
-        dispatcher.register_deepep_dispatch_hook(
-            lambda d: call_order.append("hook")
-        )
+        dispatcher.register_deepep_dispatch_hook(lambda d: call_order.append("hook"))
 
         result = dispatcher.dispatch(
             torch.randn(4, 64, dtype=torch.bfloat16),
@@ -163,9 +266,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
     def test_default_value(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = False
             result = NcclEpBuffer._resolve_max_num_sms(256)
             self.assertEqual(result, 20)
@@ -173,9 +274,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
     def test_env_override(self):
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 40
             result = NcclEpBuffer._resolve_max_num_sms(256)
@@ -185,9 +284,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
         """256 experts need at least ceil(256/14)=19 SMs (nccl_ep.cc:1305)."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 1  # too low
             result = NcclEpBuffer._resolve_max_num_sms(256)
@@ -197,9 +294,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
         """64 experts need at least ceil(64/14)=5 SMs."""
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpBuffer
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS"
-        ) as mock_env:
+        with patch("sglang.srt.environ.envs.SGLANG_NCCL_EP_MAX_NUM_SMS") as mock_env:
             mock_env.is_set.return_value = True
             mock_env.get.return_value = 1
             result = NcclEpBuffer._resolve_max_num_sms(64)
@@ -248,9 +343,7 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
                         "sglang.srt.layers.moe.utils.get_server_args"
                     ) as mock_sa:
                         mock_sa.return_value = SimpleNamespace(dwdp_size=1)
-                        result = should_skip_post_experts_all_reduce(
-                            is_tp_path=True
-                        )
+                        result = should_skip_post_experts_all_reduce(is_tp_path=True)
 
         self.assertFalse(result)
 
@@ -292,8 +385,10 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
                 "sglang.srt.layers.moe.fused_moe_triton.layer.get_tp_group",
                 return_value=tp_group_mock,
             ):
+                # Expert-major intentionally retains its legacy dispatcher;
+                # rank-major selects the new dispatcher at runtime.
                 with patch(
-                    "sglang.srt.layers.moe.token_dispatcher.nccl_ep.NcclEpDispatcher"
+                    "sglang.srt.layers.moe.token_dispatcher.nccl_ep_expert_major_legacy.NcclEpDispatcher"
                 ) as mock_disp_class:
                     create_moe_dispatcher(cfg)
 
@@ -323,14 +418,11 @@ class TestNcclRuntimeVersionParsing(unittest.TestCase):
             _nccl_runtime_version,
         )
 
-        mock_version_info = SimpleNamespace(
-            nccl=SimpleNamespace(
-                version="2.30.7"
-            )
-        )
+        mock_version_info = SimpleNamespace(nccl=SimpleNamespace(version="2.30.7"))
 
         with patch.dict("sys.modules", {"nccl": MagicMock(), "nccl.core": MagicMock()}):
             import sys
+
             mock_nccl = MagicMock()
             mock_nccl.get_version.return_value = mock_version_info
             sys.modules["nccl"] = mock_nccl
@@ -351,6 +443,7 @@ class TestNcclRuntimeVersionParsing(unittest.TestCase):
 
         with patch.dict("sys.modules", {"nccl": MagicMock(), "nccl.core": MagicMock()}):
             import sys
+
             mock_nccl = MagicMock()
             mock_nccl.get_version.return_value = None
             sys.modules["nccl"] = mock_nccl

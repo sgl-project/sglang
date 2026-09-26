@@ -778,6 +778,8 @@ class ModelRunner:
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
+        self.init_nccl_ep_comm_resources()
+
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
@@ -804,6 +806,34 @@ class ModelRunner:
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
         )
+
+    def init_nccl_ep_comm_resources(self):
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_nccl_ep():
+            return
+
+        layer_model = self.model
+        if not hasattr(layer_model, "layers"):
+            return
+        for layer in layer_model.layers:
+            moe_block = None
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                moe_block = layer.mlp.experts
+            elif hasattr(layer, "block_sparse_moe") and hasattr(
+                layer.block_sparse_moe, "experts"
+            ):
+                moe_block = layer.block_sparse_moe.experts
+            elif hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
+                moe_block = layer.moe.experts
+            elif hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
+                moe_block = layer.mixer.experts
+            if moe_block is not None and hasattr(moe_block, "dispatcher"):
+                dispatcher = moe_block.dispatcher
+                if isinstance(dispatcher, NcclEpDispatcher):
+                    dispatcher.init_comm_resources()
+                    dispatcher.init_handle_for_graph()
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)

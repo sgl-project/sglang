@@ -145,6 +145,14 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
         )
     elif a2a_backend.is_nccl_ep():
+        # Both expert_major and rank_major layouts are handled by the single
+        # NcclEpDispatcher in nccl_ep.py; the layout is resolved inside the
+        # dispatcher via get_nccl_ep_layout().  The legacy
+        # nccl_ep_expert_major_legacy.py set hidden_states_scale=None for the
+        # BF16 dispatch-output dtype, which crashes W4AFP8's
+        # apply_deepep_ll (expects a per-token-group FP8 scale).  The unified
+        # dispatcher always runs _quantize_fp8 in the EM path, producing a
+        # valid scale for both FP8 and W4AFP8 expert compute.
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
 
         return NcclEpDispatcher(

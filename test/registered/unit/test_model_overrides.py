@@ -1858,6 +1858,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(
             _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="nccl_ep", tp_size=8))
+            ),
+            {"ep_size": 8},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
                 ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
             ),
             {},

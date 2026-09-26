@@ -1271,7 +1271,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
-    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
+    # NCCL EP uses the NCCL Device API, which requires cuMem-backed windows.
+    # This must happen before the scheduler creates the EP communicator; an
+    # inherited NCCL_CUMEM_ENABLE=0 would otherwise make Group.create fail.
+    if server_args.moe_a2a_backend == "nccl_ep":
+        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    elif "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ

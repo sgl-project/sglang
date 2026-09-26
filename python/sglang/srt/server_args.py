@@ -2294,6 +2294,11 @@ class ServerArgs:
         "NCCL EP dispatch algorithm. Only `low_latency` is implemented; `auto` resolves to it. The high-throughput (prefill) path is a follow-up.",
         NS("exec.moe"),
     ] = "low_latency"
+    nccl_ep_layout: A[
+        Literal["expert_major", "rank_major"],
+        "NCCL EP low-latency layout. `expert_major` is the established default. `rank_major` transports BF16 source-rank slots and packs them locally for W4AFP8 expert compute.",
+        NS("exec.moe"),
+    ] = "expert_major"
     nccl_ep_num_max_dispatch_tokens_per_rank: A[
         int,
         "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024).",

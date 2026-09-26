@@ -29,6 +29,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        NcclEpRankMajorCombineInput,
+        NcclEpRankMajorDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -154,6 +156,12 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_deepep_ll()
 
     @staticmethod
+    def format_is_nccl_ep_rank_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[NcclEpRankMajorDispatchOutput]:
+        return dispatch_output.format.is_nccl_ep_rank_major()
+
+    @staticmethod
     def format_is_deepep(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
@@ -171,6 +179,7 @@ class DispatchOutputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    NCCL_EP_RANK_MAJOR = "nccl_ep_rank_major"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
 
@@ -185,6 +194,9 @@ class DispatchOutputFormat(Enum):
 
     def is_deepep_ll(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_LL
+
+    def is_nccl_ep_rank_major(self) -> bool:
+        return self == DispatchOutputFormat.NCCL_EP_RANK_MAJOR
 
     def is_deepep(self) -> bool:
         return self in [
@@ -235,6 +247,12 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.DEEPEP_LL
 
     @staticmethod
+    def format_is_nccl_ep_rank_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[NcclEpRankMajorCombineInput]:
+        return combine_input.format == CombineInputFormat.NCCL_EP_RANK_MAJOR
+
+    @staticmethod
     def format_is_deepep(
         combine_input: CombineInput,
     ) -> TypeGuard[Union[DeepEPNormalCombineInput, DeepEPLLCombineInput]]:
@@ -254,6 +272,7 @@ class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    NCCL_EP_RANK_MAJOR = "nccl_ep_rank_major"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
 

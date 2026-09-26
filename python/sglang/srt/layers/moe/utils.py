@@ -220,6 +220,20 @@ class NcclEpMode(Enum):
         return self == NcclEpMode.LOW_LATENCY
 
 
+class NcclEpLayout(Enum):
+    """NCCL EP low-latency receive layout.
+
+    EXPERT_MAJOR is the historical SGLang path. RANK_MAJOR keeps NCCL's
+    source-rank slots through transport and is packed locally for expert GEMM.
+    """
+
+    EXPERT_MAJOR = "expert_major"
+    RANK_MAJOR = "rank_major"
+
+    def is_rank_major(self) -> bool:
+        return self == NcclEpLayout.RANK_MAJOR
+
+
 class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
@@ -325,6 +339,7 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
     moe.deepep_config = server_args.deepep_config or ""
     moe.nccl_ep_mode = NcclEpMode(server_args.nccl_ep_mode)
+    moe.nccl_ep_layout = NcclEpLayout(server_args.nccl_ep_layout)
     moe.nccl_ep_num_max_dispatch_tokens_per_rank = int(
         server_args.nccl_ep_num_max_dispatch_tokens_per_rank or 0
     )
@@ -387,6 +402,13 @@ def get_nccl_ep_mode() -> NcclEpMode:
     if moe.nccl_ep_mode is None:
         moe.nccl_ep_mode = NcclEpMode.LOW_LATENCY
     return moe.nccl_ep_mode
+
+
+def get_nccl_ep_layout() -> NcclEpLayout:
+    moe = get_flags().moe
+    if moe.nccl_ep_layout is None:
+        moe.nccl_ep_layout = NcclEpLayout.EXPERT_MAJOR
+    return moe.nccl_ep_layout
 
 
 def get_nccl_ep_num_max_dispatch_tokens_per_rank() -> int:

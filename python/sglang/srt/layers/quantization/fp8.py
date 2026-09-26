@@ -1075,6 +1075,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
                 get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_nccl_ep()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
             )

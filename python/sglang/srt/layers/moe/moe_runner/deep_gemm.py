@@ -47,6 +47,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+        NcclEpRankMajorCombineInput,
+        NcclEpRankMajorDispatchOutput,
+    )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -790,6 +794,54 @@ def post_permute_deep_gemm_to_deepep_ll(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
+    )
+
+
+@register_pre_permute("nccl_ep_rank_major", "deep_gemm")
+def pre_permute_nccl_ep_rank_major_to_deep_gemm(
+    dispatch_output: NcclEpRankMajorDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Feed the dispatcher's packed expert-major view to masked DeepGEMM."""
+    running_state["src2dst"] = dispatch_output.src2dst
+    running_state["local_topk_ids"] = dispatch_output.local_topk_ids
+    running_state["recv_topk_weights"] = dispatch_output.recv_topk_weights
+    running_state["slot_shape"] = dispatch_output.slot_shape
+    running_state["hidden_states_shape"] = dispatch_output.hidden_states.shape
+    running_state["hidden_states_dtype"] = dispatch_output.hidden_states.dtype
+    running_state["hidden_states_device"] = dispatch_output.hidden_states.device
+    # NCCL carries BF16 and the dispatcher quantizes the packed activation in
+    # fixed groups of 128, matching the DeepEP LL activation contract.
+    running_state["mxfp8_act_gran_k"] = 128
+
+    return DeepGemmRunnerInput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        use_masked_gemm=True,
+        masked_m=dispatch_output.masked_m,
+        expected_m=dispatch_output.expected_m,
+    )
+
+
+@register_post_permute("deep_gemm", "nccl_ep_rank_major")
+def post_permute_deep_gemm_to_nccl_ep_rank_major(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> NcclEpRankMajorCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+        NcclEpRankMajorCombineInput,
+    )
+
+    return NcclEpRankMajorCombineInput(
+        hidden_states=runner_output.hidden_states,
+        src2dst=running_state["src2dst"],
+        local_topk_ids=running_state["local_topk_ids"],
+        recv_topk_weights=running_state["recv_topk_weights"],
+        slot_shape=running_state["slot_shape"],
     )
 
 
