@@ -268,12 +268,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
-        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
-        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
-        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
-        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
-        # layout and is intentionally excluded so the attn_tp-local
-        # num_token_non_padded adjustment still runs for it.
+        # True if the DSA or MLA prefill-CP flavor is active. These flavors
+        # feed a zigzag-split rank-local layout into the runner; MHA-arch
+        # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
+        # attn_tp-replicated layout and is intentionally excluded so the
+        # attn_tp-local num_token_non_padded adjustment still runs for it.
         self.enable_prefill_cp = is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()

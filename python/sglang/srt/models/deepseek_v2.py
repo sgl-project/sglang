@@ -75,7 +75,6 @@ from sglang.srt.layers.communicator import (
     layer_input_buffer,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
-    DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -2632,9 +2631,13 @@ class DeepseekV2DecoderLayer(nn.Module):
     ):
         """The communicator for this layer's norms; it chooses its boundary
         steps from them at construction."""
-        if get_parallel().enable_prefill_cp:
-            communicator_cls = DSACPLayerCommunicator
-        elif not self.is_nextn and _use_mnnvl_cutedsl_fusion():
+        # Prefill CP runs the base communicator, which chooses its CP steps
+        # from the declarations.
+        if (
+            not get_parallel().enable_prefill_cp
+            and not self.is_nextn
+            and _use_mnnvl_cutedsl_fusion()
+        ):
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
             from sglang.srt.layers.moe.cutedsl_ar_fusion import (
                 CuteDSLFusionLayerCommunicator,

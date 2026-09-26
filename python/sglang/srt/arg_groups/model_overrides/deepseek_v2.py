@@ -102,8 +102,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
+                # The DSA / MLA CP gather and reduce-scatter
+                # (communicator_dsa_cp) assume it.
                 attn_cp_size = cfg.tp_size // cfg.dp_size
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
@@ -167,8 +167,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
             )
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # DSACPLayerCommunicator does not all-reduce attention-TP
-            # partial o_proj outputs before replicated dense FFNs.
+            # The DSA / MLA CP gather and reduce-scatter
+            # (communicator_dsa_cp) assume it.
             attn_cp_size = cfg.tp_size // cfg.dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
