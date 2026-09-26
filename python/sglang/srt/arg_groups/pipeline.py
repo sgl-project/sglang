@@ -148,7 +148,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
-    run_hook(handle_decode_context_parallelism, server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
     # resolution (the declarative registry materializes too late to affect
@@ -261,6 +260,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+
+    # Handle decode context parallelism. After the model overrides: the DSA
+    # check reads the resolved DSA backends, and Kimi-K3 reads the comm
+    # backend this declares through `dcp_comm_backend_of`.
+    run_hook(handle_decode_context_parallelism, server_args)
 
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
