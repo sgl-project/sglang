@@ -7,11 +7,16 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.gemm.fp8_kernel import (
+    get_w8a8_channelwise_fp8_config,
+    triton_scaled_mm,
+    w8a8_block_fp8_matmul_deepgemm,
+    w8a8_block_fp8_matmul_triton,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
-    get_w8a8_channelwise_fp8_config,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -19,9 +24,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
-    triton_scaled_mm,
-    w8a8_block_fp8_matmul_deepgemm,
-    w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -815,9 +817,9 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     weight_scale_swizzled: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    from sglang.kernels.ops.gemm.fp8_kernel import w8a8_mxfp8_matmul_deepgemm
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
-        w8a8_mxfp8_matmul_deepgemm,
     )
 
     assert input_scale is None

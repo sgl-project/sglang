@@ -785,15 +785,15 @@ The command evaluates all 57 subjects. Historical results below use the removed 
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --thinking-mode deepseek-v3
+sgl-eval run gpqa --base-url http://127.0.0.1:30000/v1 --num-examples 198 --max-tokens 128000 --n-repeats 8 --thinking
 ```
 
-- **Test Results** (model: `deepseek-ai/DeepSeek-V3.2-Exp`, 8×B200):
+- **Historical Test Results** (model: `deepseek-ai/DeepSeek-V3.2-Exp`, 8×B200; measured with the earlier `sglang.test.run_eval` GPQA command):
   - Default (`temperature=0`): mean **0.797** over 8 runs — closely matches the official GPQA-Diamond score of **79.9** for DeepSeek-V3.2-Exp reported in its [model card](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp)
   - With `temperature=1.0, top_p=0.95` (as recommended by DeepSeek):
 
 ```shell Command
-python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
+sgl-eval run gpqa --base-url http://127.0.0.1:30000/v1 --num-examples 198 --max-tokens 128000 --n-repeats 8 --top-p 0.95 --temperature 1.0 --thinking
 ```
 
   ```

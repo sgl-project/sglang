@@ -1235,7 +1235,9 @@ class BufferModePipeline:
                 key=key,
                 value=torch.cat([req.prefix_indices, device_indices]),
                 prev_prefix_len=splice_base,
-                swa_evicted_seqlen=(span_end - staged_swa) if staged_swa else 0,
+                component_evicted_seqlens={
+                    ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0
+                },
             )
         )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(

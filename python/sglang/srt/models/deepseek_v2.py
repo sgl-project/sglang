@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.dsv4 import (
+from sglang.kernels.ops.moe.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -191,6 +191,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     attention_backends,
     get_device,
     get_exec,
@@ -548,7 +549,7 @@ class MoEGate(nn.Module):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-            from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 
             logits = linear_bf16_fp32(hidden_states, self.weight)
 
@@ -3451,6 +3452,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
+        lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
         # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
         defer_moe_finalize=False,
     ):
