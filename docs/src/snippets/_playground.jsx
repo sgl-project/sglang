@@ -400,6 +400,13 @@ export const Playground = ({ config }) => {
     "--hicache-storage-backend-extra-config",
   ];
 
+  // `umbp.roleOverrides: [{mode, when, enable, allowTp, env?, flags?, note?}]` —
+  // first entry whose PD role and `when` match the live selection. `enable` is
+  // the default when the reader has not toggled the card; `allowTp` lifts
+  // requiresDpAttention; env / flags join the recipe while it is on.
+  const umbpRoleOverride = (fc, sel, h) => (fc.roleOverrides || []).find((r) =>
+    r && sel && r.mode === sel.pdMode && (!r.when || h.matchConstraint(sel, r.when)));
+
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
   // the canonical pair plus all per-family legacy spellings.
@@ -983,11 +990,18 @@ export const Playground = ({ config }) => {
     pdDisagg: {
       // The transport default is the config's first entry, so a model whose
       // recipes standardize on one backend does not silently start on another.
-      initState: (fc) => ({
-        mode: "off",
-        transferBackend: (fc && (fc.transferBackends || [])[0] || {}).id || "mooncake",
-        ibDevice: "auto",
-      }),
+      // An entry with `defaultWhen` takes over as the default for the selections
+      // it matches (e.g. MORI and the rdmaN NIC list on ROCm).
+      initState: (fc, base) => {
+        const pick = (entries) => (entries || []).find((e) =>
+          e && e.defaultWhen && base && matchConstraint(base, e.defaultWhen));
+        const backends = (fc && fc.transferBackends) || [];
+        return {
+          mode: "off",
+          transferBackend: (pick(backends) || backends[0] || {}).id || "mooncake",
+          ibDevice: (pick(fc && fc.ibDevices) || {}).id || "auto",
+        };
+      },
 
       apply: ({ flags, env, value, sel, fc, h }) => {
         // The bootstrap port is the base cell's to choose — the router's
@@ -1057,6 +1071,11 @@ export const Playground = ({ config }) => {
             flags = h.stripFlagsByFirstToken(
               flags, roleSpec.flags.map((f) => f.split(/[\s=]/)[0]));
             adds.push(...roleSpec.flags);
+          }
+          // `stripFlags` drops base-cell flags the role has no use for (an
+          // aggregated-serving knob) without re-emitting a value of its own.
+          if (modeOk && roleSpec && roleSpec.stripFlags && roleSpec.stripFlags.length) {
+            flags = h.stripFlagsByFirstToken(flags, roleSpec.stripFlags);
           }
           // Single-host needs no --dist-init-addr: prefill/decode derive their
           // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
@@ -1373,24 +1392,28 @@ export const Playground = ({ config }) => {
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const roleOverride = umbpRoleOverride(fc, sel, h);
         const ownedHeads = [
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
           ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
         ];
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
-        if (fc.requiredEnv && fc.requiredEnv.length) {
-          env = h.stripEnvByPrefix(env, fc.requiredEnv.map((e) => e.split("=")[0]));
+        const ownedEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        if (ownedEnv.length) {
+          env = h.stripEnvByPrefix(env, ownedEnv.map((e) => e.split("=")[0]));
         }
         const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
+          ? value.enable
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
         if (!enabled) return { flags, env };
         if (fc.onlyHw && sel && !fc.onlyHw.includes(sel.hw)) return { flags, env };
         // The linker keys by DP rank; under pure TP each rank opens its own
         // keyspace and the store holds TP copies of the same tokens, so the
         // recipe is only meaningful with DP attention on. Read it off the live
         // flags rather than the Deploy dims — the attention axis runs first.
-        if (fc.requiresDpAttention
+        // A role override with `allowTp` is a TP-only shape validated as-is.
+        if (fc.requiresDpAttention && !(roleOverride && roleOverride.allowTp)
           && !flags.some((f) => f.split(/[\s=]/)[0] === "--enable-dp-attention")) {
           return { flags, env };
         }
@@ -1401,17 +1424,22 @@ export const Playground = ({ config }) => {
           "--enable-unified-cache-external-linker",
           `--unified-cache-external-linker-backend ${backend}`,
           ...(fc.requiredFlags || []),
+          ...((roleOverride && roleOverride.flags) || []),
         ]);
-        env = [...env, ...(fc.requiredEnv || []).filter((e) => !env.includes(e))];
+        const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        env = [...env, ...extraEnv.filter((e) => !env.includes(e))];
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, renderSelect, derived }) => {
         if (fc.onlyHw && !fc.onlyHw.includes(base.hw)) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const roleOverride = umbpRoleOverride(fc, base, h);
         const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
-        const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn;
+          ? value.enable
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
+        const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn
+          && !(roleOverride && roleOverride.allowTp);
         const backend = value.backend !== null
           ? value.backend : ((derived && derived.backend) || fc.defaultBackend || "mori");
         return (
@@ -1434,6 +1462,9 @@ export const Playground = ({ config }) => {
                 </span>
               )}
             </div>
+            {enabled && !needsDp && roleOverride && roleOverride.note && (
+              <div style={s.axisNote}>{roleOverride.note}</div>
+            )}
           </div>
         );
       },
@@ -1723,9 +1754,25 @@ export const Playground = ({ config }) => {
         mi355x: AMD_RDMA_DOCKER_FLAGS,
       };
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
-      // Mirrors the vendor branch in _deployment.jsx: ROCm reaches its GPUs
-      // through /dev/kfd + /dev/dri and the video group, not --gpus all.
+      // Mirrors the vendor branches in _deployment.jsx: ROCm reaches its GPUs
+      // through /dev/kfd + /dev/dri and the video group (not --gpus all), and
+      // Ascend NPUs are reached with --device, one per /dev/davinciN core (16
+      // on an A3 Series node, 8 on a 950PR/DT Series node — the catalog's
+      // `npuDevices`).
       const isAmdHw = /^mi\d/.test(sel.hw || "");
+      const HW_NPU_DEVICES = { a3: 16, a5: 8 };
+      const npuDevices = HW_NPU_DEVICES[sel.hw];
+      const davinciLines = (devices) => {
+        const lines = [];
+        for (let i = 0; i < devices; i += 4) {
+          const group = [];
+          for (let k = i; k < Math.min(i + 4, devices); k++) {
+            group.push(`--device=/dev/davinci${k}`);
+          }
+          lines.push("  " + group.join(" "));
+        }
+        return lines;
+      };
       const dockerLines = [
         ...(isAmdHw
           ? [
@@ -1735,6 +1782,21 @@ export const Playground = ({ config }) => {
               "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
               "  --shm-size 32g",
             ]
+          : npuDevices
+          ? [
+              // NPU: --privileged grants the davinci devices; the host CANN
+              // driver/firmware/state must be mounted in.
+              "docker run --privileged --shm-size=16g",
+              ...davinciLines(npuDevices),
+              "  --device=/dev/davinci_manager",
+              "  --device=/dev/hisi_hdc",
+              "  -v /usr/local/sbin:/usr/local/sbin",
+              "  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver",
+              "  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware",
+              "  -v /etc/ascend_install.info:/etc/ascend_install.info",
+              "  -v /var/queue_schedule:/var/queue_schedule",
+              "  -v ~/.cache/:/root/.cache/",
+            ]
           : [
               "docker run --gpus all",
               "  --shm-size 32g",
@@ -1743,7 +1805,8 @@ export const Playground = ({ config }) => {
         // A PD pair is cross-host even when each role is a single-node cell, so
         // the RDMA fabric flags are needed for `pdMode` too, not just multinode.
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
-        "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        // The NPU device block already mounts ~/.cache/.
+        ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),

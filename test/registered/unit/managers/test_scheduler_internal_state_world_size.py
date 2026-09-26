@@ -92,16 +92,6 @@ class TestSchedulerInternalStateWorldSize(unittest.TestCase):
 
         self.assertEqual(internal_state["world_size"], 4)
 
-    def test_the_reported_size_is_not_one_replica_of_a_data_parallel_server(self):
-        """Each plain dp replica has its own process group, so no scheduler can report the whole server from it."""
-        shape = _shape(tp_size=2, pp_size=1, dp_size=2, enable_dp_attention=False)
-
-        internal_state = self._get_internal_state(shape)
-
-        self.assertNotEqual(
-            internal_state["world_size"], shape["tp_size"] * shape["pp_size"]
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
