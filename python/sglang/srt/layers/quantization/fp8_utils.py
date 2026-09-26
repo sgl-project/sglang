@@ -1651,8 +1651,9 @@ def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
+    """Quantize BF16 or FP32 weights with 128x128 power-of-two block scales."""
     assert weight_block_size == [128, 128]
-    assert weight_dequant.dtype == torch.bfloat16, (
+    assert weight_dequant.dtype in (torch.bfloat16, torch.float32), (
         f"{weight_dequant.dtype=} {weight_dequant.shape=}"
     )
 

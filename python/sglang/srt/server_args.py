@@ -890,6 +890,9 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = ep_joiner_of(resolving_view(server_args))
+            # Ordinary peer nodes connect to the head's TCP endpoints. Checking
+            # those port numbers on the peer can conflict with unrelated services.
+            check_local_ports = server_args.node_rank == 0 or is_joiner
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
@@ -898,7 +901,7 @@ class PortArgs:
                 envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
             )
             try:
-                if dp_rank is None:
+                if dp_rank is None and check_local_ports:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
@@ -911,7 +914,7 @@ class PortArgs:
                         wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if check_local_ports and (dp_rank is None or worker_ports is None):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(

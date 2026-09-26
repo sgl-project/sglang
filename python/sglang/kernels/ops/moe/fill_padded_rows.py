@@ -30,9 +30,10 @@ def _fill_padded_rows_kernel(
 
 
 def _can_fuse_padded_region(x: torch.Tensor) -> bool:
-    # The fused kernel uses one program per row and assumes a row-major 2D
-    # tensor (columns contiguous); fall back to eager for anything else.
-    return x.dim() == 2 and x.stride(1) == 1
+    # The fused kernel is a Triton launch over one program per row and assumes
+    # a row-major 2D tensor (columns contiguous); fall back to eager for host
+    # tensors and for anything else.
+    return x.is_cuda and x.dim() == 2 and x.stride(1) == 1
 
 
 def _fill_padded_rows(
