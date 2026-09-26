@@ -158,6 +158,9 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    # (full, swa) tokens of the allocation this eviction serves. When set, eviction
+    # stops once the allocator says it fits; the counts above only cap each side.
+    alloc_demand: Optional[tuple[int, int]] = None
 
 
 @dataclasses.dataclass
