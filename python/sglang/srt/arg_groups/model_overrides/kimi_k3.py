@@ -107,23 +107,24 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
-        elif decode_backend == "aiter":
+        elif decode_backend in ("aiter", "moonmath_mla"):
+            # moonmath_mla subclasses aiter and falls back to its gluon DCP paths.
             _require_kimi_k3_aiter_gluon_dcp_support()
-            # Override prefill backend to aiter by default
+            # Override prefill backend to the decode one by default
             # if users don't explicitly specify triton
-            prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
+            prefill_ab = "triton" if prefill_backend == "triton" else decode_backend
             logger.info(
                 "Kimi-K3 DCP uses aiter MLA decode: "
                 f"prefill={prefill_backend!r} -> {prefill_ab!r}, "
-                f"decode={decode_backend!r} -> 'aiter'."
+                f"decode={decode_backend!r}."
             )
             overrides.update(
                 prefill_attention_backend=prefill_ab,
-                decode_attention_backend="aiter",
+                decode_attention_backend=decode_backend,
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla', 'aiter' or 'moonmath_mla', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
