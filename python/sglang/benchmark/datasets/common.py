@@ -29,6 +29,8 @@ class DatasetRow:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
+    cache_prefix: Optional[Any] = None
+    cache_prefix_len: Optional[int] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
