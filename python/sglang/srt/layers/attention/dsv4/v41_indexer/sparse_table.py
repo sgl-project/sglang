@@ -13,26 +13,25 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    amax8_varlen,
     amax_topk_blocks,
     candidate_row_lens,
-    get_tail_row_indices,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
     CANDIDATE_BLOCK_SIZE,
-    amax8_varlen,
     build_sparse_indexer_schedule,
     sort_candidate_blocks,
+)
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
     sparse_logits,
-    topk_transform_sparse,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
+    topk_transform_sparse,
 )
-from sglang.srt.layers.attention.dsv4.indexer import (
-    deep_gemm_fp4_paged_mqa_logits,
-    topk_transform_paged_from_metadata,
-)
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 
 from .scoring import (
@@ -49,6 +48,7 @@ from .types import (
     DecodeInputs,
     PrefillInputs,
     Selection,
+    get_tail_row_indices,
 )
 
 if TYPE_CHECKING:

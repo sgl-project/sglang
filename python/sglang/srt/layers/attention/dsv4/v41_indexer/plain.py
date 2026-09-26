@@ -11,11 +11,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
-from sglang.srt.layers.attention.dsv4.indexer import (
+from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
-    topk_transform_paged_from_metadata,
 )
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
     decode_scores,

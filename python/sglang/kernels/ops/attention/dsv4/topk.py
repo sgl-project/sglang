@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_xpu
 
+from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
 
 
@@ -131,10 +132,9 @@ def topk_transform_paged_torch(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """The torch ``topk_transform_paged``: the top-``k`` (``k = out_page_indices.shape[1]``)
-    of each row of ``scores`` within its first ``seq_lens[b]`` columns, ascending, as
-    pool slots through ``page_tables`` and, when given, as positions; ``-1`` where a
-    row has fewer than ``k`` columns."""
+    """The torch ``topk_transform_paged``: top-``k`` (``k = out_page_indices.shape[1]``)
+    of each row within its first ``seq_lens[b]`` columns, ascending, as pool slots
+    through ``page_tables`` and as positions when given; ``-1`` padded."""
     topk = out_page_indices.shape[1]
     columns = torch.arange(scores.shape[1], device=seq_lens.device)
     lens_c = seq_lens.unsqueeze(-1)
@@ -325,4 +325,19 @@ def topk_transform_packed_v2(
         out_page_indices,
         page_size,
         row_to_batch,
+    )
+
+
+def topk_transform_sparse(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
+    ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
+    column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
+    published blocks as pool slots / 8, compressed positions for logical ids."""
+    topk_transform_bf16_small(
+        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

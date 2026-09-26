@@ -13,6 +13,24 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
 
+def get_tail_row_indices(
+    full_rows_per_request: List[int],
+    tail_rows_per_request: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """int64 indices of each request's last ``tail_rows_per_request[b]`` rows, in
+    row order, copied without a host sync (pinned staging, non-blocking)."""
+    rows, start = [], 0
+    for n, t in zip(full_rows_per_request, tail_rows_per_request):
+        rows.extend(range(start + n - t, start + n))
+        start += n
+    device = torch.device(device)
+    if device.type != "cuda":
+        return torch.tensor(rows, dtype=torch.int64, device=device)
+    staged = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
+    return staged.to(device, non_blocking=True)
+
+
 class CandidateMetadata:
     def tail(self, rows_per_request: List[int]) -> CandidateMetadata:
         raise NotImplementedError(f"{type(self).__name__} is not a prefill publish")

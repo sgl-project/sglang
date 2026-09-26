@@ -16,10 +16,8 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.dense_prefill import (
-    score_tiles as score_tiles_op,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 
 from .types import (
     DecodeInputs,
@@ -227,7 +225,7 @@ def score_tiles(
     ``rows.start + i`` against ``kv[request_starts + j]``, garbage past the row's
     ``compress_lens``; the width is the batch's largest context aligned to
     ``width_align`` columns."""
-    yield from score_tiles_op(
+    yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
         weights=data.weights,

@@ -15,7 +15,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    get_tail_row_indices,
     select_candidate_block_ids,
     topk_among_blocks,
 )
@@ -35,6 +34,7 @@ from .types import (
     DecodeInputs,
     PrefillInputs,
     Selection,
+    get_tail_row_indices,
 )
 
 if TYPE_CHECKING:

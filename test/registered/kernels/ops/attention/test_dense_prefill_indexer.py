@@ -253,10 +253,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                         selected, _ = run_dense(
                             tail_inputs,
                             publish_candidates=False,
-                            candidates=[
-                                b[b.shape[0] - t :]
-                                for b, t in zip(candidates, tail_lengths)
-                            ],
+                            candidates=candidates.tail(tail_lengths),
                         )
                         self.assert_topk(tail_inputs, selected, consumer_scores[rows])
 

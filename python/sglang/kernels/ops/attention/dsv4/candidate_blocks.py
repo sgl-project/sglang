@@ -2,20 +2,27 @@
 blocks of ``block_size`` compressed positions, its newest block always, and a
 consumer selects among the kept blocks only.
 
-The per-row block counts and sparse-row lengths, the block selection (the JIT
-chain on SM100, torch elsewhere), and the torch top-k among chosen blocks."""
+The per-row block counts and sparse-row lengths, the block keys, the block
+selection (the JIT chain on SM100, torch elsewhere), and the torch top-k among
+chosen blocks."""
 
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
-from .candidate_table import CANDIDATE_BLOCK_SIZE, amax8_varlen
+from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .topk import plan_topk_v2, topk_transform_paged_v2
+from .utils import make_name
 
 
 @triton.jit
@@ -73,6 +80,44 @@ def candidate_row_lens(
         **pdl_kwargs,
     )
     return nblocks, valid
+
+
+@cache_once
+def _jit_block_amax_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("block_amax"),
+        *args,
+        cuda_files=["deepseek_v4/block_amax.cuh"],
+        cuda_wrappers=[("amax8_varlen", f"BlockAmaxKernel<{args}>::amax8_varlen")],
+    )
+
+
+def amax8_varlen(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk: int = 0,
+    *,
+    max_seqlen: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Level-one keys of the two-level indexer: ``out[b, i]`` is the max of
+    ``scores[b, 8 i : 8 i + 8]`` for ``i < ceil(seq_lens[b] / 8)``, the last of
+    them ``+inf`` (the newest block is always selected), nothing written past
+    that count. Rows with at most ``topk`` blocks are skipped (every block is
+    selected anyway); ``topk=0`` never skips. ``out`` is allocated as
+    ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
+    the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
+    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
+    of 8). Returns ``out``.
+    """
+    if out is None:
+        num_tokens, max_len = scores.shape
+        if max_seqlen == 0:
+            max_seqlen = max_len
+        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
+    _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
+    return out
 
 
 def amax_topk_blocks(
@@ -154,21 +199,3 @@ def topk_among_blocks(
     if picked.shape[1] < k:
         picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
     return picked
-
-
-def get_tail_row_indices(
-    full_rows_per_request: List[int],
-    tail_rows_per_request: List[int],
-    device: torch.device,
-) -> torch.Tensor:
-    """int64 indices of each request's last ``tail_rows_per_request[b]`` rows, in
-    row order, copied without a host sync (pinned staging, non-blocking)."""
-    rows, start = [], 0
-    for n, t in zip(full_rows_per_request, tail_rows_per_request):
-        rows.extend(range(start + n - t, start + n))
-        start += n
-    device = torch.device(device)
-    if device.type != "cuda":
-        return torch.tensor(rows, dtype=torch.int64, device=device)
-    staged = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
-    return staged.to(device, non_blocking=True)

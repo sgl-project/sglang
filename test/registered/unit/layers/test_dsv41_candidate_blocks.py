@@ -3,11 +3,11 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    get_tail_row_indices,
     select_candidate_block_ids,
     topk_among_blocks,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
