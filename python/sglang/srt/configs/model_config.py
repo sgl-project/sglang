@@ -2475,6 +2475,7 @@ def is_hybrid_swa_model(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
+        "Exaone4ForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
@@ -2482,6 +2483,13 @@ def is_hybrid_swa_model(
             "LagunaForCausalLM" in model_architectures
             and hf_text_config is not None
             and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
+        # Only treat Exaone4 as hybrid SWA when it has a window and a pattern.
+        if "Exaone4ForCausalLM" in model_architectures and not (
+            hf_text_config is not None
+            and getattr(hf_text_config, "sliding_window", None)
+            and getattr(hf_text_config, "sliding_window_pattern", None)
         ):
             return False
         return True
@@ -2544,6 +2552,15 @@ def get_hybrid_layer_ids(
     elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
+    elif "Exaone4ForCausalLM" in model_architectures:
+        # Same rule as models/exaone4.py, which does not read layer_types.
+        period = len(hf_text_config.sliding_window_pattern)
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % period != 0
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % period == 0
+        ]
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
