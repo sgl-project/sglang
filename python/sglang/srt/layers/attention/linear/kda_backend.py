@@ -259,14 +259,7 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
-        ):
-            raise NotImplementedError(
-                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
-                f"got {self.decode_kernel.__class__.__name__}."
-            )
-        return self.decode_kernel.decode(
+        return self.effective_decode_kernel(lower_bound).decode(
             q,
             k,
             v,
@@ -304,14 +297,7 @@ class KDAKernelDispatcher:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
         (FlashInfer decode -> recurrent_kda; Triton / CuTe DSL decode -> the Triton
         fused KDA verify)."""
-        if lower_bound is not None and not isinstance(
-            self.verify_kernel, TritonKDAKernel
-        ):
-            raise NotImplementedError(
-                "lower_bound (safe gate) target verify is only supported by "
-                f"TritonKDAKernel; got {self.verify_kernel.__class__.__name__}."
-            )
-        return self.verify_kernel.target_verify(
+        return self.effective_verify_kernel(lower_bound).target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -331,11 +317,27 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def effective_decode_kernel(self, lower_bound: Optional[float]):
+        """The kernel ``decode`` will actually run: safe-gate models reroute
+        kernels without ``supports_safe_gate`` to Triton."""
+        kernel = self.decode_kernel
+        if lower_bound is not None and not kernel.supports_safe_gate:
+            kernel = self.triton_kernel
+        return kernel
+
+    def effective_verify_kernel(self, lower_bound: Optional[float]):
+        """The kernel ``target_verify`` will actually run: safe-gate models reroute
+        kernels without ``supports_safe_gate`` to Triton."""
+        kernel = self.verify_kernel
+        if lower_bound is not None and not kernel.supports_safe_gate:
+            kernel = self.triton_kernel
+        return kernel
+
     def effective_extend_kernel(self, lower_bound: Optional[float]):
         """The kernel ``extend`` will actually run: safe-gate models reroute
         kernels without ``supports_safe_gate`` to Triton."""
         kernel = self.extend_kernel
-        if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
+        if lower_bound is not None and not kernel.supports_safe_gate:
             kernel = self.triton_kernel
         return kernel
 
