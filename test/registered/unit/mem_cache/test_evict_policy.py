@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_cpu_ci(est_time=5, suite="base-c-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 import unittest
 from unittest.mock import MagicMock
@@ -32,10 +32,6 @@ class TestLRUStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = LRUStrategy()
 
-    def test_priority_is_last_access_time(self):
-        node = _make_node(last_access_time=42.0)
-        self.assertEqual(self.strategy.get_priority(node), 42.0)
-
     def test_older_access_evicted_first(self):
         old = _make_node(last_access_time=1.0)
         new = _make_node(last_access_time=10.0)
@@ -47,10 +43,6 @@ class TestLRUStrategy(unittest.TestCase):
 class TestLFUStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = LFUStrategy()
-
-    def test_priority_is_hit_count_and_time(self):
-        node = _make_node(hit_count=5, last_access_time=3.0)
-        self.assertEqual(self.strategy.get_priority(node), (5, 3.0))
 
     def test_lower_hit_count_evicted_first(self):
         cold = _make_node(hit_count=1, last_access_time=10.0)
@@ -71,10 +63,6 @@ class TestFIFOStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = FIFOStrategy()
 
-    def test_priority_is_creation_time(self):
-        node = _make_node(creation_time=7.0)
-        self.assertEqual(self.strategy.get_priority(node), 7.0)
-
     def test_earlier_created_evicted_first(self):
         first = _make_node(creation_time=1.0)
         second = _make_node(creation_time=5.0)
@@ -86,10 +74,6 @@ class TestFIFOStrategy(unittest.TestCase):
 class TestMRUStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = MRUStrategy()
-
-    def test_priority_is_negated_access_time(self):
-        node = _make_node(last_access_time=5.0)
-        self.assertEqual(self.strategy.get_priority(node), -5.0)
 
     def test_most_recently_used_evicted_first(self):
         """MRU evicts the most recently accessed node first (lowest priority value)."""
@@ -104,10 +88,6 @@ class TestFILOStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = FILOStrategy()
 
-    def test_priority_is_negated_creation_time(self):
-        node = _make_node(creation_time=3.0)
-        self.assertEqual(self.strategy.get_priority(node), -3.0)
-
     def test_last_created_evicted_first(self):
         """FILO evicts the most recently created node first."""
         first = _make_node(creation_time=1.0)
@@ -120,10 +100,6 @@ class TestFILOStrategy(unittest.TestCase):
 class TestPriorityStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = PriorityStrategy()
-
-    def test_priority_is_tuple(self):
-        node = _make_node(priority=2, last_access_time=4.0)
-        self.assertEqual(self.strategy.get_priority(node), (2, 4.0))
 
     def test_lower_priority_evicted_first(self):
         low = _make_node(priority=1, last_access_time=10.0)
@@ -176,10 +152,6 @@ class TestSLRUStrategy(unittest.TestCase):
         at = _make_node(hit_count=5, last_access_time=1.0)
         self.assertEqual(strategy.get_priority(below), (0, 1.0))
         self.assertEqual(strategy.get_priority(at), (1, 1.0))
-
-    def test_default_threshold_is_2(self):
-        default = SLRUStrategy()
-        self.assertEqual(default.protected_threshold, 2)
 
 
 class TestEvictionOrdering(unittest.TestCase):

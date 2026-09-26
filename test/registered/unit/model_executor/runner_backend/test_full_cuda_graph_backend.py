@@ -24,6 +24,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -56,6 +58,11 @@ def _make_backend(runner):
     backend._outputs = {}
     backend._pool = None
     backend._capture_stream = None
+    backend._precarve = SimpleNamespace(
+        measure=contextlib.nullcontext, mint=mock.Mock()
+    )
+    backend._reuse_output_buffer = False
+    backend._output_buffer = None
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
@@ -104,6 +111,32 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
 
+    def test_prefill_shapes_share_one_output_storage(self):
+        runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+
+        outputs = iter(
+            [
+                torch.ones((4, 2)),
+                torch.ones((4, 2)),
+                torch.ones((4, 2)),
+                torch.ones((2, 2)),
+                torch.ones((2, 2)),
+                torch.ones((2, 2)),
+            ]
+        )
+        with mock.patch("torch.cuda.CUDAGraph", side_effect=["GRAPH4", "GRAPH2"]):
+            backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
+            backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
+
+        large = backend._outputs[ShapeKey(size=4)]
+        small = backend._outputs[ShapeKey(size=2)]
+        self.assertEqual(large.shape, (4, 2))
+        self.assertEqual(small.shape, (2, 2))
+        self.assertEqual(large.data_ptr(), small.data_ptr())
+        self.assertEqual(backend._output_buffer.shape, (4, 2))
+
     def test_enable_flag_set_but_no_profiler_attr_does_not_step(self):
         # The runner advertises the flag but never created a profiler; the
         # getattr guard must keep capture_one on the non-profiling path.
@@ -130,32 +163,38 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         backend = _make_backend(runner)
 
         forward_fn = mock.Mock(return_value=object())
-        rf_names = []
 
-        def _fake_record_function(name):
-            rf_names.append(name)
-            return contextlib.nullcontext()
-
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"), mock.patch(
-            "torch.profiler.record_function", side_effect=_fake_record_function
-        ):
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 
-        return profiler, forward_fn, rf_names
+        return profiler, forward_fn
 
     def test_steps_twice_in_warmup_and_once_after_capture(self):
-        profiler, forward_fn, _ = self._run(
+        profiler, forward_fn = self._run(
             size=4, num_tokens_per_bs=1, mode_name="DECODE"
         )
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
 
-    def test_capture_not_wrapped_in_record_function(self):
-        # The capture forward is no longer wrapped in a record_function; per-bs
-        # trace naming is handled by the profiler's on_trace_ready callback.
-        _, _, rf_names = self._run(size=4, num_tokens_per_bs=1, mode_name="DECODE")
-        self.assertEqual(rf_names, [])
+
+class TestCleanup(CustomTestCase):
+    def test_resets_graphs_before_releasing_references(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        graphs = [mock.Mock(), mock.Mock()]
+        backend._graphs = {
+            ShapeKey(size=i + 1): graph for i, graph in enumerate(graphs)
+        }
+        backend._outputs = {ShapeKey(size=1): object()}
+        backend._pool = object()
+
+        backend.cleanup()
+
+        for graph in graphs:
+            graph.reset.assert_called_once_with()
+        self.assertEqual(backend._graphs, {})
+        self.assertEqual(backend._outputs, {})
+        self.assertIsNone(backend._pool)
 
 
 if __name__ == "__main__":

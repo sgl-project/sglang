@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
@@ -24,10 +24,12 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
     TransferStatus,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class NotificationFakeAgent:
@@ -106,6 +108,106 @@ def _fake_staging_buffer_module(mock_gather=None):
     return module
 
 
+class TestNixlBackendInitialization(CustomTestCase):
+    def _initialize_manager(self, agent, device_module, mode, gpu_id):
+        args = SimpleNamespace(
+            pp_rank=0,
+            engine_rank=0,
+            gpu_id=gpu_id,
+            kv_data_ptrs=[],
+            kv_item_lens=[],
+        )
+        mgr = object.__new__(NixlKVManager)
+        mgr.kv_args = args
+        mgr.disaggregation_mode = mode
+        mgr.enable_deferred_decode_kv_release = False
+
+        api = types.ModuleType("nixl._api")
+        api.nixl_agent = MagicMock(return_value=agent)
+        api.nixl_agent_config = MagicMock()
+        api.nixl_thread_sync_t = SimpleNamespace(NIXL_THREAD_SYNC_STRICT="strict")
+        nixl = types.ModuleType("nixl")
+        nixl._api = api
+        agent.get_plugin_list.return_value = ["UCX"]
+
+        with (
+            patch.dict(sys.modules, {"nixl": nixl, "nixl._api": api}),
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND": "UCX",
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS": "{}",
+                    "SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT": "5",
+                    "SGLANG_DISAGGREGATION_QUEUE_SIZE": "0",
+                    "SGLANG_DISAGG_STAGING_BUFFER": "false",
+                },
+            ),
+            get_context().override_server_args(device="cuda") as server_args,
+            patch.object(CommonKVManager, "__init__", return_value=None),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.get_parallel",
+                return_value=SimpleNamespace(tp_size=4),
+            ),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.torch.get_device_module",
+                return_value=device_module,
+            ) as get_device_module,
+            patch.object(NixlKVManager, "register_buffer_to_engine"),
+            patch.object(NixlKVManager, "_start_bootstrap_thread"),
+            patch.object(NixlKVManager, "_start_decode_listener_thread"),
+            patch.object(NixlKVManager, "_start_heartbeat_checker_thread"),
+        ):
+            self.assertIsNone(server_args.device)
+            NixlKVManager.__init__(mgr, args, mode, server_args)
+            get_device_module.assert_called_once_with("cuda")
+
+    def test_backend_initialization_selects_device_in_deadline_thread(self):
+        caller_thread = threading.get_ident()
+        for mode, gpu_id in (
+            (DisaggregationMode.PREFILL, 3),
+            (DisaggregationMode.DECODE, 1),
+        ):
+            with self.subTest(mode=mode, gpu_id=gpu_id):
+                calls = []
+                device_module = MagicMock()
+                device_module.set_device.side_effect = lambda device: calls.append(
+                    ("set_device", device, threading.get_ident())
+                )
+                agent = MagicMock()
+                agent.create_backend.side_effect = lambda backend, params: calls.append(
+                    ("create_backend", backend, threading.get_ident())
+                )
+
+                self._initialize_manager(agent, device_module, mode, gpu_id)
+
+                self.assertEqual(len(calls), 2)
+                backend_thread = calls[1][2]
+                self.assertNotEqual(backend_thread, caller_thread)
+                self.assertEqual(
+                    calls,
+                    [
+                        ("set_device", gpu_id, backend_thread),
+                        ("create_backend", "UCX", backend_thread),
+                    ],
+                )
+                agent.create_backend.assert_called_once_with(
+                    "UCX",
+                    {"num_threads": "8"} if mode == DisaggregationMode.PREFILL else {},
+                )
+
+    def test_backend_initialization_propagates_error(self):
+        error = RuntimeError("backend initialization failed")
+        agent = MagicMock()
+        agent.create_backend.side_effect = error
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._initialize_manager(
+                agent, MagicMock(), DisaggregationMode.DECODE, gpu_id=3
+            )
+
+        self.assertIs(raised.exception, error)
+
+
 class TestNixlTransferInfo(CustomTestCase):
     def test_from_zmq_parses_required_fields(self):
         kv_indices = np.array([3, 5, 8], dtype=np.int32)
@@ -165,7 +267,7 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertFalse(info.is_dummy())
+        self.assertFalse(info.is_dummy)
 
     def test_empty_indices_without_decode_prefix_is_dummy(self):
         info = TransferInfo.from_zmq(
@@ -182,7 +284,106 @@ class TestNixlTransferInfo(CustomTestCase):
             ]
         )
 
-        self.assertTrue(info.is_dummy())
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_true_is_dummy(self):
+        # msg[9] is the explicit is_dummy frame the sender writes
+        # (str(int(is_dummy))); it wins over payload inference.
+        info = TransferInfo.from_zmq(
+            [
+                b"11",
+                b"127.0.0.1",
+                b"12349",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"0",
+                b"1",
+            ]
+        )
+
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_true_with_prefix_hit_stays_dummy(self):
+        # A dummy rank whose request also has a decode-side prefix hit: the
+        # sender sends decode_prefix_len unconditionally, so only the explicit
+        # frame distinguishes this from a real full-prefix-hit transfer.
+        info = TransferInfo.from_zmq(
+            [
+                b"12",
+                b"127.0.0.1",
+                b"12350",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+                b"1",
+            ]
+        )
+
+        self.assertTrue(info.is_dummy)
+
+    def test_explicit_dummy_frame_false_with_empty_indices_is_real(self):
+        # Full prefix hit as the sender encodes it: empty kv indices,
+        # decode_prefix_len > 0, explicit is_dummy 0.
+        info = TransferInfo.from_zmq(
+            [
+                b"13",
+                b"127.0.0.1",
+                b"12351",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+                b"0",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
+
+    def test_explicit_dummy_frame_false_for_real_transfer(self):
+        info = TransferInfo.from_zmq(
+            [
+                b"14",
+                b"127.0.0.1",
+                b"12352",
+                b"agent",
+                np.array([3, 5], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"0",
+                b"0",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
+
+    def test_fallback_without_dummy_frame_reads_prefix_hit_dummy_as_real(self):
+        # Old-peer fallback: without msg[9], a dummy rank with a decode-side
+        # prefix hit is indistinguishable from a real full-prefix-hit transfer
+        # and parses as real. The explicit frame above exists for this case.
+        info = TransferInfo.from_zmq(
+            [
+                b"15",
+                b"127.0.0.1",
+                b"12353",
+                b"agent",
+                np.array([], dtype=np.int32).tobytes(),
+                b"2",
+                b"1",
+                b"",
+                b"128",
+            ]
+        )
+
+        self.assertFalse(info.is_dummy)
 
 
 class TestNixlKVArgsRegisterInfo(CustomTestCase):
@@ -340,6 +541,59 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlEmptyStateTransfer(CustomTestCase):
+    def test_empty_pp_state_component_is_a_noop(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.pp_size = 2
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
+
+        handle = mgr._send_kvcache_generic(
+            peer_name="decode",
+            src_data_ptrs=[],
+            dst_data_ptrs=[],
+            item_lens=[],
+            prefill_data_indices=np.array([3], dtype=np.int32),
+            dst_data_indices=np.array([5], dtype=np.int32),
+            dst_gpu_id=0,
+            notif="qsa-empty",
+            state_type=StateType.QSA_PENDING,
+            force_flat=True,
+            src_layer_ids=[],
+            dst_layer_ids=[],
+        )
+
+        self.assertIsNone(handle)
+        self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+    def test_paired_state_entries_reject_item_length_mismatch(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = False
+        mgr.pp_size = 1
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
+
+        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+            mgr._send_kvcache_generic(
+                peer_name="decode",
+                src_data_ptrs=[10],
+                dst_data_ptrs=[20],
+                item_lens=[32],
+                prefill_data_indices=np.array([3], dtype=np.int32),
+                dst_data_indices=np.array([5], dtype=np.int32),
+                dst_gpu_id=0,
+                notif="qsa-mismatch",
+                state_type=StateType.QSA_PENDING,
+                force_flat=True,
+                src_layer_ids=[24],
+                dst_layer_ids=[24],
+                dst_item_lens=[48],
+            )
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
@@ -476,7 +730,9 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
-        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
+        mgr.kv_args = SimpleNamespace(
+            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+        )
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -534,6 +790,94 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.transfer_infos)
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
+
+    def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
+        room = 23
+        mgr = self._make_manager(room)
+        agents = ("agent0a", "agent0b", "agent1")
+        dcp_ranks = (0, 0, 1)
+        mgr.transfer_infos[room] = {
+            agent: TransferInfo(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=5555 + i,
+                agent_name=agent,
+                dst_kv_indices=np.array([2 + i], dtype=np.int32),
+                dst_aux_index=0,
+                required_dst_info_num=len(agents),
+                dst_state_indices=[],
+            )
+            for i, agent in enumerate(agents)
+        }
+        mgr.decode_kv_args_table = {
+            agent: SimpleNamespace(
+                decode_tp_size=len(agents),
+                dst_kv_ptrs=[0x3000 + i * 0x100],
+                dst_aux_ptrs=[0],
+                gpu_id=0,
+                staging_base_ptr=0,
+                staging_total_size=0,
+                kv_xfer_segments=None,
+                dst_homogeneous_mem_kind="VRAM",
+                requires_dcp_relayout=True,
+                dst_dcp_size=2,
+                dst_dcp_rank=dcp_rank,
+                dcp_dst_region_indices=[0],
+                dcp_token_item_lens=[4],
+            )
+            for i, (agent, dcp_rank) in enumerate(zip(agents, dcp_ranks))
+        }
+        mgr.kv_args = SimpleNamespace(
+            engine_rank=0,
+            kv_data_ptrs=[0x1000],
+            page_size=4,
+            num_draft_entries=0,
+        )
+        mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
+
+        packed_rank0 = ([0x9000], np.arange(2, dtype=np.int64))
+        packed_rank1 = ([0x9008], np.arange(2, dtype=np.int64))
+        try_pack = MagicMock(side_effect=[packed_rank0, packed_rank1])
+        dcp_pack_module = types.ModuleType("sglang.srt.disaggregation.common.dcp_pack")
+        dcp_pack_module.try_pack_dcp_src = try_pack
+        submitted = []
+
+        def send_kvcache_dcp(*args, **kwargs):
+            submitted.append((args[0], args[-1]))
+            # One handle per transfer part; the worker extends its handle list.
+            return [f"handle-{args[0]}"]
+
+        mgr.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
+        submitted_counts_at_poll = []
+
+        def check_xfer_state(_handle):
+            submitted_counts_at_poll.append(len(submitted))
+            return "DONE"
+
+        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.num_kv_tokens = 4
+
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.disaggregation.common.dcp_pack": dcp_pack_module},
+        ):
+            self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(try_pack.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["pack_offset_bytes"] for call in try_pack.call_args_list],
+            [0, 8],
+        )
+        self.assertEqual(
+            submitted,
+            [
+                ("agent0a", packed_rank0),
+                ("agent0b", packed_rank0),
+                ("agent1", packed_rank1),
+            ],
+        )
+        self.assertEqual(submitted_counts_at_poll, [3, 3, 3])
 
 
 class TestNixlNotifications(CustomTestCase):
@@ -663,10 +1007,9 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.update_transfer_status.assert_called_once_with()
         mgr.record_failure.assert_not_called()
         mgr.update_status.assert_not_called()
-        self.assertNotIn(11, mgr.transfer_statuses)
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
-    def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
+    def test_transfer_done_returns_success_and_clear_drops_room_state(self, mock_time):
         mock_time.return_value = 12.0
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
@@ -679,9 +1022,16 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.check_transfer_done.return_value = True
 
         self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+        # poll() only concludes now; dropping room state is left to clear(), the
+        # way mooncake and mori already do it. The scheduler calls clear() as
+        # soon as poll() reports Success or Failed, so both terminal paths clean
+        # up -- the cleanup that used to live in poll() ran on Success only.
+        receiver.clear()
+
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
-        self.assertEqual(receiver.conclude_state, KVPoll.Success)
 
 
 class TestNixlNodeFailure(CustomTestCase):
@@ -788,16 +1138,16 @@ class TestNixlStaging(CustomTestCase):
         agent = StagingFakeAgent(register_result=["staging"])
         mgr = self._make_manager(agent)
 
-        mgr._register_staging_memory(0x1000, 4096, 3)
+        mgr._register_staging_memory(0x1000, 4096)
 
         self.assertEqual(
             agent.register_memory_calls,
-            [([(0x1000, 4096, 3, "")], "VRAM")],
+            [([(0x1000, 4096, 1, "")], "VRAM")],
         )
 
         mgr = self._make_manager(StagingFakeAgent(register_result=[]))
         with self.assertRaisesRegex(RuntimeError, "staging buffer"):
-            mgr._register_staging_memory(0x1000, 4096, 3)
+            mgr._register_staging_memory(0x1000, 4096)
 
     def test_prefetch_staging_reqs_noops_when_disabled_or_missing_kv_buffers(self):
         mgr = self._make_manager()
@@ -946,8 +1296,8 @@ class TestNixlStaging(CustomTestCase):
             staging_total_size=4096,
         )
         calls = []
-        mgr.send_kvcache_staged = (
-            lambda *args, **kwargs: calls.append((args, kwargs)) or "handle"
+        mgr.send_kvcache_staged = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or "handle"
         )
 
         handle, deferred = mgr._do_staging_transfer(

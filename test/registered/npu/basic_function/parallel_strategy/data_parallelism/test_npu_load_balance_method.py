@@ -18,7 +18,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=700, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=700, suite="nightly-16-npu-a3", nightly=True)
 
 
@@ -82,7 +81,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.url.hostname}",
+            host=self.url.hostname,
             port=int(self.url.port),
         )
 

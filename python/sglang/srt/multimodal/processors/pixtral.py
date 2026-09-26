@@ -83,7 +83,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_data=image_data,
             return_text=True,
         )
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             mm_data, self.mm_tokens
         )
 

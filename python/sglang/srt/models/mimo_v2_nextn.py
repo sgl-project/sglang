@@ -127,6 +127,7 @@ class MiMoV2MTPLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -151,11 +152,12 @@ class MiMoV2MTPLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        with get_global_expert_distribution_recorder().disable_this_region():
+        with (
+            self.layer_communicator.ffn_exit(forward_batch) as ffn_exit,
+            get_global_expert_distribution_recorder().disable_this_region(),
+        ):
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -238,7 +240,6 @@ class MiMoV2ModelNextN(nn.Module):
 
 
 class MiMoV2MTP(MiMoV2ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -320,7 +321,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:

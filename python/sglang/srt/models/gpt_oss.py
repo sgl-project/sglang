@@ -27,13 +27,13 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    reduce_output,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -44,7 +44,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    reduce_moe_output,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -63,26 +66,28 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    is_blackwell_supported,
+    get_device,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
     is_npu,
-    is_sm90_supported,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -94,7 +99,7 @@ _is_cuda = is_cuda()
 _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
-    and (is_sm90_supported() or is_blackwell_supported())
+    and (get_platform().is_sm90 or get_platform().is_blackwell)
 )
 
 if _is_tinygemm_supported:
@@ -224,8 +229,7 @@ class GptOssSparseMoeBlock(nn.Module):
             )
             extra_kwargs = {
                 # for moe gate_up_proj and down_proj and their bias loading
-                "use_weight_loader_fused": quant_config_name
-                != "mxfp4"
+                "use_weight_loader_fused": quant_config_name != "mxfp4"
             }
 
         self.experts = experts_type(
@@ -330,8 +334,7 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
@@ -561,9 +564,8 @@ class GptOssDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        # GptOss all layers are sparse and have no nextn now
+        # GptOss all layers are sparse
         self.is_layer_sparse = True
-        self.is_nextn = False
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
@@ -607,9 +609,7 @@ class GptOssDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            is_last_layer=(
-                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
+            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -634,22 +634,9 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -665,7 +652,7 @@ class GptOssModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if _is_npu:
             config.hidden_act = "npu_swiglu_oai"
@@ -734,11 +721,16 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
                 if i + 1 in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(
                         hidden_states + residual
                         if residual is not None
                         else hidden_states
                     )
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -775,7 +767,7 @@ class GptOssForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = GptOssModel(
@@ -941,20 +933,25 @@ class GptOssForCausalLM(nn.Module):
             )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
-        mxfp4_weights = []
         normal_weights = []
 
-        for name, weight in weights:
-            if (
-                ".experts" in name
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "mxfp4"
-            ):
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def experts(weights):
+            # The RunAI streamer reuses one staging buffer across tensors, so a
+            # tensor read after later ones arrive can be read back as garbage.
+            # Expert weights are copied into their parameter as they are
+            # yielded; the rest are held until afterwards and need their own
+            # memory.
+            for name, weight in weights:
+                if (
+                    ".experts" in name
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "mxfp4"
+                ):
+                    yield name, weight
+                else:
+                    normal_weights.append((name, _own_if_runai_streamed(weight)))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
@@ -977,9 +974,9 @@ class GptOssForCausalLM(nn.Module):
         original_intermediate_size = getattr(
             self.config, "original_intermediate_size", intermediate_size
         )
-        assert (
-            intermediate_size % mxfp4_block == 0
-        ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        assert intermediate_size % mxfp4_block == 0, (
+            f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        )
         intermediate_size_block = intermediate_size // mxfp4_block
 
         per_rank_intermediate_size_block = math.ceil(
@@ -1001,9 +998,10 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
+        weight_device = next(iter(params_dict.values())).device
+
         for name, weight in weights:
-            if _is_cuda:
-                weight = weight.cuda()
+            weight = weight.to(weight_device)
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1366,6 +1364,18 @@ class GptOssForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
 
+def _own_if_runai_streamed(tensor: torch.Tensor) -> torch.Tensor:
+    """Take a copy the streamer cannot overwrite.
+
+    The copy lands on the host: distributed streaming yields device tensors,
+    and these are held until the whole checkpoint has streamed, so cloning
+    them in place would add their own GiB to peak GPU usage.
+    """
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.detach().to("cpu", copy=True)
+    return tensor
+
+
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):
     weights_out_dict = dict(weights_in)
 
@@ -1393,8 +1403,9 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
 
     original_device = w_blocks.device
 
-    w_blocks = w_blocks.cuda()
-    w_scales = w_scales.cuda()
+    device = get_device()
+    w_blocks = w_blocks.to(device)
+    w_scales = w_scales.to(device)
 
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()
