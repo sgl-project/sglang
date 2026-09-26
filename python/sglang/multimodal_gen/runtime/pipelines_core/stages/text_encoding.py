@@ -169,6 +169,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 stage_name=stage_name,
                 component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
                 preferred_ready_after_request=i == 0,
+                start_at_stage_entry=False,
                 target_dtype=resolve_component_precision_override(
                     server_args,
                     "text_encoder" if i == 0 else f"text_encoder_{i + 1}",
@@ -602,38 +603,43 @@ class TextEncodingStage(ConditionEncodingStage):
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             )
-            # hash the CPU tokens, without waiting for preceding GPU encoders
-            cache_inputs = dict(text_inputs)
-            text_inputs = text_inputs.to(target_device, non_blocking=True)
-
-            input_ids = text_inputs["input_ids"]
-            attention_mask = (
-                server_args.pipeline_config.get_text_encoder_attention_mask(
-                    text_inputs, i
-                )
-            )
-            encoder_forward_kwargs = {
-                "input_ids": input_ids,
-                "output_hidden_states": True,
-            }
-            if attention_mask is not None:
-                encoder_forward_kwargs["attention_mask"] = attention_mask
-            if "use_cache" in inspect.signature(text_encoder.forward).parameters:
-                encoder_forward_kwargs["use_cache"] = False
-            self._begin_text_encoder_use(i)
+            # match host tokens before preparing weights or uploading encoder inputs
+            host_inputs = text_inputs
+            cache_inputs = dict(host_inputs)
             dp_group = self._text_encode_dp_group(
-                server_args, encoder_config, input_ids.shape[0], text_encoder
+                server_args,
+                encoder_config,
+                host_inputs["input_ids"].shape[0],
+                text_encoder,
             )
-            postprocess_sig = inspect.signature(postprocess_func)
-
-            postprocess_kwargs = {}
-            if "pipeline_config" in postprocess_sig.parameters:
-                # required by models like LTX
-                postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
-            if "return_attention_mask" in postprocess_sig.parameters:
-                postprocess_kwargs["return_attention_mask"] = return_attention_mask
 
             def encode_conditioning():
+                text_inputs = host_inputs.to(target_device, non_blocking=True)
+
+                input_ids = text_inputs["input_ids"]
+                attention_mask = (
+                    server_args.pipeline_config.get_text_encoder_attention_mask(
+                        text_inputs, i
+                    )
+                )
+                encoder_forward_kwargs = {
+                    "input_ids": input_ids,
+                    "output_hidden_states": True,
+                }
+                if attention_mask is not None:
+                    encoder_forward_kwargs["attention_mask"] = attention_mask
+                if "use_cache" in inspect.signature(text_encoder.forward).parameters:
+                    encoder_forward_kwargs["use_cache"] = False
+                self._begin_text_encoder_use(i)
+                postprocess_sig = inspect.signature(postprocess_func)
+
+                postprocess_kwargs = {}
+                if "pipeline_config" in postprocess_sig.parameters:
+                    # required by models like LTX
+                    postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
+                if "return_attention_mask" in postprocess_sig.parameters:
+                    postprocess_kwargs["return_attention_mask"] = return_attention_mask
+
                 if dp_group is not None:
                     outputs = _data_parallel_text_encode(
                         lambda kw: self._forward_text_encoder(text_encoder, kw),
@@ -644,11 +650,96 @@ class TextEncodingStage(ConditionEncodingStage):
                     outputs = self._forward_text_encoder(
                         text_encoder, encoder_forward_kwargs
                     )
-                return (
-                    postprocess_func(outputs, text_inputs, **postprocess_kwargs),
+                postprocess_result = postprocess_func(
+                    outputs, text_inputs, **postprocess_kwargs
+                )
+                pooled_output = (
                     server_args.pipeline_config.get_text_encoder_pooler_output(
                         outputs, i
-                    ),
+                    )
+                )
+                prompt_embeds_mask = None
+                prompt_seq_lens = None
+                if isinstance(postprocess_result, TextConditioningOutput):
+                    prompt_embeds = postprocess_result.prompt_embeds
+                    prompt_embeds_mask = postprocess_result.prompt_embeds_mask
+                    prompt_seq_lens = postprocess_result.prompt_seq_lens
+                elif isinstance(postprocess_result, tuple):
+                    if len(postprocess_result) != 2:
+                        raise ValueError(
+                            "Text postprocess tuple output must be (prompt_embeds, prompt_embeds_mask)"
+                        )
+                    prompt_embeds, prompt_embeds_mask = postprocess_result
+                else:
+                    prompt_embeds = postprocess_result
+
+                if dtype is not None:
+                    prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
+                else:
+                    prompt_embeds = prompt_embeds.to(device=target_device)
+
+                if prompt_embeds_mask is not None:
+                    prompt_embeds_mask = prompt_embeds_mask.to(
+                        device=target_device, dtype=torch.bool
+                    )
+
+                if pooled_output is not None:
+                    pooled_output = pooled_output.to(device=target_device)
+
+                mask_to_store = embeds_mask = seq_lens = None
+                if return_attention_mask:
+                    if prompt_embeds_mask is not None:
+                        mask_to_store = prompt_embeds_mask.to(
+                            device=target_device,
+                            dtype=(
+                                attention_mask.dtype
+                                if attention_mask is not None
+                                else torch.long
+                            ),
+                        )
+                    elif attention_mask is not None and list(
+                        attention_mask.shape
+                    ) == list(prompt_embeds.shape[:2]):
+                        mask_to_store = attention_mask.to(device=target_device)
+                    else:
+                        mask_to_store = torch.ones(
+                            prompt_embeds.shape[:2],
+                            device=target_device,
+                            dtype=(
+                                attention_mask.dtype
+                                if attention_mask is not None
+                                else torch.long
+                            ),
+                        )
+
+                    embeds_mask = prompt_embeds_mask
+                    if embeds_mask is None:
+                        embeds_mask = (
+                            server_args.pipeline_config.build_text_conditioning_mask(
+                                text_inputs,
+                                attention_mask,
+                                prompt_embeds,
+                                i,
+                            )
+                        )
+                    if prompt_seq_lens is not None:
+                        seq_lens = [int(x) for x in prompt_seq_lens]
+                    elif embeds_mask is not None:
+                        seq_lens = server_args.pipeline_config.seq_lens_from_text_conditioning_mask(
+                            embeds_mask
+                        )
+                    elif prompt_embeds.ndim == 2:
+                        seq_lens = [int(prompt_embeds.shape[0])]
+                    else:
+                        seq_lens = [int(prompt_embeds.shape[1])] * int(
+                            prompt_embeds.shape[0]
+                        )
+                return (
+                    prompt_embeds,
+                    mask_to_store,
+                    pooled_output,
+                    embeds_mask,
+                    seq_lens,
                 )
 
             if dp_group is None and isinstance(text_encoder, TextEncoder):
@@ -657,13 +748,14 @@ class TextEncodingStage(ConditionEncodingStage):
                     cache_group = get_tp_group()
                 # Cache the consumed conditioning, not every intermediate layer.
                 # The stage namespace separates pipeline postprocessing contracts.
-                postprocess_result, pooled_output = cached_encoder_call(
+                conditioning = cached_encoder_call(
                     text_encoder,
                     (cache_inputs,),
                     {
                         "encoder_index": i,
                         "return_attention_mask": return_attention_mask,
                         "device": str(target_device),
+                        "dtype": dtype,
                     },
                     encode_conditioning,
                     cache_group,
@@ -673,88 +765,15 @@ class TextEncodingStage(ConditionEncodingStage):
             else:
                 # Batch-DP keeps caching inside each encoder copy so every rank
                 # still enters the output gather, including on a cache hit.
-                postprocess_result, pooled_output = encode_conditioning()
-            prompt_embeds_mask = None
-            prompt_seq_lens = None
-            if isinstance(postprocess_result, TextConditioningOutput):
-                prompt_embeds = postprocess_result.prompt_embeds
-                prompt_embeds_mask = postprocess_result.prompt_embeds_mask
-                prompt_seq_lens = postprocess_result.prompt_seq_lens
-            elif isinstance(postprocess_result, tuple):
-                if len(postprocess_result) != 2:
-                    raise ValueError(
-                        "Text postprocess tuple output must be (prompt_embeds, prompt_embeds_mask)"
-                    )
-                prompt_embeds, prompt_embeds_mask = postprocess_result
-            else:
-                prompt_embeds = postprocess_result
-
-            if dtype is not None:
-                prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
-            else:
-                prompt_embeds = prompt_embeds.to(device=target_device)
-
-            if prompt_embeds_mask is not None:
-                prompt_embeds_mask = prompt_embeds_mask.to(
-                    device=target_device, dtype=torch.bool
-                )
-
+                conditioning = encode_conditioning()
+            prompt_embeds, mask, pooled_output, embeds_mask, seq_lens = conditioning
             embeds_list.append(prompt_embeds)
-
             if pooled_output is not None:
-                pooled_embeds_list.append(pooled_output.to(device=target_device))
-
+                pooled_embeds_list.append(pooled_output)
             if return_attention_mask:
-                if prompt_embeds_mask is not None:
-                    mask_to_store = prompt_embeds_mask.to(
-                        device=target_device,
-                        dtype=(
-                            attention_mask.dtype
-                            if attention_mask is not None
-                            else torch.long
-                        ),
-                    )
-                elif attention_mask is not None and list(attention_mask.shape) == list(
-                    prompt_embeds.shape[:2]
-                ):
-                    mask_to_store = attention_mask.to(device=target_device)
-                else:
-                    mask_to_store = torch.ones(
-                        prompt_embeds.shape[:2],
-                        device=target_device,
-                        dtype=(
-                            attention_mask.dtype
-                            if attention_mask is not None
-                            else torch.long
-                        ),
-                    )
-                attn_masks_list.append(mask_to_store)
-
-                embeds_mask = prompt_embeds_mask
-                if embeds_mask is None:
-                    embeds_mask = (
-                        server_args.pipeline_config.build_text_conditioning_mask(
-                            text_inputs,
-                            attention_mask,
-                            prompt_embeds,
-                            i,
-                        )
-                    )
+                attn_masks_list.append(mask)
                 embeds_masks_list.append(embeds_mask)
-                if prompt_seq_lens is not None:
-                    seq_lens_list.append([int(x) for x in prompt_seq_lens])
-                elif embeds_mask is not None:
-                    seq_lens_list.append(
-                        server_args.pipeline_config.seq_lens_from_text_conditioning_mask(
-                            embeds_mask
-                        )
-                    )
-                elif prompt_embeds.ndim == 2:
-                    seq_lens_list.append([int(prompt_embeds.shape[0])])
-                else:
-                    seq_lens_list.append(
-                        [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
-                    )
+                seq_lens_list.append(seq_lens)
 
         # Shape results according to return_type
         if return_type == "list":
