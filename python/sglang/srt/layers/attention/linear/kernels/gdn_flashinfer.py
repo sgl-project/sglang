@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -214,7 +215,56 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._mtp_fn is None:
             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
-        if self.use_state_pool and mtp_bf16_fn is not None:
+        # FlashInfer's public ``gated_delta_rule_decode_pretranspose`` dispatches
+        # BF16 state-pool MTP verify to the best registered backend (the
+        # source-only Cake GDN rows when promoted for the exact shape, the CuTe
+        # BF16 MTP kernel otherwise).  Calling the CuTe kernel directly skips
+        # that dispatch, so prefer the public API whenever it can express the
+        # verify call (``backend``/``intermediate_states_buffer`` keywords).
+        decode_params = inspect.signature(self._decode_fn).parameters
+        self._verify_via_pretranspose = (
+            self.use_state_pool
+            and "backend" in decode_params
+            and "intermediate_states_buffer" in decode_params
+            and "disable_state_update" in decode_params
+        )
+
+        if self._verify_via_pretranspose:
+
+            def _mtp_via_pretranspose(
+                q,
+                k,
+                v,
+                initial_state,
+                initial_state_indices,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                use_qk_l2norm=True,
+                **kw,
+            ):
+                return self._decode_fn(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=None,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=kw.get("scale"),
+                    output=kw.get("output"),
+                    use_qk_l2norm=use_qk_l2norm,
+                    initial_state=initial_state,
+                    initial_state_indices=initial_state_indices,
+                    intermediate_states_buffer=kw.get("intermediate_states_buffer"),
+                    disable_state_update=kw.get("disable_state_update", False),
+                    backend="auto",
+                )
+
+            self._mtp_fn = _mtp_via_pretranspose
+        elif self.use_state_pool and mtp_bf16_fn is not None:
             # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
             def _mtp_bf16_adapted(
                 q,
@@ -312,10 +362,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         dt_bias: torch.Tensor,
         *,
         A_log_dtype: Optional[torch.dtype] = None,
+        dt_bias_dtype: Optional[torch.dtype] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             self._prepare_parameter("A_log", A_log, dtype=A_log_dtype),
-            self._prepare_parameter("dt_bias", dt_bias),
+            self._prepare_parameter("dt_bias", dt_bias, dtype=dt_bias_dtype),
         )
 
     def _mutable_inputs_are_aligned(
@@ -675,7 +726,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_mtp = self._prepare_dynamic_input(
             "verify_b", b.view(batch_size, draft_token_num, num_v_heads)
         )
-        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
+        # The SM100 state-pool backends consume float32 gate parameters: the
+        # CuTe BF16 MTP kernel needs float32 A_log and accepts either dt_bias
+        # dtype, while the Cake GDN rows behind the public dispatch require
+        # float32 for both.  SM90 keeps the source dtype.  The cast is cached
+        # per parameter tensor, so it costs nothing per call and is graph-safe.
+        gate_dtype = torch.float32 if self.use_state_pool else None
+        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(
+            A_log, dt_bias, A_log_dtype=gate_dtype, dt_bias_dtype=gate_dtype
+        )
         cache_indices_fi = self._prepare_dynamic_input(
             "verify_cache_indices", cache_indices
         )

@@ -207,6 +207,144 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
             A_log_sm90,
         )
 
+    def test_gate_parameter_cache_casts_dt_bias_when_requested(self):
+        kernel = _make_kernel_without_flashinfer()
+        A_log = torch.empty(8, dtype=torch.bfloat16)
+        dt_bias = torch.empty(8, dtype=torch.bfloat16)
+
+        _, dt_bias_sm90 = kernel._prepare_gate_parameters(A_log, dt_bias)
+        A_log_sm100, dt_bias_sm100 = kernel._prepare_gate_parameters(
+            A_log,
+            dt_bias,
+            A_log_dtype=torch.float32,
+            dt_bias_dtype=torch.float32,
+        )
+
+        self.assertEqual(dt_bias_sm90.dtype, torch.bfloat16)
+        self.assertEqual(A_log_sm100.dtype, torch.float32)
+        self.assertEqual(dt_bias_sm100.dtype, torch.float32)
+        self.assertEqual(dt_bias_sm100.data_ptr() % 32, 0)
+        self.assertIs(
+            kernel._prepare_gate_parameters(
+                A_log,
+                dt_bias,
+                A_log_dtype=torch.float32,
+                dt_bias_dtype=torch.float32,
+            )[1],
+            dt_bias_sm100,
+        )
+
+    def test_mtp_state_pool_passes_float32_gate_parameters(self):
+        kernel = _make_kernel_without_flashinfer()
+        kernel.use_state_pool = True
+        captured = {}
+
+        def fake_mtp(**kwargs):
+            captured.update(kwargs)
+            return torch.zeros_like(kwargs["v"]), None
+
+        kernel._mtp_fn = fake_mtp
+        kernel.target_verify(
+            torch.zeros(8, dtype=torch.bfloat16),
+            torch.zeros(8, dtype=torch.bfloat16),
+            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, dtype=torch.bfloat16),
+            ssm_states=torch.zeros(7, 8, 4, 4, dtype=torch.bfloat16),
+            cache_indices=torch.zeros(2, dtype=torch.int32),
+            query_start_loc=torch.arange(0, 6, 2, dtype=torch.int32),
+            intermediate_states_buffer=torch.zeros(
+                (7, 2, 8, 4, 4), dtype=torch.bfloat16
+            ),
+            intermediate_state_indices=torch.arange(7, dtype=torch.int32),
+            cache_steps=2,
+            retrieve_parent_token=None,
+        )
+
+        self.assertEqual(captured["A_log"].dtype, torch.float32)
+        self.assertEqual(captured["dt_bias"].dtype, torch.float32)
+
+    def test_state_pool_verify_routes_through_public_pretranspose_dispatch(self):
+        captured = {}
+
+        def fake_decode(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale=None,
+            output=None,
+            use_qk_l2norm=True,
+            initial_state=None,
+            initial_state_indices=None,
+            output_state_indices=None,
+            intermediate_states_buffer=None,
+            disable_state_update=False,
+            backend="auto",
+        ):
+            captured.update(
+                backend=backend,
+                initial_state=initial_state,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=disable_state_update,
+            )
+            return torch.zeros_like(v), initial_state
+
+        def fake_mtp_bf16(**kwargs):
+            raise AssertionError("the CuTe MTP kernel must not be called directly")
+
+        fake_triton = mock.MagicMock()
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "_get_flashinfer_gdn_kernels",
+                return_value=(True, None, fake_mtp_bf16, fake_decode, fake_mtp_bf16),
+            ),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.layers.attention.linear.kernels.gdn_triton": mock.MagicMock(
+                        TritonGDNKernel=fake_triton
+                    )
+                },
+            ),
+        ):
+            kernel = FlashInferGDNKernel()
+
+        self.assertTrue(kernel._verify_via_pretranspose)
+        pool = torch.zeros(7, 8, 4, 4, dtype=torch.bfloat16)
+        workspace = torch.zeros((7, 2, 8, 4, 4), dtype=torch.bfloat16)
+        kernel.target_verify(
+            torch.zeros(8, dtype=torch.float32),
+            torch.zeros(8, dtype=torch.float32),
+            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, 4, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, dtype=torch.bfloat16),
+            torch.empty(1, 4, 8, dtype=torch.bfloat16),
+            ssm_states=pool,
+            cache_indices=torch.zeros(2, dtype=torch.int32),
+            query_start_loc=torch.arange(0, 6, 2, dtype=torch.int32),
+            intermediate_states_buffer=workspace,
+            intermediate_state_indices=torch.arange(7, dtype=torch.int32),
+            cache_steps=2,
+            retrieve_parent_token=None,
+        )
+
+        self.assertEqual(captured["backend"], "auto")
+        self.assertIs(captured["initial_state"], pool)
+        self.assertTrue(captured["disable_state_update"])
+        self.assertEqual(
+            captured["intermediate_states_buffer"].data_ptr(), workspace.data_ptr()
+        )
+
     def test_mutable_state_falls_back_without_losing_writeback(self):
         kernel = _make_kernel_without_flashinfer()
         captured = {}
