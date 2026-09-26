@@ -2731,6 +2731,55 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestSm120DecodeCudaGraphDefault(CustomTestCase):
+    def _decode_graph_limit(self, gpu_mem, tp_size=1, explicit_max_bs=None):
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            tp_size=tp_size,
+            chunked_prefill_size=4096,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=explicit_max_bs),
+                prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+            ),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        decode = resolution_result(args, "cuda_graph_config").decode
+        return decode.max_bs, decode.bs[-1]
+
+    @override_platform(is_cuda=True, is_sm120=True)
+    def test_sm120_32gb_defaults_to_128(self):
+        """The 48-batch default leaves a 5090 on eager decode under load."""
+        self.assertEqual(self._decode_graph_limit(32607), (128, 128))
+
+    @override_platform(is_cuda=True, is_sm120=True)
+    def test_sm120_24gb_keeps_existing_default(self):
+        self.assertEqual(self._decode_graph_limit(24 * 1024), (48, 48))
+
+    @override_platform(is_cuda=True, is_sm120=False)
+    def test_non_sm120_32gb_keeps_existing_default(self):
+        self.assertEqual(self._decode_graph_limit(32 * 1024), (48, 48))
+
+    @override_platform(is_cuda=True, is_sm120=True)
+    def test_explicit_decode_graph_limit_is_preserved(self):
+        self.assertEqual(self._decode_graph_limit(32607, explicit_max_bs=64), (64, 64))
+
+    @override_platform(is_cuda=True, is_sm120=True)
+    def test_tp4_keeps_existing_default(self):
+        self.assertEqual(self._decode_graph_limit(32607, tp_size=4), (160, 160))
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
