@@ -125,6 +125,7 @@ def test_session_slot_round_trip_preserves_component_state():
     req.kv.mamba_last_track_idx = 0
     req.kv.mamba_last_track_seqlen = 3
     req.kv.set_evicted_seqlen(ComponentType.SWA, 2)
+    req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 3)
 
     slot = SessionSlot()
     slot.save_from_req(req, is_first=True)
@@ -135,7 +136,10 @@ def test_session_slot_round_trip_preserves_component_state():
     assert next_req.kv.mamba_next_track_idx == 1
     assert next_req.kv.mamba_last_track_idx == 0
     assert next_req.kv.mamba_last_track_seqlen == 3
-    assert next_req.kv.component_evicted_seqlens == {ComponentType.SWA: 2}
+    assert next_req.kv.component_evicted_seqlens == {
+        ComponentType.SWA: 2,
+        ComponentType.AUXILIARY_SWA: 3,
+    }
     assert req.kv.component_evicted_seqlens == {}
     next_req.kv.mark_kv_released()
     assert next_req.kv.is_kv_released
@@ -261,6 +265,8 @@ def test_release_session_preserves_component_lock_receipt(uuid):
     )
     acquired.set_lock_uuid(ComponentType.SWA, uuid)
     acquired.set_lock_uuid(ComponentType.SWA, 19, lock_host=True)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 23)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, None, lock_host=True)
     tree_cache.slots["session-a"] = SessionSlot(
         kv=ReqKvInfo(
             req_pool_idx=0,
@@ -274,6 +280,8 @@ def test_release_session_preserves_component_lock_receipt(uuid):
 
     acquired.set_lock_uuid(ComponentType.SWA, 99)
     acquired.set_lock_uuid(ComponentType.SWA, 99, lock_host=True)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99)
+    acquired.set_lock_uuid(ComponentType.AUXILIARY_SWA, 99, lock_host=True)
     tree_cache.release_session("session-a")
 
     assert inner.dec_lock_ref_calls == [lock_node]
@@ -282,6 +290,8 @@ def test_release_session_preserves_component_lock_receipt(uuid):
     assert params.skipped_lock_components == (ComponentType.MAMBA,)
     assert params.get_lock_uuid(ComponentType.SWA) == uuid
     assert params.get_lock_uuid(ComponentType.SWA, lock_host=True) == 19
+    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA) == 23
+    assert params.get_lock_uuid(ComponentType.AUXILIARY_SWA, lock_host=True) is None
     for lock_host in (False, True):
         with pytest.raises(KeyError):
             params.get_lock_uuid(ComponentType.MAMBA, lock_host=lock_host)
@@ -378,7 +388,7 @@ def test_trim_overshoot_postcondition():
 
 
 @pytest.mark.parametrize("operation", ["trim", "match"])
-@pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.FULL])
+@pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.AUXILIARY_SWA])
 def test_session_rewind_keeps_component_cursors_page_aligned(operation, component):
     """Rewinding below any component cursor must free whole pages."""
     page_size = 16

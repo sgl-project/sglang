@@ -204,7 +204,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        self._tree_core_backend = (
+            params.tree_core_backend
+            if params.tree_core_backend is not None
+            else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
