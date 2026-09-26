@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -69,9 +70,10 @@ def free_swa_out_of_window_slots(
     assert req.kv.cache_protected_len % page_size == 0, (
         "cache_protected_len must be page aligned"
     )
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
+    swa_evicted_seqlen = max(
+        req.kv.get_evicted_seqlen(ComponentType.SWA), req.kv.swa_dead_lo(page_size)
     )
+    req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -89,22 +91,19 @@ def free_swa_out_of_window_slots(
         # retained checkpoint could never be matched and holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
-    new_swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen,
-        evict_threshold,
-    )
+    new_swa_evicted_seqlen = max(swa_evicted_seqlen, evict_threshold)
 
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+    if new_swa_evicted_seqlen > swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.kv.req_pool_idx, swa_evicted_seqlen:new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa_segment(
-            free_slots, start_pos=req.kv.swa_evicted_seqlen
+            free_slots, start_pos=swa_evicted_seqlen
         )
-        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+        req.kv.set_evicted_seqlen(ComponentType.SWA, new_swa_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
