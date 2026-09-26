@@ -23,7 +23,10 @@ from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
     use_cutedsl_bf16_gemm,
 )
 
-SHAPES = [(n, k) for n in [1024, 2624, 6144] for k in [2048, 6144]] + [(2048, 4096)]
+# 6144/12288 route through the split-K tactics (29-34) for small-N shapes.
+SHAPES = [(n, k) for n in [1024, 2624, 6144] for k in [2048, 6144, 12288]] + [
+    (2048, 4096)
+]
 NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 
 
