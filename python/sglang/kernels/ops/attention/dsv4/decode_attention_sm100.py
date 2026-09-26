@@ -1,11 +1,13 @@
-"""SM100 small-batch paged attention with the heads on the MMA N dimension; the
-caller applies the inverse RoPE to the result."""
+"""SM100 / gfx950 small-batch paged attention with the heads on the MMA N dimension;
+the inverse RoPE is applied by the caller, or by the combine when inv_rope is given."""
 
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import is_hip
 
 from .kv_layout import KVLayout
 
@@ -38,12 +40,33 @@ def can_use_swapab_attention(
 
 
 @triton.jit
+def inverse_rope_tail(
+    out, d, FREQS, pos, freq_stride, HEAD_DIM: tl.constexpr, ROPE_DIM: tl.constexpr
+):
+    """out (head dims d) with its last ROPE_DIM dims inverse-rotated at position pos. It
+    rotates the rounded values, as the model's standalone RoPE kernel reads them."""
+    x = out.to(tl.float32)
+    is_rope = d >= HEAD_DIM - ROPE_DIM
+    freq_index = ((d - (HEAD_DIM - ROPE_DIM)) // 2) * 2
+    cos = tl.load(FREQS + pos * freq_stride + freq_index, is_rope, 0)
+    sin = tl.load(FREQS + pos * freq_stride + freq_index + 1, is_rope, 0)
+    signed = tl.where(d % 2 == 0, -x * sin, x * sin)
+    swapped = tl.reshape(tl.flip(tl.reshape(signed, (d.shape[0] // 2, 2)), 1), d.shape)
+    rotated = tl.fma(x, cos, swapped)
+    return tl.where(is_rope, rotated.to(out.dtype), out)
+
+
+@triton.jit
 def _combine(
     PART,
     MAX,
     SUM,
     SINK,
     OUT,
+    FREQS,
+    POSITIONS,
+    FREQ_STRIDE: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     NT: tl.constexpr,
     ST: tl.constexpr,
     H: tl.constexpr,
@@ -66,6 +89,10 @@ def _combine(
     )
     out = tl.sum(vals * factor[:, None], 0) / denominator
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
+    out = out.to(OUT.dtype.element_ty)
+    if ROPE_DIM > 0:
+        pos = tl.load(POSITIONS + b)
+        out = inverse_rope_tail(out, d, FREQS, pos, FREQ_STRIDE, 512, ROPE_DIM)
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 
@@ -78,10 +105,14 @@ def swapab_attention(
     extra_kv=None,
     extra_indices=None,
     extra_lengths=None,
+    inv_rope=None,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once."""
-    from .decode_attention_sm100_gluon import partial_gluon
+    if is_hip():
+        from .swapab_gluon_hip import partial_gluon
+    else:
+        from .decode_attention_sm100_gluon import partial_gluon
 
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
@@ -144,6 +175,15 @@ def swapab_attention(
         TILE=LAYOUT.tile_size,
         num_warps=4,
     )
+    if inv_rope is not None:
+        freqs, positions = inv_rope
+        assert freqs.dtype == torch.float32 and freqs.stride(1) == 1
+        assert positions.shape == (b,)
+        rope_dim = freqs.shape[1]
+        assert 0 < rope_dim <= 512 and rope_dim % 2 == 0
+    else:
+        freqs = positions = out
+        rope_dim = 0
     bd = 64 if ne else 512
     _combine[(b, h, triton.cdiv(512, bd))](
         partial,
@@ -151,6 +191,10 @@ def swapab_attention(
         sums,
         sink,
         out,
+        freqs,
+        positions,
+        FREQ_STRIDE=freqs.stride(0),
+        ROPE_DIM=rope_dim,
         NT=nt,
         ST=triton.next_power_of_2(nt),
         H=h,
