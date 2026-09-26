@@ -36,7 +36,6 @@ import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
-import sglang.multimodal_gen.runtime.models.dits.ming_image as ming_image
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
@@ -107,7 +106,6 @@ from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
     _apply_longcat_qknorm_rope,
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
-from sglang.multimodal_gen.runtime.models.dits.ming_image import MingSiluAndMul
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageCrossAttention,
     QwenImageTransformerBlock,
@@ -518,50 +516,6 @@ class TestFlux2EagerFusions(CustomTestCase):
 
         with patch("torch.compiler.is_compiling", return_value=True):
             self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
-
-
-# -------------------------------------------------------------------------
-# Ming-Image -- reuse the packed SwiGLU kernel through the model wrapper
-# -------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def test_ming_packed_swiglu_verifies_and_runs_fused_path(monkeypatch):
-    gate = BitExactFusionGate("Ming test SiLU-mul", per_signature=True)
-    monkeypatch.setattr(ming_image, "_MING_SWIGLU_FUSION", gate)
-    x = torch.randn(1, 32, 256, dtype=torch.bfloat16, device="cuda")
-    expected = F.silu(x[..., :128]) * x[..., 128:]
-
-    with patch.object(
-        ming_image,
-        "fused_packed_silu_mul_bitexact",
-        wraps=ming_image.fused_packed_silu_mul_bitexact,
-    ) as fused:
-        actual = MingSiluAndMul()(x)
-        replay = MingSiluAndMul()(x)
-
-    assert torch.equal(actual, expected)
-    assert torch.equal(replay, expected)
-    assert fused.call_count == 2
-    assert gate.verified and not gate.disabled
-
-
-@torch.no_grad()
-def test_ming_packed_swiglu_disables_fusion_on_mismatch(monkeypatch):
-    gate = BitExactFusionGate("Ming test SiLU-mul", per_signature=True)
-    monkeypatch.setattr(ming_image, "_MING_SWIGLU_FUSION", gate)
-    monkeypatch.setattr(
-        ming_image,
-        "fused_packed_silu_mul_bitexact",
-        lambda x: torch.zeros(
-            (*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype
-        ),
-    )
-    x = torch.randn(1, 4, 128, dtype=torch.bfloat16, device="cuda")
-    expected = F.silu(x[..., :64]) * x[..., 64:]
-
-    assert torch.equal(MingSiluAndMul()(x), expected)
-    assert gate.disabled and not gate.verified
 
 
 # -------------------------------------------------------------------------
