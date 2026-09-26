@@ -755,6 +755,16 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # EXPERIMENTAL: store the MHA HiCache L2 (host) pool as INT8 payload plus
+    # BF16 per-head scales instead of raw BF16. Cuts host bytes/token by 43.75%
+    # at TP=1 for Qwen3-8B, so a fixed --hicache-size buys ~1.78x more cached
+    # tokens. Requires --hicache-mem-layout layer_first, --page-size 1, TP=1,
+    # io_backend kernel and a BF16/FP16 dense MHA device pool; the pool raises at
+    # startup for anything else. See srt/mem_cache/pool_host/mha_int8.py.
+    SGLANG_EXPERIMENTAL_HICACHE_INT8 = EnvBool(False)
+    # Rows of device staging per direction for the INT8 HiCache path. Transfers
+    # larger than this grow the buffer; this only sets the initial allocation.
+    SGLANG_HICACHE_INT8_STAGING_TOKENS = EnvInt(2048)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
