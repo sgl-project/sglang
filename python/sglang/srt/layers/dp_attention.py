@@ -567,7 +567,11 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_parallel().attn_tp_rank == 0):
+    # CP ranks hold the same rows of their DP group; CP rank 0 writes them.
+    writes = (is_partial or get_parallel().attn_tp_rank == 0) and (
+        get_parallel().attn_cp_rank == 0
+    )
+    if local_tokens.shape[0] > 0 and writes:
         assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
             "aliasing between global_tokens and local_tokens not allowed"
         )
@@ -868,7 +872,20 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    """Gather each DP group's rows into its slot of the global buffer.
+
+    Under attention CP the CP ranks of a DP group must hold the same rows, and
+    only CP rank 0's copy is gathered. A caller whose CP ranks hold different
+    rows has to restore the full rows on every CP rank first.
+    """
     _note_dp_gather_in_prefill_graph()
+    if get_parallel().attn_cp_size > 1:
+        # The all-gathers take one block from every rank of the TP group, which
+        # spans the CP ranks as well; only placement before a sum keeps one copy.
+        _dp_gather_via_all_reduce(
+            global_tokens, local_tokens, forward_batch, is_partial
+        )
+        return
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
