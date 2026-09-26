@@ -84,8 +84,8 @@ def dense_prefill_topk(
 
 
 def _rows_per_chunk(rows: int, width: int, *, heads: int, budget_bytes: int) -> int:
-    """Query rows per logits tile so one fp32 [rows, width] tile fits
-    ``budget_bytes``; the row count stays a multiple of the kernel's row alignment."""
+    """Rows per fp32 logits tile within ``budget_bytes``, at the kernel's row
+    alignment."""
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
@@ -108,13 +108,10 @@ def score_tiles(
     budget_bytes: int,
     width_align: int = 4,
 ) -> Iterator[tuple[slice, torch.Tensor]]:
-    """The dense scores of the chunk row tile by row tile, each fp32 tile within
-    ``budget_bytes``:
-    ``(rows, logits)`` with fp32 ``logits[i, j]`` the score of query row
-    ``rows.start + i`` against ``kv[starts + j]``, garbage past the row's
-    ``lengths``; the width is the largest of ``context_lengths`` (compressed
-    positions at each request's newest token) aligned to ``width_align``
-    columns."""
+    """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
+    ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
+    garbage past the row's ``lengths``; the width is ``max(context_lengths)``
+    aligned to ``width_align``."""
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]

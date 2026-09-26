@@ -131,10 +131,9 @@ def topk_transform_paged_torch(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """The torch ``topk_transform_paged``: the top-``k`` (``k = out_page_indices.shape[1]``)
-    of each row of ``scores`` within its first ``seq_lens[b]`` columns, ascending, as
-    pool slots through ``page_tables`` and, when given, as positions; ``-1`` where a
-    row has fewer than ``k`` columns."""
+    """The torch ``topk_transform_paged``: top-``k`` (``k = out_page_indices.shape[1]``)
+    of each row within its first ``seq_lens[b]`` columns, ascending, as pool slots
+    through ``page_tables`` and as positions when given; ``-1`` padded."""
     topk = out_page_indices.shape[1]
     columns = torch.arange(scores.shape[1], device=seq_lens.device)
     lens_c = seq_lens.unsqueeze(-1)
