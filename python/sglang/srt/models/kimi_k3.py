@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -705,6 +704,12 @@ class KimiK3MoE(nn.Module):
         # control of weight layout.
         if _is_npu:
             return
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_quant import (
+                _k3_densify_quark_shared_experts,
+            )
+
+            _k3_densify_quark_shared_experts(self)
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
                 self.shared_experts.gate_up_proj,
@@ -1944,7 +1949,7 @@ class KimiK3DeltaAttention(nn.Module):
             f_b_weight = getattr(self, "_bfa_f_b_w", None)
             if f_b_weight is None:
                 f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
+            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
             backend_available = (
                 backend == "aiter"
                 and kda_fused_decode_aiter_hip.available(f_b_weight.device)

@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
@@ -27,7 +26,7 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
+    if not torch.cuda.is_available():
         return False
     try:
         return get_gfx() == "gfx950"

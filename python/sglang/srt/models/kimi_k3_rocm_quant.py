@@ -107,3 +107,21 @@ def _k3_merge_kda_inproj_fp8(self_attn: nn.Module) -> bool:
         self_attn.f_b_proj, self_attn.f_b_proj.weight.data
     ).contiguous()
     return True
+
+
+def _k3_densify_quark_shared_experts(mlp: nn.Module) -> None:
+    """Dequantize Quark MXFP4 shared experts to BF16 before the MoE front merge.
+
+    With the default bf16 SGLANG_ROCM_QUARK_MXFP4_LINEAR_ACT, Quark dequantizes
+    them anyway, but only after load_weights has merged the front. Doing it
+    here lets them join the fused front; the later loader pass is a no-op.
+    """
+    from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
+
+    shared = getattr(mlp, "shared_experts", None)
+    if shared is None or not quark_w4a4_mxfp4._dequant_linear_to_bf16:
+        return
+    for linear in (shared.gate_up_proj, shared.down_proj):
+        scheme = getattr(linear, "scheme", None)
+        if isinstance(scheme, quark_w4a4_mxfp4.QuarkW4A4MXFP4):
+            scheme.process_weights_after_loading(linear)
