@@ -196,6 +196,23 @@ class TestAnthropicServing(unittest.TestCase):
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
 
+    def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
+        """PD routers inject bootstrap fields into /v1/messages bodies; dropping
+        them in the Chat Completions conversion strands the decode request."""
+        request = self._anthropic_request(
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=2**62 + 17,
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.bootstrap_host, "prefill.internal")
+        self.assertEqual(converted.bootstrap_port, 8998)
+        self.assertEqual(converted.bootstrap_room, 2**62 + 17)
+        self.assertEqual(converted.routed_dp_rank, 3)
+        self.assertEqual(converted.disagg_prefill_dp_rank, 2)
+
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
             [
