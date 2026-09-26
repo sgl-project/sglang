@@ -1772,6 +1772,39 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids, decoded_prompt = cached
                 return list(prompt_ids), decoded_prompt
 
+        render_kwargs = dict(
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=tools,
+            return_dict=False,
+            **template_kwargs,
+        )
+        developer_indices = [
+            i for i, message in enumerate(messages) if message["role"] == "developer"
+        ]
+        if developer_indices:
+            # Some templates silently omit unsupported roles instead of raising.
+            # Probe this conversation's positions without changing the real prompt.
+            probe_messages = copy.deepcopy(messages)
+            sentinels = {}
+            for i in developer_indices:
+                sentinel = f"__sglang_developer_{uuid.uuid4().hex}__"
+                sentinels[i] = sentinel
+                probe_messages[i]["content"] = (
+                    [{"type": "text", "text": sentinel}]
+                    if isinstance(messages[i].get("content"), list)
+                    else sentinel
+                )
+            probe = self.tokenizer_manager.tokenizer.apply_chat_template(
+                probe_messages, **render_kwargs
+            )
+            for i, sentinel in sentinels.items():
+                if sentinel not in probe:
+                    raise ValueError(
+                        f"The chat template does not render the developer message "
+                        f"at index {i}. Use a template that supports developer "
+                        "messages or a supported message role."
+                    )
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
