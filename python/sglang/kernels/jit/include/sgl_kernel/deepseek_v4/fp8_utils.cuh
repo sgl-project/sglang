@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sgl_kernel/deepseek_v4/fp8_e4m3.h>
+
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -58,8 +60,8 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 // __HIP_SATFINITE -- the x2 fast path converts the value it was handed, not the clamped
 // one (ROCm 7.2).
 //
-// gfx942 keeps the software cast below, top-segment bug and all -- this instruction does
-// not produce the fnuz flavour that arch needs, so it takes a separate fix.
+// gfx942 keeps the software cast below: this instruction does not produce the fnuz
+// flavour that arch needs.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   const fp32x2_t v{fp8_e4m3_clip(x), fp8_e4m3_clip(y)};
   return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
@@ -67,68 +69,17 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 #else
 // Software float -> FP8 E4M3 conversion for the archs the branch above skips: gfx942,
 // plus any target with no native fp8 convert.
+// Keep the quantization clamp (FN: 448, FNUZ: 224): NaN -> +max, +/-Inf -> +/-max.
+// FNUZ can represent 240, but that does not change this path's scale/clamp convention.
 SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
+  // Do not leave signaling-NaN behavior to the platform's fmin/fmax lowering.
+  if ((__float_as_uint(val) & 0x7fffffffu) > 0x7f800000u) val = kFP8E4M3Max;
   val = fp8_e4m3_clip(val);
-  if (val == 0.0f) return 0;
-
-  uint32_t f32 = __float_as_uint(val);
-  uint8_t sign = static_cast<uint8_t>((f32 >> 31) << 7);
-  int32_t exp32 = static_cast<int32_t>((f32 >> 23) & 0xFF) - 127;
-  uint32_t mant23 = f32 & 0x7FFFFF;
-
 #if HIP_FP8_TYPE_FNUZ
-  // E4M3FNUZ: bias=8, max=240, no negative zero, NaN=0x80
-  constexpr int32_t kBias = 8;
-  constexpr int32_t kMaxExp = 15;
-  constexpr int32_t kMinSubnormExp = -10;  // min subnormal exponent
-  constexpr int32_t kMinNormExp = -7;      // min normal exponent
-  constexpr uint8_t kSaturate = 0x7Fu;     // max normal = 0_1111_111 = 240.0
+  return f32_to_fp8_e4m3_bits<true>(__float_as_uint(val));
 #else
-  // E4M3FN: bias=7, max=448, NaN=0x7F
-  constexpr int32_t kBias = 7;
-  constexpr int32_t kMaxExp = 15;
-  constexpr int32_t kMinSubnormExp = -9;
-  constexpr int32_t kMinNormExp = -6;
-  constexpr uint8_t kSaturate = 0x7Eu;  // max normal = 0_1111_110 = 448.0
+  return f32_to_fp8_e4m3_bits<false>(__float_as_uint(val));
 #endif
-
-  int32_t exp8;
-  uint8_t mant3;
-
-  if (exp32 < kMinSubnormExp) {
-#if HIP_FP8_TYPE_FNUZ
-    // E4M3FNUZ (gfx942) has no negative zero: byte 0x80 is NaN, not -0.0.
-    // Returning `sign` (0x80) for an underflowing negative injects NaN into the
-    // fp8 KV cache -> NaN attention/logits. Flush underflow to +0 instead.
-    return 0;
-#else
-    // E4M3FN (gfx950): 0x80 == -0.0, harmless.
-    return sign;
-#endif
-  } else if (exp32 < kMinNormExp) {
-    // Subnormal range
-    int32_t shift = -(kBias - 1) - exp32;  // 1..3
-    uint32_t subnorm_mant = (0x800000 | mant23) >> (shift + 20);
-    uint32_t round_bit = ((0x800000 | mant23) >> (shift + 19)) & 1;
-    subnorm_mant += round_bit;
-    mant3 = static_cast<uint8_t>(subnorm_mant & 0x07);
-    exp8 = 0;
-    if (subnorm_mant > 7) {
-      exp8 = 1;
-      mant3 = 0;
-    }
-  } else {
-    exp8 = exp32 + kBias;
-    mant3 = static_cast<uint8_t>(mant23 >> 20);
-    uint32_t round_bit = (mant23 >> 19) & 1;
-    mant3 += round_bit;
-    if (mant3 > 7) {
-      mant3 = 0;
-      exp8++;
-    }
-    if (exp8 >= kMaxExp) return sign | kSaturate;
-  }
-  return sign | (static_cast<uint8_t>(exp8) << 3) | mant3;
 }
 
 // Pack two fp32 values into a single fp8x2_e4m3 (uint16_t on HIP).
