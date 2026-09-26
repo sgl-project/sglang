@@ -2,6 +2,7 @@
 
 import sys
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,7 +10,11 @@ import pytest
 import torch
 
 from sglang.srt.layers.boundary_layout import Layout, TokenAxis
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import (
+    ADD_AND_NORM,
+    LayerCommunicator,
+    _attention_input_step,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -225,15 +230,20 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None
-    communicator._attn_input_fusions = ()
     gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
     # The rows of the steps the batch runs decide, not the ordinary steps'.
     communicator._steps = SimpleNamespace(
         ffn_input_rows=local if gathered_over_dp else gathered
     )
     selected = SimpleNamespace(
+        attention_prepare=partial(
+            _attention_input_step,
+            layer_input=None,
+            fusions=(),
+            enters_stack=False,
+            residual_ops=ADD_AND_NORM,
+        ),
         attention_input=lambda hidden_states, **kwargs: hidden_states,
-        layer_input=None,
         attention_handoff=lambda hidden_states, *args: hidden_states,
         ffn_input=lambda hidden_states, residual, *args: (hidden_states, residual),
         ffn_input_rows=gathered if gathered_over_dp else local,

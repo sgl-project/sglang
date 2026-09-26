@@ -1,6 +1,7 @@
 import contextlib
 import types
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -42,6 +43,13 @@ def sp_region_steps():
 
 def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
     return comm.BoundarySteps(
+        attention_prepare=partial(
+            comm._attention_input_step,
+            layer_input=None,
+            fusions=(),
+            enters_stack=False,
+            residual_ops=comm.ADD_AND_NORM,
+        ),
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
         ffn_input_rows=Layout(frozenset()),

@@ -1,6 +1,7 @@
 import ast
 import types
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,13 @@ def ordinary_steps(ffn_output, *, returns_over_dp=False):
     """A layer's ordinary steps, carrying the FFN output declaration the exit
     reads and whether the output goes back over attention DP."""
     return comm.BoundarySteps(
+        attention_prepare=partial(
+            comm._attention_input_step,
+            layer_input=None,
+            fusions=(),
+            enters_stack=False,
+            residual_ops=comm.ADD_AND_NORM,
+        ),
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
         ffn_input_rows=Layout(frozenset()),
