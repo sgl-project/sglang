@@ -13,11 +13,10 @@ from typing import Callable, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.layers.boundary_layout import SumGroup
+from sglang.srt.layers.boundary_layout import SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     FusedMlpInput,
     LayerCommunicator,
-    ScatterMode,
     UnreducedOutput,
     get_attn_tp_context,
 )
@@ -178,9 +177,6 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
-    # Chooses its own boundary steps, not from the declarations.
-    _takes_declared_boundaries = False
-
     fusion_service: CuteDSLFusionService | None = None
 
     # The runner can defer and a successor or the final norm consumes the handoff.
@@ -245,13 +241,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         fusions = super()._select_mlp_input_fusions()
         parallel = get_parallel()
         if (
-            self.layer_scatter_modes.layer_input_mode is ScatterMode.TP_ATTN_FULL
+            TokenAxis.ATTN_TP_SCATTER not in self.input_rows.sharded
+            # The workspace sums over TP, which is then the attention-TP group.
             and parallel.attn_tp_size == parallel.tp_size
             and _fused_norm_gamma(self.post_attention_layernorm) is not None
         ):
             return (
                 FusedMlpInput(
-                    completes=SumGroup.TP,
+                    completes=SumGroup.ATTN_TP,
                     run=self._mlp_input_reduce_output_and_update_and_read_residual_cutedsl,
                     may_return_new_residual=True,
                 ),
@@ -325,8 +322,9 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
             and self._context.tp_size > 1
-            # Restates the base's moe-cp, MOE_FULL and SCATTERED refusals.
-            and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
+            # The FFN runs on the full rows, not each rank's own slice.
+            and TokenAxis.ATTN_TP_SCATTER
+            not in self._batch_steps(forward_batch).ffn_input_rows.sharded
         )
 
     def should_fuse_mlp_allreduce_with_next_layer(
