@@ -2534,6 +2534,17 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
         check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
 
+    def test_dspark_case_insensitive(self):
+        for algo in ("DSPARK", "dspark", "Dspark"):
+            with self.subTest(algo=algo):
+                check_pipeline_parallel_compat(self._cfg(speculative_algorithm=algo))
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm=algo, disaggregation_mode="decode"
+                        )
+                    )
+
     def test_dspark_is_rejected_outside_pd_prefill(self):
         for mode in ("decode", "null"):
             with self.subTest(mode=mode):

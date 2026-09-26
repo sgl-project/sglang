@@ -58,7 +58,7 @@ def check_pipeline_parallel_compat(
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if (cfg.speculative_algorithm or "").upper() == "DSPARK":
         assert cfg.disaggregation_mode == "prefill", (
             "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
         )
