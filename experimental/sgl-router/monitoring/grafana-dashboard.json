@@ -100,7 +100,7 @@
     {
       "type": "stat",
       "title": "Error ratio",
-      "description": "Share of dispatches whose outcome=error.",
+      "description": "Share of dispatches that failed on the WORKER's side (outcome=error). Excludes client_error (4xx), backpressure (429/503) and cancelled, so a saturated fleet or a bad client does not read as a worker fault.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -511,7 +511,7 @@
     {
       "type": "timeseries",
       "title": "Responses by HTTP status",
-      "description": "Client-visible HTTP status codes (2xx/4xx/5xx, 504=stale-cancel).",
+      "description": "Client-visible HTTP status codes. A 504 is any router-side give-up \u2014 the stale-request deadline or an upstream timeout \u2014 or a worker 504 forwarded unchanged; worker_requests_total{outcome} tells them apart.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1601,6 +1601,100 @@
           "range": true,
           "refId": "A",
           "legendFormat": "{{worker_url}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "input_ids forwarding share by outcome",
+      "description": "Share of dispatched chat requests by input_ids forwarding outcome. Anything other than forwarded means the engine tokenized the request itself.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 41,
+        "w": 8,
+        "h": 8
+      },
+      "id": 23,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(sgl_router_input_ids_forwarding_total{model_id=~\"$model_id\"}[$__rate_interval])) / scalar(sum(rate(sgl_router_input_ids_forwarding_total{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}",
           "format": "time_series"
         }
       ]

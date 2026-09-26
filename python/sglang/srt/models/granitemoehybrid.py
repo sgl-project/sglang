@@ -4,7 +4,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
@@ -67,7 +66,6 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -253,7 +251,6 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -327,7 +324,7 @@ class GraniteMoeHybridModel(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -443,7 +440,7 @@ class GraniteMoeHybridForCausalLM(
         super().__init__()
 
         self.capture_aux_hidden_states = False
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.quant_config = quant_config
         self.config = config

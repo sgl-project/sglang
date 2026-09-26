@@ -403,7 +403,7 @@ class SWAComponent(TreeComponent):
             return prefix_len
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
-        swa_evicted_seqlen = params.swa_evicted_seqlen
+        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
         # A locked tombstone is legal (segment locks count every node); the
         # full-value swap below is safe because full lock_ref >= swa
         # lock_ref, so a locked-SWA node always takes the Recover branch.
@@ -480,7 +480,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         if node.component_data[ct].value is not None:
             return
-        swa_evicted_seqlen = params.swa_evicted_seqlen
+        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
         assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
             f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
         )
@@ -524,13 +524,14 @@ class SWAComponent(TreeComponent):
 
         node_start = result.prefix_len
         node_end = node_start + len(node.key)
-        split_pos = params.swa_evicted_seqlen - node_start
+        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
+        split_pos = swa_evicted_seqlen - node_start
         if split_pos >= len(node.key):
             # Entire leaf is outside the SWA window — left as a tombstone.
             return
         result.record_adopted_range(
             self.component_type,
-            max(node_start, params.swa_evicted_seqlen),
+            max(node_start, swa_evicted_seqlen),
             node_end,
         )
         if split_pos > 0:
@@ -751,6 +752,8 @@ class SWAComponent(TreeComponent):
             return x.id
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the SWA KV to host before the internal tombstone.
+        self._maybe_backup_node_before_swa_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -764,6 +767,45 @@ class SWAComponent(TreeComponent):
         )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
+
+    def _maybe_backup_node_before_swa_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's SWA KV to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator treats an unbacked tombstone as a window reset,
+        so a dropped internal SWA segment caps the match frontier until a
+        full sliding window re-accumulates below it, leaving up to one
+        window of still-resident KV unservable. The leaf backup walk covers
+        ancestors only within one window of the evicted leaf, so an
+        internal node whose child spans the window arrives here unbacked.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or not self.tree_core.has_swa_host_pool
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # in the SWA host pool the way the PREFETCH hook does.
+        needed = sum(
+            len(n.component_data[self.component_type].value)
+            for n in self._collect_unbacked_swa_nodes(node)
+        )
+        if needed == 0:
+            return
+        if (
+            self._swa_kv_pool_host is not None
+            and self._swa_kv_pool_host.available_size() < needed
+        ):
+            cache.evict_host(needed, self.component_type)
+        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
@@ -823,10 +865,7 @@ class SWAComponent(TreeComponent):
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
-        if lock_host:
-            result.swa_uuid_for_host_lock = swa_uuid
-        else:
-            result.swa_uuid_for_lock = swa_uuid
+        result.set_lock_uuid(ct, swa_uuid, lock_host=lock_host)
         return result
 
     def release_component_lock(
@@ -837,9 +876,9 @@ class SWAComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         root = self.tree_core.root_node
-        swa_uuid_for_lock = (
-            params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock
-        )
+        if node is root:
+            return
+        swa_uuid_for_lock = params.get_lock_uuid(ct, lock_host=lock_host)
         dec_swa = True
         uuid_key = "host_uuid" if lock_host else "uuid"
 
@@ -931,7 +970,9 @@ class SWAComponent(TreeComponent):
     ) -> Optional[int]:
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
-        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        insert_params.set_evicted_seqlen(
+            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+        )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -968,7 +1009,9 @@ class SWAComponent(TreeComponent):
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
         self._free_out_of_window_slots(req, pre_len)
-        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        insert_params.set_evicted_seqlen(
+            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+        )
 
     def cleanup_after_caching_req(
         self,
@@ -1051,8 +1094,19 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=torch.cat(
-                        [n.component_data[ct].value for n in unbacked_swa_nodes]
+                    device_indices=(
+                        self._translate_full_to_swa(
+                            torch.cat(
+                                [
+                                    n.component_data[BASE_COMPONENT_TYPE].value
+                                    for n in unbacked_swa_nodes
+                                ]
+                            )
+                        )
+                        if self._unified_allocator() is not None
+                        else torch.cat(
+                            [n.component_data[ct].value for n in unbacked_swa_nodes]
+                        )
                     ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
@@ -1206,12 +1260,11 @@ class SWAComponent(TreeComponent):
             if req.kv is None:
                 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-                req.kv = ReqKvInfo(
-                    kv_allocated_len=prefix_len,
-                    swa_evicted_seqlen=boundary,
-                )
-            else:
-                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            req.kv.set_evicted_seqlen(
+                self.component_type,
+                max(req.kv.get_evicted_seqlen(self.component_type), boundary),
+            )
             return transfer
 
         assert phase == ExternalLinkerLoadPhase.COMMIT

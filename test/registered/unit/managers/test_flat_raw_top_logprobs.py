@@ -4,10 +4,7 @@
 
 import asyncio
 import base64
-import json
-import os
 import pickle
-import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -569,6 +566,41 @@ class TestTokenizerManagerLogprobs(CustomTestCase):
         self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
         self.assertEqual(meta_info["output_token_logprobs_length"], 1)
 
+    def test_top_and_token_ids_logprobs_without_logprob_lists(self):
+        """An output without logprob lists, as sent for a request aborted before
+        prefill, must not crash a request that asked for top or token id logprobs."""
+        state = _make_state(
+            return_logprob=True, top_logprobs_num=2, token_ids_logprob=[42]
+        )
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            output_token_logprobs_val=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_val_flat=None,
+            output_top_logprobs_val=None,
+            input_token_ids_logprobs_val=None,
+            output_token_ids_logprobs_val=None,
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=[42],
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+        )
+
+        for key in (
+            "input_top_logprobs",
+            "output_top_logprobs",
+            "input_token_ids_logprobs",
+            "output_token_ids_logprobs",
+        ):
+            self.assertEqual(meta_info[key], [])
+
 
 def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     """A two-request BatchTokenIDOutput with the required fields stubbed."""
@@ -601,7 +633,6 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=None,
         output_token_sampling_mask=None,
-        output_token_sampling_logprobs=None,
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
@@ -660,128 +691,6 @@ class TestBatchOutputTransport(CustomTestCase):
         self.assertIsNone(output.input_top_logprobs_val_flat)
         self.assertIsNone(output.input_top_logprobs_idx_flat)
         self.assertIsNone(output.input_top_logprobs_flat_null_prefix)
-
-
-@unittest.skipUnless(
-    os.environ.get("SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS"),
-    "Serialization microbenchmark; set SGLANG_BENCH_FLAT_RAW_TOP_LOGPROBS=1 to run.",
-)
-class BenchFlatRawTopLogprobsSerialization(CustomTestCase):
-    """Round-trip cost of the formats: server assembly + json.dumps, then
-    client json.loads + reconstruction into [rows, k] arrays."""
-
-    def test_bench(self):
-        num_positions, k = 32768, 2
-        rng = np.random.default_rng(0)
-        vals = rng.standard_normal((num_positions, k)).astype(np.float32)
-        idxs = rng.integers(0, 150000, size=(num_positions, k), dtype=np.int32)
-        val_rows = [None] + vals[1:].tolist()
-        idx_rows = [None] + idxs[1:].tolist()
-
-        def best_of(fn, iters=5):
-            result = fn()
-            elapsed = min(
-                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
-                for _ in range(iters)
-            )
-            return elapsed * 1e3, result
-
-        def bench(name, build, decode):
-            encode_ms, payload = best_of(lambda: json.dumps(build()))
-            decode_ms, arrays = best_of(lambda: decode(payload))
-            self.assertEqual(arrays[0].shape, (num_positions - 1, k))
-            print(
-                f"{name}: encode {encode_ms:.1f} ms, decode {decode_ms:.1f} ms, "
-                f"{len(payload)} bytes"
-            )
-
-        def decode_nested(payload):
-            rows = [r for r in json.loads(payload) if r is not None]
-            return (
-                np.array([[e[0] for e in r] for r in rows], dtype=np.float32),
-                np.array([[e[1] for e in r] for r in rows], dtype=np.int32),
-            )
-
-        def decode_flat(payload):
-            d = json.loads(payload)
-            shape = d["input_top_logprobs_shape"]
-            return (
-                np.asarray(d["input_top_logprobs_val_flat"], np.float32).reshape(shape),
-                np.asarray(d["input_top_logprobs_idx_flat"], np.int32).reshape(shape),
-            )
-
-        bench(
-            "nested triples",
-            lambda: [
-                (None if row is None else [(v, i, None) for v, i in zip(row, idx_row)])
-                for row, idx_row in zip(val_rows, idx_rows)
-            ],
-            decode_nested,
-        )
-        bench(
-            "flat lists",
-            lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k
-            ),
-            decode_flat,
-        )
-
-        def decode_b64(payload):
-            d = json.loads(payload)
-            shape = d["input_top_logprobs_shape"]
-            return (
-                np.frombuffer(
-                    base64.b64decode(d["input_top_logprobs_val_flat_b64"]),
-                    np.dtype(d["input_top_logprobs_val_flat_b64_dtype"]),
-                ).reshape(shape),
-                np.frombuffer(
-                    base64.b64decode(d["input_top_logprobs_idx_flat_b64"]),
-                    np.dtype(d["input_top_logprobs_idx_flat_b64_dtype"]),
-                ).reshape(shape),
-            )
-
-        bench(
-            "flat b64",
-            lambda: _build_flat_input_top_logprobs_fields(
-                val_rows, idx_rows, top_logprobs_num=k, return_b64=True
-            ),
-            decode_b64,
-        )
-
-    def test_bench_ipc_pickle(self):
-        """Inter-process cost of BatchTokenIDOutput input-top fields: nested
-        per-position rows vs scheduler-flat arrays (two ZMQ pickle hops each
-        pay dumps + loads)."""
-        num_positions, k = 32768, 2
-        rng = np.random.default_rng(0)
-        vals = rng.standard_normal((num_positions, k)).astype(np.float32)
-        idxs = rng.integers(0, 150000, size=(num_positions, k), dtype=np.int32)
-
-        def best_of(fn, iters=10):
-            return min(
-                (lambda s=time.perf_counter(): (fn(), time.perf_counter() - s)[1])()
-                for _ in range(iters)
-            )
-
-        nested = _make_batch_token_id_output(
-            input_top_logprobs_val=[[None] + vals[1:].tolist(), []],
-            input_top_logprobs_idx=[[None] + idxs[1:].tolist(), []],
-        )
-        flat = _make_batch_token_id_output(
-            input_top_logprobs_val_flat=[vals[1:], None],
-            input_top_logprobs_idx_flat=[idxs[1:], None],
-            input_top_logprobs_flat_null_prefix=[1, None],
-        )
-        for name, obj in (("nested rows", nested), ("flat arrays", flat)):
-            payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-            dumps_ms = best_of(
-                lambda o=obj: pickle.dumps(o, protocol=pickle.HIGHEST_PROTOCOL)
-            )
-            loads_ms = best_of(lambda p=payload: pickle.loads(p))
-            print(
-                f"{name}: pickle.dumps {dumps_ms * 1e3:.2f} ms, "
-                f"pickle.loads {loads_ms * 1e3:.2f} ms, {len(payload) / 1e6:.2f} MB"
-            )
 
 
 if __name__ == "__main__":

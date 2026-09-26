@@ -384,6 +384,11 @@ class TreeComponent(ABC):
         - Mamba: performs the copy-on-write into a per-request slot."""
         return result
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        """Constrain the combined effective cache length after every
+        component's `prepare_for_caching_req` truncation has been min'd."""
+        return cache_len
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
@@ -610,7 +615,8 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: copies its eviction cursor into insert_params for finished and
+          unfinished requests; may return a branching boundary.
         - Mamba: prepares mamba_value (finished from ping-pong buffer,
           unfinished fork from req); returns mamba_last_track_seqlen."""
         return None
