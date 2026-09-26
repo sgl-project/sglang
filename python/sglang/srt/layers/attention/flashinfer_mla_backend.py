@@ -934,6 +934,11 @@ class FlashInferMLAIndicesUpdaterDecode:
                 valid.copy_(translator.translate_dcp_read_ids(valid))
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+            if not init_metadata_replay:
+                # FlashInfer >= 0.7.0 rejects a plan whose kv_len_arr disagrees with
+                # kv_indptr, and a draft branch spans its prefix plus one per step.
+                # Replay plans through fast_mla_decode_plan, which skips that check.
+                kv_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
         if not init_metadata_replay:
             wrapper.plan(
