@@ -25,7 +25,7 @@ from .evs_module import EVS, EVSConfig
 
 def _non_evs_data_items(
     *,
-    image: torch.Tensor | None,
+    image: torch.Tensor | list[torch.Tensor] | None,
     image_offsets: list[tuple[int, int]],
     video: torch.Tensor | None,
     video_offsets: list[tuple[int, int]],
@@ -91,7 +91,7 @@ class EVSProcessor:
         def create_evs_data_items(
             *,
             input_ids_list: list[int],
-            image: torch.Tensor | None,
+            image: torch.Tensor | list[torch.Tensor] | None,
             image_offsets: list[tuple[int, int]],
             video: torch.Tensor | None,
             video_offsets: list[tuple[int, int]],

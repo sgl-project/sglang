@@ -319,7 +319,13 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 for image in preprocessed_images
             ]
             prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
-            image_feature = torch.cat(preprocessed_images, dim=0)
+            # One entry per image, each holding that image's tiles. Packing
+            # them is not just wasted work: with more than one tile per image
+            # the packed rows outnumber the placeholders, _try_simple_split
+            # declines, and the item stays bundled -- losing the per-image
+            # cache granularity the split exists for. The dynamic-resolution
+            # branch above already keeps its list for the same reason.
+            image_feature = preprocessed_images
 
         video_feature = None
         T = self.video_temporal_patch_size
