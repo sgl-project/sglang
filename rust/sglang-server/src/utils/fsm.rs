@@ -13,14 +13,14 @@
 //! ```
 //!
 //! The to-scheduler stages run in one fixed order, each skipped when a request
-//! has nothing for it: `Tokenizing` (text → ids) then `Encoding` (ids + media →
+//! has nothing for it: `Tokenizing` (text -> ids) then `Encoding` (ids + media ->
 //! placeholder-expanded ids + features), converging on `PreSendValidating`.
 //! `Tokenizing` carries what follows it ([`AfterTokenize`]) so the tokenizer
 //! pool, which applies `TokenizeDone` itself, needs no routing knowledge: the
 //! next state is a pure function of (state, event), decided by intake once at
 //! `Normalizing`. A request that already has ids still passes through
-//! `Tokenizing` — intake applies `TokenizeDone` inline instead of visiting the
-//! pool — so "skip" means no pool hop, never a different route.
+//! `Tokenizing` -- intake applies `TokenizeDone` inline instead of visiting the
+//! pool -- so "skip" means no pool hop, never a different route.
 
 use super::error::Error;
 
@@ -50,8 +50,8 @@ pub enum RequestState {
     Aborted,
 }
 
-/// The stage after `Tokenizing`: the pre-send checks, or — for a multimodal
-/// prompt, whose placeholders the MM worker expands in ids — `Encoding`.
+/// The stage after `Tokenizing`: the pre-send checks, or -- for a multimodal
+/// prompt, whose placeholders the MM worker expands in ids -- `Encoding`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterTokenize {
     PreSend,
@@ -61,7 +61,7 @@ pub enum AfterTokenize {
 /// Outcome of validation.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Tokenizing, then Encoding, where an MM worker
+    /// Has multimodal inputs -> Tokenizing, then Encoding, where an MM worker
     /// runs the multimodal pipeline and returns the final expanded `input_ids`.
     HasMultimodal,
     /// Plain text → Tokenizing.
@@ -157,7 +157,7 @@ impl RequestState {
                 TokenizeDone,
             ) => Encoding,
             // The MM worker returns the *final* placeholder-expanded input_ids,
-            // so an encoded request never revisits the tokenizer pool — but not
+            // so an encoded request never revisits the tokenizer pool -- but not
             // the pre-send checks: expanded image tokens count against the same
             // input + max_new_tokens ceiling as tokenized text.
             (Encoding, EncodeDone) => PreSendValidating,
@@ -193,8 +193,8 @@ mod tests {
         state
     }
 
-    /// Every to-scheduler branch — control, client-supplied ids, text through the
-    /// tokenizer pool, and media through the MM pool — must land in
+    /// Every to-scheduler branch -- control, client-supplied ids, text through the
+    /// tokenizer pool, and media through the MM pool -- must land in
     /// `PreSendValidating`, because that is where the checks needing the final
     /// `input_ids` run. A branch that reached `Queued` directly would skip them
     /// silently.
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// The stages run in one fixed order: a multimodal prompt tokenizes, then
-    /// encodes — the single MM route, whether the pool or intake (ids already
+    /// encodes -- the single MM route, whether the pool or intake (ids already
     /// present) applies `TokenizeDone`. It cannot reach the ring without
     /// `Encoding`, and `Encoding` never loops back to the pool.
     #[test]

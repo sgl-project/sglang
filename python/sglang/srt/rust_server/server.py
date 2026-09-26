@@ -219,7 +219,7 @@ class RustServer:
         polling the zmq socket when `rust_server_mode` is set.
 
         Each request arrives as a scalar msgpack `header` (with `input_ids`
-        and `token_ids_logprob` left nil) plus its named **buffers** — the one
+        and `token_ids_logprob` left nil) plus its named **buffers** -- the one
         data plane every non-scalar payload uses. An inline buffer is a shaped
         numpy array that owns the Rust vector (nothing was copied to get here);
         a shm buffer is a `ShmBuffer` naming the segment to map after the TP
@@ -230,7 +230,7 @@ class RustServer:
         (the one copy left, forced by that type), `token_ids_logprob` as a
         list, and the `mm.*` set through :meth:`_wrap_mm_result`.
         `recv_requests` never waits: the ring drain is `try_recv` (returns the
-        instant the ring is dry, capped at `max_recv`) — same contract as
+        instant the ring is dry, capped at `max_recv`) -- same contract as
         `zmq.NOBLOCK`. Parking for work is :meth:`wait_request`, which does
         release the GIL.
         """

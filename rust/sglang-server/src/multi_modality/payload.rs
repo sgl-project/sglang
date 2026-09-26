@@ -17,7 +17,7 @@ use crate::message::types::TokenIds;
 /// prefetched on the async API layer; data URLs and bare base64 are decoded on
 /// the MM worker.
 pub struct ResolvedMediaWork {
-    /// The prompt ids with placeholders unexpanded — always present, the
+    /// The prompt ids with placeholders unexpanded -- always present, the
     /// tokenizer pool having run first for a text prompt.
     pub input_ids: TokenIds,
     pub images: Vec<Bytes>,

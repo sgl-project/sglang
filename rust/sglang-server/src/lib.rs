@@ -6,7 +6,7 @@
 //! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
 //! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
 //! (boot, `recv_requests`/`wait_request`, `push_*`, shutdown),
-//! [`IngressRequest`] and [`ShmBuffer`]. Everything behind that boundary —
+//! [`IngressRequest`] and [`ShmBuffer`]. Everything behind that boundary --
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
 //! a `PyObject`.
@@ -42,7 +42,7 @@ use crate::utils::startup::{listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
-/// msgpack scalar header plus every non-scalar payload as a named buffer —
+/// msgpack scalar header plus every non-scalar payload as a named buffer --
 /// `input_ids`, `token_ids_logprob`, and for a multimodal request the
 /// `mm.*` set (`mm.feature.{i}` per item, `mm.mrope`, and the `mm.meta`
 /// msgpack sidecar) that `RustMmProcessor.wrap_encoded` or an external
@@ -59,7 +59,7 @@ pub struct IngressRequest {
 }
 
 /// A buffer parked in a POSIX shared-memory segment: `name` is what Python's
-/// `SharedMemory(name=…)` opens, `dtype` the numpy dtype to view it with,
+/// `SharedMemory(name=...)` opens, `dtype` the numpy dtype to view it with,
 /// `shape` its logical shape.
 ///
 /// The unlink duty stays on this side until Python has admitted the request.
@@ -276,7 +276,7 @@ impl Server {
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
     /// in Rust; their buffers ride the ring with the request (the `mm.*` set of
     /// [`IngressRequest::buffers`]). Anything the pipeline cannot serve is
-    /// rejected back to the client — there is no Python fallback.
+    /// rejected back to the client -- there is no Python fallback.
     pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         self.rt
             .start_mm_workers(spec, workers)

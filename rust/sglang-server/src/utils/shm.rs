@@ -23,7 +23,7 @@ pub fn reserve_pages(fd: BorrowedFd<'_>, len: u64) -> rustix::io::Result<()> {
     fallocate(fd, FallocateFlags::empty(), 0, len)
 }
 
-/// A named POSIX shared-memory segment owning its name: dropped → unlinked.
+/// A named POSIX shared-memory segment owning its name: dropped -> unlinked.
 ///
 /// Written by an MM worker so the TP broadcast carries a ~100-byte
 /// `ShmPointerMMData` stub instead of the ~20 MB feature tensor, and every
@@ -36,8 +36,8 @@ pub struct ShmSegment {
 }
 
 impl ShmSegment {
-    /// Create the segment `name` holding exactly `bytes`. No leading slash —
-    /// the name must suit Python's `SharedMemory(name=…)` (shm_open adds one).
+    /// Create the segment `name` holding exactly `bytes`. No leading slash --
+    /// the name must suit Python's `SharedMemory(name=...)` (shm_open adds one).
     pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
         Self::create_with(name, bytes, reserve_pages)
     }
@@ -85,12 +85,12 @@ impl ShmSegment {
         Ok(segment)
     }
 
-    /// The name as Python's `SharedMemory(name=…)` sees it.
+    /// The name as Python's `SharedMemory(name=...)` sees it.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Hand the segment — and the duty to unlink — to the caller (Python, at
+    /// Hand the segment -- and the duty to unlink -- to the caller (Python, at
     /// drain time).
     pub fn into_name(self) -> String {
         std::mem::take(&mut std::mem::ManuallyDrop::new(self).name)
@@ -128,7 +128,7 @@ mod tests {
         unique_name("test")
     }
 
-    /// The segment holds exactly the written bytes and dropping it unlinks —
+    /// The segment holds exactly the written bytes and dropping it unlinks --
     /// the leak guard for results purged before Python takes them.
     #[test]
     fn segment_roundtrip_and_drop_unlinks() {

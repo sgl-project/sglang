@@ -379,7 +379,7 @@ fn hidden_states_gated_on_server_support() {
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
-/// to the channel, after registration — so it must be deregistered, not leaked.
+/// to the channel, after registration -- so it must be deregistered, not leaked.
 #[test]
 fn over_context_request_deregisters_and_never_reaches_the_channel() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
@@ -861,7 +861,7 @@ fn make_intake_with_tokenizer(
 }
 
 /// Stand in for the MM pool: write the worker's result onto the request and
-/// advance `Encoding → PreSendValidating`, exactly as `MmWorker::run` does.
+/// advance `Encoding -> PreSendValidating`, exactly as `MmWorker::run` does.
 fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffer>) {
     assert!(
         matches!(req.state, RequestState::Encoding),
@@ -877,8 +877,8 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
 
 /// An abort while the request is out in the mm pool cancels it: the sink is
 /// deregistered at once, no AbortReq is sent (the scheduler never saw the
-/// rid), and the returning request is dropped instead of pushed — releasing
-/// the shm its buffers carry — so no GPU time or KV memory goes to a client
+/// rid), and the returning request is dropped instead of pushed -- releasing
+/// the shm its buffers carry -- so no GPU time or KV memory goes to a client
 /// that left.
 #[test]
 fn abort_while_in_mm_pool_drops_on_return() {
@@ -996,7 +996,7 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
     );
     assert!(consumer.drain(16).is_empty(), "in the pool, not queued");
 
-    // The worker returns the final expanded ids → pushed to the channel.
+    // The worker returns the final expanded ids -> pushed to the channel.
     encode_like_worker(&mut req, vec![5, 6, 7, 8], Vec::new());
     intake.drive(req);
     let batch = consumer.drain(16);
@@ -1010,7 +1010,7 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
 
 /// A multimodal *text* prompt visits the tokenizer pool first
 /// (`Tokenizing { then: Encode }`), then the mm pool in `Encoding` carrying the
-/// tokenizer's ids — the MM worker never sees text. `Encoded` then → channel.
+/// tokenizer's ids -- the MM worker never sees text. `Encoded` then -> channel.
 #[test]
 fn mm_text_prompt_tokenizes_then_encodes() {
     let (mut intake, tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);

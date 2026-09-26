@@ -186,7 +186,7 @@ fn tensor_data(data: TensorData) -> BufferData {
 }
 
 /// Lay each item's feature tensor out as `mm.feature.{i}`: in its own shm
-/// segment when `shm` is set — the unit Python's `ShmPointerMMData` maps —
+/// segment when `shm` is set -- the unit Python's `ShmPointerMMData` maps --
 /// else inline. An empty tensor stays inline even under `shm`: a zero-length
 /// segment cannot be mapped on either side, and there is nothing to share.
 /// Any shm failure (`/dev/shm` full) falls the whole request back to inline,
@@ -230,7 +230,7 @@ fn place_features(
 }
 
 /// The ring's named buffers for one result: the per-item features (see
-/// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar —
+/// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
     let meta = MmMeta::of(&entry).encode()?;
@@ -274,7 +274,7 @@ fn process(
 /// the spec).
 pub struct MmWiring {
     /// Requests in `Encoding`, drained by the worker pool. Stays empty for
-    /// non-multimodal models — nothing routes to it.
+    /// non-multimodal models -- nothing routes to it.
     pub mm_rx: flume::Receiver<Request>,
     /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
@@ -303,7 +303,7 @@ impl Runnable for MmWorker {
     /// shutdown). One request at a time, so the pool size bounds MM
     /// concurrency. Mirrors `TokenizerWorker`: carve the work out of the
     /// request, process, write the result back, advance the FSM
-    /// (`EncodeDone` → PreSendValidating, or `Error` → Failed, which intake
+    /// (`EncodeDone` -> PreSendValidating, or `Error` -> Failed, which intake
     /// rejects to the client as Python turns a per-request exception into a
     /// 400), and return the request as `Encoded`.
     fn run(self) {
@@ -766,7 +766,7 @@ mod tests {
             move || MmWorker::new(mm_rx, tm_tx, ok_ctx).run()
         });
         mm_tx.send(encoding_req("ok", vec![1, 2])).unwrap();
-        drop(mm_tx); // closes the pool edge → the loop exits after draining
+        drop(mm_tx); // closes the pool edge -> the loop exits after draining
         worker.join().unwrap();
 
         let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {

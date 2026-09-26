@@ -350,7 +350,7 @@ pub fn mrope_image_only(
 pub struct QwenPackedOutput {
     pub input_ids: Vec<i64>,
     /// Per item `pixel_values` in prompt order, each flattened
-    /// `[t·h·w, 3·temporal_patch_size·patch_size²]` — moved straight out of
+    /// `[t*h*w, 3*temporal_patch_size*patch_size^2]` -- moved straight out of
     /// the driver output, never concatenated, so each item can be placed
     /// (inline or in its own shm segment) without a copy.
     pub features: Vec<Vec<f32>>,

@@ -1,6 +1,6 @@
-//! The one Rust → scheduler data plane. Every non-scalar payload a request
-//! carries — `input_ids`, `token_ids_logprob`, the multimodal feature tensors
-//! and their metadata sidecar — is a named, shaped [`Buffer`] riding the ring
+//! The one Rust -> scheduler data plane. Every non-scalar payload a request
+//! carries -- `input_ids`, `token_ids_logprob`, the multimodal feature tensors
+//! and their metadata sidecar -- is a named, shaped [`Buffer`] riding the ring
 //! beside the msgpack scalar header, and crosses the pyo3 boundary the same
 //! way: an inline buffer hands its very allocation to numpy (no copy); a shm
 //! buffer hands over only its segment name, for the receiver to map after the
@@ -20,7 +20,7 @@ pub enum DType {
     U64,
     /// Raw BF16 bits; Python reinterprets them without a copy.
     U16,
-    /// Opaque bytes — a msgpack sidecar for structured scalars.
+    /// Opaque bytes -- a msgpack sidecar for structured scalars.
     U8,
 }
 
@@ -138,8 +138,8 @@ pub enum BufferStore {
     Inline(BufferData),
     /// A POSIX shared-memory segment (see [`ShmSegment`]); only the name
     /// crosses to Python, which maps it on every TP rank after the broadcast.
-    /// Dropped unconsumed — request rejected after encoding (a pre-send
-    /// check, a full ring) or dropped at shutdown — the segment is unlinked
+    /// Dropped unconsumed -- request rejected after encoding (a pre-send
+    /// check, a full ring) or dropped at shutdown -- the segment is unlinked
     /// with it.
     Shm { segment: ShmSegment, dtype: DType },
 }
@@ -147,7 +147,7 @@ pub enum BufferStore {
 /// One named payload of a scheduler request.
 #[derive(Debug)]
 pub struct Buffer {
-    /// The key the Python drain attaches it by (`input_ids`, `mm.feature.0`, …).
+    /// The key the Python drain attaches it by (`input_ids`, `mm.feature.0`, ...).
     pub name: String,
     /// Logical shape; numpy views the elements with it. `[len]` for a flat
     /// buffer.

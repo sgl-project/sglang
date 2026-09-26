@@ -821,7 +821,7 @@ impl GenerateRequest {
     /// Every non-scalar payload as a named buffer, in the shape the Python
     /// drain attaches: `input_ids` (already the scheduler's int64),
     /// `token_ids_logprob` when present, then whatever the MM worker left in
-    /// `mm_buffers`. Pure moves — no id is read here, and the header, the last
+    /// `mm_buffers`. Pure moves -- no id is read here, and the header, the last
     /// thing built from this request, never carries them.
     pub fn take_buffers(&mut self) -> Vec<Buffer> {
         let mut buffers = Vec::with_capacity(2 + self.mm_buffers.len());

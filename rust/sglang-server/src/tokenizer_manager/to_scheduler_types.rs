@@ -10,7 +10,7 @@ pub struct MmDispatch {
     /// ignored, as the Python `TokenizerManager` does with `mm_processor is
     /// None`.
     pub enabled: bool,
-    /// → MM worker pool (spawned via `Server.start_mm_workers`); carries the
+    /// -> MM worker pool (spawned via `Server.start_mm_workers`); carries the
     /// whole request, like the tokenizer pool's edge.
     pub tx: flume::Sender<Request>,
 }

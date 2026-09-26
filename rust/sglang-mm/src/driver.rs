@@ -25,7 +25,7 @@ pub enum ImageSource {
 /// Typed multimodal request input. The server's message layer owns the wire
 /// format and parses its payload into this before calling [`process`].
 pub struct MmInput {
-    /// The tokenized prompt with its placeholders still unexpanded — the
+    /// The tokenized prompt with its placeholders still unexpanded -- the
     /// client's own ids or the tokenizer pool's. Tokenization is not this
     /// pipeline's job: the layout step only needs ids.
     pub input_ids: Vec<i64>,

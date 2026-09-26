@@ -29,7 +29,7 @@ pub enum TmEvent {
     /// A request back from the MM pool: `PreSendValidating` with the final
     /// placeholder-expanded `input_ids` and the feature buffers (inline or
     /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
-    /// preprocess error, …).
+    /// preprocess error, ...).
     Encoded(Request),
 }
 

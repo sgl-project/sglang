@@ -1,5 +1,5 @@
-//! The one result shape every multimodal processor produces — the built-in
-//! Qwen pipeline and external model packages alike — and its msgpack
+//! The one result shape every multimodal processor produces -- the built-in
+//! Qwen pipeline and external model packages alike -- and its msgpack
 //! sidecar. The worker turns it into the ring's named buffers (see
 //! `worker::make_buffers`): one shaped feature buffer per item, the M-RoPE
 //! positions, and `mm.meta`, the sidecar carrying everything small and

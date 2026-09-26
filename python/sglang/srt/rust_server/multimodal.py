@@ -113,7 +113,7 @@ def rust_mm_family_for(
 
 
 class _ModalityTable(dict):
-    """``mm.meta`` modality names → scheduler ``Modality``, resolved lazily so
+    """``mm.meta`` modality names -> scheduler ``Modality``, resolved lazily so
     this module keeps its light import footprint."""
 
     def __missing__(self, name):
@@ -153,8 +153,8 @@ def settle_shm_buffers(buffers, *, admitted: bool) -> None:
 class MmTransportStats:
     """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
 
-    A feature tensor crosses in one of two shapes: ``inline`` — a numpy array
-    that owns the Rust vector, viewed by ``torch.from_numpy`` — or ``shm`` — a
+    A feature tensor crosses in one of two shapes: ``inline`` -- a numpy array
+    that owns the Rust vector, viewed by ``torch.from_numpy`` -- or ``shm`` -- a
     POSIX segment the worker wrote, named in the request so every TP rank maps
     it after the broadcast."""
 
@@ -332,7 +332,7 @@ class RustMmProcessor:
     def wrap_encoded(spec: RustMmSpec, buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
-        the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
+        the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
         resize, patchify, token expansion and M-RoPE all ran in Rust.
 
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,

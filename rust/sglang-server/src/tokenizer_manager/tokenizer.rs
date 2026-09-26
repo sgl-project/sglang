@@ -197,8 +197,8 @@ impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
             // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating,
-            // or → Encoding for a multimodal prompt; the state's `then` says which).
+            // then advance the FSM: `TokenizeDone` on success (-> PreSendValidating,
+            // or -> Encoding for a multimodal prompt; the state's `then` says which).
             // A request is never dropped here: a kind this pool cannot serve
             // goes back as `Failed`, so intake rejects it and releases its
             // tracking entry instead of leaving the client hung.

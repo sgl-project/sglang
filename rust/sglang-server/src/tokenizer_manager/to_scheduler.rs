@@ -124,7 +124,7 @@ impl Intake {
     }
 
     /// Drive a request through its intake states until it terminates (failed or
-    /// pushed to the channel) or is handed to a pool — the tokenizer pool
+    /// pushed to the channel) or is handed to a pool -- the tokenizer pool
     /// (re-entering as `Tokenized`) or the MM pool (re-entering as `Encoded`).
     /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
     /// are the design table's states, `Failed` the single reject path.
@@ -199,7 +199,7 @@ impl Intake {
                             // still needs placeholder expansion) — the same
                             // precedence as the Python TokenizerManager. The MM
                             // worker expands placeholders in ids only, so the
-                            // route is Tokenizing → Encoding; a prompt that
+                            // route is Tokenizing -> Encoding; a prompt that
                             // already has ids skips the pool hop, not the state.
                             Ok(()) if self.mm.enabled && g.has_multimodal() => {
                                 Ok(ValidationOutcome::HasMultimodal)
@@ -216,15 +216,15 @@ impl Intake {
                             let _ = req.state.apply(Event::Error(e)); // → Failed
                         }
                         Ok(o) => {
-                            // AlreadyTokenized → PreSendValidating; NeedsTokenize
-                            // and HasMultimodal → Tokenizing (then PreSend / Encode).
+                            // AlreadyTokenized -> PreSendValidating; NeedsTokenize
+                            // and HasMultimodal -> Tokenizing (then PreSend / Encode).
                             let _ = req.state.apply(Event::Validated(o));
                         }
                     }
                 }
                 // Hand off to the MM worker pool, which returns the request as
                 // an `Encoded` event (PreSendValidating with the expanded ids and
-                // feature buffers set — or Failed on error). Doesn't loop. The
+                // feature buffers set -- or Failed on error). Doesn't loop. The
                 // request is out of reach while there; an abort in that window
                 // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
@@ -249,8 +249,8 @@ impl Intake {
                     return;
                 }
                 // Hand off to the tokenizer pool; it returns the request as a
-                // `Tokenized` event (`then`: PreSendValidating or Encoding — or
-                // Failed on error). Doesn't loop — except for a prompt that
+                // `Tokenized` event (`then`: PreSendValidating or Encoding -- or
+                // Failed on error). Doesn't loop -- except for a prompt that
                 // already carries ids (a pre-tokenized multimodal request), which
                 // has nothing for the pool: apply `TokenizeDone` here and keep
                 // driving, so the state walks the same fixed order without the hop.
@@ -295,7 +295,7 @@ impl Intake {
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Hand the request to the stage that answers it: the scheduler
-                // channel (generate payload or control frame), or — for detokenize
+                // channel (generate payload or control frame), or -- for detokenize
                 // — the detok shard itself.
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the

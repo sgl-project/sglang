@@ -45,7 +45,7 @@ impl ToSchedulerTx {
 
 impl ToSchedulerRx {
     /// Drain up to `max` messages, returning immediately when the ring runs
-    /// dry — mirrors the scheduler's existing `zmq.NOBLOCK` loop in
+    /// dry -- mirrors the scheduler's existing `zmq.NOBLOCK` loop in
     /// `request_receiver._pull_raw_reqs`. The requests move out whole: their
     /// buffers are handed to numpy by the pyo3 boundary, never copied here.
     ///
