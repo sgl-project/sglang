@@ -941,6 +941,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v41_thinking_env_uses_engine_budgets() {
+        // Isolate the environment so other formatter tests keep their defaults.
+        const CHILD: &str = "SGL_ROUTER_TEST_V41_BUDGET_CHILD";
+        let Ok(default_budget) = std::env::var(CHILD) else {
+            for (effort, budget) in [
+                (None, 75),
+                (Some("low"), 50),
+                (Some("high"), 75),
+                (Some("xhigh"), 75),
+                (Some("max"), 100),
+                (Some("42"), 42),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "tokenizer::chat_formatter::tests::v41_thinking_env_uses_engine_budgets",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, budget.to_string())
+                    .env("SGLANG_DEFAULT_THINKING", "1")
+                    .env_remove("SGLANG_DSV41_REASONING_EFFORT");
+                if let Some(effort) = effort {
+                    child.env("SGLANG_DSV41_REASONING_EFFORT", effort);
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "effort={effort:?}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let enc = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").unwrap();
+        for (effort, budget) in [
+            (None, default_budget.as_str()),
+            (Some("unsupported"), default_budget.as_str()),
+            (Some("low"), "50"),
+            (Some("high"), "75"),
+            (Some("xhigh"), "75"),
+            (Some("max"), "100"),
+        ] {
+            let mut req = request(json!([{"role":"user","content":"hi"}]));
+            if let Some(effort) = effort {
+                req["reasoning_effort"] = json!(effort);
+            }
+            let prompt = enc.render(&req).unwrap();
+            assert!(
+                prompt.contains(&format!("Reasoning Effort: {budget} (range 1-100,")),
+                "request={req}, prompt={prompt}"
+            );
+            assert!(prompt.ends_with("<think>"), "{prompt}");
+        }
+    }
+
     /// Messages reach the template shaped like the engine's request schema.
     #[test]
     fn messages_match_engine_schema() {

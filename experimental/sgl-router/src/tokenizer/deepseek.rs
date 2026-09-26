@@ -311,7 +311,7 @@ fn render_v41(
         });
     let budget = dsv41_budget(effort)
         .or_else(|| dsv41_budget(env_effort))
-        .unwrap_or(50);
+        .unwrap_or(75);
     v41::encode_messages(
         &messages,
         if thinking {
@@ -328,8 +328,8 @@ fn render_v41(
 fn dsv41_budget(effort: Option<Value>) -> Option<u8> {
     match effort {
         Some(Value::String(s)) => match s.as_str() {
-            "low" => Some(25),
-            "high" => Some(50),
+            "low" => Some(50),
+            "high" => Some(75),
             "xhigh" => Some(75),
             "max" => Some(100),
             _ => None,

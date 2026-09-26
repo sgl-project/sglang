@@ -2409,6 +2409,51 @@ mod tests {
         .to_string();
         assert!(err.contains("unknown parameter"), "got: {err}");
     }
+
+    #[test]
+    fn default_chat_template_kwargs_reaches_the_model_config() {
+        let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "high"});
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-chat-template-kwargs",
+            &kwargs.to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(config.model.default_chat_template_kwargs).unwrap(),
+            kwargs
+        );
+
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(defaults.model.default_chat_template_kwargs.is_empty());
+    }
+
+    #[test]
+    fn malformed_default_chat_template_kwargs_fails_the_launch() {
+        for kwargs in [
+            r#"{"thinking": true"#,
+            "[]",
+            "null",
+            "true",
+            "42",
+            r#""high""#,
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--default-chat-template-kwargs",
+                kwargs,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("--default-chat-template-kwargs must be a JSON object"),
+                "kwargs={kwargs}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn input_ids_forwarding_can_be_disabled_for_the_model() {
         let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
