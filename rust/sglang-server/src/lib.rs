@@ -39,7 +39,7 @@ use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
 use crate::utils::startup::{listen_addr, value_error};
-use crate::utils::{logging, runtime};
+use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
 /// msgpack scalar header plus every non-scalar payload as a named buffer —
@@ -60,13 +60,58 @@ pub struct IngressRequest {
 
 /// A buffer parked in a POSIX shared-memory segment: `name` is what Python's
 /// `SharedMemory(name=…)` opens, `dtype` the numpy dtype to view it with,
-/// `shape` its logical shape. The duty to unlink moves to Python with it
-/// (`ShmPointerMMData.materialize()` unlinks after the post-broadcast clone).
-#[pyclass(frozen, get_all)]
+/// `shape` its logical shape.
+///
+/// The unlink duty stays on this side until Python has admitted the request.
+/// `release()` hands it to `ShmPointerMMData` (whose `materialize()` unlinks
+/// after the post-broadcast open) once every item of the request wrapped;
+/// `discard()` unlinks at once when the request is rejected; and a `ShmBuffer`
+/// dropped with neither call (a header that never decoded, so the buffers were
+/// never looked at) unlinks on drop. So no rejection path can leak a segment.
+#[pyclass]
 pub struct ShmBuffer {
+    /// `Some` while this side still owns the unlink.
+    segment: Option<ShmSegment>,
+    #[pyo3(get)]
     name: String,
+    #[pyo3(get)]
     dtype: &'static str,
+    #[pyo3(get)]
     shape: Vec<usize>,
+}
+
+impl ShmBuffer {
+    fn new(segment: ShmSegment, dtype: &'static str, shape: Vec<usize>) -> Self {
+        Self {
+            name: segment.name().to_owned(),
+            segment: Some(segment),
+            dtype,
+            shape,
+        }
+    }
+
+    /// Whether this side still owns the unlink.
+    #[cfg(test)]
+    fn owns_segment(&self) -> bool {
+        self.segment.is_some()
+    }
+}
+
+#[pymethods]
+impl ShmBuffer {
+    /// Hand the unlink duty to Python: the request was admitted and its
+    /// `ShmPointerMMData` stubs now own the segment. Idempotent.
+    fn release(&mut self) {
+        if let Some(segment) = self.segment.take() {
+            let _ = segment.into_name();
+        }
+    }
+
+    /// Unlink now: the request was rejected before Python took the segment.
+    /// Idempotent, and a no-op after `release`.
+    fn discard(&mut self) {
+        self.segment.take();
+    }
 }
 
 /// Hand one buffer across: the inline vector becomes a numpy array owning it,
@@ -98,15 +143,9 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
             BufferData::U16(v) => shaped(py, v, &shape)?,
             BufferData::U8(v) => shaped(py, v, &shape)?,
         },
-        BufferStore::Shm { segment, dtype } => Py::new(
-            py,
-            ShmBuffer {
-                name: segment.into_name(),
-                dtype: dtype.numpy(),
-                shape,
-            },
-        )?
-        .into_any(),
+        BufferStore::Shm { segment, dtype } => {
+            Py::new(py, ShmBuffer::new(segment, dtype.numpy(), shape))?.into_any()
+        }
     };
     Ok((buffer.name, value))
 }
@@ -300,4 +339,50 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Server>()?;
     register_boundary_types(m)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod shm_buffer_tests {
+    use super::ShmBuffer;
+    use crate::utils::shm::{ShmSegment, shm_path, unique_name};
+
+    fn buffer() -> (ShmBuffer, String) {
+        let name = unique_name("test");
+        let segment = ShmSegment::create(name.clone(), &[1, 2, 3, 4]).unwrap();
+        (ShmBuffer::new(segment, "float32", vec![1]), name)
+    }
+
+    /// Neither `release` nor `discard` (the header never decoded): dropping
+    /// the handle unlinks, so a rejected request cannot leak its segment.
+    #[test]
+    fn drop_without_admission_unlinks() {
+        let (buffer, name) = buffer();
+        assert_eq!(buffer.name, name);
+        assert!(buffer.owns_segment());
+        drop(buffer);
+        assert!(!shm_path(&name).exists());
+    }
+
+    /// `release` moves the unlink duty to Python: the segment must outlive the
+    /// handle so the TP receivers can still open it.
+    #[test]
+    fn release_keeps_the_segment_for_python() {
+        let (mut buffer, name) = buffer();
+        buffer.release();
+        assert!(!buffer.owns_segment());
+        buffer.discard(); // no-op after release
+        drop(buffer);
+        assert!(shm_path(&name).exists(), "released: Python unlinks later");
+        let _ = rustix::shm::unlink(format!("/{name}"));
+    }
+
+    /// `discard` unlinks at once (a rejected request), and is idempotent.
+    #[test]
+    fn discard_unlinks_immediately() {
+        let (mut buffer, name) = buffer();
+        buffer.discard();
+        assert!(!shm_path(&name).exists());
+        buffer.discard();
+        drop(buffer);
+    }
 }

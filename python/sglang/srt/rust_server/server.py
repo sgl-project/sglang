@@ -30,6 +30,8 @@ from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
+    discard_shm_buffers,
+    shm_feature_buffers,
 )
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
@@ -233,6 +235,7 @@ class RustServer:
         limit = max_recv if max_recv > 0 else self._max_per_poll
         out = []
         for req in self.server.recv_requests(limit):
+            buffers = dict(req.buffers)
             try:
                 obj = msgpack_decode_explained(req.header)
             except MsgpackDecodeError as e:
@@ -242,22 +245,41 @@ class RustServer:
                 )
                 if e.rid is not None:
                     self.server.push_error(e.rid, f"invalid request: {e.reason}")
+                # The buffers were never looked at: Rust still owns their
+                # segments, so unlink them now rather than at GC time.
+                discard_shm_buffers(shm_feature_buffers(buffers))
                 continue
-            buffers = dict(req.buffers)
-            ids = buffers.get("input_ids")
-            if ids is not None:  # generate request
-                obj.input_ids = array("q")
-                obj.input_ids.frombytes(memoryview(ids).cast("B"))
-            token_ids_logprob = buffers.get("token_ids_logprob")
-            if token_ids_logprob is not None:
-                obj.token_ids_logprob = token_ids_logprob.tolist()
-            if self._multimodal_enabled and "mm.meta" in buffers:
-                # Wrapping the worker's buffers into tensors is the only Python
-                # step of the Rust path; a text-only request on a multimodal
-                # model carries no `mm.*` buffers.
-                obj.mm_inputs = self._wrap_mm_result(buffers)
+            try:
+                self._attach_buffers(obj, buffers)
+            except Exception as e:
+                logger.warning(
+                    "rust ingress: rejecting request %s: %s: %s",
+                    obj.rid,
+                    type(e).__name__,
+                    e,
+                )
+                self.server.push_error(obj.rid, f"invalid request: {e}")
+                # `wrap_encoded` already discarded on its own failure; this
+                # covers a failure before it, and discard is idempotent.
+                discard_shm_buffers(shm_feature_buffers(buffers))
+                continue
             out.append(obj)
         return out
+
+    def _attach_buffers(self, obj, buffers: dict) -> None:
+        """Attach one drained request's named buffers to its decoded header."""
+        ids = buffers.get("input_ids")
+        if ids is not None:  # generate request
+            obj.input_ids = array("q")
+            obj.input_ids.frombytes(memoryview(ids).cast("B"))
+        token_ids_logprob = buffers.get("token_ids_logprob")
+        if token_ids_logprob is not None:
+            obj.token_ids_logprob = token_ids_logprob.tolist()
+        if self._multimodal_enabled and "mm.meta" in buffers:
+            # Wrapping the worker's buffers into tensors is the only Python
+            # step of the Rust path; a text-only request on a multimodal
+            # model carries no `mm.*` buffers.
+            obj.mm_inputs = self._wrap_mm_result(buffers)
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

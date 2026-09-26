@@ -60,8 +60,7 @@ impl ShmSegment {
         Ok(segment)
     }
 
-    /// Test helper: the name as Python's `SharedMemory(name=…)` sees it.
-    #[cfg(test)]
+    /// The name as Python's `SharedMemory(name=…)` sees it.
     pub fn name(&self) -> &str {
         &self.name
     }

@@ -131,6 +131,25 @@ class _ModalityTable(dict):
 _MODALITIES = _ModalityTable()
 
 
+def shm_feature_buffers(buffers) -> list:
+    """The ``mm.feature.*`` buffers a request parked in POSIX shm: everything
+    that is not an inline numpy array is the Rust extension's ``ShmBuffer``."""
+    import numpy as np
+
+    return [
+        value
+        for name, value in buffers.items()
+        if name.startswith("mm.feature.") and not isinstance(value, np.ndarray)
+    ]
+
+
+def discard_shm_buffers(shm_buffers) -> None:
+    """Unlink the segments of a request that will not be admitted. Idempotent
+    on the Rust side, so it is safe after a partial wrap already unlinked some."""
+    for buffer in shm_buffers:
+        buffer.discard()
+
+
 class MmTransportStats:
     """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
 
@@ -330,63 +349,87 @@ class RustMmProcessor:
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
         import msgspec
+        import torch
+
+        from sglang.srt.managers.schedule_batch import (
+            MultimodalProcessorOutput,
+        )
+
+        # Rust keeps the unlink duty for every segment until the whole request
+        # wrapped: only then is it handed to the stubs (`release`). Any failure
+        # in between closes the stubs built so far and unlinks every segment
+        # (`discard`), wrapped or not, so a rejected request leaves nothing in
+        # /dev/shm.
+        shm_buffers = shm_feature_buffers(buffers)
+        stubs: list = []
+        try:
+            meta = msgspec.msgpack.decode(buffers["mm.meta"].tobytes())
+            items = [
+                RustMmProcessor._wrap_item(
+                    index=index, item=item, buffers=buffers, stubs=stubs
+                )
+                for index, item in enumerate(meta["items"])
+            ]
+            if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+                for item in items:
+                    item.set_pad_value()
+            output = MultimodalProcessorOutput(
+                mm_items=items,
+                im_token_id=spec.image_token_id,
+                im_start_id=spec.vision_start_token_id,
+                im_end_id=spec.vision_end_token_id,
+                video_token_id=spec.video_token_id,
+                mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
+                mrope_position_delta=torch.tensor(
+                    [[meta["mrope_delta"]]], dtype=torch.long
+                ),
+            )
+        except BaseException:
+            for stub in stubs:
+                stub.close_and_unlink()
+            discard_shm_buffers(shm_buffers)
+            raise
+        for buffer in shm_buffers:
+            buffer.release()
+        return output
+
+    @staticmethod
+    def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
         import numpy as np
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
-        from sglang.srt.managers.schedule_batch import (
-            MultimodalDataItem,
-            MultimodalProcessorOutput,
-        )
+        from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
-        meta = msgspec.msgpack.decode(buffers["mm.meta"].tobytes())
-        items = []
-        for index, item in enumerate(meta["items"]):
-            feature = buffers[f"mm.feature.{index}"]
-            if isinstance(feature, np.ndarray):
-                array = feature
-                feature = torch.from_numpy(array)
-                MM_TRANSPORT_STATS.record_inline(array=array, tensor=feature)
-            else:
-                MM_TRANSPORT_STATS.record_shm(stub=feature)
-                # The worker placed this item's buffer in a named POSIX segment
-                # (see `_use_feature_shm`). Build the stub in its
-                # post-`__setstate__` form: rank 0 never pickle-roundtrips its
-                # own copy, and `materialize()` needs the mapped view. The
-                # duty to unlink moved here with the buffer.
-                stub = ShmPointerMMData.__new__(ShmPointerMMData)
-                stub.__setstate__(
-                    {
-                        "shm_name": feature.name,
-                        "shape": tuple(feature.shape),
-                        "dtype": torch.float32,
-                        "precomputed_hash": item["hash"],
-                    }
-                )
-                feature = stub
-            t, h, w = item["model_specific_data"]["image_grid_thw"]
-            items.append(
-                MultimodalDataItem(
-                    modality=_MODALITIES[item["modality"]],
-                    feature=feature,
-                    hash=item["hash"],
-                    offsets=[tuple(span) for span in item["offsets"]],
-                    model_specific_data={
-                        "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-                    },
-                )
+        feature = buffers[f"mm.feature.{index}"]
+        if isinstance(feature, np.ndarray):
+            array = feature
+            feature = torch.from_numpy(array)
+            MM_TRANSPORT_STATS.record_inline(array=array, tensor=feature)
+        else:
+            MM_TRANSPORT_STATS.record_shm(stub=feature)
+            # The worker placed this item's buffer in a named POSIX segment
+            # (see `_use_feature_shm`). Build the stub in its
+            # post-`__setstate__` form: rank 0 never pickle-roundtrips its
+            # own copy, and `materialize()` needs the mapped view.
+            stub = ShmPointerMMData.__new__(ShmPointerMMData)
+            stub.__setstate__(
+                {
+                    "shm_name": feature.name,
+                    "shape": tuple(feature.shape),
+                    "dtype": torch.float32,
+                    "precomputed_hash": item["hash"],
+                }
             )
-        if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
-            for item in items:
-                item.set_pad_value()
-        return MultimodalProcessorOutput(
-            mm_items=items,
-            im_token_id=spec.image_token_id,
-            im_start_id=spec.vision_start_token_id,
-            im_end_id=spec.vision_end_token_id,
-            video_token_id=spec.video_token_id,
-            mrope_positions=torch.from_numpy(buffers["mm.mrope"]),
-            mrope_position_delta=torch.tensor(
-                [[meta["mrope_delta"]]], dtype=torch.long
-            ),
+            stubs.append(stub)
+            feature = stub
+        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        return MultimodalDataItem(
+            modality=_MODALITIES[item["modality"]],
+            feature=feature,
+            hash=item["hash"],
+            offsets=[tuple(span) for span in item["offsets"]],
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+            },
         )

@@ -125,6 +125,43 @@ class TestWrapEncoded(CustomTestCase):
         )
 
 
+class FakeShmBuffer:
+    """The Rust extension's ``ShmBuffer`` contract: it owns the unlink until
+    ``release()`` hands it to the stubs, or ``discard()`` unlinks now."""
+
+    def __init__(self, name, shape):
+        self.name = name
+        self.dtype = "float32"
+        self.shape = shape
+        self.released = False
+        self.discarded = False
+
+    def release(self):
+        self.released = True
+
+    def discard(self):
+        from multiprocessing import shared_memory
+
+        self.discarded = True
+        try:
+            handle = shared_memory.SharedMemory(name=self.name)
+        except FileNotFoundError:
+            return
+        handle.close()
+        handle.unlink()
+
+
+def segment_exists(name) -> bool:
+    from multiprocessing import shared_memory
+
+    try:
+        handle = shared_memory.SharedMemory(name=name)
+    except FileNotFoundError:
+        return False
+    handle.close()
+    return True
+
+
 class TestWrapEncodedShm(TestWrapEncoded):
     """The shm entry shape (TP>1): features arrive as named POSIX segments, and
     each item becomes a ``ShmPointerMMData`` stub whose ``materialize()`` yields
@@ -133,6 +170,7 @@ class TestWrapEncodedShm(TestWrapEncoded):
     def setUp(self):
         super().setUp()
         self._segments = []
+        self._buffers = []
 
     def tearDown(self):
         # Defensive: unlink anything a failing test left behind.
@@ -160,12 +198,13 @@ class TestWrapEncodedShm(TestWrapEncoded):
     def transport(self, features):
         """Shm: the worker placed each item's slice in its own segment; the
         buffer is the `ShmBuffer` stub naming it."""
-        return {
-            f"mm.feature.{i}": SimpleNamespace(name=name, dtype="float32", shape=(n, 6))
-            for i, (name, n) in enumerate(
-                zip(self._park(features), [t * h * w for t, h, w in self.GRIDS])
+        self._buffers = [
+            FakeShmBuffer(name, (n, 6))
+            for name, n in zip(
+                self._park(features), [t * h * w for t, h, w in self.GRIDS]
             )
-        }
+        ]
+        return {f"mm.feature.{i}": b for i, b in enumerate(self._buffers)}
 
     def test_wraps_and_slices_native_buffers(self):
         import torch
@@ -175,6 +214,11 @@ class TestWrapEncodedShm(TestWrapEncoded):
         output, features = self.build()
         for item in output.mm_items:
             self.assertIsInstance(item.feature, ShmPointerMMData)
+        # Admitted: Rust handed the unlink to the stubs, and the segments are
+        # still there for the TP receivers to open after the broadcast.
+        self.assertTrue(all(b.released for b in self._buffers))
+        self.assertFalse(any(b.discarded for b in self._buffers))
+        self.assertTrue(all(segment_exists(b.name) for b in self._buffers))
         # The stub is a zero-copy view over the segment until materialized.
         self.assertEqual(
             [tuple(item.feature.shape) for item in output.mm_items], [(4, 6), (1, 6)]
@@ -192,6 +236,118 @@ class TestWrapEncodedShm(TestWrapEncoded):
         for item in output.mm_items:
             with self.assertRaises(FileNotFoundError):
                 shared_memory.SharedMemory(name=item.feature.shm_name)
+
+    def test_partial_wrap_failure_leaves_no_segment(self):
+        """Item 1 fails after item 0's stub exists: the stub is closed and both
+        segments are unlinked, and nothing was handed to Python."""
+        features = np.arange(30, dtype=np.float32)
+        meta = msgspec.msgpack.decode(self.meta().tobytes())
+        del meta["items"][1]["model_specific_data"]["image_grid_thw"]
+        buffers = {
+            "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
+            **self.transport(features),
+        }
+        with self.assertRaises(KeyError):
+            RustMmProcessor.wrap_encoded(self.spec, buffers)
+        self.assertFalse(any(b.released for b in self._buffers))
+        self.assertTrue(all(b.discarded for b in self._buffers))
+        self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+
+
+class TestDrainShmOwnership(TestWrapEncodedShm):
+    """``RustServer.drain`` must not leak a segment on any rejection path: a
+    header that never decodes (the buffers are never looked at) and a request
+    whose wrapping fails part-way both end with every segment unlinked and the
+    client told."""
+
+    # Reuse the shm fixture only; the inherited cases already ran above.
+    test_wraps_and_slices_native_buffers = None
+    test_optional_pad_values_use_precomputed_hashes = None
+    test_partial_wrap_failure_leaves_no_segment = None
+
+    def _server(self, header, buffers):
+        from sglang.srt.rust_server.server import RustServer
+
+        errors = []
+        fake = SimpleNamespace(
+            recv_requests=lambda limit: [
+                SimpleNamespace(header=header, buffers=list(buffers.items()))
+            ],
+            push_error=lambda rid, msg: errors.append((rid, msg)),
+        )
+        return RustServer(server=fake, http_port=0, mm_spec=self.spec), errors
+
+    @staticmethod
+    def _header(rid):
+        """A minimal generate header, as the Rust api_server encodes it."""
+        from sglang.srt.managers.io_struct import (
+            TokenizedGenerateReqInput,
+            msgpack_encode,
+        )
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        return msgpack_encode(
+            TokenizedGenerateReqInput(
+                rid=rid,
+                input_text="t",
+                input_ids=None,  # rides the `input_ids` buffer, as from Rust
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+    def _request_buffers(self, meta=None):
+        features = np.arange(30, dtype=np.float32)
+        return {
+            "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
+            "mm.meta": self.meta() if meta is None else meta,
+            **self.transport(features),
+        }
+
+    def test_malformed_header_discards_segments(self):
+        server, errors = self._server(b"\xc1", self._request_buffers())
+        self.assertEqual(server.drain(8), [])
+        self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+        self.assertFalse(any(b.released for b in self._buffers))
+
+    def test_wrap_failure_rejects_request_and_discards_segments(self):
+        meta = msgspec.msgpack.decode(self.meta().tobytes())
+        del meta["items"][1]["model_specific_data"]["image_grid_thw"]
+        header = self._header("r1")
+        server, errors = self._server(
+            header,
+            self._request_buffers(
+                np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8)
+            ),
+        )
+        self.assertEqual(server.drain(8), [], "rejected, not handed to the scheduler")
+        self.assertEqual([rid for rid, _ in errors], ["r1"])
+        self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
+        self.assertFalse(any(b.released for b in self._buffers))
+
+    def test_admitted_request_keeps_segments_for_receivers(self):
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+        header = self._header("r2")
+        server, errors = self._server(header, self._request_buffers())
+        drained = server.drain(8)
+        self.assertEqual(errors, [], msg=str(errors))
+        (obj,) = drained
+        self.assertTrue(all(b.released for b in self._buffers))
+        # Still there until a receiver materializes: nothing unlinked early.
+        self.assertTrue(all(segment_exists(b.name) for b in self._buffers))
+        for item in obj.mm_inputs.mm_items:
+            self.assertIsInstance(item.feature, ShmPointerMMData)
+            item.feature.materialize()
+        self.assertFalse(any(segment_exists(b.name) for b in self._buffers))
 
 
 if __name__ == "__main__":
