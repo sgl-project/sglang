@@ -2549,6 +2549,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+    def test_sm100_spec_attention_backend_respects_topk_not_page_size(self):
+        from sglang.srt.arg_groups.model_override_base import get_default_attn_backend
+
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5MoeForConditionalGeneration"],
+            ),
+            has_asymmetric_kv=False,
+            has_attention_sinks=False,
+        )
+
+        with override_platform(is_sm100=True, has_flashinfer=True):
+            # topk=1: explicit page_size must not block trtllm_mha.
+            server_args = SimpleNamespace(
+                speculative_algorithm="NEXTN",
+                speculative_eagle_topk=1,
+                page_size=16,
+            )
+            self.assertEqual(
+                get_default_attn_backend(
+                    server_args,
+                    use_mla_backend=False,
+                    model_config=model_config,
+                ),
+                "trtllm_mha",
+            )
+
+            # topk>1: trtllm_mha remains unsupported.
+            server_args.speculative_eagle_topk = 4
+            self.assertNotEqual(
+                get_default_attn_backend(
+                    server_args,
+                    use_mla_backend=False,
+                    model_config=model_config,
+                ),
+                "trtllm_mha",
+            )
+
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
             _qwen3_5_hybrid_overrides,
