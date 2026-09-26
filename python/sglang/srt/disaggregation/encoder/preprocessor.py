@@ -299,13 +299,7 @@ class EncoderPreprocessor:
     # Media I/O
     # ------------------------------------------------------------------
 
-    def _load_single_item(
-        self,
-        data,
-        modality: Modality,
-        frame_count_limit=None,
-        discard_alpha_channel=True,
-    ):
+    def _load_single_item(self, data, modality: Modality, discard_alpha_channel=True):
         from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
 
         media_metadata = {}
@@ -349,7 +343,9 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
+                # The encoder owns its GPU: decode there. (Positional
+                # frame_count_limit used to bind into use_gpu.)
+                vid = load_video(data, use_gpu=True)
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata

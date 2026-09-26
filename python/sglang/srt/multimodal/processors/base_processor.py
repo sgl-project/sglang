@@ -44,6 +44,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_mm,
     get_serving,
@@ -65,6 +66,19 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+
+def feature_transport_uses_gpu() -> bool:
+    """True when multimodal features travel over a GPU transport.
+
+    Only then should a tokenizer worker initialize a CUDA context (nvJPEG
+    image decode, NVDEC video decode, pin_memory). Falls back to False when
+    the mm config namespace is not published (unit tests calling
+    ``_load_single_item`` directly), so the GPU path requires an explicit opt-in.
+    """
+    if not get_context().is_config_namespace_published("mm"):
+        return False
+    return get_mm().mm_feature_transport in ("cuda_ipc", "cuda_vmm")
 
 
 @dataclasses.dataclass
@@ -974,8 +988,13 @@ class BaseMultimodalProcessor(ABC):
         if cls._is_preprocessed_input(data):
             return data
         try:
+            # nvJPEG image decode and pin_memory() each initialize a CUDA
+            # context in this worker process. With CPU feature transport the
+            # worker must stay off the base GPU, so force CPU decode and skip
+            # pinning; GPU transports keep GPU decode + pinned frames.
+            gpu_transport = feature_transport_uses_gpu()
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, cls.gpu_image_decode and gpu_transport)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -988,7 +1007,9 @@ class BaseMultimodalProcessor(ABC):
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                # frame_count_limit is applied by the model processor's own
+                # frame sampling; here only the decode device is chosen.
+                return load_video(data, use_gpu=gpu_transport, pin=gpu_transport)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
