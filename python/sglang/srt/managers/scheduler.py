@@ -5456,6 +5456,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
