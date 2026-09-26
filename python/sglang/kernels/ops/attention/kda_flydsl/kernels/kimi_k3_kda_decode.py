@@ -8,7 +8,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _to_raw
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu as mlir_gpu
@@ -218,7 +217,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                     sum_q_partial
                     + mlir_vector.ReductionOp(
                         T.f32,
-                        vector.CombiningKind.ADD,
+                        mlir_vector.CombiningKind.ADD,
                         sum_q_vec,
                     ).dest
                 )
@@ -226,7 +225,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                     sum_k_partial
                     + mlir_vector.ReductionOp(
                         T.f32,
-                        vector.CombiningKind.ADD,
+                        mlir_vector.CombiningKind.ADD,
                         sum_k_vec,
                     ).dest
                 )
@@ -298,7 +297,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 ).result
             dot_kq = mlir_vector.ReductionOp(
                 T.f32,
-                vector.CombiningKind.ADD,
+                mlir_vector.CombiningKind.ADD,
                 dot_kq_vec,
             ).dest
             for offset in (1, 2, 4):
@@ -354,12 +353,12 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
                 sum_hk = mlir_vector.ReductionOp(
                     T.f32,
-                    vector.CombiningKind.ADD,
+                    mlir_vector.CombiningKind.ADD,
                     sum_hk_vec,
                 ).dest
                 sum_hq = mlir_vector.ReductionOp(
                     T.f32,
-                    vector.CombiningKind.ADD,
+                    mlir_vector.CombiningKind.ADD,
                     sum_hq_vec,
                 ).dest
                 for offset in (1, 2, 4):
