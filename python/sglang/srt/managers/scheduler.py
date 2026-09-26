@@ -342,6 +342,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_mps,
+    is_xpu,
     kill_itself_when_parent_died,
     rank_consensus_checker,
     require_mlp_sync,
@@ -430,6 +431,10 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _should_enable_war_barrier() -> bool:
+    return is_cuda() or is_xpu() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
 class Scheduler(
@@ -1875,9 +1880,9 @@ class Scheduler(
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
-        # The global WAR barrier fences the scheduler's next shared-buffer write
-        # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        # CUDA and XPU publish a graph-recorded read-done event. Other devices
+        # retain the opt-in switch until they provide an equivalent event path.
+        self._war_barrier_enabled = _should_enable_war_barrier()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)

@@ -242,7 +242,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.record_nolora_graph = record_nolora_graph
 
         # In-graph metadata prep: shared buffers -> in-graph private data
-        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self.in_graph_metadata_prep_done: Optional[torch.Event] = None
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile

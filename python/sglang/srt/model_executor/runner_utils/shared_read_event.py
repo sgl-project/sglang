@@ -8,19 +8,21 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 
 logger = logging.getLogger(__name__)
 
 
-def make_external_event(device_module) -> Optional[torch.cuda.Event]:
-    """Create a persistent external event, e.g., for CUDA graph capture."""
-    if not is_cuda():
-        return None
-    try:
-        return device_module.Event(external=True)
-    except TypeError:
-        return None
+def make_external_event(device_module) -> Optional[torch.Event]:
+    """Create an event that can be recorded inside a device graph."""
+    if is_cuda():
+        try:
+            return device_module.Event(external=True)
+        except TypeError:
+            return None
+    if is_xpu():
+        return device_module.Event()
+    return None
 
 
 def maybe_publish_prefill_shared_read_done(

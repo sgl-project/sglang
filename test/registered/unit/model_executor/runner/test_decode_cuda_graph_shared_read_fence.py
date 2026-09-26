@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import create_autospec
+from unittest.mock import create_autospec, patch
 
 import pytest
 
@@ -10,6 +10,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    make_external_event,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -67,6 +70,87 @@ def test_publish_read_done():
     runner._publish_read_done(in_graph=False)
     assert recorded == ["record"]
     assert runner.model_runner.shared_read_done_event is not marker
+
+
+def test_make_external_event_uses_plain_event_on_xpu():
+    created = []
+
+    class DeviceModule:
+        def Event(self, **kwargs):
+            created.append(kwargs)
+            return object()
+
+    with (
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_cuda",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_xpu",
+            return_value=True,
+        ),
+    ):
+        event = make_external_event(DeviceModule())
+
+    assert event is not None
+    assert created == [{}]
+
+
+def test_make_external_event_requests_external_cuda_event():
+    created = []
+
+    class DeviceModule:
+        def Event(self, **kwargs):
+            created.append(kwargs)
+            return object()
+
+    with (
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_cuda",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_xpu",
+            return_value=False,
+        ),
+    ):
+        event = make_external_event(DeviceModule())
+
+    assert event is not None
+    assert created == [{"external": True}]
+
+
+def test_record_in_graph_metadata_prep_done_records_xpu_event():
+    recorded = []
+
+    class Event:
+        def record(self):
+            recorded.append("record")
+
+    class DeviceModule:
+        def is_current_stream_capturing(self):
+            return True
+
+        def Event(self, **kwargs):
+            assert kwargs == {}
+            return Event()
+
+    runner = _runner()
+    runner.device_module = DeviceModule()
+    with (
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_cuda",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.model_executor.runner_utils.shared_read_event.is_xpu",
+            return_value=True,
+        ),
+    ):
+        runner._record_in_graph_metadata_prep_done()
+
+    assert runner.in_graph_metadata_prep_done is not None
+    assert recorded == ["record"]
 
 
 if __name__ == "__main__":
