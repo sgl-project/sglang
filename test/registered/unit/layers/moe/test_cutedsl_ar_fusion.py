@@ -5,11 +5,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.boundary_layout import SumGroup
+from sglang.srt.layers.boundary_layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     ADD_AND_NORM,
     LayerCommunicator,
-    ScatterMode,
     UnreducedOutput,
     _attention_input_step,
 )
@@ -135,20 +134,52 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
-        comm.layer_scatter_modes = SimpleNamespace(
-            layer_input_mode=ScatterMode.TP_ATTN_FULL
-        )
+        comm._declared = SimpleNamespace(input_rows=Layout(frozenset()))
         fusions = comm._select_mlp_input_fusions()
         assert [f.run for f in fusions] == [cutedsl, base]
-        # The workspace reduces over the TP group, which is the attention-TP
-        # group here; both kernels hand back a new residual.
-        assert [f.completes for f in fusions] == [SumGroup.TP, SumGroup.ATTN_TP]
+        # Both complete the attention output's sum: the workspace reduces over
+        # the TP group, which is the attention-TP group here. Both hand back a
+        # new residual.
+        assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
         assert all(f.may_return_new_residual for f in fusions)
-        # A scattered residual is gathered first, which the workspace does not do.
-        comm.layer_scatter_modes = SimpleNamespace(
-            layer_input_mode=ScatterMode.SCATTERED
+        # A residual on each rank's slice is gathered first, which the
+        # workspace does not do.
+        comm._declared = SimpleNamespace(
+            input_rows=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
         )
         assert [f.run for f in comm._select_mlp_input_fusions()] == [base]
+
+
+def test_the_fusion_runs_only_on_the_ffn_full_rows():
+    """The finalize and the AR + norm sum over the whole TP group, so they need
+    the batch's FFN input on the full rows, not each rank's own slice (a2a, the
+    fp4 all-gather, DWDP or a dense MLP on every rank)."""
+    comm = _communicator()
+    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
+    comm._context = SimpleNamespace(tp_size=2)
+    with (
+        patch(
+            f"{_MODULE}.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1),
+        ),
+        patch(f"{_MODULE}.is_dp_attention_enabled", return_value=False),
+        patch(
+            f"{_MODULE}.get_attn_tp_context",
+            return_value=SimpleNamespace(input_scattered=False),
+        ),
+        patch(
+            f"{_MODULE}.get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+    ):
+        for sharded, eligible in (
+            (frozenset(), True),
+            (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
+        ):
+            comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
+                ffn_input_rows=rows
+            )
+            assert comm._common_eligible(_DECODE, 8) is eligible
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):

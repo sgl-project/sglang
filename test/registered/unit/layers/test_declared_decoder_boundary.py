@@ -38,7 +38,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusionLayerCommunicator
 from sglang.srt.runtime_context import LoRABatchLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -542,12 +541,6 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         )
         self.assertFalse(self.declared(build(direct, dp)))
 
-    def test_subclasses_that_pick_their_own_steps(self):
-        self.assertFalse(CuteDSLFusionLayerCommunicator._takes_declared_boundaries)
-        for cls in (LayerCommunicator, MHCLayerCommunicator):
-            with self.subTest(cls.__name__):
-                self.assertTrue(cls._takes_declared_boundaries)
-
 
 def build_mhc(
     modes, parallel, *, a2a=False, dsa_cp=False, two_batch_overlap=False, **kwargs
@@ -935,9 +928,13 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
         with (
             planning(parallel, a2a=a2a),
             patch.object(comm, "get_exec", lambda: overlap),
-            # Otherwise the scatter-mode steps, which the subclasses that pick
-            # their own steps run.
-            patch.object(LayerCommunicator, "_takes_declared_boundaries", declared),
+            # Otherwise the scatter-mode steps, which a layer off the
+            # declarations runs.
+            nullcontext()
+            if declared
+            else patch.object(
+                LayerCommunicator, "_declared_sides", lambda self, **kwargs: None
+            ),
         ):
             communicator = LayerCommunicator(
                 layer_scatter_modes=modes,

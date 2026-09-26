@@ -804,9 +804,6 @@ def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
 class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA layout.
     _publish_lora_layout: bool = False
-    # Whether this class's boundary steps may be chosen from both sides'
-    # declarations; a subclass that picks its own steps says no.
-    _takes_declared_boundaries = True
     # A plain residual unless the layer is built with its own.
     _residual_ops: ResidualOps = ADD_AND_NORM
 
@@ -999,8 +996,7 @@ class LayerCommunicator:
             )
 
         if not (
-            self._takes_declared_boundaries
-            and (parallel.attn_cp_size == 1 or _cp_on_declarations())
+            (parallel.attn_cp_size == 1 or _cp_on_declarations())
             # MoE layers under attention DP and GQA prefill CP keep the
             # scatter-mode steps.
             and not (
