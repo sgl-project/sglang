@@ -174,6 +174,12 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
 
+### External KV Router Integration
+
+HiCache is not only consumed inside SGLang. An external KV-aware router placed in front of the engines can also query the same L3 data to route requests to the instance that can reuse the most KV cache. Such a router must rebuild the exact object keys the backend uses, which for Mooncake is `{key_prefix}_{page_hash}{suffix}`. The suffix depends on the model's pool layout, the parallelism layout, and the resolved `--page-size`, so the engine exposes its layout instead of letting each router derive the naming itself.
+
+For this purpose the Mooncake backend reports the layout of every registered pool: the key suffixes, the hit policy, and, for pools that only cover a trailing window of pages (the sliding-window states), the window size. A router that requires every pool on every page scores sequences with sliding-window states as misses, so the hit policy distinguishes the two cases. The suffixes are rank-independent for single-PP MLA models; with `pp_size > 1` or an MHA layout they embed the rank, so the layout also reports which rank produced it. When hierarchical caching is disabled or the L3 backend is not Mooncake, the layout is reported as unavailable.
+
 ## Related Parameters
 
 - **`--enable-hierarchical-cache`**: Enable hierarchical cache functionality. This is required to use HiCache.

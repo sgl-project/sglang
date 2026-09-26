@@ -1161,6 +1161,17 @@ async def hicache_storage_backend_status():
     }
 
 
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    if layouts:
+        return layouts[0]
+    return {"enabled": False, "backend": None, "hicache_object_layout": {"pools": []}}
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
