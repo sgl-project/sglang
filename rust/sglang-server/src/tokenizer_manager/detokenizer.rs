@@ -27,6 +27,7 @@ use crate::message::detok::DetokMsg;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
+use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::AbortSource;
 use crate::utils::runtime::Runnable;
 use crate::utils::{
@@ -43,7 +44,7 @@ const SKIP_SPECIAL_TOKENS: bool = true;
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens).
 pub trait StreamDecoder: Send {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error>;
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error>;
 }
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
@@ -52,7 +53,7 @@ struct DynamoDecoder {
 }
 
 impl StreamDecoder for DynamoDecoder {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error> {
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error> {
         let mut out = String::new();
         for &id in token_ids {
             if let Some(chunk) = self
@@ -411,7 +412,7 @@ fn handle_chunk(
 
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(token_ids: &mut Vec<i32>, matched: &Option<Matched>, no_stop_trim: bool) {
+fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
     // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
     // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
     // for any model whose stop id happens to be 0.
@@ -574,7 +575,7 @@ mod tests {
         table.insert(Rid::from("bob"), state(tx_b));
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
 
-        let chunk = |rid: &str, id: i32| ChunkEvent {
+        let chunk = |rid: &str, id: i64| ChunkEvent {
             rid: Rid::from(rid.to_string()),
             token_ids: vec![id],
             ..Default::default()
@@ -614,7 +615,7 @@ mod tests {
     fn final_chunk(
         no_stop_trim: bool,
         finish_reason: serde_json::Value,
-        ids: Vec<i32>,
+        ids: TokenIds,
     ) -> ChunkEvent {
         let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
