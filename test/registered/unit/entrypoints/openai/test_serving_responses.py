@@ -1207,6 +1207,21 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertEqual(adapted_request.routed_dp_rank, 2)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
+    def test_parent_session_id_forwarded_to_engine(self):
+        captured = self._capture(
+            make_serving(),
+            ResponsesRequest(
+                model="x",
+                input="child turn",
+                parent_session_id="parent-session",
+                store=False,
+            ),
+        )
+
+        self.assertEqual(
+            captured["adapted_request"].parent_session_id, "parent-session"
+        )
+
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
