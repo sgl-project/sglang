@@ -32,6 +32,8 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    layer_input_buffer,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -85,7 +87,6 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.runtime_context import (
-    get_forward,
     get_parallel,
     get_platform,
     get_stream,
@@ -859,7 +860,7 @@ class BailingMoE(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -1163,7 +1164,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
             qkv_latent_func=(
                 self.attention.prepare_qkv_latent
                 if self.attention_type == 1 and self.use_mla
@@ -1211,19 +1211,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             if not (
                 enable_moe_dense_fully_dp()
                 and (not self.is_layer_sparse)
@@ -1233,13 +1221,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch=forward_batch,
                 )
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1403,13 +1385,18 @@ class BailingMoELinearModel(nn.Module):
                 if (
                     capture_aux
                     and i in self.layers_to_capture
-                    and hidden_states.shape[0] != 0
+                    and layer_input_buffer(hidden_states).shape[0] != 0
                 ):
+                    hidden_states = reduce_output(hidden_states)
                     if residual is None:
                         dspark_aux_hidden_states.append(hidden_states)
                     else:
                         dspark_aux_hidden_states.append(hidden_states + residual)
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}

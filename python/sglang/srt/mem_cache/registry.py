@@ -14,7 +14,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -101,12 +100,28 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
-    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-        # lazy import to avoid JIT overhead
-        from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+    if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
-        logger.info("Using experimental C++ radix tree implementation.")
-        return RadixCacheCpp(params=params, server_args=server_args)
+        tree_components = []
+        if not (ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0):
+            tree_components.append(ComponentType.FULL)
+        if ctx.is_hybrid_swa:
+            tree_components.append(ComponentType.SWA)
+        if ctx.is_hybrid_ssm:
+            tree_components.append(ComponentType.MAMBA)
+        params.tree_components = tuple(tree_components)
+        return LMCacheUnifiedRadixCache(
+            params,
+            model_config=ctx.model_config,
+            tp_size=ctx.tp_size,
+            tp_rank=ctx.tp_rank,
+            lmcache_config_file=get_memory().lmcache_config_file,
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
+        )
 
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
@@ -115,19 +130,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
-
-    if get_memory().enable_lmcache:
-        from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-            LMCRadixCache,
-        )
-
-        return LMCRadixCache(
-            params=params,
-            model_config=ctx.model_config,
-            tp_size=ctx.tp_size,
-            rank=ctx.tp_rank,
-            tp_group=ctx.tp_group,
-        )
 
     if get_memory().enable_flexkv:
         # Importing the package side-effect registers the explicit

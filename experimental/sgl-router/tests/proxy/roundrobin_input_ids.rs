@@ -106,9 +106,23 @@ fn without_forwarding(mut cfg: Config, policy: PolicyKind) -> Config {
     cfg
 }
 
+fn without_minted_rid(mut body: Value) -> Value {
+    let rid = body
+        .as_object_mut()
+        .expect("a forwarded chat body is an object")
+        .remove("rid");
+    assert!(
+        rid.as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(crate::common::is_engine_shaped_rid),
+        "plain mode must mint an abort rid; got {rid:?}",
+    );
+    body
+}
+
 async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
     assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
-    assert_eq!(captured(mock), *request);
+    assert_eq!(without_minted_rid(captured(mock)), *request);
     assert!(!ctx
         .metrics
         .render()
@@ -281,6 +295,42 @@ async fn round_robin_tool_request_omits_input_ids() {
     );
 }
 
+/// One forwarding outcome books per dispatched chat request.
+#[tokio::test]
+async fn input_ids_forwarding_metric_books_outcome_per_request() {
+    let chat = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let mut tools = chat.clone();
+    tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+    let mut image = chat.clone();
+    image["messages"][0]["content"] =
+        json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]);
+    for (cfg, request, outcome) in [
+        (config(), &chat, "forwarded"),
+        (config(), &tools, "ineligible"),
+        (config(), &image, "ineligible_multimodal"),
+        (
+            without_forwarding(config(), PolicyKind::RoundRobin),
+            &chat,
+            "disabled",
+        ),
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let expected = format!(
+            r#"sgl_router_input_ids_forwarding_total{{model_id="{MODEL}",outcome="{outcome}"}} 1"#
+        );
+        let rendered = ctx.metrics.render();
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected}; got:\n{rendered}"
+        );
+    }
+}
+
 /// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
 /// offload was expected but the encoder failed. A tool request on the same model
@@ -428,6 +478,6 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
         } else {
             assert!(ids.is_none());
         }
-        assert_eq!(captured(&mock), request);
+        assert_eq!(without_minted_rid(captured(&mock)), request);
     }
 }
