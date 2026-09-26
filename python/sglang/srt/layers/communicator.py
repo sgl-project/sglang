@@ -787,6 +787,7 @@ class LayerCommunicator:
                 self._declared_sides(cp_active=True),
                 fusions=self._select_mlp_input_fusions(),
                 force_layernorm_before_gather=force_layernorm_before_dp_gather,
+                cp_moves=_cp_moves(),
             )
             if sides is not None and get_parallel().attn_cp_size > 1
             else None
@@ -882,15 +883,15 @@ class LayerCommunicator:
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
-        if _gathers_over_attention_cp():
-            # DSA and MLA CP: a CP extend's FFN leaves its sum to the
-            # reduce-scatter that takes each rank's shard back.
+        if parallel.attn_cp_size > 1 and _cp_moves().reduce_scatter is not None:
+            # A CP extend's FFN may leave its sum to the reduce-scatter that
+            # takes each rank's shard back (DSA and MLA CP).
             may_leave = not cp_active
             may_leave_to_reduce_scatter = True
         else:
-            # Under GQA prefill CP the FFN completes its own sum: the next
-            # layer's input holds only this rank's chunk, and a reduce-scatter
-            # back over attention DP would split across the CP ranks.
+            # Otherwise under CP the FFN completes its own sum: the next layer's
+            # input holds only this rank's chunk, and a reduce-scatter back over
+            # attention DP would split across the CP ranks.
             may_leave = may_leave_to_reduce_scatter = parallel.attn_cp_size == 1
         return decoder_layer_sides(
             axis_sizes=_token_axis_sizes(cp_active=cp_active),
@@ -1331,7 +1332,7 @@ class LayerCommunicator:
         steps = self._batch_steps(forward_batch)
         if not steps.ffn_output.leaves_for_reduce_scatter:
             return False
-        if dp_step is not None or steps is self._cp_steps:
+        if dp_step is not None or steps.ffn_output_move_completes_sum:
             return True
         # The scatter-mode steps of a DSA or MLA CP extend (the subclasses that
         # pick their own steps). Prefill CP predicates must stay out of decode
@@ -2015,6 +2016,41 @@ def _batch_shards_over_cp(forward_batch: ForwardBatch) -> bool:
     return moe_cp_gathered_rows(forward_batch) is not None
 
 
+class CpMoves(msgspec.Struct, frozen=True):
+    """How a CP extend's rows reach an FFN that needs all of them and come back,
+    chosen once for the kind of prefill CP: ``gather`` gathers the FFN input
+    after each rank has completed its own block, ``take_back`` returns this
+    rank's block of a complete output, and ``reduce_scatter``, where there is
+    one, completes a sum left over the ranks of ``reduce_scatter_group()`` and
+    returns the block in the same collective."""
+
+    gather: Callable
+    take_back: Callable
+    reduce_scatter: Optional[Callable] = None
+    reduce_scatter_group: Optional[Callable[[], GroupCoordinator]] = None
+
+
+def _cp_moves() -> CpMoves:
+    """DSA and MLA CP gather equal shards over the attention-CP group and can
+    complete a sum over it. GQA prefill CP gathers blocks padded to the longest
+    over the MoE-CP group and takes back only a complete output."""
+    if _gathers_over_attention_cp():
+        return CpMoves(
+            gather=_mlp_input_gather_attention_cp,
+            take_back=CommunicateSummableTensorPairFn._take_back_attention_cp_shard,
+            reduce_scatter=CommunicateSummableTensorPairFn._reduce_scatter_over_cp,
+            reduce_scatter_group=lambda: get_parallel().attn_cp_group,
+        )
+    return CpMoves(
+        gather=_mlp_input_gather_moe_cp,
+        take_back=CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
+    )
+
+
+def _same_ranks(a: GroupCoordinator, b: GroupCoordinator) -> bool:
+    return sorted(a.ranks) == sorted(b.ranks)
+
+
 class BoundarySteps(msgspec.Struct, frozen=True):
     """The steps a batch runs at a layer's boundaries: into the attention,
     from the attention output to the FFN input, and the FFN output on to the
@@ -2029,6 +2065,8 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     ffn_output_move: Optional[Callable]
     # Whether the next layer's input can take the FFN's sum.
     ffn_sum_is_movable: bool
+    # Whether ffn_output_move also completes the sum the FFN leaves.
+    ffn_output_move_completes_sum: bool = False
     # The fused kernels ffn_input tries first.
     fused: Tuple["FusedMlpInput", ...] = ()
     # Completes what the layer's input owes before the input norm; None when it
@@ -2045,10 +2083,15 @@ def _select_boundary_steps(
     *,
     fusions: Tuple["FusedMlpInput", ...] = (),
     force_layernorm_before_gather: bool = False,
+    cp_moves: Optional[CpMoves] = None,
 ) -> BoundarySteps:
-    """The steps a set of declarations chooses."""
-    returns_over_dp, ffn_output_move = _select_ffn_output_move(
-        sides.ffn_output, residual=sides.ffn_residual_rows, to=sides.output_rows
+    """The steps a set of declarations chooses; ``cp_moves`` for the ones
+    that gather over attention CP."""
+    returns_over_dp, ffn_output_move, completes_sum = _select_ffn_output_move(
+        sides.ffn_output,
+        residual=sides.ffn_residual_rows,
+        to=sides.output_rows,
+        cp_moves=cp_moves,
     )
     rows = sides.input_rows
     layer_input = None
@@ -2071,12 +2114,14 @@ def _select_boundary_steps(
         force_layernorm_before_gather=force_layernorm_before_gather,
         fusions=fusions,
         residual_joins_sum=sides.residual_joins_attention_sum,
+        cp_moves=cp_moves,
     )
     return BoundarySteps(
         attention_input=_select_attention_input_move(rows, sides.attention),
         ffn_input=ffn_input,
         ffn_output=sides.ffn_output,
         ffn_output_move=None if returns_over_dp else ffn_output_move,
+        ffn_output_move_completes_sum=completes_sum,
         ffn_sum_is_movable=sides.ffn_output.group is not None,
         fused=fused,
         layer_input=layer_input,
@@ -2120,6 +2165,7 @@ def _select_ffn_input(
     force_layernorm_before_gather: bool,
     fusions: Tuple[FusedMlpInput, ...],
     residual_joins_sum: bool = False,
+    cp_moves: Optional[CpMoves] = None,
 ) -> Tuple[Callable, Tuple[FusedMlpInput, ...]]:
     """The steps from the attention output to the FFN input, and the fused
     kernels they try first: complete the attention-TP sum, move the residual to
@@ -2153,9 +2199,9 @@ def _select_ffn_input(
             (),
         )
     if gathered == {TokenAxis.ATTN_CP}:
-        # Each CP rank completes its own chunk, then the chunks are gathered:
-        # under DSA and MLA CP over the attention-CP group in equal shards,
-        # otherwise over the MoE-CP group, each padded to the longest.
+        # Each CP rank completes its own chunk, then the CP moves gather them.
+        if cp_moves is None:
+            raise NotImplementedError(f"{produced=} {need=}")
         on_chunk, fused = _select_ffn_input(
             produced,
             residual=residual,
@@ -2165,9 +2211,7 @@ def _select_ffn_input(
             fusions=fusions,
             residual_joins_sum=residual_joins_sum,
         )
-        if _gathers_over_attention_cp():
-            return partial(_mlp_input_gather_attention_cp, gather=on_chunk), fused
-        return partial(_mlp_input_gather_moe_cp, gather=on_chunk), fused
+        return partial(cp_moves.gather, gather=on_chunk), fused
     if (
         residual_to != produced.layout
         or gathered
@@ -2225,38 +2269,47 @@ def _select_ffn_input(
 
 
 def _select_ffn_output_move(
-    produced: StageOutput, *, residual: Layout, to: Layout
-) -> Tuple[bool, Optional[Callable]]:
+    produced: StageOutput,
+    *,
+    residual: Layout,
+    to: Layout,
+    cp_moves: Optional[CpMoves] = None,
+) -> Tuple[bool, Optional[Callable], bool]:
     """How the FFN output reaches the rows the layer hands on: whether it goes
     back by undoing the attention-DP gather (the FFN exit and postprocess run
     that step), or else the postprocess that moves it, None when there is none
-    to choose here."""
+    to choose here; and whether that move also completes the sum the FFN
+    leaves."""
     if produced.layout == residual:
         if to == residual:
-            return False, CommunicateSummableTensorPairFn._trivial
+            return False, CommunicateSummableTensorPairFn._trivial, False
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
             # Each rank's slice back to the attention's rows: fold the residual
             # into the output, then gather over attention TP.
-            return False, CommunicateSummableTensorPairFn._gather
+            return False, CommunicateSummableTensorPairFn._gather, False
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     if returned == {TokenAxis.ATTN_CP}:
-        if _gathers_over_attention_cp():
-            # The reduce-scatter over attention CP completes the sum the FFN
-            # left and takes this rank's shard back.
-            if not produced.leaves_for_reduce_scatter:
-                raise NotImplementedError(f"{produced=} {residual=} {to=}")
-            return False, CommunicateSummableTensorPairFn._reduce_scatter_over_cp
-        # This rank's chunk of the rows gathered over CP; no collective.
-        return False, CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+        if cp_moves is None:
+            raise NotImplementedError(f"{produced=} {residual=} {to=}")
+        if not produced.leaves_for_reduce_scatter:
+            # A complete output: this rank's block of it, nothing summed.
+            return False, cp_moves.take_back, False
+        # The FFN leaves its sum: only a take-back that sums over the same
+        # ranks completes it.
+        if cp_moves.reduce_scatter is None or not _same_ranks(
+            _sum_group(produced.group), cp_moves.reduce_scatter_group()
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {to=}")
+        return False, cp_moves.reduce_scatter, True
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
-        return False, CommunicateSummableTensorPairFn._take_back_cp_shard
+        return False, CommunicateSummableTensorPairFn._take_back_cp_shard, False
     if returned != {TokenAxis.ATTN_DP}:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
-    return True, None
+    return True, None, False
 
 
 class MlpInputKind(Enum):
@@ -2644,6 +2697,20 @@ class CommunicateSummableTensorPairFn:
     ):
         assert residual is None, "not yet handled residual!=None"
         return _redistribute_to_attn_tp_shards(hidden_states, context), None
+
+    @staticmethod
+    def _take_back_attention_cp_shard(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        **kwargs,
+    ):
+        """DSA and MLA CP: this rank's shard of a complete output gathered in
+        equal shards over the attention-CP group."""
+        parallel = get_parallel()
+        shard = hidden_states.tensor_split(parallel.attn_cp_size)[parallel.attn_cp_rank]
+        return shard, residual
 
     @staticmethod
     def _reduce_scatter_over_cp(

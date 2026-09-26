@@ -61,8 +61,11 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         dwdp_size=1,
         enable_dp_attention=attn_dp > 1,
         enable_attn_tp_input_scattered=False,
-        tp_group=SimpleNamespace(name="tp"),
-        attn_tp_group=SimpleNamespace(name="attn_tp"),
+        tp_group=SimpleNamespace(
+            name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
+        ),
+        attn_tp_group=SimpleNamespace(name="attn_tp", ranks=list(range(attn_tp))),
+        attn_cp_group=SimpleNamespace(name="attn_cp", ranks=list(range(attn_cp))),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -104,6 +107,10 @@ def planning(parallel, *, sp=False, a2a=False, dsa_cp=False):
         ),
         patch.object(comm, "is_enable_moe_cp_allgather", moe_cp_gathers),
         patch.object(comm, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
+        # A MoE whose EP and TP sums merge: its output's group is the TP group.
+        patch.object(
+            comm, "post_experts_reduction_group", lambda: get_parallel().tp_group
+        ),
         # Planning asks whether a dense layer gathers for two-batch overlap.
         patch.object(
             comm,
