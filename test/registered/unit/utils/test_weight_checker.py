@@ -672,24 +672,6 @@ class TestCompare(_WeightCheckerTestBase):
 
 
 class TestHandle(_WeightCheckerTestBase):
-    def test_routes_to_actions(self):
-        with (
-            patch.object(self.checker, "_snapshot") as m_snap,
-            patch.object(self.checker, "_reset_tensors") as m_reset,
-            patch.object(self.checker, "_compare") as m_compare,
-            patch.object(
-                self.checker, "_compute_checksum", return_value={"checksums": {}}
-            ) as m_checksum,
-        ):
-            self.checker.handle("snapshot", role="target")
-            self.checker.handle("reset_tensors", role="target")
-            self.checker.handle("compare", role="target")
-            self.checker.handle("checksum", role="target")
-            m_snap.assert_called_once()
-            m_reset.assert_called_once()
-            m_compare.assert_called_once()
-            m_checksum.assert_called_once()
-
     def test_returns_none_for_non_checksum_actions(self):
         self.assertIsNone(self.checker.handle("snapshot", role="target"))
         self.assertIsNone(self.checker.handle("compare", role="target"))

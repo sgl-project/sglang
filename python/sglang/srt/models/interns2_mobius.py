@@ -43,7 +43,7 @@ from sglang.srt.models.qwen3_5 import (
     _enable_qwen35_fused_ar_quant,
     _linear_accepts_fp8_tuple,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -423,20 +423,11 @@ class _InternS2MobiusDecoderMixin:
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        # Model-side all-reduce fusion is intentionally disabled for baseline.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self._forward_mobius_mlp(
                 hidden_states, forward_batch, meta_mlp
             )
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -507,6 +498,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -640,6 +632,7 @@ class InternS2MobiusAttentionDecoderLayer(
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            allow_deferred_ffn_reduction=False,
         )
         self.alt_stream = alt_stream
 

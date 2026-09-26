@@ -17,14 +17,14 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsa.indexer_k import (
+    fused_k_indexer_norm_rope,
+    fused_k_indexer_norm_rope_store,
+)
 from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
-)
-from sglang.kernels.ops.quantization.dsv32 import (
-    fused_k_indexer_norm_rope,
-    fused_k_indexer_norm_rope_store,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

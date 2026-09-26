@@ -498,7 +498,7 @@ class QSAIndexer(MultiPlatformOp):
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
-            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+            from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             block_indices = fast_topk(
                 logits,
