@@ -33,7 +33,7 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
             f"sglang-radix-tree manifest not found at {SGLANG_RADIX_TREE_MANIFEST}",
         )
         build = torch_build_configuration(
-            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_2_13_compat.h",
+            compat_header=SGLANG_RADIX_TREE_MANIFEST.parent / "torch_compat.h",
             python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
         )
         proc = subprocess.run(

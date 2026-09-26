@@ -250,7 +250,7 @@ jobs:
               root / "python/sglang/srt/rust_extensions/torch_build.py"
           )
           build = helper["torch_build_configuration"](
-              compat_header=root / "rust/sglang-radix-tree/torch_2_13_compat.h",
+              compat_header=root / "rust/sglang-radix-tree/torch_compat.h",
               python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
               torch_module=torch,
               include_absolute_rpath=False,
