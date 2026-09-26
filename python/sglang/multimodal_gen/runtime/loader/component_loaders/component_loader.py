@@ -24,6 +24,7 @@ from transformers.quantizers import AutoHfQuantizer
 
 from sglang.multimodal_gen.configs.models.base import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
     component_attn_backend_context_manager,
@@ -55,7 +56,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -242,11 +246,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         """Build the attention-selection context used by this loader."""
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=True,
             require_backend_selection=require_backend_selection,
         )
@@ -283,11 +289,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with self.component_attention_backend_context(
             attn_backend,
             component_attn_name,
             require_backend_selection,
+            backend_by_role,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -305,11 +313,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with self.component_attention_backend_context(
             attn_backend,
             component_attn_name,
             require_backend_selection,
+            backend_by_role,
         ):
             component = self.load_native(
                 component_model_path,
@@ -328,6 +338,9 @@ class ComponentLoader(ABC):
         *,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        component_backend_by_role: (
+            dict[AttentionRole, AttentionBackendEnum] | None
+        ) = None,
         allow_native_fallback: bool = True,
     ) -> tuple[AutoModel, float]:
         """
@@ -369,13 +382,26 @@ class ComponentLoader(ABC):
                     component_attn_backend.name.lower(),
                     matched_backend_key,
                 )
+        if (
+            component_backend_by_role is None
+            and get_component_attn_backend_context() is None
+        ):
+            # A caller that resolved only the component-wide backend must not
+            # silently drop the role-qualified overrides that go with it.
+            component_backend_by_role = server_args.resolve_component_backend_by_role(
+                component_name, component_attn_name
+            )
         requested_backend = (
             server_args.requested_component_attention_backend(component_attn_name)
             if component_attn_name is not None
             else None
         )
-        require_backend_selection = requested_backend is not None
-        if require_backend_selection and (
+        # A role override is as explicit as a component-wide one, so it carries
+        # the same requirement that the component actually apply it.
+        require_backend_selection = requested_backend is not None or bool(
+            component_backend_by_role
+        )
+        if requested_backend is not None and (
             component_attn_backend is None
             or component_attn_backend.name.lower() != requested_backend
         ):
@@ -391,6 +417,7 @@ class ComponentLoader(ABC):
                 component_attn_backend,
                 component_attn_name,
                 require_backend_selection,
+                component_backend_by_role,
             )
             source = "sgl-diffusion"
         except (
@@ -455,6 +482,7 @@ class ComponentLoader(ABC):
                 component_attn_backend,
                 component_attn_name,
                 require_backend_selection,
+                component_backend_by_role,
             )
             source = "native"
             logger.warning(
@@ -995,12 +1023,14 @@ class GenericComponentLoader(ComponentLoader):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         # An unknown out-of-tree component may itself be the primary transformer.
         # Require it to opt into fallback through a registered component loader.
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=False,
             require_backend_selection=require_backend_selection,
         )
@@ -1020,6 +1050,9 @@ class PipelineComponentLoader:
         component_architecture: str | None = None,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        component_backend_by_role: (
+            dict[AttentionRole, AttentionBackendEnum] | None
+        ) = None,
         component_type: str | None = None,
         loader_cls: type[ComponentLoader] | None = None,
     ):
@@ -1051,6 +1084,7 @@ class PipelineComponentLoader:
                 transformers_or_diffusers,
                 component_attn_backend=component_attn_backend,
                 component_attn_name=component_attn_name,
+                component_backend_by_role=component_backend_by_role,
                 allow_native_fallback=loader_cls is None,
             )
         except Exception:

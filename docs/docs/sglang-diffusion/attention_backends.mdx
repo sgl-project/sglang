@@ -9,7 +9,7 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
-Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible overrides, including an override for a component that constructs no SGLang attention layer, fail unless a sparse backend is being replaced for cross-attention.
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible overrides, including an override for a component that constructs no SGLang attention layer, fail unless a sparse backend is being replaced for cross-attention. A component key may carry a `.self` or `.cross` role suffix to override just one kind of attention; see [Per-role overrides](#per-role-overrides).
 
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
@@ -152,16 +152,42 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 The selection order in `runtime/layers/attention/selector.py` is:
 
 1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
-2. Component override from `--component-attention-backends` while that component is being constructed
-3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
-4. Layer or component default, when declared
-5. Auto selection (platform capability, dtype, and installed packages)
+2. Component *and role* override from `--component-attention-backends.<component>.<role>` while that component is being constructed
+3. Component override from `--component-attention-backends` while that component is being constructed
+4. CLI `--attention-backend` (`ServerArgs.attention_backend`)
+5. Layer or component default, when declared
+6. Auto selection (platform capability, dtype, and installed packages)
 
 An explicit global backend mismatch fails for DiT self-attention. Auxiliary
 components may fall back to their declared default or another compatible backend.
 Sparse backends selected for self-attention similarly fall back to a compatible
 dense backend for cross-attention. Explicit component overrides are otherwise
 strict.
+
+### Per-role overrides
+
+A role is the kind of attention a layer performs: `self` or `cross`. Appending
+a role to a component key selects a backend for just that role, which is useful
+when a quantized or otherwise expensive backend pays off for self-attention but
+not for the much lighter cross-attention:
+
+```bash Command
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.transformer.self sage_attn \
+  --component-attention-backends.transformer.cross fa
+```
+
+A role override outranks the component-wide backend for layers of that role and
+leaves the other role alone. Layers of a role with no override fall through to
+the component-wide backend as usual, and `<component>_2` inherits
+`<component>`'s role overrides unless it declares its own.
+
+Role overrides are as strict as component-wide ones: a role override that never
+reaches a layer fails the load, including when the component builds no layers of
+that role at all. The one tolerated divergence is the shared sparse rule above —
+a sparse backend named for `cross` is replaced by a compatible dense backend and
+logged, rather than failing.
 
 Model and layer backend sets guide automatic selection; they are not positive
 allowlists for explicit requests. A backend selected with
