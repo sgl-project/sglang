@@ -321,6 +321,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -1782,10 +1783,10 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indices, kv_indptr, qo_indptr, _ = (
                     forward_batch.spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        paged_kernel_lens=forward_batch.seq_lens,
+                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                        translator=self.kv_index_translator,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -2966,7 +2967,11 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_is_vectorized_5d:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            cache_loc,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3010,12 +3015,17 @@ class AiterAttnBackend(AttentionBackend):
                         kv_lora_rank = v.shape[-1]
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
-                            cache_loc,
+                            KVWriteLoc.for_batch(forward_batch, cache_loc),
                             k[..., :kv_lora_rank],
                             k[..., kv_lora_rank:],
                         )
                     else:
-                        self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            KVWriteLoc.for_batch(forward_batch, cache_loc),
+                            k,
+                            v,
+                        )
                 elif self._use_fused_fp8_kv_write(layer):
                     # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
@@ -3037,7 +3047,11 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            cache_loc,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         k_descale,
@@ -3858,9 +3872,10 @@ class AiterAttnBackend(AttentionBackend):
             if self.kv_cache_is_vectorized_5d:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
+                    KVWriteLoc.for_batch(
+                        forward_batch,
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
@@ -3894,7 +3909,10 @@ class AiterAttnBackend(AttentionBackend):
             elif self.use_mla:
                 # MLA pool has its own set_kv_buffer (no scale args).
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc.for_batch(forward_batch, forward_batch.out_cache_loc),
+                    k,
+                    v,
                 )
             elif self._use_fused_fp8_kv_write(layer):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel.
@@ -3916,9 +3934,10 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(
+                    KVWriteLoc.for_batch(
+                        forward_batch,
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
                     v,
@@ -4080,6 +4099,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -4151,10 +4171,10 @@ class AiterIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 
@@ -4168,6 +4188,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -4229,10 +4250,10 @@ class AiterMlaIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    kv_lens,
-                    kv_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=kv_lens,
+                    paged_kernel_lens_sum=kv_lens_sum,
+                    translator=self.kv_index_translator,
                 )
             )
 
