@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
@@ -811,18 +812,16 @@ class PrefillAdder:
         )
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+        """Shared-gap reservation for all Mamba slots still needed by a request.
 
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return self._mamba_slot_cost
+        The shared-memory allocator accounts in Full-token equivalents, while
+        ``HybridReqToTokenPool.alloc`` may still need a main state and one or
+        two initial ping-pong states. Charge the exact outstanding count so
+        Full-KV admission cannot consume their backing bytes.
+        """
+        req_pool = self.tree_cache.req_to_token_pool
+        if self._mamba_slot_cost and isinstance(req_pool, HybridReqToTokenPool):
+            return self._mamba_slot_cost * req_pool.mamba_admission_slots(req.kv)
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -886,7 +885,7 @@ class PrefillAdder:
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:

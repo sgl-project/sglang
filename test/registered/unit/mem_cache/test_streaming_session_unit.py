@@ -146,6 +146,28 @@ def test_session_slot_round_trip_preserves_component_state():
     assert next_req.kv.component_evicted_seqlens == {}
 
 
+def test_get_session_kv_is_non_mutating():
+    tree_cache = StreamingSession(SimpleNamespace())
+    session_kv = ReqKvInfo(
+        req_pool_idx=1,
+        kv_committed_len=4,
+        kv_allocated_len=4,
+        mamba_pool_idx=torch.tensor(2),
+        mamba_ping_pong_track_buffer=torch.tensor([3, 4]),
+    )
+    tree_cache.slots["session-a"] = SessionSlot(kv=session_kv)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
+    req.kv = ReqKvInfo()
+    fresh_kv = req.kv
+
+    assert tree_cache.get_session_kv(req) is session_kv
+    assert req.kv is fresh_kv
+
+    setattr(req, "to_finish", object())
+    assert tree_cache.get_session_kv(req) is None
+    assert req.kv is fresh_kv
+
+
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
