@@ -186,21 +186,24 @@ def topk_among_blocks(
         scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
     num_blocks = scores.shape[1] // block_size
     by_block = scores.unflatten(1, (num_blocks, block_size))
-    ids = blocks.to(torch.int64).clamp_(0, num_blocks - 1)
+    blocks64 = blocks.to(torch.int64)
+    ids = blocks64.clamp(0, num_blocks - 1)
     # [rows, n, block_size], the only scratch of the row count's size
     candidates = by_block.gather(1, ids[:, :, None].expand(rows, n, block_size))
     # column j of block b is position b * block_size + j, kept if b is a real
-    # block and the position is causal: j < lens - b * block_size
-    offsets = torch.arange(block_size, device=scores.device, dtype=torch.int32)
-    room = lens.to(torch.int32)[:, None] - blocks.to(torch.int32) * block_size
-    valid = (blocks >= 0)[:, :, None] & (offsets[None, None, :] < room[:, :, None])
-    candidates.masked_fill_(~valid, -torch.inf)
+    # block and the position is causal: j < lens - b * block_size (a padded
+    # block is -1, so its room exceeds block_size and the sign test drops it)
+    offsets = torch.arange(block_size, device=scores.device, dtype=lens.dtype)
+    room = lens[:, None] - blocks64 * block_size
+    drop = (offsets[None, None, :] >= room[:, :, None]) | (blocks64 < 0)[:, :, None]
+    candidates.masked_fill_(drop, -torch.inf)
     flat = candidates.flatten(1)
     top = flat.topk(min(k, flat.shape[1]), dim=-1, sorted=False)
-    picked = blocks.to(torch.int64).gather(1, top.indices // block_size) * block_size
-    picked = (picked + top.indices % block_size).masked_fill(
-        ~(top.values > -torch.inf), -1
+    block_of_pick = top.indices // block_size
+    picked = blocks64.gather(1, block_of_pick) * block_size + (
+        top.indices - block_of_pick * block_size
     )
+    picked = picked.masked_fill(top.values == -torch.inf, -1)
     if picked.shape[1] < k:
         picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
     return picked
