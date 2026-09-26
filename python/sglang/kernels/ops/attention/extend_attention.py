@@ -37,6 +37,11 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
+_is_rtx_pro_6000 = (
+    _is_cuda
+    and CUDA_CAPABILITY[0] == 12
+    and "RTX PRO 6000" in torch.cuda.get_device_name().upper()
+)
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -876,6 +881,7 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    extend_prefix_lens_cpu=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -890,6 +896,8 @@ def extend_attention_fwd(
     see triton_ops/score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
+    ``extend_prefix_lens_cpu`` permits a qualified long-prefix launch policy;
+    omitting it retains the original launch geometry.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -974,6 +982,34 @@ def extend_attention_fwd(
     FP8_BLOCK_N = 128 if BLOCK_N_ARCH < 128 and Lq <= 192 else BLOCK_N_ARCH
     BLOCK_N = FP8_BLOCK_N if USE_FP8_EXTEND else BLOCK_N_ARCH
     BLOCK_N_PREFIX = FP8_BLOCK_N if USE_FP8_PREFIX else BLOCK_N_ARCH
+    if (
+        _is_rtx_pro_6000
+        and Lq == Lk == 192
+        and Lv == 128
+        and head_num == 32
+        and k_extend.shape[1] == 2
+        and max_len_extend >= 512
+        and extend_prefix_lens_cpu is not None
+        and len(extend_prefix_lens_cpu) == batch_size
+        and min(extend_prefix_lens_cpu, default=0) >= 8192
+        and q_extend.dtype == k_extend.dtype == v_extend.dtype == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        and page_size == 1
+        and custom_mask is None
+        and is_causal
+        and sliding_window_size <= 0
+        and sinks is None
+        and score_mod is None
+        and aux_tensors is None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # MiMo TP2 global attention on RTX PRO 6000: reuse each prefix tile
+        # across twice as many queries once every prefix is at least 8K.
+        # Short prefixes retain the original FP8 reduction partition.
+        # The measured 524K-prefix kernel fell
+        # from 184.6 to 91.6 ms, using 90,112 of the available 101,376 shared
+        # bytes. Keep BF16 current-token tiles and other hardware unchanged.
+        BLOCK_M, BLOCK_N_PREFIX, num_warps = 128, 128, 8
     USE_EXP2 = (
         _is_gfx95
         and kimi_k3_shape
