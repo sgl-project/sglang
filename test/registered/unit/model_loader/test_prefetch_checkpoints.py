@@ -390,7 +390,7 @@ class TestPrefetchDispatch(CustomTestCase):
             weight_loader_disable_mmap=disable_mmap,
             weight_loader_prefetch_checkpoints=prefetch,
             weight_loader_prefetch_num_threads=4,
-            weight_loader_drop_cache_after_load=drop_cache,
+            weight_loader_drop_cache_after_load="shard" if drop_cache else None,
         )
 
     def _run(self, loader, **iterator_kwargs):

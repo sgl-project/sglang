@@ -206,7 +206,7 @@ Top-level arguments that tune how safetensors weights are read, independent of `
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--weight-loader-drop-cache-after-load</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Call <code>posix_fadvise(DONTNEED)</code> after successfully loading each shard, freeing page cache. Supported by the standard safetensors and <code>fastsafetensors</code> loaders.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Advise page-cache release with <code>posix_fadvise(DONTNEED)</code>. The bare flag or <code>shard</code> advises after each shard is yielded. <code>model</code> waits for model loading and postprocessing across ranks, then advises each file once per node before host-cache allocation.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>off</td>
     </tr>
     <tr>

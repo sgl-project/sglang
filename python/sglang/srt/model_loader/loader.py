@@ -111,6 +111,7 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    drop_checkpoint_cache_after_model_load,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -436,6 +437,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        self._files_to_drop_after_load: List[str] = []
         _validate_default_loader_extra_config(
             extra_config=load_config.model_loader_extra_config,
             load_format=load_config.load_format,
@@ -639,9 +641,10 @@ class DefaultModelLoader(BaseModelLoader):
                 startup_prefetch_active or start_iterator_prefetch
             )
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
-            weight_loader_drop_cache_after_load = (
-                get_model().weight_loader_drop_cache_after_load
-            )
+            drop_cache_mode = get_model().weight_loader_drop_cache_after_load
+            weight_loader_drop_cache_after_load = drop_cache_mode == "shard"
+            if drop_cache_mode == "model":
+                self._files_to_drop_after_load.extend(hf_weights_files)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -1000,9 +1003,14 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            self._files_to_drop_after_load.clear()
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+            if self._files_to_drop_after_load:
+                drop_checkpoint_cache_after_model_load(
+                    self._files_to_drop_after_load, get_parallel().nnodes
+                )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

@@ -1126,6 +1126,30 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def drop_checkpoint_cache_after_model_load(
+    hf_weights_files: List[str], nnodes: int = 1
+) -> None:
+    """Advise release of checkpoint files across ``nnodes`` engine nodes.
+
+    Wait for asynchronous copies and all ranks, then advise each file once per
+    node before any rank starts allocating host caches. Returns None.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    local_rank, local_size = 0, 1
+    world_group = None
+    if torch.distributed.is_initialized():
+        world_group = get_parallel().world_group
+        world_group.barrier()
+        # Engine ranks are contiguous per node; device IDs can have offsets.
+        local_size = world_group.world_size // nnodes
+        local_rank = world_group.rank % local_size
+    for path in sorted(set(hf_weights_files))[local_rank::local_size]:
+        _drop_file_cache_after_load(path)
+    if world_group is not None:
+        world_group.barrier()
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,

@@ -362,6 +362,8 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None)
             )
             if default is not _MISSING:
                 kwargs["default"] = default
+            if arg_meta.nargs is not None:
+                kwargs["nargs"] = arg_meta.nargs
             if arg_meta.const is not None:
                 kwargs["const"] = arg_meta.const
             parser.add_argument(*names, **kwargs)
