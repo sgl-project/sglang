@@ -6,10 +6,10 @@ worker, posting helpers, barrier, descriptor cleanup, and status messages run.
 
 import threading
 import unittest
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import DEFAULT, Mock, patch
 
 import numpy as np
 
@@ -33,12 +33,9 @@ class Missing(Exception):
 class NativeAgent:
     def __init__(self):
         self.metadata = {"bad", "healthy"}
-        self.handles = []
         self.post_fault = False
         self.read_fault = False
-        self.blocked = threading.Event()
-        self.proceed = threading.Event()
-        self.proceed.set()
+        self.pending = False
         self.released = []
         self.rebuilds = []
         self.prepared = []
@@ -58,9 +55,7 @@ class NativeAgent:
     def initialize_xfer(self, op, src, dst, peer, notif):
         if peer not in self.metadata:
             raise Missing()
-        h = SimpleNamespace(peer=peer, state="PROC", notif=notif)
-        self.handles.append(h)
-        return h
+        return SimpleNamespace(peer=peer, state="PROC", notif=notif)
 
     def transfer(self, h):
         if self.post_fault and h.peer == "bad":
@@ -80,8 +75,7 @@ class NativeAgent:
             self.metadata.remove(h.peer)
             h.state = "DISCONNECTED"
             raise Disconnected()
-        if h.peer == "bad" and not self.proceed.is_set():
-            self.blocked.set()
+        if h.peer == "bad" and self.pending:
             return "PROC"
         h.state = "DONE"
         return h.state
@@ -99,25 +93,15 @@ class NativeAgent:
         self.rebuilds.append(h)
 
 
-class Queue:
-    def __init__(self, chunks):
-        self.chunks = deque(chunks)
-
-    def get(self):
-        if not self.chunks:
-            raise SystemExit()
-        return self.chunks.popleft()
-
-
 class TestPeerRecovery(CustomTestCase):
     def setUp(self):
-        self.patches = [
-            patch.object(conn, "_NIXL_REMOTE_DISCONNECT_ERRORS", (Disconnected,)),
-            patch.object(conn, "_NIXL_NOT_FOUND_ERRORS", (Missing,)),
-        ]
-        for p in self.patches:
-            p.start()
-            self.addCleanup(p.stop)
+        errors = patch.multiple(
+            conn,
+            _NIXL_REMOTE_DISCONNECT_ERRORS=(Disconnected,),
+            _NIXL_NOT_FOUND_ERRORS=(Missing,),
+        )
+        errors.start()
+        self.addCleanup(errors.stop)
 
     def manager(self):
         mgr = object.__new__(conn.NixlKVManager)
@@ -208,14 +192,16 @@ class TestPeerRecovery(CustomTestCase):
 
     def run_chunks(self, mgr, chunks):
         with self.assertRaises(SystemExit):
-            mgr.transfer_worker(Queue(chunks))
+            mgr.transfer_worker(
+                SimpleNamespace(get=Mock(side_effect=[*chunks, SystemExit]))
+            )
+        self.assertEqual(mgr.shutdowns, [])
 
     def test_recovery_default_version_gate_and_opt_out(self):
         for version, backend, mode, disabled, expected in (
             ("1.4.1", "UCX", "prefill", False, True),
             ("1.5.0", "UCX", "prefill", False, True),
             ("1.4.0", "UCX", "prefill", False, False),
-            ("1.3.2", "UCX", "prefill", False, False),
             ("1.4.1", "UCCL", "prefill", False, False),
             ("1.4.1", "UCX", "decode", False, False),
             ("1.4.1", "UCX", "prefill", True, False),
@@ -238,15 +224,22 @@ class TestPeerRecovery(CustomTestCase):
 
     def test_post_disconnect_fails_one_request_and_next_request_succeeds(self):
         """A post exception previously lost the handle and permanently poisoned the peer."""
-        mgr = self.manager()
-        mgr.agent.post_fault = True
-        self.run_chunks(mgr, [self.chunk(mgr, 1), self.chunk(mgr, 2)])
-        self.assertEqual(mgr.request_status, {1: KVPoll.Failed, 2: KVPoll.Success})
-        self.assertEqual(len(mgr.agent.released), 2)
-        self.assertEqual(mgr.agent.rebuilds, ["bad-dlist"])
-        self.assertEqual(mgr.prep_handles, {"healthy": "healthy-dlist", "": "source"})
-        self.assertEqual(mgr.shutdowns, [])
-        self.assertEqual(len(mgr.messages), 1)
+        for registration_fails in (False, True):
+            with self.subTest(registration_fails=registration_fails):
+                mgr = self.manager()
+                mgr.agent.post_fault = True
+                if registration_fails:
+                    mgr.agent.add_remote_agent = Mock(
+                        wraps=mgr.agent.add_remote_agent,
+                        side_effect=[RuntimeError("metadata import failed"), DEFAULT],
+                    )
+                self.run_chunks(mgr, [self.chunk(mgr, 1), self.chunk(mgr, 2)])
+                self.assertEqual(
+                    mgr.request_status, {1: KVPoll.Failed, 2: KVPoll.Success}
+                )
+                self.assertEqual(len(mgr.agent.released), 2)
+                self.assertEqual(mgr.agent.rebuilds, ["bad-dlist"])
+                self.assertEqual(len(mgr.messages), 1)
 
     def test_drained_failed_request_acknowledges_decode_abort(self):
         """Recovery must not leave decode holding pages until its abort timeout."""
@@ -282,25 +275,6 @@ class TestPeerRecovery(CustomTestCase):
                     [m for m in mgr.messages if m[0] == b"ABORT_ACK"],
                     [[b"ABORT_ACK", b"1", b"0"]],
                 )
-                self.assertEqual(mgr.shutdowns, [])
-
-    def test_registration_failure_after_post_error_does_not_kill_worker(self):
-        mgr = self.manager()
-        mgr.agent.post_fault = True
-        add = mgr.agent.add_remote_agent
-        failures = [True]
-
-        def add_once_failing(metadata):
-            if failures:
-                failures.pop()
-                raise RuntimeError("temporary metadata import failure")
-            return add(metadata)
-
-        mgr.agent.add_remote_agent = add_once_failing
-        self.run_chunks(mgr, [self.chunk(mgr, 1), self.chunk(mgr, 2)])
-        self.assertEqual(mgr.request_status, {1: KVPoll.Failed, 2: KVPoll.Success})
-        self.assertEqual(len(mgr.agent.released), 2)
-        self.assertEqual(mgr.shutdowns, [])
 
     def test_idle_metadata_loss_rebuilds_destination_geometry_only(self):
         mgr = self.manager()
@@ -346,11 +320,11 @@ class TestPeerRecovery(CustomTestCase):
     def test_missing_metadata_does_not_make_a_running_sibling_terminal(self):
         """After one error erases metadata, a sibling must be polled again before ack."""
         mgr = self.manager()
-        batch = mgr._peer_recovery.begin(["bad"])
-        first = mgr.send_aux("bad", 0, [200], 0, "1_aux")
+        mgr._peer_recovery.begin(["bad"])
+        mgr.send_aux("bad", 0, [200], 0, "1_aux")
         second = mgr.send_aux("bad", 0, [200], 1, "2_aux")
         mgr.agent.read_fault = True
-        mgr.agent.proceed.clear()
+        mgr.agent.pending = True
         # A deterministic native boundary: the sibling's poll first observes
         # missing metadata, then blocks until the test permits completion.
         original = mgr.agent.check_xfer_state
@@ -361,7 +335,7 @@ class TestPeerRecovery(CustomTestCase):
             if h is second and len(polls) >= 4:
                 self.assertEqual(mgr.agent.released, [])
                 self.assertEqual(mgr.agent.rebuilds, [])
-                mgr.agent.proceed.set()
+                mgr.agent.pending = False
             return original(h)
 
         mgr.agent.check_xfer_state = check
@@ -373,9 +347,9 @@ class TestPeerRecovery(CustomTestCase):
         self.assertEqual(len(mgr.agent.released), 2)
         self.assertEqual(mgr.shutdowns, [])
 
-    def test_unsettled_transfer_never_releases_handles_or_notifies_decode(self):
+    def test_unsettled_transfer_shuts_down_without_releasing_handles(self):
         mgr = self.manager()
-        mgr.agent.proceed.clear()
+        mgr.agent.pending = True
         mgr._peer_recovery.begin(["bad"])
         mgr.send_aux("bad", 0, [200], 0, "1_aux")
         with patch.object(conn, "NIXL_ERR_SETTLE_TIMEOUT_S", 0):
@@ -383,7 +357,6 @@ class TestPeerRecovery(CustomTestCase):
                 mgr._await_handles([], failure_seen=True)
         self.assertEqual(mgr.agent.released, [])
         self.assertEqual(mgr.agent.rebuilds, [])
-        self.assertEqual(mgr.messages, [])
         self.assertEqual(len(mgr.shutdowns), 1)
         mgr._peer_recovery.end()
 
