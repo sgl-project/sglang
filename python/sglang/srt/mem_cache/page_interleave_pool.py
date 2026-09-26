@@ -56,9 +56,15 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     RadixAttention,
@@ -68,10 +74,7 @@ from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
 )
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton,
-)
+from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
 from sglang.srt.utils import ceil_div, get_bool_env_var
 
 if TYPE_CHECKING:
@@ -166,6 +169,7 @@ class PageInterleaveKVPoolMixin:
         # sort key of logical page l is (l % N) * stride + l // N.
         self._local_page_stride = self.size // spec.page_size + 2
         self._debug_plan_checks = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._send_pages: Optional[torch.Tensor] = None
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -226,6 +230,10 @@ class PageInterleaveKVPoolMixin:
     def _gather_pairs(self, local_layer: int) -> List[Tuple[torch.Tensor, str]]:
         """(pool buffer of ``local_layer``, scratch tensor name) pairs."""
         raise NotImplementedError
+
+    def _gather_send_rows(self, name: str) -> torch.Tensor:
+        """Source indices in a gather pair's first dimension (tokens by default)."""
+        return self._send_rows
 
     # ---- per-batch plan -------------------------------------------------------
 
@@ -355,12 +363,14 @@ class PageInterleaveKVPoolMixin:
                         torch.zeros((n_pad,), dtype=torch.int64, device=self.device),
                     ]
                 )
+            self._send_pages = own_local
             self._send_rows = (
                 own_local[:, None] * ps
                 + torch.arange(ps, dtype=torch.int64, device=self.device)
             ).reshape(-1)
             self._prefetch_layer(self.start_layer)
         else:
+            self._send_pages = None
             self._send_rows = None
 
     def end_shard_extend(self) -> None:
@@ -395,16 +405,17 @@ class PageInterleaveKVPoolMixin:
         key = (layer_id, self._epoch)
         if slot.resident_key == key:
             return
-        block = self._block_pages * self.shard_spec.page_size
         # Order the gather after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
         # writes that produced the prefix rows.
         self.kv_gather_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
             for pool_buf, name in self._gather_pairs(local_layer):
+                send_rows = self._gather_send_rows(name)
+                block = send_rows.numel()
                 scratch = slot.tensors[name]
                 send = scratch[self.shard_rank * block : (self.shard_rank + 1) * block]
-                torch.index_select(pool_buf, 0, self._send_rows, out=send)
+                torch.index_select(pool_buf, 0, send_rows, out=send)
                 # In-place regular allgather: send is exactly the rank's
                 # block of the output, every rank contributes `block` rows.
                 with self.kv_gather_comm.change_state(enable=True):
@@ -667,14 +678,9 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         if self._shard_extend_active:
             slot = self._slots[layer_id % 2]
             rows = self._translate_loc_cached(loc)
-            staged_nope, staged_rope = cache_k_nope, cache_k_rope
-            if staged_nope.dtype != self.dtype:
-                staged_nope = staged_nope.to(self.dtype)
-                staged_rope = staged_rope.to(self.dtype)
-            if self.store_dtype != self.dtype:
-                staged_nope = staged_nope.view(self.store_dtype)
-                staged_rope = staged_rope.view(self.store_dtype)
-            set_mla_kv_buffer_triton(slot.tensors["kv"], rows, staged_nope, staged_rope)
+            self._write_mla_kv_buffer(
+                slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
+            )
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
             return
@@ -733,3 +739,217 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         )
         get_mla_kv_buffer_triton(kv_buffer, rows, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
+
+
+class _PageInterleaveIndexKeyCache(IndexKeyCache):
+    """Packed indexer pages using the latent pool's ownership and scratch plan."""
+
+    def get_buffer(self, layer_id: int) -> torch.Tensor:
+        pool = self.pool
+        local = self.get_local_buffer(layer_id)
+        if pool._shard_extend_active:
+            slot = pool._acquire_slot_for_read(layer_id)
+            # Raw getters preserve the empty skip-topk placeholder, but still
+            # advance layer prefetch rather than exposing stale scratch bytes.
+            return slot.tensors["index_k"] if local.shape[0] else local
+        return local
+
+    def _scratch_pages(self, layer_id: int, page_indices: torch.Tensor) -> torch.Tensor:
+        assert self.pool._shard_extend_active, (
+            "logical indexer page reads require begin_shard_extend"
+        )
+        assert self.buffer[layer_id - self.pool.start_layer].shape[0], (
+            "cannot read indexer keys for a skip-topk layer"
+        )
+        return self.pool._page_pos[page_indices.long()]
+
+    def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
+        return super().get_k_continuous(
+            layer_id, seq_len, self._scratch_pages(layer_id, page_indices)
+        )
+
+    def get_k_scale_continuous(
+        self, layer_id: int, seq_len: int, page_indices: torch.Tensor
+    ):
+        return super().get_k_scale_continuous(
+            layer_id, seq_len, self._scratch_pages(layer_id, page_indices)
+        )
+
+    def get_k_and_scale(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        return super().get_k_and_scale(
+            layer_id,
+            seq_len_tensor,
+            self._scratch_pages(layer_id, page_indices),
+            seq_len_sum,
+            max_seq_len,
+        )
+
+    def store_quantized(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        if loc.numel() == 0:
+            return
+        pool = self.pool
+        assert self.buffer[layer_id - pool.start_layer].shape[0], (
+            "cannot write indexer keys for a skip-topk layer"
+        )
+        if pool._shard_extend_active:
+            index_buf_accessor.SetKAndS.execute(
+                pool=pool,
+                buf=pool._slots[layer_id % 2].tensors["index_k"],
+                loc=pool.translate_loc_to_scratch(loc),
+                index_k=index_k,
+                index_k_scale=index_k_scale,
+            )
+        # Indexer callers may reuse or mutate their location tensors. Compute
+        # fresh indices instead of memoizing only their pointer and length.
+        owned_idx = torch.nonzero(
+            pool.placement.local_mask(loc, pool.shard_rank)
+        ).squeeze(1)
+        local_rows = pool.placement.local_index(loc[owned_idx])
+        if owned_idx.numel():
+            super().store_quantized(
+                layer_id,
+                local_rows,
+                index_k.index_select(0, owned_idx),
+                index_k_scale.index_select(0, owned_idx),
+            )
+
+
+class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToKVPool):
+    """DSA latent and indexer caches sharing one logical-page shard plan.
+
+    The indexer keeps its native page layout: all FP8 keys followed by all
+    FP32 scales in each uint8 page. Prefix gathers copy complete packed pages;
+    chunk stores stage every token and persist only the owning rank's tokens.
+
+    ``get_index_k_continuous``, ``get_index_k_scale_continuous``, and
+    ``get_index_k_scale_buffer`` accept logical page IDs during an active
+    sharded extend. Consumers of the raw ``get_index_k_with_scale_buffer``
+    must translate their page IDs with the batch's scratch plan themselves,
+    just as consumers of ``get_key_buffer`` do. Outside an extend, raw getters
+    expose owner-local storage; ``index_key_cache.get_local_buffer`` always
+    exposes that storage.
+
+    This is a pool-level implementation. DSA backend metadata, fused indexer
+    stores, and model-runner selection still require separate integration.
+    """
+
+    def __init__(
+        self,
+        *args,
+        shard_spec: PageShardSpec,
+        shard_group: GroupCoordinator,
+        **kwargs,
+    ):
+        # Initialize both DSA buffers before allocating their shared scratch;
+        # the ordinary sharded MLA constructor deliberately rejects use_dsa.
+        DSATokenToKVPool.__init__(self, *args, **kwargs)
+        assert self.index_buf_size == self.size, (
+            "page-interleave DSA requires equal latent and indexer capacities"
+        )
+        self._init_page_shard_state(shard_spec, shard_group)
+
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        return _PageInterleaveIndexKeyCache(self, self.index_buf_size)
+
+    def _scratch_tensor_specs(self, rows: int) -> Dict[str, torch.Tensor]:
+        tensors = super()._scratch_tensor_specs(rows)
+        tensors["index_k"] = torch.zeros(
+            self.index_key_cache._buffer_shape(rows // self.page_size),
+            dtype=self.index_k_with_scale_buffer_dtype,
+            device=self.device,
+        )
+        return tensors
+
+    def _gather_pairs(self, local_layer: int):
+        pairs = super()._gather_pairs(local_layer)
+        index_k = self.index_k_with_scale_buffer[local_layer]
+        if index_k.shape[0]:
+            pairs.append((index_k, "index_k"))
+        return pairs
+
+    def _gather_send_rows(self, name: str) -> torch.Tensor:
+        # The indexer's first dimension counts complete pages, while latent
+        # storage counts tokens. Both use the exact same page ownership order.
+        if name == "index_k":
+            return self._send_pages
+        return super()._gather_send_rows(name)
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_key_cache.get_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        if self.dsa_kv_cache_store_fp8:
+            raise NotImplementedError(
+                "packed DSA latent writes require set_mla_kv_buffer"
+            )
+        return super().set_kv_buffer(
+            layer, loc_info, cache_k, cache_v, layer_id_override
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Read logical rows as separate NoPE and RoPE tensors.
+
+        Packed FP8 rows contain scales and BF16 RoPE bytes, so decode them
+        after gathering instead of using the ordinary MLA row-copy kernel.
+        The DSA decoder produces BF16 by default; an explicit ``dst_dtype``
+        converts those decoded values to the requested type.
+        """
+        if not self.dsa_kv_cache_store_fp8:
+            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+
+        slot = self._acquire_slot_for_read(layer.layer_id)
+        rows = self.translate_loc_to_scratch(loc)
+        kv = dequantize_k_cache_paged(self._scratch_kv(slot), rows)
+        if dst_dtype is not None:
+            kv = kv.to(dst_dtype)
+        return (
+            kv[..., : self.kv_lora_rank].contiguous(),
+            kv[..., self.kv_lora_rank :].contiguous(),
+        )
+
+    def get_value_buffer(self, layer_id: int):
+        if self.dsa_kv_cache_store_fp8:
+            raise NotImplementedError(
+                "packed DSA latent reads require the raw key buffer and a DSA backend"
+            )
+        return super().get_value_buffer(layer_id)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "DSA cache relocation requires a transfer between logical-page owners"
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "DSA CPU offload is unsupported under logical-page KV sharding"
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "DSA CPU restore is unsupported under logical-page KV sharding"
+        )
