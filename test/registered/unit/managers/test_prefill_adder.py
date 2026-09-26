@@ -218,7 +218,7 @@ class TestPrefillAdder(CustomTestCase):
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
-            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+            continuation, waiting, adder.rem_chunk_tokens, adder.page_size, 0
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(continuation.extend_range.length, 2560)
@@ -241,6 +241,28 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         req.set_extend_range.assert_not_called()
         self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_reserve_tokens_reject_second_unfinished_chunk(self):
+        override = get_context().override_server_args(
+            schedule_policy="lpm", chunked_prefill_reserve_tokens=512
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=256, rem_chunk_tokens=512
+        )
+        req = self.create_shared_req("second-chunk")
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        req.set_extend_range.assert_not_called()
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)

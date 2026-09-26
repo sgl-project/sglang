@@ -1298,6 +1298,9 @@ class Scheduler(
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
+        self.chunked_prefill_reserve_tokens = (
+            get_schedule().chunked_prefill_reserve_tokens
+        )
         self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -3915,6 +3918,7 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                self.chunked_prefill_reserve_tokens,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4038,6 +4042,16 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if (
+                    res == AddReqResult.OTHER
+                    and not added
+                    and self.chunked_req is not None
+                    and self.chunked_prefill_reserve_tokens > 0
+                    and adder.rem_chunk_tokens is not None
+                    and adder.rem_chunk_tokens > 0
+                    and adder.rem_input_tokens > 0
+                ):
+                    continue
                 break
 
         if mamba_allocator is not None:
