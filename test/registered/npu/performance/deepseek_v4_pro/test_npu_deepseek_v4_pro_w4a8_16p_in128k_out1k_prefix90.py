@@ -15,19 +15,15 @@ register_npu_ci(
 )
 
 # Environment variables for DSV4-Pro-0813 single-node PD-mix deployment,
-# ported from scripts_shell/dspark-with-radix-cache/dsv4_pro_2mix.sh.
-DEEPSEEK_V4_PRO_W4A8_8P_ENVS = {
+DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
+    "DEEPEP_HCCL_BUFFSIZE": "1536",
+    "HCCL_CONNECT_TIMEOUT": "300",
+    "HCCL_EXEC_TIMEOUT": "68",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ACL_DEVICE_SYNC_TIMEOUT": "60",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_CONNECT_TIMEOUT": "300",
-    "HCCL_EXEC_TIMEOUT": "68",
-    "ACL_DEVICE_SYNC_TIMEOUT": "60",
-    "DEEPEP_HCCL_BUFFSIZE": "1536",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "30",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
@@ -38,12 +34,14 @@ DEEPSEEK_V4_PRO_W4A8_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    "SGLANG_OPT_FP8_WO_A_GEMM": "0",
-    "TRANSFORMERS_VERBOSITY": "error",
-    # MTP (DSPARK)
+    "SGLANG_OPT_FP8_WO_A_GEMM": "False",
+    # [DEEPEP]
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "30",
+    # [MTP]
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    # dspark correctness-first setup
+    "TRANSFORMERS_VERBOSITY": "error",
+    # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
@@ -52,26 +50,22 @@ DEEPSEEK_V4_PRO_W4A8_8P_ENVS = {
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
 }
 
+
 # Server launch arguments for DSV4-Pro W4A8 single-node 16p PD-mix.
-# Aligned with dsv4_pro_2mix-without-dspark.sh (radix cache disabled).
-DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS = [
+DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
     16,
-    "--dp-size",
-    16,
-    "--enable-dp-attention",
-    "--enable-dp-lm-head",
     "--trust-remote-code",
-    "--device",
-    "npu",
     "--attention-backend",
     "ascend",
+    "--device",
+    "npu",
     "--watchdog-timeout",
     9000,
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.75,
+    0.8,
     "--quantization",
     "modelslim",
     "--chunked-prefill-size",
@@ -90,6 +84,10 @@ DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS = [
     "--deepep-mode",
     "auto",
     "--enable-metrics",
+    "--dp-size",
+    16,
+    "--enable-dp-attention",
+    "--enable-dp-lm-head",
     "--disable-radix-cache",
     # DSPARK speculative decoding with the bundled draft weights.
     "--speculative-algorithm",
@@ -113,8 +111,8 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH
-    other_args = DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS
-    envs = DEEPSEEK_V4_PRO_W4A8_8P_ENVS
+    other_args = DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS
+    envs = DEEPSEEK_V4_PRO_W4A8_16P_ENVS
     dataset_name = "generated-shared-prefix"
     warmup_requests = 16
     max_concurrency = 16
