@@ -368,6 +368,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        # DWDP keeps tokens local and skips the post-MoE TP
+                        # reduction, so each rank needs the entire shared MLP.
+                        or get_parallel().dwdp_size > 1
                     )
                     else {}
                 ),
