@@ -70,6 +70,7 @@ def generate_draft_decode_kv_indices(
     kv_indices,
     kv_indptr,
     positions,
+    v2p,
     pool_len: tl.constexpr,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
@@ -80,6 +81,7 @@ def generate_draft_decode_kv_indices(
     window_size: tl.constexpr = 0,
     sink_size: tl.constexpr = 0,
     NUM_STEPS: tl.constexpr = 0,
+    TRANSLATE: tl.constexpr = False,
 ):
     # window_size > 0 restricts the draft (not the target) to sink_size prefix
     # tokens + the most-recent window_size; window_size == 0 is the identity.
@@ -137,6 +139,10 @@ def generate_draft_decode_kv_indices(
                 recent_start + copy_offset - s_eff,
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
+            if TRANSLATE:
+                d64 = data.to(tl.int64)
+                phys = tl.load(v2p + d64 // page_size, mask=mask, other=0)
+                data = tl.maximum(phys * page_size + d64 % page_size, 0)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
             copy_offset += BLOCK_SIZE
     else:
@@ -149,6 +155,10 @@ def generate_draft_decode_kv_indices(
                 recent_start + copy_offset - s_eff,
             )
             data = tl.load(token_pool_ptr + src, mask=mask)
+            if TRANSLATE:
+                d64 = data.to(tl.int64)
+                phys = tl.load(v2p + d64 // page_size, mask=mask, other=0)
+                data = tl.maximum(phys * page_size + d64 % page_size, 0)
             tl.store(kv_ptr + copy_offset, data, mask=mask)
 
     # Extension entries and kv_indptr belong to token block 0 alone; other
@@ -179,6 +189,11 @@ def generate_draft_decode_kv_indices(
                 token_pool_ptr + start + extend_offset,
                 mask=extend_offset < iters,
             )
+
+        if TRANSLATE:
+            e64 = extend_data.to(tl.int64)
+            phys = tl.load(v2p + e64 // page_size, mask=extend_offset < iters, other=0)
+            extend_data = tl.maximum(phys * page_size + e64 % page_size, 0)
 
         tl.store(
             kv_ptr + seq_len_w + extend_offset,

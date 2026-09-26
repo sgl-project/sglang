@@ -129,7 +129,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
         kvcache.full_kv_pool.host_transfer_translate = (
-            self.full_attn_allocator.translate_kv_loc_for_kernel
+            self.full_attn_allocator.translate_kv_loc
         )
 
     # -- size: dynamic --
@@ -255,35 +255,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> physical TOKEN ids; `-1` passes through as
-        `-1` (padding downstream). ``out=`` supports cuda-graph buffer stability."""
+        """Full-pool virtual TOKEN ids -> physical TOKEN ids; an unmapped or
+        negative id lands on 0, the sink. ``out=`` supports cuda-graph buffer
+        stability."""
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
-
-    @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
 
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
         build the MLA block table straight from req_to_token gather through this,
-        then scale by `kernel_page_multiplier` to reach the per-page block."""
+        The kernel id is the physical token id; there is no per-page scale."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property
     def full_p2v_page_table(self) -> torch.Tensor:
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
-
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
     def translate_write_loc_for_kernel(
         self,

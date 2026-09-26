@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -130,7 +131,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
 
         # save current latent cache.
         get_token_to_kv_pool().set_kv_buffer(
-            self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+            self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
         )
         key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
@@ -197,7 +198,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mqa, forward_batch.out_cache_loc, k_input, None
+                self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
