@@ -70,9 +70,7 @@ class TestNemotronMTPReduction(CustomTestCase):
                     layer.mixer = nn.Identity()
                     layer.norm = _Norm()
                     layer._init_layer_communicator(
-                        SimpleNamespace(hybrid_override_pattern="*E"),
-                        1,
-                        is_sparse=False,
+                        SimpleNamespace(hybrid_override_pattern="*E"), 1
                     )
                     partial = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
