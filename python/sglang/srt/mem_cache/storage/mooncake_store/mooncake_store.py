@@ -53,6 +53,13 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
             size *= d
         size *= torch.tensor([], dtype=self.dtype).element_size()
         ptr_int = self.allocator.alloc(size)
+        if not ptr_int:
+            raise RuntimeError(
+                f"MooncakeHostMemAllocator.alloc returned a null pointer for "
+                f"{size / 1024**3:.3f} GB ({size} bytes); the mooncake host memory "
+                f"allocator could not map the segment (check host memory "
+                f"availability and the mooncake allocator logs)."
+            )
         self.ptr = ptr_int
         c_type = ctypes.c_byte * size
         c_array = c_type.from_address(ptr_int)
