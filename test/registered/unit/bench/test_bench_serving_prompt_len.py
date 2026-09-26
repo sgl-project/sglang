@@ -1,27 +1,8 @@
-"""Unit tests for the prompt length bench_serving attributes to each request.
-
-``RequestFuncOutput.prompt_len`` is seeded from the dataset row. For a
-single-turn row that is correct, because one row is one request. A multi-turn
-row is replayed as one request per round, and every round's output inherits the
-row's single value -- so summing ``prompt_len`` across outputs counts one number
-once per round instead of adding up each request's own prompt.
-
-Two consumers divide by that sum: the ``--cache-report`` hit rate and
-``input_lens`` in the JSON output. On an ``agentic-trace`` run of 16
-conversations x 10 turns the denominator came out 6.5x too large, turning a real
-83.8% cache hit rate into a reported 12.4%.
-
-The fix prefers the length the server reports -- ``usage.prompt_tokens`` on the
-OpenAI-compatible routes, ``meta_info.prompt_tokens`` on the native one -- which
-is the same quantity for a single-turn row and therefore needs no per-dataset
-branch.
-"""
+"""Unit tests for the per-request prompt length bench_serving records."""
 
 import asyncio
 import json
-import socket
 import threading
-import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -35,89 +16,57 @@ from sglang.benchmark.serving import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# What the dataset row claims. Deliberately not equal to anything the stub
-# server reports, so a test can only pass by reading the server's figure.
+# The dataset row's value; never what the stub reports.
 ROW_PROMPT_LEN = 9999
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class _SSEHandler(BaseHTTPRequestHandler):
-    """Streams one round's chunks, then advances to the next round's script.
-
-    Like an SGLang server with the default ``stream_response_default_include_usage
-    = False``, it sends the usage-only trailer only when the request sets
-    ``stream_options.include_usage``.
-    """
-
-    rounds: list = []
-    call_count: int = 0
-
-    def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
-        length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length)) if length else {}
-        include_usage = (body.get("stream_options") or {}).get("include_usage")
-        chunks = type(self).rounds[
-            min(type(self).call_count, len(type(self).rounds) - 1)
-        ]
-        if not include_usage:
-            chunks = [c for c in chunks if c.get("choices")]
-        type(self).call_count += 1
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-        for chunk in chunks:
-            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
-            self.wfile.flush()
-            time.sleep(0.01)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-
-    def log_message(self, fmt, *args):  # silence access logs
-        return
-
-
-class _JSONHandler(BaseHTTPRequestHandler):
-    response_body: dict = {}
+class _ChatHandler(BaseHTTPRequestHandler):
+    """Reports server.prompt_tokens[i] for the i-th request. Like a default SGLang
+    server, a streamed response carries usage only when include_usage is set."""
 
     def do_POST(self):  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.bodies.append(body)
+        usage = {
+            "completion_tokens": 1,
+            "prompt_tokens": self.server.prompt_tokens[len(self.server.bodies) - 1],
+        }
+        if body.get("stream"):
+            chunks = [{"choices": [{"index": 0, "delta": {"content": "hi"}}]}]
+            if (body.get("stream_options") or {}).get("include_usage"):
+                chunks.append({"choices": [], "usage": usage})
+            content_type = "text/event-stream"
+            payload = b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks)
+            payload += b"data: [DONE]\n\n"
+        else:
+            message = {"role": "assistant", "content": "hi"}
+            choice = {"index": 0, "message": message, "finish_reason": "length"}
+            content_type = "application/json"
+            payload = json.dumps({"choices": [choice], "usage": usage}).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.end_headers()
-        self.wfile.write(json.dumps(type(self).response_body).encode())
-        self.wfile.flush()
+        self.wfile.write(payload)
 
     def log_message(self, fmt, *args):
-        return
-
-
-def _content_chunk(text):
-    return {"choices": [{"index": 0, "delta": {"content": text}}]}
-
-
-def _usage_chunk(prompt_tokens=None, completion_tokens=1):
-    """A usage-only trailer, as OpenAI-compatible servers emit (choices=[])."""
-    usage = {"completion_tokens": completion_tokens}
-    if prompt_tokens is not None:
-        usage["prompt_tokens"] = prompt_tokens
-    return {"choices": [], "usage": usage}
+        pass
 
 
 class TestBenchServingPromptLen(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
+        self.server = HTTPServer(("127.0.0.1", 0), _ChatHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def _run(self, request_func, prompt, prompt_tokens, stream=True, extra=None):
+        self.server.bodies = []
+        self.server.prompt_tokens = prompt_tokens
         set_global_args(
             Namespace(
-                disable_stream=False,
+                disable_stream=not stream,
                 disable_ignore_eos=True,
                 print_requests=False,
                 tokenizer="",
@@ -125,128 +74,65 @@ class TestBenchServingPromptLen(CustomTestCase):
                 cache_report=False,
             )
         )
-
-    def _serve(self, handler_cls):
-        port = _free_port()
-        server = HTTPServer(("127.0.0.1", port), handler_cls)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        return port, server
-
-    def _request(self, port, prompt="hello", extra_request_body=None):
-        return RequestFuncInput(
+        request = RequestFuncInput(
             prompt=prompt,
-            api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+            api_url=f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions",
             prompt_len=ROW_PROMPT_LEN,
-            output_len=64,
+            output_len=8,
             model="dummy-model",
             lora_name="",
             image_data=None,
-            extra_request_body=extra_request_body or {},
+            extra_request_body=extra or {},
         )
+        out = asyncio.run(request_func(request))
+        outputs = out if isinstance(out, list) else [out]
+        for o in outputs:
+            self.assertTrue(o.success, o.error)
+        return [o.prompt_len for o in outputs]
 
-    def test_streaming_prefers_server_prompt_tokens(self):
-        class Handler(_SSEHandler):
-            rounds = [[_content_chunk("hi"), _usage_chunk(prompt_tokens=123)]]
-            call_count = 0
-
-        port, server = self._serve(Handler)
-        try:
-            req = self._request(
-                port, extra_request_body={"stream_options": {"include_usage": True}}
-            )
-            out = asyncio.run(async_request_openai_chat_completions(req))
-        finally:
-            server.shutdown()
-        self.assertTrue(out.success, out.error)
-        self.assertEqual(out.prompt_len, 123)
-
-    def test_streaming_without_usage_keeps_dataset_value(self):
-        """No server figure, no change -- backends that report nothing regress nothing."""
-
-        class Handler(_SSEHandler):
-            rounds = [[_content_chunk("hi")]]
-            call_count = 0
-
-        port, server = self._serve(Handler)
-        try:
-            out = asyncio.run(
-                async_request_openai_chat_completions(self._request(port))
-            )
-        finally:
-            server.shutdown()
-        self.assertTrue(out.success, out.error)
-        self.assertEqual(out.prompt_len, ROW_PROMPT_LEN)
-
-    def test_non_streaming_prefers_server_prompt_tokens(self):
-        class Handler(_JSONHandler):
-            response_body = {
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "hi"},
-                        "finish_reason": "length",
-                    }
-                ],
-                "usage": {"completion_tokens": 1, "prompt_tokens": 456},
-            }
-
-        set_global_args(
-            Namespace(
-                disable_stream=True,
-                disable_ignore_eos=True,
-                print_requests=False,
-                tokenizer="",
-                header=None,
-                cache_report=False,
-            )
-        )
-        try:
-            port, server = self._serve(Handler)
-            try:
-                out = asyncio.run(
-                    async_request_openai_chat_completions(self._request(port))
+    def test_single_request(self):
+        usage_on = {"stream_options": {"include_usage": True}}
+        cases = [
+            ("streaming with usage", True, usage_on, 123),
+            ("non-streaming", False, None, 123),
+            ("no usage keeps row value", True, None, ROW_PROMPT_LEN),
+        ]
+        for name, stream, extra, expected in cases:
+            with self.subTest(name):
+                lens = self._run(
+                    async_request_openai_chat_completions,
+                    "hello",
+                    [123],
+                    stream=stream,
+                    extra=extra,
                 )
-            finally:
-                server.shutdown()
-        finally:
-            self.setUpClass()
-        self.assertTrue(out.success, out.error)
-        self.assertEqual(out.prompt_len, 456)
+                self.assertEqual(lens, [expected])
 
-    def test_multi_turn_sums_each_round_not_the_row_value(self):
-        """The bug itself: three rounds of a growing conversation.
-
-        Before the fix every round reported ROW_PROMPT_LEN, so the sum was
-        3 x 9999. It must instead be the three lengths the server reported --
-        which the stub only sends because the multi-turn wrapper asks for usage.
-        """
+    def test_multi_turn_requests_usage_per_round(self):
         per_round = [100, 250, 400]
-
-        class Handler(_SSEHandler):
-            rounds = [
-                [_content_chunk("reply"), _usage_chunk(prompt_tokens=n)]
-                for n in per_round
-            ]
-            call_count = 0
-
-        port, server = self._serve(Handler)
-        try:
-            multi_turn = wrap_multi_turn_request_func(
-                async_request_openai_chat_completions, backend="sglang-oai-chat"
-            )
-            req = self._request(port, prompt=["turn one", "turn two", "turn three"])
-            outputs = asyncio.run(multi_turn(req))
-        finally:
-            server.shutdown()
-
-        self.assertEqual(len(outputs), len(per_round))
-        self.assertTrue(all(o.success for o in outputs))
-        self.assertEqual([o.prompt_len for o in outputs], per_round)
-        self.assertEqual(sum(o.prompt_len for o in outputs), sum(per_round))
-        self.assertNotEqual(
-            sum(o.prompt_len for o in outputs), ROW_PROMPT_LEN * len(per_round)
+        multi_turn = wrap_multi_turn_request_func(
+            async_request_openai_chat_completions, backend="sglang-oai-chat"
         )
+        on = {"include_usage": True}
+        other = {"continuous_usage_stats": False}
+        off = {"include_usage": False}
+        # (user's extra_request_body, stream_options sent, prompt_len per round)
+        cases = [
+            (None, on, per_round),
+            ({"stream_options": {}}, on, per_round),
+            ({"stream_options": None}, on, per_round),
+            ({"stream_options": other}, {**other, **on}, per_round),
+            ({"stream_options": off}, off, [ROW_PROMPT_LEN] * 3),
+        ]
+        for extra, sent, expected in cases:
+            with self.subTest(extra=extra):
+                lens = self._run(
+                    multi_turn, ["one", "two", "three"], per_round, extra=extra
+                )
+                self.assertEqual(lens, expected)
+                self.assertEqual(
+                    [b["stream_options"] for b in self.server.bodies], [sent] * 3
+                )
 
 
 if __name__ == "__main__":
