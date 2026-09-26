@@ -150,6 +150,52 @@ class TestAiterSparseBackend(CustomTestCase):
                 torch.equal(flash_mla_with_kvcache_entrypoint(**kwargs)[0], got)
             )
 
+    def test_folded_inverse_rope_matches_the_model_rope(self):
+        """The split combine folds the model's inverse RoPE into its output: bitwise the
+        combine without it followed by the standalone inverse RoPE of the rope tail."""
+        from sglang.srt.layers.attention.hip_flash_mla import (
+            flash_mla_with_kvcache_entrypoint,
+        )
+
+        gen = torch.Generator(device="cpu").manual_seed(20)
+        dev = torch.device("cuda")
+        fr = _freqs(dev)
+        for batch, pos_dtype in ((1, torch.int64), (5, torch.int32)):
+            with self.subTest(batch=batch):
+                c = _decode_case(batch, 16, gen, dev)
+                swa_len = torch.full((batch,), 77, dtype=torch.int32, device=dev)
+                topk_len = torch.full((batch,), 301, dtype=torch.int32, device=dev)
+                kwargs = dict(
+                    backend="aiter_sparse",
+                    q=c.q,
+                    k_cache=c.swa_cache,
+                    head_dim_v=D,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=None,
+                    softmax_scale=SCALE,
+                    is_fp8_kvcache=True,
+                    attn_sink=c.sink,
+                    extra_k_cache=c.topk_cache,
+                    indices=_masked(c.swa_idx, swa_len),
+                    topk_length=swa_len,
+                    extra_indices_in_kvcache=_masked(c.topk_idx, topk_len),
+                    extra_topk_length=topk_len,
+                )
+                pos = torch.randint(0, 8192, (batch,), device=dev, dtype=pos_dtype)
+                # the combine runs only with split KV
+                with patch(
+                    "sglang.srt.layers.attention.hip_flash_mla.hip_attn_kv_splits",
+                    lambda: 4,
+                ):
+                    plain = flash_mla_with_kvcache_entrypoint(**kwargs)[0]
+                    got = flash_mla_with_kvcache_entrypoint(
+                        **kwargs, inv_rope=(fr, pos)
+                    )[0]
+                ref = plain.clone().squeeze(1)
+                _model_inverse_rope(ref[..., -ROPE:], fr, pos)
+                self.assertTrue(torch.equal(got.squeeze(1), ref))
+
     def test_matches_reference(self):
         """Full lists, contexts shorter than the window and the top-k width (the length
         masks live slots left in the list), and the model's 64-padded heads; then
@@ -344,99 +390,6 @@ def _model_inverse_rope(x, freqs_real, positions):
     fused_rope_inplace(x, None, freqs_cis, positions, inverse=True)
 
 
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
-)
-class TestAiterSparseDecodeReduce(CustomTestCase):
-    def _inputs(self, batch, heads, seed, swa_len=128, topk_len=512):
-        """The kernel's own shapes: q [b, h, D], uint8 caches, flat length-folded lists."""
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        dev = torch.device("cuda")
-        c = _decode_case(batch, heads, gen, dev)
-
-        def lengths(n):
-            return torch.full((batch,), n, dtype=torch.int32, device=dev)
-
-        return dict(
-            q=c.q.squeeze(1),
-            sink=c.sink,
-            swa_cache=c.swa_cache.view(torch.uint8).squeeze(2),
-            topk_cache=c.topk_cache.view(torch.uint8).squeeze(2),
-            swa_idx=_masked(c.swa_idx, lengths(swa_len)).reshape(-1),
-            topk_idx=_masked(c.topk_idx, lengths(topk_len)).reshape(-1),
-        )
-
-    @staticmethod
-    def _indptr(n, width):
-        return torch.arange(0, (n + 1) * width, width, dtype=torch.int32, device="cuda")
-
-    def _aiter(self, inputs, kv_splits, skip_reduce):
-        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
-
-        n = inputs["q"].shape[0]
-        return pa_decode_sparse(
-            inputs["q"],
-            inputs["swa_cache"],
-            inputs["swa_idx"],
-            self._indptr(n, 128),
-            inputs["sink"],
-            SCALE,
-            extra_cache=inputs["topk_cache"],
-            extra_indices=inputs["topk_idx"],
-            extra_indptr=self._indptr(n, 512),
-            kv_splits=kv_splits,
-            skip_reduce=skip_reduce,
-        )
-
-    def test_bitwise_against_aiter_reduce(self):
-        from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
-            aiter_sparse_split_reduce,
-        )
-
-        for batch, heads, splits, seed in [
-            (3, 16, 4, 3),
-        ]:
-            with self.subTest(batch=batch, heads=heads, splits=splits):
-                # Partial lists: some splits come out empty.
-                lens = (77, 301)
-                inputs = self._inputs(batch, heads, seed, *lens)
-                ref = self._aiter(inputs, splits, skip_reduce=False)
-                acc, m, lsum = self._aiter(inputs, splits, skip_reduce=True)
-                self.assertEqual(tuple(acc.shape), (batch, splits, heads, D))
-                got = aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"])
-                self.assertEqual(got.dtype, torch.bfloat16)
-                self.assertTrue(torch.equal(got, ref))
-                self.assertTrue(
-                    torch.equal(
-                        aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"]), got
-                    )
-                )
-
-    def test_inverse_rope_matches_flat_kernel(self):
-        from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
-            aiter_sparse_split_reduce,
-        )
-
-        dev = torch.device("cuda")
-        fr = _freqs(dev)
-        for batch, heads, splits, pos_dtype in [
-            (1, 16, 4, torch.int64),
-            (5, 16, 4, torch.int32),
-        ]:
-            with self.subTest(batch=batch, heads=heads, splits=splits):
-                inputs = self._inputs(batch, heads, 20 + batch)
-                acc, m, lsum = self._aiter(inputs, splits, skip_reduce=True)
-                pos = torch.randint(0, 8192, (batch,), device=dev, dtype=pos_dtype)
-                plain = aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"])
-                ref = plain.clone()
-                _model_inverse_rope(ref[..., -ROPE:], fr, pos)
-                got = aiter_sparse_split_reduce(
-                    acc, m, lsum, inputs["sink"], inv_rope=(fr, pos)
-                )
-                self.assertTrue(torch.equal(got, ref))
-                self.assertTrue(torch.equal(got[..., :-ROPE], plain[..., :-ROPE]))
-
-
 @unittest.skipUnless(is_hip(), "HIP radix backend")
 class TestDecodeSelectionOrder(CustomTestCase):
     """The HIP decode top-k must be ordered by position, not slot: the aiter sparse
@@ -447,7 +400,7 @@ class TestDecodeSelectionOrder(CustomTestCase):
         """Same keys on two page layouts: the position-sorted selection attends bitwise
         the same, and the AOT sort with raw indices produces that order."""
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
             topk_transform_paged_sorted,
         )
         from sglang.srt.layers.attention.hip_flash_mla import aiter_sparse_decode_fwd

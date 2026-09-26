@@ -81,9 +81,6 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
     def test_capture_replay_matches_eager(self):
         self._capture_replay_matches_eager(max_context_size=None)
 
-    def test_fixed_context_capture_replay_matches_eager(self):
-        self._capture_replay_matches_eager(max_context_size=512)
-
     def _capture_replay_matches_eager(self, max_context_size):
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,

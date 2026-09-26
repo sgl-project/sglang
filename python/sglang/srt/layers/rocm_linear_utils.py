@@ -5,9 +5,7 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
 from aiter.tuned_gemm import tgemm
 
-from sglang.kernels.ops.moe.rocm_router_gate import (
-    rocm_router_gemv_split_k,
-)
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 

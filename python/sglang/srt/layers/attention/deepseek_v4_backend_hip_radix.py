@@ -27,6 +27,10 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     sparse_buffers,
     widen_pair_i64,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+    CandidateBlocks,
+    slice_candidate_blocks,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     HEAD_DIM as SWAPAB_HEAD_DIM,
 )
@@ -72,7 +76,6 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-    CandidateBlocks,
     build_low_ratio_decode_workspaces,
     low_ratio_candidate_span,
     low_ratio_decode_rows_are_identity,
@@ -80,7 +83,6 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     low_ratio_index_topk_hip_decode,
     low_ratio_index_topk_hip_extend,
     refresh_low_ratio_prefill_workspaces,
-    slice_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,

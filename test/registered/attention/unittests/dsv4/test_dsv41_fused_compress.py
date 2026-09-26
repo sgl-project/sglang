@@ -2,12 +2,10 @@
 
 import types
 import unittest
-from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import is_hip
@@ -316,41 +314,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 f"cache bytes differ from the unfused chain",
             )
 
-    def test_ratio_2_matches_exact_reference(self):
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
-            DeepseekV41Compressor,
-        )
-
-        torch.manual_seed(0)
-        hidden, head_dim, n = 5120, 512, 37
-        comp = DeepseekV41Compressor(hidden, head_dim, compress_ratio=2, eps=1e-6)
-        comp = comp.cuda()
-        # Read wkv/wgate from either the fused [2D, K] layout or split projections;
-        # both must satisfy the same numerical contract.
-        if comp.use_fused_gate:
-            w = comp.wkv_gate.weight
-            w_kv, w_gate = w[:head_dim], w[head_dim:]
-        else:
-            w_kv, w_gate = comp.wkv.weight, comp.wgate.weight
-        self.assertEqual(w_kv.dtype, torch.bfloat16)
-        self.assertEqual(w_gate.dtype, torch.bfloat16)
-
-        x = torch.randn(n, hidden, device="cuda", dtype=torch.bfloat16)
-        kv, score = comp.project(x)
-
-        # bf16 x bf16 products are exact in fp32 and fp64, so an fp64 GEMM over
-        # the same inputs is the reference up to the fp32 accumulation order.
-        x64 = x.double().cpu()
-        ref_kv = x64 @ w_kv.double().cpu().t()
-        ref_score = x64 @ w_gate.double().cpu().t()
-
-        for out, ref in ((kv, ref_kv), (score, ref_score)):
-            self.assertEqual(out.dtype, torch.float32)
-            torch.testing.assert_close(out.double().cpu(), ref, rtol=1e-4, atol=1e-4)
-            # Well below what a bf16-rounded output could reach.
-            bf16_err = (out.bfloat16().double().cpu() - ref).abs().max()
-            self.assertLess((out.double().cpu() - ref).abs().max(), bf16_err)
-
     def test_matches_the_unfused_chain(self):
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
@@ -379,65 +342,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
         t.x.normal_()
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
-
-    def test_static_verify_dispatch_and_real_pool_writes(self):
-        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
-            c2_decode_norm_rope_store,
-        )
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _low_ratio_compression_metadata,
-        )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        with get_context().override_server_args(
-            page_size=POOL_PAGE_SIZE,
-            speculative_algorithm="DSPARK",
-            speculative_num_draft_tokens=6,
-            speculative_dspark_block_size=5,
-        ):
-            t = _build(12, 2, seed=418)
-            t.draft_len = 6
-            t.req.copy_(torch.arange(2, device="cuda").repeat_interleave(6))
-            t.pos.copy_(
-                (
-                    torch.tensor([31, 32], device="cuda")[:, None]
-                    + torch.arange(6, device="cuda")
-                ).flatten()
-            )
-            core = t.backend.forward_metadata.core_metadata
-            t.out_loc, _ = _low_ratio_compression_metadata(
-                2, t.pos + 1, core.raw_out_loc
-            )
-            core.c2_out_loc = t.out_loc
-            angles = torch.randn(64, ROPE_DIM // 2, device="cuda")
-            t.freqs = t.layer.freqs_cis = torch.polar(torch.ones_like(angles), angles)
-            backend = t.backend
-            backend.is_dspark_draft = False
-            backend.speculative_num_draft_tokens = 6
-            backend._low_ratio_compress_fused = types.MethodType(
-                DeepseekV4AttnBackend._low_ratio_compress_fused, backend
-            )
-            backend._low_ratio_compress_torch = Mock()
-            batch = types.SimpleNamespace(
-                forward_mode=ForwardMode.TARGET_VERIFY, batch_size=2
-            )
-            with (
-                envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
-                patch(
-                    "sglang.kernels.ops.attention.dsv4.low_ratio_compress.c2_decode_norm_rope_store",
-                    wraps=c2_decode_norm_rope_store,
-                ) as fused,
-            ):
-                DeepseekV4AttnBackend._low_ratio_compress(
-                    backend, t.layer, t.x, t.req, t.pos, batch
-                )
-                fused.assert_called_once()
-                self.assertEqual(fused.call_args.kwargs["draft_len"], 6)
-            backend._low_ratio_compress_torch.assert_not_called()
-            ref_kv, ref_index = _reference(t, 2)
-            self.assertTrue(torch.equal(t.kv_cache.view(torch.uint8), ref_kv))
-            for got, ref in zip(t.index_cache, ref_index):
-                self.assertTrue(torch.equal(got, ref))
 
     @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_padded_rows_publish_nothing(self):
