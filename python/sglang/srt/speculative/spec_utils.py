@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -950,6 +951,10 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+    bs = accept_lens.shape[0]
+    src_indices_raw = (
+        batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
+    )
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -980,6 +985,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
         return
@@ -1000,7 +1006,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
@@ -1047,6 +1052,7 @@ def commit_mamba_states_after_verify(
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
+            src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
@@ -1054,6 +1060,7 @@ def commit_mamba_states_after_verify(
                 spec_state.intermediate_conv_window[0],
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
+                src_indices_raw,
             )
         return
 
@@ -1075,7 +1082,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
@@ -1115,13 +1121,13 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return
 
     attn_backend = model_runner.attn_backend
 
-    bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(

@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -158,6 +160,43 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
         self.assertIsNone(args.linear_attn_decode_backend)
         self.assertEqual(args.linear_attn_backend, "helion")
+
+    def test_pp_spec_flashinfer_verify_fallback_is_kda_only(self):
+        cases = (
+            ("KimiK3LinearForCausalLM", {"kda_layers": [0]}, None, "triton"),
+            ("KimiK3LinearForCausalLM", {"kda_layers": [0]}, "flashinfer", "triton"),
+            ("Qwen3NextForCausalLM", {"linear_attention_layers": [0]}, None, None),
+        )
+        for architecture, linear_config, requested, expected in cases:
+            with self.subTest(architecture=architecture, requested=requested):
+                args = ServerArgs(
+                    model_path="dummy",
+                    linear_attn_decode_backend="flashinfer",
+                    linear_attn_verify_backend=requested,
+                )
+                config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[architecture], linear_attn_config=linear_config
+                    )
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook.model_config_of",
+                        return_value=config,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook."
+                        "pp_spec_stable_rows_enabled",
+                        return_value=True,
+                    ),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                ):
+                    handle_linear_attn_backend(args)
+
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), expected
+                )
 
 
 class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):

@@ -21,6 +21,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -314,12 +317,19 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
+        dst_indices_raw = select_verify_intermediate_state_indices(
+            None,
+            forward_batch.req_pool_indices,
+            batch.lengths.ne(0),
+            pool.size,
+        )
         pool.set_ngram_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
-            )
+            ),
+            dst_indices_raw,
         )
         return
 
@@ -1096,9 +1106,23 @@ class Qwen4ExpPLELayer(nn.Module):
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
-                intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(
-                    intermediate_state.to(dtype=intermediate_cache.dtype)
+                intermediate_state = intermediate_state.to(
+                    dtype=intermediate_cache.dtype
                 )
+                dst_indices_raw = select_verify_intermediate_state_indices(
+                    None,
+                    forward_batch.req_pool_indices,
+                    batch.lengths.ne(0),
+                    get_req_to_token_pool().size,
+                )
+                if dst_indices_raw is None:
+                    intermediate_cache[
+                        : batch.lengths.shape[0], : batch.row_width
+                    ].copy_(intermediate_state)
+                else:
+                    intermediate_cache[
+                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                    ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
