@@ -34,6 +34,7 @@ import sglang.multimodal_gen.runtime.models.dits.ernie_image as ernie_image
 import sglang.multimodal_gen.runtime.models.dits.flux as flux
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
+import sglang.multimodal_gen.runtime.models.dits.hunyuanvideo as hunyuanvideo
 import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
@@ -1034,7 +1035,22 @@ def test_hunyuan_qkv_rope_pack_is_bit_exact(img_tokens, txt_tokens):
     cos = torch.randn(img_tokens, 64, device="cuda")
     sin = torch.randn_like(cos)
 
-    q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+    inputs = (img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+    # Direct parity cannot be hidden by the model wrapper's eager fallback.
+    q, k, v = hunyuan_qkv_rope_pack(*inputs)
+    gate = BitExactFusionGate("test Hunyuan pack", per_signature=True)
+    with (
+        patch.object(hunyuanvideo, "_HUNYUAN_QKV_PACK", gate),
+        patch.object(hunyuanvideo, "_HUNYUAN_QKV_PACK_SIGS", gate.verified_sigs),
+        patch.object(
+            hunyuanvideo, "hunyuan_qkv_rope_pack", wraps=hunyuan_qkv_rope_pack
+        ) as fused,
+    ):
+        wrapped = _hunyuan_pack_qkv(*inputs)
+        assert fused.call_count == 1
+        assert gate.verified and not gate.disabled
+        assert len(gate.verified_sigs) == 1
+    assert all(torch.equal(a, b) for a, b in zip((q, k, v), wrapped))
     q_ref = torch.cat(
         (_apply_rotary_emb(img_q, cos, sin, is_neox_style=False), txt_q), dim=1
     )
@@ -1046,6 +1062,70 @@ def test_hunyuan_qkv_rope_pack_is_bit_exact(img_tokens, txt_tokens):
     assert torch.equal(q, q_ref)
     assert torch.equal(k, k_ref)
     assert torch.equal(v, v_ref)
+
+
+@pytest.mark.parametrize("num_heads,head_dim", [(3, 80), (24, 128)])
+@pytest.mark.parametrize("rope_dtype", [torch.float32, torch.float64])
+def test_hunyuan_qkv_rope_pack_independent_strides(num_heads, head_dim, rope_dtype):
+    # Exercise both small and large token/head dispatches with the same layout.
+    batch, img_tokens, txt_tokens = 2, 385, 31
+    inputs = []
+    for index, tokens in enumerate([img_tokens] * 3 + [txt_tokens] * 3):
+        shape = (batch, tokens, num_heads, head_dim)
+        head_stride = head_dim + 8 + index * 2
+        token_stride = num_heads * head_stride + 16 + index
+        strides = (tokens * token_stride + 32 + index, token_stride, head_stride, 1)
+        offset = index + 1
+        size = offset + 1 + sum((n - 1) * stride for n, stride in zip(shape, strides))
+        storage = torch.randn(size, device="cuda", dtype=torch.bfloat16)
+        inputs.append(storage.as_strided(shape, strides, offset))
+    for padding in (3, 7):
+        storage = torch.randn(
+            img_tokens + 1, head_dim // 2 + padding, device="cuda", dtype=rope_dtype
+        )
+        inputs.append(storage[1:, : head_dim // 2])
+    before = [x.clone() for x in inputs]
+    packed = hunyuan_qkv_rope_pack(*inputs)
+    img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin = inputs
+    expected = (
+        torch.cat((_apply_rotary_emb(img_q.contiguous(), cos, sin, False), txt_q), 1),
+        torch.cat((_apply_rotary_emb(img_k.contiguous(), cos, sin, False), txt_k), 1),
+        torch.cat((img_v, txt_v), 1),
+    )
+    assert all(torch.equal(a, b) for a, b in zip(packed, expected))
+    assert all(torch.equal(a, b) for a, b in zip(inputs, before))
+    assert all(x.is_contiguous() for x in packed)
+    assert len({x.untyped_storage().data_ptr() for x in packed}) == 1
+    assert len({x.data_ptr() for x in packed}) == 3
+    assert all(
+        out.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        for out in packed
+        for x in inputs
+    )
+
+
+def test_hunyuan_qkv_rope_pack_graph_replays_changed_inputs():
+    img_tokens, txt_tokens, heads, dim = 257, 31, 3, 80
+    inputs = [
+        torch.randn(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        for tokens in [img_tokens] * 3 + [txt_tokens] * 3
+    ]
+    inputs += [torch.randn(img_tokens, dim // 2, device="cuda") for _ in range(2)]
+    # Complete autotuning before capture, as the model's first-call gate does.
+    hunyuan_qkv_rope_pack(*inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed = hunyuan_qkv_rope_pack(*inputs)
+    for x in inputs:
+        x.add_(0.25)
+    graph.replay()
+    img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin = inputs
+    expected = (
+        torch.cat((_apply_rotary_emb(img_q, cos, sin, False), txt_q), 1),
+        torch.cat((_apply_rotary_emb(img_k, cos, sin, False), txt_k), 1),
+        torch.cat((img_v, txt_v), 1),
+    )
+    assert all(torch.equal(a, b) for a, b in zip(packed, expected))
 
 
 def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
@@ -1065,6 +1145,10 @@ def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
     qkv = projection[..., : 3 * num_heads * head_dim].view(
         1, total_tokens, 3, num_heads, head_dim
     )
+    # Distinct nonzero rows expose wrapped offsets, including text view offsets.
+    for plane in range(3):
+        qkv[:, img_tokens - 1, plane].fill_(plane + 1)
+        qkv[:, -1, plane].fill_(plane + 4)
     q = qkv[:, :, 0].contiguous()
     k = qkv[:, :, 1].contiguous()
     v = qkv[:, :, 2]
@@ -1086,7 +1170,9 @@ def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
 
     expected_shape = (1, total_tokens, num_heads, head_dim)
     assert all(x.shape == expected_shape for x in packed)
-    assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
+    for actual, expected in zip(packed, (q, k, v)):
+        assert torch.equal(actual[:, img_tokens - 1], expected[:, img_tokens - 1])
+        assert torch.equal(actual[:, -1], expected[:, -1])
 
 
 def test_hunyuan_quality_qknorm_matches_rmsnorm():
