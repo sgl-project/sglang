@@ -1,4 +1,4 @@
-"""Archived test classes split out of test/registered/quant/test_awq.py; not in CI."""
+"""Archived test classes split out of test/registered/e2e/quantization/test_awq.py; not in CI."""
 
 import unittest
 from types import SimpleNamespace

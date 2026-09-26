@@ -87,6 +87,11 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer import (
+    CandidateMetadata,
+    make_candidate_indexer,
+    make_full_topk_indexer,
+)
 from sglang.srt.layers.attention.hip_flash_mla import (
     flash_mla_with_kvcache_entrypoint,
     hip_attn_kv_splits,
@@ -645,6 +650,8 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
+    # the torch prefill oracle's candidate publish (CUDA's candidate backends)
+    candidate_metadata: Optional[CandidateMetadata] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -812,7 +819,11 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_compress_torch = DeepseekV4AttnBackend._low_ratio_compress_torch
     _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
-    _low_ratio_index_topk_torch = DeepseekV4AttnBackend._low_ratio_index_topk_torch
+    _make_low_ratio_prefill_indexer_inputs = (
+        DeepseekV4AttnBackend._make_low_ratio_prefill_indexer_inputs
+    )
+    _get_low_ratio_selection = DeepseekV4AttnBackend._get_low_ratio_selection
+    _publish_candidate_metadata = DeepseekV4AttnBackend._publish_candidate_metadata
     _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
     # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
@@ -874,6 +885,17 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
+        # the torch prefill oracle (SGLANG_DSV41_TORCH_PREFILL_INDEXER) runs CUDA's selection
+        self.prefill_candidates, _ = make_candidate_indexer(
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            page_size=self.page_size,
+            candidate_topk_blocks=getattr(hf_text_config, "candidate_topk_blocks", 0),
+            candidate_block_size=getattr(hf_text_config, "candidate_block_size", 0),
+        )
+        self.full_topk_indexer = make_full_topk_indexer(
+            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+        )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
@@ -2998,7 +3020,9 @@ class DeepseekV4HipRadixBackend(
                 q_lens.to(torch.int64),
                 output_size=x.shape[0],
             )
-            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+            DeepseekV4AttnBackend._low_ratio_index_topk(
+                self, layer, x, q_lora, req, pos, forward_batch
+            )
             return
         self.forward_metadata.core_metadata.drop_folded_sparse_indices(
             layer.compress_ratio
@@ -3030,7 +3054,9 @@ class DeepseekV4HipRadixBackend(
         ):
             low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
         else:
-            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+            DeepseekV4AttnBackend._low_ratio_index_topk(
+                self, layer, x, q_lora, req, pos, forward_batch
+            )
 
     def expand_extend_with_same_length(
         self,

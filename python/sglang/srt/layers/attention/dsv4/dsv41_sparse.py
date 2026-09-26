@@ -11,11 +11,11 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.kernels.ops.moe.rocm_router_gate import rocm_gemv_split_k_max_tokens
 from sglang.srt.layers.linear import ReplicatedLinear

@@ -12,18 +12,21 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    select_candidate_block_ids,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import sort_selection_rows
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _low_ratio_compression_metadata,
 )
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    expand_index_page_table as _expand_index_page_table,
-)
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
     _extend_k_slots,
     topk_within_candidate_blocks_hip,
+)
+from sglang.srt.layers.attention.dsv4.metadata import (
+    expand_index_page_table as _expand_index_page_table,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -54,15 +57,10 @@ def index_slots(page_table, pos):
 
 def reference_position_mask(logits, lens, topk_blocks, block_size):
     """The reference's level one on logits whose tail past the reach is -inf."""
-    from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-        select_candidate_blocks,
-    )
-
     col = torch.arange(logits.shape[1], device=logits.device)
     pre = logits.masked_fill(col >= lens[:, None], -torch.inf)
-    return select_candidate_blocks(
-        pre, lens[:, None], topk_blocks=topk_blocks, block_size=block_size
-    )
+    ids = select_candidate_block_ids(pre, lens[:, None], topk_blocks, block_size)
+    return ids_to_position_mask(ids, block_size, logits.shape[1])
 
 
 def candidate_block_ids_to_mask(ids, num_blocks):

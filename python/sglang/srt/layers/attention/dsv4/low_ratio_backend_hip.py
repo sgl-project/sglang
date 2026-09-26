@@ -27,7 +27,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 )
 from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 from sglang.srt.layers.attention.deepseek_v4_backend import (
-    _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
 )
 
@@ -39,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 # the k the AOT fast_topk op (topk_hip.hip) is instantiated for; any other k takes torch.topk
 _AOT_FAST_TOPK_K = 2048
+# fp32 logits scored per candidate-block chunk stay under this many bytes
+_CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
 
 
 def topk_transform_paged_sorted(
@@ -914,7 +915,7 @@ def _select_topk_extend_hip(
                 # Consumers index the publication by request, so keep the slot.
                 publish.append(None)
                 continue
-            step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            step = max(1, _CANDIDATE_SCORE_BUDGET_BYTES // (lc * 4))
             pieces = []
             for lo in range(0, t_len, step):
                 chunk = slice(rows.start + lo, rows.start + min(lo + step, t_len))
