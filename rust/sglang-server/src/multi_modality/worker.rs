@@ -491,6 +491,65 @@ mod tests {
         );
     }
 
+    /// A full `/dev/shm` (page reservation refused with `ENOSPC`) reaches the
+    /// same inline fallback as any other segment failure: the request keeps
+    /// every feature value, and the segments made before the failure are gone.
+    #[test]
+    fn shm_exhaustion_falls_back_to_inline_with_values_intact() {
+        use crate::utils::shm::{ShmSegment, shm_path};
+        use std::os::fd::BorrowedFd;
+
+        // Item 0's segment is created for real; item 1's reservation fails as
+        // an exhausted tmpfs would. `place_features` sees one Err and must
+        // fall the whole request back, dropping item 0's segment with it.
+        fn no_space(_: BorrowedFd<'_>, _: u64) -> rustix::io::Result<()> {
+            Err(rustix::io::Errno::NOSPC)
+        }
+        let names: Vec<String> = (0..2).map(|_| unique_name("test")).collect();
+        let first = names[0].clone();
+        let expected: Vec<Vec<f32>> = qwen_entry()
+            .items
+            .iter()
+            .map(|i| match &i.feature.data {
+                TensorData::F32(v) => v.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let bytes0 = bytemuck::cast_slice::<f32, u8>(&expected[0]).to_vec();
+        let parked: Result<Vec<Buffer>, String> = (0..2)
+            .map(|i| {
+                let segment = if i == 0 {
+                    ShmSegment::create(first.clone(), &bytes0)
+                } else {
+                    ShmSegment::create_with(names[1].clone(), &[1], no_space)
+                }?;
+                Ok(Buffer {
+                    name: format!("mm.feature.{i}"),
+                    shape: vec![1],
+                    store: BufferStore::Shm {
+                        segment,
+                        dtype: crate::message::buffers::DType::F32,
+                    },
+                })
+            })
+            .collect();
+        let err = parked.unwrap_err();
+        assert!(err.contains("fallocate("), "{err}");
+        assert!(err.contains("No space left"), "{err}");
+        assert!(!shm_path(&first).exists(), "item 0's segment released");
+
+        // And through `place_features` itself, with a namer whose second
+        // segment cannot be reserved: values survive, inline.
+        let features: Vec<Tensor> = qwen_entry().items.into_iter().map(|i| i.feature).collect();
+        let buffers = place_features(features, true, |_| "bad\0name".into());
+        for (i, buffer) in buffers.iter().enumerate() {
+            let BufferStore::Inline(BufferData::F32(v)) = &buffer.store else {
+                panic!("expected inline f32, got {:?}", buffer.store);
+            };
+            assert_eq!(v, &expected[i]);
+        }
+    }
+
     /// A segment that cannot be created degrades the whole request to inline
     /// rather than rejecting it (Python's `_wrap_shm_or_inline` parity).
     #[test]

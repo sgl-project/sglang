@@ -5,9 +5,23 @@
 //! and widens `mode_t` for the variadic `shm_open` on Apple where the raw
 //! call would be UB.
 
-use rustix::fs::{Mode, ftruncate};
+use std::os::fd::{AsFd, BorrowedFd};
+
+use rustix::fs::{FallocateFlags, Mode, fallocate, ftruncate};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::shm::{OFlags, open, unlink};
+
+/// Reserve `len` bytes of backing pages for a fresh segment, so a full
+/// `/dev/shm` surfaces here as `ENOSPC` instead of as a `SIGBUS` on the first
+/// write into the mapping. `ftruncate` only sets the length; tmpfs allocates
+/// pages lazily at write time. Mirrors Python's `posix_fallocate` in
+/// `ShmPointerMMData`. Injectable so tests can stand in for an exhausted tmpfs.
+pub type Reserve = fn(BorrowedFd<'_>, u64) -> rustix::io::Result<()>;
+
+/// The real reservation.
+pub fn reserve_pages(fd: BorrowedFd<'_>, len: u64) -> rustix::io::Result<()> {
+    fallocate(fd, FallocateFlags::empty(), 0, len)
+}
 
 /// A named POSIX shared-memory segment owning its name: dropped → unlinked.
 ///
@@ -25,6 +39,13 @@ impl ShmSegment {
     /// Create the segment `name` holding exactly `bytes`. No leading slash —
     /// the name must suit Python's `SharedMemory(name=…)` (shm_open adds one).
     pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
+        Self::create_with(name, bytes, reserve_pages)
+    }
+
+    /// [`create`](Self::create) with the page reservation step supplied, so a
+    /// test can make it fail the way a full `/dev/shm` does. Every failure
+    /// after `shm_open` unlinks the segment on the way out (`segment` drops).
+    pub fn create_with(name: String, bytes: &[u8], reserve: Reserve) -> Result<Self, String> {
         // Rejected before anything is opened: mmap refuses length 0.
         if bytes.is_empty() {
             return Err(format!("shm({name}): empty payload"));
@@ -38,6 +59,10 @@ impl ShmSegment {
         let segment = Self { name }; // unlink from here on any failure
         ftruncate(&fd, bytes.len() as u64)
             .map_err(|e| format!("ftruncate({}): {e}", segment.name))?;
+        // Must precede the copy below: an unreserved page that cannot be
+        // allocated at write time kills the process instead of erroring.
+        reserve(fd.as_fd(), bytes.len() as u64)
+            .map_err(|e| format!("fallocate({}): {e}", segment.name))?;
         // SAFETY: a fresh mapping independent of any existing allocation,
         // unmapped below before `fd` drops.
         let ptr = unsafe {
@@ -134,6 +159,41 @@ mod tests {
         let name = segment.into_name();
         assert!(shm_path(&name).exists(), "handoff must not unlink");
         unlink(format!("/{name}")).unwrap(); // manual cleanup for the test
+    }
+
+    /// A full `/dev/shm` is an `Err`, reached before any byte is written into
+    /// the mapping (where it would be a fatal `SIGBUS`), and the half-made
+    /// segment is unlinked on the way out.
+    #[test]
+    fn exhausted_shm_is_an_error_and_leaves_nothing() {
+        fn no_space(_: BorrowedFd<'_>, _: u64) -> rustix::io::Result<()> {
+            Err(rustix::io::Errno::NOSPC)
+        }
+        let name = test_name();
+        let err = ShmSegment::create_with(name.clone(), &[1, 2, 3], no_space).unwrap_err();
+        assert!(err.starts_with("fallocate("), "{err}");
+        assert!(err.contains("No space left"), "{err}");
+        assert!(
+            !shm_path(&name).exists(),
+            "partial segment must be unlinked"
+        );
+    }
+
+    /// The real reservation is what `create` runs: a segment it made is fully
+    /// backed, so a later write cannot fault.
+    #[test]
+    fn create_reserves_backing_pages() {
+        let name = test_name();
+        let payload = vec![7u8; 4096 * 3];
+        let segment = ShmSegment::create(name.clone(), &payload).unwrap();
+        let meta = std::fs::metadata(shm_path(&name)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert!(
+            meta.blocks() * 512 >= payload.len() as u64,
+            "blocks={}",
+            meta.blocks()
+        );
+        drop(segment);
     }
 
     /// A name that is already taken is an error, not a silent overwrite of
