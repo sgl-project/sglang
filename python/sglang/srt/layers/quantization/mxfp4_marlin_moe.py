@@ -171,12 +171,6 @@ class Mxfp4MarlinMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-        topk_output = dispatch_output.topk_output
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
         target_hidden_size = layer.w13_weight.shape[1] * 16
         if hidden_states.shape[-1] == target_hidden_size:
@@ -195,4 +189,8 @@ class Mxfp4MarlinMoEMethod:
             quant_info=quant_info,
         )
 
-        return StandardCombineInput(hidden_states=runner_output.hidden_states)
+        return runner_output._replace(
+            hidden_states=runner_output.hidden_states[
+                ..., : hidden_states.shape[-1]
+            ].contiguous()
+        )
