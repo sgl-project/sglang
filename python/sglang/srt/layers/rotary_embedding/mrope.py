@@ -23,12 +23,14 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -170,11 +172,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if self.cos_sin_cache.device != query.device:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        # On HIP, keep fp32 for the fused QSA indexer JIT kernel
+        # (qsa_indexer.cuh requires const float* cos_sin_cache).
+        if not _is_hip and self.cos_sin_cache.dtype != query.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(dtype=query.dtype)
 
     def forward_native(
         self,

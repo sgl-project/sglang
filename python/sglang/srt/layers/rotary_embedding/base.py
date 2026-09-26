@@ -111,7 +111,9 @@ class RotaryEmbedding(BaseFusedOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        # HIP: the fused QSA indexer JIT kernel (qsa_indexer.cuh) requires
+        # fp32 cos_sin_cache. Keep fp32 on HIP, matching CUDA behavior.
+        if not (_is_cuda or _is_hip or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -154,11 +156,12 @@ class RotaryEmbedding(BaseFusedOp):
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if self.cos_sin_cache.device != query.device:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        # On HIP, keep fp32 for the fused QSA indexer JIT kernel
+        # (qsa_indexer.cuh requires const float* cos_sin_cache).
+        if not _is_hip and self.cos_sin_cache.dtype != query.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(dtype=query.dtype)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -436,9 +439,12 @@ class RotaryEmbedding(BaseFusedOp):
                 assert fused_set_kv_buffer_arg is None, (
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
-                self.cos_sin_cache = self.cos_sin_cache.to(
-                    query.device, dtype=query.dtype
-                )
+                if _is_hip:
+                    self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                else:
+                    self.cos_sin_cache = self.cos_sin_cache.to(
+                        query.device, dtype=query.dtype
+                    )
                 self.fallback_rotary_embedding(
                     positions,
                     query,
