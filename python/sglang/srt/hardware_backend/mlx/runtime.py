@@ -8,6 +8,7 @@ from packaging.version import InvalidVersion, Version
 from sglang.srt.environ import envs
 
 _MIN_MLX_VERSION = Version("0.32.0")
+_MIN_TRANSFORMERS_MAJOR = 5
 _SUPPORTED_TORCH_SERIES = (2, 13)
 
 
@@ -25,6 +26,42 @@ def _is_stable_at_least(raw_version: object, minimum: Version) -> bool:
     except InvalidVersion:
         return False
     return not version.is_prerelease and version >= minimum
+
+
+def _validate_transformers_version() -> None:
+    """Reject transformers 4.x, which breaks config imports on Apple Silicon installs.
+
+    A common failure mode on macOS is installing outside ``python[srt_mps]`` /
+    ``python[all_mps]`` (or letting a transitive dep like a free ``xgrammar``
+    resolve pull ``transformers<5``). That surfaces as
+    ``ImportError: cannot import name 'PreTrainedConfig'``.
+    """
+    try:
+        import transformers
+    except ImportError as exc:
+        raise RuntimeError(
+            "SGLANG_USE_MLX requires transformers>=5 (pinned to 5.12.1 via the "
+            "srt_mps extra), but transformers is not installed; reinstall with "
+            "the srt_mps extra from python/pyproject_other.toml"
+        ) from exc
+
+    transformers_version = getattr(transformers, "__version__", None)
+    try:
+        version = Version(str(transformers_version))
+    except InvalidVersion as exc:
+        raise RuntimeError(
+            "SGLANG_USE_MLX could not parse transformers version "
+            f"{transformers_version!r}; reinstall with the srt_mps extra"
+        ) from exc
+
+    if version.major < _MIN_TRANSFORMERS_MAJOR:
+        raise RuntimeError(
+            "SGLANG_USE_MLX requires transformers>=5 "
+            f"(found {transformers_version}). On Apple Silicon, install from "
+            "python/pyproject_other.toml with the srt_mps (or all_mps) extra; "
+            "do not use the default CUDA python/pyproject.toml. "
+            "See docs/docs/hardware-platforms/apple_metal.mdx"
+        )
 
 
 @lru_cache(maxsize=1)
@@ -48,6 +85,8 @@ def _validate_runtime() -> None:
             f"Torch {torch_version or 'unknown'} + MLX {mlx_version or 'unknown'}; "
             "reinstall with the srt_mps extra"
         )
+
+    _validate_transformers_version()
 
     mps_backend = getattr(torch.backends, "mps", None)
     is_mps_available = getattr(mps_backend, "is_available", None)
