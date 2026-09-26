@@ -682,6 +682,88 @@ class TestHunyuanDetectorStructureInfo(CustomTestCase):
         self.assertFalse(self.detector.supports_structural_tag())
 
 
+class TestHunyuanDetectorTypeArrays(CustomTestCase):
+    def test_type_arrays_preserve_arguments_in_both_modes(self):
+        cases = (
+            (["integer", "null"], "7", 7),
+            (["null", "integer"], "null", None),
+            (["number", "null"], "1.25", 1.25),
+            (["null", "boolean"], "false", False),
+            (["string", "null"], 'literal "quoted" text', 'literal "quoted" text'),
+            (["array", "null"], "[1,2]", [1, 2]),
+            (["object", "null"], '{"ok": true}', {"ok": True}),
+            (["string", "integer"], "7", 7),
+            (["integer", "string"], "plain text", "plain text"),
+            (["string", "array"], "[1,2]", [1, 2]),
+        )
+        for types, raw_value, expected in cases:
+            for schema in (
+                {"type": types},
+                {"anyOf": [{"type": types}]},
+                {"oneOf": [{"type": types}]},
+            ):
+                for chunk_size in (1, 7, 10000):
+                    with self.subTest(
+                        schema=schema, value=raw_value, chunk_size=chunk_size
+                    ):
+                        tools = [
+                            Tool(
+                                type="function",
+                                function=Function(
+                                    name="echo",
+                                    parameters={
+                                        "type": "object",
+                                        "properties": {"value": schema},
+                                    },
+                                ),
+                            )
+                        ]
+                        call = (
+                            "<tool_call>echo<tool_sep>"
+                            f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value>"
+                            "</tool_call>"
+                        )
+                        # Repeated calls must reset streaming argument state.
+                        text = "<tool_calls>" + call + call + "</tool_calls>"
+                        with self.subTest(mode="nonstream"):
+                            result = HunyuanDetector().detect_and_parse(text, tools)
+                            self.assertEqual(len(result.calls), 2)
+                            for parsed in result.calls:
+                                self.assertEqual(parsed.name, "echo")
+                                value = json.loads(parsed.parameters)["value"]
+                                self.assertEqual(value, expected)
+                                self.assertIs(type(value), type(expected))
+
+                        with self.subTest(mode="stream"):
+                            detector = HunyuanDetector()
+                            deltas = []
+                            for start in range(0, len(text), chunk_size):
+                                deltas.extend(
+                                    detector.parse_streaming_increment(
+                                        text[start : start + chunk_size], tools
+                                    ).calls
+                                )
+                            collected = _collect_streamed_tool_calls(deltas)
+                            self.assertEqual(len(collected), 2)
+                            for parsed in collected:
+                                self.assertEqual(parsed["name"], "echo")
+                                value = json.loads(parsed["parameters"])["value"]
+                                self.assertEqual(value, expected)
+                                self.assertIs(type(value), type(expected))
+
+    def test_type_array_normalization_matches_scalar_options(self):
+        schemas = (
+            {"type": ["int32", "null"]},
+            {"anyOf": [{"type": ["int32", "null"]}, {"type": "boolean"}]},
+            {"oneOf": [{"type": ["string", "array"]}]},
+        )
+        for schema, expected in zip(
+            schemas, ({"integer"}, {"integer", "boolean"}, {"string", "array"})
+        ):
+            with self.subTest(schema=schema):
+                self.assertEqual(HunyuanDetector._get_types(schema), expected)
+
+
 class TestHunyuanDetectorFunctionCallParser(CustomTestCase):
     """Test through the FunctionCallParser interface."""
 

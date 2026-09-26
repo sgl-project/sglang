@@ -214,9 +214,13 @@ class HunyuanDetector(BaseFormatDetector):
     @staticmethod
     def _get_types(arg_schema: dict) -> Set[str]:
         schemas = HunyuanDetector._get_schema_options(arg_schema)
-        return {
-            HunyuanDetector._normalize_type(s.get("type", "string")) for s in schemas
-        } - {"null"}
+        types = set()
+        for schema in schemas:
+            raw_types = schema.get("type", "string")
+            if isinstance(raw_types, str):
+                raw_types = [raw_types]
+            types.update(HunyuanDetector._normalize_type(t) for t in raw_types)
+        return types - {"null"}
 
     @staticmethod
     def _is_only_string_type(
