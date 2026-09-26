@@ -805,6 +805,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             boundary_kv_ready_event = torch.get_device_module(self.device).Event()
             boundary_kv_ready_event.record()
 
+        if self.plan_stream is not None and boundary_kv_ready_event is None:
+            # Zero-front and idle batches still consume compute-stream inputs.
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             if boundary_kv_ready_event is not None:
                 self.plan_stream.wait_event(boundary_kv_ready_event)
