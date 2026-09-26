@@ -52,7 +52,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 7)
+        self.assertEqual(len(matrix), 8)
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
         self.assertEqual(by_architecture["BertModel"]["attention"], "bidirectional")
         self.assertTrue(by_architecture["CLIPModel"]["supports_multimodal"])
@@ -62,6 +62,29 @@ class TestEmbeddingModelSpec(unittest.TestCase):
             ],
             "full_encoder",
         )
+
+    def test_laya_is_a_bidirectional_decision_model(self):
+        spec = resolve_embedding_model_spec(
+            ["LayaForDecision"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "laya")
+        self.assertEqual(spec.task, EmbeddingTask.EMBED)
+        self.assertEqual(spec.execution, EmbeddingExecution.ENCODER_ONLY)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertEqual(spec.pooling, PoolingStrategy.MODEL_DEFINED)
+        # The model returns calibrated probabilities and two act-head outputs;
+        # normalising or re-softmaxing them would corrupt the numbers.
+        self.assertFalse(spec.normalize)
+        self.assertTrue(spec.bidirectional_attention)
+        self.assertTrue(spec.auto_enable_embedding)
+        self.assertFalse(spec.requires_embedding_flag)
+        # Full-prompt attention: prefix reuse and split prefills are invalid for a
+        # bidirectional encoder, so the spec must ask for them to be switched off.
+        self.assertTrue(spec.safe_disable_radix_cache)
+        self.assertTrue(spec.safe_disable_chunked_prefill)
 
     def test_resolved_plan_reports_effective_runtime_knobs(self):
         spec = resolve_embedding_model_spec(

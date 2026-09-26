@@ -389,6 +389,19 @@ class Envs:
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
+    # Laya ships fitted per-(question type, option count) temperatures, one of
+    # which (`choice:11+` = 0.1006) sharpens the logits ~10x. The released SDK
+    # clamps them to [0.5, 5.0]; set this to False to serve the raw fitted
+    # values instead (which is what the published pre-clamp sweep used).
+    SGLANG_LAYA_TEMPERATURE_CLAMP = EnvBool(True)
+
+    # Laya's encoder computes its own bidirectional attention (with the
+    # per-layer local window) instead of going through the paged attention
+    # backend: the backend path produced outputs that disagreed with the
+    # checkpoint's reference implementation. Set this to True to route Laya
+    # through the attention backend instead (for A/B comparison).
+    SGLANG_LAYA_ATTENTION_BACKEND = EnvBool(False)
+
     # ===================================================================
     # Crash diagnostics and shutdown
     # ===================================================================
