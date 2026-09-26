@@ -761,8 +761,8 @@ class ExecMoe(msgspec.Struct):
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
     fuseep_mode: A[
-        Literal[1, 2],
-        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
+        Literal[1, 2, 3],
+        "Select the mode when enabling Ascend FuseEP MoE: 1 runs dispatch_gmm_combine_decode; 2 runs dispatch_ffn_combine (and supports hybrid deployment); 3 runs the MegaMoE fused operator for ModelSlim W4A8 Kimi-K3.",
     ] = 2
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
