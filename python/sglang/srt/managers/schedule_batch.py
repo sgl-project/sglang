@@ -2591,7 +2591,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def grammar_needs_sync(self) -> bool:
         """Whether grammar forces this batch onto the synchronous path, i.e. the
         previous batch's result is resolved before this forward."""
-        return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
+        if not self.has_grammar:
+            return False
+
+        # Mixed batches skip verify(), so sync grammar before building the next mask.
+        if self.forward_mode.is_mixed():
+            return any(req.grammar is not None for req in self.decoding_reqs or ())
+
+        return not self.spec_algorithm.supports_grammar_overlap()
 
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
