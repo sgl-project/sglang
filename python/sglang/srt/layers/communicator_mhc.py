@@ -13,7 +13,7 @@
 # ==============================================================================
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -28,6 +28,7 @@ from sglang.srt.layers.boundary_layout import (
     DecoderLayerSides,
     SumGroup,
     TokenAxis,
+    scattered_residual_layer_sides,
 )
 from sglang.srt.layers.communicator import (
     AttentionInputs,
@@ -41,6 +42,7 @@ from sglang.srt.layers.communicator import (
     MlpInputKind,
     ScatterMode,
     _select_attention_input_move,
+    _token_axis_sizes,
     get_attn_tp_context,
     mlp_input_kind,
     tp_reduce_scatter,
@@ -72,6 +74,51 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
     return output
 
 
+def _attention_input(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    context: CommunicateContext,
+    *,
+    move: Callable,
+    qkv_latent_func: Optional[Callable],
+):
+    """Move the attention input to the attention's rows and hand the QKV hook
+    its input."""
+    hidden_states = move(
+        hidden_states=hidden_states, forward_batch=forward_batch, context=context
+    )
+    if qkv_latent_func is not None:
+        get_attn_tp_context().set_attn_inputs(
+            AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
+        )
+    return hidden_states
+
+
+def _input_scattered_attention_input(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    context: CommunicateContext,
+    *,
+    qkv_latent_func: Optional[Callable],
+):
+    """Input-scattered attention: the QKV hook gathers the rows after its
+    projection, except that DSA and attention without a hook consume full
+    hidden states, so those are gathered here."""
+    ctx = get_attn_tp_context()
+    if ctx.is_dsa or qkv_latent_func is None:
+        hidden_states = tp_all_gather_hidden_states(hidden_states, forward_batch)
+    if qkv_latent_func is not None:
+        ctx.set_attn_inputs(
+            AttentionInputs(
+                hidden_states,
+                forward_batch,
+                qkv_latent_func,
+                is_pre_gathered=ctx.is_dsa,
+            )
+        )
+    return hidden_states
+
+
 def _select_mhc_ffn_input(sides: DecoderLayerSides, mhc: "MHCState") -> Callable:
     """MHC's steps from the attention output to the FFN input, for the rows
     the declarations call for. The residual is written back with hc_post,
@@ -82,6 +129,13 @@ def _select_mhc_ffn_input(sides: DecoderLayerSides, mhc: "MHCState") -> Callable
     fns = MHCCommunicateWithAllReduceAndLayerNormFn
     gathered = produced.layout.sharded - need.layout.sharded - need.gathers_itself
     sliced = need.layout.sharded - produced.layout.sharded
+    if TokenAxis.ATTN_TP_SCATTER in residual_to.sharded - need.layout.sharded:
+        # The residual stays on each rank's slice while the FFN takes all rows
+        # (input-scattered): complete the sum onto the slice, update and read
+        # the residual there, and gather the FFN input.
+        if gathered or sliced or produced.group is not SumGroup.ATTN_TP:
+            raise NotImplementedError(f"{produced=} {need=}")
+        return partial(fns._reduce_scatter_update_and_gather, mhc=mhc)
     if sliced:
         # Each attention-TP rank takes its own slice.
         if (
@@ -106,24 +160,33 @@ def _select_mhc_ffn_input(sides: DecoderLayerSides, mhc: "MHCState") -> Callable
     return partial(fns._simple, mhc=mhc)
 
 
-def _select_mhc_ffn_output_move(sides: DecoderLayerSides) -> Optional[Callable]:
-    """MHC's move of the FFN output to the rows the layer hands on; None when
-    it goes back over attention DP, which MHC's postprocess runs itself."""
+def _select_mhc_ffn_output_move(
+    sides: DecoderLayerSides,
+) -> Tuple[Optional[Callable], bool]:
+    """MHC's move of the FFN output to the rows the layer hands on, None when
+    it goes back over attention DP (MHC's postprocess runs that itself), and
+    whether the move completes the sum the FFN leaves."""
     produced, residual, to = (
         sides.ffn_output,
         sides.ffn_residual_rows,
         sides.output_rows,
     )
     fns = MHCCommunicateSummableTensorPairFn
+    returned = residual.sharded - produced.layout.sharded
     if produced.layout == residual:
         if to == residual:
-            return fns._trivial
+            return fns._trivial, False
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP_SCATTER}:
-            return fns._gather
-    elif to == residual and residual.sharded - produced.layout.sharded == {
-        TokenAxis.ATTN_DP
-    }:
-        return None
+            return fns._gather, False
+    elif to == residual and returned == {TokenAxis.ATTN_DP}:
+        return None, False
+    elif (
+        returned == {TokenAxis.ATTN_TP_SCATTER}
+        and produced.leaves_for_reduce_scatter
+        and to in (residual, produced.layout)
+    ):
+        # The reduce-scatter onto each rank's slice completes the FFN's sum.
+        return fns._reduce_scatter_and_combine, True
     raise NotImplementedError(f"{produced=} {residual=} {to=}")
 
 
@@ -241,9 +304,10 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
         return hidden_states, residual
 
     @staticmethod
-    def _tp_all_reduce_with_scattered_residual(
+    def _reduce_scatter_update_and_gather(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
         *,
@@ -274,15 +338,6 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
         residual_on_slice: bool,
         mhc: MHCState,
     ):
-        if get_attn_tp_context().input_scattered:
-            return MHCCommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
-                hidden_states,
-                residual,
-                layernorm,
-                context,
-                mhc=mhc,
-            )
-
         if residual_on_slice:
             raise NotImplementedError(
                 "Unsupported: h_res/h_post allgather not implemented."
@@ -346,21 +401,35 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         is_last_layer: bool,
         **kwargs,
     ):
-        if get_attn_tp_context().input_scattered:
-            hidden_states, _ = tp_reduce_scatter(hidden_states, None, context)
+        hidden_states = mhc.mlp_combine(hidden_states, residual)
+        if not is_last_layer:
+            return hidden_states, None
+        return hc_contract(hidden_states, mhc.hc_mult), None
 
+    @staticmethod
+    def _reduce_scatter_and_combine(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        *,
+        mhc: MHCState,
+        is_last_layer: bool,
+        **kwargs,
+    ):
+        """Input-scattered: reduce-scatter the FFN output onto this rank's
+        slice, which completes its sum, and combine the streams there. The last
+        layer contracts them and gathers the full rows back."""
+        hidden_states, _ = tp_reduce_scatter(hidden_states, None, context)
         hidden_states = mhc.mlp_combine(hidden_states, residual)
         if not is_last_layer:
             return hidden_states, None
 
-        hidden_states = hc_contract(hidden_states, mhc.hc_mult)
-        if get_attn_tp_context().input_scattered:
-            local_states = hidden_states
-            hidden_states = local_states.new_empty(
-                local_states.shape[0] * context.tp_size, *local_states.shape[1:]
-            )
-            get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
-
+        local_states = hc_contract(hidden_states, mhc.hc_mult)
+        hidden_states = local_states.new_empty(
+            local_states.shape[0] * context.tp_size, *local_states.shape[1:]
+        )
+        get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
         return hidden_states, None
 
     @staticmethod
@@ -485,19 +554,43 @@ class MHCLayerCommunicator(LayerCommunicator):
         self, sides: DecoderLayerSides, **kwargs
     ) -> BoundarySteps:
         """MHC's own implementation of each step the declarations call for."""
+        move, completes_sum = _select_mhc_ffn_output_move(sides)
         return BoundarySteps(
-            attention_input=_select_attention_input_move(
-                sides.input_rows, sides.attention
+            attention_input=partial(
+                _attention_input,
+                move=_select_attention_input_move(sides.input_rows, sides.attention),
+                qkv_latent_func=self.qkv_latent_func,
             ),
             ffn_input=_select_mhc_ffn_input(sides, self.mhc),
             ffn_output=sides.ffn_output,
-            ffn_output_move=_select_mhc_ffn_output_move(sides),
+            ffn_output_move=move,
             ffn_sum_is_movable=sides.ffn_output.group is not None,
+            ffn_output_move_completes_sum=completes_sum,
         )
 
-    def _input_can_be_scattered(self) -> bool:
-        # MHC's steps handle input-scattered attention themselves.
-        return False
+    def _steps_for_input_scattered(self, sides: DecoderLayerSides) -> BoundarySteps:
+        """An input-scattered batch keeps the residual on each rank's slice."""
+        scattered = scattered_residual_layer_sides(
+            axis_sizes=_token_axis_sizes(),
+            ffn_group=sides.ffn_output.group,
+            is_first_layer=self.is_first_layer,
+            is_last_layer=self.is_last_layer,
+        )
+        move, completes_sum = _select_mhc_ffn_output_move(scattered)
+        return BoundarySteps(
+            attention_input=partial(
+                _input_scattered_attention_input,
+                qkv_latent_func=self.qkv_latent_func,
+            ),
+            ffn_input=_select_mhc_ffn_input(scattered, self.mhc),
+            ffn_output=scattered.ffn_output,
+            ffn_output_move=move,
+            ffn_sum_is_movable=False,
+            ffn_output_move_completes_sum=completes_sum,
+            layer_input=(
+                tp_reduce_scatter if scattered.input_owes is SumGroup.TP else None
+            ),
+        )
 
     def _local_token_move_can_go_to_next_layer(
         self, forward_batch: ForwardBatch
@@ -529,7 +622,14 @@ class MHCLayerCommunicator(LayerCommunicator):
         # attention DP is the empty move, as on the declarations.
         if postprocess is MHCCommunicateSummableTensorPairFn._scatter_hidden_states:
             postprocess = None
-        return attention_input, postprocess
+        return (
+            partial(
+                _attention_input,
+                move=attention_input,
+                qkv_latent_func=self.qkv_latent_func,
+            ),
+            postprocess,
+        )
 
     def prepare_attn(
         self,
@@ -538,42 +638,20 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
     ):
         self.publish_attn_lora_layout()
+        steps = self._batch_steps(forward_batch)
         if self.is_first_layer:
-            if get_attn_tp_context().input_scattered:
-                hidden_states, _ = tp_reduce_scatter(
-                    hidden_states,
-                    None,
-                    self._context,
-                )
+            if steps.layer_input is not None:
+                hidden_states, _ = steps.layer_input(hidden_states, None, self._context)
             hidden_states = hc_expand(hidden_states, self.mhc.hc_mult)
 
         hidden_states, residual = self.mhc.attn_split(
             hidden_states, out_norm=self.input_layernorm
         )
-
-        hidden_states = self._batch_steps(forward_batch).attention_input(
+        hidden_states = steps.attention_input(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             context=self._context,
         )
-
-        # DSA and attention without a QKV hook consume full hidden states, so
-        # gather them before attention.
-        ctx = get_attn_tp_context()
-        dsa_pre_gather = ctx.input_scattered and ctx.is_dsa
-        no_qkv_latent_pre_gather = ctx.input_scattered and self.qkv_latent_func is None
-        if dsa_pre_gather or no_qkv_latent_pre_gather:
-            hidden_states = tp_all_gather_hidden_states(hidden_states, forward_batch)
-
-        if self.qkv_latent_func is not None:
-            attn_inputs = AttentionInputs(
-                hidden_states,
-                forward_batch,
-                self.qkv_latent_func,
-                is_pre_gathered=dsa_pre_gather,
-            )
-            ctx.set_attn_inputs(attn_inputs)
-
         return hidden_states, residual
 
     def _select_mlp_input(self):
@@ -640,14 +718,12 @@ class MHCLayerCommunicator(LayerCommunicator):
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
-        if self._batch_steps(forward_batch).returns_over_dp:
+        steps = self._batch_steps(forward_batch)
+        if steps.returns_over_dp:
             # reduce_scatterv already combines expert outputs; returning False
             # would make RowParallelLinear perform an extra all-reduce.
             if should_use_dp_reduce_scatterv():
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-
-        if get_attn_tp_context().input_scattered:
-            return True
-        return False
+        return steps.ffn_output_move_completes_sum

@@ -138,6 +138,44 @@ def sequence_parallel_layer_sides(
     )
 
 
+def scattered_residual_layer_sides(
+    *,
+    axis_sizes: Mapping[TokenAxis, int],
+    ffn_group: SumGroup,
+    is_first_layer: bool,
+    is_last_layer: bool,
+) -> DecoderLayerSides:
+    """A decoder layer on an input-scattered batch whose residual stays on
+    each attention-TP rank's slice (MHC). The attention and the FFN compute on
+    the full rows; the boundary brings them those rows and reduce-scatters
+    their outputs, partial sums over TP, back onto the slice, which completes
+    the sums. The first layer's input is the embedding's partial sum on the
+    full rows; the last layer hands on the full rows again."""
+    attention = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
+    )
+    local = Layout.sharded_over(
+        TokenAxis.ATTN_DP,
+        TokenAxis.ATTN_CP,
+        TokenAxis.ATTN_TP_SCATTER,
+        axis_sizes=axis_sizes,
+    )
+    return DecoderLayerSides(
+        input_rows=attention if is_first_layer else local,
+        attention=StageInput(attention),
+        attention_output=StageOutput(
+            attention, group=SumGroup.ATTN_TP, always_leaves=True
+        ),
+        ffn=StageInput(Layout.sharded_over(axis_sizes=axis_sizes)),
+        ffn_output=StageOutput(
+            attention, group=ffn_group, leaves_for_reduce_scatter=True
+        ),
+        ffn_residual_rows=local,
+        output_rows=attention if is_last_layer else local,
+        input_owes=SumGroup.TP if is_first_layer else None,
+    )
+
+
 def input_scattered_layer_sides(
     *,
     axis_sizes: Mapping[TokenAxis, int],
