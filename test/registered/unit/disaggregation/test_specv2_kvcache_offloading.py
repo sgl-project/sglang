@@ -195,20 +195,21 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
 
-    def test_prefix_indices_decremented(self):
-        """protected_size_ is decremented by len(req.prefix_indices)."""
-        manager, _ = _make_manager(pool_size=32)
-        manager.tree_cache.protected_size_ = 10
+    def test_matched_prefix_stays_with_the_tree(self):
+        """A prefix matched at prealloc is tree-owned: unlocked, never freed."""
+        manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=20,
             kv_allocated_len=20,
             prefix_indices_len=5,
         )
+        req.kv.cache_protected_len = 5
 
         manager._release_finished_req(req)
 
-        self.assertEqual(manager.tree_cache.protected_size_, 5)
+        manager.tree_cache.unpin.assert_called_once_with(req)
+        self.assertTrue(torch.equal(freed[0], torch.arange(5, 20, dtype=torch.int64)))
 
     def test_release_finished_req_frees_prefill_and_pops_state(self):
         """
