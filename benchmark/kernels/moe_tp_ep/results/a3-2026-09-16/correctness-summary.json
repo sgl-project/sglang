@@ -1,0 +1,1796 @@
+[
+  {
+    "case": "decode_n1001_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0064102564076265614,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1001,
+        "tokens_per_rank": [
+          1001,
+          1001
+        ],
+        "input_sha256": "67d8ce1a421e33bcf4ed01775838676688f63c417e0acb585e014528ec9c78aa",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1001,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1001,
+        "tokens_per_rank": [
+          501,
+          500
+        ],
+        "input_sha256": "67d8ce1a421e33bcf4ed01775838676688f63c417e0acb585e014528ec9c78aa",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1001,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n128_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0078125,
+          "relative": 0.003846153844260355,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 128,
+        "tokens_per_rank": [
+          128,
+          128
+        ],
+        "input_sha256": "ef96b93b24b4d12e21be14a528e3fb2015053c6278460d37cc6f2eba5bd684cb",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          128,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 128,
+        "tokens_per_rank": [
+          64,
+          64
+        ],
+        "input_sha256": "ef96b93b24b4d12e21be14a528e3fb2015053c6278460d37cc6f2eba5bd684cb",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          128,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n1_seed133_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0009765625,
+          "relative": 0.001524390241522903,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          1
+        ],
+        "input_sha256": "85069ce3440d213adfd66fbb4897f5d59a9a1ceeb9410ab0baeb3bd5bda0001d",
+        "input_seed": 133,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          0
+        ],
+        "input_sha256": "85069ce3440d213adfd66fbb4897f5d59a9a1ceeb9410ab0baeb3bd5bda0001d",
+        "input_seed": 133,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n1_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0009765625,
+          "relative": 0.0010775862057074911,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          1
+        ],
+        "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          0
+        ],
+        "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n4_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.001953125,
+          "relative": 0.0013736263726603067,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 4,
+        "tokens_per_rank": [
+          4,
+          4
+        ],
+        "input_sha256": "9978155bc930154b3379dfdaf5880af2ee1ef819a8e6c36ef0c475e395891763",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          4,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 4,
+        "tokens_per_rank": [
+          2,
+          2
+        ],
+        "input_sha256": "9978155bc930154b3379dfdaf5880af2ee1ef819a8e6c36ef0c475e395891763",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          4,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n777_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0064102564076265614,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          777,
+          777
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          389,
+          388
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "decode_n777_seed20260922_skew8",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0037878787869605143,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          777,
+          777
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 8,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          389,
+          388
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "decode",
+        "layer_id": 0,
+        "skew_experts": 8,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n1001_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0064102564076265614,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1001,
+        "tokens_per_rank": [
+          1001,
+          1001
+        ],
+        "input_sha256": "67d8ce1a421e33bcf4ed01775838676688f63c417e0acb585e014528ec9c78aa",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1001,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1001,
+        "tokens_per_rank": [
+          501,
+          500
+        ],
+        "input_sha256": "67d8ce1a421e33bcf4ed01775838676688f63c417e0acb585e014528ec9c78aa",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1001,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n128_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0078125,
+          "relative": 0.003846153844260355,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 128,
+        "tokens_per_rank": [
+          128,
+          128
+        ],
+        "input_sha256": "ef96b93b24b4d12e21be14a528e3fb2015053c6278460d37cc6f2eba5bd684cb",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          128,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 128,
+        "tokens_per_rank": [
+          64,
+          64
+        ],
+        "input_sha256": "ef96b93b24b4d12e21be14a528e3fb2015053c6278460d37cc6f2eba5bd684cb",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          128,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n1_seed133_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0009765625,
+          "relative": 0.001524390241522903,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          1
+        ],
+        "input_sha256": "85069ce3440d213adfd66fbb4897f5d59a9a1ceeb9410ab0baeb3bd5bda0001d",
+        "input_seed": 133,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          0
+        ],
+        "input_sha256": "85069ce3440d213adfd66fbb4897f5d59a9a1ceeb9410ab0baeb3bd5bda0001d",
+        "input_seed": 133,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": null,
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "b0f20f707088d35dbb8af2b2d2627f230f740ec0a7a15ab74222985799c83eb7",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+            "observe_tokens.py": "f8c921c2b296df3aeb7bb270c09a8bb428c1a4baa20920b481de55b04847c402",
+            "test_workload.py": "ce0efc967ca71d14c4ce97fcd79d502fdde3ba89a7d7ac5d9d01d2be067722eb",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n1_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.0009765625,
+          "relative": 0.0010775862057074911,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          1
+        ],
+        "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 1,
+        "tokens_per_rank": [
+          1,
+          0
+        ],
+        "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          1,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n4_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.001953125,
+          "relative": 0.0013736263726603067,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 4,
+        "tokens_per_rank": [
+          4,
+          4
+        ],
+        "input_sha256": "9978155bc930154b3379dfdaf5880af2ee1ef819a8e6c36ef0c475e395891763",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          4,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 4,
+        "tokens_per_rank": [
+          2,
+          2
+        ],
+        "input_sha256": "9978155bc930154b3379dfdaf5880af2ee1ef819a8e6c36ef0c475e395891763",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          4,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n777_seed20260922_skew0",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0064102564076265614,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          777,
+          777
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          389,
+          388
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 0,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  },
+  {
+    "case": "prefill_n777_seed20260922_skew8",
+    "result": {
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.0037878787869605143,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    "configurations": {
+      "none": {
+        "schema_version": 2,
+        "backend": "none",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          777,
+          777
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 8,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 2
+      },
+      "deepep": {
+        "schema_version": 2,
+        "backend": "deepep",
+        "global_tokens": 777,
+        "tokens_per_rank": [
+          389,
+          388
+        ],
+        "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+        "input_seed": 20260922,
+        "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+        "phase": "prefill",
+        "layer_id": 0,
+        "skew_experts": 8,
+        "world_size": 2,
+        "metadata": {
+          "packages": {
+            "torch": "2.10.0+cpu",
+            "torch-npu": "2.10.0",
+            "deep-ep": "1.0.0+e145d906.cann.9.0.0.b250",
+            "sglang": "0.5.14.dev172+gf308abc05"
+          },
+          "sglang_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+          "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "scripts_sha256": {
+            "bench_moe_tp_ep.py": "d0579f7038c7e6505aaedf1a620ba337b0c7ca62b820e453b362107d45a4d0b6",
+            "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+            "test_workload.py": "658f5d28d05404291312d296402949a194760331bc74336890fe1747efc855bc",
+            "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+          },
+          "environment": {
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+            "DEEPEP_HYBRID_DEPLOYMENT": "1",
+            "HCCL_BUFFSIZE": "2048",
+            "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+            "DEEPEP_HCCL_BUFFSIZE": "2048",
+            "ASCEND_CUSTOM_OPP_PATH": "/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing:/root/sglang1098-revision/deps/deep_ep/vendors/hwcomputing",
+            "HCCL_NPU_SOCKET_PORT_RANGE": "24000-24031",
+            "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+            "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1"
+          },
+          "execution_mode": "torch.inference_mode; eager",
+          "image_digest": null
+        },
+        "global_output_shape": [
+          777,
+          2048
+        ],
+        "replica_count": 0
+      }
+    }
+  }
+]
