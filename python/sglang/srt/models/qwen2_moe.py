@@ -91,7 +91,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
     get_stream,
 )
@@ -1059,6 +1058,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -1092,17 +1092,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -62,6 +62,9 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
+    component_type: ComponentType = ComponentType.SWA,
+    free_segment: Callable[..., None] | None = None,
+    eviction_interval: int = 1,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -70,10 +73,17 @@ def free_swa_out_of_window_slots(
     assert req.kv.cache_protected_len % page_size == 0, (
         "cache_protected_len must be page aligned"
     )
-    swa_evicted_seqlen = max(
-        req.kv.get_evicted_seqlen(ComponentType.SWA), req.kv.swa_dead_lo(page_size)
+    # Protected rows limit what can be freed, not where the interval starts.
+    evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
+    if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
+        return
+    dead_lo = (
+        req.kv.swa_dead_lo(page_size)
+        if component_type == ComponentType.SWA
+        else req.kv.cache_protected_len
     )
-    req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+    evicted_seqlen = max(evicted_seqlen, dead_lo)
+    req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -91,19 +101,20 @@ def free_swa_out_of_window_slots(
         # retained checkpoint could never be matched and holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
-    new_swa_evicted_seqlen = max(swa_evicted_seqlen, evict_threshold)
+    new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
 
     if page_size > 1:
-        new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+        new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > swa_evicted_seqlen:
+    if new_evicted_seqlen > evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, swa_evicted_seqlen:new_swa_evicted_seqlen
+            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa_segment(
-            free_slots, start_pos=swa_evicted_seqlen
-        )
-        req.kv.set_evicted_seqlen(ComponentType.SWA, new_swa_evicted_seqlen)
+        if free_segment is None:
+            assert component_type == ComponentType.SWA
+            free_segment = token_to_kv_pool_allocator.free_swa_segment
+        free_segment(free_slots, start_pos=evicted_seqlen)
+        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
