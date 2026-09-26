@@ -110,6 +110,7 @@ class Llama4MoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=Llama4MoE.custom_routing_function,
         )

@@ -46,6 +46,14 @@ class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
 
     fuse_routed_scaling_factor_in_topk = True
+    # The loader writes the scales as *_weight_scale_inv (as for Fp8MoEMethod); Marlin keeps
+    # the repacked scales as *_weight_scale.
+    _LOADER_TO_RUNTIME_NAMES = {
+        "w13_weight": "w13_weight",
+        "w13_weight_scale_inv": "w13_weight_scale",
+        "w2_weight": "w2_weight",
+        "w2_weight_scale_inv": "w2_weight_scale",
+    }
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -127,6 +135,46 @@ class Mxfp4MarlinMoEMethod:
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
+        layer._mxfp4_marlin_scale_attrs = scale_attrs
+        layer._mxfp4_marlin_checkpoint_parameter_specs = {
+            name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
+            for name in self._LOADER_TO_RUNTIME_NAMES
+        }
+        layer._mxfp4_marlin_runtime_parameter_specs = None
+        layer._mxfp4_marlin_reload_in_place = False
+
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            _view_tensor_storage,
+        )
+
+        # A weight update loads the checkpoint layout into the Marlin storage and repacks it there:
+        # CUDA graphs and the memory saver hold these parameters' addresses.
+        runtime_specs = layer._mxfp4_marlin_runtime_parameter_specs
+        if runtime_specs is None:
+            raise RuntimeError(
+                f"MXFP4 Marlin weights of {self.prefix} were never post-processed."
+            )
+        for loader_name, runtime_name in self._LOADER_TO_RUNTIME_NAMES.items():
+            shape, dtype = layer._mxfp4_marlin_checkpoint_parameter_specs[loader_name]
+            param = getattr(layer, runtime_name)
+            current_spec = (tuple(param.shape), param.dtype)
+            if current_spec not in ((shape, dtype), runtime_specs[runtime_name]):
+                raise ValueError(
+                    f"Unexpected MXFP4 Marlin parameter state for {runtime_name}: "
+                    f"shape={param.shape}, dtype={param.dtype}."
+                )
+            # the loader fills only the unpadded slice, so the padding must start at zero
+            param.data = _view_tensor_storage(param.data, shape, dtype)
+            param.data.zero_()
+            if loader_name != runtime_name:
+                # the loader looks the scales up by their checkpoint name
+                alias = torch.nn.Parameter(param.data, requires_grad=False)
+                set_weight_attrs(alias, layer._mxfp4_marlin_scale_attrs)
+                alias.format_ue8m0 = False
+                layer.register_parameter(loader_name, alias)
+        layer._mxfp4_marlin_reload_in_place = True
+
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.marlin_utils import (
             check_moe_marlin_supports_layer,
@@ -157,13 +205,38 @@ class Mxfp4MarlinMoEMethod:
         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
 
+        reuse_parameter_storage = layer._mxfp4_marlin_reload_in_place
+        if reuse_parameter_storage:
+            # the repack works on the runtime names, which share storage with these aliases
+            for loader_name, runtime_name in self._LOADER_TO_RUNTIME_NAMES.items():
+                if loader_name != runtime_name:
+                    delattr(layer, loader_name)
+
         log_info_on_rank0(
             logger,
             f"Preparing MXFP4 experts for Marlin backend (layer: {self.prefix})...",
         )
         if self.runner.config.gemm1_alpha is not None:
-            deinterleave_moe_mxfp4_w13_for_marlin(layer)
-        prepare_moe_mxfp4_layer_for_marlin(layer)
+            deinterleave_moe_mxfp4_w13_for_marlin(
+                layer, reuse_parameter_storage=reuse_parameter_storage
+            )
+        prepare_moe_mxfp4_layer_for_marlin(
+            layer, reuse_parameter_storage=reuse_parameter_storage
+        )
+
+        runtime_specs = {
+            name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
+            for name in self._LOADER_TO_RUNTIME_NAMES.values()
+        }
+        if reuse_parameter_storage:
+            if runtime_specs != layer._mxfp4_marlin_runtime_parameter_specs:
+                raise ValueError(
+                    "MXFP4 Marlin in-place reload changed the runtime layout: "
+                    f"{runtime_specs} vs {layer._mxfp4_marlin_runtime_parameter_specs}."
+                )
+        else:
+            layer._mxfp4_marlin_runtime_parameter_specs = runtime_specs
+        layer._mxfp4_marlin_reload_in_place = False
         layer._dsv4_mxfp4_backend = "marlin"
 
     def apply(

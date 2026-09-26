@@ -102,6 +102,7 @@ def load_mimo_v2_qkv_proj_weight(
     loaded_weight,
     expected_fused_tp_size: Optional[int] = None,
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    config=None,
 ):
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
@@ -146,11 +147,34 @@ def load_mimo_v2_qkv_proj_weight(
         default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
     else:
         shards_per_rank = ckpt_tp // tp_size
-        shards = loaded_weight.chunk(ckpt_tp, dim=0)
-        merged = torch.cat(
-            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
-            dim=0,
-        )
+        shards = loaded_weight.chunk(ckpt_tp, dim=0)[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+        if loaded_weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            # Block-FP8 codes keep the checkpoint shard order;
+            # _resolve_deferred_qkv_scale_inv regroups them with their scales.
+            merged = torch.cat(shards, dim=0)
+        else:
+            qkv_sizes = (
+                _get_ckpt_qkv_shard_sizes(
+                    config=config, layer_name=name, ckpt_tp=ckpt_tp
+                )
+                if config is not None
+                else None
+            )
+            if qkv_sizes is None:
+                raise ValueError(
+                    f"qkv_proj weight {name}: attention TP {tp_size} below the "
+                    f"checkpoint's {ckpt_tp} kv-head shards needs the decoder layer "
+                    f"config to regroup q|k|v; MTP layers are not supported here"
+                )
+            q_per_shard, k_per_shard, v_per_shard = qkv_sizes
+            merged = _deinterleave_qkv_shards(
+                shards,
+                q_per_shard=q_per_shard,
+                k_per_shard=k_per_shard,
+                v_per_shard=v_per_shard,
+            )
         default_weight_loader(param, merged)
 
 
@@ -286,6 +310,11 @@ def _resolve_deferred_qkv_scale_inv(
         )
 
 
+def get_attention_sliding_window_size(config):
+    # RadixAttention's window excludes the query token.
+    return config.sliding_window_size - 1
+
+
 class MiMoV2MLP(nn.Module):
     def __init__(
         self,
@@ -350,7 +379,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -360,7 +389,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -369,9 +398,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
@@ -423,11 +458,13 @@ class MiMoV2MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -790,7 +827,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 head_dim=config.swa_head_dim,
                 v_head_dim=getattr(config, "swa_v_head_dim", None),
                 v_scale=getattr(config, "attention_value_scale", None),
-                sliding_window_size=config.sliding_window_size,
+                sliding_window_size=get_attention_sliding_window_size(config),
                 attention_bias=config.attention_bias,
                 attention_sink_bias=getattr(
                     config, "add_swa_attention_sink_bias", False
@@ -1592,6 +1629,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     skipped_mtp_weights = True
                 continue
 
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
+
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
@@ -1605,6 +1649,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         loaded_weight,
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
+                        config=self.config,
                     )
                 continue
 
@@ -1698,6 +1743,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:
             self.model.load_kv_cache_scales(quantization_param_path)
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
