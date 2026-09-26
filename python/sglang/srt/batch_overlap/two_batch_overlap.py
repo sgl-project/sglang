@@ -18,6 +18,7 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
     ScatterMode,
+    reduce_output,
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -823,6 +824,9 @@ class TboForwardBatchPreparer:
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                # Children publish no per-rank list of their own; the parent
+                # published the gather sizes before it was split.
+                global_num_tokens_padded_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
@@ -963,6 +967,7 @@ def _model_forward_tbo(
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
+    inputs["hidden_states"] = reduce_output(inputs["hidden_states"])
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
@@ -1005,11 +1010,22 @@ def _model_forward_tbo_split_inputs(
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
-
-    hidden_states, residual = CommunicateSummableTensorPairFn.execute(
+    # The splitter cuts the attention-TP-full layout; each microbatch then moves
+    # to the first layer's input layout.
+    to_splitter = CommunicateSummableTensorPairFn.get_fn(
         hidden_states_input_mode=input_data_scatter_mode,
         residual_input_mode=input_data_scatter_mode,
         output_mode=tbo_splitter_scatter_mode,
+        context=context,
+    )
+    to_layer_input = CommunicateSummableTensorPairFn.get_fn(
+        hidden_states_input_mode=tbo_splitter_scatter_mode,
+        residual_input_mode=tbo_splitter_scatter_mode,
+        output_mode=layer_input_scatter_mode,
+        context=context,
+    )
+
+    hidden_states, residual = to_splitter(
         hidden_states=hidden_states,
         residual=residual,
         forward_batch=forward_batch,
@@ -1025,10 +1041,7 @@ def _model_forward_tbo_split_inputs(
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
-        hidden_states, residual = CommunicateSummableTensorPairFn.execute(
-            hidden_states_input_mode=tbo_splitter_scatter_mode,
-            residual_input_mode=tbo_splitter_scatter_mode,
-            output_mode=layer_input_scatter_mode,
+        hidden_states, residual = to_layer_input(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
