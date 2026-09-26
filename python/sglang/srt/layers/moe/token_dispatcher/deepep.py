@@ -490,6 +490,15 @@ class _DeepEPDispatcherImplBase:
         self.use_mxfp8 = config["use_mxfp8"]
         self.use_nvfp4 = config["use_nvfp4"]
 
+        if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            if is_npu_arch35():
+                # DeepEP interprets use_fp8=True as FP8 on A5, not INT8.
+                # Allow the normal-mode INT8 env fallback, or dispatch BF16
+                # and let the existing MoE kernel quantize it to INT8.
+                self.use_fp8 = False
+
         # Handle environment variables
         if _is_npu:
             self._update_int8_quant_env()
