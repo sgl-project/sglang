@@ -57,7 +57,22 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             self.assertEqual(BLOCK_SIZE, 512)
             output.zero_()
 
-        noop_launcher = _KernelLauncher(lambda *args, **kwargs: None)
+        def fake_permute(
+            _input,
+            output,
+            _src2dst,
+            _topk_ids,
+            scale,
+            _topk,
+            _hidden_size,
+            *,
+            BLOCK_SIZE,
+        ):
+            self.assertEqual(output.dtype, torch.float8_e4m3fn)
+            self.assertIs(scale, layer.w13_input_scale)
+            self.assertEqual(BLOCK_SIZE, 512)
+
+        permute_launcher = _KernelLauncher(fake_permute)
         post_reorder_launcher = _KernelLauncher(fake_post_reorder)
         preprocess_result = (
             torch.arange(num_tokens * topk),
@@ -82,6 +97,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             w13_input_scale=torch.ones(1),
             w2_input_scale=torch.ones(1),
         )
+        per_tensor_quant = Mock()
 
         with (
             patch.object(
@@ -89,7 +105,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
                 "deepep_run_moe_deep_preprocess",
                 return_value=preprocess_result,
             ),
-            patch.object(w4a8_moe, "deepep_permute_triton_kernel", noop_launcher),
+            patch.object(w4a8_moe, "deepep_permute_triton_kernel", permute_launcher),
             patch.object(
                 w4a8_moe,
                 "deepep_post_reorder_triton_kernel",
@@ -110,7 +126,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             patch.object(
                 w4a8_moe,
                 "per_tensor_quant_fp8",
-                new=lambda *args, **kwargs: None,
+                new=per_tensor_quant,
             ),
             patch.object(w4a8_moe, "silu_and_mul", new=lambda *args, **kwargs: None),
         ):
@@ -139,6 +155,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
 
         self.assertEqual(output.shape, (num_tokens, hidden_size))
         self.assertEqual(output.dtype, torch.bfloat16)
+        per_tensor_quant.assert_called_once()
 
 
 if __name__ == "__main__":
