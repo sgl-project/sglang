@@ -566,14 +566,17 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -601,6 +604,7 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
     )
 
     # Run attention backend plan and cuda graph preparation
