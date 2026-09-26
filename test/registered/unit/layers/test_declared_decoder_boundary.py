@@ -1715,6 +1715,34 @@ class TestPrefillCP(CustomTestCase):
             comm.CommunicateSummableTensorPairFn._trivial,
         )
 
+    def test_a_moe_on_its_own_cp_shard_hands_on_its_sum(self):
+        # MoE DP equal to CP: each CP rank's MoE runs on its own TP ranks.
+        parallel = self.cp_parallel(moe_dp_size=2, moe_tp_size=2)
+        communicator = build(
+            layer_facts(1, 3, sparse=True, previous_sparse=True),
+            parallel,
+            allow_deferred_ffn_reduction=True,
+        )
+        for steps in (communicator._cp_steps, communicator._steps):
+            # The attention's rows are the MoE's: nothing to gather or take back.
+            self.assertIs(steps.ffn_input.func, comm._mlp_input_without_dp)
+            self.assertIs(
+                steps.ffn_output_move, comm.CommunicateSummableTensorPairFn._trivial
+            )
+            self.assertTrue(steps.ffn_output.leaves_for_next_layer)
+        dense = build(layer_facts(1, 3), parallel, allow_deferred_ffn_reduction=True)
+        self.assertIs(dense._cp_steps.ffn_input.func, comm._mlp_input_gather_moe_cp)
+        self.assertFalse(dense._cp_steps.ffn_output.leaves_for_next_layer)
+        # DSA and MLA CP gather the MoE's input over attention CP whatever its DP.
+        dsa = self.dsa_parallel(moe_dp_size=2, moe_tp_size=1)
+        modes = planned_modes(
+            1, 3, sparse=True, previous_sparse=False, parallel=dsa, dsa_cp=True
+        )
+        communicator = build(modes, dsa, dsa_cp=True, allow_reduce_scatter=True)
+        self.assertIs(
+            communicator._cp_steps.ffn_input.func, comm._mlp_input_gather_attention_cp
+        )
+
     def test_the_fused_kernels_run_on_each_chunk(self):
         with planning(self.cp_parallel()):
             communicator = LayerCommunicator(
@@ -1761,6 +1789,34 @@ class TestPrefillCP(CustomTestCase):
                 False,
                 False,
                 True,
+            ),
+            (
+                "a MoE whose data-parallel groups are the CP ranks",
+                parallel_of(
+                    attn_dp=1,
+                    attn_tp=2,
+                    attn_cp=2,
+                    enable_prefill_cp=True,
+                    moe_dp_size=2,
+                ),
+                True,
+                True,
+                False,
+                False,
+            ),
+            (
+                "a MoE whose data-parallel groups are the CP ranks, under attention DP",
+                parallel_of(
+                    attn_dp=2,
+                    attn_tp=1,
+                    attn_cp=2,
+                    enable_prefill_cp=True,
+                    moe_dp_size=2,
+                ),
+                True,
+                False,
+                False,
+                False,
             ),
             (
                 "a MoE-CP group narrower than CP",

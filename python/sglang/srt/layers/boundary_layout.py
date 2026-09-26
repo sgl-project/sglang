@@ -335,11 +335,14 @@ def decoder_layer_sides(
     leaves_for_reduce_scatter: bool,
     leaves_for_reduce_scatterv: bool,
     hands_on_attention_rows: bool = False,
+    ffn_shards_over_cp: bool = False,
 ) -> DecoderLayerSides:
     """An attention followed by an FFN, derived from the groups each computes
     over. The FFN runs either on the TP group (a dense MLP, or a MoE not
     dispatched per DP shard) or on this rank's local rows (a MoE dispatched per
     DP shard, which completes its own combine, or a dense MLP on every rank).
+    A MoE whose data-parallel groups are the CP ranks (``ffn_shards_over_cp``)
+    computes each CP shard on its own ranks: its rows stay sharded over CP.
     A layer on local rows hands on the attention's rows when it is the last, or
     with ``hands_on_attention_rows``."""
     # Attention computes over the attention-TP ranks of one DP (and CP) shard.
@@ -354,7 +357,14 @@ def decoder_layer_sides(
         axis_sizes=axis_sizes,
     )
     # The TP group spans every token axis, so an FFN on it needs every row.
-    ffn = local if ffn_on_local_rows else Layout.sharded_over(axis_sizes=axis_sizes)
+    ffn = (
+        local
+        if ffn_on_local_rows
+        else Layout.sharded_over(
+            *((TokenAxis.ATTN_CP,) if ffn_shards_over_cp else ()),
+            axis_sizes=axis_sizes,
+        )
+    )
     attention_tp = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
     return DecoderLayerSides(
         input_rows=local if previous_on_local_rows else attention,
