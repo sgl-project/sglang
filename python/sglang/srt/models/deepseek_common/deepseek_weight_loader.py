@@ -86,6 +86,32 @@ def _get_indexer_weight_block_size(
     return [128, 128]
 
 
+def _resolve_quark_fp8_block_scale_name(
+    name: str, params_dict: Dict[str, torch.Tensor]
+) -> str:
+    """Map Quark block-FP8 scale names to the shared FP8 parameter name."""
+    if name.endswith("weight_scale") and name not in params_dict:
+        candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+        if candidate in params_dict:
+            return candidate
+    return name
+
+
+def _resolve_layer_weight_block_size(
+    layer: nn.Module,
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[List[int]]:
+    """Return the resolved layer's block size, with legacy config fallback."""
+    quant_method = getattr(layer, "quant_method", None)
+    if quant_method is not None and hasattr(quant_method, "weight_block_size"):
+        return quant_method.weight_block_size
+
+    selected_quant_config = getattr(quant_config, "linear_fp8_config", None)
+    if selected_quant_config is None:
+        selected_quant_config = quant_config
+    return getattr(selected_quant_config, "weight_block_size", None)
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -107,7 +133,7 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        is_scale = name.endswith(".weight_scale_inv")
+        is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
         if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
@@ -127,7 +153,7 @@ def _load_fused_indexer_wk(
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
+    is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
@@ -461,6 +487,16 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                param_name = _resolve_quark_fp8_block_scale_name(
+                                    param_name, params_dict
+                                )
+                                if param_name not in params_dict:
+                                    logger.warning(
+                                        f"{param_name} not found in params_dict."
+                                    )
+                                    cached_a_proj.pop(q_a_proj_name, None)
+                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    continue
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
@@ -486,6 +522,9 @@ class DeepseekV2WeightLoaderMixin:
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
+                            name = _resolve_quark_fp8_block_scale_name(
+                                name, params_dict
+                            )
                             if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
@@ -608,16 +647,9 @@ class DeepseekV2WeightLoaderMixin:
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
-                selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", None
-                )
-                if selected_quant_config is None:
-                    selected_quant_config = self.quant_config
-                weight_block_size = (
-                    selected_quant_config.weight_block_size
-                    if selected_quant_config is not None
-                    else None
+                weight_block_size = _resolve_layer_weight_block_size(
+                    self_attn.kv_b_proj,
+                    self.quant_config,
                 )
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
@@ -647,11 +679,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
                     elif (
                         should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=(
-                                self.quant_config.weight_block_size
-                                if self.quant_config is not None
-                                else None
-                            )
+                            weight_block_size=weight_block_size
                         )
                         and weight_scale.format_ue8m0
                     ):
