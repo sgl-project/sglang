@@ -46,7 +46,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+    set_global_tcp_store,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -1093,9 +1097,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
-            )
+            reduce_scatter_single(output, input, group=self.device_group)
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -1304,9 +1306,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
-            )
+            all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
@@ -1397,9 +1397,7 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
+                all_gather_single(output_tensor, input_, group=self.device_group)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 

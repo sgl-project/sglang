@@ -72,8 +72,17 @@ struct MaybeDevice {
 
 }  // namespace details
 
+// Generous bound on the device ordinals one process can see; a larger ordinal
+// is not an error, it just falls through to the driver query uncached.
 inline constexpr uint32_t kNumStaticMaxDevice = 72;
 
+/**
+ * \brief Memo for a per-device driver query, keyed by device ordinal.
+ *
+ * \tparam T        Cached value type.
+ * \tparam kDefault The "not queried yet" sentinel. A query that can legally
+ *         return it would be re-run on every call, so pick one it cannot.
+ */
 template <typename T, T kDefault>
 struct DeviceCacheMap {
  public:
@@ -177,6 +186,26 @@ inline auto get_available_dynamic_smem_per_block(T kernel, int num_blocks, int b
   std::size_t smem_size;
   CHECK_CUDA(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
   return smem_size;
+}
+
+/**
+ * \brief Shared memory one block may use on the given device, in bytes.
+ *
+ * \param device_id CUDA device ordinal.
+ * \param opt_in    True for the larger limit a kernel reaches by setting
+ *        `cudaFuncAttributeMaxDynamicSharedMemorySize`, false for the default
+ *        cap that needs no opt-in.
+ * \param use_cache False re-queries the driver instead of reading the memo.
+ */
+inline auto get_max_smem_per_block(int device_id, bool opt_in = true, bool use_cache = true) -> std::size_t {
+  /// NOTE: we all know this is no larger than 1MB for all GPU, so use uint32_t
+  static DeviceCacheMap<uint32_t, 0> smem_cache[2];
+  const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin : cudaDevAttrMaxSharedMemoryPerBlock;
+  return smem_cache[opt_in].get_cached(device_id, use_cache, [attr](int32_t device_id) {
+    int value = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
+    return value;
+  });
 }
 
 struct L1Carveout {

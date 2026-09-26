@@ -1522,6 +1522,12 @@
                     ]
                   },
                   {
+                    "group": "CircleStone",
+                    "pages": [
+                      "cookbook/diffusion/CircleStone/Anima"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "tag": "NEW",
                     "pages": [
@@ -1533,6 +1539,12 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
+                    ]
+                  },
+                  {
+                    "group": "Ming-Image",
+                    "pages": [
+                      "cookbook/diffusion/inclusionAI/Ming-Image"
                     ]
                   },
                   {

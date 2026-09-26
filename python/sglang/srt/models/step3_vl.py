@@ -382,6 +382,7 @@ class Step3TextDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_deferred_ffn_reduction=False,
         )
 
     def moe_mlp_forward(self, hidden_states):
@@ -415,14 +416,12 @@ class Step3TextDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.use_moe:
-            hidden_states = self.moe_mlp_forward(hidden_states)
-        else:
-            hidden_states = self.mlp(hidden_states)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            if self.use_moe:
+                hidden_states = self.moe_mlp_forward(hidden_states)
+            else:
+                hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

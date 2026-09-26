@@ -71,7 +71,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -620,8 +620,6 @@ class LLaDA2MoeBlock(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -651,6 +649,7 @@ class LLaDA2MoeBlock(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            allow_deferred_ffn_reduction=False,
         )
 
     def _is_layer_sparse(self, config: PretrainedConfig, layer_id: int) -> bool:
@@ -683,19 +682,9 @@ class LLaDA2MoeBlock(nn.Module):
             forward_batch=forward_batch,
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

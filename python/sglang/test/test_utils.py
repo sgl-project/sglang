@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.srt.utils.network import is_port_available
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
 
 # General test models
@@ -399,24 +399,11 @@ def start_subprocess_fail_fast_watcher(
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
-    """
-    CI helper: Check if model cache is complete and enable offline mode.
+    """Set HF_HUB_OFFLINE=1 in `env` if the model cache validates; return the
+    per-run marker path, or None if offline mode was not enabled.
 
-    Uses per-run validation markers that are NOT shared across runners.
-    Each runner independently validates its cache using lightweight checks
-    before enabling offline mode.
-
-    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
-    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
-    The marker is only a hint that this snapshot was validated earlier in the run.
-
-    Args:
-        model_name_or_path: Model identifier or path
-        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
-        other_args: Launch command arguments (used to detect quantization requirement)
-
-    Returns:
-        Per-run marker path if offline mode was enabled, None otherwise
+    Markers are per-run and not shared across runners. A marker is only a hint;
+    the current launch's requirements (e.g. hf_quant_config.json) are revalidated.
     """
     from sglang.srt.model_loader.ci_weight_validation import (
         _get_per_run_marker_path,
@@ -453,8 +440,7 @@ def _try_enable_offline_mode_if_cache_complete(
     except Exception:
         return None
 
-    # Detect if quantization requires hf_quant_config.json
-    # Do this BEFORE checking marker to ensure current launch requirements are known
+    # Detect before the marker check so the current launch's requirements are known.
     requires_hf_quant_config = False
     for i, arg in enumerate(other_args):
         if arg == "--quantization" and i + 1 < len(other_args):
@@ -466,9 +452,8 @@ def _try_enable_offline_mode_if_cache_complete(
     # Check per-run marker (fast hint - snapshot validated earlier in this run)
     per_run_marker = _read_per_run_marker(snapshot_dir)
     if per_run_marker is not None:
-        # Marker exists, but STILL validate for current launch requirements
-        # This prevents a test without --quantization from enabling offline
-        # for a later test with --quantization that needs hf_quant_config.json
+        # Still validate: a marker from a launch without --quantization must not
+        # enable offline mode for a later launch that needs hf_quant_config.json.
         is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
 
         if not is_valid:
@@ -522,17 +507,7 @@ def _try_enable_offline_mode_if_cache_complete(
 
 
 def _create_clean_subprocess_env(env: dict) -> dict:
-    """Create a clean subprocess environment without internal CI keys.
-
-    Removes all keys starting with '_CI_OFFLINE_' or 'CI_OFFLINE' to prevent
-    leaking implementation details to the server subprocess.
-
-    Args:
-        env: Source environment dict
-
-    Returns:
-        Clean copy of environment dict
-    """
+    """Create a clean subprocess environment without internal CI keys."""
     child_env = env.copy()
     keys_to_remove = [
         k for k in child_env if k.startswith(("_CI_OFFLINE_", "CI_OFFLINE_"))
@@ -592,14 +567,7 @@ def _launch_server_process(
 ) -> subprocess.Popen:
     """Launch server subprocess with clean environment.
 
-    Args:
-        command: Command list for subprocess
-        env: Environment dict (will be cleaned before use)
-        return_stdout_stderr: Optional tuple of (stdout_file, stderr_file) for output capture
-        model: Model name for logging
-
-    Returns:
-        Started subprocess.Popen object
+    `return_stdout_stderr` is an optional (stdout_file, stderr_file) pair.
     """
     child_env = _create_clean_subprocess_env(env)
 
@@ -619,17 +587,7 @@ def _wait_for_server_health(
     api_key: Optional[str],
     timeout_duration: float,
 ) -> Tuple[bool, Optional[str]]:
-    """Wait for server health check to pass.
-
-    Args:
-        proc: Server subprocess
-        base_url: Base URL for health check
-        api_key: Optional API key for authorization
-        timeout_duration: Maximum wait time in seconds
-
-    Returns:
-        Tuple of (success, error_message)
-    """
+    """Wait for server health check to pass; return (success, error_message)."""
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout_duration:
@@ -686,20 +644,8 @@ def popen_launch_server(
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
-    Args:
-        model: Model path or identifier
-        base_url: Base URL for the server
-        timeout: Timeout for server startup
-        api_key: Optional API key for authentication
-        other_args: Additional command line arguments
-        env: Environment dict for subprocess
-        return_stdout_stderr: Optional tuple for output capture
-        device: Device type ("auto", "cuda", "rocm" or "cpu")
-        pd_separated: Whether to use PD separated mode
-        num_replicas: Number of replicas for mixed PD mode
-
-    Returns:
-        Started subprocess.Popen object
+    `device` is one of "auto", "cuda", "rocm", "cpu";
+    `num_replicas` applies to mixed PD mode.
     """
     other_args = other_args or []
 
@@ -897,9 +843,7 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    # Merge with os.environ so caller-supplied env adds to (not replaces)
-    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
-    # parent's environment automatically.
+    # Merge so caller-supplied env adds to, not replaces, PATH / PYTHONPATH / etc.
     if env is not None:
         env = {**os.environ, **env}
 
@@ -1018,9 +962,8 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
-    # Resolve tokenizer to local snapshot path when available, so the benchmark
-    # client's AutoTokenizer.from_pretrained uses the local path directly instead
-    # of calling the HF Hub API (which can stall for minutes in CI).
+    # Prefer the local snapshot so the client's AutoTokenizer skips the HF Hub API,
+    # which can stall for minutes in CI.
     bench_tokenizer = tokenizer
     if bench_tokenizer is None:
         try:
@@ -1090,19 +1033,7 @@ async def _run_api_benchmark_requests(
     num_requests: int,
     response_validator: Callable[[dict], bool],
 ):
-    """
-    Helper function to run API benchmark requests and collect metrics.
-
-    Args:
-        base_url: The base URL of the server
-        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
-        test_requests: List of request payloads to send
-        num_requests: Total number of requests expected
-        response_validator: Function to validate if response contains expected data
-
-    Returns:
-        Dictionary with benchmark metrics
-    """
+    """Run API benchmark requests and return a dict of metrics."""
     start_time = time.monotonic()
     successful_requests = 0
     total_latency = 0
@@ -1433,12 +1364,7 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
-    """Launch a offline process with automatic device detection.
-
-    Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
-                If "auto", will detect available platforms automatically.
-    """
+    """Launch an offline process with automatic device detection."""
     # Auto-detect device if needed
 
     device = auto_config_device()
@@ -1740,7 +1666,7 @@ def run_mmlu_test(
         )
 
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass
@@ -2340,11 +2266,9 @@ def server_args_variant(server_args, **fields):
 def enter_override(test_case, override):
     """Install a scoped context override for the length of one test.
 
-    `unittest.TestCase.enterContext` does exactly this in one call, but it is
-    Python 3.11+ and this package supports 3.10 (`requires-python = ">=3.10"`).
-    On 3.10 it raises `AttributeError: ... has no attribute 'enterContext'` --
-    and only there, so a developer on a newer interpreter sees every test pass
-    while CI does not.
+    Stands in for `unittest.TestCase.enterContext`, which is 3.11+ while this package
+    supports 3.10; on 3.10 it raises AttributeError, so tests pass locally on newer
+    interpreters but fail in CI.
     """
     installed = override.install()
     test_case.addCleanup(override.restore)
@@ -2366,9 +2290,8 @@ class CustomTestCase(unittest.TestCase):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
-        # Wrap the effective setUpClass so that tearDownClass is called
-        # even when setUpClass fails. Python's unittest skips tearDownClass
-        # if setUpClass raises, which can leak resources (ports, processes).
+        # unittest skips tearDownClass when setUpClass raises, leaking ports and
+        # processes; wrap setUpClass so tearDownClass still runs.
         setup = cls.setUpClass
         if getattr(setup, "_safe_setup_wrapped", False):
             return
@@ -2407,38 +2330,6 @@ class CustomTestCase(unittest.TestCase):
             f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
             flush=True,
         )
-
-
-def dump_bench_raw_result(
-    path: str,
-    states,
-    preds,
-    labels,
-):
-    if not path:
-        return
-
-    rows = []
-    for i in range(len(states)):
-        state = states[i]
-        output = state["answer"]
-        prompt = _ensure_remove_suffix(state.text(), output)
-        rows.append(
-            dict(
-                prompt_id=i,
-                prompt=prompt,
-                output=output,
-                correct=bool(preds[i] == labels[i]),
-            )
-        )
-
-    print(f"BenchRawResultDumper save results to {path}")
-    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
-
-
-def _ensure_remove_suffix(text: str, suffix: str):
-    assert text.endswith(suffix)
-    return text.removesuffix(suffix)
 
 
 class ModelLaunchSettings:
@@ -2701,11 +2592,6 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
       - stdout: [METRIC] metric_name=value [labels=...]
 
     This function never fails tests - all errors are silently caught.
-
-    Args:
-        metric_name: Metric name (e.g., "gsm8k_accuracy", "cache_hit_rate")
-        value: Metric value
-        labels: Optional label dict (e.g., {"backend": "fa3"})
     """
     try:
         # 1. Capture test context
@@ -2782,11 +2668,7 @@ def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
 
 
 def _get_test_context() -> tuple[str, str]:
-    """
-    Get current test's filename and test_case.
-
-    Tries PYTEST_CURRENT_TEST first, falls back to inspect.stack().
-    """
+    """Get current test's filename and test_case, via PYTEST_CURRENT_TEST or stack."""
     # 1. Try parsing PYTEST_CURRENT_TEST
     pytest_current = os.getenv("PYTEST_CURRENT_TEST")
     if pytest_current:

@@ -85,6 +85,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 
 def _build_forward_token_modalities(
@@ -152,6 +153,21 @@ def _maybe_build_forward_token_modalities(
         extend_seq_lens,
         num_tokens,
         device,
+    )
+
+
+def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
+    """Whether aiter MegaMoE needs this idle rank to carry a token anyway.
+
+    MegaMoE's dispatch is rank-synchronous: when the batch is globally a
+    prefill, a rank with nothing to do still has to enter the collective, so it
+    runs a fabricated one-token extend instead of sitting the forward out.
+    """
+    return bool(
+        _is_hip
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and batch.is_extend_in_batch
+        and batch.forward_mode.is_idle()
     )
 
 
@@ -1108,8 +1124,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information (None on a draft runner: it is unadapted)
-        if model_runner.lora_manager is not None:
+        # Init lora information
+        if (
+            model_runner.lora_manager is not None
+            and not model_runner.lora_manager.enable_dp_attention
+        ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
@@ -1540,6 +1559,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
+        # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
+        mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)
+        if mega_moe_idle_materialize:
+            global_num_tokens = [1] * len(global_num_tokens)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1582,6 +1606,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN
         self.dp_padding_mode = dp_padding_mode
+        # Read once here, where dp_padding_mode is final: the idle-row branch
+        # below runs after another arm may have rewritten self.forward_mode.
+        materializes_dummy_extend = mega_moe_idle_materialize or (
+            self.is_extend_in_batch and dp_padding_mode.is_max_len()
+        )
 
         if dp_padding_mode.is_max_len():
             # when DP gather mode is all gather, we will use
@@ -1634,7 +1663,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            elif materializes_dummy_extend:
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
