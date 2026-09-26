@@ -1586,7 +1586,6 @@ class Req(ReqDllmMixin):
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
         else:
             self._refresh_fill_ids()
 
@@ -1685,6 +1684,9 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+        if self.is_dllm():
+            self.determine_dllm_phase()
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None
@@ -1710,6 +1712,15 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.is_dllm():
+            # Appended masks and a partial prompt/output block are not reusable
+            # KV: bidirectional attention depends on the rest of that block.
+            # Bound the lookup by real tokens, even if another cached prompt
+            # happens to contain the same token IDs as our synthetic masks.
+            block_size = self.dllm_config.block_size
+            committed_len = len(self.origin_input_ids) + len(self.output_ids)
+            max_prefix_len = min(max_prefix_len, committed_len)
+            max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -2842,6 +2853,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
+                if req.is_dllm():
+                    # Denoising revisits the current block while only earlier
+                    # blocks are a reusable prefix. Recomputing that block must
+                    # not subtract its size from cross-request cache hits.
+                    new_cached = max(0, new_cached)
                 req.cached_tokens += new_cached
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
