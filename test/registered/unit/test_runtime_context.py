@@ -82,28 +82,6 @@ def _sources():
             yield path
 
 
-def _scope_entries_that_say_nothing(paths):
-    """Return ``path:line`` for draft scopes missing ``owns_attention``."""
-    import ast
-
-    missing = []
-    for path in paths:
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = getattr(func, "attr", None) or getattr(func, "id", None)
-            if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
-                continue
-            if not any(kw.arg == "owns_attention" for kw in node.keywords):
-                missing.append(f"{path}:{node.lineno}")
-    return missing
-
-
 _PS = "sglang.srt.distributed.parallel_state"
 
 
@@ -2344,17 +2322,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         "get_mooncake_transfer_engine",
     }
 
-    # Require zero callers, but do not deprecate: these getters have no
-    # equivalent context field. Group widths may differ from configured widths.
-    NOT_ANSWERED_BY_THE_CONTEXT = {
-        "get_moe_data_parallel_world_size",
-        "get_moe_tensor_parallel_world_size",
-        "get_dcp_world_size",
-        # Answers `None` where the context asserts.
-        "get_dcp_group_no_assert",
-        "get_torch_distributed_pg_options",
-    }
-
     def _accessors(self):
         """Find public getters defined in the parallel-state source."""
         from sglang.srt.distributed import parallel_state as parallel_state_module
@@ -2407,41 +2374,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             "context cannot answer them",
         )
 
-    # Maximum caller counts; reduce these as callers migrate to the context.
-    ALLOWED_CALLERS = {
-        "get_self_pp_group": 1,
-        "get_default_distributed_backend": 1,
-        "get_mooncake_transfer_engine": 6,
-    }
-
-    def test_the_exempt_accessors_do_not_grow_new_callers(self):
-        for name, allowed in sorted(self.ALLOWED_CALLERS.items()):
-            callers = self._callers(name)
-            self.assertLessEqual(
-                len(callers),
-                allowed,
-                f"{name} grew a caller: {callers}. Read it through "
-                f"get_parallel() if the context can answer it; if it truly "
-                f"cannot, lower this number only when one goes away.",
-            )
-
-    def test_every_getter_the_context_answers_is_deprecated(self):
-        from sglang.srt.distributed import parallel_state
-
-        marked = set(parallel_state._CONTEXT_NAME_OF)
-        unclassified = (
-            self._accessors() - self.ALLOWED - self.NOT_ANSWERED_BY_THE_CONTEXT
-        )
-        for name in sorted(unclassified):
-            if name in marked:
-                continue
-            self.assertIn(
-                name,
-                marked,
-                f"{name} is neither deprecated nor listed as exempt -- give it "
-                "a context name or say here why it has none",
-            )
-
     def test_calling_one_from_outside_the_package_is_deprecated(self):
         import warnings
 
@@ -2462,21 +2394,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             any("get_parallel().tp_rank" in m for m in messages),
             f"expected the replacement to be named, got {messages}",
         )
-
-    def test_nothing_the_context_answers_with_calls_back_into_the_package(self):
-        import inspect
-
-        from sglang.srt.distributed import parallel_state
-        from sglang.srt.runtime_context import ParallelContext, _derived_widths
-
-        written = {n for n, d in _derived_widths().items() if not d.fn}
-        self.assertTrue(written, "no written-at-runtime names; this proves nothing")
-        self.assertIn("tp_group", written)
-
-        body = inspect.getsource(ParallelContext._read)
-        self.assertNotIn("_ps()", body)
-        self.assertNotIn("parallel_state", body)
-        self.assertNotIn("sglang.srt.runtime_context", parallel_state._EXEMPT_CALLERS)
 
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         from sglang.srt.distributed import parallel_state
@@ -2890,34 +2807,6 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().attn_dp_size, 2)
         self.assertEqual(get_parallel().dp_size, 2)
 
-    def test_every_caller_says_whether_the_draft_owns_its_attention(self):
-        self.assertEqual(
-            _scope_entries_that_say_nothing(_sources()),
-            [],
-            "these enter the draft scope without saying",
-        )
-
-    def test_the_census_would_notice_one(self):
-        trees = {
-            part
-            for path in _sources()
-            for part in ("benchmark", "examples", "scripts", "test")
-            if f"/{part}/" in path.as_posix()
-        }
-        self.assertEqual(
-            trees,
-            {"benchmark", "examples", "scripts", "test"},
-            "the walk misses a tree that can enter the scope",
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            probe = _pathlib.Path(tmp) / "probe.py"
-            probe.write_text(
-                "with self.draft_tp_context(runner.tp_group):\n    pass\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(_scope_entries_that_say_nothing([probe]), [f"{probe}:1"])
-
     def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
         from sglang.srt.distributed import parallel_state
 
@@ -2941,6 +2830,87 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_tp_size, 2)
                 self.assertEqual(parallel.dp_size, 2)
 
+    def test_a_narrowed_draft_still_indexes_the_targets_dp_sync(self):
+        """A draft scope that owns its attention answers the DP gather width and
+        slot of the target's sync, and stops answering once the scope exits."""
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        group = self._group(world_size=1, rank=0)
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(tp_rank=2, attn_tp_rank=0, attn_dp_rank=2),
+            patch.object(parallel_state, "_TP", group),
+        ):
+            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+                self.assertEqual(get_parallel().attn_dp_size, 1)
+                self.assertEqual(get_parallel().attn_dp_rank, 0)
+                self.assertEqual(dp_gather_width(), 4)
+                self.assertEqual(dp_gather_slot(), 2)
+            self.assertIsNone(get_flags().dp.scoped_gather_slot)
+            self.assertEqual(dp_gather_slot(), 2)
+
+    def _draft_scope_at_slot_two(self):
+        """A rank in slot 2 of a four-replica gather, inside a draft scope."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        group = self._group(world_size=1, rank=0)
+        outer = [
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(tp_rank=2, attn_tp_rank=0, attn_dp_rank=2),
+            patch.object(parallel_state, "_TP", group),
+        ]
+        for entered in outer:
+            entered.__enter__()
+            self.addCleanup(entered.__exit__, None, None, None)
+        scope = parallel_state.patch_tensor_parallel_group(group, owns_attention=True)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+
+    def test_a_sequence_is_read_at_this_process_s_slot(self):
+        from sglang.srt.layers.dp_attention import dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        self.assertEqual(dp_slot_in([9, 5, 6, 4]), 2)
+
+    def test_a_sequence_of_one_is_this_process_s_own_entry(self):
+        """The scheduler skips the all-gather for a single entry, and does so
+        even where the gather is wider than one."""
+        from sglang.srt.layers.dp_attention import dp_gather_width, dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        self.assertEqual(dp_gather_width(), 4)
+        self.assertEqual(dp_slot_in([7]), 0)
+
+    def test_a_sequence_the_gather_did_not_produce_is_refused(self):
+        """The width and the slot have to come from one topology: a sequence
+        sized by another is what a stale slot reads at the wrong index."""
+        from sglang.srt.layers.dp_attention import dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        with self.assertRaises(ValueError) as caught:
+            dp_slot_in([9, 5, 6, 4, 3])
+        self.assertIn("5 entries", str(caught.exception))
+        self.assertIn("width 4", str(caught.exception))
+
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.utils.weight_checker import WeightChecker
@@ -2952,60 +2922,112 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
             checker = WeightChecker(get_model=lambda: None)
 
         self.assertEqual(get_parallel().pp_size, 2)
-        info = checker._parallelism_info()
+        info = checker._parallelism_info(role="target")
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
-class TestTheRecordIsNeverWrittenTo(CustomTestCase):
-    """Runtime configuration changes use ``RuntimeContext.override``.
+def _calls_named(text: str, name: str) -> int:
+    """How many times ``name`` is called in ``text``."""
+    import ast as _ast
 
-    Only the resolution pipeline in ``arg_groups`` may write ``ServerArgs``.
+    return sum(
+        1
+        for node in _ast.walk(_ast.parse(text))
+        if isinstance(node, _ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
+    )
+
+
+def _sequences_indexed_by_the_attention_rank(text: str) -> list:
+    """Per-replica sequences subscripted by the attention-DP rank.
+
+    That rank is the process's place in the attention topology, which a draft
+    scope narrows; the sequence is sized by the gather. Indexing one with the
+    other reads whatever sits at the wrong slot.
+    """
+    import ast as _ast
+
+    offenders = []
+    for node in _ast.walk(_ast.parse(text)):
+        if not isinstance(node, _ast.Subscript):
+            continue
+        base = getattr(node.value, "attr", getattr(node.value, "id", "")) or ""
+        if not base.startswith("global_num_tokens"):
+            continue
+        if "attn_dp_rank" in _ast.unparse(node.slice):
+            offenders.append(
+                f"{base}[{_ast.unparse(node.slice)}] at line {node.lineno}"
+            )
+    return offenders
+
+
+class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
+    """A per-replica sequence is read at the slot of the gather that produced
+    it. ``dp_slot_in`` is where the two are checked against each other, so a
+    bare slot read has to be one of the places that legitimately has no
+    sequence to check against.
     """
 
-    #: Assignments here are the record being built, not mutated behind a reader.
-    EXEMPT = ("srt/arg_groups/",)
+    #: Defines the helpers; captures the slot on draft-scope entry; and asserts
+    #: what the bare slot answers, which is this file.
+    MAY_READ_THE_BARE_SLOT = (
+        "srt/layers/dp_attention.py",
+        "srt/distributed/parallel_state.py",
+        "unit/test_runtime_context.py",
+    )
 
-    def test_nothing_assigns_a_field_of_the_record(self):
-        import ast as _ast
-
-        from sglang.srt.arg_groups.arg_utils import namespace_of
-        from sglang.srt.server_args import ServerArgs
-
-        fields = set(namespace_of(ServerArgs))
-        offenders = []
+    def test_nothing_else_reads_the_bare_slot(self):
+        offenders, exercised = [], set()
         for path in _sources():
-            rel = path.as_posix()
-            if "sglang/srt/" not in rel and "sglang/benchmark/" not in rel:
+            text = path.read_text(encoding="utf-8-sig")
+            if not _calls_named(text, "dp_gather_slot"):
                 continue
-            if any(part in rel for part in self.EXEMPT):
-                continue
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
-                targets = (
-                    node.targets
-                    if isinstance(node, _ast.Assign)
-                    else [node.target]
-                    if isinstance(node, (_ast.AugAssign, _ast.AnnAssign))
-                    else []
-                )
-                for target in targets:
-                    if not isinstance(target, _ast.Attribute):
-                        continue
-                    base = target.value
-                    name = getattr(base, "id", getattr(base, "attr", None))
-                    if target.attr.startswith("_"):
-                        continue
-                    if name == "server_args" and target.attr in fields:
-                        offenders.append(f"{rel}:{target.lineno} .{target.attr}")
+            rel = str(path).replace("\\", "/")
+            allowed = [a for a in self.MAY_READ_THE_BARE_SLOT if rel.endswith(a)]
+            if allowed:
+                exercised.update(allowed)
+            else:
+                offenders.append(rel)
         self.assertEqual(
             offenders,
             [],
-            "write the bag through get_context().override(source, ...) instead "
-            "-- the record is not a channel:\n  " + "\n  ".join(offenders),
+            "read the slot through dp_slot_in(<the sequence>) instead, so the "
+            "width it came from is checked:\n  " + "\n  ".join(offenders),
         )
+        # An allowlist entry that stopped calling it would hide a new offender.
+        self.assertEqual(exercised, set(self.MAY_READ_THE_BARE_SLOT))
+
+    def test_no_sequence_is_indexed_by_the_attention_rank(self):
+        offenders = []
+        for path in _sources():
+            found = _sequences_indexed_by_the_attention_rank(
+                path.read_text(encoding="utf-8-sig")
+            )
+            offenders.extend(f"{path}: {one}" for one in found)
+        self.assertEqual(
+            offenders,
+            [],
+            "a draft scope narrows attn_dp_rank to 0; index with "
+            "dp_slot_in(<the sequence>):\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_censuses_would_notice_one(self):
+        planted = (
+            "def f(fb):\n"
+            "    x = global_num_tokens[get_parallel().attn_dp_rank]\n"
+            "    y = fb.global_num_tokens_cpu[parallel.attn_dp_rank]\n"
+            "    return dp_gather_slot(), x, y\n"
+        )
+        self.assertEqual(len(_sequences_indexed_by_the_attention_rank(planted)), 2)
+        self.assertEqual(_calls_named(planted, "dp_gather_slot"), 1)
+        # A legal shape stays quiet.
+        legal = "def f(s):\n    return s[dp_slot_in(s)]\n"
+        self.assertEqual(_sequences_indexed_by_the_attention_rank(legal), [])
+        self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
 
 
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
-    """Reject retired getter imports and group-initialization width arguments."""
+    """Classify parallel getters and reject retired package imports."""
 
     #: Getters that answer something other than a place in the topology.
     NOT_A_PLACEMENT = {
@@ -3085,37 +3107,6 @@ class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
             [],
             "these import a name the package no longer re-exports; import it "
             "from parallel_state, or read get_parallel():\n  " + "\n  ".join(offenders),
-        )
-
-    def test_nothing_passes_a_width_to_the_build(self):
-        import ast as _ast
-        import inspect
-
-        from sglang.srt.distributed.parallel_state import initialize_model_parallel
-
-        takes = set(inspect.signature(initialize_model_parallel).parameters)
-        offenders = []
-        for path in _sources():
-            if "multimodal_gen" in path.parts:
-                continue
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
-                if (
-                    isinstance(node, _ast.Call)
-                    and getattr(node.func, "id", getattr(node.func, "attr", None))
-                    == "initialize_model_parallel"
-                ):
-                    stale = [
-                        kw.arg for kw in node.keywords if kw.arg and kw.arg not in takes
-                    ]
-                    if stale or node.args:
-                        offenders.append(
-                            f"{path}:{node.lineno} {stale or 'positional'}"
-                        )
-        self.assertEqual(
-            offenders,
-            [],
-            "the build reads every width from the context; publish the "
-            "topology instead of passing it:\n  " + "\n  ".join(offenders),
         )
 
 

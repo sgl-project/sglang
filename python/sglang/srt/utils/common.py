@@ -1950,7 +1950,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1959,7 +1959,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2962,18 +2962,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

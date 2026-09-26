@@ -131,9 +131,14 @@ def unified_memory_disagg_move_gate(scheduler):
     if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
 
         def decode_gate() -> bool:
+            decode_offload_manager = scheduler.decode_offload_manager
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or (
+                    decode_offload_manager is not None
+                    and decode_offload_manager.has_inflight_device_transfer()
+                )
             )
 
         return decode_gate
@@ -349,7 +354,9 @@ class MetadataBuffers:
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
                 self.output_token_sampling_logprobs = torch.zeros(
-                    (size, 16), dtype=torch.float32, device=device
+                    (size, max_sampling_mask_tokens),
+                    dtype=torch.float32,
+                    device=device,
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -511,38 +518,17 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            # Sentinel -1: the decode side records None for this handoff token.
-            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
-            sampling_masks = req.output_token_sampling_mask
-            sampling_logprobs = req.output_token_sampling_logprobs
-            if sampling_masks:
-                sampling_mask = sampling_masks[0]
-                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
-                if sampling_mask is not None and sampling_logprob is not None:
-                    mask_len = len(sampling_mask)
-                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
-                    if mask_len > max_mask_len:
-                        raise RuntimeError(
-                            f"Sampling mask length {mask_len} exceeds disaggregation "
-                            f"metadata capacity {max_mask_len}. Increase "
-                            "--sampling-mask-max-tokens."
-                        )
-                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
-                        0
-                    ] = mask_len
-                    if mask_len:
-                        self.output_token_sampling_mask_idx[
-                            req.metadata_buffer_index, :mask_len
-                        ].copy_(
-                            torch.tensor(
-                                sampling_mask,
-                                dtype=torch.int32,
-                                device=self.output_token_sampling_mask_idx.device,
-                            )
-                        )
-                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
-                        0
-                    ] = float(sampling_logprob)
+            # Prefill streams a request only once its KV transfer ends or it aborts,
+            # so the first token's row is the only one queued here.
+            chunk = req.sampling_mask_rows.view()
+            mask_len = len(chunk.token_ids)
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = mask_len
+            self.output_token_sampling_mask_idx[
+                req.metadata_buffer_index, :mask_len
+            ].copy_(torch.from_numpy(chunk.token_ids))
+            self.output_token_sampling_logprobs[
+                req.metadata_buffer_index, : len(chunk.logprobs)
+            ].copy_(torch.from_numpy(chunk.logprobs))
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

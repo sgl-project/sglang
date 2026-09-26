@@ -207,7 +207,7 @@ class SituAndMul(BaseFusedOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+        from sglang.kernels.ops.activation import situ_and_mul
 
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
