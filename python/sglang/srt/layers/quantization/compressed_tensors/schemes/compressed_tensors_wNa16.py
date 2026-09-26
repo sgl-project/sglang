@@ -219,6 +219,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 raise NotImplementedError(
                     "CPU compressed-tensors WNA16 currently supports only 4-bit weights."
                 )
+            if self.symmetric:
+                raise NotImplementedError(
+                    "CPU compressed-tensors WNA16 does not support symmetric 4-bit weights."
+                )
 
             qweight = layer.weight_packed.t().contiguous()
             scales = layer.weight_scale.t().contiguous()

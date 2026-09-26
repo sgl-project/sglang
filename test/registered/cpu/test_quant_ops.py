@@ -141,9 +141,15 @@ class TestCPUQuantOps(CustomTestCase):
             )
         )
         layer = SimpleNamespace(
-            qweight=packed_weight,
-            qzeros=packed_zero,
-            scales=packed_scales,
+            weight_packed=torch.nn.Parameter(
+                qweight.t().contiguous(), requires_grad=False
+            ),
+            weight_zero_point=torch.nn.Parameter(
+                qzeros.t().contiguous(), requires_grad=False
+            ),
+            weight_scale=torch.nn.Parameter(
+                scales.t().contiguous(), requires_grad=False
+            ),
         )
         scheme = CompressedTensorsWNA16(
             strategy="group",
@@ -151,6 +157,7 @@ class TestCPUQuantOps(CustomTestCase):
             group_size=128,
             symmetric=False,
         )
+        scheme.process_weights_after_loading(layer)
 
         out = scheme.apply_weights(layer, x, None)
         ref = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
@@ -158,6 +165,27 @@ class TestCPUQuantOps(CustomTestCase):
         )
 
         torch.testing.assert_close(out, ref)
+
+    def test_compressed_tensors_wna16_cpu_rejects_symmetric(self):
+        layer = SimpleNamespace(
+            weight_packed=torch.nn.Parameter(
+                torch.randint(-128, 128, (4096, 512), dtype=torch.int32),
+                requires_grad=False,
+            ),
+            weight_scale=torch.nn.Parameter(
+                torch.rand(4096, 32, dtype=torch.bfloat16) / 10,
+                requires_grad=False,
+            ),
+        )
+        scheme = CompressedTensorsWNA16(
+            strategy="group",
+            num_bits=4,
+            group_size=128,
+            symmetric=True,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "symmetric 4-bit weights"):
+            scheme.process_weights_after_loading(layer)
 
 
 if __name__ == "__main__":
