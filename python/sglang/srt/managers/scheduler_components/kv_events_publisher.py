@@ -22,7 +22,6 @@ from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
@@ -46,11 +45,6 @@ hook_custom_types(KvMetrics)
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
     kv_events_config: Optional[str]
-    ps: ParallelState
-    attn_tp_rank: int
-    attn_cp_rank: int
-    attn_dp_rank: int
-    dp_rank: Optional[int]
     tree_cache: BasePrefixCache
     send_metrics_from_scheduler: Optional[zmq.Socket]
     max_running_requests: int
@@ -63,13 +57,14 @@ class SchedulerKvEventsPublisher:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
+        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config)
 
         if self.enable_kv_cache_events:
+            parallel = get_parallel()
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(
-                    self.ps.attn_dp_size, self.ps.attn_dp_rank, get_parallel().dp_rank
+                    parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
                 ),
             )
 
