@@ -2562,21 +2562,15 @@ def get_hybrid_layer_ids(
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     elif "InklingForConditionalGenerationMTP" in model_architectures:
-        # One block per MTP depth; a banded head marks its sliding-window depths
-        # in mtp_local_layer_ids. The per-depth pool routing in the KV-cache
-        # mixin is authoritative; this keeps model_config's swa/full lists
-        # self-consistent for other consumers.
-        mtp_local_layer_ids = hf_text_config.mtp_local_layer_ids
-        if mtp_local_layer_ids:
-            num_depths = hf_text_config.num_nextn_predict_layers
-            local_set = set(mtp_local_layer_ids)
-            swa_attention_layer_ids = sorted(local_set)
-            full_attention_layer_ids = [
-                i for i in range(num_depths) if i not in local_set
-            ]
-        else:
-            swa_attention_layer_ids = []
-            full_attention_layer_ids = [0]
+        # Runner-local layer setup selects one depth from these shared lists,
+        # including when every draft depth uses full attention.
+        local_set = set(hf_text_config.mtp_local_layer_ids)
+        swa_attention_layer_ids = sorted(local_set)
+        full_attention_layer_ids = [
+            i
+            for i in range(hf_text_config.num_nextn_predict_layers)
+            if i not in local_set
+        ]
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)

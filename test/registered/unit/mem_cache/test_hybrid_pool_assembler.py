@@ -312,6 +312,42 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
+        bundle = _build_unified_swa_pool()
+        pool = bundle.token_to_kv_pool
+        for draft_arg in (
+            "mtp_full_device_pools",
+            "mtp_swa_device_pools",
+            "mtp_swa_full_device_pools",
+        ):
+            with (
+                self.subTest(draft_arg=draft_arg),
+                patch(
+                    _ASSEMBLER + "get_memory",
+                    return_value=SimpleNamespace(hicache_host_memory_mode="auto"),
+                ),
+                patch(
+                    _ASSEMBLER + "build_kv_host_pool",
+                    side_effect=NotImplementedError("packed pool reached host factory"),
+                ),
+                patch.object(
+                    UnifiedPageEnvelopeHostPool, "build_hybrid_swa_pool_pair"
+                ) as build_pair,
+            ):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "reached host factory"
+                ):
+                    build_hybrid_swa_group(
+                        page_size=4,
+                        full_kv_pool=pool.full_kv_pool,
+                        swa_kv_pool=pool.swa_kv_pool,
+                        full_layer_mapping={0: 0, 1: 1, 2: 2},
+                        swa_layer_mapping={3: 0},
+                        use_mla=False,
+                        **{draft_arg: (object(),)},
+                    )
+                build_pair.assert_not_called()
+
     def test_shared_arena_can_reuse_bytes_across_sides(self):
         page_size = 4
         full_pool, swa_pool = _build_unified_host_pair(

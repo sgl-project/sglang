@@ -253,6 +253,7 @@ class BaseSpecWorker(ABC):
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
+        target_model_runner.mtp_draft_mamba_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
@@ -265,16 +266,29 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if (
-            "InklingForConditionalGenerationMTP"
-            in draft_runners[0].model_config.hf_config.architectures
-        ):
-            raise NotImplementedError(
-                "HiCache does not support Inkling MTP draft state yet."
-            )
-
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
+            target_mamba_pool = getattr(
+                target_model_runner.req_to_token_pool, "mamba_pool", None
+            )
+            draft_mamba_pools = tuple(
+                getattr(runner.req_to_token_pool, "mamba_pool", None)
+                for runner in draft_runners
+            )
+            # Shared state is already backed up with the target. Separate
+            # draft state follows the target's Mamba slot indices.
+            if any(
+                pool is not None and pool is not target_mamba_pool
+                for pool in draft_mamba_pools
+            ):
+                assert target_mamba_pool is not None, (
+                    "Packed draft state requires target Mamba slot indices"
+                )
+                assert all(
+                    pool is not None and pool is not target_mamba_pool
+                    for pool in draft_mamba_pools
+                ), "Packed MTP requires separate state for every draft layer"
+                target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,

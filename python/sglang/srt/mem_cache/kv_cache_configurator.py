@@ -2167,6 +2167,7 @@ class KVCacheConfigurator:
                     )
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
+                    token_to_kv_pool.swa_uses_full_indices = True
                 elif not uses_unified_virtual_ids:
                     assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
