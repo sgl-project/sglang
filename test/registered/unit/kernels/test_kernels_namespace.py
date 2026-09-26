@@ -307,5 +307,15 @@ def test_registered_architecture_boundaries(op, sm, expected):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_deep_select_spec_matches_wrapper_architectures():
+    """The group cannot import the wrapper, so this is the only link between the two SM lists."""
+    from sglang.kernels.ops.attention import deep_select
+
+    spec = K.registry.get_backend("attention.deep_select_topk", KernelBackend.JIT)
+    assert spec.capabilities == frozenset(
+        Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select._SUPPORTED_CAPABILITIES
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
