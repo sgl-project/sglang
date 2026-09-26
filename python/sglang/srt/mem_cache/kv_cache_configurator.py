@@ -106,13 +106,36 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
-    )
+    if (
+        memory_config.enable_hisparse
+        or is_draft_worker
+        or memory_config.enable_unified_cache_external_linker
+        or get_disagg().disaggregation_mode != "null"
+    ):
+        return False
+    if memory_config.enable_hierarchical_cache:
+        # The HiCache INDEXER sidecar from #38426 transfers producer layers
+        # only, so its L2 path can handle zero-row device placeholders. Keep
+        # L3's cross-instance page layout and DCP's virtual index-K addressing
+        # on their existing paths until those combinations are validated.
+        return (
+            memory_config.hicache_storage_backend is None
+            and get_parallel().attn_dcp_size == 1
+        )
+    return True
+
+
+def get_dsa_hicache_indexer_layers(
+    config, start_layer: int, end_layer: int
+) -> list[int]:
+    """Return stage-local layers that produce DSA index-K entries."""
+    if not is_deepseek_dsa(config):
+        return list(range(end_layer - start_layer))
+    return [
+        layer_id - start_layer
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    ]
 
 
 _is_hip = is_hip()
@@ -1675,6 +1698,11 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             **pool_kwargs,
+        )
+        token_to_kv_pool.hicache_indexer_layers = get_dsa_hicache_indexer_layers(
+            self.model_config.hf_config,
+            self.layer_info.start_layer,
+            self.layer_info.end_layer,
         )
         return token_to_kv_pool
 
