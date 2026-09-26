@@ -29,6 +29,8 @@ class DatasetRow:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
+    prompt_len_from_usage: bool = False
+    audio_duration: float = 0.0  # Submitted seconds, before model-specific processing
 
     def __post_init__(self):
         if self.text_prompt_len is None:
