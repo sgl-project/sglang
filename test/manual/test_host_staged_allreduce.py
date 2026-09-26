@@ -5,8 +5,9 @@ Runs the communicator directly under torchrun (no ray, no engine):
     torchrun --nproc_per_node=2 test/manual/test_host_staged_allreduce.py
 
 Checks bit-exactness against torch.distributed's NCCL all-reduce for the
-message sizes a TP=2 prefill produces, that the size threshold routes small
-messages elsewhere, and that a CUDA-graph capture never sees the host path.
+message sizes a TP=2 prefill produces (also when one rank's own copy to host
+lags behind the peer's), that the size threshold routes small messages
+elsewhere, and that a CUDA-graph capture never sees the host path.
 """
 import os
 import sys
@@ -64,6 +65,27 @@ class TestHostStagedAllReduce(unittest.TestCase):
         with torch.cuda.graph(g):
             big.mul_(1)  # keep the capture non-empty
             self.assertFalse(self.comm.should_use(big))
+
+    def test_own_copy_lags_peer(self):
+        # Hold rank 0's D2H stream back so the peer's pieces land first; the
+        # in-place add must still wait for rank 0's own copy to leave src.
+        for numel in (224 * 2560, 2048 * 5120):
+            for delay in (0, 200_000, 2_000_000):
+                for _ in range(5):
+                    x = torch.randn(numel, dtype=torch.bfloat16, device=self.device) * (self.rank + 1)
+                    ref = x.clone()
+                    dist.all_reduce(ref)
+                    y = x.clone()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    if self.rank == 0 and delay:
+                        with torch.cuda.stream(self.comm.d2h):
+                            torch.cuda._sleep(delay)
+                    self.comm.all_reduce(y)
+                    torch.cuda.synchronize()
+                    ok = torch.tensor([int(torch.equal(ref, y))], device=self.device)
+                    dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+                    self.assertEqual(ok.item(), 1, f"mismatch at numel={numel} delay={delay}")
 
     def test_speed_report(self):
         x = torch.randn(2048 * 5120, dtype=torch.bfloat16, device=self.device)

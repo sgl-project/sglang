@@ -147,6 +147,12 @@ class HostStagedAllReduce:
                 for i, (a, m) in enumerate(pieces):
                     self._wait(self.h2d, p, base + i + 1)
                     self.tmp[a:a + m].copy_(theirs[a:a + m], non_blocking=True)
+                # The add overwrites src in place, so this rank's own pieces
+                # must have left it first: the peer's counter can arrive
+                # before our D2H copies finish, and the peer would then read
+                # a half-summed input. Waiting here also covers the caller,
+                # which only waits on h2d.
+                self.h2d.wait_stream(self.d2h)
                 src.view(t.dtype).add_(self.tmp[:n].view(t.dtype))
                 self._write(self.h2d, 2 + r, seq)
         cur.wait_stream(self.h2d)
