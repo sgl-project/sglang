@@ -5,6 +5,7 @@ bit for bit and stay within FA4's usual tolerance of the reference.
 """
 
 import math
+import sys
 
 import pytest
 import torch
@@ -283,3 +284,7 @@ def test_red_max_features(monkeypatch, case):
     )
     kwargs.update(case)
     _check_red_max(monkeypatch, **kwargs)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
