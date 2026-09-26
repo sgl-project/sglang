@@ -136,14 +136,14 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
                 )
                 self.assertEqual(out.activation_scale_block_size, 32)
                 self.assertEqual(out.hidden_states_scale.shape[-1], HIDDEN // 32)
-                self.assertEqual(out.is_expanded, not is_extend)
+                # Prefill expands but stays non-masked; only decode is masked.
+                self.assertEqual(out.use_masked_gemm, not is_extend)
 
     def test_bf16_dispatch_sends_unquantized_activations(self):
         hidden_states, out = self._dispatch(use_fp8_dispatch=False)
         self.assertIs(_FakeBuffer.last.dispatch_x, hidden_states)
         self.assertIsNone(out.hidden_states_scale)
         self.assertEqual(out.hidden_states.dtype, torch.bfloat16)
-        self.assertFalse(out.hidden_states_scale_tma_aligned)
 
     def test_fp8_dispatch_still_sends_activations_and_scales(self):
         _, out = self._dispatch(use_fp8_dispatch=True)

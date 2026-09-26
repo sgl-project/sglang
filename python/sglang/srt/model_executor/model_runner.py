@@ -152,6 +152,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prebuild_deepep_v2_buffers,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -1119,6 +1120,8 @@ class ModelRunner:
             # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = get_parallel().ep_join_rank_offset + self.tp_size
             self._finalize_elastic_ep_joiner(target_size)
+
+        prebuild_deepep_v2_buffers(model=self.model)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

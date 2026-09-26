@@ -29,7 +29,7 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -360,6 +360,11 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
+        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
+            raise ValueError(
+                "--deepep-v2-mode direct is NVLink-only and cannot run across "
+                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
+            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,
@@ -545,9 +550,19 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
 
 
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
-    """Largest prefill dispatch on one rank, after model-specific sharding."""
+    """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
     tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=view.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=view.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    scatter_ranks = max(1, view.tp_size // attn_dp_size)
+    tokens = -(-tokens // scatter_ranks)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
