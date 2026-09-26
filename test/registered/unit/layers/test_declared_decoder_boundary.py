@@ -500,7 +500,9 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
                 "attention_tensor_model_parallel_all_reduce",
                 lambda x: reduced.append(x) or 2 * x,
             ),
-            patch.object(comm, "_redistribute_input_to_dp", lambda h, fb: h),
+            patch.object(
+                comm, "_redistribute_input_to_dp", lambda h, fb, cp_shard_counts=None: h
+            ),
             patch.object(
                 comm, "get_parallel", lambda: parallel_of(attn_dp=2, attn_tp=2)
             ),
@@ -996,18 +998,17 @@ class TestPrefillCP(CustomTestCase):
         )
 
     def test_which_cp_the_declarations_cover(self):
-        for name, parallel, declared in (
-            ("prefill CP", self.cp_parallel(), True),
+        dp_cp = parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True)
+        for name, parallel, sparse, declared in (
+            ("prefill CP", self.cp_parallel(), False, True),
             (
                 "CP without prefill CP",
                 parallel_of(attn_dp=1, attn_tp=2, attn_cp=2),
                 False,
-            ),
-            (
-                "CP under attention DP",
-                parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True),
                 False,
             ),
+            ("CP under attention DP", dp_cp, False, True),
+            ("a MoE under attention DP and CP", dp_cp, True, False),
             (
                 "a MoE-CP group narrower than CP",
                 parallel_of(
@@ -1018,14 +1019,36 @@ class TestPrefillCP(CustomTestCase):
                     moe_dp_size=2,
                 ),
                 False,
+                False,
             ),
         ):
             with self.subTest(name):
                 modes = planned_modes(
-                    1, 3, sparse=False, previous_sparse=False, parallel=parallel
+                    1, 3, sparse=sparse, previous_sparse=sparse, parallel=parallel
                 )
                 communicator = build(modes, parallel)
                 self.assertIs(communicator._cp_steps is not None, declared)
+
+    def test_under_attention_dp_one_dp_sum_gathers_both_axes(self):
+        parallel = parallel_of(attn_dp=2, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
+        communicator = build(layer_facts(1, 3), parallel)
+        cp, ordinary = communicator._cp_steps, communicator._steps
+        # A CP extend: the DP gather places each CP rank's shard in its DP
+        # group's slot, and the output comes back from there.
+        self.assertIs(cp.ffn_input.func, comm._mlp_input_dp_partial)
+        self.assertTrue(cp.ffn_input.keywords["places_cp_shards"])
+        self.assertIs(
+            cp.ffn_output_move, comm.CommunicateSummableTensorPairFn._take_back_cp_shard
+        )
+        # Other batches: the CP ranks hold the same rows, the plain DP steps.
+        self.assertIs(ordinary.ffn_input.func, comm._mlp_input_dp_partial)
+        self.assertFalse(ordinary.ffn_input.keywords["places_cp_shards"])
+        self.assertTrue(ordinary.returns_over_dp)
+        # Under CP the FFN completes its own sum on every batch.
+        for steps in (cp, ordinary):
+            self.assertFalse(steps.ffn_output.leaves_for_next_layer)
+            self.assertFalse(steps.ffn_output.leaves_for_reduce_scatter)
+            self.assertFalse(steps.ffn_output.leaves_for_reduce_scatterv)
 
     def test_a_batch_runs_them_only_on_a_cp_extend(self):
         communicator = build(layer_facts(1, 3), self.cp_parallel())
@@ -1141,7 +1164,9 @@ class Flags:
             self.__dict__.update(saved)
 
 
-def fake_dp_gather(global_tokens, local_tokens, forward_batch, *, is_partial):
+def fake_dp_gather(
+    global_tokens, local_tokens, forward_batch, cp_shard_counts=None, *, is_partial
+):
     state = WORLD[0].state()
     global_tokens.zero_()
     if is_partial or state.parallel.attn_tp_rank == 0:
@@ -1151,7 +1176,7 @@ def fake_dp_gather(global_tokens, local_tokens, forward_batch, *, is_partial):
     global_tokens.copy_(state.parallel.tp_group.all_reduce(global_tokens))
 
 
-def fake_dp_scatter(local_tokens, global_tokens, forward_batch):
+def fake_dp_scatter(local_tokens, global_tokens, forward_batch, cp_shard_counts=None):
     state = WORLD[0].state()
     local_tokens.fill_(0)
     local_tokens[: state.rows] = global_tokens[state.offset : state.offset + state.rows]

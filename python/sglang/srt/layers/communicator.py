@@ -844,13 +844,20 @@ class LayerCommunicator:
         if not (
             self._takes_declared_boundaries
             and (parallel.attn_cp_size == 1 or _cp_on_declarations())
+            # MoE layers under attention DP and CP keep the scatter-mode steps.
+            and not (
+                parallel.attn_cp_size > 1
+                and parallel.attn_dp_size > 1
+                and modes.is_layer_sparse
+            )
             and not enable_moe_dense_fully_dp()
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
-        # A sum over rows gathered across CP stays with this layer: the next
-        # layer's input holds only this rank's chunk.
-        may_leave = not cp_active
+        # Under attention CP the FFN completes its own sum: the next layer's
+        # input holds only this rank's chunk, and a reduce-scatter back over
+        # attention DP would split across the CP ranks.
+        may_leave = parallel.attn_cp_size == 1
         return decoder_layer_sides(
             axis_sizes=_token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=modes.is_layer_sparse and moe_on_local_rows,
@@ -1773,19 +1780,34 @@ def _mlp_input_reduce_output(
     return attention_tensor_model_parallel_all_reduce(hidden_states)
 
 
+def _cp_shard_token_rows(forward_batch: ForwardBatch) -> List[int]:
+    """Rows of each CP rank's shard that hold tokens; the shards are padded to
+    one length after them."""
+    metadata = forward_batch.attn_cp_metadata
+    return metadata.per_rank_logical_token or metadata.per_rank_actual_token
+
+
 def _redistribute_input_to_dp(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    cp_shard_counts: Optional[List[int]] = None,
 ) -> torch.Tensor:
     global_hidden_states = get_global_dp_buffer(get_parallel().tp_group)
-    dp_gather_replicate(global_hidden_states, hidden_states, forward_batch)
+    dp_gather_replicate(
+        global_hidden_states, hidden_states, forward_batch, cp_shard_counts
+    )
     return global_hidden_states
 
 
 def _reduce_and_redistribute_output_to_dp(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    cp_shard_counts: Optional[List[int]] = None,
 ) -> torch.Tensor:
     global_hidden_states = get_global_dp_buffer(get_parallel().tp_group)
-    dp_gather_partial(global_hidden_states, hidden_states, forward_batch)
+    dp_gather_partial(
+        global_hidden_states, hidden_states, forward_batch, cp_shard_counts
+    )
     return global_hidden_states
 
 
@@ -1835,9 +1857,11 @@ def _mlp_input_dp_replicate(
     *,
     gathers_residual: bool,
     reduces_attention_tp: bool,
+    places_cp_shards: bool = False,
 ):
     """Attention DP: complete the attention-TP sum if it is owed, add and
-    normalize locally, then gather."""
+    normalize locally, then gather. With ``places_cp_shards`` each CP rank puts
+    its shard of the DP group's tokens beside the others' in the group's slot."""
     if gathers_residual:
         residual = _redistribute_from_attn_tp_shards(residual)
     if hidden_states.shape[0] != 0:
@@ -1848,7 +1872,11 @@ def _mlp_input_dp_replicate(
             disabled=not is_allocation_symmetric(),
         ):
             hidden_states, residual = layernorm(hidden_states, residual)
-    return _redistribute_input_to_dp(hidden_states, forward_batch), residual
+    cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
+    return (
+        _redistribute_input_to_dp(hidden_states, forward_batch, cp_shard_counts),
+        residual,
+    )
 
 
 def _mlp_input_dp_partial(
@@ -1859,15 +1887,20 @@ def _mlp_input_dp_partial(
     context: CommunicateContext,
     *,
     gathers_residual: bool,
+    places_cp_shards: bool = False,
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then
-    normalize."""
+    normalize. With ``places_cp_shards`` each CP rank puts its shard of the DP
+    group's tokens beside the others' in the group's slot."""
     if gathers_residual:
         residual = _redistribute_from_attn_tp_shards(residual)
     if context.attn_tp_rank == 0:
         hidden_states += residual
-    hidden_states = _reduce_and_redistribute_output_to_dp(hidden_states, forward_batch)
-    dp_scatter(residual, hidden_states, forward_batch)
+    cp_shard_counts = _cp_shard_token_rows(forward_batch) if places_cp_shards else None
+    hidden_states = _reduce_and_redistribute_output_to_dp(
+        hidden_states, forward_batch, cp_shard_counts
+    )
+    dp_scatter(residual, hidden_states, forward_batch, cp_shard_counts)
     if hidden_states.shape[0] != 0:
         hidden_states = layernorm(hidden_states)
     return hidden_states, residual
@@ -1918,14 +1951,12 @@ def _token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
 
 def _cp_on_declarations() -> bool:
     """Whether attention CP is one the declarations cover: a prefill CP that
-    shards tokens, without attention DP, whose FFN input gathers over a MoE-CP
-    group that is the whole CP group. DSA and MLA CP pick their own steps."""
-    parallel = get_parallel()
+    shards tokens, whose FFN input gathers over a MoE-CP group that is the
+    whole CP group. DSA and MLA CP pick their own steps."""
     return (
         _generic_prefill_cp_shards_tokens()
         and not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
-        and parallel.attn_dp_size == 1
-        and parallel.moe_dp_size == 1
+        and get_parallel().moe_dp_size == 1
     )
 
 
@@ -2081,7 +2112,12 @@ def _select_ffn_input(
         return partial(_mlp_input_gather_moe_cp, gather=on_chunk), fused
     if (
         residual_to != produced.layout
-        or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
+        or gathered
+        not in (
+            frozenset(),
+            {TokenAxis.ATTN_DP},
+            {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP},
+        )
         or residual.sharded - residual_to.sharded
         not in (frozenset(), {TokenAxis.ATTN_TP_SCATTER})
     ):
@@ -2107,13 +2143,24 @@ def _select_ffn_input(
     # The partial order adds the residual on attention-TP rank 0 before the DP
     # gather's collective completes that sum, which only a plain residual add
     # allows.
+    # Over attention DP and CP, the DP gather puts each CP rank's shard in its
+    # DP group's slot, so the one DP sum gathers both axes.
+    places_cp_shards = TokenAxis.ATTN_CP in gathered
     if owes_attention_tp and not force_layernorm_before_gather:
-        return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual), ()
+        return (
+            partial(
+                _mlp_input_dp_partial,
+                gathers_residual=gathers_residual,
+                places_cp_shards=places_cp_shards,
+            ),
+            (),
+        )
     return (
         partial(
             _mlp_input_dp_replicate,
             gathers_residual=gathers_residual,
             reduces_attention_tp=owes_attention_tp,
+            places_cp_shards=places_cp_shards,
         ),
         (),
     )
@@ -2140,6 +2187,9 @@ def _select_ffn_output_move(
     if returned == {TokenAxis.ATTN_CP}:
         # This rank's chunk of the rows gathered over CP; no collective.
         return False, CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+    if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
+        # This rank's CP shard, from where the DP gather put it.
+        return False, CommunicateSummableTensorPairFn._take_back_cp_shard
     if returned != {TokenAxis.ATTN_DP}:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     return True, None
@@ -2512,6 +2562,28 @@ class CommunicateSummableTensorPairFn:
     ):
         assert residual is None, "not yet handled residual!=None"
         return _redistribute_to_attn_tp_shards(hidden_states, context), None
+
+    @staticmethod
+    def _take_back_cp_shard(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        **kwargs,
+    ):
+        """This rank's CP shard of the rows the DP gather put in its DP group's
+        slot, at the shard's padded length with the padding zeroed."""
+        held = forward_batch.attn_cp_metadata.per_rank_actual_token
+        local_hidden_states = get_local_dp_buffer(_dp_scatter_group())[
+            : held[get_parallel().attn_cp_rank]
+        ]
+        dp_scatter(
+            local_hidden_states,
+            hidden_states,
+            forward_batch,
+            _cp_shard_token_rows(forward_batch),
+        )
+        return local_hidden_states, residual
 
     @staticmethod
     def _scatter_hidden_states_moe(
