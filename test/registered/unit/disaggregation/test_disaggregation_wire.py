@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -59,6 +60,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSATokenToKVPool,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
@@ -755,8 +757,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         seed,
         metadata_buffer_index=0,
         sampling_mask=None,
-        sampling_logprob=None,
+        sampling_logprobs=None,
+        sampling_logprobs_mode="support",
     ):
+        sampling_mask_rows = None
+        if sampling_mask is not None:
+            sampling_mask_rows = SamplingMaskRows()
+            sampling_mask_rows.append(
+                np.array(sampling_mask, np.int32),
+                np.array(sampling_logprobs, np.float32),
+            )
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
@@ -767,12 +777,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
-            output_token_sampling_mask=(
-                None if sampling_mask is None else [sampling_mask]
-            ),
-            output_token_sampling_logprobs=(
-                None if sampling_logprob is None else [sampling_logprob]
-            ),
+            sampling_logprobs_mode=sampling_logprobs_mode,
+            sampling_mask_rows=sampling_mask_rows,
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
@@ -822,7 +828,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self._make_req(
                         None,
                         sampling_mask=[7, 8, 9] if enabled else None,
-                        sampling_logprob=-1.25 if enabled else None,
+                        sampling_logprobs=[-1.25, -1.5, -2.0] if enabled else None,
                     )
                 )
                 schemas.append(buffers.get_buf_infos())
@@ -830,10 +836,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self.assertEqual(
                         buffers.output_token_sampling_mask_idx.shape, (1, 3)
                     )
-                    length, mask, logprob = buffers.get_buf(0)[6:9]
+                    length, mask, logprobs = buffers.get_buf(0)[6:9]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    self.assertAlmostEqual(logprob[0].item(), -1.25)
+                    self.assertEqual(logprobs.tolist(), [-1.25, -1.5, -2.0])
                 else:
                     self.assertIsNone(buffers.output_token_sampling_mask_len)
                     self.assertIsNone(buffers.output_token_sampling_mask_idx)
@@ -842,7 +848,89 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         disabled_ptrs, _, disabled_sizes = schemas[0]
         enabled_ptrs, _, enabled_sizes = schemas[1]
         self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
-        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 3 * 4 + 128)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 2 * 3 * 4 + 64)
+
+    def test_sampling_mask_selected_logprob_uses_first_metadata_slot(self):
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=3,
+            )
+            buffers.set_buf(
+                self._make_req(
+                    None,
+                    sampling_mask=[7, 8, 9],
+                    sampling_logprobs=[-0.5],
+                    sampling_logprobs_mode="selected",
+                )
+            )
+            length, mask, logprobs = buffers.get_buf(0)[6:9]
+            self.assertEqual(length[0].item(), 3)
+            self.assertEqual(mask.tolist(), [7, 8, 9])
+            self.assertEqual(logprobs[0].item(), -0.5)
+
+    def test_sampling_mask_row_reaches_decode_unchanged(self):
+        """The prefill worker's first-token row is the row the decode worker streams."""
+        for mode, logprobs, expected in (
+            ("support", [-1.25, -1.5, -2.0], [[-1.25, -1.5, -2.0]]),
+            ("selected", [-0.5], [-0.5]),
+        ):
+            with (
+                self.subTest(sampling_logprobs_mode=mode),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=4,
+                )
+                buffers.set_buf(
+                    self._make_req(
+                        None,
+                        sampling_mask=[7, 8, 9],
+                        sampling_logprobs=logprobs,
+                        sampling_logprobs_mode=mode,
+                    )
+                )
+                queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                queue.scheduler = SimpleNamespace(
+                    kv_checksum_computer=None,
+                    batch_result_processor=SimpleNamespace(
+                        _maybe_update_reasoning_tokens=lambda req, token_id: None
+                    ),
+                )
+                queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+                queue.metadata_buffers = buffers
+                req = SimpleNamespace(
+                    rid="r0",
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_room=9,
+                    output_ids=[],
+                    return_logprob=False,
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode=mode,
+                    sampling_mask_rows=SamplingMaskRows(),
+                    time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+                )
+
+                queue._commit_transfer_to_req(
+                    DecodeRequest(
+                        req=req,
+                        kv_receiver=SimpleNamespace(clear=lambda: None),
+                        metadata_buffer_index=0,
+                    )
+                )
+
+                self.assertEqual(req.output_ids, [101])
+                self.assertEqual(
+                    req.sampling_mask_rows.take().to_lists(
+                        support_logprobs=mode == "support"
+                    ),
+                    ([[7, 8, 9]], expected),
+                )
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (

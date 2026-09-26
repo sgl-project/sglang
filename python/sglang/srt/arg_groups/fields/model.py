@@ -1,11 +1,4 @@
-"""Config fields of the ``model`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``model`` bag, which is what ``get_model()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``model`` namespace."""
 
 from __future__ import annotations
 
@@ -214,7 +207,6 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
-                "fp4_e2m1",
             ],
             resolvable=True,
         ),

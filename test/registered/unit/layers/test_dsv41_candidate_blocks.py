@@ -2,12 +2,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    PrefillCandidateBlocks,
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_block_mask,
     select_candidate_block_ids,
     select_candidate_blocks,
 )
+from sglang.srt.layers.attention.dsv4.candidate_indexer import PrefillCandidateBlocks
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
