@@ -68,6 +68,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         tree_cache.buffer_pipeline = None
+        tree_cache.swa_reprefill_tail_tokens.return_value = 0
         return tree_cache
 
     def create_token_allocator(
@@ -279,6 +280,63 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_range.length, 4096)
+
+    def test_hold_back_final_chunk_shortens_to_leave_a_window(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=16384)  # page 256
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        # 16384 of 16385 would leave 1 row; floor (16385 - 128) to a page
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16385), 16128)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16511), 16128)
+        # rest >= window, or nothing left: unchanged
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16512), 16384)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 40000), 16384)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16384), 16384)
+        # no page-aligned length leaves a window: 0 while a later batch's
+        # budget could take all 300 in one chunk, else the chunk as it is
+        self.assertEqual(adder._hold_back_final_chunk(256, 300), 0)
+        adder = self.create_shortest_prefill_adder(chunk_tokens=256)
+        self.assertEqual(adder._hold_back_final_chunk(256, 300), 256)
+
+    def test_first_chunk_leaves_at_least_a_window_for_the_final_chunk(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        req = self.create_shared_req("short-tail")
+        req.full_untruncated_fill_ids = list(range(512 + 50))
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, req)
+        # floor (562 - 128) to a page, the final chunk gets 306 rows
+        self.assertEqual(req.extend_range.length, 256)
+
+    def test_first_chunk_defers_when_a_later_batch_fits_the_rest(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        adder.rem_chunk_tokens = 200  # the rest of this batch's budget is spent
+        req = self.create_shared_req("later-batch")
+        req.full_untruncated_fill_ids = list(range(300))
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertIsNone(adder.new_chunked_req)
+        req.set_extend_range.assert_not_called()
+
+    def test_first_chunk_is_committed_when_no_budget_could_leave_a_window(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=256)
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        req = self.create_shared_req("small-budget")
+        req.full_untruncated_fill_ids = list(range(300))
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range.length, 256)
+
+    def test_continuation_leaves_at_least_a_window_for_the_final_chunk(self):
+        adder = self.create_shortest_prefill_adder()  # chunk 4096, page 256
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        req = self.create_shared_req("continuation-short-tail")
+        req.full_untruncated_fill_ids = list(range(4096 + 50))
+        self.assertIs(adder.add_chunked_req(req), req)
+        # floor (4146 - 128) to a page
+        self.assertEqual(req.extend_range.length, 3840)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
