@@ -187,6 +187,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,
+            # Like the attention's o_proj: prepare_mlp completes the sum of the
+            # two mixers' partial outputs.
+            reduce_results=False,
             prefix=f"{prefix}.mixer",
         )
 
