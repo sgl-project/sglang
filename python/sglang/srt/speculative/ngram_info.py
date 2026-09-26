@@ -22,6 +22,8 @@ class NgramVerifyInput(SpecInput):
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
+        accept_index: Optional[torch.Tensor] = None,
+        accept_path_nodes: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -39,6 +41,10 @@ class NgramVerifyInput(SpecInput):
         self.new_seq_lens = new_seq_lens
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
+        # Raw sampler output uses flattened batch-global indices. FutureMap
+        # converts it to batch-independent local path nodes for precompute.
+        self.accept_index = accept_index
+        self.accept_path_nodes = accept_path_nodes
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
@@ -91,7 +97,6 @@ class NgramVerifyInput(SpecInput):
             req_to_token.size(1),
         )
 
-        # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
             + (self.draft_token_num**2) * bs
