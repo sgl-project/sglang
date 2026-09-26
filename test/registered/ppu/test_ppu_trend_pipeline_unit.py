@@ -27,6 +27,35 @@ def row(run="123", attempt="1", day="24", score=0.5):
     return mod.accuracy_points(report)[0]
 
 
+def perf_row():
+    return {
+        "schema_version": "ppu-perf-trend-point/v1",
+        "test_id": "perf-test",
+        "measurement_id": "prefill",
+        "config_digest": "a" * 64,
+        "generated_at": "2026-09-24T00:00:00Z",
+        "input_len": 4096,
+        "output_len": 1,
+        "num_prompts": 1,
+        "concurrency": 1,
+        "source_case": "fixture",
+        "tc_name": "prefill",
+        "status": "measured",
+        "reason_code": None,
+        "metrics": {"ttft_mean_ms": 10},
+        "provenance": {
+            "github_run_id": "123",
+            "source_revision": "b" * 40,
+            "base_image": "registry.example.invalid/ppu:test",
+            "base_image_digest": "sha256:" + "c" * 64,
+            "checkpoint_name": "fixture-model",
+            "checkpoint_config_sha256": "d" * 64,
+            "expected_hardware": "8x PPU (96 GiB/device)",
+            "package_versions": {"torch": "2.11.0", "sglang": "0.5.18+g123abc"},
+        },
+    }
+
+
 def save(root, value, name="trend.jsonl"):
     root.mkdir(parents=True, exist_ok=True)
     path = root / name
@@ -80,6 +109,95 @@ class TestStaging(unittest.TestCase):
         result = self.stage()
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "data").exists())
+        self.assertNotIn("PRIVATE_SENTINEL", result.stdout + result.stderr)
+
+    def test_perf_private_fields_are_rejected_transactionally(self):
+        changes = [
+            (("raw_response",), {"answer": "PRIVATE_SENTINEL"}),
+            (("config_components",), {"answer": "PRIVATE_SENTINEL"}),
+            (("quality_verdict",), "PRIVATE_SENTINEL"),
+            (("source_case",), {"answer": "PRIVATE_SENTINEL"}),
+            (("tc_name",), ["PRIVATE_SENTINEL"]),
+            (("input_len",), {"answer": "PRIVATE_SENTINEL"}),
+            (("provenance", "private"), "PRIVATE_SENTINEL"),
+            (("provenance", "base_image"), {"answer": "PRIVATE_SENTINEL"}),
+            (("provenance", "checkpoint_name"), ["PRIVATE_SENTINEL"]),
+            (("provenance", "expected_hardware"), {"answer": "PRIVATE_SENTINEL"}),
+            (("provenance", "package_versions", "private"), "PRIVATE_SENTINEL"),
+            (
+                ("provenance", "package_versions", "torch"),
+                {"answer": "PRIVATE_SENTINEL"},
+            ),
+            (("provenance", "source_revision"), "PRIVATE_SENTINEL"),
+            (
+                ("provenance", "github_run_url"),
+                "https://example.invalid/PRIVATE_SENTINEL",
+            ),
+        ]
+        for keys, payload in changes:
+            with self.subTest(keys=keys), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                incoming = root / "incoming"
+                save(incoming / "one", row())
+                value = perf_row()
+                target = value
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = payload
+                save(incoming / "two", value)
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "stage_trend_rows.py")],
+                    cwd=root,
+                    env={**self.env, "INCOMING_DIR": str(incoming)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "data").exists())
+                self.assertNotIn("PRIVATE_SENTINEL", result.stdout + result.stderr)
+
+    def test_perf_legacy_identity_and_diagnostic_metrics_keep_original_bytes(self):
+        value = perf_row()
+        value["provenance"]["github_run_id"] = None
+        first = save(self.incoming / "one", value)
+        value = copy.deepcopy(value)
+        value.update(
+            measurement_id="partial",
+            status="failed",
+            reason_code="incomplete_requests",
+        )
+        second = save(self.incoming / "two", value)
+        result = self.stage()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.root / "data/perf-test/2026-09-24-123-9.jsonl"
+        content = target.read_bytes()
+        self.assertEqual(
+            sorted(content.splitlines()),
+            sorted(first.read_bytes().splitlines() + second.read_bytes().splitlines()),
+        )
+        self.assertEqual(self.stage().returncode, 0)
+        self.assertEqual(target.read_bytes(), content)
+
+    def test_perf_failure_reason_must_be_a_reviewed_code(self):
+        value = perf_row()
+        value.update(status="failed", metrics=None, reason_code="PRIVATE_SENTINEL")
+        save(self.incoming, value)
+        result = self.stage()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "data").exists())
+        self.assertNotIn("PRIVATE_SENTINEL", result.stdout + result.stderr)
+
+    def test_perf_accounting_rejects_private_fields_without_echoing_them(self):
+        value = perf_row()
+        value["raw_response"] = "PRIVATE_SENTINEL"
+        save(self.incoming, value)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "account_for_trend_reports.py")],
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("PRIVATE_SENTINEL", result.stdout + result.stderr)
 
     def test_symlinks_and_conversion_markers_block_publication(self):

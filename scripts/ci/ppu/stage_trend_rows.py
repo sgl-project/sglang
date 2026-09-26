@@ -86,7 +86,9 @@ def stage(incoming, data, *, run_id, attempt):
         content = "".join(line + "\n" for _, line in sorted(entries))
         if target.exists():
             # 历史发布器保留报告顺序；同一组原行顺序不同不应触发覆盖。
-            existing = sorted(line for _, line in read_rows(target))
+            existing = sorted(
+                line for _, line in read_rows(target, allow_legacy_perf=True)
+            )
             contract.require(
                 existing == sorted(line for _, line in entries), "禁止覆盖原始行"
             )

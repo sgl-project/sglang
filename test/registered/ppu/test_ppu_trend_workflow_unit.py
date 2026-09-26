@@ -97,6 +97,68 @@ class TestTrendWorkflows(unittest.TestCase):
                     )
                     self.assertNotIn("publish_derived_trend", str(measurement))
 
+    def test_publication_uploads_stay_scoped_after_validation_failure(self):
+        jobs = [
+            load(WORKFLOWS / ("test-ppu-" + name + ".yml"))["jobs"][
+                "publish-trend-rows"
+            ]
+            for name in NAMES
+        ]
+        main = os.environ.get("PPU_TREND_MAIN_ROOT")
+        if main:
+            jobs.append(
+                load(Path(main) / ".github/workflows/nightly-test-ppu-global.yml")[
+                    "jobs"
+                ]["publish-derived-trend"]
+            )
+        for index, job in enumerate(jobs):
+            steps = job["steps"]
+            validation = next(s for s in steps if s.get("id") == "tool-version")
+            upload = next(
+                s for s in steps if s.get("uses") == "actions/upload-artifact@v4"
+            )
+            self.assertEqual(upload["if"], "always()")
+            self.assertEqual(upload["with"]["if-no-files-found"], "warn")
+            for sha in ("", "invalid", "a" * 39, "a" * 40):
+                with self.subTest(
+                    job=index, sha=sha
+                ), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp).resolve()
+                    env_file = root / "job-env"
+                    result = subprocess.run(
+                        ["bash", "-c", validation["run"]],
+                        env={
+                            **os.environ,
+                            "TREND_TOOL_SHA": sha,
+                            "RUNNER_TEMP": str(root),
+                            "GITHUB_ENV": str(env_file),
+                        },
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode == 0, len(sha) == 40)
+                    exports = (
+                        dict(
+                            line.split("=", 1)
+                            for line in env_file.read_text().splitlines()
+                        )
+                        if env_file.exists()
+                        else {}
+                    )
+                    # 只展开这两个已知表达式，绝不调用真实上传 action。
+                    path = (
+                        upload["with"]["path"]
+                        .replace("${{ runner.temp }}", str(root))
+                        .replace(
+                            "${{ env.TREND_OUTPUT_DIR }}",
+                            exports.get("TREND_OUTPUT_DIR", ""),
+                        )
+                    )
+                    self.assertEqual(Path(path), root / "trend-publication")
+                    # 合法 SHA 后的 checkout 或发布失败也必须保留同一安全路径。
+                    if result.returncode == 0:
+                        self.assertEqual(Path(exports["TREND_OUTPUT_DIR"]), Path(path))
+
     def test_artifact_patterns_are_disjoint_and_accounting_is_explicit(self):
         patterns = []
         for name in NAMES:
@@ -147,7 +209,9 @@ class TestTrendWorkflows(unittest.TestCase):
             s for s in job["steps"] if "publish_derived_trend.sh" in s.get("run", "")
         )
         self.assertEqual(publish["env"]["NEEDS_JSON"], "${{ toJSON(needs) }}")
-        self.assertEqual(publish["env"]["RUN_SOURCE_SHA"], "${{ github.sha }}")
+        self.assertEqual(
+            publish["env"]["RUN_SOURCE_SHA"], "${{ needs.prepare.outputs.source_sha }}"
+        )
         self.assertEqual(
             publish["env"]["RUN_WORKFLOW_SHA"], "${{ github.workflow_sha }}"
         )

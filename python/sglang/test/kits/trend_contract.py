@@ -90,6 +90,18 @@ PERF_METRICS = {
     "itl_p95_ms",
     "itl_p99_ms",
 }
+# 旧Perf生产端额外公开的元数据，不得套用质量行字段或接受任意嵌套对象。
+PERF_SHAPE = {"input_len", "output_len", "num_prompts", "concurrency"}
+PERF_LABELS = {"source_case", "tc_name"}
+PERF_PROVENANCE_LABELS = {"base_image", "checkpoint_name", "expected_hardware"}
+PERF_REASONS = {
+    "server_start_failed",
+    "benchmark_crashed",
+    "metrics_missing",
+    "incomplete_requests",
+    "request_errors",
+    "cache_flush_failed",
+}
 CONTRACT = "ppu-answer-trend-contract/v1"
 
 
@@ -153,10 +165,14 @@ def validate_components(parts):
         )
 
 
-def validate_provenance(prov):
+def validate_provenance(prov, *, allow_missing_identity=False):
     require(isinstance(prov, dict) and set(prov) <= PROVENANCE, "非白名单provenance")
-    require(positive_id(prov.get("github_run_id")), "无效run身份")
-    require(positive_id(prov.get("github_run_attempt")), "无效attempt身份")
+    for key in ("github_run_id", "github_run_attempt"):
+        value = prov.get(key)
+        require(
+            (allow_missing_identity and value is None) or positive_id(value),
+            "无效run或attempt身份",
+        )
     for key, pattern in (
         ("source_revision", SHA1),
         ("checkpoint_config_sha256", SHA256),
@@ -175,9 +191,12 @@ def validate_provenance(prov):
     url = prov.get("github_run_url")
     require(
         url is None
-        or url
-        == "https://github.com/flytiger-eco/sglang-for-sail/actions/runs/"
-        + prov["github_run_id"],
+        or (
+            positive_id(prov.get("github_run_id"))
+            and url
+            == "https://github.com/flytiger-eco/sglang-for-sail/actions/runs/"
+            + prov["github_run_id"]
+        ),
         "非当前仓库run链接",
     )
     packages = prov.get("package_versions")
@@ -196,7 +215,29 @@ def validate_provenance(prov):
         )
 
 
-def validate_row(row):
+def validate_perf_fields(row):
+    core = COMMON - {"quality_verdict", "quality_reason_codes"}
+    require(core <= set(row) <= core | PERF_SHAPE | PERF_LABELS, "非白名单Perf字段")
+    for key in PERF_SHAPE & row.keys():
+        require(type(row[key]) is int and row[key] > 0, "无效Perf工作负载")
+    for key in PERF_LABELS & row.keys():
+        require(isinstance(row[key], str) and bool(row[key]), "无效Perf测量标签")
+    require(
+        row["reason_code"] is None or row["reason_code"] in PERF_REASONS,
+        "未知Perf缺测原因",
+    )
+    prov = row["provenance"]
+    require(set(prov) <= PROVENANCE | PERF_PROVENANCE_LABELS, "非白名单Perf provenance")
+    for key in PERF_PROVENANCE_LABELS & prov.keys():
+        require(prov[key] is None or isinstance(prov[key], str), "无效Perf运行标签")
+    # 旧生产端没有attempt，本地报告也可能没有run；仅缺省身份可由归档上下文补全。
+    validate_provenance(
+        {key: value for key, value in prov.items() if key in PROVENANCE},
+        allow_missing_identity=True,
+    )
+
+
+def validate_row(row, *, allow_legacy_perf=False):
     require(
         isinstance(row, dict) and row.get("schema_version") in SCHEMAS, "未知趋势schema"
     )
@@ -245,6 +286,9 @@ def validate_row(row):
     require(isinstance(row.get("provenance"), dict), "缺少provenance")
     if schema == PERF:
         require(row.get("status") in {"measured", "failed"}, "未知perf状态")
+        # 仅已归档的历史行可宽松读取；所有新输入默认执行完整白名单校验。
+        if not allow_legacy_perf:
+            validate_perf_fields(row)
         return
     extra = (
         {"metric_name", "samples", "expected_samples"}

@@ -286,6 +286,40 @@ class TestPublishing(unittest.TestCase):
         self.assertIn("工具 SHA：" + "b" * 40, text)
         self.assertIn("执行 UTC 时间：2026-09-24T12:00:00Z", text)
 
+    def test_source_context_changes_only_summary_not_snapshot(self):
+        before = None
+        commit = None
+        for source_sha in ("a" * 40, "d" * 40):
+            summary = self.root / ("summary-" + source_sha)
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "publish_derived_trend.sh")],
+                cwd=self.repo,
+                env={
+                    **os.environ,
+                    "TREND_OUTPUT_DIR": str(self.output),
+                    "TREND_TOOL_SHA": "b" * 40,
+                    "TREND_AS_OF_DATE": "2026-09-24",
+                    "RUN_SOURCE_SHA": source_sha,
+                    "RUN_WORKFLOW_SHA": "c" * 40,
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = summary.read_text()
+            self.assertIn("源码 SHA：" + source_sha, text)
+            self.assertIn("workflow SHA：" + "c" * 40, text)
+            self.assertIn("工具 SHA：" + "b" * 40, text)
+            snapshot = (self.output / "trend.json").read_bytes()
+            if before is not None:
+                self.assertEqual(snapshot, before)
+                self.assertEqual(
+                    git(self.remote, "rev-parse", "nightly-test-data"), commit
+                )
+            before = snapshot
+            commit = git(self.remote, "rev-parse", "nightly-test-data")
+
     def test_failure_after_staging_leaves_no_stale_worktree(self):
         before = git(self.repo, "worktree", "list", "--porcelain")
         with mock.patch.object(

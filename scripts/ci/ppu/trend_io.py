@@ -47,14 +47,14 @@ def _constant(_value):
     raise ValueError("非有限JSON数值")
 
 
-def read_rows(path):
+def read_rows(path, *, allow_legacy_perf=False):
     no_links(path)
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         value = json.loads(line, object_pairs_hook=_pairs, parse_constant=_constant)
-        contract.validate_row(value)
+        contract.validate_row(value, allow_legacy_perf=allow_legacy_perf)
         rows.append((value, line))
     contract.require(bool(rows), "空趋势文件")
     return rows
@@ -67,7 +67,8 @@ def archived_rows(root):
         match = ARCHIVE.fullmatch(path.name)
         contract.require(len(relative.parts) == 2 and match is not None, "无效归档路径")
         day, run, attempt = match.groups()
-        for row, line in read_rows(path):
+        # 已发布历史Perf行仍可读取；派生器只投影白名单数值，不重新发布原始字段。
+        for row, line in read_rows(path, allow_legacy_perf=True):
             contract.require(relative.parts[0] == row["test_id"], "目录与行身份不符")
             contract.require(
                 str(contract.utc(row["generated_at"]).date()) == day, "归档日期不符"
