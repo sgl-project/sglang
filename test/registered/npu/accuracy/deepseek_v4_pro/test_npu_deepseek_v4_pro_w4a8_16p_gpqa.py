@@ -2,8 +2,9 @@ import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
-    TestNpuAccuracyTestCaseBase,
+    TestNpuAccuracyMultiNodePdMixTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
 )
@@ -15,10 +16,12 @@ register_npu_ci(
     nightly=True,
 )
 
-# Environment variables for DSV4-Pro-0813 single-node PD-mix deployment,
+# Environment variables for DSV4-Pro-0813 two-node mix deployment,
 # ported from scripts_shell/dspark-with-radix-cache/dsv4_pro_2mix.sh.
 DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "DEEPEP_HCCL_BUFFSIZE": "1536",
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
     "HCCL_CONNECT_TIMEOUT": "300",
     "HCCL_EXEC_TIMEOUT": "68",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -55,6 +58,8 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
     32,
+    "--nnodes",
+    2,
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -113,22 +118,24 @@ DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH = {
     },
 }
 
+DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG = {
+    "model_path": DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "other_args": DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS,
+    "node_envs": DEEPSEEK_V4_PRO_W4A8_16P_ENVS,
+}
 
-class TestNPUDeepSeekV4ProW4A88PGPQAHigh(TestNpuAccuracyTestCaseBase):
-    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 16p GPQA High mode."""
+
+class TestNPUDeepSeekV4ProW4A88PGPQAHigh(TestNpuAccuracyMultiNodePdMixTestCaseBase):
+    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 16p two-node GPQA High mode."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model = DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH
-    other_args = DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS
-    envs = DEEPSEEK_V4_PRO_W4A8_16P_ENVS
+    model_config = DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
-    few_shot_num = 0
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 32
     stream = True
     timeout = 7200
-    seed = 1
 
     def test_npu_deepseek_v4_pro_w4a8_8p_gpqa_high(self):
         """Run NPU accuracy test for DeepSeek-V4-Pro W4A8 16p GPQA High mode."""

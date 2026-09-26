@@ -3,8 +3,9 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH, TestNpuPerformanceTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH, TestNpuPerfMultiNodePdMixTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -14,9 +15,11 @@ register_npu_ci(
     nightly=True,
 )
 
-# Environment variables for DSV4-Pro-0813 single-node PD-mix deployment,
+# Environment variables for DSV4-Pro-0813 two-node mix deployment,
 DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "DEEPEP_HCCL_BUFFSIZE": "1536",
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
     "HCCL_CONNECT_TIMEOUT": "300",
     "HCCL_EXEC_TIMEOUT": "68",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -51,10 +54,12 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
 }
 
 
-# Server launch arguments for DSV4-Pro W4A8 single-node 16p PD-mix.
+# Server launch arguments for DSV4-Pro W4A8 two-node 16p PD-mix.
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--tp-size",
     32,
+    "--nnodes",
+    2,
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -103,16 +108,21 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
 ]
 
 
+DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG = {
+    "model_path": DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "other_args": DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS,
+    "node_envs": DEEPSEEK_V4_PRO_W4A8_16P_ENVS,
+}
+
+
 class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
-    TestNpuPerformanceTestCaseBase
+    TestNpuPerfMultiNodePdMixTestCaseBase
 ):
-    """Test NPU performance for DeepSeek-V4-Flash W8A8 8p 16p in128k out1k prefix90."""
+    """Test NPU performance for DeepSeek-V4-Pro W4A8 16p two-node in128k out1k prefix90."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model = DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH
-    other_args = DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS
-    envs = DEEPSEEK_V4_PRO_W4A8_16P_ENVS
+    model_config = DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
     warmup_requests = 16
     max_concurrency = 16
