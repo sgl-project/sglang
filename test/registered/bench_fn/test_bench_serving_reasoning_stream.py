@@ -150,6 +150,61 @@ class TestBenchServingReasoningStream(CustomTestCase):
             server.shutdown()
             server.server_close()
 
+    def test_streaming_error_is_not_a_successful_completion(self):
+        out = self._run(
+            [
+                {
+                    "error": {
+                        "message": "Generation aborted",
+                        "type": "InternalServerError",
+                        "code": 500,
+                    }
+                }
+            ]
+        )
+
+        self.assertFalse(out.success)
+        self.assertIn("Generation aborted", out.error)
+        self.assertEqual(out.output_len, 0)
+
+    def test_error_after_content_is_excluded_from_metrics(self):
+        failed = self._run(
+            [
+                _make_chunk(content="partial", completion_tokens=1),
+                {
+                    "error": {
+                        "message": "Generation timed out",
+                        "type": "TimeoutError",
+                        "code": 500,
+                    }
+                },
+            ]
+        )
+        successful = self._run([_make_chunk(content="answer", completion_tokens=2)])
+
+        self.assertFalse(failed.success)
+        self.assertIn("Generation timed out", failed.error)
+        self.assertTrue(successful.success, msg=successful.error)
+        metrics, output_lens = calculate_metrics(
+            input_requests=None,
+            outputs=[successful, failed],
+            dur_s=1.0,
+            tokenizer=_StrictStringTokenizer(),
+            backend="sglang-oai-chat",
+        )
+        self.assertEqual(metrics.completed, 1)
+        self.assertEqual(metrics.total_output, 2)
+        self.assertEqual(output_lens, [2, 0])
+
+    def test_null_error_field_does_not_reject_a_valid_chunk(self):
+        chunk = _make_chunk(content="ok", completion_tokens=1)
+        chunk["error"] = None
+        out = self._run([chunk])
+
+        self.assertTrue(out.success, msg=out.error)
+        self.assertEqual(out.generated_text, "ok")
+        self.assertEqual(out.output_len, 1)
+
     def test_reasoning_only_stream_populates_metrics(self):
         chunks = [
             _make_chunk(reasoning_content="Let "),
