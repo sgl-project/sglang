@@ -12,6 +12,10 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     PrefillIndexerInputs,
 )
 
+# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
+# leaves room for candidate masks and block-selection scratch.
+_SCORE_BUDGET_BYTES = 2 << 30
+
 
 def _dense_topk(
     inputs: PrefillIndexerInputs,
@@ -34,6 +38,7 @@ def _dense_topk(
         candidate_block_size=block_size,
         publish_candidates=publish,
         candidates=candidates.request_blocks if candidates is not None else None,
+        budget_bytes=_SCORE_BUDGET_BYTES,
     )
     out_positions.copy_(selected)
     if published is None:

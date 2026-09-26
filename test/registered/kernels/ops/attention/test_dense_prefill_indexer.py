@@ -45,6 +45,7 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
         topk=512,
         candidate_topk_blocks=2,
         candidate_block_size=8,
+        budget_bytes=2 << 30,
     )
 
 
@@ -120,7 +121,10 @@ class TestDensePrefillIndexer(CustomTestCase):
                     consumer_inputs["kv"] = inputs["kv"]
                     consumer_inputs["candidate_topk_blocks"] = 128
                     consumer_scores = dense_scores(consumer_inputs)
-                    with patch.object(dense_prefill, "_SCORE_BUDGET_BYTES", 128 << 10):
+                    with (
+                        patch.dict(inputs, budget_bytes=128 << 10),
+                        patch.dict(consumer_inputs, budget_bytes=128 << 10),
+                    ):
                         selected, candidates = dense_prefill.dense_prefill_topk(
                             **inputs, publish_candidates=True, candidates=None
                         )
@@ -257,7 +261,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return logits
 
                 with (
-                    patch.object(dense_prefill, "_SCORE_BUDGET_BYTES", budget),
+                    patch.dict(inputs, budget_bytes=budget),
                     patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
                 ):
                     selected, _ = dense_prefill.dense_prefill_topk(

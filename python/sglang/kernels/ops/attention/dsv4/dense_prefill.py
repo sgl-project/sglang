@@ -1,6 +1,6 @@
 """The DeepGEMM dense prefill scores of the ratio-1/2 index layers, tile by
-tile under a memory budget, and the top-k over them: plain, or publishing /
-consuming candidate block ids per request."""
+tile under a caller-given memory budget, and the top-k over them: plain, or
+publishing / consuming candidate block ids per request."""
 
 from __future__ import annotations
 
@@ -21,10 +21,6 @@ from .candidate_blocks import (
 )
 from .topk import topk_transform_ragged_v2
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate masks and block-selection scratch.
-_SCORE_BUDGET_BYTES = 2 << 30
-
 
 def dense_prefill_topk(
     *,
@@ -39,7 +35,9 @@ def dense_prefill_topk(
     candidate_block_size: int,
     publish_candidates: bool,
     candidates: list[torch.Tensor] | None,
+    budget_bytes: int,
 ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+    """``budget_bytes`` bounds one fp32 logits tile."""
     selected = torch.full(
         (q[0].shape[0], topk), -1, dtype=torch.int32, device=weights.device
     )
@@ -63,7 +61,9 @@ def dense_prefill_topk(
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
         return selected, published
-    rows_per_chunk = _rows_per_chunk(row, width, heads=q[0].shape[1])
+    rows_per_chunk = _rows_per_chunk(
+        row, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+    )
     for offset in range(0, row, rows_per_chunk):
         rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
@@ -83,14 +83,14 @@ def dense_prefill_topk(
     return selected, published
 
 
-def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
-    """Query rows per logits tile so one fp32 [rows, width] tile fits the
-    budget; the row count stays a multiple of the kernel's row alignment."""
+def _rows_per_chunk(rows: int, width: int, *, heads: int, budget_bytes: int) -> int:
+    """Query rows per logits tile so one fp32 [rows, width] tile fits
+    ``budget_bytes``; the row count stays a multiple of the kernel's row alignment."""
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
         row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_SCORE_BUDGET_BYTES,
+        budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
         return rows
@@ -105,9 +105,11 @@ def score_tiles(
     starts: torch.Tensor,
     lengths: torch.Tensor,
     context_lengths: list[int],
+    budget_bytes: int,
     width_align: int = 4,
 ) -> Iterator[tuple[slice, torch.Tensor]]:
-    """The dense scores of the chunk row tile by row tile under the budget:
+    """The dense scores of the chunk row tile by row tile, each fp32 tile within
+    ``budget_bytes``:
     ``(rows, logits)`` with fp32 ``logits[i, j]`` the score of query row
     ``rows.start + i`` against ``kv[starts + j]``, garbage past the row's
     ``lengths``; the width is the largest of ``context_lengths`` (compressed
@@ -119,7 +121,9 @@ def score_tiles(
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
         return
-    rows_per_chunk = _rows_per_chunk(rows, width, heads=q[0].shape[1])
+    rows_per_chunk = _rows_per_chunk(
+        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+    )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]

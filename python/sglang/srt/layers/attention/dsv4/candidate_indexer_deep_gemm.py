@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     expand_index_page_table,
 )
 from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
+    _SCORE_BUDGET_BYTES,
     DenseCandidateIndexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
@@ -299,6 +300,7 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
             starts=inputs.request_starts,
             lengths=inputs.compress_lens,
             context_lengths=inputs.lens_per_request,
+            budget_bytes=_SCORE_BUDGET_BYTES,
             width_align=8,
         ):
             lens = inputs.compress_lens[tile]
