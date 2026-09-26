@@ -541,7 +541,8 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX \
+        --override "${REPO_ROOT}/scripts/ci/torch-override.txt"
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.

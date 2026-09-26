@@ -415,7 +415,7 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow --override scripts/ci/torch-override.txt
 
       - name: Run test
         timeout-minutes: 60
