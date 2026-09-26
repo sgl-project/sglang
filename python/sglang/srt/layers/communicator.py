@@ -444,6 +444,8 @@ class LayerScatterModes:
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
     is_layer_sparse: bool = False
+    # The model's first layer: its input is the embedding, not a layer output.
+    is_first_layer: bool = False
     # The model's last layer: its output goes to the final norm, not a next layer.
     is_last_layer: bool = False
 
@@ -457,6 +459,7 @@ class LayerScatterModes:
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
             is_layer_sparse=context.is_layer_sparse,
+            is_first_layer=context.layer_id == 0,
             is_last_layer=context.layer_id == context.num_layers - 1,
         )
 
@@ -719,7 +722,6 @@ class LayerCommunicator:
         fused_ar_quant_keep_bf16: bool = False,
         # False for a layer whose FFN always completes its own reduction.
         allow_deferred_ffn_reduction: bool = True,
-        _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -754,30 +756,9 @@ class LayerCommunicator:
             get_lora().enable_lora
         )
 
-        # Under LayerNorm SP the norm/residual run on the sequence shard with no
-        # collectives, so delegate to an all-SCATTERED sibling while the region is
-        # active. _is_sp_variant stops the sibling from building its own.
-        self._sp_variant: Optional[LayerCommunicator] = None
-        if not _is_sp_variant and layernorm_sp.layernorm_sp_enabled():
-            self._sp_variant = LayerCommunicator(
-                layer_scatter_modes=LayerScatterModes(
-                    layer_input_mode=ScatterMode.SCATTERED,
-                    attn_mode=ScatterMode.SCATTERED,
-                    mlp_mode=ScatterMode.SCATTERED,
-                    middle_residual_mode=ScatterMode.SCATTERED,
-                    layer_output_mode=ScatterMode.SCATTERED,
-                    is_last_layer=layer_scatter_modes.is_last_layer,
-                ),
-                input_layernorm=input_layernorm,
-                post_attention_layernorm=post_attention_layernorm,
-                allow_reduce_scatter=allow_reduce_scatter,
-                qkv_latent_func=qkv_latent_func,
-                force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
-                enable_fused_ar_quant=enable_fused_ar_quant,
-                fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
-                allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
-                _is_sp_variant=True,
-            )
+        # Under LayerNorm SP the residual and norms run on this rank's sequence
+        # shard with no collectives while the region is active.
+        self._sp_region = layernorm_sp.layernorm_sp_enabled()
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -891,24 +872,14 @@ class LayerCommunicator:
                         forward_batch=forward_batch,
                     )
             hidden_states = owed.partial
-        # residual is None marks the first decoder layer, where the SP region
-        # opens: re-evaluated per forward so a crash mid-loop cannot leak into
-        # the next one.
-        if self._sp_variant is not None:
-            if residual is None:
-                get_forward().set(
-                    "sp_active", forward_batch.forward_mode == ForwardMode.EXTEND
-                )
-                if get_forward().sp_active:
-                    hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+        # The SP region opens at the first layer, re-evaluated per forward so a
+        # crash mid-loop cannot leak into the next one.
+        if self._sp_region and self.layer_scatter_modes.is_first_layer:
+            get_forward().set(
+                "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
+            )
             if get_forward().sp_active:
-                return self._sp_variant.prepare_attn(
-                    hidden_states,
-                    residual,
-                    forward_batch,
-                    quant_format,
-                    post_residual_addition,
-                )
+                hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -932,13 +903,18 @@ class LayerCommunicator:
             forward_batch=forward_batch,
         )
 
+    def _in_sp_region(self) -> bool:
+        return self._sp_region and get_forward().sp_active
+
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        hidden_states = self._communicate_simple_fn(
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            context=self._context,
-        )
+        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset. In
+        the SP region the attention input stays on this rank's sequence shard."""
+        if not self._in_sp_region():
+            hidden_states = self._communicate_simple_fn(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                context=self._context,
+            )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
@@ -1082,9 +1058,13 @@ class LayerCommunicator:
         cache=None,
     ):
         self.publish_mlp_lora_layout()
-        if self._sp_variant is not None and get_forward().sp_active:
-            return self._sp_variant.prepare_mlp(
-                hidden_states, residual, forward_batch, cache
+        if self._in_sp_region():
+            return _mlp_input_norm(
+                hidden_states,
+                residual,
+                forward_batch,
+                self.post_attention_layernorm,
+                self._context,
             )
         if cache is not None:
             self._context.cache = cache
@@ -1110,10 +1090,8 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self._sp_variant is not None and get_forward().sp_active:
-            return self._sp_variant.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        if self._in_sp_region():
+            return hidden_states, residual
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -1127,9 +1105,7 @@ class LayerCommunicator:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter, outside
         an active LayerNorm SP region."""
-        return self._postprocess_scatters_to_local_tokens and not (
-            self._sp_variant is not None and get_forward().sp_active
-        )
+        return self._postprocess_scatters_to_local_tokens and not self._in_sp_region()
 
     def _postprocess_dp_step(
         self, forward_batch: ForwardBatch
