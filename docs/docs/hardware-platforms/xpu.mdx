@@ -111,6 +111,12 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
+`SGLANG_USE_CPU_ENGINE` has no effect on a host where an XPU is available: the
+`sgl-kernel-xpu` wheel does not ship the CPU engine kernels, so the opt-in is
+logged and ignored, and the XPU engine runs. This keeps integrations that export
+the variable around `import sglang` (for example verl's rollout replica loader)
+working on XPU hosts. Use a host without a visible XPU to run the CPU engine.
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus

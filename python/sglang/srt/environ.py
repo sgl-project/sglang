@@ -1794,6 +1794,7 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    SGLANG_USE_CPU_ENGINE = EnvBool(False)
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

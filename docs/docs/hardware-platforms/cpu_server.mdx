@@ -145,6 +145,9 @@ Notes:
 
 - Note that the environment variable `SGLANG_USE_CPU_ENGINE=1`
     is required to enable the SGLang service with the CPU engine.
+    It is ignored on hosts where an Intel XPU is available, because the
+    `sgl-kernel-xpu` wheel does not ship the CPU engine kernels; such hosts
+    run the XPU engine instead.
 
 - If you encounter code compilation issues during the `sgl-kernel` building process,
     please check your `gcc` and `g++` versions and upgrade them if they are outdated.

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -22,6 +23,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
+from sglang.srt.utils.common import is_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -561,6 +563,7 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
     ):
         """When CUDA is available and no plugin activates, return CUDA defaults."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_USE_CPU_ENGINE.get.return_value = False
         mock_is_cuda_available.return_value = True
         mock_load.return_value = {}
         result = _resolve_platform()
@@ -574,6 +577,7 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_USE_CPU_ENGINE.get.return_value = False
         mock_is_cuda_available.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
@@ -588,6 +592,7 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
     ):
         """ROCm exposes torch.cuda but must not use the CUDA fallback platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_USE_CPU_ENGINE.get.return_value = False
         mock_torch.cuda.is_available.return_value = True
         mock_torch.version.hip = "6.0"
         mock_load.return_value = {}
@@ -688,6 +693,44 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
             result = _resolve_platform()
             # Only the good plugin activated; single activation succeeds
             mock_resolve.assert_called_once_with("pkg.Mod:GoodPlatform")
+
+
+# ---------------------------------------------------------------------------
+# Platform Discovery: SGLANG_USE_CPU_ENGINE opt-in
+# ---------------------------------------------------------------------------
+
+
+class TestCpuEngineOptIn(CustomTestCase):
+    """SGLANG_USE_CPU_ENGINE=1 must not select the CPU engine on an XPU host.
+
+    The XPU wheel exports none of the `*_cpu` ops the CPU engine imports at
+    module scope, so honoring the opt-in there turned `import
+    sglang.srt.entrypoints.engine` into an ImportError. One case per reader of
+    the flag: kernel dispatch and platform resolution.
+    """
+
+    def tearDown(self):
+        is_cpu.cache_clear()
+
+    def test_is_cpu_ignores_opt_in_when_xpu_present(self):
+        is_cpu.cache_clear()
+        with patch("sglang.srt.utils.common.is_xpu", return_value=True):
+            with envs.SGLANG_USE_CPU_ENGINE.override("1"):
+                self.assertFalse(is_cpu())
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms._is_xpu_available")
+    def test_resolve_platform_prefers_xpu_over_opt_in(
+        self, mock_is_xpu, mock_is_cuda, mock_load
+    ):
+        mock_is_cuda.return_value = False
+        mock_is_xpu.return_value = True
+        mock_load.return_value = {}
+        with envs.SGLANG_PLATFORM.override(""):
+            with envs.SGLANG_USE_CPU_ENGINE.override("1"):
+                result = _resolve_platform()
+        self.assertIsInstance(result, XpuSRTPlatform)
 
 
 # ---------------------------------------------------------------------------
