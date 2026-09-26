@@ -179,6 +179,8 @@ class WeightChecker:
             # reset must skip exactly what compare skips
             if _is_skip_weight_check(name, param, skip_tensor_list):
                 continue
+            if getattr(param, "_skip_weight_check", False):
+                continue
             param.copy_(_random_like(param))
 
     def _compare(
