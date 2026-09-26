@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from test_ppu_trend_pipeline_unit import SCRIPTS, row, save
 from test_ppu_quality_trend_unit import KITS, PACKAGE, answer_report, register_cpu_ci
+from test_ppu_trend_pipeline_unit import SCRIPTS, row, save
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
