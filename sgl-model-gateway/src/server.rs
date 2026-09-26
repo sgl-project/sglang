@@ -1,3 +1,4 @@
+use crate::chat_validation::SglangChatRequest;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -40,7 +41,6 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -184,7 +184,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(SglangChatRequest(body)): ValidatedJson<SglangChatRequest>,
 ) -> Response {
     state
         .router
