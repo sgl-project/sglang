@@ -409,6 +409,12 @@ class QuarkConfig(QuantizationConfig):
             and len(block_size) == 2
             and input_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
             and input_config.get("is_dynamic") is True
+            # Block-FP8 reads one activation scale per weight block column.
+            # A different grouping is a different numerical format, so fall
+            # through rather than silently reinterpreting the checkpoint.
+            and input_config.get("qscheme") == "per_group"
+            and input_config.get("ch_axis", -1) == -1
+            and input_config.get("group_size") == block_size[1]
         ):
             return None
 

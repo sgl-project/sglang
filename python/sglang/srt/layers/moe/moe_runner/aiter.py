@@ -307,7 +307,7 @@ class AiterRunnerCore(MoeRunnerCore):
         elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+            # Clamped MXFP4 paths need an explicit gate/up layout.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
             # lives elsewhere / is absent.

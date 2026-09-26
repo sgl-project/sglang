@@ -12,11 +12,13 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
+_OUTPUT_RTOL = 2 * torch.finfo(torch.bfloat16).eps
 
 _CASES = [
     (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
@@ -29,10 +31,19 @@ _CASES = [
     (1, 4, 8, 8, 64, 64, 4, True, None, False, 8),
 ]
 
-# ReplaySSM ring-write cases: _CASES plus HV != H shapes, which exercise the
+_RING_CASES = list(_CASES)
+
+_CASES += [
+    # GLM-5.3 Flash TP4: 16 local heads, six-token EAGLE verification,
+    # and a negative safe-gate lower bound.
+    (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 9),
+    (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
+]
+
+# ReplaySSM ring-write cases add HV != H shapes, which exercise the
 # per-k-head rawk vs per-v-head g/beta writer split (the GQA hazard: a wrong
 # head index scribbles another head's ring silently).
-_RING_CASES = _CASES + [
+_RING_CASES += [
     (2, 4, 2, 4, 128, 128, 4, True, None, False, 20),
     (1, 5, 2, 8, 64, 64, 4, True, 1.5, False, 21),
     (3, 4, 4, 8, 128, 128, 4, True, None, True, 22),
@@ -59,17 +70,37 @@ def _make_ring_buffers(H, HV, K, V):
     }
 
 
-def _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed):
+def _assert_output_matches_reference(actual, reference):
+    # The tuned multi-warp fused reduction can cross a BF16 rounding boundary
+    # relative to the one-warp reference. Non-reduction cache checks stay exact.
+    torch.testing.assert_close(
+        actual.float(), reference.float(), rtol=_OUTPUT_RTOL, atol=1e-6
+    )
+
+
+def _make_inputs(
+    B,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    W,
+    has_bias,
+    neg_slot,
+    seed,
+    weight_dtype=torch.bfloat16,
+):
     torch.manual_seed(seed)
     dim = 2 * H * K + HV * V
     seq_len = B * T
-    lines = slots = 8
+    lines = slots = max(8, B + 2)
 
     inputs = {
         "mixed": torch.randn(seq_len, dim, device=_DEVICE, dtype=torch.bfloat16) * 0.5,
-        "w": torch.randn(dim, W, device=_DEVICE, dtype=torch.bfloat16) * 0.3,
+        "w": torch.randn(dim, W, device=_DEVICE, dtype=weight_dtype) * 0.3,
         "bias": (
-            torch.randn(dim, device=_DEVICE, dtype=torch.bfloat16) * 0.1
+            torch.randn(dim, device=_DEVICE, dtype=weight_dtype) * 0.1
             if has_bias
             else None
         ),
@@ -185,7 +216,7 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
         head_k_dim=K,
         head_v_dim=V,
         lower_bound=lower_bound,
-        num_warps=num_warps,
+        **({"num_warps": num_warps} if num_warps is not None else {}),
         cache_ring=rings is not None,
         replayssm_rawv=rings["rawv"] if rings is not None else None,
         replayssm_rawk=rings["rawk"] if rings is not None else None,
@@ -195,9 +226,9 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
     return o, conv, win, ic
 
 
-def _compare_case(case, num_warps, use_ring=False):
+def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloat16):
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
-    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
     if use_ring:
         template = _make_ring_buffers(H, HV, K, V)
         rings_ref = {name: buf.clone() for name, buf in template.items()}
@@ -216,8 +247,7 @@ def _compare_case(case, num_warps, use_ring=False):
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    # One bf16 ulp: the fused and reference tiles reduce K in different orders.
-    torch.testing.assert_close(o_fus_v, o_ref_v, rtol=2**-7, atol=1e-7)
+    _assert_output_matches_reference(o_fus_v, o_ref_v)
     # conv_state is read-only in verify; the commit scatter advances it.
     assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
@@ -239,11 +269,32 @@ def test_matches_unfused_reference(case):
     _compare_case(case, num_warps=4)
 
 
+@pytest.mark.parametrize("case_index", [8, 9])
+def test_glm_fp32_weights_match_unfused_reference(case_index):
+    _compare_case(_CASES[case_index], weight_dtype=torch.float32)
+
+
+@pytest.mark.skipif(not torch.version.hip, reason="ROCm default launch shape")
+@pytest.mark.parametrize("case_index", [8, 9])
+def test_glm_fp32_weights_bit_exact_on_rocm(case_index):
+    # One wave keeps the reference reduction order and separately rounded
+    # conv products keep LLVM from contracting them into FMAs.
+    B, T, H, HV, K, V, W, bias, lower, neg_slot, seed = _CASES[case_index]
+    inp = _make_inputs(B, T, H, HV, K, V, W, bias, neg_slot, seed, torch.float32)
+    o_ref, _, _, ic_ref = _run_reference(inp, B, T, H, HV, K, V, lower)
+    o_fus, _, _, ic_fus = _run_fused(inp, B, T, H, HV, K, V, lower, None)
+    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
+    assert torch.equal(
+        o_fus.reshape(B, T, HV, V)[valid], o_ref.reshape(B, T, HV, V)[valid]
+    )
+    assert torch.equal(ic_fus[valid], ic_ref[valid])
+
+
 def test_output_does_not_depend_on_cta_scheduling():
     """The verify output must not change with how the CTAs happen to be
     scheduled. H=1 with HV=16 shares one Q/K history across 16 V tiles."""
-    if torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("green contexts need SM90 or newer")
+    if torch.version.hip or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("green contexts need CUDA SM90 or newer")
     from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 
     case = (1, 6, 1, 16, 128, 128, 4, False, None, False, 1)

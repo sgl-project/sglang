@@ -122,7 +122,7 @@ def _gather_index_k_scale_prefix_into_kernel(
     token_id = tl.program_id(0)
     page_idx = token_id // PAGE_SIZE
     token_offset_in_page = token_id % PAGE_SIZE
-    page = tl.load(page_indices_ptr + page_idx)
+    page = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM

@@ -386,6 +386,18 @@ class TestQuarkPerLayerBlockFp8(CustomTestCase):
 
         self.assertIsNone(QuarkConfig._get_block_fp8_config(layer_config, {}))
 
+    def test_mismatched_activation_grouping_is_not_treated_as_block_fp8(self):
+        for field, value in (
+            ("group_size", 64),
+            ("qscheme", "per_tensor"),
+            ("ch_axis", 0),
+        ):
+            with self.subTest(field=field):
+                layer_config = deepcopy(self._BLOCK_FP8_CONFIG)
+                layer_config["input_tensors"][field] = value
+
+                self.assertIsNone(QuarkConfig._get_block_fp8_config(layer_config, {}))
+
     def test_unmatched_layer_still_uses_global_quark_config(self):
         config = self._build_bare_config()
         config.apply_weight_name_mapper(

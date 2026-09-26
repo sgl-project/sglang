@@ -34,6 +34,7 @@ from sglang.srt.layers.communicator import (
     reduce_output,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -314,11 +315,14 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             swiglu_limit=vision_config.swiglu_limit,
         )
 
-        self.downsample = nn.Conv2d(
+        # These non-overlapping patches are equivalent to unfold + linear and
+        # avoid MIOpen's expensive per-shape convolution search on ROCm.
+        self.downsample = Conv2dLayer(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
+            disable_linear=False,
         )
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
@@ -1559,8 +1563,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def maybe_map_fp8_block_scale_name(name: str) -> str:
-            if name.endswith("weight_scale"):
-                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+            # Quark stores dequantization scales without native block-FP8's
+            # "_inv" suffix, including fused w13/w2 expert parameters.
+            if name not in params_dict and name.endswith("weight_scale"):
+                candidate = name + "_inv"
                 if candidate in params_dict:
                     return candidate
             return name

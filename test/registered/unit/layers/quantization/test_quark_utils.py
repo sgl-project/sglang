@@ -48,6 +48,18 @@ class TestShouldIgnoreLayer(CustomTestCase):
         mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
         self.assertFalse(should_ignore_layer(layer, (), mapping))
 
+    def test_one_shot_iterator_of_excludes_is_reusable(self):
+        # `ignore` is typed Iterable and scanned several times, so a generator
+        # or other one-shot iterator must not test empty after the first pass.
+        layer = "model.layers.0.self_attn.qkv_proj"
+        mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        shards = [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+        ]
+        self.assertTrue(should_ignore_layer(layer, iter(shards), mapping))
+
     def test_mixed_schemes_raise(self):
         # Safety net preserved: if a fused module genuinely mixes excluded and
         # quantized shards, the loader must fail loudly rather than guess.

@@ -280,6 +280,29 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_range.length, 4096)
 
+    def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
+        # A Mamba checkpoint only lands on a page-aligned chunk end, so an
+        # off-grid chunk leaves the rest of the prompt uncacheable.
+        self.mock_token_allocator.available_size.return_value = 32768
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        for supports_mamba, expected in ((False, 100), (True, 64)):
+            with (
+                self.subTest(supports_mamba=supports_mamba),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
+            ):
+                self.mock_tree_cache.supports_mamba.return_value = supports_mamba
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+                )
+                req = self.create_shared_req("chunked")
+                req.full_untruncated_fill_ids = list(range(300))
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(req.extend_range.length, expected)
+
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
         first, second = (

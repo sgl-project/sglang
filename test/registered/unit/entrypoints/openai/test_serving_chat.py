@@ -1162,6 +1162,23 @@ class ServingChatTestCase(unittest.TestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    def test_glm47_without_tools_has_no_tool_call_constraint(self):
+        """A plain GLM47 chat must not get the full-assistant EBNF: its
+        terminal state finishes the request even under ignore_eos."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertIsNone(processed.tool_call_constraint)
+
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
         self.template_manager.chat_template_name = None

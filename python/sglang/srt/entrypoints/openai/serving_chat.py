@@ -1128,12 +1128,12 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        # A lossy text round-trip makes the rendered prompt unusable, so send the
-        # ids instead. Only when nothing needs placeholder expansion: with media
-        # attached the MM processor still has to tokenize the text itself.
+        # Send the ids already encoded while rendering: re-tokenizing long text
+        # prompts is costly, and a lossy text round-trip makes the text unusable.
+        # Only when nothing needs placeholder expansion: with media attached the
+        # MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
-            and isinstance(processed_messages.prompt_ids, list)
+            isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
             and not (
                 processed_messages.image_data
@@ -1322,8 +1322,12 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        # Only tool-bearing requests get the full-assistant EBNF: its terminal
+        # state finishes a request even under ignore_eos.
+        glm_constraint = (
+            self.tool_call_parser == "glm47"
+            and bool(effective_tools)
+            and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
