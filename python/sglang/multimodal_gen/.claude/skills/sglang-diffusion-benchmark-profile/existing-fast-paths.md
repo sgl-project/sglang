@@ -49,6 +49,11 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/qwen_image21_vae_cuda_opt.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/conv_fold.py`
+- `python/sglang/kernels/ops/diffusion/norm/channel_rmsnorm_finish_silu_jit.py`
+- `python/sglang/kernels/ops/diffusion/norm/channel_rmsnorm_silu_nhwc_jit.py`
+- `python/sglang/kernels/ops/diffusion/elementwise/bias_residual_add_jit.py`
 - `python/sglang/multimodal_gen/runtime/breakable_cuda_graph/runner.py`
 - `test/registered/kernels/ops/diffusion/test_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_norm.py`
@@ -125,7 +130,9 @@ framework-specific optimization workflow.
   decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan / Qwen-Image
   VAE RMSNorm+SiLU (the Qwen-Image VAE is the Wan 2.1 VAE; its gate also
   re-expresses the `Resample` upsample input with canonical NHWC strides so
-  the 2D conv runs channels_last end-to-end).
+  the 2D conv runs channels_last end-to-end), and the Qwen-Image 2.1 VAE
+  channels_last decode with its NHWC channel RMSNorm + SiLU kernel
+  (pattern 18).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test/registered/kernels/ops/diffusion/test_sites.py`,
@@ -285,6 +292,38 @@ framework-specific optimization workflow.
   calls plus scatter/mask/final-topk launches, check the score dtype,
   contiguity, group layout, and platform before proposing another router
   kernel.
+
+18. Qwen-Image 2.1 VAE decode
+- Kernels: `channel_rmsnorm_finish_silu`, `channel_rmsnorm_silu_nhwc`,
+  `bias_residual_add`, and `dup_up3d_add`'s bias input.
+- Locations: `norm/channel_rmsnorm_finish_silu_jit.py`,
+  `norm/channel_rmsnorm_silu_nhwc_jit.py`,
+  `elementwise/bias_residual_add_jit.py` (with their `.cuh` files),
+  `layout/wan_causal_cache_triton.py`, `vaes/conv_fold.py`, and
+  `runtime/models/vaes/qwen_image21_vae_cuda_opt.py` (mounted from
+  `optimize_vae` in `platforms/cuda.py`).
+- Default-on and bit-exact: the decoder's channel RMSNorm keeps the aten fp32
+  `norm(dim=1)` reduction and fuses only the pointwise finish
+  (`max(norm, 1e-12)`, divide, scale, gamma, `+0.0`) with SiLU; the causal
+  convs fold their symmetric `F.pad` into the conv padding, verified per
+  (dtype, shape, stride) signature because cuDNN may pick another algorithm;
+  aten's separate conv-bias pass disappears for each residual block's second
+  conv (`bias_residual_add` applies bias and residual in one pass) and for the
+  upsampler conv (`dup_up3d_add` takes the bias on the shortcut add).
+- Under `quality=extra-high` / `high` (`VaeFastPathGate`, decode scoped): the
+  decoder switches to channels_last, the channel RMSNorm + SiLU runs as one
+  lane-group-per-pixel NHWC kernel (own fp32 reduction order, not bit-exact)
+  that also takes the first conv's bias, and the nearest 2x upsample + conv3x3
+  of each upsampler becomes one ConvTranspose2d(k4, s2, p1) with fp32-folded
+  weights (`conv_fold.py`, shared with FLUX.2); leaving the scope restores the
+  NCHW parameter layout. Measured on one SM120 GPU at 1024x1024: decode
+  186.0 ms -> 159.8 ms (lossless) -> 100.4 ms (extra-high), RGBA PSNR 59 dB and
+  SSIM > 0.9999 against the lossless image. The remaining extra-high decode is
+  ~80% cuDNN conv time (the last up block runs six 3x3 convs at 1024x1024).
+- Validation: `test/registered/kernels/ops/diffusion/test_channel_rmsnorm_finish_silu.py`,
+  `test_channel_rmsnorm_silu_nhwc.py`, `test_bias_residual_add.py`, the
+  `dup_up3d_add` bias case in `test_layout.py`, and
+  `test_qwen_image21_vae_fast_paths.py`.
 
 **Faster CUDA Kernel Usage Points**
 

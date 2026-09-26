@@ -28,6 +28,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
+    fold_upsample2x_conv2d_weight,
+)
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     register_vae_fast_path_gate,
@@ -134,25 +137,7 @@ def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
 # ---------------------------------------------------------------------------
 
 # Which 3x3 conv taps sum into each 4x4 transposed-conv tap (per spatial axis).
-_UPSAMPLE_TAP_MAP = {0: (2,), 1: (1, 2), 2: (0, 1), 3: (0,)}
-
-
-def _fold_upsample2x_conv2d_weight(conv: nn.Conv2d) -> torch.Tensor:
-    """Sum the 3x3 conv taps into the equivalent ConvTranspose2d(k4) kernel."""
-    w = conv.weight.detach().float()  # [Cout, Cin, 3, 3]
-    cout, cin = w.shape[:2]
-    wt = w.new_zeros(cin, cout, 4, 4)  # ConvTranspose2d layout
-    for a in range(4):
-        for b in range(4):
-            acc = w.new_zeros(cout, cin)
-            for i in _UPSAMPLE_TAP_MAP[a]:
-                for j in _UPSAMPLE_TAP_MAP[b]:
-                    acc += w[:, :, i, j]
-            wt[:, :, a, b] = acc.t()
-    wt = wt.to(conv.weight.dtype)
-    if conv.weight.is_contiguous(memory_format=torch.channels_last):
-        wt = wt.contiguous(memory_format=torch.channels_last)
-    return wt.to(conv.weight.device)
+_fold_upsample2x_conv2d_weight = fold_upsample2x_conv2d_weight
 
 
 class FusedUpsample2xConv2d(nn.Module):
