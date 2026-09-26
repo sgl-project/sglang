@@ -44,7 +44,7 @@ const SKIP_SPECIAL_TOKENS: bool = true;
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens).
 pub trait StreamDecoder: Send {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error>;
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error>;
 }
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
@@ -53,7 +53,7 @@ struct DynamoDecoder {
 }
 
 impl StreamDecoder for DynamoDecoder {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error> {
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error> {
         let mut out = String::new();
         for &id in token_ids {
             if let Some(chunk) = self
@@ -575,7 +575,7 @@ mod tests {
         table.insert(Rid::from("bob"), state(tx_b));
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
 
-        let chunk = |rid: &str, id: i32| ChunkEvent {
+        let chunk = |rid: &str, id: i64| ChunkEvent {
             rid: Rid::from(rid.to_string()),
             token_ids: vec![id],
             ..Default::default()
@@ -615,7 +615,7 @@ mod tests {
     fn final_chunk(
         no_stop_trim: bool,
         finish_reason: serde_json::Value,
-        ids: Vec<i32>,
+        ids: TokenIds,
     ) -> ChunkEvent {
         let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();

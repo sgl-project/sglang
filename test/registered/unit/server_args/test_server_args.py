@@ -577,6 +577,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("4 tokenizer worker", output)
 
     @override_platform(is_cuda=True)
+    def test_cuda_ipc_rejects_multi_node(self):
+        """CUDA IPC handles are node-local, so an explicit cuda_ipc on a
+        multi-node layout must be refused at resolution rather than boot a
+        server whose second node can never open the pool."""
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "cuda_ipc only supports a single node"):
+            handle_multimodal_feature_transport(server_args)
+
+    @override_platform(is_cuda=True)
     def test_explicit_cpu_overrides_legacy_environment(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
 

@@ -5265,6 +5265,9 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if self.rust_server is not None:
+            ret["rust_mm_transport"] = self.rust_server.mm_transport_stats()
+
         if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:

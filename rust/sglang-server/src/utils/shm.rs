@@ -1,0 +1,208 @@
+//! POSIX shared-memory segments (`shm_open` family) via `rustix`.
+//!
+//! `rustix` over raw `libc`: it hands back an `OwnedFd` (closed on every
+//! path for free), takes a `u64` length so the `off_t` width never matters,
+//! and widens `mode_t` for the variadic `shm_open` on Apple where the raw
+//! call would be UB.
+
+use std::os::fd::{AsFd, BorrowedFd};
+
+use rustix::fs::{FallocateFlags, Mode, fallocate, ftruncate};
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+use rustix::shm::{OFlags, open, unlink};
+
+/// Reserve `len` bytes of backing pages for a fresh segment, so a full
+/// `/dev/shm` surfaces here as `ENOSPC` instead of as a `SIGBUS` on the first
+/// write into the mapping. `ftruncate` only sets the length; tmpfs allocates
+/// pages lazily at write time. Mirrors Python's `posix_fallocate` in
+/// `ShmPointerMMData`. Injectable so tests can stand in for an exhausted tmpfs.
+pub type Reserve = fn(BorrowedFd<'_>, u64) -> rustix::io::Result<()>;
+
+/// The real reservation.
+pub fn reserve_pages(fd: BorrowedFd<'_>, len: u64) -> rustix::io::Result<()> {
+    fallocate(fd, FallocateFlags::empty(), 0, len)
+}
+
+/// A named POSIX shared-memory segment owning its name: dropped -> unlinked.
+///
+/// Written by an MM worker so the TP broadcast carries a ~100-byte
+/// `ShmPointerMMData` stub instead of the ~20 MB feature tensor, and every
+/// rank maps it in parallel. Python's `materialize()` unlinks after cloning;
+/// this `Drop` covers the paths where the buffers never reach Python (request
+/// rejected after encoding, or dropped at shutdown).
+#[derive(Debug)]
+pub struct ShmSegment {
+    name: String,
+}
+
+impl ShmSegment {
+    /// Create the segment `name` holding exactly `bytes`. No leading slash --
+    /// the name must suit Python's `SharedMemory(name=...)` (shm_open adds one).
+    pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
+        Self::create_with(name, bytes, reserve_pages)
+    }
+
+    /// [`create`](Self::create) with the page reservation step supplied, so a
+    /// test can make it fail the way a full `/dev/shm` does. Every failure
+    /// after `shm_open` unlinks the segment on the way out (`segment` drops).
+    pub fn create_with(name: String, bytes: &[u8], reserve: Reserve) -> Result<Self, String> {
+        // Rejected before anything is opened: mmap refuses length 0.
+        if bytes.is_empty() {
+            return Err(format!("shm({name}): empty payload"));
+        }
+        let fd = open(
+            format!("/{name}"),
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| format!("shm_open({name}): {e}"))?;
+        let segment = Self { name }; // unlink from here on any failure
+        ftruncate(&fd, bytes.len() as u64)
+            .map_err(|e| format!("ftruncate({}): {e}", segment.name))?;
+        // Must precede the copy below: an unreserved page that cannot be
+        // allocated at write time kills the process instead of erroring.
+        reserve(fd.as_fd(), bytes.len() as u64)
+            .map_err(|e| format!("fallocate({}): {e}", segment.name))?;
+        // SAFETY: a fresh mapping independent of any existing allocation,
+        // unmapped below before `fd` drops.
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                ProtFlags::WRITE,
+                MapFlags::SHARED,
+                &fd,
+                0,
+            )
+        }
+        .map_err(|e| format!("mmap({}): {e}", segment.name))?;
+        // SAFETY: `ptr` is a writable mapping of exactly `bytes.len()` bytes
+        // that cannot overlap `bytes`; nothing references it after the unmap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            let _ = munmap(ptr, bytes.len());
+        }
+        Ok(segment)
+    }
+
+    /// The name as Python's `SharedMemory(name=...)` sees it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Hand the segment -- and the duty to unlink -- to the caller (Python, at
+    /// drain time).
+    pub fn into_name(self) -> String {
+        std::mem::take(&mut std::mem::ManuallyDrop::new(self).name)
+    }
+}
+
+impl Drop for ShmSegment {
+    fn drop(&mut self) {
+        // ENOENT (already unlinked by Python's materialize) is fine to ignore.
+        let _ = unlink(format!("/{}", self.name));
+    }
+}
+
+/// Unique segment names: the pid separates server restarts (a crash can leak
+/// segments under the old pid), the counter separates segments within one.
+/// `tag` says who made it, for anyone listing `/dev/shm`.
+pub fn unique_name(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sgl-{tag}-{}-{n}", std::process::id())
+}
+
+/// Test helper: where Linux exposes the segment as a file.
+#[cfg(test)]
+pub fn shm_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new("/dev/shm").join(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_name() -> String {
+        unique_name("test")
+    }
+
+    /// The segment holds exactly the written bytes and dropping it unlinks --
+    /// the leak guard for results purged before Python takes them.
+    #[test]
+    fn segment_roundtrip_and_drop_unlinks() {
+        let name = test_name();
+        let payload: Vec<u8> = (0..255u8).collect();
+        let segment = ShmSegment::create(name.clone(), &payload).unwrap();
+        assert_eq!(segment.name(), name);
+        assert_eq!(std::fs::read(shm_path(&name)).unwrap(), payload);
+        drop(segment);
+        assert!(!shm_path(&name).exists(), "drop must unlink");
+    }
+
+    /// An empty payload is refused before the segment exists: nothing to
+    /// map, nothing left in `/dev/shm`.
+    #[test]
+    fn empty_payload_is_rejected_without_a_segment() {
+        let name = test_name();
+        let err = ShmSegment::create(name.clone(), &[]).unwrap_err();
+        assert!(err.contains("empty payload"), "{err}");
+        assert!(!shm_path(&name).exists(), "no segment may be created");
+    }
+
+    /// `into_name` transfers the unlink duty to the caller (Python's
+    /// `materialize()`), so the segment must survive the handoff.
+    #[test]
+    fn into_name_disarms_the_unlink() {
+        let segment = ShmSegment::create(test_name(), &[1, 2, 3]).unwrap();
+        let name = segment.into_name();
+        assert!(shm_path(&name).exists(), "handoff must not unlink");
+        unlink(format!("/{name}")).unwrap(); // manual cleanup for the test
+    }
+
+    /// A full `/dev/shm` is an `Err`, reached before any byte is written into
+    /// the mapping (where it would be a fatal `SIGBUS`), and the half-made
+    /// segment is unlinked on the way out.
+    #[test]
+    fn exhausted_shm_is_an_error_and_leaves_nothing() {
+        fn no_space(_: BorrowedFd<'_>, _: u64) -> rustix::io::Result<()> {
+            Err(rustix::io::Errno::NOSPC)
+        }
+        let name = test_name();
+        let err = ShmSegment::create_with(name.clone(), &[1, 2, 3], no_space).unwrap_err();
+        assert!(err.starts_with("fallocate("), "{err}");
+        assert!(err.contains("No space left"), "{err}");
+        assert!(
+            !shm_path(&name).exists(),
+            "partial segment must be unlinked"
+        );
+    }
+
+    /// The real reservation is what `create` runs: a segment it made is fully
+    /// backed, so a later write cannot fault.
+    #[test]
+    fn create_reserves_backing_pages() {
+        let name = test_name();
+        let payload = vec![7u8; 4096 * 3];
+        let segment = ShmSegment::create(name.clone(), &payload).unwrap();
+        let meta = std::fs::metadata(shm_path(&name)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert!(
+            meta.blocks() * 512 >= payload.len() as u64,
+            "blocks={}",
+            meta.blocks()
+        );
+        drop(segment);
+    }
+
+    /// A name that is already taken is an error, not a silent overwrite of
+    /// another result's segment.
+    #[test]
+    fn duplicate_name_is_rejected() {
+        let name = test_name();
+        let _first = ShmSegment::create(name.clone(), &[1]).unwrap();
+        let err = ShmSegment::create(name, &[2]).unwrap_err();
+        assert!(err.starts_with("shm_open("), "{err}");
+    }
+}
