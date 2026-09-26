@@ -140,6 +140,16 @@ class _OngoingWriteThrough(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _NodeBackupSpec(NamedTuple):
+    """One node's pending D->H backup: its transfers and the lock it holds."""
+
+    node_id: NodeId
+    lock_params: Optional[DecLockRefParams]
+    device_value: torch.Tensor
+    comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    publish_node_ids: list[NodeId]
+
+
 class _OngoingLoadBack(NamedTuple):
     """Tracks an in-flight H→D load-back operation."""
 
@@ -257,6 +267,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self._batch_write_through = (
+            envs.SGLANG_ENABLE_HICACHE_BATCHED_WRITE_THROUGH.get()
+        )
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -375,6 +388,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        # Write-through backups accepted during a scheduler step (each node
+        # locked so it stays device-resident) and executed as one batch by the
+        # step's flush_pending_backups; ancestors before children.
+        self.queued_backups: dict[NodeId, Optional[DecLockRefParams]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -1323,7 +1340,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
             else:
-                self._execute_and_commit_kv_backup(action)
+                self._queue_write_through_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1587,27 +1604,83 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         written = 0
         for node_id in action.node_ids:
-            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            # Overlapping chain actions may revisit nodes with Full KV already
-            # backed up. Skip only when no transfer remains.
-            if device_value.numel() == 0 and not comp_xfers:
+            spec = self._build_node_backup_spec(node_id, lock_params=None)
+            if spec is None:
                 continue
-            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
-            host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
-            )
-            if host_indices is None:
+            node_written = self._backup_specs([spec], write_back=write_back)
+            if node_written is None:
                 return 0
-            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
-            lock_params = None
-            if not write_back:
-                lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
-            self._track_write_through_node(
-                node_id, lock_params, publish_node_ids=publish_node_ids
-            )
-            written = len(host_indices)
+            written = node_written
         return written
+
+    def _build_node_backup_spec(
+        self, node_id: NodeId, lock_params: Optional[DecLockRefParams]
+    ) -> Optional[_NodeBackupSpec]:
+        """Read what a node still needs backed up; None (lock released) when nothing."""
+        device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+        # Overlapping chain actions may revisit nodes with Full KV already
+        # backed up. Skip only when no transfer remains.
+        if device_value.numel() == 0 and not comp_xfers:
+            if lock_params is not None:
+                self.dec_lock_ref(node_id, lock_params)
+            return None
+        return _NodeBackupSpec(
+            node_id,
+            lock_params,
+            device_value,
+            comp_xfers,
+            self._backup_publish_node_ids(node_id, comp_xfers),
+        )
+
+    def _backup_specs(
+        self, specs: list[_NodeBackupSpec], *, write_back: bool = False
+    ) -> Optional[int]:
+        """Back disjoint nodes up with one host allocation per pool and one D->H
+        op, then commit and track each node. Returns the Full KV tokens written,
+        or None when the host allocation failed (the nodes' locks stay held)."""
+        device_value = specs[0].device_value
+        comp_xfers = specs[0].comp_xfers
+        parts: dict[tuple[ComponentType, PoolName], list[PoolTransfer]] = {}
+        merged: dict[tuple[ComponentType, PoolName], PoolTransfer] = {}
+        if len(specs) > 1:
+            device_value = torch.cat([spec.device_value for spec in specs])
+            for spec in specs:
+                for component_type, transfers in spec.comp_xfers.items():
+                    for transfer in transfers:
+                        key = (component_type, transfer.name)
+                        parts.setdefault(key, []).append(transfer)
+            comp_xfers = {}
+            for key, transfers in parts.items():
+                merged[key] = PoolTransfer(
+                    name=key[1],
+                    device_indices=torch.cat([t.device_indices for t in transfers]),
+                )
+                comp_xfers.setdefault(key[0], []).append(merged[key])
+        host_indices = self._execute_kv_backup(
+            [spec.node_id for spec in specs],
+            device_value,
+            comp_xfers,
+            self._build_backup_sidecar(device_value, comp_xfers),
+        )
+        if host_indices is None:
+            return None
+        # Hand each node its slice of every merged host allocation.
+        for key, transfers in parts.items():
+            sizes = [len(t.device_indices) for t in transfers]
+            for transfer, host_slice in zip(
+                transfers, merged[key].host_indices.split(sizes)
+            ):
+                transfer.host_indices = host_slice
+        sizes = [len(spec.device_value) for spec in specs]
+        for spec, host_slice in zip(specs, host_indices.split(sizes)):
+            self.tree_core.commit_backup(spec.node_id, host_slice, spec.comp_xfers)
+            lock_params = spec.lock_params
+            if not write_back and lock_params is None:
+                lock_params = self.inc_lock_ref(spec.node_id).to_dec_params()
+            self._track_write_through_node(
+                spec.node_id, lock_params, publish_node_ids=spec.publish_node_ids
+            )
+        return len(host_indices)
 
     @staticmethod
     def _backup_publish_node_ids(
@@ -1629,8 +1702,8 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
-        """Execute Backup action."""
+    def _execute_kv_backup(self, node_ids, device_value, comp_xfers, sidecar_xfers):
+        """Allocate host slots and queue one D->H op that acks every node_ids entry."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
         if (
@@ -1646,7 +1719,7 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
+            device_value, extra_pools=aux_xfers or None, flush=False, node_ids=node_ids
         )
 
     def _track_write_through_node(
@@ -3273,6 +3346,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
+            self._drain_queued_backups()
             cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
@@ -3487,10 +3561,56 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
-        """Submit pending D2H backups as a merged operation."""
+        """Back the step's queued write-through nodes up as a batch and submit
+        them, with anything else queued, as one merged D2H operation."""
         if self.linker is not None or self.cache_controller is None:
             return
+        if self.queued_backups:
+            self._drain_queued_backups()
         self.cache_controller.start_writing()
+
+    def _queue_write_through_backup(self, action: BackupKV) -> None:
+        """With batching on, lock the action's nodes now and leave the host
+        alloc, transfer build and submit to this step's flush_pending_backups;
+        otherwise back them up right here."""
+        if self.buffer_pipeline is not None or not self._batch_write_through:
+            self._execute_and_commit_kv_backup(action)
+            return
+        for node_id in action.node_ids:
+            if node_id in self.queued_backups or node_id in self.ongoing_write_through:
+                continue
+            self.queued_backups[node_id] = self.inc_lock_ref(node_id).to_dec_params()
+
+    def _drain_queued_backups(self) -> None:
+        """Execute every queued backup, oldest first, in as few batches as the
+        SWA windows allow."""
+        batch: list[_NodeBackupSpec] = []
+        covered: set[NodeId] = set()
+        while self.queued_backups:
+            node_id = next(iter(self.queued_backups))
+            lock_params = self.queued_backups.pop(node_id)
+            spec = self._build_node_backup_spec(node_id, lock_params)
+            if spec is not None and not covered.isdisjoint(spec.publish_node_ids):
+                # A node already in the batch sits in this one's SWA window; commit
+                # the batch so the rebuilt spec sees it backed up, as node by node would.
+                self._backup_queued_batch(batch)
+                batch, covered = [], set()
+                spec = self._build_node_backup_spec(node_id, lock_params)
+            if spec is None:
+                continue
+            batch.append(spec)
+            covered.update(spec.publish_node_ids)
+        self._backup_queued_batch(batch)
+
+    def _backup_queued_batch(self, batch: list[_NodeBackupSpec]) -> None:
+        if not batch or self._backup_specs(batch) is not None:
+            return
+        # The merged host allocation failed: retry node by node, as the
+        # insert-time path would, and drop whatever still does not fit.
+        for spec in batch:
+            retry = self._build_node_backup_spec(spec.node_id, spec.lock_params)
+            if retry is not None and self._backup_specs([retry]) is None:
+                self.dec_lock_ref(spec.node_id, spec.lock_params)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
