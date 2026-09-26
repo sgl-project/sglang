@@ -349,6 +349,41 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
   }
 }
 
+__global__ __launch_bounds__(kThreadsPerBlock)  // prefill, row-mapped
+    void topk_transform_prefill_row_mapped_kernel(
+        const FastTopKParams params,
+        int32_t* __restrict__ dst_page_table,
+        const int32_t* __restrict__ src_page_table,
+        const int64_t src_stride,
+        const int32_t* __restrict__ row_to_page_table) {
+  const auto& [input, row_starts, _, lengths, input_stride] = params;
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = threadIdx.x;
+  const auto length = lengths[bid];
+  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
+  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto score = input + bid * input_stride;
+
+  // Direct indexing: each Q row maps to a batch row via row_to_page_table.
+  // No shared-memory scan of cu_seqlens_q needed.
+  const auto src_page_entry = src_page_table + row_to_page_table[bid] * src_stride;
+
+  if (length <= TopK) {
+    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
+  } else {
+    __shared__ int s_indices[TopK];
+    fast_topk_cuda_tl(score, s_indices, row_start, length);
+    static_assert(TopK % kThreadsPerBlock == 0);
+    static_assert(TopK / kThreadsPerBlock == 2);
+    const auto idx_0 = tid;
+    const auto pos_0 = s_indices[idx_0];
+    dst_page_entry[idx_0] = src_page_entry[pos_0];
+    const auto idx_1 = tid + kThreadsPerBlock;
+    const auto pos_1 = s_indices[idx_1];
+    dst_page_entry[idx_1] = src_page_entry[pos_1];
+  }
+}
+
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     void topk_transform_prefill_ragged_kernel(
         const FastTopKParams params,
@@ -459,50 +494,74 @@ void fast_topk_transform_interface(
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt) {
+    std::optional<at::Tensor> row_starts_opt,
+    std::optional<at::Tensor> row_to_page_table_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_page_table);
   CHECK_CUDA(src_page_table);
-  CHECK_CUDA(cu_seqlens_q);
   if (row_starts_opt.has_value()) {
     CHECK_CUDA(row_starts_opt.value());
   }
-  const auto params = get_params(score, lengths, row_starts_opt);
+
   const auto B = score.size(0);
+
+  // Shared shape checks
+  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1);
+  TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous());
+  TORCH_CHECK(lengths.size(0) == B);
   TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
-  TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
-  TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
-  const auto prefill_bs = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(dst_page_table.size(0) == B);
   TORCH_CHECK(dst_page_table.size(1) == TopK);
-  TORCH_CHECK(src_page_table.size(0) == prefill_bs);
-  TORCH_CHECK(prefill_bs <= B);  // prefill_bs should be smaller than expanded bs
+  TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
 
-  // launch kernel
+  const auto params = get_params(score, lengths, row_starts_opt);
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
   const auto src_stride = src_page_table.stride(0);
 
-  // dispatch to decode or prefill
-  // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
-  // decode: row_starts_opt is null, invokes the decode kernel
-  // target verify: row_starts_opt is null, invokes the prefill kernel
-  const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
-  if (is_decode) {
-    setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-    topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
-  } else {
-    setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-    topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
+  if (row_to_page_table_opt.has_value()) {
+    // Row-mapped path (chunk): no cu_seqlens_q scan needed.
+    const auto& rtp = row_to_page_table_opt.value();
+    CHECK_CUDA(rtp);
+    TORCH_CHECK(rtp.dim() == 1 && rtp.is_contiguous());
+    TORCH_CHECK(rtp.dtype() == at::kInt);
+    TORCH_CHECK(rtp.size(0) == B);
+    setup_kernel_smem_once<topk_transform_prefill_row_mapped_kernel, kSmem>();
+    topk_transform_prefill_row_mapped_kernel<<<grid, block, kSmem, stream>>>(
         params,
         dst_page_table.data_ptr<int32_t>(),
         src_page_table.data_ptr<int32_t>(),
         src_stride,
-        cu_seqlens_q.data_ptr<int32_t>(),
-        prefill_bs);
+        rtp.data_ptr<int32_t>());
+  } else {
+    // Legacy path: cu_seqlens_q scan
+    CHECK_CUDA(cu_seqlens_q);
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
+    const auto prefill_bs = cu_seqlens_q.size(0) - 1;
+    TORCH_CHECK(src_page_table.size(0) == prefill_bs);
+    TORCH_CHECK(prefill_bs <= B);
+
+    // dispatch to decode or prefill
+    // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
+    // decode: row_starts_opt is null, invokes the decode kernel
+    // target verify: row_starts_opt is null, invokes the prefill kernel
+    const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
+    if (is_decode) {
+      setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
+      topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
+          params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+    } else {
+      setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
+      topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
+          params,
+          dst_page_table.data_ptr<int32_t>(),
+          src_page_table.data_ptr<int32_t>(),
+          src_stride,
+          cu_seqlens_q.data_ptr<int32_t>(),
+          prefill_bs);
+    }
   }
 
   const auto result = cudaGetLastError();
