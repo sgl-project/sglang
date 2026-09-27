@@ -21,6 +21,7 @@ fn engine(id: &str, active: usize) -> Arc<Worker> {
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
         bootstrap_port: None,
+        version_group: None,
     }));
     engine.active_requests.store(active, Ordering::Relaxed);
     engine

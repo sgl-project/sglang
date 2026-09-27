@@ -235,6 +235,7 @@ mod tests {
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("stub-model".into())],
                     bootstrap_port: None,
+                    version_group: None,
                 })
                 .expect("worker accepted");
         }
@@ -354,6 +355,7 @@ mod tests {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: Some(8998),
+                version_group: None,
             })
             .expect("prefill accepted");
         ctx.registry
@@ -363,6 +365,7 @@ mod tests {
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: None,
+                version_group: None,
             })
             .expect("decode accepted");
 

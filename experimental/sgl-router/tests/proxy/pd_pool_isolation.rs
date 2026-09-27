@@ -117,6 +117,7 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            version_group: None,
         })
         .unwrap();
     registry
@@ -126,6 +127,7 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         })
         .unwrap();
     let prefill_worker = registry.get(&WorkerId("p1".into())).unwrap();
@@ -212,6 +214,7 @@ async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
         mode: WorkerMode::Decode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        version_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -265,6 +268,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -272,6 +276,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -338,6 +343,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("p2".into()),
@@ -345,6 +351,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -352,6 +359,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -359,6 +367,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -408,6 +417,7 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        version_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -434,6 +444,7 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         mode: WorkerMode::Prefill,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        version_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -462,6 +473,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -469,6 +481,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -476,6 +489,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            version_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -514,6 +528,7 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        version_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -524,4 +539,93 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         "plain-mode chat response must not carry x-sgl-decode-url; headers: {:?}",
         res.headers(),
     );
+}
+
+fn pd_spec(id: &str, url: &str, mode: WorkerMode, port: Option<u16>, group: &str) -> WorkerSpec {
+    WorkerSpec {
+        id: WorkerId(id.into()),
+        url: url.into(),
+        mode,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: port,
+        version_group: Some(group.into()),
+    }
+}
+
+/// Every PD request pairs a prefill with a decode from the same version group.
+/// The decode body's `bootstrap_port` names the prefill that was paired with it.
+#[tokio::test]
+async fn pd_mode_pairs_prefill_and_decode_within_version_group() {
+    use crate::common::mock_worker::MockWorker;
+    use std::collections::{HashMap, HashSet};
+
+    let prefill_v1 = MockWorker::start(vec![]).await;
+    let prefill_v2 = MockWorker::start(vec![]).await;
+    let decode_v1a = MockWorker::start(vec![]).await;
+    let decode_v1b = MockWorker::start(vec![]).await;
+    let decode_v2 = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        pd_spec(
+            "p-v1",
+            &prefill_v1.url,
+            WorkerMode::Prefill,
+            Some(1111),
+            "v1",
+        ),
+        pd_spec(
+            "p-v2",
+            &prefill_v2.url,
+            WorkerMode::Prefill,
+            Some(2222),
+            "v2",
+        ),
+        pd_spec("d-v1a", &decode_v1a.url, WorkerMode::Decode, None, "v1"),
+        pd_spec("d-v1b", &decode_v1b.url, WorkerMode::Decode, None, "v1"),
+        pd_spec("d-v2", &decode_v2.url, WorkerMode::Decode, None, "v2"),
+    ]);
+    let decodes: HashMap<&str, (&MockWorker, &str)> = [
+        (decode_v1a.url.as_str(), (&decode_v1a, "v1")),
+        (decode_v1b.url.as_str(), (&decode_v1b, "v1")),
+        (decode_v2.url.as_str(), (&decode_v2, "v2")),
+    ]
+    .into();
+    let app = build_router(ctx);
+
+    let mut groups_served = HashSet::new();
+    for _ in 0..12 {
+        let res = app.clone().oneshot(chat_request()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let decode_url = res.headers()["x-sgl-decode-url"].to_str().unwrap();
+        let (decode, decode_group) = decodes[decode_url];
+        let body = decode.captured.lock().unwrap().last_body.clone().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let prefill_group = match body["bootstrap_port"].as_u64() {
+            Some(1111) => "v1",
+            Some(2222) => "v2",
+            other => panic!("unexpected bootstrap_port {other:?}"),
+        };
+        assert_eq!(prefill_group, decode_group, "cross-group PD pairing");
+        groups_served.insert(decode_group);
+    }
+    assert_eq!(groups_served.len(), 2, "round robin must reach both groups");
+}
+
+/// Prefill and decode workers exist, but in different version groups: no pair
+/// is possible, so the request fails instead of crossing groups.
+#[tokio::test]
+async fn pd_mode_without_same_group_decode_returns_no_decode_workers_available() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        pd_spec("p-v1", &prefill.url, WorkerMode::Prefill, Some(8997), "v1"),
+        pd_spec("d-v2", &decode.url, WorkerMode::Decode, None, "v2"),
+    ]);
+
+    let res = build_router(ctx).oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "no_decode_workers_available",
+    );
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
 }

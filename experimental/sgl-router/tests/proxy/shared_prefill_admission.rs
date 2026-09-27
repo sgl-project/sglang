@@ -196,6 +196,7 @@ async fn fixture(
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: None,
+                version_group: None,
             })
             .unwrap();
     }
@@ -413,6 +414,7 @@ async fn chat_records_prefill_admission_exhausted_for_out_of_range_primary() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        version_group: None,
     }));
     let fixture = fixture(PolicyKind::SessionAware, |_| {
         Arc::new(InvalidPairPolicy {

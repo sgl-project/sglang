@@ -51,6 +51,22 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+To run two engine versions side by side in PD mode (e.g. during a rollout),
+pass `--pd-version-group-label <key>`. The router then pairs a prefill worker
+only with a decode worker that has the same value for that label, so KV is never
+transferred across versions. The label is read from the EndpointSlice, which
+copies it from its Service, so each (role, version) needs its own labeled
+Service. Prefill workers whose group has no healthy decode worker are skipped,
+and `/readyz` needs at least one group that has both roles. Workers without the
+label form one more group. `--chat-routing reorg` does not support the flag.
+
+```bash
+sgl-router --model-id qwen3 --service-discovery \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --pd-version-group-label sglang.ai/version-group
+```
+
 External KV indexer as the cache-aware signal source:
 
 ```bash

@@ -45,6 +45,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        version_group: None,
     });
     // Use the configured tokenizer so the chat path can emit input_ids.
     let policies =

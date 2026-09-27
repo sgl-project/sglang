@@ -110,6 +110,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
                 mode,
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
+                version_group: None,
             })
             .unwrap();
     }

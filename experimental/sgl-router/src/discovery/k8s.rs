@@ -76,6 +76,29 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
     true
 }
 
+/// Read a slice's PD version group from the configured label key.
+///
+/// EndpointSlices inherit their Service's labels, so the group is set per
+/// Service: one Service per (role, version). A slice that lacks the label
+/// yields `None` and pairs only with other unlabeled workers.
+fn version_group(es: &EndpointSlice, label: Option<&str>) -> Option<String> {
+    let label = label?;
+    let group = es
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(label))
+        .cloned();
+    if group.is_none() {
+        tracing::warn!(
+            slice = es.metadata.name.as_deref().unwrap_or(""),
+            label,
+            "k8s discovery: EndpointSlice has no PD version group label; its workers pair only with other unlabeled workers"
+        );
+    }
+    group
+}
+
 /// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
 /// supplied [`WorkerMode`].
 ///
@@ -143,6 +166,7 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 mode,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                version_group: None,
             });
         }
     }
@@ -202,7 +226,10 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.url != spec.url
+                    || prev.model_ids != spec.model_ids
+                    || prev.version_group != spec.version_group
+                {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
                 }
@@ -244,8 +271,12 @@ async fn emit_diff(
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
-async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
-where
+async fn process_events<S>(
+    mut stream: S,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    mode: K8sDiscoveryMode,
+    version_group_label: Option<String>,
+) where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
     let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
@@ -255,14 +286,19 @@ where
     fn workers_for_slice(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
+        version_group_label: Option<&str>,
     ) -> HashMap<WorkerId, WorkerSpec> {
-        match classify_mode(es, mode) {
-            Some(wm) => extract_workers(es, wm)
-                .into_iter()
-                .map(|w| (w.id.clone(), w))
-                .collect(),
-            None => HashMap::new(),
-        }
+        let Some(wm) = classify_mode(es, mode) else {
+            return HashMap::new();
+        };
+        let group = version_group(es, version_group_label);
+        extract_workers(es, wm)
+            .into_iter()
+            .map(|mut w| {
+                w.version_group = group.clone();
+                (w.id.clone(), w)
+            })
+            .collect()
     }
 
     while let Some(event) = stream.next().await {
@@ -273,7 +309,7 @@ where
             }
             Ok(watcher::Event::InitApply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 if let Some(buf) = init_buffer.as_mut() {
                     buf.insert(key, workers);
                     Ok(())
@@ -293,7 +329,7 @@ where
             }
             Ok(watcher::Event::Apply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, version_group_label.as_deref());
                 per_slice.insert(key, workers);
                 emit_diff(&tx, &per_slice, &mut prev_union).await
             }
@@ -335,7 +371,11 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        version_group_label,
+    } = cfg;
 
     let client = Client::try_default()
         .await
@@ -384,6 +424,7 @@ pub async fn spawn(
             namespace = %namespace_display,
             prefill_selector = %prefill_selector,
             decode_selector = %decode_selector,
+            version_group_label = version_group_label.as_deref().unwrap_or("<none>"),
             "k8s discovery starting (PD mode); a wrong namespace or selector matches zero EndpointSlices"
         ),
     }
@@ -391,7 +432,7 @@ pub async fn spawn(
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        process_events(stream, tx, mode).await;
+        process_events(stream, tx, mode, version_group_label).await;
     });
     Ok(handle)
 }
@@ -637,7 +678,7 @@ mod tests {
         ];
         let (tx, mut rx) = mpsc::channel(16);
         let stream = futures::stream::iter(events);
-        process_events(stream, tx, plain_mode()).await;
+        process_events(stream, tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -665,7 +706,7 @@ mod tests {
             Ok(watcher::Event::InitDone),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -699,7 +740,7 @@ mod tests {
         }));
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let handle = tokio::spawn(process_events(events, tx, plain_mode()));
+        let handle = tokio::spawn(process_events(events, tx, plain_mode(), None));
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("process_events must exit promptly when consumer drops")
@@ -718,7 +759,7 @@ mod tests {
             Ok(watcher::Event::Apply(s)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        process_events(futures::stream::iter(events), tx, plain_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -764,7 +805,7 @@ mod tests {
             Ok(watcher::Event::Apply(unrelated_slice)),
         ];
         let (tx, mut rx) = mpsc::channel(16);
-        process_events(futures::stream::iter(events), tx, pd_mode()).await;
+        process_events(futures::stream::iter(events), tx, pd_mode(), None).await;
         let mut out = Vec::new();
         while let Ok(e) = rx.try_recv() {
             out.push(e);
@@ -783,6 +824,90 @@ mod tests {
         );
         assert_eq!(added[0].mode, WorkerMode::Prefill);
         assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
+    }
+
+    fn group_slice(name: &str, addr: &str, role: &str, group: Option<&str>) -> EndpointSlice {
+        let mut labels = vec![("app", "sglang"), ("role", role)];
+        labels.extend(group.map(|g| ("sglang.ai/version-group", g)));
+        with_uid(
+            make_slice_full(&[addr], 30000, true, "ns", name, &labels),
+            &format!("u-{name}"),
+        )
+    }
+
+    async fn run_with_group_label(events: Vec<EndpointSlice>) -> Vec<DiscoveryEvent> {
+        let events = events
+            .into_iter()
+            .map(|es| Ok(watcher::Event::Apply(es)))
+            .collect::<Vec<_>>();
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(
+            futures::stream::iter(events),
+            tx,
+            pd_mode(),
+            Some("sglang.ai/version-group".into()),
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    /// The configured label's value on each slice becomes its workers' version
+    /// group; a slice without the label yields `None`.
+    #[tokio::test]
+    async fn pd_mode_reads_version_group_from_slice_label() {
+        let out = run_with_group_label(vec![
+            group_slice("p-v1", "10.0.0.1", "prefill", Some("v1")),
+            group_slice("d-v2", "10.0.0.2", "decode", Some("v2")),
+            group_slice("d-none", "10.0.0.3", "decode", None),
+        ])
+        .await;
+        let mut groups: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                DiscoveryEvent::Added(spec) => {
+                    Some((spec.url.as_str(), spec.version_group.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        groups.sort_unstable();
+        assert_eq!(
+            groups,
+            [
+                ("http://10.0.0.1:30000", Some("v1")),
+                ("http://10.0.0.2:30000", Some("v2")),
+                ("http://10.0.0.3:30000", None),
+            ]
+        );
+    }
+
+    /// Relabeling a slice's version group re-registers its workers so the new
+    /// group takes effect; a worker is never left paired under its old group.
+    #[tokio::test]
+    async fn version_group_change_emits_remove_then_add() {
+        let out = run_with_group_label(vec![
+            group_slice("p", "10.0.0.1", "prefill", Some("v1")),
+            group_slice("p", "10.0.0.1", "prefill", Some("v2")),
+        ])
+        .await;
+        let id = WorkerId("ns/p/10.0.0.1:30000".into());
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    DiscoveryEvent::Added(first),
+                    DiscoveryEvent::Removed { id: removed },
+                    DiscoveryEvent::Added(second),
+                ] if first.version_group.as_deref() == Some("v1")
+                    && removed == &id
+                    && second.version_group.as_deref() == Some("v2")
+            ),
+            "out={out:?}"
+        );
     }
 
     /// End-to-end K8s + PD integration: synthesize EndpointSlice events
@@ -939,7 +1064,7 @@ mod tests {
         ];
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(events);
-            process_events(stream, dtx, pd_mode()).await;
+            process_events(stream, dtx, pd_mode(), None).await;
         });
 
         // Poll the registry until all four workers are present with
@@ -1058,6 +1183,7 @@ mod tests {
             ]),
             tx,
             plain_mode(),
+            None,
         )
         .await;
         let mut events = Vec::new();
@@ -1178,7 +1304,7 @@ mod tests {
         // Drive the ready=true slice through the real discovery processor.
         let producer = tokio::spawn(async move {
             let stream = futures::stream::iter(vec![Ok(watcher::Event::Apply(slice))]);
-            process_events(stream, dtx, plain_mode()).await;
+            process_events(stream, dtx, plain_mode(), None).await;
         });
 
         // No target_ref on the endpoint => id falls back to ns/slice/addr:port.

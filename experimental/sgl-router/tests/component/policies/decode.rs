@@ -29,6 +29,7 @@ fn worker(id: &str) -> Arc<Worker> {
         mode: WorkerMode::Decode,
         model_ids: vec![ModelId("m".into())],
         bootstrap_port: None,
+        version_group: None,
     }))
 }
 

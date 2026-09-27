@@ -179,6 +179,9 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// PD pairing scope; carried from `WorkerSpec`. See
+    /// [`crate::discovery::WorkerSpec`].
+    version_group: Option<String>,
 }
 
 impl Worker {
@@ -212,6 +215,7 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            version_group: spec.version_group,
         }
     }
 
@@ -223,6 +227,12 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// PD version group. A prefill worker pairs only with decode workers
+    /// of the same group; `None` is a group of its own.
+    pub fn version_group(&self) -> Option<&str> {
+        self.version_group.as_deref()
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -284,6 +294,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("protocol", &self.protocol)
+            .field("version_group", &self.version_group)
             .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
@@ -303,6 +314,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            version_group: None,
         });
         assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
@@ -351,6 +363,7 @@ mod tests {
                 mode: m,
                 model_ids: vec![],
                 bootstrap_port: None,
+                version_group: None,
             });
             assert_eq!(w.mode(), m);
         }
@@ -364,6 +377,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: None,
+            version_group: None,
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -380,6 +394,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![],
             bootstrap_port: None,
+            version_group: None,
         };
         // `new` takes the always-safe default; the resolved protocol reaches a
         // worker only through the constructor the registry uses.
@@ -398,6 +413,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
+            version_group: None,
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -410,6 +426,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![],
             bootstrap_port: None,
+            version_group: None,
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -422,6 +439,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            version_group: None,
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -434,6 +452,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            version_group: None,
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -450,6 +469,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            version_group: None,
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }
@@ -461,6 +481,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            version_group: None,
         })
     }
 

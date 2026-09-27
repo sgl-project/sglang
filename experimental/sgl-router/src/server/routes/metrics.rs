@@ -387,6 +387,7 @@ mod tests {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("m".into())],
                 bootstrap_port: None,
+                version_group: None,
             })
             .unwrap();
         let app = crate::server::app::build_router(ctx.clone());
