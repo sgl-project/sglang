@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
     RawRGBRealtimeOutputAdapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
+from sglang.multimodal_gen.runtime.realtime.video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
     WEBP_FRAME_CONTENT_TYPE,

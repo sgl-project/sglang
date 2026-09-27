@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-simulator"
+dynamic = ["version"]
+description = "A simulation benchmark tool for sglang"
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "joblib",
+]
+
+[project.optional-dependencies]
+aic = [
+    "aiconfigurator==0.10.0"
+]

@@ -72,9 +72,9 @@ def generate_clangd():
         arch = make_jit_cuda_arch(int(major), int(minor))
     else:
         arch = get_jit_cuda_arch()
-        assert (
-            arch.major > 0
-        ), "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
+        assert arch.major > 0, (
+            "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
+        )
 
     compile_flags = [
         "-xcuda",

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
+
+_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -18,7 +22,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -34,6 +39,9 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AiterQuantType(str, Enum):
@@ -98,10 +106,32 @@ _AITER_ACTIVATIONS = {
 }
 
 
-def _aiter_activation(activation: str):
+# aiter's ActivationType.Swiglu is SwiGLU-OAI with alpha and the (up + beta) bias baked in
+_AITER_SWIGLU_OAI_ALPHA = 1.702
+_AITER_SWIGLU_OAI_BETA = 1.0
+
+
+def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
+    """Return the clamp limit for matching SwiGLU-OAI configs on gfx95."""
+    if not is_gfx95_supported():
+        return None
+    if config.activation != "silu" or not config.is_gated:
+        return None
+    if config.gemm1_alpha != _AITER_SWIGLU_OAI_ALPHA:
+        return None
+    if config.gemm1_beta not in (None, _AITER_SWIGLU_OAI_BETA):
+        return None
+    if config.gemm1_clamp_limit is None:
+        return None
+    return float(config.gemm1_clamp_limit)
+
+
+def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
-    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+    if aiter_swiglu_oai_limit(config) is not None:
+        return ActivationType.Swiglu
+    return getattr(ActivationType, _AITER_ACTIVATIONS.get(config.activation, "Gelu"))
 
 
 def _aiter_quant_type(quant_type: AiterQuantType):
@@ -123,7 +153,106 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+_RECV_BOUND_LOGGED: set[int] = set()
+_RECV_BOUND_WARNED = False
+
+
+def _warn_recv_bound_unavailable() -> None:
+    global _RECV_BOUND_WARNED
+    if not _RECV_BOUND_WARNED:
+        _RECV_BOUND_WARNED = True
+        logger.warning(
+            "SGLANG_MORI_RECV_BOUND is set but the per-rank DP token counts do "
+            "not cover every mori sender, so the receive fan-in is unknown; "
+            "leaving the receive buffer unbounded."
+        )
+
+
+def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
+    """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
+
+    Worst case fan-in is every rank routing all of its tokens to this one, so
+    `sum(per-rank tokens) * topk`, where topk already includes the fused shared
+    expert. The per-rank counts come from the DP sync, so this is the fan-in for
+    the batch actually being run rather than an upper bound over all batches.
+
+    That is only sound because enabling this gate also makes
+    `require_mlp_tp_gather()` true for mori, which gives every rank the same
+    cuda-graph bucket. The value is baked into a captured graph and has to hold
+    for every later replay; with per-rank buckets a rank on a narrow tier could
+    be handed rows by a peer on a wider one, and the only bound valid under that
+    is the widest tier's -- 4-16x looser than the batch being run, which costs
+    more in expert-GEMM tiles (M 32/64 -> 128) than the trim saves.
+
+    Two cases stay unbounded, because a bound below the real fan-in silently
+    drops rows from the all-to-all -- wrong output rather than an error:
+
+    * Prefill, whose per-rank counts are uneven and not knowable here.
+    * Anything that leaves the per-rank counts unpopulated, or where the EP world
+      is wider than the DP world so the counts do not cover every sender.
+    """
+    if not get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
+        return 0
+
+    from sglang.srt.layers.dp_attention import (
+        get_dp_global_num_tokens,
+        get_is_extend_in_batch,
+    )
+
+    if get_is_extend_in_batch():
+        return 0
+
+    per_rank_tokens = get_dp_global_num_tokens()
+    ep_size = get_parallel().moe_ep_size
+    if not per_rank_tokens or len(per_rank_tokens) < ep_size:
+        # Either the DP sync did not publish counts, or they do not cover every
+        # mori sender. Both mean the fan-in is unknown here.
+        _warn_recv_bound_unavailable()
+        return 0
+
+    max_tokens = sum(per_rank_tokens)
+    bound = max_tokens * topk
+    # Never grow the tensor, and nothing to do when there is nothing to trim.
+    if not 0 < bound < recv_rows:
+        return 0
+
+    # One INFO line the first time it engages, so an inert bound is not mistaken
+    # for an active one in the results. Per-tier values go to DEBUG: capture
+    # visits every tier, and at INFO on every rank that is dozens of lines.
+    if get_parallel().tp_rank == 0 and bound not in _RECV_BOUND_LOGGED:
+        first = not _RECV_BOUND_LOGGED
+        _RECV_BOUND_LOGGED.add(bound)
+        if first:
+            logger.info(
+                "mori recv bound active: %d rows -> %d for this tier "
+                "(dp_tokens=%d ep=%d topk=%d); per-tier values at DEBUG",
+                recv_rows,
+                bound,
+                max_tokens,
+                get_parallel().moe_ep_size,
+                topk,
+            )
+        else:
+            logger.debug(
+                "mori recv bound: %d rows -> %d (dp_tokens=%d ep=%d topk=%d)",
+                recv_rows,
+                bound,
+                max_tokens,
+                get_parallel().moe_ep_size,
+                topk,
+            )
+    return bound
+
+
 class AiterRunnerCore(MoeRunnerCore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from sglang.kernels.ops.moe.moe_sorting_small import (
+            apply_aiter_small_moe_sort_patch,
+        )
+
+        apply_aiter_small_moe_sort_patch()
+
     def run(
         self,
         runner_input: AiterRunnerInput,
@@ -159,6 +288,7 @@ class AiterRunnerCore(MoeRunnerCore):
             else quant_info.a13_scale
         )
 
+        is_gfx95 = is_gfx95_supported()
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
@@ -174,6 +304,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+        elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
+            extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -181,19 +313,58 @@ class AiterRunnerCore(MoeRunnerCore):
             # lives elsewhere / is absent.
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            # a gate_mode from fused_moe_kwargs wins; else gfx95 honors the weight layout,
+            # and SGLANG_USE_AITER_MOE_GU_ITLV=0 selects SEPARATED (gpt-oss MXFP4 layout)
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if (not is_gfx95 or self.config.gate_up_interleaved)
+                    and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
+        if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
+            from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
+
+            try:
+                if (
+                    _smallm.smallm_moe_supported(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_ids,
+                        quant_info.expert_mask,
+                        quant_info.doweight_stage1,
+                        self.config.activation == "silu",
+                        quant_info.b13 is not None or quant_info.b2 is not None,
+                        a1_scale,
+                    )
+                    and not extra.get("no_combine")
+                    and runner_input.num_local_tokens is None
+                ):
+                    out = _smallm.smallm_moe_fwd(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_weights,
+                        runner_input.topk_ids,
+                        quant_info.w13_scale,
+                        quant_info.w2_scale,
+                    )
+                    if out is not None:
+                        return AiterRunnerOutput(hidden_states=out)
+            except _smallm.SmallMMoeUnavailable:
+                pass
+
+        activation = extra.pop("activation", None) if is_gfx95 else None
+        if activation is None:
+            activation = _aiter_activation(self.config)
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -202,7 +373,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
@@ -240,9 +411,9 @@ def pre_permute_standard_to_aiter(
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
-        assert (
-            topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
-        ), "apply_router_weight_on_input requires topk=1"
+        assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
+            "apply_router_weight_on_input requires topk=1"
+        )
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
@@ -322,6 +493,10 @@ def _pre_permute_deepep_to_aiter(
         # reads [0, totalRecvTokenNum), so the truncated result needs no
         # padding back.
         mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
+        if mori_max <= 0:
+            mori_max = _mori_decode_recv_bound(
+                hidden_states.shape[0], topk_ids.shape[-1]
+            )
         if mori_max > 0:
             hidden_states = hidden_states[:mori_max]
             if a1_scale is not None:
@@ -346,7 +521,21 @@ def _pre_permute_deepep_to_aiter(
             "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
         )
 
-        if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
+        # MXFP8 dispatch already carries fp8 data with group-32 e8m0 scales,
+        # which is what per_1x32 wants, so hand it straight to fused_moe. Only
+        # fp8 dispatch's group-128/fp32 scales need the dequant round trip; it is
+        # distinguishable by scale dtype (fp32 there, e8m0 here).
+        is_mx_fp8_dispatch = (
+            a1_scale is not None
+            and a1_scale.dtype == torch.float8_e8m0fnu
+            and not is_fp4_dispatch
+        )
+        if (
+            is_w4a4
+            and a1_scale is not None
+            and not is_fp4_dispatch
+            and not is_mx_fp8_dispatch
+        ):
             # W4A4 weights with FP8 dispatch: dequant FP8->BF16 first; the
             # FP4 per_1x32 path needs BF16 input.
             hidden_states = upscale(

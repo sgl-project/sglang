@@ -11,6 +11,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
@@ -19,6 +20,7 @@ try:
         fused_recurrent_gated_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        _select_recurrent_launch_config,
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -26,7 +28,7 @@ try:
 except ImportError:
     KERNELS_AVAILABLE = False
 
-register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
@@ -180,6 +182,57 @@ def test_fused_gdn_mtp_precision(N: int, T: int):
     torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+@pytest.mark.parametrize("N", [1, 3, 16])
+def test_qwen35_tp4_fused_gdn_mtp_precision(N: int):
+    """Exercise the gfx950 TP4 launch shape against the reference path."""
+    T, H, HV, K, V = 4, 4, 16, 128, 128
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+
+    out_ref = run_reference(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state.clone(),
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+    )
+    out_fused = run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state.clone(),
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+    )
+
+    torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not (torch.version.hip and is_gfx95_supported()), reason="requires AMD gfx95"
+)
+def test_qwen35_tp4_launch_config_is_narrow():
+    assert _select_recurrent_launch_config(1, 4, 16, 128, 128, False) == (8, 4)
+    assert _select_recurrent_launch_config(3, 4, 16, 128, 128, False) == (16, 2)
+    assert _select_recurrent_launch_config(32, 4, 16, 128, 128, False) == (16, 2)
+    assert _select_recurrent_launch_config(33, 4, 16, 128, 128, False) == (32, 1)
+    assert _select_recurrent_launch_config(3, 8, 32, 128, 128, False) == (32, 1)
+    assert _select_recurrent_launch_config(3, 4, 16, 128, 128, True) == (32, 1)
+
+
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
 @pytest.mark.parametrize("N", [1, 16, 128])
 def test_mtp_single_step_decode(N: int):
@@ -232,6 +285,41 @@ def test_mtp_single_step_decode(N: int):
         f"fail_rate={state_fail_rate:.2f}%"
     )
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_verify_scratch_pitch_uses_allocated_steps():
+    # Gear below the allocated step dim must not spill into the neighbor block.
+    N, T, ALLOCATED = 2, 4, 8
+    H, HV, K, V = 16, 32, 128, 128
+
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+    buffer = torch.full(
+        (N + 1, ALLOCATED, HV, V, K), float("nan"), dtype=torch.float32, device="cuda"
+    )
+
+    run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state,
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+        intermediate_states_buffer=buffer,
+        intermediate_state_indices=indices,
+        cache_steps=T,
+    )
+
+    assert not torch.isnan(buffer[:N, :T]).any()
+    assert torch.isnan(buffer[N:]).all()
+    assert torch.isnan(buffer[:N, T:]).all()
 
 
 if __name__ == "__main__":

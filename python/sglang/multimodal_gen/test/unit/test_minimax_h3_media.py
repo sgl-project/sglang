@@ -13,9 +13,19 @@ import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    keyframe_encoding,
     material_io,
     reference_encoding,
 )
+
+
+def test_keyframe_rng_supports_cpu_and_default_device():
+    initial_state = torch.random.get_rng_state()
+
+    for device in (None, torch.device("cpu")):
+        with keyframe_encoding.minimax_h3_scoped_encode_rng(42, device):
+            assert torch.initial_seed() == 42
+        torch.testing.assert_close(torch.random.get_rng_state(), initial_state)
 
 
 def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
@@ -117,7 +127,7 @@ def test_video_transform_can_share_one_host_decode(monkeypatch):
         os.write(output_fd, expected.tobytes())
         return SimpleNamespace(stderr=b"")
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     reference_encoding._reference_video_host_leader.cache_clear()
@@ -164,7 +174,7 @@ def test_shared_video_transform_falls_back_when_proc_fd_is_blocked(monkeypatch):
             raise PermissionError("blocked by test policy")
         return real_open(path, flags)
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(os, "open", guarded_open)
@@ -206,7 +216,7 @@ def test_shared_video_transform_propagates_any_host_decode_failure(monkeypatch):
             ]
         gather_index += 1
 
-    monkeypatch.setattr(reference_encoding, "get_world_group", FakeGroup)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(
         reference_encoding,

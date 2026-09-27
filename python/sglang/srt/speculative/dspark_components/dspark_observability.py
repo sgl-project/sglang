@@ -495,7 +495,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -655,7 +654,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,

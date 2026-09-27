@@ -58,9 +58,9 @@ def test_fused_equals_separate(T, N1, N2, K):
     fused = mxfp8_linear(x, w, sp)
 
     assert fused.shape == ref.shape
-    assert torch.equal(
-        fused, ref
-    ), f"max abs diff {(fused.float() - ref.float()).abs().max().item()}"
+    assert torch.equal(fused, ref), (
+        f"max abs diff {(fused.float() - ref.float()).abs().max().item()}"
+    )
 
 
 if __name__ == "__main__":

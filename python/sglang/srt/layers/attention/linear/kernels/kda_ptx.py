@@ -9,15 +9,17 @@ serving shape: K = V = 128, chunk 64.
 Scope: ordinary extend batches satisfying the kernel's fixed tensor contract.
 Correctness-sensitive cases stay on Triton:
 
-- track batches receive dense intermediate SSM states directly from the kernel
-  when the cache checkpoint stride is also 64 tokens. Other interior snapshots
-  stay on Triton; boundary-only tracking can still use the final state;
+- track batches carrying the fp32 snapshot buffer (``track_state``, the mamba
+  extra_buffer track path) stay on Triton — the kernel cannot write it.
+  Interior snapshots consumed as dense ``h`` still come from the kernel when
+  the cache checkpoint stride is also 64 tokens; boundary-only tracking uses
+  the final state either way;
 - spec-decode extends, which must stay rollback-able.
 
 Single-sequence token counts that are not a multiple of the kernel's 64-token
 chunk are padded up to a bucket (1k/2k/4k/8k/16k/32k) in a persistent staging
 buffer, which bounds the resident workspace set. Pad rows are state-neutral:
-k/v/beta zero => no rank-1 update; raw gate -1000 => transformed decay of
+k/v zero => no rank-1 update, even with beta sigmoid; raw gate -1000 => decay of
 exactly 1. Multi-sequence batches go through the kernel's own varlen grid
 (real cu_seqlens, no padding), so their shapes are whatever the scheduler
 produces and each distinct shape can retain another workspace.
@@ -49,6 +51,12 @@ _PAD_GATE = -1000.0
 
 
 class PtxKDAKernel(LinearAttnKernelBase):
+    # Batches carrying the fp32 track snapshot buffer (track_state) route to
+    # the embedded Triton fallback, which forwards the snapshot arguments
+    # (the track_state check in extend -> _triton_extend); boundary-only
+    # tracking stays native.
+    supports_track_state_snapshot: bool = True
+
     def __init__(self):
         # tcgen05 + TMEM with sm_103a-only encodings: GB300 (SM103) only.
         self.supports_prefill = torch.cuda.is_available() and (
@@ -217,6 +225,11 @@ class PtxKDAKernel(LinearAttnKernelBase):
             )
         eligible = (
             not kwargs.get("is_spec_decode")
+            # The native kernel cannot write the fp32 track snapshot buffer;
+            # a batch carrying one must take the Triton fallback, which
+            # forwards the snapshot arguments (see _triton_extend). Leaving
+            # the buffer unwritten would corrupt prefix-cache track slots.
+            and kwargs.get("track_state") is None
             and intermediate_stride_supported
             and shape_known
             and supported_shape
@@ -314,6 +327,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 dt_bias=self._flat_param(dt_bias),
                 return_intermediate_states=return_intermediate_states,
                 use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=kwargs.get("beta_is_raw", False),
             )
             out, final_state, h = result[0], result[1], result[10]
             ssm_states.index_copy_(0, slot, final_state.to(ssm_states.dtype))

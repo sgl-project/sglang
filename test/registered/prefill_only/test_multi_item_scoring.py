@@ -21,13 +21,14 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.server_args import _declared_default
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=142, stage="base-b", runner_config="1-gpu-small")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
@@ -56,9 +57,8 @@ class TestMISServerArgsValidation(unittest.TestCase):
 
     def test_enable_mis_default(self):
         """Test that enable_mis defaults to False."""
-        from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(ServerArgs.enable_mis, False)
+        self.assertEqual(_declared_default("enable_mis"), False)
 
 
 class TestMultiItemScoringOptimization(CustomTestCase):
@@ -433,7 +433,12 @@ class TestMultiItemScoringParity(CustomTestCase):
         tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
 
         def label_ids(labels):
-            return [tokenizer.encode(lb, add_special_tokens=False)[0] for lb in labels]
+            token_ids = []
+            for label in labels:
+                (token_id,) = tokenizer.encode(label, add_special_tokens=False)
+                token_ids.append(token_id)
+            assert len(set(token_ids)) == len(token_ids), token_ids
+            return token_ids
 
         return {
             "basic": dict(
@@ -460,7 +465,7 @@ class TestMultiItemScoringParity(CustomTestCase):
             "many_items": dict(
                 query="Rate this option from 1 to 5:",
                 items=[f" Option {i}" for i in range(10)],
-                label_token_ids=label_ids([" 1", " 2", " 3", " 4", " 5"]),
+                label_token_ids=label_ids(["1", "2", "3", "4", "5"]),
                 apply_softmax=True,
             ),
         }

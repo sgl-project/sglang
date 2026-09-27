@@ -16,7 +16,7 @@ use crate::tokenizer_manager::channel::FromSchedulerRx;
 use crate::tokenizer_manager::wiring::{Senders, recv};
 
 /// A monotonic counter bumped once per from_scheduler frame the dispatcher drains.
-/// It's the rust-native equivalent of the Python `TokenizerManager`'s
+/// Equivalent to the Python `TokenizerManager`'s
 /// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
 /// scheduler → detok path is alive (the value itself is meaningless).
 pub type ActivityCounter = Arc<AtomicU64>;
