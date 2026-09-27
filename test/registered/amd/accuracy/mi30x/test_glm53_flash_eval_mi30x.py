@@ -24,11 +24,11 @@ coverage for this model. That path reaches gfx942 only with the HIP guard in
 the fused mHC post/pre kernel and decode graph capture dies with "Unresolved
 call Op(tl.get_lane_idx)" (run 36092686822).
 
-Measured on current main: 0.9750 (1286/1319) on the rocm10 image, with a
-2769 s weight load, a 1391 s eval and 4419 s of wall clock (run 36232707853).
-That is bit-identical to the gfx950 score in test_glm53_flash_eval_mi35x.py,
-which is the strongest evidence available that the two arches run the same
-model. It requires both HIP fixes in #41136.
+Measured on main plus both HIP fixes in #41136, which this test requires:
+0.9750 (1286/1319) on the rocm10 image, with a 2769 s weight load, a 1391 s
+eval and 4419 s of wall clock (run 36232707853). That is the same count the
+gfx950 gate in test_glm53_flash_eval_mi35x.py scored, so the gfx942 fallback
+paths are not costing accuracy relative to the gfx950 fast paths.
 
 Threshold: 0.92 follows this repo's `measured - 0.05` convention for sgl-eval
 gsm8k thresholds and matches the gfx950 gate, so the two arches stay directly
