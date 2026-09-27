@@ -127,9 +127,13 @@ class PipelineExecutor(ABC):
         self.before_stage(stage, stage_index, payload, server_args)
         with maybe_record_function(f"STAGE {stage_name}"):
             with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-                payload = self.run_stage_with_context(
-                    stage, payload, server_args, run_stage
-                )
+                with self.conditioning_cache.group_scope(
+                    enabled=(isinstance(payload, list) and len(payload) > 1)
+                    or (isinstance(payload, Req) and payload.batch_size > 1)
+                ):
+                    payload = self.run_stage_with_context(
+                        stage, payload, server_args, run_stage
+                    )
         return payload
 
     @staticmethod

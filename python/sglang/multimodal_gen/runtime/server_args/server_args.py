@@ -3036,7 +3036,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--disable-conditioning-cache",
             action="store_true",
             default=ServerArgs.disable_conditioning_cache,
-            help="Disable reuse of text/image encoder outputs and VAE posteriors between requests.",
+            help="Disable cross-request text/image and VAE posterior caching; reuse within a grouped stage remains enabled.",
         )
         parser.add_argument(
             "--conditioning-cache-max-size-mb",

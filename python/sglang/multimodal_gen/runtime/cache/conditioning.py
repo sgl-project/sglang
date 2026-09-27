@@ -145,6 +145,36 @@ class _CacheEntry:
             event.synchronize()
 
 
+@dataclass
+class _GroupEntry:
+    output: object
+    owner: int
+    copied_bytes: int
+    ready: tuple[tuple[torch.device, torch.cuda.Event], ...]
+
+    def wait(self):
+        for device, event in self.ready:
+            torch.cuda.current_stream(device).wait_event(event)
+
+        def record(t):
+            if t.device.type == "cuda":
+                t.record_stream(torch.cuda.current_stream(t.device))
+            return t
+
+        _map_output(self.output, record)
+
+
+def _copy_output(value, *, share_tensors=False):
+    tensors = {}
+
+    def copy_tensor(t):
+        if id(t) not in tensors:
+            tensors[id(t)] = t if share_tensors else t.clone()
+        return tensors[id(t)]
+
+    return _map_output(value, copy_tensor)
+
+
 def _map_output(value, tensor_fn, *, restore=False):
     if isinstance(value, _HostTensor if restore else torch.Tensor):
         return tensor_fn(value)
@@ -191,8 +221,13 @@ class ConditioningCache:
         self._entries = OrderedDict()
         self._models = weakref.WeakKeyDictionary()
         self._next_model = 0
+        self._group_entries = ContextVar("conditioning_group_entries", default=None)
+        self.group_hits = 0
 
     def clear(self):
+        group_entries = self._group_entries.get()
+        if group_entries is not None:
+            group_entries.clear()
         for entry in self._entries.values():
             entry.wait()
         self._entries.clear()
@@ -214,6 +249,11 @@ class ConditioningCache:
                 entry.wait()
                 self.bytes -= entry.size
                 del self._entries[key]
+        group_entries = self._group_entries.get()
+        if group_entries is not None:
+            for key, entry in list(group_entries.items()):
+                if entry.owner in owners:
+                    del group_entries[key]
 
     def stats(self):
         return dict(
@@ -223,6 +263,7 @@ class ConditioningCache:
             bypasses=self.bypasses,
             entries=len(self._entries),
             bytes=self.bytes,
+            group_hits=self.group_hits,
         )
 
     def _identity(self, owner):
@@ -230,6 +271,46 @@ class ConditioningCache:
             self._models[owner] = self._next_model
             self._next_model += 1
         return self._models[owner]
+
+    @contextmanager
+    def group_scope(self, enabled=True):
+        """Keep device results only while a stage executes a group of requests."""
+        token = self._group_entries.set({} if enabled else None)
+        try:
+            yield
+        finally:
+            self._group_entries.reset(token)
+
+    def _remember_group(self, key, output, owner, share_in_group):
+        entries = self._group_entries.get()
+        if entries is None:
+            return
+        tensors = {}
+
+        def visit(t):
+            tensors[id(t)] = t
+            return t
+
+        _map_output(output, visit)
+        size = (
+            0
+            if share_in_group
+            else sum(t.numel() * t.element_size() for t in tensors.values())
+        )
+        # private snapshots must not retain unbounded intermediate encoder states
+        if not share_in_group and (
+            len(entries) >= 128
+            or size + sum(entry.copied_bytes for entry in entries.values())
+            > 512 * 1024**2
+        ):
+            return
+        stored = _copy_output(output, share_tensors=share_in_group)
+        ready = []
+        for device in {t.device for t in tensors.values() if t.device.type == "cuda"}:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            ready.append((device, event))
+        entries[key] = _GroupEntry(stored, owner, size, tuple(ready))
 
     @contextmanager
     def scope(self, enabled=True, *, refresh=False):
@@ -253,9 +334,11 @@ class ConditioningCache:
         *,
         nested=False,
         namespace=None,
+        share_in_group=False,
     ):
+        group_entries = self._group_entries.get()
         try:
-            if not self.max_bytes:
+            if not self.max_bytes and group_entries is None:
                 raise Uncacheable("cache disabled")
             if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
                 raise Uncacheable("stateful autoregressive encoding")
@@ -265,6 +348,7 @@ class ConditioningCache:
                 self._identity(model),
                 self._identity(namespace) if namespace is not None else None,
                 method,
+                share_in_group,
                 precision,
                 torch.is_autocast_enabled("cuda"),
                 torch.get_autocast_dtype("cuda"),
@@ -277,7 +361,10 @@ class ConditioningCache:
         except Uncacheable:
             key = None
         entry = self._entries.get(key)
-        hit = entry is not None and not _refresh_cache.get()
+        group_entry = group_entries.get(key) if group_entries is not None else None
+        hit = (
+            group_entry is not None or entry is not None
+        ) and not _refresh_cache.get()
         if group is not None and group.world_size > 1:
             # Encoders may issue TP/folding collectives. A rank-local eviction
             # must never leave another rank returning early from the encoder.
@@ -285,9 +372,13 @@ class ConditioningCache:
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
             hit = bool(flag.item())
         if hit:
+            self.hits += 1
+            if group_entry is not None:
+                self.group_hits += 1
+                group_entry.wait()
+                return _copy_output(group_entry.output, share_tensors=share_in_group)
             entry.wait()
             entry.preferred |= _prefer_cache.get()
-            self.hits += 1
             self._entries.move_to_end(key)
             logger.debug("Conditioning cache hit: %s.%s", type(model).__name__, method)
             restored = {}
@@ -297,7 +388,9 @@ class ConditioningCache:
                     restored[id(t)] = t.data.to(t.device, copy=True, non_blocking=True)
                 return restored[id(t)]
 
-            return _map_output(entry.output, restore, restore=True)
+            output = _map_output(entry.output, restore, restore=True)
+            self._remember_group(key, output, entry.owner, share_in_group)
+            return output
         if key is None:
             self.bypasses += 1
             return compute()
@@ -320,6 +413,7 @@ class ConditioningCache:
                 return t
 
             _map_output(output, count)
+            self._remember_group(key, output, self._identity(model), share_in_group)
             if not size or size > self.max_bytes:
                 self.bypasses += 1
                 return output
@@ -399,7 +493,15 @@ def _inference_cache(model):
 
 
 def cached_encoder_call(
-    model, args, kwargs, compute, group=None, *, namespace=None, nested=True
+    model,
+    args,
+    kwargs,
+    compute,
+    group=None,
+    *,
+    namespace=None,
+    nested=True,
+    share_in_group=False,
 ):
     cache = _inference_cache(model)
     if (
@@ -427,6 +529,7 @@ def cached_encoder_call(
         group,
         nested=nested,
         namespace=namespace,
+        share_in_group=share_in_group,
     )
 
 

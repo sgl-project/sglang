@@ -98,6 +98,7 @@ class QwenImage21EncodingStage(PipelineStage):
             lambda: self._encode_prompt(prompt, images, device),
             cache_group,
             namespace=self,
+            share_in_group=True,
         )
         self.finish_unused_declared_component(
             component_name="text_encoder", module=self.text_encoder

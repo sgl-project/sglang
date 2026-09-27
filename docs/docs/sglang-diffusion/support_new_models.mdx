@@ -176,7 +176,11 @@ For a custom VAE, apply `cached_vae_encode` only to the deterministic encode met
 
 For integrated models without a separate encoder, use `cached_conditioning` on a pure conditioning method, as in Cosmos3's understanding pathway or SenseNova-U1's reference-image features. Every rank in the current encoder TP group must enter that method together. Do not decorate the noisy-image or denoising path.
 
-Test cache-on versus cache-off with identical seeds, changed prompts/masks/reference pixels (including alpha), downstream in-place mutations, changed weights, and rank-local eviction under supported parallel groups. Include the new model in the [conditioning cache coverage](/docs/sglang-diffusion/caching-acceleration#coverage-and-limits).
+Prefer these function boundaries to whole-stage deduplication. A stage may also write per-request metadata, advance RNG state, release materials, or execute collectives; these actions must still run for each request. The executor gives each grouped or batched stage a temporary device-result scope, using the same keys and invalidation as the CPU cache. Use `share_in_group=True` only for consumed tensors that remain read-only across requests; containers are copied. Other outputs get private tensor snapshots with a bounded temporary budget. The scope ends at stage exit, including exceptions, and remains available with `--disable-conditioning-cache`.
+
+Do not put `Req`, scheduler instances, sampled latents, or session state into a cross-request cache. Keep model-specific grouped execution for parallel work distribution and material ownership. Preserve batch shapes and padding when matching batched encoder calls; per-row regrouping needs separate numerical validation.
+
+Test cache-on versus cache-off with identical seeds, changed prompts/masks/reference pixels (including alpha), downstream in-place mutations, changed weights, and rank-local eviction under supported parallel groups. Also exercise grouped requests through the executor with a zero or undersized CPU budget: check encoder call counts, per-request metadata, output ownership, and group cleanup on failure. Include the new model in the [conditioning cache coverage](/docs/sglang-diffusion/caching-acceleration#coverage-and-limits).
 
 ## Choose a Pipeline Shape
 

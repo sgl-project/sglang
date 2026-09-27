@@ -8,8 +8,6 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
-from dataclasses import dataclass
-from typing import Any
 
 import torch
 
@@ -107,15 +105,6 @@ def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
     )
 
 
-@dataclass(frozen=True)
-class TextEncodingFingerprint:
-    prompt: Any
-    negative_prompt: Any
-    do_classifier_free_guidance: bool
-    prompt_template: Any
-    max_sequence_length: int | None
-
-
 def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
     base_shape = list(tensors[0].shape)
     for tensor in tensors[1:]:
@@ -133,22 +122,6 @@ class TextEncodingStage(ConditionEncodingStage):
     This stage handles the encoding of text prompts into the embedding space
     expected by the diffusion model.
     """
-
-    deduplicated_output_fields = (
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "prompt_attention_mask",
-        "negative_attention_mask",
-        "prompt_embeds_mask",
-        "negative_prompt_embeds_mask",
-        "prompt_seq_lens",
-        "negative_prompt_seq_lens",
-        "pooled_embeds",
-        "neg_pooled_embeds",
-        "clip_embedding_pos",
-        "clip_embedding_neg",
-        "is_prompt_processed",
-    )
 
     def __init__(self, text_encoders, tokenizers) -> None:
         """
@@ -367,17 +340,6 @@ class TextEncodingStage(ConditionEncodingStage):
             )
 
         return batch
-
-    def build_dedup_fingerprint(
-        self, batch: Req, server_args: ServerArgs
-    ) -> TextEncodingFingerprint:
-        return TextEncodingFingerprint(
-            prompt=self.freeze_for_dedup(batch.prompt),
-            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
-            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
-            prompt_template=self.freeze_for_dedup(batch.prompt_template),
-            max_sequence_length=batch.max_sequence_length,
-        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
@@ -761,6 +723,7 @@ class TextEncodingStage(ConditionEncodingStage):
                     cache_group,
                     namespace=self,
                     nested=False,
+                    share_in_group=True,
                 )
             else:
                 # Batch-DP keeps caching inside each encoder copy so every rank
