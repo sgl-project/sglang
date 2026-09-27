@@ -17,16 +17,19 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=False, disabled=No
 
 @pytest.mark.parametrize("prefix_lens", [(0, 0), (2, 0), (2, 1)])
 @pytest.mark.parametrize("cache_path", ["bf16", "fp8", "dcp"])
-@pytest.mark.parametrize("fp8_weights", [True, False])
-def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
+@pytest.mark.parametrize("weight_layout", ["block_scale", "serialized_fp8", "bf16"])
+def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, weight_layout):
     # Two requests, with distinct cached prefixes and newly appended suffixes.
     suffix_lens = (2, 3)
     seq_lens = [p + e for p, e in zip(prefix_lens, suffix_lens)]
     total = sum(seq_lens)
-    latent = torch.arange(1, total * 3 + 1, dtype=torch.float32).view(total, 3)
-    norm_weight = torch.tensor([1.5, 0.5])
-    normalized = F.rms_norm(latent[:, :2], (2,), norm_weight, 1e-5)
-    projection = torch.arange(1, 13, dtype=torch.float32).view(2, 6)
+    rank = 256  # Two 128-element quantization blocks.
+    latent = torch.arange(1, total * (rank + 1) + 1, dtype=torch.float32).view(
+        total, rank + 1
+    )
+    norm_weight = torch.linspace(0.5, 1.5, rank)
+    normalized = F.rms_norm(latent[:, :rank], (rank,), norm_weight, 1e-5)
+    projection = torch.arange(1, rank * 6 + 1, dtype=torch.float32).view(rank, 6)
     indices = []
     offset = 0
     for prefix, length in zip(prefix_lens, seq_lens):
@@ -37,7 +40,7 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
     # Cached prefix values are already normalized; suffix entries are filled by
     # the real prepare method's cache-write boundary before the cache is read.
     cached_kv = normalized.clone()
-    cached_rope = latent[:, 2:].unsqueeze(1).clone()
+    cached_rope = latent[:, rank:].unsqueeze(1).clone()
     cached_kv[new_indices] = float("nan")
     cached_rope[new_indices] = float("nan")
     projected_inputs = []
@@ -47,16 +50,25 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
         unquantized = value[0] if isinstance(value, tuple) else value
         return unquantized @ projection, None
 
-    kv_b_proj = mock.Mock(side_effect=project)
-    kv_b_proj.weight = SimpleNamespace(
-        dtype=torch.float8_e4m3fn if fp8_weights else torch.bfloat16
+    kv_b_proj = project
+    kv_b_proj.weight = torch.empty(
+        6,
+        rank,
+        dtype=torch.bfloat16 if weight_layout == "bf16" else torch.float8_e4m3fn,
     )
-    norm = mock.Mock(side_effect=lambda x: F.rms_norm(x, (2,), norm_weight, 1e-5))
+    if weight_layout == "block_scale":
+        kv_b_proj.weight_scale = torch.ones(1, rank // 128)
+    elif weight_layout == "serialized_fp8":
+        # Standard serialized FP8 exposes weight_scale_inv. Preserve its normal
+        # input-quantization path, which does not use the fused RMSNorm tuple.
+        kv_b_proj.weight_scale_inv = torch.ones(1, rank // 128)
+    fused_layout = weight_layout == "block_scale"
+    norm = mock.Mock(side_effect=lambda x: F.rms_norm(x, (rank,), norm_weight, 1e-5))
     norm.weight = norm_weight
     norm.variance_epsilon = 1e-5
 
     def fused_norm_quant(value, weight, eps, *args, **kwargs):
-        result = F.rms_norm(value, (2,), weight, eps)
+        result = F.rms_norm(value, (rank,), weight, eps)
         # Model the quantization boundary without requiring an AMD device.
         return (result, torch.ones(len(result), 1)), result, None, None
 
@@ -67,7 +79,7 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
     read_cache = mock.Mock(side_effect=lambda *args: (cached_kv, cached_rope))
     layer = SimpleNamespace(
         q_lora_rank=None,
-        kv_lora_rank=2,
+        kv_lora_rank=rank,
         num_local_heads=2,
         qk_head_dim=3,
         qk_nope_head_dim=2,
@@ -103,9 +115,6 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
         mock.patch.object(forward_mha_rocm, "_use_aiter_gfx95", True),
         mock.patch.object(forward_mha_rocm, "_use_aiter_bpreshuffle_gfx95", False),
         mock.patch.object(forward_mha_rocm, "_use_fp8_prefill_attn", False),
-        mock.patch.object(
-            forward_mha_rocm, "_is_block_scale_fp8", return_value=fp8_weights
-        ),
         mock.patch.object(
             forward_mha_rocm,
             "fused_rms_fp8_group_quant",
@@ -146,7 +155,7 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
     # absence of a second RMSNorm on restored KV, not just the projection shape.
     expected = (normalized @ projection).view(total, 2, 3)
     expected_k = torch.cat(
-        (expected[..., :2], latent[:, None, 2:].expand(-1, 2, -1)), -1
+        (expected[..., :2], latent[:, None, rank:].expand(-1, 2, -1)), -1
     )
     torch.testing.assert_close(k, expected_k)
     torch.testing.assert_close(v, expected[..., 2:])
@@ -154,11 +163,11 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, fp8_weights):
     assert returned_batch is batch
     assert len(projected_inputs) == 1
     assert isinstance(projected_inputs[0], tuple) == (
-        fp8_weights and not any(prefix_lens)
+        fused_layout and not any(prefix_lens)
     )
     assert read_cache.call_count == int(any(prefix_lens))
-    assert fused.call_count == int(fp8_weights)
-    assert norm.call_count == int(not fp8_weights)
+    assert fused.call_count == int(fused_layout)
+    assert norm.call_count == int(not fused_layout)
 
 
 if __name__ == "__main__":
