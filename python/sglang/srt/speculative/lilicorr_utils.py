@@ -105,9 +105,6 @@ def parse_lilicorr_draft_config(*, draft_hf_config: Any) -> LiLiCorrConfig:
 
 
 def reject_added_vocab(lm_head) -> None:
-    # Checked once at build, not per call: the candidate top-k is contiguous over the
-    # base shard, and added rows sit past its padded tail, so they would be skipped
-    # silently rather than raising.
     if not isinstance(lm_head, VocabParallelEmbedding):
         return
     if int(lm_head.shard_indices.num_added_elements) != 0:
@@ -129,16 +126,7 @@ def target_input_embeddings(target_model):
 def lilicorr_candidates(
     *, hidden_states: torch.Tensor, lm_head, topk: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-row top-k over the target head, as normalized log-probs and global ids.
-
-    Returns (log_probs [N, topk] fp32, tokens [N, topk] int64), equivalent to
-    log_softmax(logits).topk(topk): the head scores log-probs normalized over the FULL
-    vocabulary, so the log-partition is part of the contract rather than an optimization.
-
-    The candidates, the TP gather and the partition all come from DFlash's `candidate_topk`
-    -- which is also what gives LiLiCorr a quantized lm_head, since the projection goes
-    through `quant_method` there instead of reading the weight directly.
-    """
+    # log_softmax(logits).topk(topk) over the FULL vocabulary: the head was trained on it.
     ids, vals, lse = candidate_topk(
         hidden_states, lm_head, int(topk), with_partition=True
     )

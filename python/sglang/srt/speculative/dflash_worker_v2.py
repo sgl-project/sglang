@@ -808,9 +808,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if lm_head is None:
             return _eager("no target lm_head")
 
-        # A gate-admitted quantized head is capture-safe: the target's own logits path
-        # already runs the same kernel under CUDA graphs. Both candidate_topk callers
-        # screen on this.
+        # A gate-admitted quantized head is capture-safe: the target's own
+        # logits path already runs the same kernel under CUDA graphs.
         head_supported = is_dense_head_weight(
             getattr(lm_head, "weight", None)
         ) or should_apply_lm_head_quant_method(
@@ -836,9 +835,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_enabled=self._selector_sampling_enabled,
             )
         if self.lilicorr is not None:
-            # LiLiCorr takes its candidates from the same candidate_topk the selector
-            # uses, so a quantized head folds here rather than dropping to the eager
-            # path -- which, before that reuse, could not project a packed weight at all.
             if not head_supported:
                 return _eager("unsupported quantized lm_head")
             return build_lilicorr_draft_sampler(
