@@ -1288,10 +1288,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def _encode_visual(self, items, grid_attr: str) -> torch.Tensor:
         grids = torch.cat([getattr(item, grid_attr) for item in items], dim=0)
         rows = list(self._iter_visual_rows(items, grid_attr))
-        # --mm-enable-dp-encoder replicates the full ViT on every rank and
-        # turns TP off. Encoding the whole clip on every rank is what OOMs
-        # a multi-image request or a long video. Shard rows across ranks,
-        # and split a video into frames so the frames can move independently.
+
         if not self.visual.use_data_parallel:
             pixel_values = torch.cat(rows, dim=0).to(dtype=self.visual.dtype)
             return self.visual(pixel_values, grid_thw=grids)
