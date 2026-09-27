@@ -114,8 +114,8 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
     )
     build_flashinfer_kda_checkpoint_plan(forward_batch, metadata, "cuda", 64)
     assert metadata.state_checkpoint_cu_starts.tolist() == [0, 2, 4]
-    assert metadata.state_checkpoint_track_src.tolist() == [1]
-    assert metadata.state_checkpoint_indices.tolist() == [0, 1, 2, 3]
+    assert metadata.num_state_checkpoints == 1
+    assert metadata.state_checkpoint_indices.tolist() == [-1, 0, -1, -1]
 
     triton = TritonKDAKernel()
     flashinfer = FlashInferKDAPrefillKernel(triton)
@@ -165,7 +165,6 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
             state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
             num_state_checkpoints=metadata.num_state_checkpoints,
             state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
-            state_checkpoint_track_src=metadata.state_checkpoint_track_src,
             state_checkpoint_indices=metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
             **common,
@@ -200,6 +199,36 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         extend_seq_lens_cpu=[128],
     )
     torch.testing.assert_close(fi_track[0], prefix_state[0].float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("lower_bound,num_tokens", [(None, 128), (-5.0, 1)])
+def test_kda_prefill_fallback_does_not_plan(lower_bound, num_tokens):
+    kernel = FlashInferKDAPrefillKernel(TritonKDAKernel())
+    q = torch.empty((1, num_tokens, 1, 128), device="cuda", dtype=torch.bfloat16)
+    state = torch.empty((1, 1, 128, 128), device="cuda", dtype=torch.float32)
+    offsets = torch.tensor([0, num_tokens], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+    with (
+        patch.object(kernel, "plan", side_effect=AssertionError("unused plan")),
+        patch.object(kernel._triton, "extend", return_value=q) as fallback,
+    ):
+        output = kernel.extend(
+            q,
+            q,
+            q,
+            q,
+            q[..., 0],
+            ssm_states=state,
+            cache_indices=slots,
+            query_start_loc=offsets,
+            A_log=torch.zeros(1, device="cuda"),
+            dt_bias=torch.zeros((1, 128), device="cuda"),
+            lower_bound=lower_bound,
+            beta_is_raw=True,
+            extend_seq_lens_cpu=[num_tokens],
+        )
+    assert output is q
+    fallback.assert_called_once()
 
 
 @pytest.fixture

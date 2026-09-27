@@ -20,12 +20,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def _cpu_list(value) -> list[int]:
-    if isinstance(value, torch.Tensor):
-        return value.to(device="cpu").tolist()
-    return list(value)
-
-
 def build_flashinfer_kda_checkpoint_plan(
     forward_batch: ForwardBatch,
     metadata: ForwardMetadata,
@@ -36,31 +30,27 @@ def build_flashinfer_kda_checkpoint_plan(
         return
     if chunk_size <= 0 or chunk_size % 32:
         return
+    if any(
+        values is None
+        for values in (
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.mamba_track_seqlens_cpu,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.mamba_prefill_track_mask_cpu,
+        )
+    ):
+        return
 
-    extend_lens = _cpu_list(
-        forward_batch.extend_seq_lens_cpu
-        if forward_batch.extend_seq_lens_cpu is not None
-        else forward_batch.extend_seq_lens
-    )
-    track_lens = _cpu_list(
-        forward_batch.mamba_track_seqlens_cpu
-        if forward_batch.mamba_track_seqlens_cpu is not None
-        else forward_batch.mamba_track_seqlens
-    )
-    prefix_lens = _cpu_list(
-        forward_batch.extend_prefix_lens_cpu
-        if forward_batch.extend_prefix_lens_cpu is not None
-        else forward_batch.extend_prefix_lens
-    )
-    track_mask = _cpu_list(
-        forward_batch.mamba_prefill_track_mask_cpu
-        if forward_batch.mamba_prefill_track_mask_cpu is not None
-        else forward_batch.mamba_track_mask
-    )
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    track_lens = forward_batch.mamba_track_seqlens_cpu
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    track_mask = forward_batch.mamba_prefill_track_mask_cpu
 
     checkpoint_counts = [length // chunk_size for length in extend_lens]
     checkpoint_starts = list(accumulate(checkpoint_counts, initial=0))
-    track_sources = []
+    # -1 skips boundaries SGLang will never restore from the radix cache.
+    checkpoint_destinations = [-1] * checkpoint_starts[-1]
+    num_tracked_checkpoints = 0
     for row, tracked in enumerate(track_mask):
         if not tracked:
             continue
@@ -70,20 +60,20 @@ def build_flashinfer_kda_checkpoint_plan(
         completed_chunks = relative_track_len // chunk_size
         if completed_chunks == 0 or completed_chunks > checkpoint_counts[row]:
             return  # Triton handles a track point without a complete boundary.
-        track_sources.append(checkpoint_starts[row] + completed_chunks - 1)
+        checkpoint_destinations[checkpoint_starts[row] + completed_chunks - 1] = (
+            num_tracked_checkpoints
+        )
+        num_tracked_checkpoints += 1
 
-    if len(track_sources) != metadata.track_ssm_h_batch_src.numel():
+    if num_tracked_checkpoints != metadata.track_ssm_h_batch_src.numel():
         return
     metadata.state_checkpoint_cu_starts = torch.tensor(
         checkpoint_starts, dtype=torch.int64, device=device
     )
-    metadata.num_state_checkpoints = checkpoint_starts[-1]
+    metadata.num_state_checkpoints = num_tracked_checkpoints
     metadata.state_checkpoint_every_n_tokens = chunk_size
-    metadata.state_checkpoint_track_src = torch.tensor(
-        track_sources, dtype=torch.int64, device=device
-    )
-    metadata.state_checkpoint_indices = torch.arange(
-        checkpoint_starts[-1], dtype=torch.int32, device=device
+    metadata.state_checkpoint_indices = torch.tensor(
+        checkpoint_destinations, dtype=torch.int32, device=device
     )
 
 
@@ -125,10 +115,11 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
-        state_checkpoint_track_src: Optional[torch.Tensor] = None,
         state_checkpoint_indices: Optional[torch.Tensor] = None,
         track_ssm_h_batch_src: Optional[torch.Tensor] = None,
-        prefill_wrapper: Optional[RecurrentKDAPrefillWrapper] = None,
+        prefill_metadata: Optional[ForwardMetadata] = None,
+        prefill_forward_batch: Optional[ForwardBatch] = None,
+        prefill_chunk_size: int = 0,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
@@ -147,6 +138,16 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and A_log is not None
             and dt_bias is not None
             and q.dtype == k.dtype == v.dtype == g.dtype == beta.dtype == torch.bfloat16
+            and q.device
+            == k.device
+            == v.device
+            == g.device
+            == beta.device
+            == ssm_states.device
+            == cache_indices.device
+            == query_start_loc.device
+            == A_log.device
+            == dt_bias.device
             and ssm_states.dtype in (torch.bfloat16, torch.float32)
             and q.ndim == k.ndim == v.ndim == g.ndim == 4
             and beta.ndim == 3
@@ -166,6 +167,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and beta.shape[2] == q.shape[2]
             and beta.data_ptr() % 16 == 0
             and g.shape[1] >= q.shape[1]
+            and g.shape[2:] == q.shape[2:]
             and g[:, : q.shape[1]].is_contiguous()
             and num_sequences > 0
             and query_start_loc.is_cuda
@@ -178,14 +180,27 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and len(seq_lens_cpu) == num_sequences
             and min(seq_lens_cpu) > 0
             and sum(seq_lens_cpu) == q.shape[1]
-            and (
-                not needs_checkpoint
-                or (
-                    state_checkpoint_cu_starts is not None
-                    and state_checkpoint_indices is not None
-                    and state_checkpoint_track_src is not None
-                    and track_ssm_h_batch_src is not None
+        )
+        if eligible and needs_checkpoint and state_checkpoint_cu_starts is None:
+            if prefill_metadata is not None and prefill_forward_batch is not None:
+                build_flashinfer_kda_checkpoint_plan(
+                    prefill_forward_batch,
+                    prefill_metadata,
+                    q.device,
+                    prefill_chunk_size,
                 )
+                state_checkpoint_cu_starts = prefill_metadata.state_checkpoint_cu_starts
+                state_checkpoint_indices = prefill_metadata.state_checkpoint_indices
+                num_state_checkpoints = prefill_metadata.num_state_checkpoints
+                state_checkpoint_every_n_tokens = (
+                    prefill_metadata.state_checkpoint_every_n_tokens
+                )
+        eligible = eligible and (
+            not needs_checkpoint
+            or (
+                state_checkpoint_cu_starts is not None
+                and state_checkpoint_indices is not None
+                and track_ssm_h_batch_src is not None
             )
         )
         if not eligible:
@@ -206,8 +221,15 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
                 **kwargs,
             )
 
+        prefill_wrapper = (
+            prefill_metadata.flashinfer_kda_prefill_wrapper
+            if prefill_metadata is not None
+            else None
+        )
         if prefill_wrapper is None:
             prefill_wrapper = self.plan(query_start_loc)
+            if prefill_metadata is not None:
+                prefill_metadata.flashinfer_kda_prefill_wrapper = prefill_wrapper
         checkpoints = (
             ssm_states.new_empty((num_state_checkpoints, *ssm_states.shape[1:]))
             if needs_checkpoint
@@ -242,8 +264,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             ),
         )
         if needs_checkpoint:
-            kwargs["track_state"][track_ssm_h_batch_src] = checkpoints[
-                state_checkpoint_track_src
-            ].float()
+            kwargs["track_state"][track_ssm_h_batch_src] = checkpoints.float()
         output = result[0]
         return (output, None) if return_intermediate_states else output
