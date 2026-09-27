@@ -193,7 +193,7 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
         and get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and _device_sm != 90
-        and _mega_moe_mma_type() == "fp8xfp4"
+        and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
         and moe.shared_experts_weight_block_size == [128, 128]
     )
@@ -215,47 +215,29 @@ def forward_mega_moe(
         )
 
     num_tokens = hidden_states.shape[0]
-
-    if moe.mega_shared_l1_weights is not None:
-        fused_fork_flag = (
-            moe.alt_stream is not None and num_tokens > 0 and get_is_capture_mode()
-        )
-        if not fused_fork_flag:
-            return _run_mega_routed(
-                moe, hidden_states, forward_batch, input_ids_global, num_tokens
-            )
-
-        current_stream = torch.cuda.current_stream()
-        moe.alt_stream.wait_stream(current_stream)
-        with torch.cuda.stream(moe.alt_stream):
-            y = _run_mega_routed(
-                moe, hidden_states, forward_batch, input_ids_global, num_tokens
-            )
-        current_stream.wait_stream(moe.alt_stream)
-        return y
-
-    sbo_overlap_flag = (
+    fused_shared = moe.mega_shared_l1_weights is not None
+    fork_mega_moe = (
         moe.alt_stream is not None
-        and moe.num_fused_shared_experts == 0
+        and (fused_shared or moe.num_fused_shared_experts == 0)
         and num_tokens > 0
         and get_is_capture_mode()
     )
 
-    if sbo_overlap_flag:
+    if fork_mega_moe:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
         mega_stream_ctx = nullcontext()
+
+    shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
 
     with mega_stream_ctx:
         y = _run_mega_routed(
             moe, hidden_states, forward_batch, input_ids_global, num_tokens
         )
 
-    if sbo_overlap_flag:
+    if fork_mega_moe:
         current_stream.wait_stream(moe.alt_stream)
 
     if shared_output is not None:
