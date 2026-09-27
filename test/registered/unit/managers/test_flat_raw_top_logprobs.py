@@ -17,6 +17,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt import runtime_context as rc
+from sglang.srt.disaggregation.utils import (
+    MAX_DISAGG_TOKEN_IDS_LOGPROB,
+    DisaggregationMode,
+)
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GenerateReqInput,
@@ -542,6 +546,26 @@ class TestMetaInfoFromSchedulerArrays(CustomTestCase):
 
 
 class TestTokenizerManagerLogprobs(CustomTestCase):
+    def test_requested_logprob_capacity_is_rejected_before_pd_admission(self):
+        """PD cannot silently truncate the first row; aggregate has no wire limit."""
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.model_config = SimpleNamespace(vocab_size=1000)
+        for mode in DisaggregationMode:
+            with self.subTest(mode=mode):
+                manager.disaggregation_mode = mode
+                obj = GenerateReqInput(
+                    input_ids=[1],
+                    return_logprob=True,
+                    token_ids_logprob=list(range(MAX_DISAGG_TOKEN_IDS_LOGPROB)),
+                )
+                manager._validate_token_ids_logprob(obj)
+                obj.token_ids_logprob.append(MAX_DISAGG_TOKEN_IDS_LOGPROB)
+                if mode == DisaggregationMode.NULL:
+                    manager._validate_token_ids_logprob(obj)
+                else:
+                    with self.assertRaisesRegex(ValueError, "metadata capacity"):
+                        manager._validate_token_ids_logprob(obj)
+
     def test_output_logprobs_without_input_logprobs(self):
         state = _make_state(return_logprob=True, top_logprobs_num=0)
         recv_obj = SimpleNamespace(

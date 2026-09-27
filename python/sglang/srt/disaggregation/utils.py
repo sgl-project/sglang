@@ -47,6 +47,8 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+# Fixed-width metadata shared by both roles. Reject wider requests at admission.
+MAX_DISAGG_TOKEN_IDS_LOGPROB = 128
 
 
 def poll_and_all_reduce_pp(
@@ -343,6 +345,16 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_token_ids_logprobs_val = torch.zeros(
+                (size, MAX_DISAGG_TOKEN_IDS_LOGPROB),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.output_token_ids_logprobs_idx = torch.zeros(
+                (size, MAX_DISAGG_TOKEN_IDS_LOGPROB),
+                dtype=torch.int32,
+                device=device,
+            )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
             self.output_token_sampling_logprobs = None
@@ -413,6 +425,8 @@ class MetadataBuffers:
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
             self.output_token_sampling_logprobs,
+            self.output_token_ids_logprobs_val,
+            self.output_token_ids_logprobs_idx,
             self.output_topk_p,
             self.output_topk_index,
             self.output_hidden_states,
@@ -451,6 +465,8 @@ class MetadataBuffers:
                 if self.enable_sampling_mask
                 else None
             ),
+            self.output_token_ids_logprobs_val[idx].clone(),
+            self.output_token_ids_logprobs_idx[idx].clone(),
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
@@ -467,7 +483,7 @@ class MetadataBuffers:
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot 7 holds the requested-token logprob row length; 8-15 remain spare.
         # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
@@ -483,6 +499,8 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # Reset the length on every reuse, including requests without logprobs.
+        self.cached_tokens[req.metadata_buffer_index][7] = 0
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -517,6 +535,31 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
+            token_ids = req.logprob.token_ids_logprob
+            if token_ids:
+                num_tokens = len(token_ids)
+                if num_tokens > MAX_DISAGG_TOKEN_IDS_LOGPROB:
+                    raise RuntimeError(
+                        "token_ids_logprob exceeds disaggregation metadata capacity "
+                        f"{MAX_DISAGG_TOKEN_IDS_LOGPROB}"
+                    )
+                values = req.logprob.output_token_ids_logprobs_val
+                indices = req.logprob.output_token_ids_logprobs_idx
+                if (
+                    not values
+                    or not indices
+                    or len(values[0]) != num_tokens
+                    or list(indices[0]) != token_ids
+                ):
+                    raise RuntimeError("Incomplete first-token requested logprobs")
+                for buf, row in (
+                    (self.output_token_ids_logprobs_val, values[0]),
+                    (self.output_token_ids_logprobs_idx, indices[0]),
+                ):
+                    buf[req.metadata_buffer_index, :num_tokens].copy_(
+                        torch.as_tensor(row, dtype=buf.dtype, device=buf.device)
+                    )
+                self.cached_tokens[req.metadata_buffer_index][7] = num_tokens
         if req.return_sampling_mask:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.

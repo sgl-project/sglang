@@ -1,3 +1,4 @@
+import ctypes
 import struct
 import threading
 import unittest
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    MAX_DISAGG_TOKEN_IDS_LOGPROB,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -48,7 +50,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ReqLogprob
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -886,6 +888,130 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     ),
                     ([[7, 8, 9]], expected),
                 )
+
+    def test_requested_logprobs_reach_decode_after_metadata_transfer(self):
+        """PDD must retain first-token requested scores, even outside top-k.
+
+        Copy only registered wire buffers between independent role allocations;
+        a local-only field would still lose the row in a real transfer.
+        """
+        sender, receiver = [
+            MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4,
+            )
+            for _ in range(2)
+        ]
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.scheduler = SimpleNamespace(
+            kv_checksum_computer=None,
+            batch_result_processor=SimpleNamespace(
+                _maybe_update_reasoning_tokens=lambda req, token_id: None
+            ),
+        )
+        queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        queue.metadata_buffers = receiver
+        # Reuse the same slot with a shorter row: stale tail values must not leak.
+        for token_ids, scores in (
+            (
+                list(range(MAX_DISAGG_TOKEN_IDS_LOGPROB)),
+                [-8.0] * MAX_DISAGG_TOKEN_IDS_LOGPROB,
+            ),
+            ([4000, 5000, 6000], [-8.0, -9.0, -10.0]),
+            ([7000], [-11.0]),
+            ([], []),
+            (None, []),
+        ):
+            with self.subTest(token_ids=token_ids):
+                prefill = self._make_req(None)
+                prefill.return_logprob = True
+                prefill.logprob = ReqLogprob(
+                    top_logprobs_num=1,
+                    token_ids_logprob=token_ids,
+                    output_token_logprobs_val=[-0.5],
+                    output_token_logprobs_idx=[101],
+                    output_top_logprobs_val=[[-0.5]],
+                    output_top_logprobs_idx=[[101]],
+                    output_token_ids_logprobs_val=[scores],
+                    output_token_ids_logprobs_idx=[token_ids],
+                )
+                sender.set_buf(prefill)
+                src_ptrs, lengths, _ = sender.get_buf_infos()
+                dst_ptrs, dst_lengths, _ = receiver.get_buf_infos()
+                self.assertEqual(lengths, dst_lengths)
+                for src, dst, size in zip(src_ptrs, dst_ptrs, lengths, strict=True):
+                    ctypes.memmove(dst, src, size)
+                req = SimpleNamespace(
+                    rid="requested-scores",
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_room=9,
+                    output_ids=[],
+                    return_logprob=True,
+                    return_sampling_mask=False,
+                    logprob=ReqLogprob(
+                        top_logprobs_num=1,
+                        token_ids_logprob=token_ids,
+                        output_token_logprobs_val=[],
+                        output_token_logprobs_idx=[],
+                        output_top_logprobs_val=[],
+                        output_top_logprobs_idx=[],
+                        output_token_ids_logprobs_val=[],
+                        output_token_ids_logprobs_idx=[],
+                    ),
+                    time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+                )
+                queue._commit_transfer_to_req(
+                    DecodeRequest(
+                        req=req,
+                        kv_receiver=SimpleNamespace(clear=lambda: None),
+                        metadata_buffer_index=0,
+                    )
+                )
+                self.assertEqual(req.output_ids, [101])
+                expected_ids = [token_ids] if token_ids is not None else []
+                expected_values = [scores] if token_ids is not None else []
+                self.assertEqual(
+                    req.logprob.output_token_ids_logprobs_idx, expected_ids
+                )
+                self.assertEqual(
+                    req.logprob.output_token_ids_logprobs_val, expected_values
+                )
+                self.assertEqual(req.logprob.output_top_logprobs_idx, [[101]])
+                # A replayed rebootstrap boundary retains its original scores.
+                # Deliberately different fresh-prefill metadata must be ignored.
+                receiver.output_token_ids_logprobs_val.fill_(-20.0)
+                req.pd_rebootstrap_forced_output_id = 101
+                queue._commit_transfer_to_req(
+                    DecodeRequest(
+                        req=req,
+                        kv_receiver=SimpleNamespace(clear=lambda: None),
+                        metadata_buffer_index=0,
+                        is_rebootstrap=True,
+                    )
+                )
+                self.assertEqual(
+                    req.logprob.output_token_ids_logprobs_idx, expected_ids
+                )
+                self.assertEqual(
+                    req.logprob.output_token_ids_logprobs_val, expected_values
+                )
+                self.assertEqual(req.logprob.output_token_logprobs_val, [-0.5])
+
+                if token_ids:
+                    # Stale/incomplete metadata must abort rather than invent scores.
+                    req.output_ids.clear()
+                    receiver.cached_tokens[0, 7] = 0
+                    queue._commit_transfer_to_req(
+                        DecodeRequest(
+                            req=req,
+                            kv_receiver=SimpleNamespace(clear=lambda: None),
+                            metadata_buffer_index=0,
+                        )
+                    )
+                    self.assertEqual(req.output_ids, [])
+                    self.assertEqual(req.finished_reason.status_code, 500)
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
