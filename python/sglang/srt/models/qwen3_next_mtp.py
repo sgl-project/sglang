@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -32,18 +31,13 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -59,7 +53,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings

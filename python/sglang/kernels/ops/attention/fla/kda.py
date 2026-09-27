@@ -25,8 +25,10 @@ from sglang.kernels.ops.attention.fla.index import (
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
+    autotune_cache_kwargs,
     check_shared_mem,
     is_intel,
+    is_nvidia,
 )
 
 if is_intel:
@@ -514,18 +516,8 @@ def chunk_kda_scaled_dot_kkt_fwd(
     return A, Aqk
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
+def _recompute_w_u_fwd_kernel(
     k,
     kg,
     v,
@@ -645,6 +637,67 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+_RECOMPUTE_W_U_CONFIGS = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [64, 128]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+recompute_w_u_fwd_kernel = triton.autotune(
+    configs=_RECOMPUTE_W_U_CONFIGS,
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
+)(_recompute_w_u_fwd_kernel)
+
+_K3_RECOMPUTE_W_U_CONFIGS = {
+    (9, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
+    (10, 3): {"BK": 64, "BV": 128, "num_warps": 8, "num_stages": 2},
+}
+
+
+@torch.inference_mode()
+def precompile_k3_recompute_w_u_kernel(
+    *, num_heads: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    device = torch.device(device)
+    if (
+        not is_nvidia
+        or device.type != "cuda"
+        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, 128)
+    k = torch.zeros(shape, dtype=dtype, device=device)
+    v = torch.zeros_like(k)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    A = torch.zeros((1, 1, num_heads, 64), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    recompute_w_u_fwd(k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens)
+    return True
+
+
+def _get_k3_recompute_w_u_config(
+    k: torch.Tensor,
+    gk: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    K: int,
+    V: int,
+    BT: int,
+) -> dict | None:
+    if (
+        not is_nvidia
+        or gk is None
+        or cu_seqlens is None
+        or (K, V, BT) != (128, 128, 64)
+    ):
+        return None
+    return _K3_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -664,7 +717,13 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
+    kernel = (
+        _recompute_w_u_fwd_kernel
+        if static_config is not None
+        else recompute_w_u_fwd_kernel
+    )
+    kernel[(NT, B * H)](
         k=k,
         kg=kg,
         v=v,
@@ -682,7 +741,8 @@ def recompute_w_u_fwd(
         BT=BT,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32",
+        DOT_PRECISION="ieee",
+        **(static_config or {}),
     )
     return w, u, kg
 
@@ -690,8 +750,8 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64]
-        for BV in [64]
+        for BK in [32, 64]
+        for BV in [64, 128]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
@@ -802,7 +862,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v)
+    b_o += tl.dot(b_A, b_v, allow_tf32=False)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -857,6 +917,7 @@ def softplus_fwd(x):
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_BETA": lambda args: args["beta"] is not None,
         "HAS_SCALE": lambda args: args["scale"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
@@ -868,7 +929,7 @@ def softplus_fwd(x):
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=["H", "S", "BT", "IS_VARLEN"],
+    key=["H", "S", "BT", "IS_VARLEN", "HAS_BETA"],
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(
@@ -880,12 +941,18 @@ def kda_gate_chunk_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     lower_bound,
+    beta,
+    beta_out,
+    beta_stride_b: tl.constexpr,
+    beta_stride_t: tl.constexpr,
+    beta_stride_h: tl.constexpr,
     T,
     H: tl.constexpr,
     S: tl.constexpr,
     BT: tl.constexpr,
     BS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_BETA: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
@@ -951,6 +1018,24 @@ def kda_gate_chunk_cumsum_vector_kernel(
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
+    if HAS_BETA:
+        if i_s == 0:
+            offsets_t = i_t * BT + tl.arange(0, BT)
+            if IS_VARLEN:
+                beta_offsets = (bos + offsets_t) * beta_stride_t
+            else:
+                beta_offsets = i_b * beta_stride_b + offsets_t * beta_stride_t
+            b_beta = tl.load(
+                beta + beta_offsets + i_h * beta_stride_h,
+                mask=offsets_t < T,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                beta_out + (bos + offsets_t) * H + i_h,
+                tl.sigmoid(b_beta),
+                mask=offsets_t < T,
+            )
+
 
 def kda_gate_chunk_cumsum(
     g: torch.Tensor,
@@ -962,9 +1047,10 @@ def kda_gate_chunk_cumsum(
     output_dtype: Optional[torch.dtype] = torch.float,
     chunk_indices: Optional[torch.LongTensor] = None,
     lower_bound: Optional[float] = None,
-) -> torch.Tensor:
+    beta: Optional[torch.Tensor] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused KDA gate activation + chunk-local cumulative sum.
+    Fused KDA gate activation + chunk-local cumulative sum, with optional beta.
 
     Combines two memory-bound kernels into one:
       1. Gate activation: g = -exp(A_log) * softplus(raw_g + dt_bias)
@@ -980,25 +1066,39 @@ def kda_gate_chunk_cumsum(
         output_dtype: Output dtype (default float32).
         chunk_indices: Pre-computed chunk indices for varlen mode.
         lower_bound: If set, use safe gate: lower_bound * sigmoid(exp(A_log) * g).
+        beta: Optional raw beta of shape [B, T, H], including strided projections.
 
     Returns:
-        Cumulative-summed gated tensor of shape [B, T, H, K].
+        Cumulative-summed gated tensor of shape [B, T, H, K]. If beta is
+        supplied, also return its sigmoid in a contiguous float32 [B, T, H] tensor.
     """
     if cu_seqlens is not None:
-        assert (
-            g.shape[0] == 1
-        ), "Only batch size 1 is supported when cu_seqlens are provided"
+        assert g.shape[0] == 1, (
+            "Only batch size 1 is supported when cu_seqlens are provided"
+        )
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    if beta is not None:
+        assert beta.shape == (B, T, H)
+        assert beta.device == g.device
+        beta_out = torch.empty((B, T, H), dtype=torch.float32, device=beta.device)
+        beta_strides = beta.stride()
+        if cu_seqlens is not None:
+            beta_strides = (0, beta_strides[1], beta_strides[2])
+    else:
+        beta_out = None
+        beta_strides = (0, 0, 0)
+    if B * T == 0:
+        return g if beta is None else (g, beta_out)
 
     def grid(meta):
         return (cdiv(meta["S"], meta["BS"]), NT, B * H)
@@ -1012,12 +1112,17 @@ def kda_gate_chunk_cumsum(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         lower_bound=lower_bound,
+        beta=beta,
+        beta_out=beta_out,
+        beta_stride_b=beta_strides[0],
+        beta_stride_t=beta_strides[1],
+        beta_stride_h=beta_strides[2],
         T=T,
         H=H,
         S=S,
         BT=BT,
     )
-    return g
+    return g if beta is None else (g, beta_out)
 
 
 def chunk_kda_fwd(
@@ -1034,6 +1139,9 @@ def chunk_kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
+    beta_is_raw: bool = False,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1056,9 +1164,14 @@ def chunk_kda_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             lower_bound=lower_bound,
+            beta=beta if beta_is_raw else None,
         )
+        if beta_is_raw:
+            g, beta = g
     else:
         # g is already gate-activated by caller; just do cumsum.
+        if beta_is_raw:
+            beta = beta.float().sigmoid().contiguous()
         g = chunk_local_cumsum(
             g,
             chunk_size=chunk_size,
@@ -1094,6 +1207,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        safe_gate=lower_bound is not None,
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
@@ -1108,6 +1222,8 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
     del w, u, kg
 
@@ -1126,6 +1242,9 @@ def chunk_kda_fwd(
     del Aqk, v_new
 
     if output_intermediate_states:
+        # h holds the recurrent state at every chunk-size boundary
+        # ([1, NT, H, V, K] packed across cu_seqlens) — the mamba radix
+        # track path snapshots per-chunk states from it during extend.
         return o, h
     del h
     return o
@@ -1146,6 +1265,9 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
+    beta_is_raw: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1161,7 +1283,7 @@ def chunk_kda(
         k=k,
         v=v.contiguous(),
         g=g.contiguous(),
-        beta=beta.contiguous(),
+        beta=beta if beta_is_raw else beta.contiguous(),
         scale=scale,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
@@ -1170,4 +1292,7 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
+        beta_is_raw=beta_is_raw,
     )

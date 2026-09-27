@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+from array import array
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -14,7 +15,6 @@ from sglang.srt.configs.inkling import (
     InklingModelConfig,
     InklingVisionConfig,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -71,10 +71,13 @@ from sglang.srt.models.inkling_common.util import (
     use_inkling_shared_fused_moe,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
+    get_memory,
+    get_mm,
     get_model,
     get_parallel,
-    get_server_args,
+    get_schedule,
 )
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
@@ -303,7 +306,7 @@ class InklingDecoderLayer(nn.Module):
                     hs,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                     norm=self.attn_norm,
                     norm_residual=res,
                 )
@@ -312,7 +315,7 @@ class InklingDecoderLayer(nn.Module):
                 # MoE's unreduced partials; the kernel returns the gathered
                 # post-conv [T, H], and the norm runs unfused below.
                 hs = ar_scattered_sconv_fused(
-                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                    hs, prev_mlp_sconv, forward_batch, get_parallel().tp_group
                 )
                 hs, res = self.attn_norm(hs, res)
         elif prev_mlp_partial:
@@ -326,13 +329,13 @@ class InklingDecoderLayer(nn.Module):
                     prev_mlp_sconv,
                     self.attn_norm,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
             else:
                 # Fused extend {AR + full-width sconv + cache update}
                 # (non-scattered); norm runs unfused on the gathered [T, H].
                 hs = ar_fullwidth_sconv_fused(
-                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                    hs, prev_mlp_sconv, forward_batch, get_parallel().tp_group
                 )
                 hs, res = self.attn_norm(hs, res)
         else:
@@ -399,7 +402,7 @@ class InklingDecoderLayer(nn.Module):
         attn_out / residual_out and returns None (the eager_on_graph copy-back is
         per-tensor, not per-tuple, so outputs must be pre-allocated buffers)."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
-        n = forward_batch.num_token_non_padded_cpu
+        n = forward_batch.global_num_token_non_padded_cpu
         # log_scaling_tau is per-token, so narrow it to match the real tokens too.
         hs, res = self._attn_block(
             hidden_states[:n],
@@ -423,7 +426,7 @@ class InklingDecoderLayer(nn.Module):
         """Eager break for the final layer's deferred mlp_sconv: run on the real
         tokens with the live forward_batch, write the padded output buffer."""
         forward_batch = get_tc_piecewise_forward_context().forward_batch
-        n = forward_batch.num_token_non_padded_cpu
+        n = forward_batch.global_num_token_non_padded_cpu
         y = self.mlp_sconv(hidden_states[:n], positions[:n], forward_batch)
         if self.scattered_sconv:
             # y is the [n, H/P] shard; the output buffer is post-gather [n, H].
@@ -613,7 +616,7 @@ class InklingCausalLLM(nn.Module):
         # the prefill graph disabled and --skip-server-warmup there is no eager
         # forward to build them lazily; decode capture would bake the fallback).
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
-            ensure_inkling_ar_resources(get_tensor_model_parallel_group())
+            ensure_inkling_ar_resources(get_parallel().tp_group)
             ensure_inkling_ar_resources(get_parallel().attn_tp_group)
 
         # Warm the fused decode {AR -> mlp_sconv -> norm} JIT module (both
@@ -628,7 +631,7 @@ class InklingCausalLLM(nn.Module):
             and sconv0 is not None
             and world in (4, 8)  # symm-mem multimem worlds, power-of-two
         ):
-            from sglang.kernels.ops.model.inkling.inkling_ar_fused import (
+            from sglang.kernels.ops.communication.inkling_ar_fused import (
                 compile_inkling_ar_sconv_norm,
             )
 
@@ -649,7 +652,7 @@ class InklingCausalLLM(nn.Module):
         # local/SWA layer (head_dim != 128) that never uses the prologue while
         # later full-attention layers do.
         if is_cuda() and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
-            from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+            from sglang.kernels.ops.attention.inkling_attn_prologue import (
                 compile_inkling_attn_prologue,
             )
 
@@ -680,6 +683,32 @@ class InklingCausalLLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
+        self._dflash_layers_to_capture: set[int] = set()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Capture post-layer hidden states consumed by a DFLASH drafter."""
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit target layer IDs.")
+        if len(layer_ids) != len(set(layer_ids)):
+            raise ValueError(f"DFLASH target layer IDs must be unique: {layer_ids}")
+        if layer_ids != sorted(layer_ids):
+            raise ValueError(f"DFLASH target layer IDs must be sorted: {layer_ids}")
+        invalid = [idx for idx in layer_ids if idx < 0 or idx >= len(self.layers)]
+        if invalid:
+            raise ValueError(
+                f"DFLASH target layer IDs out of range [0, {len(self.layers)}): {invalid}"
+            )
+
+        self._dflash_layers_to_capture = set(layer_ids)
+        # Inkling can defer an MoE all-reduce into the next layer. A tapped
+        # layer must instead materialize a complete hidden state at its tap.
+        for layer in self.layers:
+            if not hasattr(layer, "_mlp_ar_fusable_without_dflash"):
+                layer._mlp_ar_fusable_without_dflash = layer.mlp_ar_fusable
+            layer.mlp_ar_fusable = (
+                layer._mlp_ar_fusable_without_dflash
+                and layer.layer_id not in self._dflash_layers_to_capture
+            )
 
     def get_input_embeddings(self):
         # Fold embed_norm into the embedding so general_mm_embed_routine norms the text
@@ -732,7 +761,7 @@ class InklingCausalLLM(nn.Module):
         fuse_ar_sconv = (
             not forward_batch.forward_mode.is_idle()
             and ar_sconv_norm_fusable(
-                get_tensor_model_parallel_group(),
+                get_parallel().tp_group,
                 forward_batch,
                 hidden_states.shape[0],
                 hidden_states.shape[-1],
@@ -757,7 +786,7 @@ class InklingCausalLLM(nn.Module):
         # kernel. Mutually exclusive with ar_sconv_norm_fusable by mode
         # (extend vs decode/verify) and by the scattered gate inside it.
         if not forward_batch.forward_mode.is_idle() and scattered_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             hidden_states.shape[0],
             hidden_states.shape[-1],
@@ -772,7 +801,7 @@ class InklingCausalLLM(nn.Module):
         # (mode for ar_sconv_norm_fusable, the scattered flag for
         # scattered_ar_sconv_fusable).
         if not forward_batch.forward_mode.is_idle() and fullwidth_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             hidden_states.shape[0],
             hidden_states.shape[-1],
@@ -781,6 +810,12 @@ class InklingCausalLLM(nn.Module):
             fuse_ar_sconv = True
             fuse_attn_ar = True
         prev_mlp_partial = False
+        aux_hidden_states: Optional[list[torch.Tensor]] = (
+            []
+            if self._dflash_layers_to_capture
+            and not forward_batch.forward_mode.is_idle()
+            else None
+        )
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states,
@@ -795,6 +830,18 @@ class InklingCausalLLM(nn.Module):
             )
             prev_mlp_sconv = layer.mlp_sconv
             prev_mlp_partial = fuse_ar_sconv and layer.mlp_ar_fusable
+            if (
+                aux_hidden_states is not None
+                and layer.layer_id in self._dflash_layers_to_capture
+            ):
+                # The trained taps are post-layer and precede the deferred
+                # mlp_sconv belonging to this layer.
+                tap_hidden = hidden_states
+                if layer.scattered_sconv:
+                    tap_hidden = all_gather_hidden(tap_hidden, layer.attn_tp_group)
+                aux_hidden_states.append(
+                    tap_hidden if residual is None else tap_hidden + residual
+                )
         # The final layer's mlp_sconv was deferred; run it now — as an eager break
         # under BCG (so it re-reads live per-seq metadata at replay), else inline.
         if prev_mlp_sconv is not None and not forward_batch.forward_mode.is_idle():
@@ -807,21 +854,29 @@ class InklingCausalLLM(nn.Module):
                         hidden_states,
                         prev_mlp_sconv,
                         forward_batch,
-                        get_tensor_model_parallel_group(),
+                        get_parallel().tp_group,
                         norm=self.norm,
                         norm_residual=residual,
                     )
-                    return hidden_states
+                    return (
+                        (hidden_states, aux_hidden_states)
+                        if self._dflash_layers_to_capture
+                        else hidden_states
+                    )
                 # Fused extend tail: {AR + scattered sconv}, then the final
                 # norm unfused on the gathered [T, H].
                 hidden_states = ar_scattered_sconv_fused(
                     hidden_states,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return hidden_states
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if self._dflash_layers_to_capture
+                    else hidden_states
+                )
             if prev_mlp_partial:
                 fm = forward_batch.forward_mode
                 if fm.is_decode() or fm.is_target_verify():
@@ -833,19 +888,27 @@ class InklingCausalLLM(nn.Module):
                         prev_mlp_sconv,
                         self.norm,
                         forward_batch,
-                        get_tensor_model_parallel_group(),
+                        get_parallel().tp_group,
                     )
-                    return hidden_states
+                    return (
+                        (hidden_states, aux_hidden_states)
+                        if self._dflash_layers_to_capture
+                        else hidden_states
+                    )
                 # Fused extend tail: {AR + full-width sconv + cache update}
                 # (non-scattered), then the final norm unfused.
                 hidden_states = ar_fullwidth_sconv_fused(
                     hidden_states,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return hidden_states
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if self._dflash_layers_to_capture
+                    else hidden_states
+                )
             # Same gate as the per-layer group: the eager break needs the tc_piecewise
             # context (installed only by the prefill BCG runner) to read the live
             # forward_batch at replay; else run inline with the passed forward_batch.
@@ -873,7 +936,11 @@ class InklingCausalLLM(nn.Module):
                         hidden_states, self.layers[-1].attn_tp_group
                     )
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return (
+            (hidden_states, aux_hidden_states)
+            if self._dflash_layers_to_capture
+            else hidden_states
+        )
 
 
 class InklingAudio(nn.Module):
@@ -947,12 +1014,10 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        server_args = get_server_args()
-        assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
-        if server_args.disaggregation_mode != "decode":
-            assert not server_args.disable_radix_cache
-            assert not server_args.disable_hybrid_swa_memory
-            assert server_args.enable_mamba_extra_buffer()
+        if get_disagg().disaggregation_mode != "decode":
+            assert not get_memory().disable_radix_cache
+            assert not get_schedule().disable_hybrid_swa_memory
+            assert get_exec().mamba.enable_mamba_extra_buffer
 
         from types import SimpleNamespace
 
@@ -961,7 +1026,7 @@ class InklingForConditionalGeneration(nn.Module):
         )
 
         inkling_quant_config = get_quantization_config(
-            SimpleNamespace(hf_config=self.config, model_path=server_args.model_path)
+            SimpleNamespace(hf_config=self.config, model_path=get_model().model_path)
         )
         if inkling_quant_config is not None:
             quant_config = inkling_quant_config
@@ -978,7 +1043,7 @@ class InklingForConditionalGeneration(nn.Module):
         # checkpoint served text-only must not allocate/load the towers (wasted
         # GPU memory / avoidable startup OOM). The mm dispatch (forward) and the
         # weight loader already skip audio./visual. when these are None.
-        build_multimodal = bool(server_args.enable_multimodal)
+        build_multimodal = bool(get_mm().enable_multimodal)
         self.audio = (
             InklingAudio(self.config.audio_config)
             if build_multimodal and self.config.audio_config.decoder_dmodel is not None
@@ -1057,7 +1122,7 @@ class InklingForConditionalGeneration(nn.Module):
             return 2
         return 1
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # The processor expands one placeholder per media item into a run of the same
         # token id; the scheduler calls this to replace each run with the item's
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.
@@ -1068,6 +1133,14 @@ class InklingForConditionalGeneration(nn.Module):
 
     def get_embed_and_head(self):
         return self.llm.embed_tokens.weight, self.llm.lm_head.weight
+
+    @property
+    def lm_head(self) -> nn.Module:
+        """Expose the target head through the common speculative API."""
+        return self.llm.lm_head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.llm.set_dflash_layers_to_capture(layer_ids)
 
     def get_num_kv_cache_layers(self) -> int:
         return self.text_config.num_hidden_layers
@@ -1104,6 +1177,9 @@ class InklingForConditionalGeneration(nn.Module):
             data_embedding_funcs=data_embedding_funcs,
             positions=positions,
         )
+        aux_hidden_states = None
+        if self.llm._dflash_layers_to_capture:
+            hidden_states, aux_hidden_states = hidden_states
         mup_width_multiplier = self.config.text_config.logits_mup_width_multiplier
         hidden_states_for_logits = (
             hidden_states
@@ -1118,39 +1194,12 @@ class InklingForConditionalGeneration(nn.Module):
             hidden_states_for_logits,
             self.llm.lm_head,
             forward_batch,
-            hidden_states_before_norm=hidden_states,
-        )
-
-    def update_conv_state_after_mtp_verify(
-        self,
-        req_to_token_pool,
-        req_pool_indices: torch.Tensor,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-    ) -> None:
-        """Commit the per-step sconv windows saved during TARGET_VERIFY into the
-        persistent conv caches at each request's last accepted step.
-
-        Inkling bypasses the HybridLinearAttnBackend wrapper (ShortConvolution reads
-        the mamba pool directly), so the model owns this commit instead of an
-        attention-backend hook. The pool is passed in because this runs from the
-        spec worker after the forward context has exited.
-        """
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            scatter_mamba_states_after_mtp_verify,
-        )
-
-        pool = req_to_token_pool
-        mamba_indices = pool.translate_mamba_indices(
-            pool.get_mamba_indices(req_pool_indices)
-        )
-        scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
-            mamba_indices,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
+            aux_hidden_states=aux_hidden_states,
+            # DFLASH needs the concatenated tap states. LogitsProcessor gives
+            # hidden_states_before_norm precedence, so omit it in this mode.
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else hidden_states
+            ),
         )
 
     def _load_regular_param(
@@ -1281,7 +1330,9 @@ class InklingForConditionalGeneration(nn.Module):
             and not self.text_config.inference_moe_w13_interleaved
             and weight_loader is not default_weight_loader
         ):
-            from sglang.srt.layers.quantization.modelopt_quant import deinterleave_w13
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                deinterleave_w13,
+            )
 
             loaded_weight = deinterleave_w13(loaded_weight)
         if (
@@ -1733,7 +1784,7 @@ class InklingMTPLayer(nn.Module):
             h_inproj.dtype,
         )
         if not fm_idle and scattered_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             h_inproj.shape[0],
             h_inproj.shape[-1],
@@ -1775,6 +1826,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
     """
 
     fall_back_to_pt_during_load = False
+    mtp_layer_id_is_depth = True
 
     def __init__(
         self,

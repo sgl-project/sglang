@@ -27,6 +27,8 @@ def _draft_topk1_partial_argmax_kernel(
         mask=mask,
         other=-float("inf"),
     ).to(tl.float32)
+    # Keep NaNs on valid lanes from selecting the masked tail.
+    vals = tl.where(vals == vals, vals, -1e30)
 
     max_val = tl.max(vals, axis=0)
     local_index = tl.argmax(vals, axis=0)
@@ -146,3 +148,15 @@ def draft_topk1_postprocess(
         num_warps=1,
     )
     return topk_p, topk_index
+
+
+def draft_topk1_argmax_only(next_token_logits: torch.Tensor):
+    """Select top-k=1 without mutating caller-owned positions."""
+    # The upstream finalizer always advances positions. Draft-extend has already
+    # consumed its positions, so absorb that side effect in a discarded buffer.
+    scratch_positions = torch.zeros(
+        next_token_logits.shape[0],
+        dtype=torch.long,
+        device=next_token_logits.device,
+    )
+    return draft_topk1_postprocess(next_token_logits, scratch_positions)

@@ -3,7 +3,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 from sglang.srt.models import kimi_vl_moonvit
 from sglang.srt.models.kimi_vl_moonvit import Learnable2DInterpPosEmb

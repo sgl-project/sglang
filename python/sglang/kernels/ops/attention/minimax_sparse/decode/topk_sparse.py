@@ -6,7 +6,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import check_sparse_kv_fp8, robust_allocator
+from ..common.utils import (
+    check_sparse_kv_fp8,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 
 
 @triton.heuristics(
@@ -18,6 +23,7 @@ from ..common.utils import check_sparse_kv_fp8, robust_allocator
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
         "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+        "HAS_HISPARSE_SLOTS": lambda args: args["hisparse_slots_ptr"] is not None,
     }
 )
 @triton.autotune(
@@ -38,6 +44,7 @@ def _gqa_share_sparse_decode_kernel(
     idx_ptr,  # topk index: qh x b x topk
     o_ptr,  # O partial: c x b x qh x d
     lse_ptr,  # lse partial: c x b x qh
+    hisparse_slots_ptr,  # pre-resolved device slots: kh x b x (topk * block)
     seq_lens,
     slot_ids,
     # shape
@@ -47,8 +54,13 @@ def _gqa_share_sparse_decode_kernel(
     head_dim,
     max_topk,
     max_kv_len,
+    hisparse_slots_stride_h,
+    hisparse_slots_stride_b,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # stride
     stride_q_b,
     stride_q_h,
@@ -81,6 +93,7 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    HAS_HISPARSE_SLOTS: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -153,18 +166,30 @@ def _gqa_share_sparse_decode_kernel(
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.
     cur_idx_ptr = idx_base + chunk_start_topk * stride_ti_t
+    hisparse_topk_counter = chunk_start_topk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
         # load index
         c = tl.load(cur_idx_ptr).to(tl.int32) * BLOCK_SIZE_N
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
-        # resolve slots for this block via req_to_token
         pos = c + off_n
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
+        if HAS_HISPARSE_SLOTS:
+            slots = tl.load(
+                hisparse_slots_ptr
+                + pid_kh * hisparse_slots_stride_h
+                + pid_b * hisparse_slots_stride_b
+                + hisparse_topk_counter * BLOCK_SIZE_N
+                + off_n,
+                mask=off_n < BLOCK_SIZE_N,
+                other=0,
+            ).to(tl.int64)
+            hisparse_topk_counter = hisparse_topk_counter + 1
+        else:
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
         slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
@@ -178,10 +203,12 @@ def _gqa_share_sparse_decode_kernel(
             other=0.0,
         )
         if IS_FP8:
-            # fp8 KV cache is unit-scaled (set_kv_buffer casts bf16->fp8 with no
-            # scale), so dequant is just a widening cast to the Q compute dtype
-            # before the tl.dot. Matches the bf16 path bit-for-bit when the cache
-            # is bf16 (IS_FP8 False -> this branch is compiled out).
+            # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
+            # (unit-scaled cache -> exact inverse dequant; k_scale covers
+            # calibrated caches). With fp8 Q (fp8 attn-GEMM mode) the cast is a
+            # no-op and tl.dot below runs fp8x8 on tensor cores. Matches the
+            # bf16 path bit-for-bit when the cache is bf16 (IS_FP8 False ->
+            # this branch is compiled out).
             k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
         v_off = (
@@ -195,15 +222,16 @@ def _gqa_share_sparse_decode_kernel(
             other=0.0,
         )
         if IS_FP8:
-            # Widen V before the P@V dot. This also makes the `p.to(v.dtype)`
-            # below cast P to the compute dtype (not to fp8, which would be
-            # catastrophic precision loss on the attention weights).
+            # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
+            # `p.to(v.dtype)` below keeps P in the compute dtype); with fp8 Q it
+            # is a no-op and P is quantized to e4m3 for the fp8 PV MMA — the
+            # same accuracy contract as fmha_sm100's fp8 kernel.
             v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale
+        qk += tl.dot(q, k) * (sm_scale * k_scale)
         # compute m_ij and l_ij
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp(qk - m_ij[:, None])
@@ -212,9 +240,8 @@ def _gqa_share_sparse_decode_kernel(
         acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
-        p = p.to(v.dtype)
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
         # update statistics
         m_i = m_ij
         lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
@@ -308,17 +335,23 @@ def flash_decode_with_gqa_share_sparse(
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    hisparse_slots: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     assert topk_idx.shape[0] == num_kv_heads
-    assert (
-        triton.next_power_of_2(block_size) == block_size
-    ), f"block_size must be a power of 2, but got {block_size}"
+    assert triton.next_power_of_2(block_size) == block_size, (
+        f"block_size must be a power of 2, but got {block_size}"
+    )
     # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
     max_kv_len = req_to_token.shape[1]
     # gqa
@@ -328,6 +361,9 @@ def flash_decode_with_gqa_share_sparse(
     # sm scale
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+    # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
+    # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
+    sm_scale = sm_scale * unit_scale(q_scale)
     # Pick NUM_TOPK_CHUNKS so total grid ≈ TARGET_GRID. Same constraints as
     # flash_decode_with_topk_idx: must be power of 2 (Triton arange) and must
     # only depend on shape constants (so grid is fixed within a cuda graph).
@@ -345,7 +381,7 @@ def flash_decode_with_gqa_share_sparse(
         batch_size,
         num_q_heads,
         head_dim,
-        dtype=q.dtype,
+        dtype=sparse_out_dtype(q),
         device=q.device,
     )
     lse_partial = torch.empty(
@@ -366,6 +402,7 @@ def flash_decode_with_gqa_share_sparse(
         topk_idx,
         o_partial,
         lse_partial,
+        hisparse_slots,
         seq_lens,
         slot_ids,
         max_slots,
@@ -374,7 +411,11 @@ def flash_decode_with_gqa_share_sparse(
         head_dim,
         max_topk,
         max_kv_len,
+        hisparse_slots.stride(0) if hisparse_slots is not None else 0,
+        hisparse_slots.stride(1) if hisparse_slots is not None else 0,
         sm_scale,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),

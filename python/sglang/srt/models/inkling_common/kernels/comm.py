@@ -94,7 +94,7 @@ def _ar_jit():
     lazy so importing comm.py doesn't pull in the JIT machinery)."""
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_all_reduce
+    from sglang.kernels.ops.communication import inkling_all_reduce
 
     return inkling_all_reduce
 
@@ -103,7 +103,7 @@ def _ar_jit():
 def _ar_fused_jit():
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_ar_fused
+    from sglang.kernels.ops.communication import inkling_ar_fused
 
     return inkling_ar_fused
 
@@ -241,7 +241,7 @@ def ar_sconv_norm_fusable(
     (attn-side: wo_ud AR -> attn_sconv -> mlp_norm; MoE-side: MoE AR ->
     mlp_sconv -> next attn_norm)
     can run as the single fused kernel
-    (kernels/ops/model/inkling/inkling_ar_fused.py). Must be
+    (kernels/ops/communication/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
     if not is_cuda():
@@ -455,9 +455,12 @@ def symm_mem_all_reduce(
     ):
         n = input.numel()
         num_tokens = input.shape[0] if input.dim() >= 2 else n
+        # select_ar_config() keys off the token count; plain multimem below
+        # reduces in a shape-independent order.
         res = (
             _get_inkling_ar_resources(comm)
             if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
+            and not get_exec().deterministic.enable_deterministic_inference
             else None
         )
         # Custom kernels need a 16B-vector-multiple size (validate() enforces it);
@@ -675,7 +678,7 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
 def _ar_ssconv_jit():
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_ar_scattered_sconv
+    from sglang.kernels.ops.communication import inkling_ar_scattered_sconv
 
     return inkling_ar_scattered_sconv
 
@@ -689,7 +692,7 @@ def scattered_ar_sconv_fusable(
 ) -> bool:
     """True when an extend {reduce_scatter_hidden -> sconv(shard) ->
     all_gather_hidden} chain can run as the single fused v3/v3b-style kernel
-    (kernels/ops/model/inkling/inkling_ar_scattered_sconv.py). Pure function of
+    (kernels/ops/communication/inkling_ar_scattered_sconv.py). Pure function of
     per-forward
     state -- the producing layer (reduce=False) and the consuming site must
     evaluate it identically."""
@@ -1003,7 +1006,7 @@ def ar_scattered_sconv_fused(
         **norm_kwargs,
     )
     if is_verify:
-        # Save the per-position windows for update_conv_state_after_mtp_verify.
+        # Save the per-position windows for the backend's MTP-verify commit.
         sconv.verify_fused_ar_finish(forward_batch, x_scratch, cache_indices)
     if norm is not None:
         return norm_kwargs["norm_out"], norm_residual

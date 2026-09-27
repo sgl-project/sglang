@@ -1,0 +1,1084 @@
+---
+title: "SGLang Plugin System"
+metatags:
+    description: "Allows hardware vendors and developers to extend SGLang without modifying the main repository code."
+---
+
+## Overview
+
+Allows hardware vendors and developers to extend SGLang **without modifying the main repository code**.
+
+The framework provides two plugin types, both discovered via Python's standard `setuptools` entry_points:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Plugin Type</th>
+      <th>Entry Point Groups</th>
+      <th>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Hardware Platform Plugin</strong></td>
+      <td><code>sglang.srt.platforms</code><br/><code>sglang.multimodal_gen.platforms</code></td>
+      <td>Register a custom hardware platform (device operations, KV cache pools, attention backends, graph capture, compilation backends, etc.)</td>
+    </tr>
+    <tr>
+      <td><strong>General Plugin</strong></td>
+      <td><code>sglang.srt.plugins</code><br/><code>sglang.multimodal_gen.plugins</code></td>
+      <td>Inject hooks (before/after/around/replace) into any function/method, or replace entire classes</td>
+    </tr>
+  </tbody>
+</table>
+
+### Principles
+
+- **Non-intrusive**: Built-in platforms remain the fallback when no OOT platform activates.
+- **Install-time discovery**: Plugins are discovered from Python entry points after installation.
+- **Environment variable control**: `SGLANG_PLATFORM` selects an SRT platform, `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` selects a diffusion platform, and `SGLANG_PLUGINS` filters general plugins in either hook group.
+
+### Current scope
+
+The platform plugin system targets **out-of-tree (OOT) hardware platforms**. Diffusion support is experimental and covers the seams documented below, not every device-specific branch.
+
+## Architecture
+
+### Runtime-specific platform interfaces
+
+SRT and diffusion have separate platform base classes and platform identity types in `sglang.srt.platforms` and `sglang.multimodal_gen.runtime.platforms`. A package supporting both runtimes should define separate platform classes and use each runtime's own `PlatformEnum.OOT` value.
+
+Each platform entry point resolves to a zero-argument activation callback:
+
+```python
+def activate() -> str | None:
+    """Return the platform class qualname when this hardware is available."""
+```
+
+Return a fully qualified class name when the provider can run, or `None` otherwise. Keep activation import-safe: do not access `current_platform` or initialize runtime or device state. Put required backend setup in the platform's `init_backend()` method and reserve general plugins for hooks that the platform interface cannot express.
+
+Explicit selection enumerates entry-point metadata and imports only the selected callback. Automatic selection invokes installed platform callbacks to determine which provider is active.
+
+Diffusion reserves `cpu`, `cuda`, `rocm`, `xpu`, `mps`, `npu`, and `musa`. Automatic discovery also rejects duplicate entry-point names; explicit selection validates only the selected name and does not import unrelated providers.
+
+#### SRT selection
+
+`current_platform` is a **lazy singleton** in `sglang.srt.platforms`. On first access it resolves the active platform through the following priority chain:
+
+```text
+entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadata only)
+  │
+  ├─ SGLANG_PLATFORM set (front-loading filter):
+  │   ├─ Name not found in discovered → RuntimeError
+  │   ├─ activate() returns non-None  → load that platform
+  │   └─ activate() returns None      → RuntimeError (hardware unavailable)
+  │
+  └─ SGLANG_PLATFORM unset (auto-discover, activate all):
+      ├─ 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
+      ├─ 0 activated + CUDA available          → fallback CudaSRTPlatform
+      ├─ 0 activated + ROCm available          → fallback RocmSRTPlatform
+      ├─ 0 activated + XPU available           → fallback XpuSRTPlatform
+      ├─ 0 activated + none of the above       → fallback base SRTPlatform
+      ├─ 1 activated → use it
+      └─ N activated → RuntimeError (must set SGLANG_PLATFORM)
+```
+
+#### Diffusion selection
+
+SGLang Diffusion resolves its platform in this order:
+
+1. When `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` names `cpu`, `cuda`, `rocm`, `mps`, `npu`, or `musa`, select that built-in platform without hardware probing. XPU remains automatic-only, preserving the existing selector behavior.
+2. When it contains another name, load only the matching `sglang.multimodal_gen.platforms` entry point. An unknown name or a callback that returns `None` is an error.
+3. When it is unset, activate installed diffusion platform plugins. No active plugin continues to built-in detection, one selects that plugin, and multiple active plugins raise an error that asks you to set the selector. An activation callback that raises aborts startup rather than falling back, so a broken vendor runtime cannot silently run the job on a built-in platform.
+4. Try built-in platforms in order: MPS, XPU, ROCm, CUDA, NPU, MUSA, then CPU.
+
+The existing override variable is therefore the single explicit selector for supported built-in aliases and OOT entry-point names.
+
+Selection resolves lazily, the first time anything in a process touches `current_platform`, so it needs no call site and happens in every process automatically. SGLang Diffusion also records which distribution supplied the selected platform, and skips the hooks of every other installed platform package.
+
+#### Required platform initialization vs. optional hooks
+
+The two mechanisms have different failure semantics, and it matters which one you use:
+
+| | Platform contract | General plugin |
+| --- | --- | --- |
+| Entry-point group | `sglang.multimodal_gen.platforms` | `sglang.multimodal_gen.plugins` |
+| Delivery | methods on your `Platform` subclass | hooks that monkey-patch a target |
+| Activation | lazy `current_platform`, plus guarded `init_backend()` in each worker | registration with `load_plugins()`, then explicit `apply_plugin_hooks()` per process |
+| A failure | aborts startup | aborts startup if the plugin ships in the selected platform's distribution; otherwise logged |
+
+Anything your hardware needs in order to be correct belongs on the `Platform` subclass, so a broken platform cannot silently serve. Reach for a general plugin only when the `Platform` interface has no seam for what you need — and please report that gap.
+
+A plugin shipped in the selected platform's own distribution is treated as part of that platform's contract: a failure to load it, to run its callback, or to apply any hook it registered aborts startup rather than leaving the platform half-initialized. Plugins from any other installed package stay best-effort, so a broken third party cannot take the server down. An explicit `SGLANG_PLUGINS` allowlist can disable any general plugin, including one from the selected platform package; required hardware setup therefore belongs in `init_backend()`.
+
+### Plugin Loading Flow
+
+Each runtime has a process-local hook registry. SRT retains its single
+`load_plugins()` activation step. Diffusion separates registration
+(`load_plugins()`) from target resolution (`apply_plugin_hooks()`), because
+resolving a dotted hook target can import that target's entire module graph.
+Both runtimes honor `SGLANG_PLUGINS`.
+
+The loader is called at these SRT entry points:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Call Site</th>
+      <th>Process</th>
+      <th>Timing</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>cli/serve.py</code> <code>serve()</code></td>
+      <td>Main</td>
+      <td>Before <code>prepare_server_args()</code></td>
+    </tr>
+    <tr>
+      <td><code>launch_server.py</code> <code>__main__</code></td>
+      <td>Main</td>
+      <td>Before <code>prepare_server_args()</code></td>
+    </tr>
+    <tr>
+      <td><code>engine.py</code> <code>_launch_subprocesses()</code></td>
+      <td>Main</td>
+      <td>Before <code>server_args.check_server_args()</code></td>
+    </tr>
+    <tr>
+      <td><code>scheduler.py</code> <code>run_scheduler_process()</code></td>
+      <td>Subprocess</td>
+      <td>Before <code>Scheduler()</code> construction</td>
+    </tr>
+  </tbody>
+</table>
+
+> **Note**: Diffusion plugin registration and hook application each run once per process. Spawned subprocesses start from a blank interpreter and establish their own hooks — nothing the parent patched survives the spawn boundary. SRT's `load_plugins()` performs both phases in one call.
+
+```text
+load_plugins()
+  ├── _get_excluded_dists()                       → compute dists to skip (via SGLANG_PLATFORM)
+  ├── load_plugins_by_group("sglang.srt.plugins",     → discover entry_points, filter by SGLANG_PLUGINS
+  │     excluded_dists=...)                          skip plugins from unselected platform packages
+  ├── for each plugin:                            → set _current_plugin_source context var
+  │     func()                                      side effects (register hooks with source tracking)
+  └── HookRegistry.apply_hooks()                  → monkey-patch targets
+```
+
+Diffusion launchers call `apply_plugin_hooks()`, which first performs registration
+if necessary and then resolves and patches targets. Scheduler children use a
+stricter lifecycle in `runtime/managers/worker_bootstrap.py`:
+
+```text
+spawn unpickles SchedulerProcessSpec (stdlib types + opaque ServerArgs bytes)
+  -> initialize_current_platform()
+  -> load_plugins()                 # discover callbacks and register hooks only
+  -> apply_plugin_hooks()           # target imports are allowed from here onward
+  -> materialize ServerArgs
+  -> resolve and invoke the patched run_scheduler_process
+```
+
+HTTP children likewise finish plugin registration and hook application before
+importing `runtime.launch_server` or materializing `ServerArgs`. This matters for
+class replacements and other hooks whose effects cannot be retroactively applied
+to classes or registrations created while importing the server module graph.
+
+The bootstrap module is the `mp.Process` target and imports no diffusion runtime
+module at module scope. `ServerArgs` is serialized inside `ServerArgsPayload`, so
+the multiprocessing unpickler cannot import pipeline configuration modules
+before the target starts. Workers always use a local `spawn` context, independent
+of an embedding application's global multiprocessing setting.
+
+This ordering makes backend initialization precede plugin callback imports,
+hook-target resolution, `ServerArgs` materialization, and worker imports. A
+platform activation module necessarily loads before its own `init_backend()`;
+activation modules must therefore remain import-safe. Prefer platform methods
+and registries for required behavior.
+
+Each activation phase runs once per process behind a lock: a re-entrant call
+from a plugin callback returns and lets the outer call finish, another thread
+waits for it, and a failure is terminal. A callback must not hand activation to
+a second thread and join it — that deadlocks.
+
+#### Offline scripts and the spawn boundary
+
+`spawn` re-executes the launching script's module scope in every child *before*
+it unpickles the target's arguments, so an offline script's own imports run
+ahead of that child's platform initialization and `ServerArgsPayload` cannot
+help. The supported script layout is:
+
+```python
+from sglang.multimodal_gen import DiffGenerator  # a proxy: imports nothing yet
+
+if __name__ == "__main__":
+    generator = DiffGenerator.from_pretrained(model_path="...")
+```
+
+`DiffGenerator` on the `sglang.multimodal_gen` facade is a lazy proxy, so
+binding it at module scope costs no diffusion import and the child still reaches
+`initialize_current_platform()` with a clean module table. Module scope also
+stays open to `envs` and `runtime.platforms`, including `runtime.platforms.plugins`.
+These modules remain import-safe so a plugin can subclass `Platform` and register
+hooks before backend initialization. Everything else, including `SamplingParams` and `PipelineConfig`
+from the same facade, belongs inside the `if __name__ == "__main__":` guard or
+inside the function that uses it. A child
+that finds runtime modules already imported names them in a warning: hook
+application can still patch those modules, but classes and registrations
+created while importing them are already past reach.
+
+---
+
+## Plugin Type 1: Hardware Platform Plugin
+
+### Description
+
+A hardware platform plugin registers an SRT `SRTPlatform` subclass, a diffusion `Platform` subclass, or both. The selected class tells that runtime how to interact with a specific hardware backend.
+
+### SRT quick start
+
+**1. Create a minimal package:**
+
+```
+my_platform_plugin/
+├── pyproject.toml
+└── my_platform_plugin/
+    ├── __init__.py    # activate() function
+    ├── device.py      # MyDeviceMixin
+    └── platform.py    # MySRTPlatform
+```
+
+**2. `pyproject.toml`:**
+
+```toml
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-platform-plugin"
+version = "0.1.0"
+
+[project.entry-points."sglang.srt.platforms"]
+my_device = "my_platform_plugin:activate"
+```
+
+**3. `__init__.py`** — activation function:
+
+```python
+def activate():
+    """Return fully-qualified class name to activate, or None to skip."""
+    if _my_device_is_available():
+        return "my_platform_plugin.platform.MySRTPlatform"
+    return None
+```
+
+**4. `device.py`** — device mixin:
+
+```python
+from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
+
+class MyDeviceMixin(DeviceMixin):
+    _enum = PlatformEnum.OOT
+    device_name = "my_device"
+    device_type = "my_device"   # torch device type
+
+    def set_device(self, device) -> None: ...
+    def get_device_name(self, device_id=0) -> str: ...
+    def get_device_total_memory(self, device_id=0) -> int: ...
+    def get_current_memory_usage(self, device=None) -> float: ...
+    def get_device_capability(self, device_id=0): ...
+    def get_torch_distributed_backend_str(self) -> str: ...
+```
+
+**5. `platform.py`** — SRT platform:
+
+```python
+from sglang.srt.platforms.interface import SRTPlatform
+from my_platform_plugin.device import MyDeviceMixin
+
+class MySRTPlatform(SRTPlatform, MyDeviceMixin):
+    def get_default_attention_backend(self) -> str: ...
+    def support_cuda_graph(self) -> bool: ...
+    # ... override other methods as needed
+```
+
+**6. Install and verify:**
+
+```bash
+pip install -e my_platform_plugin/
+python -c "from sglang.srt.platforms import current_platform; print(current_platform)"
+```
+
+### SRT platform interface reference
+
+#### Identity Queries (from DeviceMixin)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>is_cuda()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is an NVIDIA CUDA platform</td>
+    </tr>
+    <tr>
+      <td><code>is_rocm()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is an AMD ROCm platform</td>
+    </tr>
+    <tr>
+      <td><code>is_npu()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is a Huawei NPU platform</td>
+    </tr>
+    <tr>
+      <td><code>is_cpu()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is a CPU-only platform</td>
+    </tr>
+    <tr>
+      <td><code>is_xpu()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is an Intel XPU platform</td>
+    </tr>
+    <tr>
+      <td><code>is_musa()</code></td>
+      <td>Based on <code>_enum</code></td>
+      <td>Whether this is a Moore Threads MUSA platform</td>
+    </tr>
+    <tr>
+      <td><code>is_cuda_alike()</code></td>
+      <td>CUDA+ROCM+MUSA</td>
+      <td>True if the hardware supports CUDA-like APIs</td>
+    </tr>
+    <tr>
+      <td><code>is_out_of_tree()</code></td>
+      <td><code>True</code> for OOT</td>
+      <td>Automatically detected based on <code>_enum = PlatformEnum.OOT</code></td>
+    </tr>
+  </tbody>
+</table>
+
+#### Device Operations (from DeviceMixin)
+
+> Methods annotated **[Active]** are called by SGLang core through `current_platform` — OOT implementations take effect immediately.
+> Methods annotated **[Planned]** are reserved interfaces — SGLang core still uses hardcoded calls (e.g. `torch.cuda.empty_cache()`). OOT implementations will NOT take effect until the core is migrated in a future PR.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Default</th>
+      <th>Status</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>get_device(local_rank)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Return <code>torch.device</code> for a given local rank</td>
+    </tr>
+    <tr>
+      <td><code>set_device(device)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Set the current device</td>
+    </tr>
+    <tr>
+      <td><code>get_device_name(device_id)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Get human-readable device name</td>
+    </tr>
+    <tr>
+      <td><code>get_device_uuid(device_id)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Get unique device identifier</td>
+    </tr>
+    <tr>
+      <td><code>get_device_capability(device_id)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Get <code>DeviceCapability(major, minor)</code>. None if N/A</td>
+    </tr>
+    <tr>
+      <td><code>empty_cache()</code></td>
+      <td><code>pass</code></td>
+      <td>Planned</td>
+      <td>Release cached device memory</td>
+    </tr>
+    <tr>
+      <td><code>synchronize()</code></td>
+      <td><code>pass</code></td>
+      <td>Planned</td>
+      <td>Synchronize device operations</td>
+    </tr>
+    <tr>
+      <td><code>get_device_total_memory(device_id)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td><strong>Active</strong></td>
+      <td>Get total device memory in bytes</td>
+    </tr>
+    <tr>
+      <td><code>get_available_memory(device_id)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Return <code>(free_bytes, total_bytes)</code></td>
+    </tr>
+    <tr>
+      <td><code>get_current_memory_usage(device)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td><strong>Active</strong></td>
+      <td>Get current peak memory usage in bytes</td>
+    </tr>
+    <tr>
+      <td><code>is_pin_memory_available(device=None)</code></td>
+      <td><code>False</code></td>
+      <td><strong>Active</strong></td>
+      <td>Whether pinned host memory is available for a target device</td>
+    </tr>
+    <tr>
+      <td><code>get_torch_distributed_backend_str()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Planned</td>
+      <td>Distributed backend string (e.g. "nccl", "hccl")</td>
+    </tr>
+    <tr>
+      <td><code>get_communicator_class()</code></td>
+      <td><code>None</code></td>
+      <td>Planned</td>
+      <td>Platform-specific communicator class</td>
+    </tr>
+    <tr>
+      <td><code>inference_mode()</code></td>
+      <td><code>torch.inference_mode(True)</code></td>
+      <td>Planned</td>
+      <td>Return inference mode context manager</td>
+    </tr>
+    <tr>
+      <td><code>seed_everything(seed)</code></td>
+      <td>Set random/np/torch seeds</td>
+      <td>Planned</td>
+      <td>Set random seeds for reproducibility</td>
+    </tr>
+    <tr>
+      <td><code>verify_quantization(quant)</code></td>
+      <td><code>pass</code></td>
+      <td>Planned</td>
+      <td>Validate quantization method support</td>
+    </tr>
+    <tr>
+      <td><code>get_cpu_architecture()</code></td>
+      <td>Auto-detect x86/arm</td>
+      <td>Planned</td>
+      <td>Detect CPU architecture (<code>CpuArchEnum</code>)</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Types (from DeviceMixin)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>PlatformEnum</code></td>
+      <td>Enumeration of platform types: CUDA, ROCM, CPU, XPU, MUSA, NPU, TPU, MPS, OOT, UNSPECIFIED</td>
+    </tr>
+    <tr>
+      <td><code>CpuArchEnum</code></td>
+      <td>CPU architecture: X86, ARM, UNSPECIFIED</td>
+    </tr>
+    <tr>
+      <td><code>DeviceCapability</code></td>
+      <td><code>NamedTuple(major, minor)</code> with comparison support. Methods: <code>as_version_str()</code>, <code>to_int()</code></td>
+    </tr>
+  </tbody>
+</table>
+
+#### Capability Flags (from SRTPlatform)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>support_cuda_graph()</code></td>
+      <td><code>False</code></td>
+      <td>Whether device graph capture is supported (plain CUDA graph)</td>
+    </tr>
+    <tr>
+      <td><code>support_piecewise_cuda_graph()</code></td>
+      <td><code>False</code></td>
+      <td>Whether piecewise CUDA graph (torch.compile backend) is supported</td>
+    </tr>
+    <tr>
+      <td><code>supports_fp8()</code></td>
+      <td><code>False</code></td>
+      <td>Whether FP8 quantization is supported</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Subsystem Factory Methods (from SRTPlatform)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>get_default_attention_backend()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Default attention backend name</td>
+    </tr>
+    <tr>
+      <td><code>get_graph_runner_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Graph Runner class</td>
+    </tr>
+    <tr>
+      <td><code>get_mha_kv_pool_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>MHA KV cache pool class</td>
+    </tr>
+    <tr>
+      <td><code>get_mla_kv_pool_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>MLA KV cache pool class</td>
+    </tr>
+    <tr>
+      <td><code>get_dsa_kv_pool_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>DSA KV cache pool class (DeepSeek V3.2)</td>
+    </tr>
+    <tr>
+      <td><code>get_paged_allocator_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Paged allocator class</td>
+    </tr>
+    <tr>
+      <td><code>get_quantization_config(quantization)</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Return hardware-specific quantization config for the specific quantization scheme, raise an error if not supported or return None to use the default config.</td>
+    </tr>
+    <tr>
+      <td><code>get_piecewise_backend_cls()</code></td>
+      <td><code>raise NotImplementedError</code></td>
+      <td>Piecewise compilation backend class</td>
+    </tr>
+    <tr>
+      <td><code>get_compile_backend(mode)</code></td>
+      <td><code>"inductor"</code></td>
+      <td>Compilation backend string</td>
+    </tr>
+    <tr>
+      <td><code>get_dispatch_key_name()</code></td>
+      <td><code>"native"</code></td>
+      <td>BaseFusedOp (fused-op) dispatch key name</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Lifecycle Hooks (from SRTPlatform)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Method</th>
+      <th>Invocation Timing</th>
+      <th>Purpose</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>apply_server_args_defaults(server_args)</code></td>
+      <td>After ServerArgs parsing, in <code>__post_init__</code></td>
+      <td>Set platform-specific defaults</td>
+    </tr>
+    <tr>
+      <td><code>init_backend()</code></td>
+      <td>In each worker, before model construction</td>
+      <td>One-time backend initialization</td>
+    </tr>
+  </tbody>
+</table>
+
+### Platform and plugin environment variables
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SGLANG_PLATFORM</code></td>
+      <td>Select the platform plugin by entry_point name (e.g. <code>kunlun</code>, <code>demo_cuda</code>). When set, <strong>only</strong> the named plugin's <code>activate()</code> is called (front-loading filter) — other plugins are not touched. Additionally, general plugins (<code>sglang.srt.plugins</code>) from unselected platform packages are automatically skipped to avoid importing their dependencies. Required when multiple plugins would activate. Errors if the name is not found or if the plugin's hardware is unavailable.</td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_PLUGINS</code></td>
+      <td>Comma-separated whitelist of general plugin names to load from either hook group. It also filters automatic SRT platform discovery when <code>SGLANG_PLATFORM</code> is unset; explicit platform selection ignores it.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Add diffusion support
+
+A package may support SRT, SGLang Diffusion, or both. Diffusion uses a zero-argument `Platform` subclass and separate platform and hook entry points:
+
+```toml
+[project.entry-points."sglang.multimodal_gen.platforms"]
+my_device = "my_platform_plugin:activate_diffusion"
+
+[project.entry-points."sglang.multimodal_gen.plugins"]
+my_device = "my_platform_plugin:register_hooks"
+```
+
+Keep activation import-safe and return the fully qualified class name only when the backend is available:
+
+```python
+def activate_diffusion() -> str | None:
+    try:
+        import my_device_runtime
+    except ImportError:
+        return None
+    if not my_device_runtime.is_available():
+        return None
+    return "my_platform_plugin.diffusion_platform.MyDiffusionPlatform"
+```
+
+The referenced class must be zero-argument constructible:
+
+```python
+from sglang.multimodal_gen.runtime.platforms import Platform, PlatformEnum
+
+class MyDiffusionPlatform(Platform):
+    _enum = PlatformEnum.OOT
+    device_name = "my_device"
+    device_type = "my_device"
+    dispatch_key = "PrivateUse1"
+
+    def get_dispatch_key_name(self) -> str:
+        return "my_device"
+```
+
+Set `dispatch_key` to the PyTorch dispatcher key used by direct `torch.library` registrations. Keep it separate from `get_dispatch_key_name()`, which selects `CustomOp` implementations. Bring up the remaining contract in dependency order:
+
+1. Implement `get_device_name()`, `get_device_total_memory()`, and `get_available_gpu_memory()` before constructing `ServerArgs`.
+2. Implement `get_device()` and `get_local_torch_device()` before worker binding.
+3. Configure distributed initialization, attention selection, and custom-op implementations for supported workloads.
+4. Run an end-to-end workload and audit model-specific kernels, compilation, and remaining device-family branches.
+
+Register custom-op implementations from `init_backend()`, which runs once in each worker before any pipeline module is constructed:
+
+```python
+class MyDiffusionPlatform(Platform):
+    ...
+
+    def init_backend(self) -> None:
+        from my_platform_plugin.ops import rms_norm_forward
+        from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+        from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+
+        CustomOp.register_oot_forward(
+            RMSNorm, fn=rms_norm_forward, platform_key="my_device"
+        )
+```
+
+`init_backend()` runs at most once per worker process, before the worker implementation is imported. Raising aborts startup and the failed initialization is not retried in that process, because registrations and other backend side effects may be only partially reversible. Custom-op dispatch is resolved when each operation is constructed, after backend initialization has completed. The selected callable therefore remains stable when the operation is compiled instead of changing on the first compiled call.
+
+The function receives the operation instance before its normal arguments. Registration matches the exact operation class and the value returned by `get_dispatch_key_name()`. Without a registration, SGLang looks for a matching `forward_<key>()` implementation on the operation, then falls back to `forward_oot()`, whose base implementation calls `forward_native()`. Returning `"cuda"`, for example, lets a CUDA-compatible OOT platform reuse operation-specific `forward_cuda()` implementations without reporting CUDA platform identity.
+
+The `sglang.multimodal_gen.plugins` entry point remains for seams the `Platform` interface does not cover. Its callbacks run in launchers and workers before scheduler or model construction, so use a `BEFORE` or `AROUND` hook on `GPUWorker.init_device_and_model()` for rank-aware initialization. Hooks from platform distributions other than the selected one are skipped. Because these ship in your platform's distribution, a failure at any stage — load, callback, or hook application — aborts startup, the same as `init_backend()`.
+
+#### Diffusion platform contract
+
+**Active** interfaces are called through `current_platform`. **Compatibility** interfaces are retained adapters; unlisted `Platform` methods are not a stable OOT contract.
+
+| Status | Area | Interface |
+| --- | --- | --- |
+| Active | Initialization | `init_backend()` |
+| Active | Configuration | `apply_server_args_defaults()` |
+| Active | Device and memory | `get_device()`, `set_device()`, `get_local_torch_device()`, `get_device_name()`, `get_device_uuid()`, `get_device_total_memory()`, `get_available_gpu_memory()`, `get_device_capability()` |
+| Active | Distributed | `get_torch_distributed_backend_str()`, `supports_distributed_device_id()`, `get_all_to_all_communicator_cls()`, `get_cpu_architecture()` |
+| Active | Dispatch and model | `dispatch_key` (read by `get_torch_library_dispatch_key()`), `get_dispatch_key_name()`, `get_attn_backend_cls_str()`, `verify_model_arch()`, `optimize_vae()` |
+| Active | Execution | `get_compile_backend()`, `get_compile_options()`, `inference_mode()`, `seed_everything()`, `enable_dit_layerwise_offload_by_default()` |
+| Compatibility | Communicator | `get_device_communicator_cls()` remains the fallback used by `get_all_to_all_communicator_cls()` for existing platform subclasses. New OOT platforms should override the latter. |
+
+Install the package, restart Python to refresh entry-point metadata, and verify explicit selection:
+
+```bash
+pip install -e my_platform_plugin/
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=my_device python -c \
+  "from sglang.multimodal_gen.runtime.platforms import current_platform; print(current_platform)"
+```
+
+### Diffusion platform limitations
+
+- SRT and diffusion require separate platform classes.
+- Only one external platform can be active per process; set the runtime selector if multiple callbacks activate.
+- `get_all_to_all_communicator_cls()` controls only `all_to_all_4D()`, not every collective, graph-capture, or synchronization path; `get_device_communicator_cls()` remains for compatibility.
+- Compile settings affect only `build_torch_compile_kwargs()` callers; audit static `@torch.compile` decorators and other direct compile paths.
+- Explicit attention selectors accept only `AttentionBackendEnum` names. Returning a custom backend works when none is selected; selecting it by name requires a hook or downstream patch.
+- Device-family branches remain outside the interface. Each supported workload needs a native fallback or an actionable unsupported-feature error.
+- The diffusion `PlatformEnum.OOT` identifies an external provider. Override built-in identity predicates only after auditing every enabled branch.
+
+---
+
+## Plugin Type 2: General Plugin
+
+### Description
+
+General function plugins inject behavior into SRT or diffusion **without requiring a custom platform**. The two runtimes have separate entry-point groups and hook registries:
+
+```python
+# SRT plugin
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+# Diffusion plugin
+from sglang.multimodal_gen.runtime.platforms.plugins import HookType, plugin_hook
+```
+
+Register an SRT plugin under `sglang.srt.plugins` and a diffusion plugin under
+`sglang.multimodal_gen.plugins`, and import the hook API from the matching
+module above. Each runtime applies only its own registry, so a hook registered
+through the other runtime's API never runs. The examples below use SRT.
+
+The diffusion hook API lives alongside platform discovery in
+`sglang.multimodal_gen.runtime.platforms.plugins`;
+`sglang.multimodal_gen.plugins` is its entry-point group, not a Python module path.
+
+Use cases include:
+
+- **Observability**: Add logging, metrics, and tracing to any function
+- **Behavior modification**: Modify function arguments or return values
+- **Performance profiling**: Add timing to critical functions
+- **A/B testing**: Replace implementations at runtime
+
+### Quick Start
+
+**1. Create a minimal package:**
+
+```
+my_general_plugin/
+├── pyproject.toml
+└── my_general_plugin/
+    └── __init__.py    # register() function
+```
+
+**2. `pyproject.toml`:**
+
+```toml
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-general-plugin"
+version = "0.1.0"
+
+[project.entry-points."sglang.srt.plugins"]
+my_plugin = "my_general_plugin:register"
+```
+
+**3. `__init__.py`** — register hooks:
+
+```python
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+def register():
+    """Entry point called by load_plugins()."""
+    HookRegistry.register(
+        "sglang.srt.managers.scheduler.Scheduler.__init__",
+        my_hook,
+        HookType.AROUND,
+    )
+
+def my_hook(original_fn, self, *args, **kwargs):
+    result = original_fn(self, *args, **kwargs)
+    print(f"Scheduler initialized! gpu_id={self.gpu_id}")
+    return result
+```
+
+**4. Install and run:**
+
+```bash
+pip install -e my_general_plugin/
+sglang serve --model-path <model> [options]
+# Look for "Scheduler initialized!" in logs
+```
+
+### Hook Types
+
+`HookRegistry` supports four hook types:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Hook Type</th>
+      <th>Signature</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>BEFORE</strong></td>
+      <td><code>fn(*args, **kwargs) -&gt; (args, kwargs) \| None</code></td>
+      <td>Runs before the original. Return <code>None</code> to keep args unchanged, or <code>(args, kwargs)</code> to modify.</td>
+    </tr>
+    <tr>
+      <td><strong>AFTER</strong></td>
+      <td><code>fn(result, *args, **kwargs) -&gt; new_result \| None</code></td>
+      <td>Runs after the original. Return <code>None</code> to keep result, or a new value to replace.</td>
+    </tr>
+    <tr>
+      <td><strong>AROUND</strong></td>
+      <td><code>fn(original_fn, *args, **kwargs) -&gt; result</code></td>
+      <td>Wraps the original. You must call <code>original_fn</code> yourself. Full control over execution.</td>
+    </tr>
+    <tr>
+      <td><strong>REPLACE</strong></td>
+      <td><code>fn(*args, **kwargs) -&gt; result</code> or <code>class</code></td>
+      <td>Replace the original function or class entirely. For class targets, pass a replacement class directly — it is substituted via <code>setattr</code> preserving <code>isinstance()</code>/<code>issubclass()</code> semantics.</td>
+    </tr>
+  </tbody>
+</table>
+
+> **Note**: Only `REPLACE` accepts a class as the hook. Passing a class to `BEFORE`/`AFTER`/`AROUND` raises `TypeError` at registration time.
+
+### Registration API
+
+Hooks can be registered using the **imperative API** or the **decorator API**:
+
+```python
+# --- Imperative API ---
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+def my_timer(original_fn, *args, **kwargs):
+    start = time.perf_counter()
+    result = original_fn(*args, **kwargs)
+    print(f"Elapsed: {time.perf_counter() - start:.3f}s")
+    return result
+
+HookRegistry.register(
+    "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run",
+    my_timer,
+    HookType.AROUND,
+)
+
+# --- Decorator API ---
+from sglang.srt.plugins.hook_registry import plugin_hook, HookType
+
+@plugin_hook(
+    "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run",
+    type=HookType.AROUND,
+)
+def my_timer(original_fn, *args, **kwargs):
+    start = time.perf_counter()
+    result = original_fn(*args, **kwargs)
+    print(f"Elapsed: {time.perf_counter() - start:.3f}s")
+    return result
+
+# --- Class replacement (REPLACE) ---
+from sglang.srt.plugins.hook_registry import plugin_hook, HookType
+from sglang.srt.managers.scheduler import Scheduler
+
+@plugin_hook(
+    "sglang.srt.managers.scheduler.Scheduler",
+    type=HookType.REPLACE,
+)
+class MyScheduler(Scheduler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        print("Enhanced scheduler initialized!")
+```
+
+### Hook Target Resolution
+
+Target paths use fully-qualified dotted notation. Both formats are supported:
+
+- **Dotted**: `sglang.srt.managers.scheduler.Scheduler.__init__`
+- **Entry-points style**: `sglang.srt.managers.scheduler:Scheduler.__init__` (colon treated as dot)
+
+### Common SRT Hook Targets
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Target</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>sglang.srt.server_args.ServerArgs.add_cli_args</code></td>
+      <td>Add custom CLI arguments</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.server_args.ServerArgs.__post_init__</code></td>
+      <td>Modify ServerArgs after parsing</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.server_args.ServerArgs.check_server_args</code></td>
+      <td>Add/relax validation</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.scheduler.Scheduler.__init__</code></td>
+      <td>Custom scheduler state</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run</code></td>
+      <td>Custom scheduling policy</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.scheduler.Scheduler.run_batch</code></td>
+      <td>Profiling / inspection</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.scheduler.Scheduler.process_batch_result</code></td>
+      <td>Custom metrics</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.tp_worker.TpModelWorker.__init__</code></td>
+      <td>Custom worker state</td>
+    </tr>
+    <tr>
+      <td><code>sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation</code></td>
+      <td>Forward pass wrapping</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## File Reference
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>File</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>sglang/srt/platforms/device_mixin.py</code></td>
+      <td><code>DeviceMixin</code> base class and SRT platform identity types</td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/platforms/interface.py</code></td>
+      <td><code>SRTPlatform</code> base class (extends DeviceMixin)</td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/platforms/__init__.py</code></td>
+      <td><code>current_platform</code> lazy singleton + discovery logic</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/interface.py</code></td>
+      <td>Diffusion <code>Platform</code> base class</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/__init__.py</code></td>
+      <td>Diffusion <code>current_platform</code> lazy singleton and built-in fallback order</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/plugins.py</code></td>
+      <td>Diffusion plugin registration, explicit hook-application phase, and hook registry</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/managers/worker_bootstrap.py</code></td>
+      <td>Import-neutral process specifications and spawn targets that initialize the backend before resolving runtime hooks</td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/plugins/__init__.py</code></td>
+      <td><code>load_plugins()</code> + <code>load_plugins_by_group()</code></td>
+    </tr>
+    <tr>
+      <td><code>sglang/srt/plugins/hook_registry.py</code></td>
+      <td><code>HookRegistry</code>, <code>HookType</code>, <code>plugin_hook</code> decorator</td>
+    </tr>
+  </tbody>
+</table>

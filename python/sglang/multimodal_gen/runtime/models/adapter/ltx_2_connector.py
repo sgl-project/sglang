@@ -11,8 +11,9 @@ from diffusers.models.attention import FeedForward
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 
 def apply_interleaved_rotary_emb(
@@ -147,22 +148,6 @@ class LTX2Attention(torch.nn.Module):
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
-
-        # Scaled dot product attention
-        self.attn = USPAttention(
-            num_heads=heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },
-        )
 
     def forward(
         self,
@@ -528,11 +513,17 @@ class LTX2ConnectorTransformer1d(nn.Module):
         return hidden_states, attention_mask
 
 
-class LTX2TextConnectors(nn.Module):
+class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
     streams.
     """
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "video_connector.transformer_blocks",
+        "audio_connector.transformer_blocks",
+    ]
 
     def __init__(
         self,

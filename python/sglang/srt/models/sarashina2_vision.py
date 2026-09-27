@@ -14,6 +14,7 @@
 """Inference-only Sarashina2Vision model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -24,11 +25,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultimodalDataItem,
-    MultimodalInputs,
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -108,7 +108,7 @@ class Sarashina2VisionForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input tokens with multimodal data hashes for RadixAttention."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

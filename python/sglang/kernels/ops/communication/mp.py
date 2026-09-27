@@ -1,7 +1,7 @@
 """Multi-process / multi-GPU launching utilities (torchrun-based).
 
-Shared `multigpu_launch` helper that both `sglang.jit_kernel.tests.utils` and
-`sglang.jit_kernel.benchmark.utils` build their domain-specific entry points on
+Shared `multigpu_launch` helper that both `sglang.test.kernels.utils` and
+`sglang.kernels.jit.benchmark.utils` build their domain-specific entry points on
 top of (`multigpu_pytest_main`, `multigpu_bench_main`).
 
 When a script that calls one of those wrappers is run with plain `python`, the
@@ -161,8 +161,7 @@ def multigpu_launch(
         for N in num_gpus:
             if N <= 1 or N > num_devices:
                 raise ValueError(
-                    f"Invalid number of GPUs requested: {N} "
-                    f"(available: {num_devices})"
+                    f"Invalid number of GPUs requested: {N} (available: {num_devices})"
                 )
     os.environ[env_key] = "1"
     os.environ[pid_key] = str(os.getpid())

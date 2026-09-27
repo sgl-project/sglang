@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -16,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
@@ -23,12 +26,12 @@ from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.process import kill_process_tree
 from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_init_payload,
@@ -50,6 +53,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_video_frame_count,
     is_image_url,
     prepare_perf_log,
+    validate_audio_output,
     validate_image,
     validate_image_file,
     validate_openai_video,
@@ -64,6 +68,17 @@ FIRST_DENOISE_STEP_TOLERANCE = 4.0
 FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
 DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
 VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
+
+
+def is_missing_diffusers_pipeline_error(message: str) -> bool:
+    """Return whether a server startup error is caused by a missing diffusers pipeline."""
+    normalized_message = message.lower()
+    return (
+        "not found in diffusers" in normalized_message
+        or "module 'diffusers' has no attribute" in normalized_message
+        or 'module "diffusers" has no attribute' in normalized_message
+    )
+
 
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
@@ -174,6 +189,7 @@ class ServerContext:
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
+    load_time_ms: float | None = None
 
     def log_tail(self, lines: int = 200) -> str:
         """Return recent server output for failure diagnostics."""
@@ -392,7 +408,10 @@ class ServerManager:
             "--log-level=debug",
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
+        access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
+        if not any(arg.startswith(access_log_exclude_flag) for arg in command):
+            command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
 
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
@@ -406,6 +425,9 @@ class ServerManager:
         # regardless of log-level configuration.
         print(f"[server-test] Running command: {cmd_str}", flush=True)
 
+        load_started_ns = time.monotonic_ns()
+        load_finished_ns = None
+        load_ready = threading.Event()
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -421,9 +443,17 @@ class ServerManager:
 
             def _log_pipe(pipe: Any, file: Any) -> None:
                 """Read from pipe and write to file and stdout."""
+                nonlocal load_finished_ns
                 try:
                     with pipe:
                         for line in iter(pipe.readline, ""):
+                            match = re.search(
+                                r"\[server-load\] workers_ready_monotonic_ns=(\d+)",
+                                line,
+                            )
+                            if match and load_finished_ns is None:
+                                load_finished_ns = int(match.group(1))
+                                load_ready.set()
                             sys.stdout.write(line)
                             sys.stdout.flush()
                             file.write(line)
@@ -446,9 +476,7 @@ class ServerManager:
             flush=True,
         )
 
-        self._wait_for_ready(process, stdout_path)
-
-        return ServerContext(
+        context = ServerContext(
             port=self.port,
             process=process,
             model=self.model,
@@ -458,11 +486,22 @@ class ServerManager:
             _stdout_fh=stdout_fh,
             _log_thread=log_thread,
         )
+        try:
+            self._wait_for_ready(process, stdout_path)
+            # health includes warmup; the worker marker's clock excludes it
+            load_ready.wait(timeout=5)
+            if load_finished_ns is not None:
+                context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
+        except BaseException:
+            context.cleanup()
+            raise
+
+        return context
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
-        """Wait for server to become ready."""
+        """Wait until model warmup finishes and inference traffic is accepted."""
         start = time.time()
-        ready_message = "Application startup complete."
+        health_url = f"http://127.0.0.1:{self.port}/health"
         log_period = 30
         prev_log_period_count = 0
 
@@ -473,14 +512,13 @@ class ServerManager:
                     f"Server exited early (code {process.returncode}).\n{tail}"
                 )
 
-            if stdout_path.exists():
-                try:
-                    content = stdout_path.read_text(encoding="utf-8", errors="ignore")
-                    if ready_message in content:
+            try:
+                with urlopen(health_url, timeout=1) as response:
+                    if response.status == 200:
                         logger.info("[server-test] Server ready")
                         return
-                except Exception as e:
-                    logger.debug("Could not read log yet: %s", e)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                pass
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:
@@ -525,7 +563,8 @@ class PerformanceValidator:
         actual: float,
         expected: float,
         tolerance: float,
-        min_abs_tolerance_ms: float = 20.0,
+        min_abs_tolerance: float = 20.0,
+        unit: str = "ms",
     ):
         """Assert that actual is less than or equal to expected within a tolerance.
 
@@ -541,27 +580,147 @@ class PerformanceValidator:
             # Use 100% higher tolerance for AMD (2x the expected value)
             amd_tolerance = 1.0  # 100%
             upper_bound = calculate_upper_bound(
-                expected, amd_tolerance, min_abs_tolerance_ms
+                expected, amd_tolerance, min_abs_tolerance
             )
             if actual > upper_bound:
                 logger.warning(
                     f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
-                    f"  Actual:   {actual:.4f}ms\n"
-                    f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
-                    f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                    f"  Actual:   {actual:.4f}{unit}\n"
+                    f"  Expected: {expected:.4f}{unit}\n"
+                    f"  AMD Limit: {upper_bound:.4f}{unit} "
+                    f"(rel_tol: {amd_tolerance:.1%}, "
+                    f"abs_pad: {min_abs_tolerance}{unit})\n"
                     f"  Original tolerance was: {tolerance:.1%}"
                 )
         else:
-            upper_bound = calculate_upper_bound(
-                expected, tolerance, min_abs_tolerance_ms
-            )
+            upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance)
             assert actual <= upper_bound, (
                 f"Validation failed for '{name}'.\n"
-                f"  Actual:   {actual:.4f}ms\n"
-                f"  Expected: {expected:.4f}ms\n"
-                f"  Limit:    {upper_bound:.4f}ms "
-                f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+                f"  Actual:   {actual:.4f}{unit}\n"
+                f"  Expected: {expected:.4f}{unit}\n"
+                f"  Limit:    {upper_bound:.4f}{unit} "
+                f"(rel_tol: {tolerance:.1%}, "
+                f"abs_pad: {min_abs_tolerance}{unit})"
+            )
+
+    def validate_peak_vram(
+        self,
+        summary: PerformanceSummary,
+        expected_load_peak_vram_mb: float,
+        expected_runtime_peak_vram_mb: float,
+        expected_warmup_peak_vram_mb: float | None = None,
+        expected_load_peak_allocated_mb: float | None = None,
+        expected_runtime_peak_allocated_mb: float | None = None,
+    ) -> None:
+        assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
+        assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
+        self._assert_peak_vram(
+            "Load Peak VRAM",
+            reserved=summary.load_peak_vram_mb,
+            allocated=summary.load_peak_allocated_mb,
+            expected_reserved=expected_load_peak_vram_mb,
+            expected_allocated=expected_load_peak_allocated_mb,
+            tolerance=self.tolerances.load_peak_vram,
+        )
+        self._assert_peak_vram(
+            "Runtime Peak VRAM",
+            reserved=summary.runtime_peak_vram_mb,
+            allocated=summary.runtime_peak_allocated_mb,
+            expected_reserved=expected_runtime_peak_vram_mb,
+            expected_allocated=expected_runtime_peak_allocated_mb,
+            tolerance=self.tolerances.runtime_peak_vram,
+        )
+        # the full-shape warmup probe keeps its own budget, separate from serving
+        if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
+            self._assert_le(
+                "Warmup Peak VRAM",
+                summary.warmup_peak_vram_mb,
+                expected_warmup_peak_vram_mb,
+                self.tolerances.runtime_peak_vram,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+
+    def _assert_peak_vram(
+        self,
+        name: str,
+        *,
+        reserved: float,
+        allocated: float,
+        expected_reserved: float,
+        expected_allocated: float | None,
+        tolerance: float,
+    ) -> None:
+        """Enforce the allocated peak when the baseline has one, else reserved.
+
+        Reserved peaks include the caching allocator's pool, which follows the
+        allocation history of everything run before the request (warmup shapes,
+        load-time leftovers) and moves a few percent for identical work. The
+        allocated peak is what the model and its activations actually use.
+        """
+        if expected_allocated is not None and allocated > 0:
+            self._assert_le(
+                f"{name} (allocated)",
+                allocated,
+                expected_allocated,
+                tolerance,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+            logger.info(
+                "%s reserved %.0f MiB (baseline %.0f MiB, reported only)",
+                name,
+                reserved,
+                expected_reserved,
+            )
+            return
+        self._assert_le(
+            name,
+            reserved,
+            expected_reserved,
+            tolerance,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
+
+    def validate_peak_host_anon(
+        self,
+        summary: PerformanceSummary,
+        expected_load_mb: float | None,
+        expected_runtime_mb: float | None,
+    ) -> None:
+        """Anonymous-host budget: peaks must stay at or under the baseline.
+
+        Skipped wholesale when the baseline carries no host figures (older
+        scenarios) or the record has none (non-Linux, or a server predating
+        the sampler) -- the VRAM checks do not imply anything about the host,
+        as the LoRA-merge blow-up showed: VRAM green, host budget gone.
+        """
+        if expected_load_mb is None and expected_runtime_mb is None:
+            return
+        if summary.runtime_peak_host_anon_mb <= 0:
+            logger.warning(
+                "Host-anon baseline present but the record has no host peaks; "
+                "skipping the host budget check"
+            )
+            return
+        if expected_load_mb is not None:
+            self._assert_le(
+                "Load Peak Host Anon",
+                summary.load_peak_host_anon_mb,
+                expected_load_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
+        if expected_runtime_mb is not None:
+            self._assert_le(
+                "Runtime Peak Host Anon",
+                summary.runtime_peak_host_anon_mb,
+                expected_runtime_mb,
+                self.tolerances.host_anon,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
             )
 
     def validate(
@@ -572,7 +731,7 @@ class PerformanceValidator:
         if self.is_baseline_generation_mode:
             return summary
 
-        self._validate_e2e(summary)
+        self.validate_e2e(summary)
         self._validate_denoise_agg(summary)
         self._validate_denoise_steps(summary)
         self._validate_stages(summary)
@@ -585,14 +744,50 @@ class PerformanceValidator:
     ) -> PerformanceSummary:
         return PerformanceSummary.from_req_perf_record(perf_record, self.step_fractions)
 
-    def _validate_e2e(self, summary: PerformanceSummary) -> None:
+    def _timing_tol(self, profile_tolerance: float) -> float:
+        """Tolerance for a wall-clock check, honoring a per-case override.
+
+        A case whose runtime is dominated by shared-runner host I/O cannot be
+        guarded at the profile tolerance; ``timing_tolerance`` in its baseline
+        entry widens only the wall-clock checks, never the memory ones.
+        """
+        override = self.scenario.timing_tolerance
+        if override is None:
+            return profile_tolerance
+        return max(profile_tolerance, override)
+
+    def validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
-        assert summary.e2e_ms > 0, "E2E duration missing"
+        assert math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0, (
+            "E2E duration missing or invalid"
+        )
+        expected = self.scenario.expected_e2e_ms
+        assert math.isfinite(expected) and expected > 0, (
+            "E2E baseline missing or invalid"
+        )
         self._assert_le(
             "E2E Latency",
             summary.e2e_ms,
             self.scenario.expected_e2e_ms,
-            self.tolerances.e2e,
+            self._timing_tol(self.tolerances.e2e),
+        )
+
+    def validate_load(self, summary: PerformanceSummary) -> None:
+        load_ms = summary.load_time_ms
+        expected_load_ms = self.scenario.expected_load_ms
+        assert load_ms is not None and math.isfinite(load_ms) and load_ms > 0, (
+            "Load duration missing or invalid"
+        )
+        assert (
+            expected_load_ms is not None
+            and math.isfinite(expected_load_ms)
+            and expected_load_ms > 0
+        ), "Load baseline missing or invalid"
+        self._assert_le(
+            "Load Latency (excluding warmup)",
+            load_ms,
+            expected_load_ms,
+            self._timing_tol(self.tolerances.e2e),
         )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
@@ -603,13 +798,13 @@ class PerformanceValidator:
             "Average Denoise Step",
             summary.avg_denoise_ms,
             self.scenario.expected_avg_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
         self._assert_le(
             "Median Denoise Step",
             summary.median_denoise_ms,
             self.scenario.expected_median_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
 
     def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
@@ -625,8 +820,8 @@ class PerformanceValidator:
                     f"Denoise Step {idx}",
                     actual,
                     expected,
-                    FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -634,7 +829,7 @@ class PerformanceValidator:
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
+                self._timing_tol(self.tolerances.denoise_step),
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -646,22 +841,22 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-            tolerance = (
+            tolerance = self._timing_tol(
                 self.tolerances.denoise_stage
-                if stage == "DenoisingStage"
+                if stage in summary.denoising_stages
                 else self.tolerances.non_denoise_stage
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
+                min_abs_tolerance = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
-                min_abs_tolerance_ms = 120.0
+                min_abs_tolerance = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=min_abs_tolerance_ms,
+                min_abs_tolerance=min_abs_tolerance,
             )
 
 
@@ -681,8 +876,8 @@ class VideoPerformanceValidator(PerformanceValidator):
                     f"Denoise Step {idx}",
                     actual,
                     expected,
-                    FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -692,8 +887,8 @@ class VideoPerformanceValidator(PerformanceValidator):
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
-                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                self._timing_tol(self.tolerances.denoise_step),
+                min_abs_tolerance=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
             )
 
     def validate(
@@ -722,7 +917,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 "Average Frame Time",
                 summary.avg_frame_time_ms,
                 expected_frame_time,
-                self.tolerances.denoise_stage,
+                self._timing_tol(self.tolerances.denoise_stage),
             )
 
 
@@ -1008,6 +1203,15 @@ def get_generate_fn(
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
+        if sampling_params.expect_audio_output:
+            audio_info = validate_audio_output(tmp_path)
+            logger.info(
+                "%s: validated audio output (%s Hz, %s channels, %.3fs)",
+                case_id,
+                audio_info.sample_rate,
+                audio_info.channels,
+                audio_info.duration_seconds,
+            )
 
         if expected_frame_count is not None:
             actual_count = get_video_frame_count(tmp_path)
@@ -1317,9 +1521,9 @@ def get_generate_fn(
             size=sampling_params.output_size,
             seconds=video_seconds,
             extra_body={
-                "reference_url": sampling_params.image_path,
                 "fps": sampling_params.fps,
                 "num_frames": sampling_params.num_frames,
+                **extra_body,
             },
         )
 
@@ -1376,10 +1580,12 @@ def get_generate_fn(
                 init_payload=init_payload,
                 events=list(sampling_params.realtime_events),
                 num_chunks=sampling_params.realtime_num_chunks,
-                require_chunk_stats=bool(sampling_params.realtime_perf_thresholds),
+                require_chunk_stats=True,
             )
         )
-        record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_perf_stats(
+            case_id, realtime_output.chunk_stats, realtime_output.e2e_ms
+        )
         record_realtime_key_frames(case_id, realtime_output.frames)
         fps = int(sampling_params.fps or 24)
         video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)

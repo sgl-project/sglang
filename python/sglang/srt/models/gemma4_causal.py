@@ -18,16 +18,21 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import Gemma4TextConfig, PretrainedConfig, PreTrainedModel
+from transformers import (
+    Gemma4TextConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
-    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+)
+from sglang.kernels.ops.moe.gemma4_routing import (
+    gemma4_fused_routing,
     gemma_routing_post_topk,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -49,7 +54,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
-from sglang.srt.models.utils import create_fused_set_kv_buffer_arg
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -64,6 +71,21 @@ def get_attention_sliding_window_size(config):
 
 Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+def load_tied_lm_head(
+    loaded_weight, *, params_dict, loaded_params, head_param_name="lm_head.weight"
+):
+    """Load a tied embedding into an lm_head the runtime could not alias.
+
+    No-op when this rank holds no lm_head.
+    """
+    head_param = params_dict.get(head_param_name)
+    if head_param is None:
+        return
+    wl = getattr(head_param, "weight_loader", default_weight_loader)
+    wl(head_param, loaded_weight)
+    loaded_params.add(head_param_name)
 
 
 def pp_filter_load_weight(
@@ -101,11 +123,12 @@ def pp_filter_load_weight(
         return True
 
     if tie_word_embeddings and pp_group.is_last_rank and name == embed_weight_name:
-        head_param = params_dict.get(head_param_name)
-        if head_param is not None:
-            wl = getattr(head_param, "weight_loader", default_weight_loader)
-            wl(head_param, loaded_weight)
-            loaded_params.add(head_param_name)
+        load_tied_lm_head(
+            loaded_weight,
+            params_dict=params_dict,
+            loaded_params=loaded_params,
+            head_param_name=head_param_name,
+        )
         return True
 
     if not pp_group.is_first_rank and any(p in name for p in first_rank_only_patterns):
@@ -195,6 +218,7 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -253,7 +277,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            activation="gelu",
+            activation=activation,
             reduce_results=True,
         )
 
@@ -289,16 +313,18 @@ class Gemma4Attention(nn.Module):
             else -1
         )
 
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-
         if layer_type == "sliding_attention":
+            self.total_num_heads = getattr(
+                config, "swa_num_attention_heads", config.num_attention_heads
+            )
             self.total_num_kv_heads = getattr(
                 config, "swa_num_key_value_heads", config.num_key_value_heads
             )
         else:
+            self.total_num_heads = config.num_attention_heads
             self.total_num_kv_heads = config.num_key_value_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
 
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
@@ -756,7 +782,7 @@ class Gemma4TextModel(PreTrainedModel):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Token / per-layer embedding tables and the per-layer projection only
         # produce activations consumed at the model entry, so they live on the
@@ -780,7 +806,7 @@ class Gemma4TextModel(PreTrainedModel):
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
             sa = get_server_args()
-            if sa is not None and not sa.disable_cuda_graph:
+            if sa is not None and not get_exec().graph.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "
@@ -955,9 +981,9 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = input_embeds
         else:
-            assert (
-                pp_proxy_tensors is not None
-            ), "pp_proxy_tensors is required on non-first PP ranks"
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
             hidden_states = pp_proxy_tensors["hidden_states"]
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.
@@ -1064,7 +1090,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 

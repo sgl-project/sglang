@@ -11,6 +11,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def calculate_linear_shift(
+    image_seq_len: int,
+    *,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+) -> float:
+    """return the affine dynamic shift used by native flow schedulers"""
+    slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    return image_seq_len * slope + base_shift - slope * base_seq_len
+
+
 def clone_scheduler_runtime(scheduler: Any) -> Any:
     """Create an isolated scheduler runtime from a scheduler template or runtime."""
     return deepcopy(scheduler)

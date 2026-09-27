@@ -16,21 +16,21 @@ from sglang.kernels.ops.attention import (
     dsv4_attn_metadata_kernels as attn_metadata_kernels,
 )
 from sglang.kernels.ops.speculative import ragged_verify_kernels
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    DSparkScheduleConfig,
-)
-from sglang.srt.speculative.dspark_components.kernels import (
+from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,
     dspark_attn_metadata,
     dspark_draft_model,
     dspark_schedule,
     dspark_verify_window,
 )
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkScheduleConfig,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = torch.device("cuda")
 VOCAB = 129280

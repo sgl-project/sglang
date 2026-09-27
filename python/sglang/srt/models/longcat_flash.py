@@ -37,17 +37,24 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+from sglang.kernels.ops.gemm.bf16_fp32 import (
+    linear_bf16_fp32,
+    mark_hpc_bf16xfp32_gemm_enabled,
+)
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -83,7 +90,11 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel as _gp
+from sglang.srt.runtime_context import (
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -107,7 +118,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -136,7 +147,6 @@ def _scmoe_align_rows(t, target):
     if t is None or t.shape[0] == target:
         return t
     from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor as _ag
-    from sglang.srt.runtime_context import get_parallel as _gp
 
     cur = t.shape[0]
     if target > cur:
@@ -175,8 +185,7 @@ class LongcatFlashMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -216,6 +225,12 @@ class LongcatFlashRouter(nn.Module):
         self.hpc_kernel_min_m = _LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M.get(
             (config.hidden_size, self.n_routed_experts)
         )
+        if (
+            self.hpc_kernel_min_m is not None
+            and self.rounter_params_dtype == torch.float32
+            and self.classifier.bias is None
+        ):
+            mark_hpc_bf16xfp32_gemm_enabled()
 
     def forward(self, hidden_states):
         if (
@@ -233,7 +248,6 @@ class LongcatFlashRouter(nn.Module):
 
 
 class LongcatFlashMoE(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -343,7 +357,6 @@ class LongcatFlashMoE(nn.Module):
 
 
 class LongcatFlashDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -490,7 +503,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         moe_hidden_states = hidden_states.clone()
-        moe_residual = residual.clone()
+        # The final gather adds its residual; the dense branch already carries it.
+        moe_residual = torch.zeros_like(residual)
         moe_hidden_states = self.mlp(moe_hidden_states)
         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
             moe_hidden_states, moe_residual, forward_batch
@@ -737,7 +751,6 @@ class LongcatFlashForCausalLM(nn.Module):
         )
 
     def post_load_weights(self, weight_names=None):
-
         # Perform post-processing after loading weights
         if weight_names is None:
             layer_ids = range(self.config.num_hidden_layers)
@@ -949,7 +962,6 @@ class LongcatFlashForCausalLM(nn.Module):
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

@@ -242,6 +242,7 @@ class FlashAttentionForwardSm100:
         v_dequant: bool = False,
         q_sf_interleaved: bool = False,
         kv_sf_interleaved: bool = False,
+        batch_invariant: bool = False,
     ):
         # MXFP8 block-scaled attention (see interface._flash_attn_fwd):
         #   qk_blockscaled: Q/K fp8 e4m3 + per-32 UE8M0 scales; QK^T runs as
@@ -331,6 +332,7 @@ class FlashAttentionForwardSm100:
         self.pack_gqa = pack_gqa
         # relative (sheared) bias
         self.has_bias = has_bias
+        self.batch_invariant = batch_invariant
         self.rel_extent_padded = rel_extent_padded
         assert rel_extent_padded % n_block_size == 0
         self.bias_n_max = rel_extent_padded // n_block_size if has_bias else 0
@@ -2069,6 +2071,7 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=(
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             ),
+            batch_invariant=self.batch_invariant,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,

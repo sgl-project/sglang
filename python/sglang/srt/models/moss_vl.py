@@ -34,7 +34,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    get_rope,
+)
 from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1019,6 +1022,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -1045,10 +1049,9 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
-        hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1189,7 +1192,6 @@ class MossVLForCausalLM(nn.Module):
 
 
 class MossVLForConditionalGeneration(nn.Module):
-
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.config = config

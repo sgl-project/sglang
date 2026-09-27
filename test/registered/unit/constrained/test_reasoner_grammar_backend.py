@@ -1,9 +1,11 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
+from xgrammar import TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarBackend
 from sglang.srt.constrained.reasoner_grammar_backend import (
@@ -13,10 +15,28 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.function_call.inkling_detector import (
+    InklingDetector as InklingToolDetector,
+)
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_MODEL_END_SAMPLING,
+    CONTENT_TEXT,
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+    MESSAGE_MODEL,
+)
+from sglang.srt.parser.reasoning_parser import InklingDetector
+from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(2.0, "base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 
 class _DummyTokenizer:
@@ -71,11 +91,11 @@ def _allowed_token_ids(vocab_mask, token_ids):
     return allowed
 
 
-class TestReasonerGrammarObject(unittest.TestCase):
+class TestReasonerGrammarObject(CustomTestCase):
     def _make_strict_object(self):
         return ReasonerGrammarObject(
             grammar=None,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=2,
             enable_token_filter=True,
@@ -117,9 +137,30 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertIs(obj.move_vocab_mask(mask, "cpu"), mask)
         self.assertIsNotNone(obj.apply_vocab_mask)
 
+    def test_budget_exhaustion_walks_multi_token_end(self):
+        obj = ReasonerGrammarObject(
+            grammar=None,
+            think_end_ids=[7, 8],
+            max_think_tokens=1,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+        )
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
 
-class TestReasonerGrammarBackend(unittest.TestCase):
+        first_mask = torch.zeros((1, 2), dtype=torch.int32)
+        obj.fill_vocab_mask(first_mask, 0)
+        self.assertEqual(_allowed_token_ids(first_mask, [7, 8, 10]), [7])
+
+        obj.accept_token(7)
+        second_mask = torch.zeros((1, 2), dtype=torch.int32)
+        obj.fill_vocab_mask(second_mask, 0)
+        self.assertEqual(_allowed_token_ids(second_mask, [7, 8, 10]), [8])
+
+
+class TestReasonerGrammarBackend(CustomTestCase):
     def setUp(self):
+        super().setUp()
         self._prev_budget = os.environ.get("SGLANG_MAX_THINK_TOKENS")
 
     def tearDown(self):
@@ -163,6 +204,42 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
 
+    def test_kimi_k3_excluded_tokens_spare_the_xtml_control_tokens(self):
+        """Kimi K3 bans bare channel names, never the marker-composing tokens.
+
+        The excluded list is flattened into single token ids, so listing a whole
+        marker such as "<|open|>response<|sep|>" would ban <|open|> and <|sep|>
+        individually -- which also blocks the think-end sequence and the jump
+        into the tools channel, leaving the model unable to stop thinking.
+        """
+        control_ids = {"<|open|>": [1], "<|close|>": [2], "<|sep|>": [3]}
+        think_end_ids = [2, 4, 3]
+        tokenizer = _DummyTokenizer(
+            {
+                THINK_CLOSE: think_end_ids,
+                "response": [10],
+                "message": [11],
+                "<|end_of_msg|>": [12],
+                "[EOS]": [13],
+                "[EOT]": [14],
+                **control_ids,
+            }
+        )
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(support_token_filter=True),
+            SimpleNamespace(detector=KimiK3ReasoningDetector()),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+        excluded = reasoner.think_excluded_token_ids
+
+        self.assertEqual(excluded, [10, 11, 12, 13, 14])
+        for token, ids in control_ids.items():
+            for token_id in ids:
+                self.assertNotIn(token_id, excluded, f"{token} must stay generatable")
+        self.assertEqual(set(think_end_ids) & set(excluded), set())
+
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
         reasoner = ReasonerGrammarBackend(
@@ -186,13 +263,285 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             enable_strict_thinking=True,
         )
 
-        wrapped = reasoner._init_value_dispatch(("json", "{}"), reasoning=True)
-        self.assertIsInstance(wrapped, ReasonerGrammarObject)
-        wrapped.accept_token(10)
-        inner_grammar.accept_token.assert_not_called()
-        wrapped.accept_token(2)
-        wrapped.accept_token(42)
-        inner_grammar.accept_token.assert_called_once_with(42)
+        for key in (("json", "{}"), ("ebnf", 'root ::= "OK"')):
+            with self.subTest(key=key):
+                inner_grammar.reset_mock()
+                wrapped = reasoner._init_value_dispatch(key, reasoning=True)
+                self.assertIsInstance(wrapped, ReasonerGrammarObject)
+                wrapped.accept_token(10)
+                inner_grammar.accept_token.assert_not_called()
+                wrapped.accept_token(2)
+                wrapped.accept_token(42)
+                inner_grammar.accept_token.assert_called_once_with(42)
+
+        bare = reasoner._init_value_dispatch(
+            ("full_assistant_ebnf", 'root ::= "OK"'), reasoning=True
+        )
+        self.assertIs(bare, inner_grammar)
+
+    def _make_xgrammar_backend(self):
+        # ASCII plus native framing IDs keeps these checks independent of model files.
+        vocab = [""] * (max(INKLING_SPECIAL_TOKEN_IDS.values()) + 1)
+        for token_id in range(128):
+            vocab[token_id] = chr(token_id)
+        vocab[128] = "</think>"
+        for token, token_id in INKLING_SPECIAL_TOKEN_IDS.items():
+            vocab[token_id] = token
+        info = TokenizerInfo(
+            vocab,
+            stop_token_ids=[INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]],
+        )
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: (
+                [128] if text == "</think>" else list(text.encode())
+            ),
+            init_xgrammar=lambda: (info, None),
+        )
+        return XGrammarGrammarBackend(tokenizer, len(vocab)), tokenizer
+
+    def _vocab_mask(self, grammar, vocab_size):
+        mask = torch.full((1, (vocab_size + 31) // 32), -1, dtype=torch.int32)
+        grammar.fill_vocab_mask(mask, 0)
+        return mask
+
+    def _accept_allowed_tokens(self, grammar, token_ids, vocab_size):
+        for token_id in token_ids:
+            mask = self._vocab_mask(grammar, vocab_size)
+            self.assertEqual(_allowed_token_ids(mask, [token_id]), [token_id])
+            grammar.accept_token(token_id)
+
+    def test_inkling_tool_masks_cover_the_whole_stream(self):
+        """Incomplete tool JSON must not terminate, even without a thinking block."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        tag = InklingToolDetector().get_auto_tool_call_structural_tag()
+        request = ChatCompletionRequest(
+            model="inkling", messages=[], tool_choice="auto"
+        )
+        params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=("structural_tag", tag),
+        )
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), tokenizer
+        )
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        prefixes = [
+            [],
+            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]
+            + tokenizer.encode("thinking")
+            + [ids[END_MESSAGE]],
+            [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+            + tokenizer.encode("calling a tool")
+            + [ids[END_MESSAGE]],
+        ]
+        for reasoning in (False, True):
+            for prefix in prefixes:
+                with self.subTest(reasoning=reasoning, prefix=prefix):
+                    grammar = reasoner._init_value_dispatch(
+                        ("structural_tag", params["structural_tag"]),
+                        reasoning=reasoning,
+                    )
+                    self._accept_allowed_tokens(
+                        grammar,
+                        prefix
+                        + [ids[MESSAGE_MODEL], ids[CONTENT_INVOKE_TOOL_JSON]]
+                        + tokenizer.encode('{"name":"tool","args":{}'),
+                        backend.vocab_size,
+                    )
+                    mask = self._vocab_mask(grammar, backend.vocab_size)
+                    self.assertEqual(
+                        _allowed_token_ids(
+                            mask, [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]]
+                        ),
+                        [],
+                    )
+                    self._accept_allowed_tokens(
+                        grammar,
+                        tokenizer.encode("}")
+                        + [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+                        backend.vocab_size,
+                    )
+                    self.assertTrue(grammar.is_terminated())
+
+    def test_inkling_plain_text_and_literal_markers_can_terminate(self):
+        """Printed marker strings must remain text rather than opening a tool payload."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        tag = InklingToolDetector().get_auto_tool_call_structural_tag()
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), tokenizer
+        )
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        for thinking in (False, True):
+            with self.subTest(thinking=thinking):
+                grammar = reasoner._init_value_dispatch(
+                    ("structural_tag", tag.model_dump_json()), reasoning=True
+                )
+                prefix = (
+                    [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]
+                    + tokenizer.encode("thinking")
+                    + [ids[END_MESSAGE]]
+                    if thinking
+                    else []
+                )
+                self._accept_allowed_tokens(
+                    grammar,
+                    prefix
+                    + [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+                    + tokenizer.encode(
+                        CONTENT_INVOKE_TOOL_JSON + " {not JSON " + END_MESSAGE
+                    )
+                    + [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+                    backend.vocab_size,
+                )
+                self.assertTrue(grammar.is_terminated())
+
+    def test_generic_token_triggered_masks_preserve_reasoning_deferral(self):
+        """Answer-only schema restrictions must not constrain the reasoning prefix."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        reasoner = ReasonerGrammarBackend(backend, self._make_parser(), tokenizer)
+        think_end_id = tokenizer.encode("</think>")[0]
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        for variant in ("required", "excluded_end", "ordinary_trigger"):
+            with self.subTest(variant=variant):
+                tag = (
+                    InklingToolDetector()
+                    .get_auto_tool_call_structural_tag()
+                    .model_dump()
+                )
+                trigger_id = ids[CONTENT_INVOKE_TOOL_JSON]
+                if variant == "required":
+                    tag["format"]["at_least_one"] = True
+                elif variant == "excluded_end":
+                    tag["format"]["exclude_tokens"] = [think_end_id]
+                else:
+                    trigger_id = ord("x")
+                    tag["format"]["trigger_tokens"] = [trigger_id]
+                    tag["format"]["tags"][0]["begin"]["token"] = trigger_id
+                grammar = reasoner._init_value_dispatch(
+                    ("structural_tag", json.dumps(tag)), reasoning=True
+                )
+
+                self._accept_allowed_tokens(
+                    grammar,
+                    tokenizer.encode("x reasoning") + [think_end_id],
+                    backend.vocab_size,
+                )
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                if variant == "required":
+                    self.assertEqual(
+                        _allowed_token_ids(mask, [ord("r"), trigger_id]), [trigger_id]
+                    )
+                elif variant == "excluded_end":
+                    self.assertEqual(_allowed_token_ids(mask, [think_end_id]), [])
+                self._accept_allowed_tokens(
+                    grammar,
+                    [trigger_id]
+                    + tokenizer.encode('{"name":"tool","args":{}}')
+                    + [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+                    backend.vocab_size,
+                )
+                self.assertTrue(grammar.is_terminated())
+
+    def test_inkling_auto_grammar_owns_its_boundaries_unless_strict(self):
+        tag = InklingToolDetector().get_auto_tool_call_structural_tag()
+        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
+        for reasoning in (False, True):
+            for strict in (False, True):
+                with self.subTest(reasoning=reasoning, strict=strict):
+                    backend = _DummyGrammarBackend()
+                    inner_grammar = MagicMock()
+                    backend._dispatch_result = inner_grammar
+                    reasoner = ReasonerGrammarBackend(
+                        backend,
+                        SimpleNamespace(detector=InklingDetector()),
+                        tokenizer,
+                        enable_strict_thinking=strict,
+                    )
+                    grammar = reasoner._init_value_dispatch(
+                        (
+                            "structural_tag",
+                            json.dumps(tag.model_dump(), sort_keys=True, indent=2),
+                        ),
+                        reasoning=reasoning,
+                    )
+
+                    if strict:
+                        self.assertIsInstance(grammar, ReasonerGrammarObject)
+                        self.assertIs(grammar.grammar, inner_grammar)
+                    else:
+                        self.assertIs(grammar, inner_grammar)
+
+    def test_other_grammars_still_defer_until_reasoning_ends(self):
+        tag = InklingToolDetector().get_auto_tool_call_structural_tag().model_dump()
+        tag["format"] = {"type": "sequence", "elements": [tag["format"]]}
+        keys = [
+            ("json", "{}"),
+            ("structural_tag", '{"structures": [], "triggers": []}'),
+            ("structural_tag", json.dumps(tag)),
+        ]
+        for key in keys:
+            with self.subTest(key=key):
+                backend = _DummyGrammarBackend()
+                backend._dispatch_result = MagicMock()
+                reasoner = ReasonerGrammarBackend(
+                    backend, self._make_parser(), self._make_tokenizer()
+                )
+                grammar = reasoner._init_value_dispatch(key, reasoning=True)
+
+                self.assertIsInstance(grammar, ReasonerGrammarObject)
+                self.assertIs(grammar.grammar, backend._dispatch_result)
+                self.assertFalse(grammar._is_generation())
+
+    def test_full_assistant_ebnf_still_owns_its_boundaries(self):
+        """Whole-assistant EBNF must keep control of the reasoning prefix."""
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                backend = _DummyGrammarBackend()
+                backend._dispatch_result = MagicMock()
+                reasoner = ReasonerGrammarBackend(
+                    backend,
+                    self._make_parser(),
+                    self._make_tokenizer(),
+                    enable_strict_thinking=strict,
+                )
+                grammar = reasoner._init_value_dispatch(
+                    ("full_assistant_ebnf", 'root ::= "answer"'), reasoning=True
+                )
+                self.assertIs(grammar, backend._dispatch_result)
+
+    def test_inkling_scheduler_uses_native_reasoning_end(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = SimpleNamespace(skip_tokenizer_init=False)
+        scheduler.skip_tokenizer_init = False
+        scheduler.model_config = SimpleNamespace(
+            is_generation=True, is_multimodal=False, think_end_ids=None
+        )
+        serving = SimpleNamespace(
+            tokenizer_path="unused",
+            tokenizer_mode="auto",
+            tokenizer_backend="default",
+            reasoning_parser="inkling",
+        )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_tokenizer", return_value=tokenizer
+            ),
+            patch("sglang.srt.managers.scheduler.get_serving", return_value=serving),
+            patch(
+                "sglang.srt.managers.scheduler.get_model",
+                return_value=SimpleNamespace(trust_remote_code=False, revision=None),
+            ),
+        ):
+            scheduler.init_tokenizer()
+
+        self.assertEqual(
+            scheduler.model_config.think_end_ids,
+            [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+        )
 
     def test_accepts_multi_token_think_start_marker(self):
         """think_start_token can be multi-token (e.g., GPT-OSS) since it's not used."""
@@ -205,16 +554,15 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         )
         self.assertIsNotNone(reasoner)
 
-    def test_rejects_multi_token_think_end_marker(self):
+    def test_accepts_multi_token_think_end_marker(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
-
-        with self.assertRaisesRegex(ValueError, "must encode to exactly one token"):
-            ReasonerGrammarBackend(
-                backend,
-                self._make_parser(),
-                self._make_tokenizer(end_ids=[2, 3]),
-                enable_strict_thinking=True,
-            )
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(end_ids=[2, 3]),
+            enable_strict_thinking=True,
+        )
+        self.assertEqual(reasoner.think_end_ids, [2, 3])
 
     def test_rejects_unencodable_excluded_token(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
@@ -247,7 +595,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             )
 
 
-class TestReasonerGrammarObjectRollback(unittest.TestCase):
+class TestReasonerGrammarObjectRollback(CustomTestCase):
     """Tests for rollback correctness at the THINKING→GENERATION boundary."""
 
     def _make_object_with_mock_grammar(self):
@@ -255,7 +603,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         inner_grammar.is_terminated.return_value = False
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -272,11 +620,10 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
 
-        # Accept 3 thinking tokens then think_end_id
         obj.accept_token(10)
         obj.accept_token(11)
         obj.accept_token(12)
-        obj.accept_token(7)  # think_end_id → tokens_after_end = 0
+        obj.accept_token(7)
 
         self.assertTrue(obj._is_generation())
         self.assertEqual(obj.tokens_after_end, 0)
@@ -296,7 +643,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         # 2 thinking tokens + think_end + 3 generation tokens
         obj.accept_token(10)  # think
         obj.accept_token(11)  # think
-        obj.accept_token(7)  # think_end_id
+        obj.accept_token(7)
         obj.accept_token(20)  # gen 1
         obj.accept_token(21)  # gen 2
         obj.accept_token(22)  # gen 3
@@ -315,7 +662,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj.maybe_init_reasoning(True)
 
         obj.accept_token(10)  # think
-        obj.accept_token(7)  # think_end_id
+        obj.accept_token(7)
         obj.accept_token(20)  # gen 1
         obj.accept_token(21)  # gen 2
 
@@ -344,7 +691,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj.maybe_init_reasoning(True)
 
         obj.accept_token(10)
-        obj.accept_token(7)  # think_end_id → GENERATION
+        obj.accept_token(7)
         obj.accept_token(20)
 
         self.assertEqual(obj.tokens_in_think, 1)
@@ -370,8 +717,28 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         self.assertEqual(copy.tokens_after_end, -1)
         self.assertTrue(copy._is_thinking())
 
+    def test_multi_token_marker_survives_rollback(self):
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 3])
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(2)
+        obj.accept_token(9)
+        obj.rollback(1)
+        obj.accept_token(3)
+        self.assertTrue(obj._is_generation())
 
-class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
+        obj.rollback(1)
+        self.assertTrue(obj._is_thinking())
+        self.assertEqual(obj._matched_think_end_tokens, 1)
+
+    def test_self_overlapping_marker_is_matched(self):
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 2, 3])
+        obj.maybe_init_reasoning(True)
+        for token in (2, 2, 2, 3):
+            obj.accept_token(token)
+        self.assertTrue(obj._is_generation())
+
+
+class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
     """Tests for fill_vocab_mask behavior in different states."""
 
     def test_thinking_phase_does_not_consult_inner_grammar(self):
@@ -383,7 +750,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -411,7 +778,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -424,7 +791,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj.maybe_init_reasoning(True)
         obj.accept_token(10)
-        obj.accept_token(7)  # think_end_id → GENERATION
+        obj.accept_token(7)
 
         mask = obj.allocate_vocab_mask(64, 1, "cpu")
         obj.fill_vocab_mask(mask, 0)
@@ -435,7 +802,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         inner_grammar = MagicMock()
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
             enable_token_filter=False,
@@ -451,7 +818,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         self.assertTrue(torch.all(mask == 0))
 
 
-class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
+class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
     """`current_token` must be tracked on the wrapper so that disaggregation's
     process_prebuilt dedup guard (`grammar.current_token is None`) works for
     reasoning requests. Without it the guard never fires and a retracted/
@@ -463,7 +830,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         inner_grammar.is_terminated.return_value = False
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
             enable_token_filter=False,
@@ -480,7 +847,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
         obj.accept_token(10)  # thinking token
-        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(7)
         obj.accept_token(58)  # generation token "["
         self.assertEqual(obj.current_token, 58)
 
@@ -497,7 +864,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         must not be re-accepted; with current_token tracked, the guard skips."""
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
-        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(7)
         obj.accept_token(58)  # "[" accepted into inner grammar
         obj.accept_token(4913)  # '{"' accepted into inner grammar
         inner_grammar.accept_token.reset_mock()

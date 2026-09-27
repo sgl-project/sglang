@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,10 +26,12 @@ def _jit_concat_mla_k_module() -> Module:
 
 @cache_once
 def _jit_concat_mla_absorb_q_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         "concat_mla_absorb_q",
+        *args,
         cuda_files=["elementwise/concat_mla.cuh"],
-        cuda_wrappers=[("concat_mla_absorb_q", "ConcatMlaAbsorbQKernel::run")],
+        cuda_wrappers=[("concat_mla_absorb_q", f"ConcatMlaAbsorbQKernel<{args}>::run")],
     )
 
 

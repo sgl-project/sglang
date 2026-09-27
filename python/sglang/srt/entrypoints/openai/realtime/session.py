@@ -187,7 +187,7 @@ class RealtimeConnection:
 
         self.model_sample_rate = adapter.model_sample_rate
         self.bytes_per_second = self.model_sample_rate * _SAMPLE_WIDTH
-        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
+        self.max_buffer_seconds = get_serving().asr_max_buffer_seconds
 
         self.config = _SessionConfig()
 
@@ -339,12 +339,12 @@ class RealtimeConnection:
         if (
             transcription is not None
             and transcription.model
-            and transcription.model != get_serving().served_model_name
+            and transcription.model != self.tokenizer_manager.served_model_name
         ):
             await self._send_error(
                 "not_supported",
                 f"Model {transcription.model!r} is not served by this endpoint "
-                f"(serving {get_serving().served_model_name!r}); set "
+                f"(serving {self.tokenizer_manager.served_model_name!r}); set "
                 f"transcription.model to null or to the server's model name.",
                 param="session.audio.input.transcription.model",
             )

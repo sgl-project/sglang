@@ -20,6 +20,7 @@
 
 import copy
 import logging
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -34,7 +35,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1065,7 +1069,7 @@ class GlmImageForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(logits_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
