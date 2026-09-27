@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -39,8 +40,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
     CAUSAL_SCENE_CUT_MASK_KEY,
     CAUSAL_SHOT_INDICES_KEY,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
+    LingBotVideoTextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2 import (
     LongLive2TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
+    MingImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -225,7 +232,9 @@ def make_server_args(**kwargs):
     return SimpleNamespace(**defaults)
 
 
-def make_group_executor(stage_type, device, capacity, *, fsdp=False, native=True):
+def make_group_executor(
+    stage_type, device, capacity, *, fsdp=False, native=True, tokenizer=None
+):
     encoder = (
         (FullHiddenStateEncoder() if native else LibraryEncoder()).to(device).eval()
     )
@@ -246,7 +255,9 @@ def make_group_executor(stage_type, device, capacity, *, fsdp=False, native=True
         should_cpu_offload_component=lambda _: False,
     )
     with patch(_GLOBAL_ARGS_PATCH, return_value=args):
-        stage = stage_type([encoder], [object()])
+        stage = stage_type(
+            [encoder], [tokenizer if tokenizer is not None else object()]
+        )
     stage._text_encode_dp_group = Mock(return_value=None)
     stage.encode_text = partial(stage.encode_text, device=device)
     pipeline = SimpleNamespace(
@@ -368,6 +379,76 @@ def test_grouped_longlive_conditioning_keeps_per_request_shot_metadata():
         assert key in outputs[0].extra and key in outputs[1].extra
         assert outputs[0].extra[key] == outputs[1].extra[key]
         assert outputs[0].extra[key] is not outputs[1].extra[key]
+
+
+@pytest.mark.parametrize("fsdp", [False, True])
+@pytest.mark.parametrize(
+    "stage_type", [MingImageEncodingStage, LingBotVideoTextEncodingStage]
+)
+@torch.no_grad()
+def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stage_type):
+    tokenizer = Mock(name_or_path="fixture", eos_token="<eos>")
+    tokenizer.side_effect = lambda text, **kwargs: {"input_ids": [len(text), 2]}
+    tokenizer.convert_tokens_to_ids.side_effect = lambda text: (
+        3 if text == "<image>" else 4
+    )
+    factory = stage_type
+    if stage_type is LingBotVideoTextEncodingStage:
+        factory = partial(stage_type, transformer=torch.nn.Linear(1, 1))
+
+        def tokenize(**kwargs):
+            texts = kwargs["text"]
+            ids = (
+                [[1]]
+                if isinstance(texts, str)
+                else [[1, len(text), 2] for text in texts]
+            )
+            return BatchEncoding(
+                {
+                    "input_ids": torch.tensor(ids),
+                    "attention_mask": torch.ones_like(torch.tensor(ids)),
+                }
+            )
+
+        tokenizer.side_effect = tokenize
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "ming_image.Qwen2VLImageProcessorPil.from_pretrained"
+    ):
+        executor, stage, encoder, args = make_group_executor(
+            factory, "cpu", 0, fsdp=fsdp, tokenizer=tokenizer
+        )
+    encoder.dtype = torch.bfloat16
+    encoder.config = SimpleNamespace(projection_config={"img_gen_scales": [1]})
+    encoder.image_token = 99
+    args.pipeline_config.dit_config.arch_config.alignment_padding_mode = "zero_masked"
+    args.pipeline_config.dit_config.arch_config.multi_frame_output = False
+
+    def requests():
+        return [
+            Req(
+                sampling_params=SamplingParams(prompt=prompt, height=64, width=64),
+                do_classifier_free_guidance=False,
+            )
+            for prompt in ("hello", "different", "hello")
+        ]
+
+    with patch(
+        f"{stage_type.__module__}.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    ):
+        for run in range(2):
+            outputs = executor.execute_group([stage], requests(), args)
+            assert encoder.calls == 2 * (run + 1)
+            assert outputs[0].prompt_embeds[0] is outputs[2].prompt_embeds[0]
+            assert outputs[0].prompt_embeds is not outputs[2].prompt_embeds
+            if stage_type is MingImageEncodingStage:
+                assert all(output.extra["ming_frames"] == 1 for output in outputs)
+                assert (
+                    outputs[0].extra["ming_direct"] is outputs[2].extra["ming_direct"]
+                )
+    assert executor.conditioning_cache._group_entries.get() is None
 
 
 def get_negative_embedding_twice(stage, server_args, first_req, second_req=None):
@@ -499,6 +580,7 @@ class TextEncodingDPGroup:
     def __init__(self, rank):
         self.rank_in_group = rank
         self.gathers = 0
+        self.cpu_group = dist.group.WORLD
 
     def all_reduce(self, tensor):
         dist.all_reduce(tensor)
@@ -512,18 +594,12 @@ class TextEncodingDPGroup:
 
 
 def run_text_encoding_dp(rank, rendezvous, grouped):
-    os.environ["LOCAL_RANK"] = str(rank)
-    torch.cuda.set_device(rank)
-    init_distributed_environment(
-        backend="gloo",
+    dist.init_process_group(
+        "gloo",
         rank=rank,
         world_size=2,
-        local_rank=rank,
-        distributed_init_method=rendezvous,
-        timeout=30,
-    )
-    initialize_model_parallel(
-        sequence_parallel_degree=2, ulysses_degree=2, backend="gloo"
+        init_method=rendezvous,
+        timeout=timedelta(seconds=30),
     )
     try:
         encoder = FullHiddenStateEncoder().eval()
@@ -533,7 +609,14 @@ def run_text_encoding_dp(rank, rendezvous, grouped):
         group = TextEncodingDPGroup(rank)
         stage._text_encode_dp_group = Mock(return_value=group)
         cache = ConditioningCache(4096)
-        with torch.no_grad(), cache.scope(), cache.group_scope(enabled=grouped):
+        stage_module = TextEncodingStage.__module__
+        with (
+            torch.no_grad(),
+            cache.scope(),
+            cache.group_scope(enabled=grouped),
+            patch(f"{stage_module}.model_parallel_is_initialized", return_value=True),
+            patch(f"{stage_module}.get_replica_group", return_value=group),
+        ):
             for attempt in range(3):
                 if attempt == 1 and rank == 0:
                     cache.clear()
@@ -550,8 +633,7 @@ def run_text_encoding_dp(rank, rendezvous, grouped):
         assert encoder.calls == (2 if rank == 0 else 1)
         assert cache.hits == (1 if rank == 0 else 2)
     finally:
-        destroy_model_parallel()
-        destroy_distributed_environment()
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("grouped", [False, True])
@@ -591,7 +673,9 @@ def run_fsdp_conditioning(rank, rendezvous):
     initialize_model_parallel(sequence_parallel_degree=2, ulysses_degree=2)
     try:
         encoder = ShardedTextEncoder().cuda().eval()
-        fully_shard(encoder, mesh=init_device_mesh("cuda", (2,)))
+        fully_shard(
+            encoder, mesh=init_device_mesh("cuda", (2,)), reshard_after_forward=True
+        )
         assert encoder.projection.weight.to_local().numel() == 4
         args = make_server_args(pipeline_config=make_text_config())
         with patch(_GLOBAL_ARGS_PATCH, return_value=args):

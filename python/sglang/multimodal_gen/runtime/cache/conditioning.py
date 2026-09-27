@@ -19,8 +19,8 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_tp_group,
-    get_world_group,
     get_world_size,
     model_parallel_is_initialized,
 )
@@ -531,7 +531,7 @@ def cached_encoder_call(
 
     if not _cross_request_cache.get() and model_parallel_is_initialized():
         # the encoder's TP group may not cover its FSDP shard group
-        group = get_world_group()
+        group = get_replica_group()
 
     def compute_conditioning():
         # a stage owns the consumed output; preserve nested vision-method caches

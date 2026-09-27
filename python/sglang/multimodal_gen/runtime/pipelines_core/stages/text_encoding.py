@@ -20,8 +20,8 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
+    get_replica_group,
     get_tp_group,
-    get_world_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -710,7 +710,7 @@ class TextEncodingStage(ConditionEncodingStage):
             if model_parallel_is_initialized():
                 if dp_group is not None:
                     # agree across encoder copies before skipping their gather
-                    cache_group = get_world_group()
+                    cache_group = get_replica_group()
                 elif cache_group is None:
                     cache_group = get_tp_group()
             # consumed embeddings have no intermediate-state size limit; library
