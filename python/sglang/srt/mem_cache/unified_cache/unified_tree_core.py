@@ -739,6 +739,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         self._update_evictable_leaf_sets(node)
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        result = DecSwaLockOnlyResult()
+        node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
+        if node is self.root_node or component_type in params.skipped_lock_components:
+            return result
+        self.components_by_type[component_type].release_window_lock(
+            node,
+            params.get_lock_uuid(component_type),
+            result.device_frees,
+            result.host_frees,
+        )
+        return result
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -3037,6 +3056,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        return self.component_protected_size_.get(component_type, 0)
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
