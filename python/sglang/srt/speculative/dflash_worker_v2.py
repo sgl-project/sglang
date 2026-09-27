@@ -77,12 +77,10 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.lilicorr_utils import (
-    SAMPLING_ENABLED as _LILICORR_SAMPLING_ENABLED,
-)
-from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
     publish_anchor,
+    resolve_sampling_enabled,
     target_input_embeddings,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -430,11 +428,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
-        # The sampled commit rides the selector's accept path.
-        self._lilicorr_sampling_enabled = (
-            _LILICORR_SAMPLING_ENABLED and self._selector_sampling_enabled
-        )
         self.lilicorr = self.draft_model.lilicorr
+        # The sampled commit rides the selector's accept path.
+        self._lilicorr_sampling_enabled = self.lilicorr is not None and (
+            resolve_sampling_enabled(device_supported=self._selector_sampling_enabled)
+        )
         self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config

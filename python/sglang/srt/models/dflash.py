@@ -560,6 +560,49 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
+    # conv_kernel_size / conv_group_size default to 0, so a config that lost them
+    # builds no conv modules and the loader drops every conv tensor silently.
+    expected = {
+        name
+        for name, _ in model.named_parameters()
+        if ".attention_conv." in name or ".mlp_conv." in name
+    }
+
+    if seen and not expected:
+        raise ValueError(
+            f"Draft checkpoint carries {len(seen)} grouped-convolution tensors "
+            f"(e.g. {sorted(seen)[:3]}) but this draft built no convolution modules: "
+            "dflash_config is missing conv_kernel_size / conv_group_size, which both "
+            "default to 0 and cannot be inferred from the tensors."
+        )
+    if expected and not seen:
+        raise ValueError(
+            f"This draft built {len(expected)} grouped-convolution parameters from "
+            "dflash_config, but the checkpoint carries none, so kernel_projection "
+            "would serve at its random initialization."
+        )
+
+    missing = sorted(expected - seen)
+    unexpected = sorted(seen - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "Draft checkpoint's grouped-convolution tensors do not correspond to the "
+            f"built ones: {len(missing)} missing (e.g. {missing[:3]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]}). Check "
+            "conv_kernel_size, conv_group_size and num_hidden_layers in dflash_config."
+        )
+
+    if expected:
+        conv = model.layers[0].attention_conv
+        logger.info(
+            "DFLASH grouped convolution live: %d taps, group size %d, %d tensors.",
+            int(conv.taps),
+            int(conv.group_size),
+            len(expected),
+        )
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -779,6 +822,7 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        seen_conv: set[str] = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -804,6 +848,8 @@ class DFlashDraftModel(nn.Module):
 
         for name, loaded_weight in weights:
             unprefixed_name = name.removeprefix("model.")
+            if ".attention_conv." in unprefixed_name or ".mlp_conv." in unprefixed_name:
+                seen_conv.add(unprefixed_name)
             if self.projector_type != "domino" and unprefixed_name.startswith(
                 ("prefix_gru.", "embed_proj.")
             ):
@@ -881,6 +927,8 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+
+        _check_conv_weight_coverage(self, seen_conv)
 
 
 class DFlashLagunaAttention(DFlashAttention):

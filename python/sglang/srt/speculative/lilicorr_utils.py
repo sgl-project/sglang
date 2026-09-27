@@ -19,18 +19,15 @@ from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy
 logger = logging.getLogger(__name__)
 
 
-# Read at import: a per-call read would be a host-side branch inside a graph replay.
-SAMPLING_ENABLED = envs.SGLANG_ENABLE_LILICORR_SAMPLING.get()
-logger.info(
-    "LiLiCorr draft commit: %s",
-    "sampled (T>0 aware)" if SAMPLING_ENABLED else "greedy",
-)
-
-if envs.SGLANG_LILICORR_REQUIRE_SAMPLING.get() and not SAMPLING_ENABLED:
-    raise RuntimeError(
-        "SGLANG_LILICORR_REQUIRE_SAMPLING is set but SGLANG_ENABLE_LILICORR_SAMPLING is "
-        "not; this process would serve the greedy commit under a sampled arm's name."
-    )
+def resolve_sampling_enabled(*, device_supported: bool) -> bool:
+    requested = envs.SGLANG_ENABLE_LILICORR_SAMPLING.get()
+    if envs.SGLANG_LILICORR_REQUIRE_SAMPLING.get() and not requested:
+        raise RuntimeError(
+            "SGLANG_LILICORR_REQUIRE_SAMPLING is set but SGLANG_ENABLE_LILICORR_SAMPLING "
+            "is not; this process would serve the greedy commit under a sampled arm's name."
+        )
+    logger.info("LiLiCorr draft commit: %s", "sampled" if requested else "greedy")
+    return requested and device_supported
 
 
 class LiLiCorrConfig(msgspec.Struct, frozen=True):
@@ -270,7 +267,7 @@ def propose_lilicorr_block(
     embed_tokens,
     anchor: Optional[torch.Tensor],
     sampling_info=None,
-    sampling_enabled: bool = SAMPLING_ENABLED,
+    sampling_enabled: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
@@ -475,7 +472,7 @@ def build_lilicorr_draft_sampler(
     embed_tokens,
     lm_head,
     block_size: int,
-    sampling_enabled: bool = SAMPLING_ENABLED,
+    sampling_enabled: bool = False,
 ) -> Optional[LiLiCorrDraftSampler]:
     def eager(reason: str) -> None:
         logger.warning(

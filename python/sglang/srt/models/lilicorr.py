@@ -404,49 +404,6 @@ def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
         )
 
 
-def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
-    # conv_kernel_size / conv_group_size default to 0, so a config that lost them
-    # builds no conv modules and the loader drops every conv tensor silently.
-    expected = {
-        name
-        for name, _ in model.named_parameters()
-        if ".attention_conv." in name or ".mlp_conv." in name
-    }
-
-    if seen and not expected:
-        raise ValueError(
-            f"Draft checkpoint carries {len(seen)} grouped-convolution tensors "
-            f"(e.g. {sorted(seen)[:3]}) but this draft built no convolution modules: "
-            "dflash_config is missing conv_kernel_size / conv_group_size, which both "
-            "default to 0 and cannot be inferred from the tensors."
-        )
-    if expected and not seen:
-        raise ValueError(
-            f"This draft built {len(expected)} grouped-convolution parameters from "
-            "dflash_config, but the checkpoint carries none, so kernel_projection "
-            "would serve at its random initialization."
-        )
-
-    missing = sorted(expected - seen)
-    unexpected = sorted(seen - expected)
-    if missing or unexpected:
-        raise ValueError(
-            "Draft checkpoint's grouped-convolution tensors do not correspond to the "
-            f"built ones: {len(missing)} missing (e.g. {missing[:3]}), "
-            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]}). Check "
-            "conv_kernel_size, conv_group_size and num_hidden_layers in dflash_config."
-        )
-
-    if expected:
-        conv = model.layers[0].attention_conv
-        logger.info(
-            "DFLASH grouped convolution live: %d taps, group size %d, %d tensors.",
-            int(conv.taps),
-            int(conv.group_size),
-            len(expected),
-        )
-
-
 class LiLiCorrDraftModel(DFlashDraftModel):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
@@ -469,21 +426,17 @@ class LiLiCorrDraftModel(DFlashDraftModel):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         seen: set[str] = set()
-        seen_conv: set[str] = set()
 
         def tracking():
             for name, weight in weights:
                 stripped = name[len("model.") :] if name.startswith("model.") else name
                 if stripped.startswith("lilicorr."):
                     seen.add(stripped)
-                elif ".attention_conv." in stripped or ".mlp_conv." in stripped:
-                    seen_conv.add(stripped)
                 yield name, weight
 
         super().load_weights(tracking())
 
         check_head_weight_coverage(self.lilicorr, seen)
-        check_conv_weight_coverage(self, seen_conv)
 
         parameter = next(self.lilicorr.parameters())
         self.lilicorr.materialize_inference_buffers(parameter.device, parameter.dtype)
