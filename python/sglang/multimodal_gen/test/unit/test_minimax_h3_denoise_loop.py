@@ -204,6 +204,71 @@ def test_rank_local_token_tags_match_reference_slice():
                 )
 
 
+def test_h3_sampling_params_accept_rollout():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+
+    params = MiniMaxH3SamplingParams(rollout=True, rollout_return_dit_trajectory=True)
+    assert params.rollout is True
+    assert params.rollout_return_dit_trajectory is True
+
+
+def test_h3_negated_v_ode_matches_native_euler():
+    import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as rl_mixin_module
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _prepare_h3_rollout_session,
+    )
+    from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+        SchedulerRLMixin,
+    )
+
+    class _FakeScheduler(SchedulerRLMixin):
+        sigmas = torch.tensor([1.0, 0.7, 0.0])
+
+    generator = torch.Generator().manual_seed(11)
+    state = torch.randn(7, 16, generator=generator)
+    velocity = torch.randn(7, 16, generator=generator)
+    sigma_curr, sigma_next = 0.7, 0.2
+    expected = state.clone()
+    _minimax_h3_update_target_rows_(
+        expected,
+        velocity.clone(),
+        sigma_t=expected.new_tensor(sigma_curr),
+        sigma_curr=sigma_curr,
+        sigma_ratio=expected.new_tensor(sigma_next / sigma_curr),
+        one_minus_sigma_ratio=expected.new_tensor(1.0 - sigma_next / sigma_curr),
+        denoised_scratch=torch.empty_like(expected),
+    )
+
+    mapped = MiniMaxH3DenoisingStage.to_flow_model_output(None, velocity)
+    torch.testing.assert_close(mapped, -velocity.float())
+
+    scheduler = _FakeScheduler()
+    batch = SimpleNamespace(
+        scheduler=scheduler,
+        latents=None,
+        generator=torch.Generator().manual_seed(0),
+        _rollout_session_data=None,
+        rollout_sde_type="ode",
+        rollout_noise_level=0.0,
+        rollout_log_prob_no_const=True,
+        rollout_debug_mode=False,
+        rollout_sde_step_indices=None,
+        _rollout_loop_step_index=0,
+    )
+    sample = state.unsqueeze(0)
+    with patch.object(rl_mixin_module, "get_sp_world_size", return_value=1):
+        _prepare_h3_rollout_session(batch, tuple(sample.shape), SimpleNamespace())
+        updated = batch.scheduler.flow_sde_sampling(
+            batch,
+            mapped.unsqueeze(0),
+            sample,
+            sample.new_tensor(sigma_curr),
+            sample.new_tensor(sigma_next),
+            batch.generator,
+        )
+    torch.testing.assert_close(updated.squeeze(0), expected, rtol=1e-5, atol=1e-5)
+
+
 def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
     packed = minimax_h3_packed_sequence(
         text_len=3,
