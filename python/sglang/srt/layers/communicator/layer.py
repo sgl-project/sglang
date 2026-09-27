@@ -534,14 +534,14 @@ class LayerCommunicator:
         if self._residual.attention_update.adds_plainly:
             scattered = input_scattered_layer_sides(
                 axis_sizes=token_axis_sizes(),
-                ffn_group=sides.ffn_output.group,
+                ffn_group=sides.ffn.output.group,
                 hands_on_partial=self.allow_reduce_scatter and not self.is_last_layer,
             )
             handoff = _hand_qkv_hook_its_input
         else:
             scattered = scattered_residual_layer_sides(
                 axis_sizes=token_axis_sizes(),
-                ffn_group=sides.ffn_output.group,
+                ffn_group=sides.ffn.output.group,
                 is_first_layer=self.layer_facts.is_first_layer,
                 is_last_layer=self.is_last_layer,
                 leaves_for_reduce_scatter=self.allow_reduce_scatter,
@@ -977,7 +977,7 @@ class LayerCommunicator:
         if self._declared is None:
             raise NotImplementedError("a branch on a layer that is one stage")
         sides = self._declared
-        return sides.ffn.layout, sides.ffn_residual_rows, sides.output_rows
+        return sides.ffn.input.layout, sides.ffn_residual_rows, sides.output_rows
 
     def branch_input(
         self,
@@ -1304,7 +1304,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         # MHC has not been run with an FFN input gathered over attention CP.
         if (
             TokenAxis.ATTN_CP
-            in sides.attention_output.layout.sharded - sides.ffn.layout.sharded
+            in sides.attention.output.layout.sharded - sides.ffn.input.layout.sharded
         ):
             raise NotImplementedError(
                 f"MHCLayerCommunicator with a gather over attention CP: {sides=}"
