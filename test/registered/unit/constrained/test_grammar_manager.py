@@ -414,7 +414,7 @@ class TestAbortRequests(unittest.TestCase):
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
-    def test_abort_by_rid_prefix(self):
+    def test_abort_by_rid(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
@@ -467,8 +467,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = ""
         mgr.abort_requests(abort_req)  # Should not raise
 
-    def test_abort_prefix_match(self):
-        """rid.startswith means prefix matching, not exact matching."""
+    def test_abort_does_not_match_rid_prefix(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123-suffix")
         req.grammar = MagicMock(spec=Future)
@@ -479,7 +478,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = "req-123"
 
         mgr.abort_requests(abort_req)
-        req.set_finish_with_abort.assert_called_once()
+        req.set_finish_with_abort.assert_not_called()
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):
@@ -702,7 +701,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         mock_all_gather.side_effect = fake_all_gather
 
         result = mgr.get_ready_grammar_requests()
-        # Intersection of ready: {0} ∩ {0,1} = {0}
+        # Intersection of ready: {0} 鈭?{0,1} = {0}
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], req0)
         # req1 stays in queue
@@ -732,7 +731,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         mock_all_gather.side_effect = fake_all_gather
 
         result = mgr.get_ready_grammar_requests()
-        # Union of failed: {} ∪ {0} = {0}
+        # Union of failed: {} 鈭?{0} = {0}
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
@@ -934,3 +933,4 @@ class TestStrictReasoningPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
