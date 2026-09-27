@@ -2,6 +2,13 @@
 
 `sglang-server` is SGLang's Rust HTTP frontend and request-processing pipeline. It exchanges typed requests and responses with the Python scheduler while keeping latency-sensitive work outside Python.
 
+## SageMaker endpoints
+
+The Rust frontend exposes the same basic SageMaker routes as the Python server:
+
+- `GET /ping` returns an empty HTTP 200 response for HTTP-server liveness.
+- `POST /invocations` accepts the same OpenAI-compatible chat requests as `/v1/chat/completions`, using its existing handler for both streaming and non-streaming responses.
+
 ## Code review principles
 
 1. **Use strongly typed boundaries.** Model every supported protocol shape with structs, enums, and validated newtypes; avoid opaque values such as `serde_json::Value` and `rmpv::Value` in production paths.
