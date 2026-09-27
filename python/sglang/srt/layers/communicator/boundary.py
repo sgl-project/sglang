@@ -518,19 +518,33 @@ def _cp_moves() -> CpMoves:
     )
 
 
-class BoundarySteps(msgspec.Struct, frozen=True):
-    """The steps a batch runs at a layer's boundaries: into the attention,
-    from the attention output to the FFN input, and the FFN output on to the
-    rows the layer hands on."""
+class StageEntry(msgspec.Struct, frozen=True):
+    """The boundary into one of a layer's stages, as the layer runs it."""
 
-    # The half into the attention: completes what the input owes, writes the
-    # previous output into the residual and reads the attention input
-    # (_attention_input_step); attention_input then moves it.
-    attention_prepare: Callable
-    attention_input: Callable
-    ffn_input: Callable
-    # The rows ffn_input hands the FFN.
-    ffn_input_rows: Layout
+    # Completes what the input owes, writes the previous stage's output into
+    # the residual and reads this stage's input:
+    # (hidden_states, residual, forward_batch, norm, context, **call).
+    prepare: Callable
+    # The rows prepare hands the stage.
+    input_rows: Layout
+    # Moves the input onto the stage's rows after prepare, when prepare does
+    # not: (hidden_states, forward_batch, context) -> hidden_states.
+    input_move: Optional[Callable] = None
+    # Hands the stage its input once it is on its rows:
+    # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
+    handoff: Optional[Callable] = None
+    # The fused kernels prepare tries first.
+    fused: Tuple["FusedMlpInput", ...] = ()
+
+
+class BoundarySteps(msgspec.Struct, frozen=True):
+    """The steps a batch runs at a layer's boundaries: into each of its
+    stages, and the last stage's output on to the rows the layer hands on."""
+
+    # The boundary into the layer's attention and into its FFN; None for a
+    # stage a layer that is one stage does not have.
+    attention: Optional[StageEntry]
+    ffn: Optional[StageEntry]
     # What the FFN exit reads: the FFN output's group and what it may leave.
     ffn_output: StageOutput
     # The postprocess that moves the FFN output on; None when it goes back over
@@ -540,11 +554,6 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     ffn_sum_is_movable: bool
     # Whether ffn_output_move also completes the sum the FFN leaves.
     ffn_output_move_completes_sum: bool = False
-    # The fused kernels ffn_input tries first.
-    fused: Tuple["FusedMlpInput", ...] = ()
-    # Hands the attention its input once attention_input has moved it:
-    # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
-    attention_handoff: Callable = _hand_qkv_hook_its_input
 
     @property
     def returns_over_dp(self) -> bool:
@@ -604,11 +613,6 @@ def _attention_input_step(
     )
 
 
-def _another_stage(*args, **kwargs):
-    """The steps of a stage a single-stage layer does not have."""
-    raise RuntimeError("this layer is one stage and does not have the other")
-
-
 class InputRead(Enum):
     """How a boundary's consumer reads its input from the residual: with the
     attention input norm (prepare_attn) or with the FFN input norm and its
@@ -654,11 +658,10 @@ class Boundary(msgspec.Struct, frozen=True):
     @property
     def input_rows(self) -> Layout:
         """The rows the consumer is handed: what it needs, still sharded over
-        the axes it gathers itself."""
+        the axes it gathers itself as the rows its input is read on are."""
         need = self.edge.need
         return Layout(
-            need.layout.sharded
-            | (self.edge.produced.layout.sharded & need.gathers_itself)
+            need.layout.sharded | (self.edge.residual_to.sharded & need.gathers_itself)
         )
 
 
@@ -772,16 +775,21 @@ def _select_boundary_steps(
         enters_stack=enters_stack,
     )
     return BoundarySteps(
-        attention_prepare=into_attention.prepare,
-        attention_input=into_attention.input_move,
-        ffn_input=into_ffn.prepare,
-        ffn_input_rows=into_ffn.input_rows,
+        attention=StageEntry(
+            prepare=into_attention.prepare,
+            input_rows=into_attention.input_rows,
+            input_move=into_attention.input_move,
+            handoff=attention_handoff,
+        ),
+        ffn=StageEntry(
+            prepare=into_ffn.prepare,
+            input_rows=into_ffn.input_rows,
+            fused=into_ffn.fused,
+        ),
         ffn_output=edges.out_of_ffn.produced,
         ffn_output_move=out_of_ffn.output_move,
         ffn_output_move_completes_sum=out_of_ffn.output_move_completes_sum,
         ffn_sum_is_movable=edges.out_of_ffn.produced.group is not None,
-        fused=into_ffn.fused,
-        attention_handoff=attention_handoff,
     )
 
 

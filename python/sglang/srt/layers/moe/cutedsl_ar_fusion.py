@@ -361,7 +361,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and self._context.tp_size > 1
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP_SCATTER
-            not in self._batch_steps(forward_batch).ffn_input_rows.sharded
+            not in self._batch_steps(forward_batch).ffn.input_rows.sharded
         )
 
 

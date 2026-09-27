@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import cached_property, partial
 from typing import Callable, Optional, Tuple, Union
 
 import msgspec
@@ -33,7 +33,7 @@ from sglang.srt.layers.communicator.boundary import (
     FusedMlpInput,
     InputRead,
     LayerStage,
-    _another_stage,
+    StageEntry,
     _cp_moves,
     _select_boundary_steps,
     decoder_layer_sides,
@@ -245,6 +245,61 @@ def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
     return _ffn_has_tokens(forward_batch) and post_experts_sum_is_one_all_reduce()
 
 
+class StageCommunicator:
+    """One stage of a layer, its attention or its FFN: the boundary into it,
+    run with the stage's norm on the steps the layer chose for the batch."""
+
+    def __init__(self, layer: "LayerCommunicator", name: str, norm_name: str):
+        self._layer = layer
+        self._name = name
+        self._norm_name = norm_name
+
+    @property
+    def norm(self) -> torch.nn.Module:
+        """The norm the stage reads its input with, one of the layer's."""
+        return getattr(self._layer, self._norm_name)
+
+    def entry(
+        self, forward_batch: ForwardBatch, steps: Optional[BoundarySteps] = None
+    ) -> StageEntry:
+        if steps is None:
+            steps = self._layer._batch_steps(forward_batch)
+        entry = getattr(steps, self._name)
+        if entry is None:
+            raise NotImplementedError(
+                f"a layer that is one stage has no {self._name} stage"
+            )
+        return entry
+
+    def prepare(
+        self,
+        hidden_states,
+        residual,
+        forward_batch: ForwardBatch,
+        steps: Optional[BoundarySteps] = None,
+        **call,
+    ):
+        """The stage's input and the residual, from the previous stage's output
+        (``call``: what the stage's read takes, e.g. the attention's
+        ``quant_format``)."""
+        entry = self.entry(forward_batch, steps)
+        context = self._layer._context
+        hidden_states, residual = entry.prepare(
+            hidden_states, residual, forward_batch, self.norm, context, **call
+        )
+        if entry.input_move is not None:
+            hidden_states = entry.input_move(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                context=context,
+            )
+        if entry.handoff is not None:
+            hidden_states = entry.handoff(
+                hidden_states, forward_batch, self._layer.qkv_latent_func
+            )
+        return hidden_states, residual
+
+
 class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
@@ -378,17 +433,31 @@ class LayerCommunicator:
             enters_stack=stage.enters_stack,
         )
         out = make_boundary(out_edge, reads=None)
+        entry = StageEntry(
+            prepare=into.prepare,
+            input_rows=into.input_rows,
+            input_move=None if reads_ffn else into.input_move,
+            handoff=None if reads_ffn else _hand_qkv_hook_its_input,
+            fused=into.fused,
+        )
         self._steps = BoundarySteps(
-            attention_prepare=_another_stage if reads_ffn else into.prepare,
-            attention_input=_another_stage if reads_ffn else into.input_move,
-            ffn_input=into.prepare if reads_ffn else _another_stage,
-            ffn_input_rows=into.input_rows,
+            attention=None if reads_ffn else entry,
+            ffn=entry if reads_ffn else None,
             ffn_output=out_edge.produced,
             ffn_output_move=out.output_move,
             ffn_output_move_completes_sum=out.output_move_completes_sum,
             ffn_sum_is_movable=out_edge.produced.group is not None,
-            fused=into.fused,
         )
+
+    @cached_property
+    def attn(self) -> StageCommunicator:
+        """The layer's attention stage."""
+        return StageCommunicator(self, "attention", "input_layernorm")
+
+    @cached_property
+    def ffn(self) -> StageCommunicator:
+        """The layer's FFN stage."""
+        return StageCommunicator(self, "ffn", "post_attention_layernorm")
 
     @property
     def input_rows(self) -> Layout:
@@ -593,9 +662,7 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._batch_steps(
-                forward_batch
-            ).attention_input(
+            gathered_last_layer_output = self.attn.entry(forward_batch).input_move(
                 hidden_states=residual,
                 forward_batch=forward_batch,
                 context=self._context,
@@ -623,10 +690,7 @@ class LayerCommunicator:
         the batch is not input-scattered.
         """
         return (
-            any(
-                f.may_return_new_residual
-                for f in self._batch_steps(forward_batch).fused
-            )
+            any(f.may_return_new_residual for f in self.ffn.entry(forward_batch).fused)
             and not get_attn_tp_context().input_scattered
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
@@ -644,7 +708,7 @@ class LayerCommunicator:
                 "lora_batch_layout",
                 (
                     LoRABatchLayout.DP_LOCAL
-                    if TokenAxis.ATTN_DP in steps.ffn_input_rows.sharded
+                    if TokenAxis.ATTN_DP in steps.ffn.input_rows.sharded
                     else LoRABatchLayout.TP_GLOBAL
                 ),
             )
@@ -667,19 +731,12 @@ class LayerCommunicator:
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        hidden_states, residual = self._batch_steps(forward_batch).attention_prepare(
+        return self.attn.prepare(
             hidden_states,
             residual,
             forward_batch,
-            self.input_layernorm,
-            self._context,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
-        )
-        return self._finish_prepare_attn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
         )
 
     def _in_sp_region(self) -> bool:
@@ -699,19 +756,6 @@ class LayerCommunicator:
         if self._cp_steps is not None and _batch_shards_over_cp(forward_batch):
             return self._cp_steps
         return self._steps
-
-    def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        steps = self._batch_steps(forward_batch)
-        hidden_states = steps.attention_input(
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            context=self._context,
-        )
-        hidden_states = steps.attention_handoff(
-            hidden_states, forward_batch, self.qkv_latent_func
-        )
-        return hidden_states, residual
 
     def _select_attn_input_fusions(self) -> Tuple[Callable, ...]:
         """The fused kernels that complete what the previous layer left together
@@ -820,13 +864,7 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return steps.ffn_input(
-            hidden_states,
-            residual,
-            forward_batch,
-            self.post_attention_layernorm,
-            self._context,
-        )
+        return self.ffn.prepare(hidden_states, residual, forward_batch, steps)
 
     def maybe_prefetch_next_full_attention_kv(
         self,
