@@ -173,7 +173,7 @@ class KDAKernelDispatcher:
             else:
                 self.extend_kernel = triton_kernel
                 rank0_log(
-                    "PTX KDA prefill needs SM103 (GB300); falling back to Triton "
+                    "PTX KDA prefill needs SM100 or SM103; falling back to Triton "
                     "extend."
                 )
         elif prefill_backend.is_nvidia_kda():
@@ -196,7 +196,7 @@ class KDAKernelDispatcher:
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM103)."
+                "SM100, ptx_kda SM100 or SM103)."
             )
 
         self.supports_packed_decode = getattr(
