@@ -278,7 +278,11 @@ def handle_deprecated_args(server_args: Any):
         "_handle_deprecated_args",
         enable_flashinfer_allreduce_fusion=False,
     )
-    # Deprecated attention-backend alias: "compressed" -> "dsv4".
+    # Deprecated attention-backend aliases: "compressed" -> "dsv4",
+    # "nsa" -> "dsa". Normalized once here so every downstream consumer
+    # (e.g. CPAttentionBackendKind.from_string) only ever sees the
+    # canonical names.
+    deprecated_attention_backends = {"compressed": "dsv4", "nsa": "dsa"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -286,12 +290,16 @@ def handle_deprecated_args(server_args: Any):
         "prefill_attention_backend",
         "speculative_draft_attention_backend",
     ):
-        if getattr(server_args, attr, None) == "compressed":
+        alias = getattr(server_args, attr, None)
+        canonical = deprecated_attention_backends.get(alias)
+        if canonical is not None:
             logger.warning(
-                "--%s=compressed is deprecated; use 'dsv4' instead.",
+                "--%s=%s is deprecated; use '%s' instead.",
                 attr.replace("_", "-"),
+                alias,
+                canonical,
             )
-            renamed[attr] = "dsv4"
+            renamed[attr] = canonical
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
