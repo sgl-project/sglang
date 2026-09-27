@@ -1179,6 +1179,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self._init_request_token_capacity()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2539,7 +2540,7 @@ class Scheduler(
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
         token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
+            self.request_token_capacity * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
@@ -5832,7 +5833,30 @@ class Scheduler(
     def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
         return role_switch.handle_pd_role_switch(self, recv_req)
 
+    def _init_request_token_capacity(self):
+        # The KV span one request may reach, which bounds its max_new_tokens:
+        # the device pool, or a PD HiSparse decode's host-backed logical pool
+        # (ModelRunner.request_token_capacity; max_req_len uses the same).
+        self.request_token_capacity = self.max_total_num_tokens
+        if self.enable_hisparse and get_disagg().disaggregation_mode == "decode":
+            self.request_token_capacity = (
+                self.tp_worker.model_runner.request_token_capacity
+            )
+
+    def _refresh_request_length_limits(self):
+        # A PD role switch changes whether a HiSparse server is bounded by its
+        # logical or its device pool; recompute what was cached at startup.
+        if not self.enable_hisparse:
+            return
+        info = self.tp_worker.get_worker_info()
+        self.max_req_len, self.max_req_input_len = info[4], info[5]
+        self._init_request_token_capacity()
+        beam_coordinator = getattr(self, "beam_coordinator", None)
+        if beam_coordinator is not None and hasattr(beam_coordinator, "max_req_len"):
+            object.__setattr__(beam_coordinator, "max_req_len", self.max_req_len)
+
     def _sync_disaggregation_mode_to_subcomponents(self):
+        self._refresh_request_length_limits()
         # Push the (possibly flipped) mode into sub-components that cache it.
         # object.__setattr__ because some are frozen dataclasses.
         for name in (

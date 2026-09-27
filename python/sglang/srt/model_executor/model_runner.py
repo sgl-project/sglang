@@ -180,6 +180,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1458,6 +1459,21 @@ class ModelRunner:
             if size_full is not None:
                 return size_full
         return self.effective_max_total_num_tokens
+
+    @property
+    def request_token_capacity(self):
+        """Tokens one request's KV may span on this worker.
+
+        A PD HiSparse decode receives a request's KV straight into the
+        host-backed logical pool (logical indices only) and holds just a fixed
+        hot buffer per request on the device, so one request is bounded by the
+        logical pool, which is also what DecodePreallocQueue admits against.
+        Everywhere else, including an aggregated HiSparse server, whose
+        prefill extends take a device slot per token, it is the device pool.
+        """
+        if self.enable_hisparse and get_disagg().disaggregation_mode == "decode":
+            return self.max_token_pool_size
+        return self.effective_logical_max_total_num_tokens
 
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.

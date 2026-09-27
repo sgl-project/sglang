@@ -76,6 +76,7 @@ def make_worker(dcp_size):
     runner.server_args = NS(dcp_size=dcp_size)
     runner.kv_cache_configurator = make_configurator()
     runner.is_hybrid_swa = False
+    runner.enable_hisparse = False
     runner.max_total_num_tokens = PHYSICAL
     runner.max_running_requests = 64
     runner.token_to_kv_pool = kv
