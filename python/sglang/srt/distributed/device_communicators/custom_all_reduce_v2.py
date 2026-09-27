@@ -473,12 +473,6 @@ class CustomAllReduceV2:
         self.close()
 
 
-def _is_vmm_backed_allocator(device: torch.device) -> bool:
-    """Check whether expandable-segments VMM backs the caching allocator."""
-    probe = torch.empty(1, dtype=torch.uint8, device=device)
-    return is_vmm_pointer(probe.data_ptr())
-
-
 def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
@@ -487,7 +481,18 @@ def can_use_custom_all_reduce_v2(
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
-        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
+        # Multi-node (MNNVL): a single NVLink fabric clique shares one address
+        # space across nodes, which is what the symm-mem workspace needs, and
+        # the clique check is the whole capability requirement.
+        #
+        # The caching-allocator VMM probe deliberately does not gate this. Its
+        # only consumer is graph zero-copy input registration, where cross-node
+        # inputs travel as FABRIC / POSIX-fd VMM handles rather than cudaIpc --
+        # and custom AR v2 already disables graph mode on a multi-node group
+        # outright (see `_is_graph_mode_supported`), so that path can never run
+        # here. Requiring it rejected v2 on every default launch and silently
+        # cost ~19% throughput on GB300 NVL72 (#36429).
+        return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
