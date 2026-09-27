@@ -20,6 +20,7 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
+HISPARSE_XPU_DSA_BACKENDS = {"intel_xpu"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
@@ -32,6 +33,8 @@ def _hisparse_default_backend(kv_cache_dtype: str) -> str:
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
+    if get_platform().is_xpu:
+        return HISPARSE_XPU_DSA_BACKENDS
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
         kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
     )
