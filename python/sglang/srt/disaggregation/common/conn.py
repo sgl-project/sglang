@@ -682,14 +682,41 @@ class CommonKVManager(BaseKVManager):
         except Exception as e:
             logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
 
+    def _abort_ack_fanout_targets(self, room: int) -> List[Tuple[str, int]]:
+        """Every decode peer of the room, dummy pairings included: each decode
+        rank counts drain acks from every prefill rank it notified, and a dummy
+        pairing still expects its ack (nothing was written, so it is trivially
+        drained). Snapshot: the control thread can register a late peer while
+        we walk the dict."""
+        infos = self.transfer_infos.get(room)
+        if not infos:
+            return []
+        targets: List[Tuple[str, int]] = []
+        for info in list(infos.values()):
+            target = (info.endpoint, info.dst_port)
+            if target not in targets:
+                targets.append(target)
+        return targets
+
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
         target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+        if target is None:
+            return
+        # With prefill TP < decode TP several decode ranks share one room, but
+        # the registry keeps only the last ABORT sender -- the earlier ranks
+        # would hold their pages for the full release timeout. Fan the ack out
+        # to every known peer; the registered sender is the guaranteed floor
+        # (transfer_infos is gone after teardown and may be incomplete when the
+        # abort lands during bootstrap).
+        targets = self._abort_ack_fanout_targets(room)
+        if target not in targets:
+            targets.append(target)
+        for decode_ip, decode_port in targets:
+            self._send_abort_ack(decode_ip, decode_port, room)
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
