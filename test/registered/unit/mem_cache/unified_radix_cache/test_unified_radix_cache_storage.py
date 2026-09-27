@@ -81,7 +81,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF, window_evictable
+from sglang.test.tree_slots import FAMILY_OF, window_evictable, window_protected
 
 
 def _window_hit(req):
@@ -1233,6 +1233,67 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
+
+    @requires_swa_only
+    @requires_hicache
+    def test_swa_lock_window_split_in_buffer_only_mode(self):
+        """Buffer-only HiCache has every node split return a pending-backup action
+        with no tree ack. The lock walk's window split applies it instead of
+        tripping on it and still pins one page-aligned window; a node whose
+        buffer-mode write is pending is left whole, since that write reads all
+        of it and pins it with a lock walk of its own."""
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
+
+        # A live parent of 4 pages, then the one-window leaf the insert caps;
+        # its backups are through before the lock walk reaches it.
+        seq = self._make_seq(1, tail_pages + 4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        self._drain_buffer_writes(cache)
+        cache.sanity_check()
+
+        key = seq[:-ps] + self._make_seq(100_000, 1)
+        matched = len(seq) - ps
+        m = match_prefix(cache, key)
+        self.assertEqual(m.device_prefix_len, matched)
+        self.assertFalse(cache.buffer_backup_pending(m.last_device_node))
+        lock_result = cache.inc_lock_ref(m.last_device_node)
+        cache.sanity_check()
+        self.assertEqual(window_protected(cache), tail_size)
+        self.assertEqual(cache.full_protected_size(), matched)
+        cache.dec_lock_ref(m.last_device_node, lock_result.to_dec_params())
+        cache.sanity_check()
+        self.assertEqual(window_protected(cache), 0)
+        self.assertEqual(match_prefix(cache, seq).device_prefix_len, len(seq))
+
+        # A parent longer than the window with its backup queued and not yet
+        # written: the walk leaves the pending node whole, so the lock pins all
+        # of it (the key ends at the parent, so the match splits nothing).
+        seq = self._make_seq(5000, 2 * tail_pages + 4)
+        parent_len = (tail_pages + 4) * ps
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        parent = node_parent(cache, leaf)
+        self.assertEqual(node_key_length(cache, parent), parent_len)
+        write_backup(cache, leaf)
+        self.assertTrue(cache.buffer_backup_pending(parent))
+        key = seq[:parent_len] + self._make_seq(200_000, 1)
+        m = match_prefix(cache, key)
+        self.assertEqual(m.device_prefix_len, parent_len)
+        self.assertEqual(m.last_device_node, parent)
+        lock_result = cache.inc_lock_ref(parent)
+        cache.sanity_check()
+        self.assertEqual(window_protected(cache), parent_len)
+        self._drain_buffer_writes(cache)
+        cache.dec_lock_ref(parent, lock_result.to_dec_params())
+        cache.sanity_check()
+        self.assertEqual(window_protected(cache), 0)
 
     @requires_hicache
     def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
