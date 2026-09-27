@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     find_available_port,
 )
 
-register_cuda_ci(est_time=57, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=69, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(
     est_time=64,
     suite="stage-c-test-4-gpu-amd",
@@ -77,7 +77,9 @@ class EngineWrapper:
         self, named_tensors: Iterable[Tuple[str, torch.Tensor]]
     ):
         if self._tp_rank == 0:
+            self._engine.begin_weight_update()
             self._engine.update_weights_from_tensor(list(named_tensors))
+            self._engine.end_weight_update()
             self._engine.flush_cache()
         dist.barrier(group=self._device_mesh_cpu.get_group())
 

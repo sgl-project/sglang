@@ -56,7 +56,7 @@ pub(super) struct SubmittedChoice {
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
     /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`, and native unknown finish types are preserved rather than lost.
+    /// `abort`; unrecognized scheduler finish types are preserved as well.
     finish_reason_override: Option<String>,
 }
 
@@ -445,7 +445,7 @@ fn completion_choice(
             Matched::Token(id) => serde_json::json!(id),
             Matched::Str(value) => serde_json::json!(value),
             // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
+            // multi-token list. Preserve the original token IDs.
             Matched::Tokens(ids) => serde_json::json!(ids),
         });
     (

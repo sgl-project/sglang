@@ -196,7 +196,7 @@ class TestQwen35Mxfp4MI35x(CustomTestCase):
             if is_in_ci():
                 write_github_step_summary(
                     f"### gsm8k accuracy ({MXFP4_MODEL_PATH})\n"
-                    f'score={metrics["score"]:.3f} '
+                    f"score={metrics['score']:.3f} "
                     f"(threshold {MXFP4_ACC_THRESHOLD})\n"
                 )
             self.assertGreater(metrics["score"], MXFP4_ACC_THRESHOLD)
@@ -233,7 +233,7 @@ class TestQwen35MoeMxfp4MI35x(CustomTestCase):
             if is_in_ci():
                 write_github_step_summary(
                     f"### gsm8k run-through ({MOE_MXFP4_MODEL_PATH}, fuse_gate)\n"
-                    f'score={metrics["score"]:.3f} (run-through, no gate)\n'
+                    f"score={metrics['score']:.3f} (run-through, no gate)\n"
                 )
             # Ran e2e and returned parseable answers -> fuse_gate path is healthy.
             self.assertGreater(metrics["score"], 0.0)

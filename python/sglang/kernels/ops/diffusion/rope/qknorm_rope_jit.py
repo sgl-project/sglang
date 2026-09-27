@@ -33,6 +33,7 @@ def _jit_qknorm_rope_module(
     round_norm_before_rope: bool,
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
+    out_of_place: bool = False,
 ) -> Module:
     args = make_cpp_args(
         head_dim,
@@ -44,8 +45,12 @@ def _jit_qknorm_rope_module(
         round_norm_before_rope,
         cache_has_full_width,
     )
-    op_name = "qknorm_rope_pack_kv" if pack_kv else "qknorm_rope"
-    kernel_name = "QKNormRopePackKVKernel" if pack_kv else "QKNormRopeKernel"
+    if pack_kv:
+        op_name, kernel_name = "qknorm_rope_pack_kv", "QKNormRopePackKVKernel"
+    elif out_of_place:
+        op_name, kernel_name = "qknorm_rope_out_of_place", "QKNormRopeOutOfPlaceKernel"
+    else:
+        op_name, kernel_name = "qknorm_rope", "QKNormRopeKernel"
     return load_jit(
         op_name,
         *args,
@@ -96,15 +101,13 @@ def _can_use_fused_qknorm_rope(
                 rotary_lanes,
             )
             return False
-    elif cache_has_full_width:
-        logger.warning("Full-width cos/sin caches are only supported for NeoX RoPE")
-        return False
     if pack_kv and cache_has_full_width:
         logger.warning("KV packing does not support full-width cos/sin caches")
         return False
-    if round_norm_before_rope and cache_dtype != dtype:
+    if round_norm_before_rope and cache_dtype not in (dtype, torch.float32):
         logger.warning(
-            "Exact fused QKNorm+RoPE requires cache dtype %s to match activation dtype %s",
+            "Exact fused QKNorm+RoPE requires cache dtype %s to match activation "
+            "dtype %s or use float32",
             cache_dtype,
             dtype,
         )
@@ -182,6 +185,46 @@ def fused_inplace_qknorm_rope(
         cache_has_full_width,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+@register_custom_op(mutates_args=["q_out", "k_out"])
+def fused_qknorm_rope_out_of_place(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
+) -> None:
+    """QK-norm + RoPE from ``q``/``k`` (any strides) into ``q_out``/``k_out``;
+    the inputs are left untouched. Same arithmetic as the in-place kernel."""
+    head_dim = head_dim or q.size(-1)
+    if not rope_dim:
+        cache_width = cos_sin_cache.size(-1)
+        rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    module = _jit_qknorm_rope_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        q.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+        False,
+        cache_has_full_width,
+        True,
+    )
+    module.qknorm_rope_out_of_place(
+        q, k, q_out, k_out, q_weight, k_weight, cos_sin_cache, positions, eps
+    )
 
 
 @register_custom_op(mutates_args=["q", "packed_kv"])

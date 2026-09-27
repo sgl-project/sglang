@@ -27,13 +27,16 @@ from sglang.srt.kv_canary.perturb.utils import (
     flip_first_byte_in_source,
     pick_target_group,
 )
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
+    add_unified_child,
     make_buffer_group,
     make_forward_batch,
-    make_radix_cache,
     make_req_to_token_pool,
+    make_unified_radix_cache,
+    make_unified_radix_chain,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -159,22 +162,27 @@ class TestPerturbManager(CustomTestCase):
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
 
-        with patch.object(
-            manager,
-            "perturb_real_kv_post_forward",
-            lambda batch: calls.append("real_kv_post_forward"),
-        ), patch.object(
-            manager,
-            "perturb_req_to_token",
-            lambda batch: calls.append("req_to_token"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_used",
-            lambda batch: calls.append("real_kv_used"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_unused_cache",
-            lambda batch: calls.append("real_kv_unused_cache"),
+        with (
+            patch.object(
+                manager,
+                "perturb_real_kv_post_forward",
+                lambda batch: calls.append("real_kv_post_forward"),
+            ),
+            patch.object(
+                manager,
+                "perturb_req_to_token",
+                lambda batch: calls.append("req_to_token"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_used",
+                lambda batch: calls.append("real_kv_used"),
+            ),
+            patch.object(
+                manager,
+                "perturb_real_kv_unused_cache",
+                lambda batch: calls.append("real_kv_unused_cache"),
+            ),
         ):
             manager.perturb_post_forward(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -201,7 +209,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [2], dtype=torch.int32, device=device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         head_snapshot = group.k_head.clone()
         v_head_snapshot = group.v_head.clone()
@@ -283,7 +291,7 @@ class TestReqToTokenPerturb(CustomTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int32, device=device
         )
-        forward_batch.num_token_non_padded_cpu = 1
+        forward_batch.global_num_token_non_padded_cpu = 1
 
         targets = collect_active_slots(
             maybe_inaccurate_forward_batch=forward_batch,
@@ -394,10 +402,13 @@ class TestRealKvUsedPerturb(CustomTestCase):
 
         pool_snapshot = pool.req_to_token.clone()
         source_snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            real_kv_unused_cache_module,
-            "_pick_sweep_slot_for_group",
-            return_value=3,
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                real_kv_unused_cache_module,
+                "_pick_sweep_slot_for_group",
+                return_value=3,
+            ),
         ):
             manager.perturb(maybe_inaccurate_forward_batch=forward_batch)
 
@@ -433,13 +444,16 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
-        manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
+        manager.attach_radix_cache(make_unified_radix_chain([[3]], device=device))
 
         snapshot = source.tensor.clone()
-        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            torch,
-            "randint",
-            return_value=torch.tensor(0),
+        with (
+            patch.object(torch, "rand", return_value=torch.tensor(0.0)),
+            patch.object(
+                torch,
+                "randint",
+                return_value=torch.tensor(0),
+            ),
         ):
             manager.perturb_real_kv_unused_cache(None)
 
@@ -451,9 +465,9 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         """Verify unused-cache perturbation chooses only unlocked radix-cache slots."""
         device = DEFAULT_DEVICE
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
-        cache = make_radix_cache([[], [1, 2], [3]], device=device)
-        locked_node = next(iter(cache.root_node.children.values()))
-        locked_node.lock_ref = 1
+        cache = make_unified_radix_cache()
+        locked_node = add_unified_child(cache, [1, 2], lock_ref=1, device=device)
+        add_unified_child(cache, [3], parent=locked_node, device=device)
 
         with patch.object(torch, "randint", return_value=torch.tensor(0)):
             slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
@@ -471,7 +485,8 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         group = make_buffer_group(
             kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut
         )
-        cache = make_radix_cache([[], [1]], device=device)
+        cache = make_unified_radix_cache((ComponentType.FULL, ComponentType.SWA))
+        add_unified_child(cache, [1], swa_value=[1], device=device)
 
         with patch.object(torch, "randint", return_value=torch.tensor(0)):
             slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(

@@ -136,8 +136,8 @@ than restating.
   = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
-  platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with
-  `run_eval --eval-name gsm8k --num-examples 1319` and shows both as one "GSM8K %"
+  platform's GSM8K with a historical raw completion harness and another's with
+  `sgl-eval run gsm8k --num-examples 1319` and shows both as one "GSM8K %"
   (the scores aren't comparable). Either standardize on one harness (matching
   `benchmarkCommands.accuracy`) or require an explicit per-entry note. Common when folding
   a second contributor's measurements (e.g. an AMD/ROCm PR) into the page.
@@ -146,6 +146,18 @@ than restating.
 - Any `sglang serve` command shown in MDX prose (config tips, benchmark section) must
   equal what the engine emits from the corresponding cell — same flags, same order. Drift
   here is the most common review miss.
+
+### 5b. ComfyUI section (diffusion pages)
+- A diffusion page ends with `## <n>. Run in ComfyUI` rendering `<ComfyUISupport />`. A
+  reader must not have to guess whether the model is reachable from ComfyUI.
+- The `model` prop is a key that exists in `docs/src/snippets/diffusion/comfyui-support.jsx`.
+  A model-specific key is only correct when the plugin really treats it specially — an entry
+  in `executor_class_dict`
+  (`python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/core/generator.py`) or a dedicated
+  node. Otherwise the generic `image` / `video` key is the honest one; a model-specific key
+  without matching plugin support makes the page claim support that does not exist.
+- Prose describing ComfyUI support inline instead of using the component is a finding: the
+  facts drift from the plugin.
 
 ### 6. Commands / port
 - Launch uses `sglang serve` — flag any `python -m sglang.launch_server` /

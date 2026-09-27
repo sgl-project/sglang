@@ -329,9 +329,9 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
     idx = d["cache_indices"].long()
     s_err = (st_fi[idx].float() - st_ref[idx].float()).abs()
     assert s_err.max().item() < 1e-1, f"decode state max diff {s_err.max().item():.2e}"
-    assert (
-        s_err.mean().item() < 1e-2
-    ), f"decode state mean diff {s_err.mean().item():.2e}"
+    assert s_err.mean().item() < 1e-2, (
+        f"decode state mean diff {s_err.mean().item():.2e}"
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 31, 32, 64, 128])
@@ -714,12 +714,12 @@ def test_kda_target_verify_flashinfer_checkpoint_states(
     assert torch.isfinite(got).all(), "verify checkpoint states have non-finite values"
     s_err = (got - ref_states).abs()
     # bf16 recurrent state; same tolerance as the decode committed-state check.
-    assert (
-        s_err.max().item() < 1e-1
-    ), f"checkpoint state max diff {s_err.max().item():.2e}"
-    assert (
-        s_err.mean().item() < 1e-2
-    ), f"checkpoint state mean diff {s_err.mean().item():.2e}"
+    assert s_err.max().item() < 1e-1, (
+        f"checkpoint state max diff {s_err.max().item():.2e}"
+    )
+    assert s_err.mean().item() < 1e-2, (
+        f"checkpoint state mean diff {s_err.mean().item():.2e}"
+    )
 
 
 def test_kda_target_verify_flashinfer_rejects_tree_spec():

@@ -263,7 +263,18 @@ asyncio.run(main())
 - Request-local `PrefixContext` is always reused across all denoise steps in one request. The prefix K/V is not cloned per step.
 - The optional global prefix cache is a bounded exact-match LRU. It is disabled by default because changing robot frames rarely hit it and enabling it prevents unrelated misses from entering grouped prefix execution. Set `enable_global_prefix_cache=true` for repeated observations, retries, or multiple policy calls over the same camera/state sample; `runtime.prefix_cache` can then disable lookup per request.
 - Partial-prefix reuse is not supported because Pi0.5 combines image and tokenized task/state inputs under full attention. Changing any input can change every deeper-layer prefix K/V tensor. The exact key hashes resized and normalized pixels before SigLIP, plus effective token IDs, token masks, camera masks, model revision, dtype, and parallel layout. Tensor content hashing reuses SRT's CPU/CUDA implementation; hashing the pre-SigLIP input lets an exact hit skip both the vision encoder and prefix transformer.
-- CUDA graph capture targets single-request prefix encoding and one action-denoise step. Prefix capture uses one bounded input-shape bucket by default; grouped prefixes, prefix TP, CPU offload, and global prefix-cache misses stay eager. The denoise graph is replayed across the flow-matching loop and uses batch size, prefix length, action horizon, action dim, dtype, and parallel layout in its shape signature. With action SP enabled, the denoise bucket uses the local action shard length and rank-specific position offset.
+- CUDA graph capture targets single-request prefix encoding and one action-denoise step. The lossless default keeps exact prompt lengths and one resident prefix graph. Prefix and action graph residency are independently bounded by `prefix_cuda_graph_max_entries` (default `1`) and `action_cuda_graph_max_entries` (default `4`). Without prompt buckets, unseen signatures run eagerly after the cache reaches capacity, avoiding capture churn. The denoise signature includes whether prefix attention is full or masked, plus batch size, prefix length, action horizon, action dim, dtype, and parallel layout. Mask-aware action graphs rebuild position IDs from the current request mask inside the captured graph. With action SP enabled, the denoise bucket uses the local action shard length and rank-specific position offset.
+- `prompt_token_buckets` optionally right-pads prompt tokens to fixed sizes such as `[32, 64, 128, 200]`, allowing nearby prompt lengths to reuse both graphs. In this mode the bounded graph caches use LRU replacement and reset evicted CUDA graphs; prompts beyond the largest configured bucket stay exact-length and eager. This is opt-in because padding changes GPU reduction shapes: an H200 sweep over lengths around all four boundaries was structurally correct and bounded to four prefix/action graphs, but non-boundary prompts differed from the exact-length path by up to `0.09589` in normalized action space over five denoise steps. Validate closed-loop policy quality before enabling it; empty buckets preserve the numerically lossless path.
+
+An opt-in four-bucket serving config is:
+
+```json File
+{
+  "prompt_token_buckets": [32, 64, 128, 200],
+  "prefix_cuda_graph_max_entries": 4,
+  "action_cuda_graph_max_entries": 4
+}
+```
 - Cache-DiT is not used in the default Pi0.5 path. The current robot policy target is numerically lossless inference, while Cache-DiT-style reuse is an image/video DiT approximation that needs separate policy-quality validation before it can be recommended for action control.
 - Do not use CFG parallelism to split the 10 Euler steps. Use it only for independent branches such as multiple candidate actions or future conditional/unconditional branches.
 - Prefix TP uses native SGLang parallel linear layers for the PaliGemma language prefix model when model parallel TP is initialized and the VLA split broadcast group is not active. The action expert does not share that TP layout. The v1 split prefix/action path instead uses the SP group: prefix root computes/broadcasts `PrefixContext`, while action ranks run the SP action path.
@@ -299,7 +310,8 @@ Use this single-GPU config first for 16GB-class robot workstations. It keeps par
   "prefix_cache_max_entries": 0,
   "enable_prefix_cuda_graph": true,
   "prefix_cuda_graph_max_entries": 1,
-  "enable_action_cuda_graph": true
+  "enable_action_cuda_graph": true,
+  "action_cuda_graph_max_entries": 1
 }
 ```
 
@@ -473,7 +485,7 @@ The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 | OpenPI/SGLang precision | Official OpenPI JAX inference restores the public GCS checkpoint as bf16 with selected fp32 stability compute and returns float32 actions. The converted OpenPI PyTorch `pi05_aloha` checkpoint keeps `119,720,608` fp32 stability params; SGLang reports the same fp32 set and `3,233,713,264` bf16 runtime params after skipping unused LM heads. |
 | Native attention dtype | Checkpoint source tensors may be fp32, but SGLang finalizes PiGemma and SigLIP compute dtype before native attention backend selection; backend logs showed `Using fa attention backend` for the PiGemma path in the prior run. |
 | 16GB-free Python pressure | With an H100 artificially constrained to `16381 MiB` free before model load, single-GPU bf16 no-offload Python grouped path completed without OOM. Re-run latency after precision or loader changes before using pressure numbers for deployment sizing. |
-| Low-VRAM switches | Disabling prefix cache prevents cache growth across changing robot frames. Prefix graph residency is bounded by `prefix_cuda_graph_max_entries` (default `1`); set `enable_prefix_cuda_graph=false` or the limit to `0` to save about `48.5 MiB` for the validated ALOHA bucket. Action graph can stay enabled when the action expert remains resident; disable both graph paths for offload fallback modes. |
+| Low-VRAM switches | Disabling prefix cache prevents cache growth across changing robot frames. Prefix graph residency defaults to `1`, action graph residency defaults to `4`, and setting either limit to `0` disables that runner. One validated ALOHA prefix graph used about `48.5 MiB`; action graph residency is now bounded separately. Keep `prompt_token_buckets` empty for the lossless path. |
 | Offload fallback | CPU/offload modes are retained as numerically lossless compatibility fallbacks, but earlier fp32-runtime offload latency numbers are stale after the bf16 dtype correction and should be revalidated before deployment decisions. |
 | Run:ai direct loader | Single-GPU serve streamed `13.5 GiB` safetensors to `cuda:0` in about `1.5 s` and returned `[50, 32]` actions. Distributed direct streaming is now rank-local and should be revalidated on the target split topology; offload ranks with CPU targets still use the safe loader. |
 | OpenPI comparison status | Official OpenPI GCS `pi05_base` is a JAX checkpoint; converted PyTorch eager was validated without `torch.compile`. On 80GB H100, ALOHA OpenPI PyTorch eager was about `125-130 ms` single and about `164 ms / 4` in the direct-model batch path. Current SGLang Python grouped measured `52.4 ms` single and `91.9 ms / 4`; JAX OpenPI was `53.0 ms` single and `59.5 ms / 2` in a short check. |
