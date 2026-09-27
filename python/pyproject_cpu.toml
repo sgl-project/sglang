@@ -70,7 +70,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.7",
   "zstandard",
 ]
 
@@ -110,7 +110,7 @@ test = [
   "pandas",
   "peft>=0.18.0",
   "sentence_transformers",
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
 ]
 all = []
 dev = ["sglang[test]"]

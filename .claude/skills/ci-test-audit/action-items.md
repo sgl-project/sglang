@@ -193,7 +193,7 @@ Spot: a command any commenter can trigger; a command that reruns far more than t
 needs; an unrecognized command that is skipped silently; a reply that names the wrong
 backend or run. Examples: #35750, #31980, #34057, #37618, #38734, #38736, #36778.
 
-**E5. Fast-fail cascades link only jobs whose failures are correlated.**
+**E5. Fail-fast cascades link only jobs whose failures are correlated.**
 Spot: a scheduled or manually dispatched run whose later jobs are cancelled by an earlier
 unrelated failure; another platform's lane cancelled by a CUDA failure. Examples:
 #35392, #35238, #36146.
