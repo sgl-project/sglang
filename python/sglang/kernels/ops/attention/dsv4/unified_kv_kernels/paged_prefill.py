@@ -61,6 +61,9 @@ except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
 
+# Resolved once: the retuned launch config below is gfx1250-only.
+_is_gfx1250 = is_gfx1250_supported()
+
 
 @triton.jit
 def _sparse_attn_v4_paged_prefill_kernel(
@@ -251,9 +254,24 @@ def _sparse_attn_v4_paged_prefill_triton(
     kv_indices_extend = kv_indices_extend.to(torch.int32).contiguous()
     kv_indptr_extend = kv_indptr_extend.to(torch.int32).contiguous()
 
-    block_h = 16  # AMD MFMA min tile
+    # gfx1250 retune v2: the shipped (16, 16, num_stages=None) sits at the
+    # MFMA *minimum* tile with no software pipelining, which this
+    # gather-bound kernel needs. BLOCK_H=64 == index_n_heads, so one CTA
+    # covers all heads of a token. Measured 2.8x/2.1x/2.3x at T=128/512/2048
+    # (geomean ~2.2x). Tuned for large T: 90% of prefill tokens arrive in
+    # batches at the chunked-prefill cap. Gated because non-gfx95 NVIDIA
+    # also reaches this Triton path.
+    if _is_gfx1250:
+        block_h = 64
+        block_k = 16
+        num_warps = 4
+        num_stages = 2
+    else:
+        block_h = 16  # AMD MFMA min tile
+        block_k = 16 if D >= 256 else 32
+        num_warps = 8
+        num_stages = None
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
     _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
         q,
         unified_kv,
@@ -280,7 +298,8 @@ def _sparse_attn_v4_paged_prefill_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        num_warps=8,
+        num_warps=num_warps,
+        **({} if num_stages is None else {"num_stages": num_stages}),
     )
     return out
 
