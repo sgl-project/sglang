@@ -1,7 +1,11 @@
+import copy
 import json
 import logging
 import re
 from typing import List, Literal, Optional, Union
+
+from jsonschema import Draft202012Validator
+from referencing import Registry
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import (
@@ -15,17 +19,17 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
 
-_KIMI_K2_SPECIAL_TOKENS = [
+_KIMI_K2_SPECIAL_TOKENS = (
     "<|tool_calls_section_begin|>",
     "<|tool_calls_section_end|>",
     "<|tool_call_begin|>",
     "<|tool_call_end|>",
     "<|tool_call_argument_begin|>",
-]
+)
 
 _KIMI_NON_STRICT_ARGUMENTS_SCHEMA = {"type": "object"}
 
@@ -52,6 +56,8 @@ class KimiK2Detector(BaseFormatDetector):
     ```
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
+
+    Client-style IDs (``call_3``, ``toolu_...``, UUIDs) also infer the name.
 
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
@@ -91,35 +97,25 @@ class KimiK2Detector(BaseFormatDetector):
     def _parse_tool_call_id(
         self, function_id: str, tools: List[Tool], function_args: str = None
     ):
-        """Parse a tool call ID into (function_name, call_index).
-
-        Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
-        Bare counter:    "3" → call_index=3, infer name from arguments.
-
-        The bare counter is a conversation-level auto-increment, NOT an index
-        into the tools list. The function name is inferred by matching argument
-        keys against tool parameter schemas.
-        """
         m = self.tool_call_id_regex.match(function_id)
         if m:
             return m.group("name"), int(m.group("index"))
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            call_index = int(function_id)
-            name = self._infer_tool_name(tools, function_args)
-            if name:
-                return name, call_index
-            return None, call_index
-
-        logger.warning("Unexpected tool_call_id format: %s", function_id)
-        return None, 0
+        # Numeric IDs count conversation calls, not positions in the tool list.
+        call_index = (
+            int(function_id)
+            if self.tool_call_id_counter_regex.match(function_id)
+            else 0
+        )
+        name = self._infer_tool_name(tools, function_args)
+        if name is None:
+            logger.warning(
+                "Could not resolve a tool name for tool_call_id %r; dropping the call",
+                function_id,
+            )
+        return name, call_index
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
-        """Infer function name when the model omits it (bare counter ID).
-
-        Matches argument keys against tool parameter schemas, preferring the
-        tool whose declared properties best match the actual arguments.
-        """
         if not tools:
             return None
         if len(tools) == 1:
@@ -132,30 +128,47 @@ class KimiK2Detector(BaseFormatDetector):
             return None
 
         try:
-            arg_keys = set(json.loads(function_args).keys())
+            args = json.loads(function_args)
         except (json.JSONDecodeError, TypeError):
             logger.debug(
                 "Could not parse function_args for tool name inference "
                 "(may be partial JSON in streaming)"
             )
             return None
+        if not isinstance(args, dict):
+            return None
+        candidates = []
+        try:
+            for tool in tools:
+                schema = tool.function.parameters
+                if schema is None or schema is True:
+                    schema = {}
+                if not isinstance(schema, dict):
+                    continue
+                schema = copy.deepcopy(schema)
+                normalize_json_schema_types(schema)
+                # Inference requires declared keys unless the schema allows extras.
+                schema.setdefault("unevaluatedProperties", False)
+                # Resolve local references without allowing network retrieval.
+                if Draft202012Validator(schema, registry=Registry()).is_valid(args):
+                    candidates.append(tool.function.name)
+        except Exception:
+            # An unevaluable candidate cannot be ruled out as a second match.
+            logger.warning(
+                "Could not evaluate schema for tool %r; cannot infer a tool name",
+                tool.function.name,
+            )
+            return None
 
-        # Pick the tool whose properties best match the argument keys.
-        best_name = None
-        best_score = -1
-        for tool in tools:
-            params = tool.function.parameters or {}
-            props = set(get_schema_properties(params).keys())
-            if not props:
-                continue
-            overlap = len(arg_keys & props)
-            extra = len(arg_keys - props)
-            score = overlap - extra
-            if score > best_score:
-                best_score = score
-                best_name = tool.function.name
-
-        return best_name
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            logger.debug(
+                "Tool name inference is ambiguous: arguments with keys %s satisfy %s",
+                sorted(args),
+                candidates,
+            )
+        return None
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -222,7 +235,9 @@ class KimiK2Detector(BaseFormatDetector):
             and self.bot_token not in self._buffer
             and self.tool_call_start_token not in self._buffer
         ):
-            emit, hold = self._split_pending_start(self._buffer)
+            emit, hold = self._split_pending_marker(
+                self._buffer, _KIMI_K2_SPECIAL_TOKENS
+            )
             self._buffer = hold
             return StreamingParseResult(normal_text=_strip_special_tokens(emit))
 
@@ -272,10 +287,9 @@ class KimiK2Detector(BaseFormatDetector):
                 # Resolve function name (cached across chunks within a section).
                 name_just_resolved = False
                 if self._current_stream_function_name is None:
+                    # Multi-tool inference must wait for complete arguments.
                     args_for_inference = (
-                        buffer[args_start:end_idx]
-                        if end_idx != -1
-                        else buffer[args_start:]
+                        buffer[args_start:end_idx] if end_idx != -1 else None
                     )
                     resolved = self._resolve_function_name(
                         function_id, tools, args_for_inference
@@ -285,7 +299,8 @@ class KimiK2Detector(BaseFormatDetector):
                             # Wait for the end marker before deciding.
                             break
                         logger.warning(
-                            "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
+                            "Kimi-K2 could not resolve a tool name for "
+                            "tool_call_id %r; skipping section.",
                             function_id,
                         )
                         self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
@@ -317,7 +332,9 @@ class KimiK2Detector(BaseFormatDetector):
                 if end_idx != -1:
                     args_full = buffer[args_start:end_idx]
                 else:
-                    args_full = buffer[args_start:]
+                    args_full, _ = self._split_pending_marker(
+                        buffer[args_start:], (self.tool_call_end_token,)
+                    )
                 argument_diff = args_full[len(self._last_arguments) :]
                 if argument_diff or name_just_resolved:
                     calls.append(
@@ -374,7 +391,7 @@ class KimiK2Detector(BaseFormatDetector):
         """
         begin_idx = buffer.find(self.tool_call_start_token)
         if begin_idx == -1:
-            emit, hold = self._split_pending_start(buffer)
+            emit, hold = self._split_pending_marker(buffer, _KIMI_K2_SPECIAL_TOKENS)
             if emit:
                 normal_text_parts.append(_strip_special_tokens(emit))
             self._buffer = hold
@@ -385,18 +402,24 @@ class KimiK2Detector(BaseFormatDetector):
             self._buffer = buffer[begin_idx:]
         return 0
 
-    def _split_pending_start(self, text: str) -> tuple[str, str]:
-        """Hold back a trailing fragment that could be the start of
-        <|tool_calls_section_begin|> or <|tool_call_begin|>. Everything
-        before it is safe to emit as normal text.
-        """
-        candidates = (self.bot_token, self.tool_call_start_token)
-        max_tail = max(len(t) for t in candidates) - 1
-        for n in range(min(len(text), max_tail), 1, -1):
-            tail = text[-n:]
-            if any(t.startswith(tail) for t in candidates):
-                return text[:-n], tail
+    def _split_pending_marker(
+        self, text: str, markers: tuple[str, ...]
+    ) -> tuple[str, str]:
+        start = text.rfind("<")
+        if start != -1:
+            tail = text[start:]
+            if any(
+                len(tail) < len(token) and token.startswith(tail) for token in markers
+            ):
+                return text[:start], tail
         return text, ""
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # Incomplete calls are not text; unmatched marker prefixes may be literal.
+        text = "" if self.tool_call_start_token in self._buffer else self._buffer
+        self._buffer = ""
+        self._reset_inflight_call_state()
+        return StreamingParseResult(normal_text=_strip_special_tokens(text))
 
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
@@ -409,10 +432,7 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name")
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            return self._infer_tool_name(tools, function_args)
-
-        return None
+        return self._infer_tool_name(tools, function_args)
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""

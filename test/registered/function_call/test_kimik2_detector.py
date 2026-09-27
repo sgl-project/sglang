@@ -210,12 +210,14 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
     """Streaming incremental parsing tests for KimiK2Detector."""
 
     def test_streaming_trailing_literal_left_angle_is_not_dropped(self):
-        """A final literal '<' must remain in normal_text instead of being buffered away."""
+        """EOF releases a literal '<' held as a possible marker prefix."""
         detector = KimiK2FuncDetector()
 
         result = detector.parse_streaming_increment("normal text <", [])
 
-        self.assertEqual(result.normal_text, "normal text <")
+        self.assertEqual(
+            result.normal_text + detector.finish([]).normal_text, "normal text <"
+        )
         self.assertEqual(detector._buffer, "")
 
     def setUp(self):
@@ -786,9 +788,7 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
     def test_e2e_chunk_split_invariance(self):
         """The detector must produce identical results across a few realistic
-        chunking variants. Special tokens (e.g. ``<|tool_calls_section_begin|>``)
-        are atomic and never split, so cuts only fall on token boundaries or
-        inside JSON args.
+        chunking variants with whole marker spellings and cuts inside JSON args.
         """
         prefix = "<think>Thinking about it...</think>This is a content:"
         call1 = (
@@ -898,14 +898,12 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         tc_det = KimiK2FuncDetector()
 
         # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
-        # ``stream_tool_call_portion_regex`` but fails both the standard
-        # ``name:idx`` form and the bare-counter form, so
-        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        # ``stream_tool_call_portion_regex``, but its arguments match no tool.
         chunks = [
             "normal text before",
             "<|tool_calls_section_begin|>"
             "<|tool_call_begin|>weird@id"
-            '<|tool_call_argument_begin|>{"city"'
+            '<|tool_call_argument_begin|>{"unknown_key"'
             ': "London"}'
             "<|tool_call_end|>"
             "<|tool_calls_section_end|>",
