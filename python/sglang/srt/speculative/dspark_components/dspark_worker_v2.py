@@ -1,6 +1,6 @@
 import logging
 from contextlib import nullcontext
-from typing import Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -84,6 +84,9 @@ from sglang.srt.utils import (
     is_pin_memory_available,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -126,6 +129,9 @@ def _configure_target_hidden_projection(
 
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
+    def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
     def __init__(
         self,
@@ -640,11 +646,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         state_slot = final_pos = None
         if is_unified_kv_triton():
             repeats = ctx_lens.to(torch.int64)
+            num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
-                batch.req_pool_indices.to(device=device, dtype=torch.int64), repeats
+                batch.req_pool_indices.to(device=device, dtype=torch.int64),
+                repeats,
+                output_size=num_tokens,
             )
             final_pos = torch.repeat_interleave(
-                (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64),
+                repeats,
+                output_size=num_tokens,
             )
         cache_loc = batch.out_cache_loc
         token_indices = logits_output.hidden_states_token_indices
