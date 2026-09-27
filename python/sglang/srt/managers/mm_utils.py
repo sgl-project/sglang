@@ -19,6 +19,7 @@ from torch import nn
 
 from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
@@ -724,27 +725,33 @@ def general_mm_embed_routine(
             # best-effort, offloading to CPU ensures we have a reliable fallback
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
-            if mm_inputs_list:
+            if mm_inputs_list and input_embeds.is_cuda:
+                language_only = get_disagg().language_only
+                stream = torch.cuda.current_stream(input_embeds.device)
+                offloaded = False
                 for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_disagg().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
+                    for mm_item in mm_input_obj.mm_items:
+                        feature = mm_item.feature
+                        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                            feature.record_stream(stream)
+                            mm_item.feature = feature.to("cpu", non_blocking=True)
+                            offloaded = True
+                        if language_only:
+                            precomputed = mm_item.precomputed_embeddings
+                            if (
+                                isinstance(precomputed, torch.Tensor)
+                                and precomputed.is_cuda
+                                and not mm_item.keep_device_embedding
+                            ):
+                                precomputed.record_stream(stream)
+                                mm_item.precomputed_embeddings = precomputed.to(
+                                    "cpu", non_blocking=True
                                 )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                    and not mm_item.keep_device_embedding
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
-                                    )
+                                offloaded = True
+                if offloaded:
+                    if mm_schedule.host_offload_event is None:
+                        mm_schedule.host_offload_event = torch.cuda.Event()
+                    mm_schedule.host_offload_event.record(stream)
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
