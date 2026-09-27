@@ -43,7 +43,7 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     32768,
     "--max-prefill-tokens",
     32768,
-    "--mamba-scheduler-strategy",
+    "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--trust-remote-code",
     "--max-running-requests",
@@ -52,7 +52,7 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     120,
     "--mem-fraction-static",
     0.8,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
@@ -91,6 +91,7 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBas
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
     accuracy = 0.878
+    max_retries = 1
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64

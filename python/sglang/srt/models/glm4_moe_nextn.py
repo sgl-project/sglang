@@ -47,7 +47,7 @@ class Glm4MoeModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
+            logger.debug(
                 "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 / GLM-4.7 model."
             )
             quant_config = None
@@ -106,6 +106,9 @@ class Glm4MoeModelNextN(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 hidden_states, _ = self.shared_head.norm(hidden_states, residual)

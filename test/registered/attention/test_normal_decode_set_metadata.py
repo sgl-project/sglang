@@ -31,7 +31,6 @@ def reference_normal_decode_set_metadata(
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    strided_indices: torch.Tensor,
     max_seq_pages: int,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
@@ -45,6 +44,11 @@ def reference_normal_decode_set_metadata(
     """
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
     cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
+    # Page-start columns, derived internally (the wrapper's dead
+    # strided_indices parameter was removed alongside its v2p args).
+    strided_indices = torch.arange(
+        0, req_to_token.shape[1], page_size, device=req_to_token.device
+    )
     page_indices = req_to_token[
         req_pool_indices[:, None],
         strided_indices[:max_seq_pages][None, :],
@@ -213,7 +217,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             ref_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -229,7 +232,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -351,7 +353,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             test_data["seq_len_delta"],
@@ -408,7 +409,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             ref_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             0,
@@ -423,7 +423,6 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["page_table"],
             test_data["req_to_token"],
             test_data["req_pool_indices"],
-            test_data["strided_indices"],
             test_data["max_seq_pages"],
             test_data["seq_lens"],
             0,

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
+import functools
 import math
 from contextlib import nullcontext
 from typing import Optional
@@ -31,6 +32,33 @@ def _vit_norm_input(module, hidden_states):
 def _scaled_residual_add(residual, x, scale):
     fused = try_fused_scaled_residual_add_exact(residual, x, scale)
     return residual + x * scale if fused is None else fused
+
+
+@functools.lru_cache(maxsize=1)
+def _is_sm120() -> bool:
+    return bool(current_platform.is_sm120())
+
+
+def _unfused_bias_linear(
+    linear: nn.Linear, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """``linear`` as a plain matmul plus a separate bias add on SM12.x.
+
+    For the decoder's w2 shape ([~1800, 8192] x [8192, 2048], fp16/bf16) the
+    fused ``addmm`` epilogue makes cuBLAS on a GB10 pick a 16x16 wmma kernel
+    that runs at 14 TFLOPS; the same product without the fused bias runs at
+    76-91 TFLOPS (measured: 4.0 ms -> 0.8 ms per call, 3780 calls per decode).
+    """
+    if (
+        linear.bias is None
+        or not hidden_states.is_cuda
+        or hidden_states.dtype != linear.weight.dtype
+        or not _is_sm120()
+    ):
+        return linear(hidden_states)
+    out = torch.matmul(hidden_states, linear.weight.t())
+    out += linear.bias
+    return out
 
 
 class FeedForward(nn.Module):
@@ -99,7 +127,7 @@ class FeedForward(nn.Module):
         else:
             hidden_states = self.act_fn(hidden_states)
 
-        hidden_states = self.w2(hidden_states)
+        hidden_states = _unfused_bias_linear(self.w2, hidden_states)
         return hidden_states
 
     def _get_forward_impl(self):

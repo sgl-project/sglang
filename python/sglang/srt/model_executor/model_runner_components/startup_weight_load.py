@@ -520,8 +520,7 @@ class StartupWeightLoadManager:
         if changed_names:
             preview = ", ".join(changed_names[:8])
             raise RuntimeError(
-                "Startup weight commit changed graph-visible tensor storage: "
-                f"{preview}"
+                f"Startup weight commit changed graph-visible tensor storage: {preview}"
             )
         unchanged_names = manifest.unchanged_parameter_names(
             CAPTURE_SAFE_WEIGHT_SENTINEL

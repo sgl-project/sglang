@@ -100,18 +100,18 @@ def concat_and_cast_mha_k_triton(
     k_rope: torch.Tensor,
 ):
     # The source data type will be implicitly converted to the target data type.
-    assert (
-        len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3
-    ), f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    assert len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3, (
+        f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
 
     nope_dim = k_nope.shape[-1]
     rope_dim = k_rope.shape[-1]
@@ -638,9 +638,9 @@ def absorbed_bmm_concat_cast_q_fp8(
     assert q_fp8_pad.shape[0] >= num_tokens and q_fp8_pad.shape[1] >= num_heads
     assert q_fp8_pad.shape[2] == n_dim + rope_dim
     # tl.arange / tl.dot constraints
-    assert (
-        k_dim % 16 == 0 and 16 <= k_dim <= 256
-    ), "K must be a multiple of 16 in [16, 256]"
+    assert k_dim % 16 == 0 and 16 <= k_dim <= 256, (
+        "K must be a multiple of 16 in [16, 256]"
+    )
     assert (rope_dim & (rope_dim - 1)) == 0, "ROPE must be a power of two"
     assert n_dim % block_n == 0, "N must be a multiple of block_n"
     assert q_nope.stride(2) == 1 and q_rope.stride(2) == 1
@@ -680,22 +680,22 @@ def absorbed_bmm_concat_cast_q_fp8(
             # Largest power-of-2 divisor of K, capped at 128 (K % 16 == 0
             # makes this >= 16), unless the caller pinned block_k.
             blk_k = block_k or min(k_dim & -k_dim, 128)
-            assert (
-                k_dim % blk_k == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16
-            ), "loop needs BLOCK_K a power-of-2 divisor of K >= 16"
+            assert k_dim % blk_k == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
+                "loop needs BLOCK_K a power-of-2 divisor of K >= 16"
+            )
             k_mode = 1
         elif v == "two_dot":
             blk_k = 1 << (k_dim.bit_length() - 1)  # largest power of 2 < K
             k1 = k_dim - blk_k
-            assert (
-                k1 & (k1 - 1) == 0 and k1 >= 16
-            ), "two_dot needs K = pow2 + pow2 with both halves >= 16"
+            assert k1 & (k1 - 1) == 0 and k1 >= 16, (
+                "two_dot needs K = pow2 + pow2 with both halves >= 16"
+            )
             k_mode = 2
         elif v == "three_dot":
             blk_k = k_dim // 3
-            assert (
-                k_dim % 3 == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16
-            ), "three_dot needs K = 3 * pow2 with pow2 >= 16"
+            assert k_dim % 3 == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
+                "three_dot needs K = 3 * pow2 with pow2 >= 16"
+            )
             k_mode = 3
         elif v == "pad":
             blk_k = 1 << k_dim.bit_length()  # next power of 2 above K

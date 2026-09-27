@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=126, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=360, suite="nightly-xpu-1-gpu", nightly=True)
 
 _is_xpu = is_xpu()
@@ -47,6 +47,9 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     # (via XPUCudaGraphBackend). Opt in explicitly now that it is disabled
     # by default so the coverage is preserved.
     extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
+    # EAGLE3 + full CUDA-graph decode capture on XPU takes >600s from cold on
+    # Arc-class GPUs; the 600s default trips a spurious launch timeout here.
+    server_launch_timeout = 1800
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
+import dataclasses
 import importlib.util
 import json
 import types
@@ -13,7 +14,10 @@ from PIL import Image
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+    Cosmos3Config,
+    is_nano_checkpoint,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -38,10 +42,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-    _cosmos3_sampling_param_kwargs,
     _multipart_video_extras,
-    _resolve_sound_duration,
     _resolve_video_path,
+    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -109,6 +112,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         tp_size=1,
         sp_size=1,
         is_compiled=False,
+        hidden_size=0,
     ):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
@@ -117,6 +121,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             tp_size=tp_size,
             sp_size=sp_size,
             is_compiled=is_compiled,
+            hidden_size=hidden_size,
         )
 
     def test_blackwell_remains_enabled(self):
@@ -135,7 +140,47 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
 
-    def test_hopper_tensor_parallel_disabled(self):
+    def test_hopper_super_t2i_tp2_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True, hidden_size=5120, tp_size=2))
+
+    def test_hopper_super_t2i_unsupported_topologies_disabled(self):
+        for overrides in (
+            {"hidden_act": "relu2"},
+            {"hidden_act": "gelu"},
+            {"hidden_size": 4096},
+            {"tp_size": 4},
+            {"sp_size": 2},
+            {"is_compiled": True},
+            {"is_hopper": False},
+        ):
+            with self.subTest(overrides=overrides):
+                settings = dict(is_hopper=True, hidden_size=5120, tp_size=2)
+                settings.update(overrides)
+                self.assertFalse(self._can_enable(**settings))
+
+    def test_hopper_edge_single_gpu_enabled(self):
+        self.assertTrue(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_hopper_edge_parallel_and_compiled_disabled(self):
+        for override in ({"tp_size": 2}, {"sp_size": 2}, {"is_compiled": True}):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    self._can_enable(
+                        is_hopper=True,
+                        hidden_act="relu2",
+                        hidden_size=2048,
+                        **override,
+                    )
+                )
+
+    def test_hopper_larger_dense_mlp_disabled(self):
+        self.assertFalse(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
+        )
+
+    def test_hopper_other_tensor_parallel_shapes_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
 
     def test_hopper_sequence_parallel_disabled(self):
@@ -841,6 +886,44 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
 class TestCosmos3ModelResolution(unittest.TestCase):
     """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
 
+    def test_nano_architecture_detection_does_not_depend_on_model_path(self):
+        cases = (
+            (
+                {
+                    "hidden_size": 4096,
+                    "num_hidden_layers": 36,
+                    "num_attention_heads": 32,
+                },
+                True,
+            ),
+            (
+                {
+                    "hidden_size": 5120,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 64,
+                },
+                False,
+            ),
+            (
+                {
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 16,
+                },
+                False,
+            ),
+        )
+        for index, (transformer_config, expected) in enumerate(cases):
+            with self.subTest(transformer_config=transformer_config):
+                is_nano_checkpoint.cache_clear()
+                with mock.patch(
+                    "sglang.multimodal_gen.configs.pipeline_configs.cosmos3._transformer_config",
+                    return_value=transformer_config,
+                ):
+                    self.assertEqual(
+                        is_nano_checkpoint(f"/models/checkpoint-{index}"), expected
+                    )
+
     def test_hf_checkpoint_uses_registered_native_pipeline_config(self):
         for model_path in (
             "nvidia/Cosmos3-Nano",
@@ -887,6 +970,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
     """Verify Cosmos3 modality knobs stay model-specific video extras."""
 
     def test_cosmos3_template_fields_remain_extra_fields(self):
+        base_fields = {field.name for field in dataclasses.fields(SamplingParams)}
+        cosmos_fields = {
+            field.name for field in dataclasses.fields(Cosmos3SamplingParams)
+        }
         for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
             with self.subTest(request_cls=request_cls.__name__):
                 self.assertIn("max_sequence_length", request_cls.model_fields)
@@ -895,6 +982,15 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_resolution_template", request_cls.model_fields)
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
+        for field_name in (
+            "sound_duration",
+            "use_duration_template",
+            "use_resolution_template",
+            "use_system_prompt",
+            "use_guardrails",
+        ):
+            self.assertNotIn(field_name, base_fields)
+            self.assertIn(field_name, cosmos_fields)
 
     def test_cosmos3_modal_fields_are_model_specific_video_extras(self):
         for field_name in (
@@ -963,7 +1059,9 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _cosmos3_sampling_param_kwargs(req, num_frames=48, fps=24)
+        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs.update(num_frames=48, fps=24)
+        kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
         self.assertEqual(kwargs["condition_frame_indexes"], [0, 2])
         self.assertEqual(kwargs["condition_video_keep"], "last")
@@ -1019,10 +1117,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        self.assertEqual(
-            _resolve_sound_duration(req, num_frames=48, fps=24),
-            0.0,
-        )
+        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs.update(num_frames=48, fps=24)
+        kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
+        self.assertEqual(kwargs["sound_duration"], 0.0)
 
 
 class TestCosmos3Guardrails(unittest.TestCase):
@@ -1850,18 +1948,6 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
         self.assertEqual(sp.video_path, "in.mp4")
         self.assertEqual(sp.condition_frame_indexes, [0, 1])
         self.assertEqual(sp.condition_video_keep, "first")
-
-    def test_action_fields_default_none(self):
-        sp = Cosmos3SamplingParams(prompt="t")
-        for field in (
-            "action_mode",
-            "domain_id",
-            "domain_name",
-            "raw_action_dim",
-            "action_fps",
-            "action",
-        ):
-            self.assertIsNone(getattr(sp, field))
 
 
 class TestCosmos3CaptionMetadata(unittest.TestCase):

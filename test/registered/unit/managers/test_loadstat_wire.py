@@ -1,11 +1,13 @@
 """Wire contract and port/rank gating for the LoadStat load snapshot.
 
-Locks the msgpack array shape the sgl-router `cache_aware_zmq` policy will
-decode positionally (that consumer lands with the router PR; it is not yet
-in this tree, so this pins only the Python side):
+Locks the msgpack array shape the sgl-router engine load subscriber in #38108
+will decode positionally (that consumer is not yet in this tree, so this pins
+only the Python side):
 
     ["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,
-     max_total_num_tokens, attn_dp_rank]
+     max_total_num_tokens, attn_dp_rank,
+     num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
+     total_prefill_uncached_tokens, total_prefill_busy_us]
 
 carried as the payload of a three-frame message ``[b"load", BE-i64 seq,
 payload]``. A field reorder or rename is a silent cross-language break, so
@@ -21,15 +23,14 @@ from unittest.mock import MagicMock, patch
 
 import msgspec.msgpack
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.load_publisher import (
     LoadStat,
     SchedulerLoadPublisher,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestLoadStatWire(CustomTestCase):
@@ -46,7 +47,7 @@ class TestLoadStatWire(CustomTestCase):
                 attn_dp_rank=2,
             )
         )
-        self.assertEqual(raw.hex(), "96a84c6f6164537461740703cd0400cd200002")
+        self.assertEqual(raw.hex(), "9ba84c6f6164537461740703cd0400cd2000020000000000")
 
     def test_loadstat_msgpack_array_shape(self):
         raw = msgspec.msgpack.Encoder().encode(
@@ -59,10 +60,10 @@ class TestLoadStatWire(CustomTestCase):
             )
         )
         # tag=True + array_like → [tag, *fields] in declaration order; the
-        # router reads the tag + four counts and ignores the trailing field.
+        # router reads the tag and four base fields and ignores the suffix.
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(raw),
-            ["LoadStat", 7, 3, 1024, 8192, 2],
+            ["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0],
         )
 
     def test_loadstat_tag_is_class_name(self):
@@ -78,8 +79,9 @@ class TestLoadStatWire(CustomTestCase):
         )
         decoded = msgspec.msgpack.Decoder().decode(raw)
         # LoadStat sets no omit_defaults, so the trailing field is always
-        # emitted (null when unset); a decoder must tolerate it.
-        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None])
+        # emitted (null when unset); a decoder must tolerate it. The new suffix
+        # fields are always emitted as well.
+        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None, 0, 0, 0, 0, 0])
 
 
 ZMQ_ENDPOINT = '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
@@ -94,20 +96,19 @@ class TestLoadPublisherGating(CustomTestCase):
     connect-style one.
     """
 
-    def _build(
-        self, *, config=ZMQ_ENDPOINT, dp_size=1, explicit="auto", **ps_overrides
-    ):
-        """Construct a publisher with the socket bind stubbed out, returning
-        (publisher, captured _open_pub_socket mock). Opts in via explicit="auto"
-        by default (the feature is off without it). dp_size lives on the ps,
-        which the publisher reads (no separate param to disagree with it)."""
-        with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher."
-            "_open_pub_socket"
-        ) as open_sock:
+    def _build(self, *, config=ZMQ_ENDPOINT, explicit="auto", ranks=None, **topology):
+        """Return a publisher and its mocked socket factory under a published topology.
+
+        ``explicit="auto"`` enables load publication by default.
+        """
+        with (
+            published_topology(ranks=ranks, **topology),
+            patch(
+                "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket"
+            ) as open_sock,
+        ):
             pub = SchedulerLoadPublisher(
                 kv_events_config=config,
-                ps=ParallelState.trivial(dp_size=dp_size, **ps_overrides),
                 load_publish_endpoint=explicit,
             )
         return pub, open_sock
@@ -128,14 +129,17 @@ class TestLoadPublisherGating(CustomTestCase):
     def test_disabled_off_pp_rank_zero(self):
         # Every PP stage shares attn_tp_rank/attn_cp_rank 0, so without the
         # pp_rank gate they all bind the same load port.
-        pub, open_sock = self._build(pp_rank=1, pp_size=2)
+        pub, open_sock = self._build(pp_size=2, ranks={"world_rank": 1})
         self.assertFalse(pub.enable)
         open_sock.assert_not_called()
 
     def test_disabled_off_attn_tp_and_cp_rank_zero(self):
-        for override in ({"attn_tp_rank": 1}, {"attn_cp_rank": 1}):
-            with self.subTest(**override):
-                pub, open_sock = self._build(**override)
+        for layout in (
+            {"tp_size": 2},
+            {"tp_size": 2, "attn_cp_size": 2},
+        ):
+            with self.subTest(**layout):
+                pub, open_sock = self._build(ranks={"world_rank": 1}, **layout)
                 self.assertFalse(pub.enable)
                 open_sock.assert_not_called()
 
@@ -143,11 +147,16 @@ class TestLoadPublisherGating(CustomTestCase):
         # Pure DP: attn_dp_size == 1 and every worker has attn_dp_rank == 0, so
         # the publisher must key off dp_rank or all replicas collide on one
         # port. kv 5557 + dp_size 4 => base 5561; rank 2 binds 5563.
-        _, open_sock = self._build(attn_dp_size=1, attn_dp_rank=0, dp_rank=2, dp_size=4)
+        _, open_sock = self._build(dp_size=4, ranks={"world_rank": 0, "dp_rank": 2})
         open_sock.assert_called_once_with("tcp://*:5563")
 
     def test_dp_attention_keys_the_load_port_by_attn_dp_rank(self):
-        _, open_sock = self._build(attn_dp_size=4, attn_dp_rank=3, dp_rank=0, dp_size=4)
+        _, open_sock = self._build(
+            tp_size=4,
+            dp_size=4,
+            enable_dp_attention=True,
+            ranks={"world_rank": 3, "dp_rank": 0},
+        )
         open_sock.assert_called_once_with("tcp://*:5564")
 
     def test_load_port_is_packed_after_the_kv_range(self):
@@ -257,10 +266,8 @@ class TestLoadPublisherGating(CustomTestCase):
 
         _, open_sock = self._build(
             explicit="tcp://*:7000",
-            attn_dp_size=1,
-            attn_dp_rank=0,
-            dp_rank=2,
             dp_size=4,
+            ranks={"world_rank": 0, "dp_rank": 2},
         )
         open_sock.assert_called_once_with("tcp://*:7002")
 
@@ -284,15 +291,14 @@ class TestLoadPublisherGating(CustomTestCase):
         import zmq
 
         with patch(
-            "sglang.srt.managers.scheduler_components.load_publisher."
-            "_open_pub_socket",
+            "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket",
             side_effect=zmq.ZMQError,
         ) as open_sock:
-            pub = SchedulerLoadPublisher(
-                kv_events_config=ZMQ_ENDPOINT,
-                ps=ParallelState.trivial(),
-                load_publish_endpoint="auto",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config=ZMQ_ENDPOINT,
+                    load_publish_endpoint="auto",
+                )
         open_sock.assert_called_once()  # the bind was attempted and failed
         self.assertFalse(pub.enable)
         pub.publish_load_stat(MagicMock(), force=True)  # still a no-op
@@ -338,6 +344,11 @@ class TestLoadPublisherGating(CustomTestCase):
                 num_waiting_reqs=2,
                 num_used_tokens=3,
                 max_total_num_tokens=4,
+                num_waiting_uncached_tokens=5,
+                num_total_tokens=6,
+                max_running_requests=7,
+                total_prefill_uncached_tokens=8,
+                total_prefill_busy_us=9,
             )
         )
 
@@ -358,6 +369,11 @@ class TestLoadPublisherGating(CustomTestCase):
             num_waiting_reqs=2,
             num_used_tokens=3,
             max_total_num_tokens=4,
+            num_waiting_uncached_tokens=5,
+            num_total_tokens=6,
+            max_running_requests=7,
+            total_prefill_uncached_tokens=8,
+            total_prefill_busy_us=9,
         )
         pub.publish_load_stat(provider, force=True, snapshot=snap)
         provider.assert_not_called()
@@ -374,7 +390,7 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertEqual(seq, (0).to_bytes(8, "big"))
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 1, 2, 3, 4, 0],
+            ["LoadStat", 1, 2, 3, 4, 0, 5, 6, 7, 8, 9],
         )
 
     def test_unchanged_stat_is_deduped_to_the_heartbeat(self):
@@ -457,11 +473,11 @@ class TestLoadStatIntegration(CustomTestCase):
             with _socket.socket() as probe:
                 probe.bind(("", 0))
                 port = probe.getsockname()[1]
-            pub = SchedulerLoadPublisher(
-                kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
-                ps=ParallelState.trivial(),
-                load_publish_endpoint=f"tcp://*:{port}",
-            )
+            with published_topology():
+                pub = SchedulerLoadPublisher(
+                    kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+                    load_publish_endpoint=f"tcp://*:{port}",
+                )
             if pub.enable:
                 break
         self.assertTrue(pub.enable, "load socket never bound a free port")
@@ -477,6 +493,11 @@ class TestLoadStatIntegration(CustomTestCase):
             num_waiting_reqs=3,
             num_used_tokens=1024,
             max_total_num_tokens=8192,
+            num_waiting_uncached_tokens=512,
+            num_total_tokens=4096,
+            max_running_requests=64,
+            total_prefill_uncached_tokens=20_000,
+            total_prefill_busy_us=2_000_000,
         )
         # PUB/SUB drops messages sent before the subscription propagates, so
         # re-publish until one lands (heartbeat reset each pass).
@@ -494,7 +515,7 @@ class TestLoadStatIntegration(CustomTestCase):
         self.assertEqual(len(seq), 8)
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 7, 3, 1024, 8192, 0],
+            ["LoadStat", 7, 3, 1024, 8192, 0, 512, 4096, 64, 20_000, 2_000_000],
         )
 
 

@@ -23,9 +23,13 @@ from sglang.srt.utils.rank_consensus_checker import (
     shutdown,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, find_available_port
+from sglang.test.test_utils import (
+    CustomTestCase,
+    find_available_port,
+    publish_build_topology,
+)
 
-register_cpu_ci(est_time=193, suite="base-b-test-cpu")
+register_cpu_ci(est_time=193, suite="stage-a-test-cpu-intel")
 
 
 def run_distributed_test(
@@ -80,11 +84,8 @@ def run_distributed_test(
                 backend="gloo",
             )
 
-            initialize_model_parallel(
-                tensor_model_parallel_size=tp_size,
-                pipeline_model_parallel_size=pp_size,
-                backend="gloo",
-            )
+            publish_build_topology(tp_size=tp_size, pp_size=pp_size, world_rank=rank)
+            initialize_model_parallel(backend="gloo")
 
             fn()
         except Exception as e:
@@ -226,9 +227,9 @@ class TestAssertSame(RankConsensusCheckerTestCase):
 
         err = err_box.get()
         shutdown()
-        assert isinstance(
-            err, RuntimeError
-        ), f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        assert isinstance(err, RuntimeError), (
+            f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        )
 
     def test_assert_same_rejects_non_scheduler_thread(self):
         """Check that assert_same() must be called in the scheduler thread.  Otherwise report error."""

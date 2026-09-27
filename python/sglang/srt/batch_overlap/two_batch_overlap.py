@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
-import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -19,6 +18,7 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
     ScatterMode,
+    reduce_output,
 )
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -516,7 +516,7 @@ class TboForwardBatchPreparer:
             batch,
             tbo_children_num_token_non_padded=tbo_children_num_token_non_padded,
             # Eager split: the children can carry a CPU count too, so the
-            # attention 0-token skip (which reads num_token_non_padded_cpu)
+            # attention 0-token skip (which reads global_num_token_non_padded_cpu)
             # survives the split. The cuda-graph plugin path below leaves this
             # None because its device buffer is refreshed per replay.
             tbo_children_num_token_non_padded_cpu=cls._split_num_token_non_padded(
@@ -630,9 +630,9 @@ class TboForwardBatchPreparer:
                 sum_field="extend_num_tokens",
             )
 
-        assert (
-            child_a.extend_num_tokens == half_seq_lens_sum
-        ), f"{child_a.extend_num_tokens=}, {half_seq_lens_sum=}"
+        assert child_a.extend_num_tokens == half_seq_lens_sum, (
+            f"{child_a.extend_num_tokens=}, {half_seq_lens_sum=}"
+        )
 
         child_a.seq_lens_cpu = copy.deepcopy(child_a.seq_lens_cpu)
         child_a.seq_lens_cpu[-1] = (
@@ -674,9 +674,9 @@ class TboForwardBatchPreparer:
         out_num_token_non_padded: torch.Tensor,
         out_num_token_non_padded_cpu: Optional[int] = None,
     ):
-        assert (
-            end_token_index >= start_token_index
-        ), f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        assert end_token_index >= start_token_index, (
+            f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -688,25 +688,25 @@ class TboForwardBatchPreparer:
             "out_cache_loc",
         ]:
             old_value = getattr(batch, key)
-            assert (
-                old_value.shape[0] == num_tokens
-            ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+            assert old_value.shape[0] == num_tokens, (
+                f"{key=} {old_value=} {num_tokens=} {batch=}"
+            )
             output_dict[key] = old_value[start_token_index:end_token_index]
+
+        if batch.out_cache_loc_virtual is not None:
+            output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
+                start_token_index:end_token_index
+            ]
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
-        if _is_hip:
-            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-
-            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
-            n_tokens = end_token_index - start_token_index
-            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
             "req_pool_indices",
+            "req_pool_indices_cpu",
             "seq_lens",
             "seq_lens_cpu",
             "extend_seq_lens",
@@ -736,9 +736,9 @@ class TboForwardBatchPreparer:
                     start_seq_index : min(end_seq_index, len(old_value))
                 ]
                 continue
-            assert (
-                len(old_value) == num_seqs
-            ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+            assert len(old_value) == num_seqs, (
+                f"{key=} {old_value=} {num_seqs=} {batch=}"
+            )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
         spec_info = getattr(batch, "spec_info")
@@ -753,14 +753,17 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "dp_spec_prefill_coordination_applied",
             "return_logprob",
             "can_run_decode_cuda_graph",
             "can_run_dp_prefill_cuda_graph",
+            "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
@@ -806,7 +809,12 @@ class TboForwardBatchPreparer:
                 extend_num_tokens=extend_num_tokens,
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
-                num_token_non_padded_cpu=out_num_token_non_padded_cpu,
+                global_num_token_non_padded=None,
+                global_num_token_non_padded_cpu=out_num_token_non_padded_cpu,
+                # The child runs the same forward, so it keeps the parent's
+                # sharding verdict; its counts above are already per-child.
+                attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
+                encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -816,6 +824,9 @@ class TboForwardBatchPreparer:
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+                # Children publish no per-rank list of their own; the parent
+                # published the gather sizes before it was split.
+                global_num_tokens_padded_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
@@ -863,8 +874,8 @@ class TboForwardBatchPreparer:
     @staticmethod
     def _get_num_token_non_padded_cpu(batch: ForwardBatch) -> int:
         num_token_non_padded = (
-            batch.num_token_non_padded_cpu
-            if batch.num_token_non_padded_cpu is not None
+            batch.global_num_token_non_padded_cpu
+            if batch.global_num_token_non_padded_cpu is not None
             else len(batch.input_ids)
         )
         return num_token_non_padded
@@ -956,6 +967,7 @@ def _model_forward_tbo(
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
+    inputs["hidden_states"] = reduce_output(inputs["hidden_states"])
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
@@ -998,11 +1010,22 @@ def _model_forward_tbo_split_inputs(
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
-
-    hidden_states, residual = CommunicateSummableTensorPairFn.execute(
+    # The splitter cuts the attention-TP-full layout; each microbatch then moves
+    # to the first layer's input layout.
+    to_splitter = CommunicateSummableTensorPairFn.get_fn(
         hidden_states_input_mode=input_data_scatter_mode,
         residual_input_mode=input_data_scatter_mode,
         output_mode=tbo_splitter_scatter_mode,
+        context=context,
+    )
+    to_layer_input = CommunicateSummableTensorPairFn.get_fn(
+        hidden_states_input_mode=tbo_splitter_scatter_mode,
+        residual_input_mode=tbo_splitter_scatter_mode,
+        output_mode=layer_input_scatter_mode,
+        context=context,
+    )
+
+    hidden_states, residual = to_splitter(
         hidden_states=hidden_states,
         residual=residual,
         forward_batch=forward_batch,
@@ -1018,10 +1041,7 @@ def _model_forward_tbo_split_inputs(
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
-        hidden_states, residual = CommunicateSummableTensorPairFn.execute(
-            hidden_states_input_mode=tbo_splitter_scatter_mode,
-            residual_input_mode=tbo_splitter_scatter_mode,
-            output_mode=layer_input_scatter_mode,
+        hidden_states, residual = to_layer_input(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,

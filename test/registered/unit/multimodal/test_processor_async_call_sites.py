@@ -18,7 +18,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 _MULTIMODAL_ROOT = (
     pathlib.Path(__file__).resolve().parents[4]
@@ -27,6 +27,11 @@ _MULTIMODAL_ROOT = (
     / "srt"
     / "multimodal"
 )
+if not _MULTIMODAL_ROOT.is_dir():
+    raise RuntimeError(
+        f"multimodal processor tree not found at {_MULTIMODAL_ROOT}; "
+        "these tests must run from a full source checkout"
+    )
 # The async helper and the sync body live side by side here by design.
 _EXEMPT = {"base_processor.py"}
 
@@ -149,6 +154,9 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # explicitly so that adding a processor forces a decision instead of silently
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
+    # Runs its own image preprocessing to keep the raw token ids the Engram
+    # hasher needs; the shared chain would re-tokenize them.
+    "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
     "lightonocr.py",
