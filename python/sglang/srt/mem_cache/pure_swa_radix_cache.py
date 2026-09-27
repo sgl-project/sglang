@@ -5,15 +5,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import torch
-
-from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
-    EvictResult,
-    InsertParams,
-)
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -62,53 +57,22 @@ class PureSWARadixCache(RadixCache):
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ):
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
         """Insert only the prefill portion [0, evict_floor); free_kv_row skips
         the span _evict_swa already freed during decode."""
-        if self.disable:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-            return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
-        ]
-
-        radix_key = RadixKey(
-            token_ids,
-            req.extra_key,
-            is_bigram=self.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        keys_len = len(radix_key)
-
-        old_prefix_len = req.kv.cache_protected_len
-        swa_evict_floor = req.kv.swa_evict_floor
-        if self.page_size > 1 and swa_evict_floor > 0:
-            swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size
-        if swa_evict_floor > 0:
-            insert_end = min(swa_evict_floor, keys_len)
-        else:
-            insert_end = keys_len
-
-        release_from = old_prefix_len
-        if is_insert and insert_end > 0:
-            insert_values = kv_indices[:insert_end].to(dtype=torch.int64, copy=True)
-            result = self.insert(
-                InsertParams(key=radix_key[:insert_end], value=insert_values)
+        if not self.disable:
+            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+            swa_evict_floor = req.kv.swa_evict_floor
+            key_limit = (
+                ceil_align(swa_evict_floor, self.page_size)
+                if swa_evict_floor > 0
+                else None
             )
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[old_prefix_len : result.prefix_len],
-                start_pos=old_prefix_len,
-            )
-            release_from = insert_end
-
-        self.free_kv_row(req.kv, [(release_from, owned_kv_len)])
-
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+            radix_key, _, _ = self._adopt(req, token_ids, key_limit=key_limit)
+            req.kv.cache_protected_len = len(radix_key)
+        # The protected prefix is not this req's to free.
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        self.unpin(req)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction

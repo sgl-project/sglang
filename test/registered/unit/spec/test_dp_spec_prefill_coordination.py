@@ -224,9 +224,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                             "get_dp_padding_mode",
                             return_value=DpPaddingMode.MAX_LEN,
                         ),
-                        patch(
-                            f"{module}.dp_gather_slot", return_value=0 if idle else 1
-                        ),
+                        patch(f"{module}.dp_slot_in", return_value=0 if idle else 1),
                         patch(f"{module}.set_dp_buffer_len_from_batch"),
                         patch(f"{module}.set_is_extend_in_batch"),
                         patch(

@@ -46,7 +46,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+    set_global_tcp_store,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -54,6 +58,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     set_global_dwdp_manager,
@@ -1092,9 +1097,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output, input, group=self.device_group
-            )
+            reduce_scatter_single(output, input, group=self.device_group)
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
@@ -1303,9 +1306,7 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
-            )
+            all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
@@ -1396,9 +1397,7 @@ class GroupCoordinator:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
+                all_gather_single(output_tensor, input_, group=self.device_group)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 
@@ -3067,6 +3066,16 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
+
     _TP_STATE_PATCHED = True
     global _TP
     old_tp_group = _TP
@@ -3093,10 +3102,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 

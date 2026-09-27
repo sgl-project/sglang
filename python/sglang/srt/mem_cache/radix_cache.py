@@ -433,127 +433,81 @@ class RadixCache(BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ):
-        """Cache request when it finishes."""
-        if self.disable:
-            # The protected prefix is not this req's to free.
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_len
-            ]
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices, start_pos=req.kv.cache_protected_len
-            )
-            return
-
-        if not is_insert:
-            # Frees committed slots that no token id names, which the insert
-            # path below cannot reach; the protected prefix stays with the cache.
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_len
-            ]
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices, start_pos=req.kv.cache_protected_len
-            )
-            if req.last_node is not None:
-                self.dec_lock_ref(req.last_node)
-            return
-
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+    def _adopt(
+        self,
+        req: Req,
+        token_ids,
+        *,
+        chunked: bool = False,
+        key_limit: Optional[int] = None,
+        split_prompt: bool = False,
+    ) -> Tuple[RadixKey, torch.Tensor, int]:
+        """Insert the page-aligned key of ``token_ids`` (cut at ``key_limit``)
+        and free the duplicates it exposed; returns (key, row slice, matched)."""
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
+            req.kv.req_pool_idx, : len(token_ids)
         ]
-
         radix_key = RadixKey(
             token_ids,
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
+        if key_limit is not None:
+            radix_key = radix_key[:key_limit]
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        priority = getattr(req, "priority", 0) or 0
+        priority = req.priority or 0
         result = self.insert(
-            InsertParams(key=radix_key, value=values, priority=priority)
-        )
-        # A request that was never cached while unfinished can add its
-        # whole prompt and generated output as one leaf. Split that leaf at
-        # the prompt boundary so LRU eviction can discard output KV without
-        # also losing the reusable prompt KV. Reinserting a prefix only
-        # changes radix topology; it reuses the indices inserted above.
-        prompt_key = RadixKey(
-            token_ids[: len(req.origin_input_ids)],
-            req.extra_key,
-            is_bigram=self.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        if 0 < len(prompt_key) < key_len:
-            self.insert(
-                InsertParams(
-                    key=prompt_key,
-                    value=values[: len(prompt_key)],
-                    priority=priority + 1,
-                    # Topology-only re-insert: this request created these
-                    # nodes moments ago, so counting it as a hit is the
-                    # same self-referencing inflation `chunked` exists to
-                    # suppress. hit_count drives eviction order, so an
-                    # extra bump would silently promote every prompt node.
-                    chunked=True,
-                )
+            InsertParams(
+                key=radix_key, value=values, chunked=chunked, priority=priority
             )
-        freed_end = result.prefix_len
-
-        # duplicates / uninserted range, then the unaligned tail
-        self.token_to_kv_pool_allocator.free_segments(
-            [
-                (
-                    kv_indices[req.kv.cache_protected_len : freed_end],
-                    req.kv.cache_protected_len,
-                ),
-                (kv_indices[key_len:], key_len),
-            ]
         )
+        if split_prompt:
+            # Split the leaf at the prompt boundary so eviction can drop the
+            # output KV without the prompt; a prefix re-insert only changes topology.
+            prompt_key = RadixKey(
+                token_ids[: len(req.origin_input_ids)],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if 0 < len(prompt_key) < key_len:
+                self.insert(
+                    InsertParams(
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        priority=priority + 1,
+                        # The request created these nodes moments ago; another
+                        # hit_count bump would promote every prompt node.
+                        chunked=True,
+                    )
+                )
 
-        # Remove req slot release the cache lock
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices[req.kv.cache_protected_len : result.prefix_len],
+            start_pos=req.kv.cache_protected_len,
+        )
+        return radix_key, kv_indices, result.prefix_len
+
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
+        """Cache request when it finishes."""
+        if not self.disable:
+            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+            radix_key, _, _ = self._adopt(req, token_ids, split_prompt=True)
+            req.kv.cache_protected_len = len(radix_key)
+        # The protected prefix is not this req's to free.
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        self.unpin(req)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
-        token_ids = req.get_fill_ids()
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
-        ]
-
-        radix_key = RadixKey(
-            token_ids,
-            req.extra_key,
-            is_bigram=self.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
-        values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-
-        # Radix Cache takes one ref in memory pool
-        result = self.insert(
-            InsertParams(
-                key=radix_key,
-                value=values,
-                chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
-            )
-        )
-        new_prefix_len = result.prefix_len
-
-        self.token_to_kv_pool_allocator.free_segment(
-            kv_indices[req.kv.cache_protected_len : new_prefix_len],
-            start_pos=req.kv.cache_protected_len,
-        )
+        radix_key, kv_indices, _ = self._adopt(req, req.get_fill_ids(), chunked=chunked)
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
