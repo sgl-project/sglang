@@ -373,6 +373,19 @@ class HiSparseCoordinator:
             layer_num,
         )
 
+    def create_speculative_host_backend(self, resolve_owner):
+        """Opt-in eager adapter, inactive until scheduler lifecycle hooks land.
+
+        resolve_owner(slot) returns (request_object, generation). The scheduler
+        must serialize calls, bind the committed host length per transaction,
+        cancel/drain before request_finished, and finish after arena retirement.
+        """
+        from sglang.srt.mem_cache.hisparse_spec_host import HiSparseSpecHostBackend
+
+        if self.is_dsv4_hisparse or self.is_m3_hisparse or self.compress_ratio != 1:
+            raise ValueError("speculative host adapter requires uncompressed MLA")
+        return HiSparseSpecHostBackend(self, device_module, resolve_owner)
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
