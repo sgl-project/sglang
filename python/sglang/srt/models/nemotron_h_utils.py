@@ -5,7 +5,6 @@ from typing import Optional
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.communicator import (
     NORM_QUANT_READ,
-    InputRead,
     LayerCommunicator,
     LayerScatterModes,
     LayerStage,
@@ -13,6 +12,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     StageDecl,
     StageInput,
+    StageKind,
     StageOutput,
     SumGroup,
     TokenAxis,
@@ -29,12 +29,13 @@ def is_attn_layer(layer_type: str) -> bool:
     return layer_type in ATTN_LAYERS
 
 
-def _stage_kind(pattern: str, layer_idx: int) -> Optional[InputRead]:
-    """How the stage at ``layer_idx`` reads its input: a Mamba or attention
-    mixer like an attention, an MLP or MoE like an FFN; None past either end."""
+def _stage_kind(pattern: str, layer_idx: int) -> Optional[StageKind]:
+    """Which stage of a decoder layer the stage at ``layer_idx`` stands for: a
+    Mamba or attention mixer the attention, an MLP or MoE the FFN; None past
+    either end."""
     if not 0 <= layer_idx < len(pattern):
         return None
-    return InputRead.ATTENTION if is_attn_layer(pattern[layer_idx]) else InputRead.FFN
+    return StageKind.ATTENTION if is_attn_layer(pattern[layer_idx]) else StageKind.FFN
 
 
 def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
@@ -56,8 +57,8 @@ def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
             StageOutput(
                 attention,
                 group=SumGroup.ATTN_TP if owes else None,
-                always_leaves=owes and following is InputRead.FFN,
-                leaves_for_next_layer=owes and following is InputRead.ATTENTION,
+                always_leaves=owes and following is StageKind.FFN,
+                leaves_for_next_layer=owes and following is StageKind.ATTENTION,
             ),
         )
     sparse = pattern[layer_idx] == MOE
@@ -75,7 +76,7 @@ def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
         StageOutput(
             full,
             group=SumGroup.MOE_OUTPUT if sparse else SumGroup.TP,
-            leaves_for_next_layer=following is InputRead.ATTENTION,
+            leaves_for_next_layer=following is StageKind.ATTENTION,
             leaves_for_reduce_scatter=True,
             leaves_for_reduce_scatterv=True,
         ),
@@ -89,7 +90,7 @@ def layer_stage(pattern: str, layer_idx: int) -> LayerStage:
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=token_axis_sizes()
     )
     return LayerStage(
-        reads=_stage_kind(pattern, layer_idx),
+        kind=_stage_kind(pattern, layer_idx),
         edges=stage_edges(
             previous=(
                 _stage_decl(pattern, layer_idx - 1).output if layer_idx > 0 else None
@@ -126,7 +127,7 @@ def make_layer_communicator(
     """The communicator of a layer that is one stage: only its own norm, and
     boundaries built from the stages next to it in the pattern."""
     stage = layer_stage(pattern, layer_idx)
-    for_attn = stage.reads is InputRead.ATTENTION
+    for_attn = stage.kind is StageKind.ATTENTION
     return LayerCommunicator(
         layer_scatter_modes=_build_layer_scatter_modes(
             pattern[layer_idx] == MOE, is_last_layer=layer_idx == len(pattern) - 1

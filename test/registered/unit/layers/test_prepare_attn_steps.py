@@ -11,7 +11,6 @@ import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import boundary as comm_boundary
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -62,19 +61,29 @@ def communicator(norm):
     c._steps = comm.BoundarySteps(
         attention=comm.StageEntry(
             prepare=partial(
-                comm_boundary._attention_input_step,
-                layer_input=None,
-                fusions=c._attn_input_fusions,
-                enters_stack=False,
-                read=comm.NORM_QUANT_READ,
-                update=comm.ADD,
+                comm_ops._consumer_step,
+                step=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                carried_fusions=c._attn_input_fusions,
             ),
             input_rows=comm.Layout(frozenset()),
             input_move=lambda hidden_states, **_: hidden_states,
             handoff=comm_ops._hand_qkv_hook_its_input,
         ),
         ffn=comm.StageEntry(
-            prepare=comm_ops._mlp_input_norm, input_rows=comm.Layout(frozenset())
+            prepare=partial(
+                comm_ops._read_input,
+                layer_input=None,
+                enters_stack=False,
+                read=comm.NORM_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
         ),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
@@ -249,12 +258,15 @@ class TestPrepareAttnSteps(CustomTestCase):
                 attention=msgspec.structs.replace(
                     c._steps.attention,
                     prepare=partial(
-                        comm_boundary._attention_input_step,
-                        layer_input=None,
-                        fusions=(takes_anything,),
-                        enters_stack=False,
-                        read=comm.NORM_QUANT_READ,
-                        update=comm.ADD,
+                        comm_ops._consumer_step,
+                        step=partial(
+                            comm_ops._read_input,
+                            layer_input=None,
+                            enters_stack=False,
+                            read=comm.NORM_QUANT_READ,
+                            update=comm.ADD,
+                        ),
+                        carried_fusions=(takes_anything,),
                     ),
                 ),
             )

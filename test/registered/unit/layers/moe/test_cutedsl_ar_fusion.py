@@ -16,7 +16,7 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.boundary import _attention_input_step
+from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -54,12 +54,15 @@ def _communicator():
     comm._steps = SimpleNamespace(
         attention=SimpleNamespace(
             prepare=partial(
-                _attention_input_step,
-                layer_input=None,
-                fusions=comm._attn_input_fusions,
-                enters_stack=False,
-                read=NORM_QUANT_READ,
-                update=ADD,
+                _consumer_step,
+                step=partial(
+                    _read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=NORM_QUANT_READ,
+                    update=ADD,
+                ),
+                carried_fusions=comm._attn_input_fusions,
             ),
             input_move=None,
             handoff=None,

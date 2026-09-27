@@ -16,7 +16,7 @@ from sglang.srt.layers.communicator import (
     Layout,
     TokenAxis,
 )
-from sglang.srt.layers.communicator.boundary import _attention_input_step
+from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -244,12 +244,15 @@ def test_communicator_publishes_layout_at_each_transition(
     selected = SimpleNamespace(
         attention=SimpleNamespace(
             prepare=partial(
-                _attention_input_step,
-                layer_input=None,
-                fusions=(),
-                enters_stack=False,
-                read=NORM_QUANT_READ,
-                update=ADD,
+                _consumer_step,
+                step=partial(
+                    _read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=NORM_QUANT_READ,
+                    update=ADD,
+                ),
+                carried_fusions=(),
             ),
             input_move=lambda hidden_states, **kwargs: hidden_states,
             handoff=lambda hidden_states, *args: hidden_states,

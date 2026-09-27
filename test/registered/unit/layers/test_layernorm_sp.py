@@ -194,12 +194,15 @@ class TestSpRegionSteps(CustomTestCase):
         return comm.BoundarySteps(
             attention=comm.StageEntry(
                 prepare=partial(
-                    comm_boundary._attention_input_step,
-                    layer_input=None,
-                    fusions=(),
-                    enters_stack=False,
-                    read=comm.NORM_QUANT_READ,
-                    update=comm.ADD,
+                    comm_ops._consumer_step,
+                    step=partial(
+                        comm_ops._read_input,
+                        layer_input=None,
+                        enters_stack=False,
+                        read=comm.NORM_QUANT_READ,
+                        update=comm.ADD,
+                    ),
+                    carried_fusions=(),
                 ),
                 input_rows=comm.Layout(frozenset()),
                 input_move=attention_input,
