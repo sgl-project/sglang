@@ -267,9 +267,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self._batch_write_through = (
-            envs.SGLANG_ENABLE_HICACHE_BATCHED_WRITE_THROUGH.get()
-        )
+        self._backup_nodes_per_step = envs.SGLANG_HICACHE_BACKUP_NODES_PER_STEP.get()
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -388,9 +386,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        # Write-through backups accepted during a scheduler step (each node
-        # locked so it stays device-resident) and executed as one batch by the
-        # step's flush_pending_backups; ancestors before children.
+        # Write-through backups accepted at insert time (each node locked so it
+        # stays device-resident) and executed in batches by flush_pending_backups,
+        # at most the per-step cap per step; ancestors before children.
         self.queued_backups: dict[NodeId, Optional[DecLockRefParams]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
@@ -3557,19 +3555,19 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
-        """Back the step's queued write-through nodes up as a batch and submit
-        them, with anything else queued, as one merged D2H operation."""
+        """Back queued write-through nodes up (at most the per-step cap) and
+        submit them, with anything else queued, as one merged D2H operation."""
         if self.linker is not None or self.cache_controller is None:
             return
         if self.queued_backups:
-            self._drain_queued_backups()
+            self._drain_queued_backups(self._backup_nodes_per_step)
         self.cache_controller.start_writing()
 
     def _queue_write_through_backup(self, action: BackupKV) -> None:
-        """With batching on, lock the action's nodes now and leave the host
-        alloc, transfer build and submit to this step's flush_pending_backups;
-        otherwise back them up right here."""
-        if self.buffer_pipeline is not None or not self._batch_write_through:
+        """With a per-step cap, lock the action's nodes now and leave the host
+        alloc, transfer build and submit to flush_pending_backups, off the
+        request-finish path; without one, back them up right here."""
+        if self.buffer_pipeline is not None or self._backup_nodes_per_step == 0:
             self._execute_and_commit_kv_backup(action)
             return
         for node_id in action.node_ids:
@@ -3577,14 +3575,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             self.queued_backups[node_id] = self.inc_lock_ref(node_id).to_dec_params()
 
-    def _drain_queued_backups(self) -> None:
-        """Execute every queued backup, oldest first, in as few batches as the
-        SWA windows allow."""
+    def _drain_queued_backups(self, limit: int = 0) -> None:
+        """Execute queued backups oldest first, in as few batches as the SWA
+        windows allow; limit 0 runs the whole queue."""
+        remaining = limit if limit > 0 else len(self.queued_backups)
         batch: list[_NodeBackupSpec] = []
         covered: set[NodeId] = set()
-        while self.queued_backups:
+        while self.queued_backups and remaining > 0:
             node_id = next(iter(self.queued_backups))
             lock_params = self.queued_backups.pop(node_id)
+            remaining -= 1
             spec = self._build_node_backup_spec(node_id, lock_params)
             if spec is not None and not covered.isdisjoint(spec.publish_node_ids):
                 # A node already in the batch sits in this one's SWA window; commit
