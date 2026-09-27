@@ -3,11 +3,13 @@ file storage) must reload with the cold run's output, across the sliding window.
 
 import os
 import tempfile
+import time
 import unittest
 
 import torch
 
 import sglang as sgl
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
     is_sm90_supported,
@@ -49,8 +51,8 @@ def prompt(length, offset=0):
     return [1 + ((i + offset) * 17) % 127 for i in range(length)]
 
 
-class TestBeamHiCache(CustomTestCase):
-    hicache_args = dict(hicache_io_backend="kernel", hicache_mem_layout="page_first")
+class _BeamHiCacheTestBase(CustomTestCase):
+    hicache_args = {}
     extra_args = {}
     min_gpus = 1
 
@@ -66,10 +68,10 @@ class TestBeamHiCache(CustomTestCase):
             )
         if torch.cuda.device_count() < cls.min_gpus:
             raise unittest.SkipTest(f"requires {cls.min_gpus} GPUs")
+        cls._before_engine()
         cls.checkpoint = tempfile.TemporaryDirectory(prefix="beam-fixture-")
         cls.config, state = make_beam_fixture(cls.checkpoint.name)
         cls.state = {name: value.cuda() for name, value in state.items()}
-        cls.filler_offset = 20000
         cls.engine = sgl.Engine(
             model_path=cls.checkpoint.name,
             skip_tokenizer_init=True,
@@ -88,6 +90,10 @@ class TestBeamHiCache(CustomTestCase):
         )
 
     @classmethod
+    def _before_engine(cls):
+        pass
+
+    @classmethod
     def tearDownClass(cls):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
@@ -97,7 +103,15 @@ class TestBeamHiCache(CustomTestCase):
             cls.checkpoint.cleanup()
 
     def setUp(self):
-        self.engine.flush_cache()
+        self.flush()
+
+    def flush(self):
+        # Engine.flush_cache() is refused while the scheduler is still busy;
+        # a timeout makes the scheduler defer it until idle instead.
+        result = self.engine.loop.run_until_complete(
+            self.engine.tokenizer_manager.flush_cache(timeout_s=30)
+        )
+        self.assertTrue(result.success, f"flush_cache failed: {result.message}")
 
     def generate(self, token_ids, count):
         batched = isinstance(token_ids[0], list)
@@ -141,6 +155,11 @@ class TestBeamHiCache(CustomTestCase):
         logits = eager_beam_logits(self.config, self.state, token_ids + generated[:-1])
         return logits[len(token_ids) - 1 :].log_softmax(-1)
 
+
+class TestBeamHiCache(_BeamHiCacheTestBase):
+    hicache_args = dict(hicache_io_backend="kernel", hicache_mem_layout="page_first")
+    filler_offset = 20000
+
     def evict_to_host(self):
         type(self).filler_offset += EVICTION_FILLER
         _, _, cached, _ = self.generate(
@@ -160,7 +179,7 @@ class TestBeamHiCache(CustomTestCase):
     def test_round_trip_across_window(self):
         for length in ROUND_TRIP_LENGTHS:
             with self.subTest(prompt=length):
-                self.engine.flush_cache()
+                self.flush()
                 cold_ids, cold_logprobs, cached, _ = self.generate(prompt(length), 4)
                 self.assertEqual(cached, 0)
                 self.evict_to_host()
@@ -252,65 +271,43 @@ class TestBeamHiCachePP2(TestBeamHiCache):
     extra_args = dict(pp_size=2)
 
 
-class TestBeamHiCacheFileStorage(CustomTestCase):
+class TestBeamHiCacheFileStorage(_BeamHiCacheTestBase):
+    hicache_args = dict(
+        hicache_io_backend="direct",
+        hicache_mem_layout="page_first_direct",
+        hicache_storage_backend="file",
+        hicache_storage_prefetch_policy="wait_complete",
+    )
+
     @classmethod
-    def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("Beam HiCache test requires a CUDA GPU")
-        if not is_flashinfer_available() or not (
-            is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
-        ):
-            raise unittest.SkipTest(
-                "Beam TRT-LLM MHA test requires FlashInfer and SM90, SM100, or SM120"
-            )
+    def _before_engine(cls):
         cls.storage = tempfile.TemporaryDirectory(prefix="beam-hicache-l3-")
-        cls.previous_dir = os.environ.get("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR")
-        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.storage.name
-        cls.checkpoint = tempfile.TemporaryDirectory(prefix="beam-fixture-")
-        cls.config, state = make_beam_fixture(cls.checkpoint.name)
-        cls.state = {name: value.cuda() for name, value in state.items()}
-        cls.engine = sgl.Engine(
-            model_path=cls.checkpoint.name,
-            skip_tokenizer_init=True,
-            dtype="bfloat16",
-            tp_size=1,
-            attention_backend="trtllm_mha",
-            page_size=PAGE_SIZE,
-            chunked_prefill_size=256,
-            max_total_tokens=DEVICE_TOKENS,
-            mem_fraction_static=0.2,
-            enable_hierarchical_cache=True,
-            hicache_ratio=4,
-            hicache_write_policy="write_through",
-            hicache_io_backend="direct",
-            hicache_mem_layout="page_first_direct",
-            hicache_storage_backend="file",
-            hicache_storage_prefetch_policy="wait_complete",
+        cls.addClassCleanup(cls.storage.cleanup)
+        storage_dir = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+            cls.storage.name
         )
+        storage_dir.__enter__()
+        cls.addClassCleanup(storage_dir.__exit__, None, None, None)
 
-    @classmethod
-    def tearDownClass(cls):
-        if getattr(cls, "engine", None) is not None:
-            cls.engine.shutdown()
-        if hasattr(cls, "previous_dir"):
-            if cls.previous_dir is None:
-                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
-            else:
-                os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.previous_dir
-        if hasattr(cls, "state"):
-            del cls.state
-        for name in ("checkpoint", "storage"):
-            if hasattr(cls, name):
-                getattr(cls, name).cleanup()
-
-    generate = TestBeamHiCache.generate
-    oracle = TestBeamHiCache.oracle
+    def wait_for_storage_pages(self, min_pages, timeout_s=30):
+        deadline = time.monotonic() + timeout_s
+        last = -1
+        while time.monotonic() < deadline:
+            # Pages are renamed into place, so every .bin file is complete.
+            count = sum(f.endswith(".bin") for f in os.listdir(self.storage.name))
+            # Sliding-window pages add files too, so also wait for the count to settle.
+            if count >= min_pages and count == last:
+                return
+            last = count
+            time.sleep(0.5)
+        self.fail(f"only {last} pages reached file storage within {timeout_s}s")
 
     def test_storage_hit_after_flush(self):
-        self.engine.flush_cache()
         cold_ids, cold_logprobs, _, _ = self.generate(prompt(LONG_PROMPT), 4)
+        # A flush drops storage writes still queued, so wait for the pages first.
+        self.wait_for_storage_pages(LONG_PROMPT // PAGE_SIZE)
         # Flushing drops the device and host tiers; the file tier keeps the pages.
-        self.engine.flush_cache()
+        self.flush()
         ids, logprobs, cached, tiers = self.generate(prompt(LONG_PROMPT), 4)
         self.assertGreater(tiers["storage"], 0, f"no storage-tier hit, got {tiers}")
         self.assertGreaterEqual(
