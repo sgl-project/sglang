@@ -31,7 +31,6 @@ from sglang.srt.layers.communicator import (
     MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    layer_input_buffer,
     reduce_output,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -920,7 +919,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        hidden_states_orig = layer_input_buffer(hidden_states)
+        hidden_states_orig = self.layer_communicator.buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,

@@ -72,7 +72,6 @@ from sglang.srt.layers.communicator import (
     LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    layer_input_buffer,
 )
 from sglang.srt.layers.communicator.adapters.context_parallel import (
     maybe_prefetch_next_full_attention_kv,
@@ -2706,7 +2705,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
-        hidden_states_orig = layer_input_buffer(hidden_states)
+        hidden_states_orig = self.layer_communicator.buffer(hidden_states)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,

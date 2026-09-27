@@ -73,6 +73,7 @@ from sglang.srt.layers.communicator.output import (
     reduce_output,
 )
 from sglang.srt.layers.communicator.residual import LayerResidual
+from sglang.srt.layers.communicator.residual.access import add_to_output, buffer, fold
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
     aiter_all_reduce_fusion_enabled_for,
@@ -221,6 +222,10 @@ class LayerFusions(Protocol):
 
 
 class LayerCommunicator:
+    add_to_output = staticmethod(add_to_output)
+    buffer = staticmethod(buffer)
+    fold = staticmethod(fold)
+
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
     _publish_lora_layout: bool = False

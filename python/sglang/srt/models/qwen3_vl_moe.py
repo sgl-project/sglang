@@ -140,9 +140,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states = reduce_output(hidden_states)
-                    hidden_states.add_(
-                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    hidden_states, residual = layer.layer_communicator.add_to_output(
+                        hidden_states,
+                        residual,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
         # Handle deepstack for the last processed layer (HF-order path only).
