@@ -1,5 +1,5 @@
 """Correctness tests for the DeepSeek-V4 sparse paged-prefill Triton kernel,
-covering the gfx1250 launch-config retune.
+covering the gfx1250 launch-config selection.
 
 ``_sparse_attn_v4_paged_prefill_triton`` picks BLOCK_H / BLOCK_K / num_warps /
 num_stages per architecture: gfx1250 uses (64, 16, 4, 2), every other target
@@ -11,12 +11,12 @@ The tests therefore:
   - check the kernel against a dense torch reference (gather the indexed KV
     rows, masked softmax, weighted sum), and
   - check every launch config against each other on identical inputs, which is
-    what actually guards the retune: a reviewer changing the constants gets a
+    what actually guards the tuning: a reviewer changing the constants gets a
     failure here rather than silently different attention output.
 
 Shapes cover both regions the kernel walks (paged ``unified_kv`` prefix and
 flat per-fwd ``kv`` extend), ``-1`` sentinels in both index lists, H not a
-multiple of BLOCK_H, and T on both sides of the point where the retuned
+multiple of BLOCK_H, and T on both sides of the point where the gfx1250
 config was measured to win.
 """
 
@@ -163,7 +163,7 @@ def test_matches_dense_reference(block_h, block_k, num_warps, num_stages):
 @pytest.mark.parametrize("T", [1, 5, 64, 512])
 @pytest.mark.parametrize("H", [64, 48])
 def test_launch_configs_agree(T, H):
-    """The retune must not change results.
+    """The launch config must not change results.
 
     H=48 is deliberately not a multiple of 64, so BLOCK_H=64 exercises the
     head-mask tail. T spans both sides of the size where the gfx1250 config
