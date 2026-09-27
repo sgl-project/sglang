@@ -85,10 +85,7 @@ def build_fused_accept_indices(
 
 
 class FlashInferKDAKernel(LinearAttnKernelBase):
-    """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1.
-
-    Prefill (``extend``) is implemented by ``FlashInferKDAPrefillKernel``.
-    """
+    """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1."""
 
     def __init__(self):
         available, self._recurrent_kda = _get_flashinfer_kda_kernel()

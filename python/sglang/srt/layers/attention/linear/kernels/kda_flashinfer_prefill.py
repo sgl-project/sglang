@@ -30,7 +30,6 @@ def build_flashinfer_kda_checkpoint_plan(
     device: torch.device,
     chunk_size: int,
 ) -> None:
-    """Plan packed complete-boundary checkpoints without changing Triton's indices."""
     if metadata.track_ssm_h_src is None or metadata.track_ssm_h_src.numel() == 0:
         return
     if chunk_size <= 0 or chunk_size % 32:
@@ -87,8 +86,6 @@ def build_flashinfer_kda_checkpoint_plan(
 
 
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
-    """Use FlashInfer 0.7 for eager KDA prefill and radix-cache snapshots."""
-
     uses_state_checkpoints = True
     supports_track_state_snapshot = True
     supports_safe_gate = True

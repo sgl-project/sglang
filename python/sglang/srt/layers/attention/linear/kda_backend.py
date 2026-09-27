@@ -86,7 +86,6 @@ class KDAKernelDispatcher:
             self.decode_kernel = CuteDSLKDAKernel()
         elif decode_backend.is_flashinfer():
             # FlashInfer recurrent_kda: SM100 decode + MTP (target_verify).
-            # Prefill is selected independently by --linear-attn-prefill-backend.
             if not is_cuda():
                 raise ValueError("KDA FlashInfer backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
