@@ -346,10 +346,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     or cfg.attn_cp_size > 1
                 ),
             ),
-            # Draft and verify extends are not validated with the HIP tail.
+            # DSpark's 128-token draft window reads only replayed target rows.
+            # Other speculative modes are not validated.
             (
-                "speculative decoding on ROCm",
-                get_platform().is_hip and cfg.speculative_algorithm is not None,
+                "speculative decoding other than DSpark on ROCm",
+                get_platform().is_hip
+                and cfg.speculative_algorithm is not None
+                and str(cfg.speculative_algorithm).upper() != "DSPARK",
             ),
         )
         for feature, enabled in incompatible:

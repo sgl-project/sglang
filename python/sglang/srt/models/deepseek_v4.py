@@ -4437,7 +4437,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+            # Shift full-extend prompt positions into the compact tail.
+            logits_metadata.extend_logprob_start_lens_cpu = (
+                [
+                    start - (n - t)
+                    for start, n, t in zip(
+                        forward_batch.extend_logprob_start_lens_cpu,
+                        forward_batch.extend_seq_lens_cpu,
+                        tail.extend_seq_lens_cpu,
+                    )
+                ]
+                if forward_batch.return_logprob
+                else tail.extend_seq_lens_cpu
+            )
 
         output = self.logits_processor(
             input_ids,
