@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
+import requests
 from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -57,6 +58,7 @@ from sglang.benchmark.serving import (
     async_request_openai_embeddings,
     flush_server_cache,
 )
+from sglang.benchmark.utils import download_and_cache_file
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -357,6 +359,79 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
     def tearDown(self):
         self._home_patch.stop()
         self.tmpdir.cleanup()
+
+    def test_download_failure_does_not_publish_partial_file(self):
+        path = self.tmpdir_path / "interrupted.jsonl"
+
+        class InterruptedResponse:
+            headers = {"content-length": "200"}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, chunk_size):
+                yield b'{"timestamp": 1, "hash_ids": []}\n'
+                raise requests.exceptions.ConnectionError("interrupted download")
+
+        with patch(
+            "sglang.benchmark.utils.requests.get",
+            return_value=InterruptedResponse(),
+        ):
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                download_and_cache_file("https://example.test/trace.jsonl", str(path))
+
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name(path.name + ".part").exists())
+
+    def test_successful_download_publishes_complete_file(self):
+        path = self.tmpdir_path / "complete.jsonl"
+        content = b'{"timestamp": 1, "hash_ids": []}\n'
+
+        class CompleteResponse:
+            headers = {"content-length": str(len(content))}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, chunk_size):
+                yield content
+
+        with patch(
+            "sglang.benchmark.utils.requests.get",
+            return_value=CompleteResponse(),
+        ):
+            result = download_and_cache_file(
+                "https://example.test/trace.jsonl", str(path)
+            )
+
+        self.assertEqual(result, str(path))
+        self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(path.with_name(path.name + ".part").exists())
+
+    def test_failed_download_preserves_existing_file(self):
+        path = self.tmpdir_path / "existing.jsonl"
+        original = b'{"timestamp": 99, "hash_ids": []}\n'
+        path.write_bytes(original)
+
+        class InterruptedResponse:
+            headers = {"content-length": "200"}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, chunk_size):
+                yield b'{"timestamp": 1, "hash_ids": []}\n'
+                raise requests.exceptions.ConnectionError("interrupted download")
+
+        with patch(
+            "sglang.benchmark.utils.requests.get",
+            return_value=InterruptedResponse(),
+        ):
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                download_and_cache_file("https://example.test/trace.jsonl", str(path))
+
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(path.with_name(path.name + ".part").exists())
 
     def _write_sharegpt_json(self):
         data = [
