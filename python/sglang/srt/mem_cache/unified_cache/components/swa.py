@@ -88,6 +88,7 @@ class SWAComponent(TreeComponent):
         self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
+    _independent = False
 
     def _collect_unbacked_swa_nodes(
         self, node: UnifiedTreeNode
@@ -385,6 +386,54 @@ class SWAComponent(TreeComponent):
             swa_branching_seqlen=branching_seqlen,
         )
 
+    @staticmethod
+    def _segments(*, node, start, end):
+        # Earlier components may have split the original insertion span.
+        segments = []
+        while end > start:
+            node_start = end - len(node.key)
+            assert node_start >= start
+            segments.append((node, node_start, end))
+            end, node = node_start, node.parent
+        return reversed(segments)
+
+    def _clip_to_window(self, *, node, start, end, window_start, cache_actions):
+        if node.component_data[self.component_type].value is not None:
+            return None
+        assert window_start % self.tree_core.page_size == 0, (
+            f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {window_start=}"
+        )
+        live_start = max(start, window_start)
+        if live_start >= end:
+            return None
+        if live_start > start:
+            _, action = self.tree_core._split_node(node.key, node, live_start - start)
+            if action is not None:
+                cache_actions.append(action)
+        return live_start
+
+    def _publish_window(self, *, node, cache_actions):
+        cache_actions.append(
+            SWARebuild(node.id, node.component_data[BASE_COMPONENT_TYPE].value)
+        )
+
+    def _recover_from_incoming(
+        self, *, node, incoming_full, start, end, result, cache_actions
+    ):
+        full_cd = node.component_data[BASE_COMPONENT_TYPE]
+        old_full = full_cd.value
+        # A locked SWA tombstone also has Full locked, so only an unlocked
+        # Full value can be replaced by the incoming ids.
+        if full_cd.lock_ref > 0:
+            cache_actions.append(
+                RecoverSWAWithLockedFull(node.id, old_full, incoming_full)
+            )
+            return
+        result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
+        full_cd.value = incoming_full.clone()
+        cache_actions.append(FreeDeviceKVFullOnly([old_full]))
+        self._publish_window(node=node, cache_actions=cache_actions)
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
@@ -398,72 +447,56 @@ class SWAComponent(TreeComponent):
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
-        is_tombstone = node.component_data[self.component_type].value is None
-        if not is_tombstone:
-            return prefix_len
+        window_start = params.get_evicted_seqlen(self.component_type)
+        if self._independent:
+            window_start = max(window_start, params.prev_prefix_len)
+        consumed_from = prefix_len
+        for fragment, start, end in self._segments(
+            node=node, start=total_prefix_len, end=total_prefix_len + prefix_len
+        ):
+            live_start = self._clip_to_window(
+                node=fragment,
+                start=start,
+                end=end,
+                window_start=window_start,
+                cache_actions=cache_actions,
+            )
+            if live_start is None:
+                continue
+            result.record_adopted_range(self.component_type, live_start, end)
+            self._recover_from_incoming(
+                node=fragment,
+                incoming_full=value_slice[
+                    live_start - total_prefix_len : end - total_prefix_len
+                ],
+                start=live_start,
+                end=end,
+                result=result,
+                cache_actions=cache_actions,
+            )
+            if not self._independent:
+                consumed_from = min(consumed_from, live_start - total_prefix_len)
+        return consumed_from
 
-        full_cd = node.component_data[BASE_COMPONENT_TYPE]
-        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
-        # A locked tombstone is legal (segment locks count every node); the
-        # full-value swap below is safe because full lock_ref >= swa
-        # lock_ref, so a locked-SWA node always takes the Recover branch.
-        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
-            f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
-        )
-
-        if swa_evicted_seqlen <= total_prefix_len:
-            # Branch 1: entire value_slice is within SWA window — recover
-            result.record_adopted_range(
-                self.component_type,
-                total_prefix_len,
-                total_prefix_len + prefix_len,
+    def _populate_range(
+        self, *, node, start, end, params, result, cap_leaf, cache_actions
+    ):
+        for fragment, start, end in self._segments(node=node, start=start, end=end):
+            live_start = self._clip_to_window(
+                node=fragment,
+                start=start,
+                end=end,
+                window_start=params.get_evicted_seqlen(self.component_type),
+                cache_actions=cache_actions,
             )
-            old_full = full_cd.value
-            if full_cd.lock_ref > 0:
-                cache_actions.append(
-                    RecoverSWAWithLockedFull(node.id, old_full, value_slice)
-                )
-                return 0
-            result.record_adopted_range(
-                BASE_COMPONENT_TYPE,
-                total_prefix_len,
-                total_prefix_len + prefix_len,
-            )
-            full_cd.value = value_slice.clone()
-            cache_actions.append(FreeDeviceKVFullOnly([old_full]))
-            cache_actions.append(SWARebuild(node.id, value_slice))
-            return 0
-        elif swa_evicted_seqlen < total_prefix_len + prefix_len:
-            # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
-            start_idx = swa_evicted_seqlen - total_prefix_len
-            result.record_adopted_range(
-                self.component_type,
-                swa_evicted_seqlen,
-                total_prefix_len + prefix_len,
-            )
-            is_locked = full_cd.lock_ref > 0
-            old_full = full_cd.value[start_idx:]
-            _, action = self.tree_core._split_node(node.key, node, start_idx)
-            if action is not None:
-                cache_actions.append(action)
-            new_full = value_slice[start_idx:]
-            if is_locked:
-                cache_actions.append(
-                    RecoverSWAWithLockedFull(node.id, old_full, new_full)
-                )
-                return start_idx
-            result.record_adopted_range(
-                BASE_COMPONENT_TYPE,
-                swa_evicted_seqlen,
-                total_prefix_len + prefix_len,
-            )
-            node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
-            cache_actions.append(FreeDeviceKVFullOnly([old_full]))
-            cache_actions.append(SWARebuild(node.id, new_full))
-            return start_idx
-        else:
-            # Branch 3: entire value_slice is outside SWA window — not consumed
-            return prefix_len
+            if live_start is None:
+                continue
+            parent = self._maybe_split_leaf_for_swa_lock(fragment) if cap_leaf else None
+            # Older fragments publish first so the tail remains more-MRU.
+            if parent is not None:
+                self._publish_window(node=parent, cache_actions=cache_actions)
+            self._publish_window(node=fragment, cache_actions=cache_actions)
+            result.record_adopted_range(self.component_type, live_start, end)
 
     def recover_after_unevict(
         self,
@@ -477,33 +510,14 @@ class SWAComponent(TreeComponent):
         # _unevict_node_on_insert already wrote the request's fresh KV slice
         # into the base value. We just need to rebuild SWA from that slice for
         # the in-window portion. There is no old SWA slot to free here.
-        ct = self.component_type
-        if node.component_data[ct].value is not None:
-            return
-        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
-        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
-            f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
-        )
-
-        if swa_evicted_seqlen <= total_prefix_len:
-            pass  # entire node is within the SWA window
-        elif swa_evicted_seqlen < total_prefix_len + prefix_len:
-            start_idx = swa_evicted_seqlen - total_prefix_len
-            _, action = self.tree_core._split_node(node.key, node, start_idx)
-            if action is not None:
-                cache_actions.append(action)
-        else:
-            return
-        result.record_adopted_range(
-            self.component_type,
-            max(total_prefix_len, swa_evicted_seqlen),
-            total_prefix_len + prefix_len,
-        )
-        cache_actions.append(
-            SWARebuild(
-                node.id,
-                node.component_data[BASE_COMPONENT_TYPE].value,
-            )
+        self._populate_range(
+            node=node,
+            start=total_prefix_len,
+            end=total_prefix_len + prefix_len,
+            params=params,
+            result=result,
+            cap_leaf=self._independent,
+            cache_actions=cache_actions,
         )
 
     def commit_insert_component_data(
@@ -522,39 +536,20 @@ class SWAComponent(TreeComponent):
         if not is_new_leaf:
             return
 
-        node_start = result.prefix_len
-        node_end = node_start + len(node.key)
-        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
-        split_pos = swa_evicted_seqlen - node_start
-        if split_pos >= len(node.key):
-            # Entire leaf is outside the SWA window — left as a tombstone.
-            return
-        result.record_adopted_range(
-            self.component_type,
-            max(node_start, swa_evicted_seqlen),
-            node_end,
+        # Another window may have split this leaf; use the full aligned insert span.
+        end = (
+            len(params.key) // self.tree_core.page_size * self.tree_core.page_size
+            if self._independent
+            else result.prefix_len + len(node.key)
         )
-        if split_pos > 0:
-            # Node straddles the boundary: split into an out-of-window parent
-            # (tombstone) and an in-window child; `node` becomes the child.
-            _, action = self.tree_core._split_node(node.key, node, split_pos)
-            assert action is None, "new leaf cannot be write-through-pending"
-        # Cap the in-window leaf at one window for lock granularity, then rebuild SWA
-        # onto the in-window node(s) at apply time; rebuild the older prefix first so
-        # the in-window tail lands more-MRU.
-        capped_parent = self._maybe_split_leaf_for_swa_lock(node)
-        if capped_parent is not None:
-            cache_actions.append(
-                SWARebuild(
-                    capped_parent.id,
-                    capped_parent.component_data[BASE_COMPONENT_TYPE].value,
-                )
-            )
-        cache_actions.append(
-            SWARebuild(
-                node.id,
-                node.component_data[BASE_COMPONENT_TYPE].value,
-            )
+        self._populate_range(
+            node=node,
+            start=result.prefix_len,
+            end=end,
+            params=params,
+            result=result,
+            cap_leaf=True,
+            cache_actions=cache_actions,
         )
 
     def _maybe_split_leaf_for_swa_lock(

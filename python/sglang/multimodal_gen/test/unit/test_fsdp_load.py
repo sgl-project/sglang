@@ -11,7 +11,6 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
@@ -444,33 +443,45 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                 rank_local_checkpoint.tp_local_shape(sources, 0, 2), (4, 4)
             )
 
-    def test_tp_local_read_refuses_sources_spanning_merged_partitions(self):
-        """A fused ``[gate | up]`` source sliced per source gives rank 0 only gates.
+    def test_reads_tp_local_fused_merged_column_per_logical_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            q = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+            k = torch.arange(16, 32, dtype=torch.bfloat16).reshape(4, 4)
+            v = torch.arange(32, 48, dtype=torch.bfloat16).reshape(4, 4)
+            fused = torch.cat((q, k, v), dim=0)
+            save_file({"qkv": fused}, file_path)
+            sources = [self._source(file_path, "qkv", (12, 4))]
 
-        Merged column linears shard each output partition, so the rank-local
-        fast path must fall back when the sources are not those partitions.
-        """
-        owner = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
-        nn.Module.__init__(owner)
-        owner.output_sizes = [4, 2, 2]
-        param = nn.Parameter(torch.empty(4, 4))
-        param.weight_loader = owner.weight_loader
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                naive = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                )
+                rank0 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
+                rank1 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=1,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
 
-        per_partition = [
-            self._source("f", "qkv", (4, 4), 0, 3),
-            self._source("f", "gate", (2, 4), 1, 3),
-            self._source("f", "up", (2, 4), 2, 3),
-        ]
-        fused_gate_up = [
-            self._source("f", "qkv", (4, 4), 0, 2),
-            self._source("f", "gate_up", (4, 4), 1, 2),
-        ]
-        self.assertTrue(
-            rank_local_checkpoint._sources_are_tp_partitions(param, per_partition, 0)
-        )
-        self.assertFalse(
-            rank_local_checkpoint._sources_are_tp_partitions(param, fused_gate_up, 0)
-        )
+            torch.testing.assert_close(naive, fused[:6])
+            torch.testing.assert_close(rank0, torch.cat((q[:2], k[:2], v[:2])))
+            torch.testing.assert_close(rank1, torch.cat((q[2:], k[2:], v[2:])))
+            self.assertFalse(torch.equal(rank0, naive))
 
     def test_reads_tp_local_merged_row_slice(self):
         with tempfile.TemporaryDirectory() as temp_dir:
