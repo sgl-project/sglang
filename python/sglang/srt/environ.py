@@ -1354,6 +1354,10 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # LiLiCorr drafts: sample each slot from the head's lattice at T > 0 instead of
+    # committing the argmax; the REQUIRE guard refuses to start if sampling is off.
+    SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
+    SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

@@ -4,7 +4,6 @@ lives in `sglang.srt.models.lilicorr`."""
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional, Tuple
 
 import msgspec
@@ -14,6 +13,7 @@ from sglang.kernels.ops.speculative.lilicorr import (
     MAX_FUSED_CANDIDATE_TOPK,
     lilicorr_topk_lse,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
@@ -22,35 +22,17 @@ from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy
 logger = logging.getLogger(__name__)
 
 
-def _env_bool(name: str, message: str) -> bool:
-    raw = os.environ.get(name, "0").strip().lower()
-    if raw not in ("0", "1", "off", "on", "false", "true"):
-        raise ValueError(f"{name}={raw!r} is not a boolean. {message}")
-    return raw in ("1", "on", "true")
-
-
 # Read at import: a per-call read would be a host-side branch inside a graph replay.
-SAMPLING_ENABLED = _env_bool(
-    "LILICORR_SAMPLING",
-    "Refusing rather than defaulting: a typo would report the greedy number under the "
-    "sampled arm's name.",
-)
+SAMPLING_ENABLED = envs.SGLANG_ENABLE_LILICORR_SAMPLING.get()
 logger.info(
     "LiLiCorr draft commit: %s",
     "sampled (T>0 aware)" if SAMPLING_ENABLED else "greedy",
 )
 
-# Forgetting LILICORR_SAMPLING is silent: set this on any run whose name says sampled.
-if (
-    _env_bool(
-        "SGLANG_LILICORR_REQUIRE_SAMPLING",
-        "Refusing rather than defaulting: a gate that silently reads as off is not a gate.",
-    )
-    and not SAMPLING_ENABLED
-):
+if envs.SGLANG_LILICORR_REQUIRE_SAMPLING.get() and not SAMPLING_ENABLED:
     raise RuntimeError(
-        "SGLANG_LILICORR_REQUIRE_SAMPLING is set but LILICORR_SAMPLING is not enabled. "
-        "This process would serve the greedy commit under a sampled arm's name."
+        "SGLANG_LILICORR_REQUIRE_SAMPLING is set but SGLANG_ENABLE_LILICORR_SAMPLING is "
+        "not; this process would serve the greedy commit under a sampled arm's name."
     )
 
 

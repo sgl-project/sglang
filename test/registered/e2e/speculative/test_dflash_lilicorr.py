@@ -72,8 +72,7 @@ class TestLiLiCorrServer(CustomTestCase, GSM8KMixin, SpecDecodingMixin):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":
