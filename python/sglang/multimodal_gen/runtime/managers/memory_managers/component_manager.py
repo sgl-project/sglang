@@ -49,6 +49,12 @@ class ComponentUse:
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
     start_at_stage_entry: bool = True
+    # Layerwise components release their resident set when the use ends, which
+    # is right for a DiT (one use spans every denoise step) and buys nothing for
+    # a component used once per forward. Set this when something that knows the
+    # pipeline's per-phase headroom has decided the room is better spent holding
+    # the set until this component runs again.
+    retain_resident_layers: bool = False
 
 
 @dataclass(slots=True)
@@ -243,10 +249,18 @@ class ComponentResidencyManager:
         no declared ``ComponentUse`` would otherwise be accepted but never
         moved to the device before a forward pass.
         """
-        if not isinstance(self.server_args, ServerArgs):
+        if (
+            not isinstance(self.server_args, ServerArgs)
+            or not self.server_args.component_residency
+        ):
             return
 
-        declared_components = {use.component_name for use in self._ordered_uses}
+        # sequential multi-output execution runs subsets of the full pipeline
+        declared_components = {
+            use.component_name
+            for name, stage in self.pipeline._stage_name_mapping.items()
+            for use in stage.component_uses(self.server_args, name)
+        }
         unmanaged_components = sorted(
             component_name
             for component_name, module in self.pipeline.modules.items()

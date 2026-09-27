@@ -5,6 +5,37 @@ description: "Browse model families and public checkpoints supported by SGLang D
 
 import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
 
+## Ming-Image integration status
+
+Native support covers `inclusionAI/Ming-Image-0.1-Design` (generation and
+single-image editing) and `inclusionAI/Ming-Image-0.1-Design-Layer` (ordered RGBA
+layers). The checkpoints are not interchangeable. No remote modeling code is
+used; checkpoint directories do not need conversion to a Diffusers layout.
+
+H200 full-checkpoint checks include 2048-square generation, 1024-square
+four-layer decomposition, and repeated 512-square HTTP generation and editing.
+The HTTP checks cover cold starts, request warmup, layerwise offload, opt-in VAE
+tiling, and one or two sequential generations per request,
+requiring identical pixels across repeated requests with fixed inputs.
+
+Two-H200 functional checks cover DiT TP2, Ulysses2, Ring2 with FlashAttention,
+CFG parallelism for Design-Layer, encoder folding, and spatial VAE decoding.
+Single-GPU checks cover DiT and encoder layerwise offload, Cache-DiT,
+SageAttention, actual breakable CUDA graph replay, and dynamic LoRA load/remove
+with a synthetic adapter. These checks do not establish quality equivalence for lossy
+optimizations or bit-identical output across parallel topologies. Quantized
+checkpoints and other GPU families remain unverified.
+
+Run the opt-in HTTP regression tests on a CUDA host with sufficient memory:
+
+```bash
+SGLANG_TEST_MING_IMAGE=1 python -m pytest -q \
+  python/sglang/multimodal_gen/test/server/test_server_ming_image.py
+```
+
+See the [Ming-Image cookbook](/cookbook/diffusion/inclusionAI/Ming-Image) for
+launch commands, request parameters, and model-specific limits.
+
 ## Qwen-Image 2.1 integration status
 
 Qwen-Image 2.1 has a separate native pipeline for text-to-image and optional
@@ -105,12 +136,10 @@ replay only matching warmup signatures, including condition-prefix length;
 other shapes run eagerly. VAE tiling is opt-in and can change numerical results.
 Do not infer compatibility from the older Qwen-Image row.
 
-Use an authorized local checkpoint with `--model-id Qwen-Image-2.1`.
+Use the public `Qwen/Qwen-Image-2.1` checkpoint; no Hugging Face token is required.
 See the [Qwen-Image 2.1 cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1)
-for checkpoint layout and usage. This entry does not assert public weight
-availability. The standard two-GPU E2E suite includes `qwen_image21_t2i_tp2`
+for checkpoint layout and usage. The standard two-GPU E2E suite includes `qwen_image21_t2i_tp2`
 with TP2, 1024px/40-step generation, two requests, and image consistency checks.
-Its runners need access to `Qwen/Qwen-Image-2.1`.
 
 The additional opt-in HTTP cases check repeated generation, editing, and real
 RGBA alpha output from a local checkpoint:

@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
+    _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
@@ -216,6 +217,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
+    # Bootstrap thread defers the ABORT ack until the transfer worker drains.
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,
@@ -224,6 +227,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        enable_custom_mem_pool, custom_mem_pool_type = (
+            check_mooncake_custom_mem_pool_enabled()
+        )
+        _validate_efa_allocator_compatibility(
+            enable_custom_mem_pool, custom_mem_pool_type
+        )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -1173,6 +1182,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for entry in range(num_target)
             ]
         sliced_draft_params = []
+        draft_to_pack = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
             if not dst_kv_item_lens and dst_attn_tp_size not in (
                 None,
@@ -1224,14 +1234,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_rank = dst_tp_rank // max(1, dst_span // src_span)
                 src_offset = (dst_rank * dst_width) % src_width
                 dst_offset = (src_rank * src_width) % dst_width
-                sliced_draft_params.append(
-                    (
-                        src_kv_ptrs[entry] + src_offset,
-                        dst_kv_ptrs[entry] + dst_offset,
-                        src_width,
-                        dst_width,
-                        copy_width,
-                    )
+                params = (
+                    src_kv_ptrs[entry] + src_offset,
+                    dst_kv_ptrs[entry] + dst_offset,
+                    src_width,
+                    dst_width,
+                    copy_width,
+                )
+                if pack_buffer is not None and src_width > dst_width:
+                    draft_to_pack.append(params)
+                else:
+                    sliced_draft_params.append(params)
+
+        if draft_to_pack:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            draft_src_ptrs, draft_dst_ptrs, src_strides, _, copy_widths = zip(
+                *draft_to_pack
+            )
+            target_pack_bytes = plan.target_src_token_indices.size * sum(
+                dcp_token_item_lens[:num_target]
+            )
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=draft_src_ptrs,
+                src_token_indices=plan.draft_src_token_indices,
+                token_item_lens=copy_widths,
+                src_token_item_lens=src_strides,
+                pack_offset_bytes=target_pack_bytes,
+            )
+            if packed is None:
+                sliced_draft_params.extend(draft_to_pack)
+            else:
+                packed_ptrs, packed_indices = packed
+                packed_groups = group_concurrent_contiguous(
+                    packed_indices, plan.draft_dst_token_indices
+                )
+                layers_params.extend(
+                    (src, dst, width, packed_groups)
+                    for src, dst, width in zip(packed_ptrs, draft_dst_ptrs, copy_widths)
                 )
 
         def process_sliced_draft(params) -> int:
@@ -1284,7 +1325,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.submit(process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
-            return self._await_transfer_futures(futures)
+            try:
+                return self._await_transfer_futures(futures)
+            finally:
+                if pack_buffer is not None:
+                    concurrent.futures.wait(futures)
 
         transfer_blocks = []
         for layer_params in layers_params:
@@ -1314,10 +1359,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         # Extract configuration
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
         # Use total KV head count (not per-rank) for correct head distribution.
@@ -1326,43 +1373,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
 
-        # GQA replication: how many prefill ranks share the same KV head
-        src_replication = max(1, self.attn_tp_size // total_kv_heads)
-
-        # Determine slicing parameters based on TP configuration
-        if self.attn_tp_size > dst_attn_tp_size:
-            # Send KVCache from multiple prefill instances to 1 decode instance
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start_offset = (
-                unique_head_idx * src_heads_per_rank
-            ) % dst_heads_per_rank
-        else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            # GQA replication (total_kv_heads < dst_attn_tp_size): consecutive decode
-            # ranks share one KV head (QKVParallelLinear: tp_rank // num_kv_head_replicas),
-            # so map by integer division NOT modulo or ranks 1..r-1 fetch the wrong head.
-            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
-            unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
-            src_head_start_offset = (
-                unique_dst_head_idx * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
+        (
+            src_head_start_offset,
+            num_heads_to_send,
+            dst_head_start_offset,
+            _,
+        ) = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            self.kv_args.engine_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
 
         src_data_ptrs = self.kv_args.kv_data_ptrs
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+            if any(
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+            ):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "
                     f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
@@ -1816,12 +1852,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     or rc
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+                # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
                 if (
                     target_rank_registration_info is not None
@@ -1830,11 +1865,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
+                        "state yet."
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if len(src_indices) > len(dst_indices_local):
+                if st == StateType.MINIMAX_DENSE_KV:
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            f"{st.value} state index length mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                elif len(src_indices) > len(dst_indices_local):
                     src_indices = src_indices[: len(dst_indices_local)]
                 elif len(src_indices) < len(dst_indices_local):
                     dst_indices_local = dst_indices_local[: len(src_indices)]
@@ -2419,9 +2460,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # first would let the worker drain+ack while the room is
                         # not yet Failed, so a newly enqueued chunk could still
                         # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
+                        # acks once its in-flight write drains.
+                        if (
+                            room_active
+                            or self._staging_outstanding.get(room_to_be_aborted, 0) > 0
+                        ):
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self.register_deferred_ack_target(
                                 room_to_be_aborted, decode_ip, decode_port
@@ -2433,10 +2476,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
+                        else:
+                            # Concluded/unknown AND quiescent (the branch above
+                            # already took every case with writes outstanding):
+                            # ack now so decode releases without the timeout.
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )
@@ -2492,7 +2535,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 decode_kv_args.dst_dcp_size,
                             )
                         )
-                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+                        self._init_dcp_pack_buffers_once(
+                            decode_kv_args.dst_dcp_size, include_draft=True
+                        )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
