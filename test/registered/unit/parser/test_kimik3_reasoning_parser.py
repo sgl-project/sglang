@@ -88,6 +88,8 @@ def test_non_stream_recovers_missing_think_separator() -> None:
     ("text", "reasoning", "content"),
     [
         ("deep thought<|close|>", "deep thought", ""),
+        ("deep thought<|open|>think", "deep thought", ""),
+        (f"{THINK_CLOSE}{RESPONSE_OPEN}answer<|open|>think", "", "answer"),
         ("deep thought<|close|>think", "deep thought", ""),
         (f"{THINK_CLOSE}<|open|>", "", ""),
         (f"{THINK_CLOSE}<|open|>response", "", ""),
