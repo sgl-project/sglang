@@ -76,7 +76,7 @@
     "registered/e2e/rust_server/test_mm_transport_1node_cpu.py",
     "registered/e2e/rust_server/test_mm_transport_1node_cuda_ipc.py",
     "registered/e2e/rust_server/test_mm_transport_1node_tp2_shm.py",
-    "registered/e2e/rust_server/test_mm_transport_2node_cpu.py"
+    "registered/e2e/rust_server/test_mm_transport_2node_cpu.py",
     "registered/vlm/test_rust_native_mm_mmmu.py"
   ],
   "unified-memory": [
