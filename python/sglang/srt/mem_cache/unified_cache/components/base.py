@@ -64,6 +64,15 @@ class EvictLayer(IntFlag):
 
 
 @dataclasses.dataclass(frozen=True)
+class InternalStateBackup:
+    """Pause eviction for a host backup before freeing internal device state."""
+
+    node_id: NodeId
+    # Host capacity required by the backup, in this component's pool units.
+    num_tokens: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PrepareLoadBackResult:
     """Outcome of prepare_load_back; default = nothing to prepare."""
 
@@ -124,9 +133,6 @@ class TreeComponent(ABC):
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
-        # An internal-state victim awaiting the controller's host backup.
-        self._evict_device_pending_node: Optional[NodeId] = None
-        self._evict_device_pending_num_tokens = 0
         # Per-session frontier nodes (the deepest registered node per cached
         # path), not physical tree leaves: a frontier node may have children.
         self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
@@ -517,8 +523,6 @@ class TreeComponent(ABC):
         assert not self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction already in progress"
         )
-        self._evict_device_pending_node = None
-        self._evict_device_pending_num_tokens = 0
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
 
@@ -527,18 +531,15 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one eviction step and return a device leaf, if selected.
+    ) -> NodeId | InternalStateBackup | None:
+        """Return a device leaf, an internal backup request, or no selection.
 
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
+        Backup requests leave device state intact until the core resumes eviction.
         """
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
-        )
-        assert self._evict_device_pending_node is None, (
-            f"finish the pending internal {self.component_type.name} eviction "
-            "before advancing"
         )
         return self._evict_device_next_node(tracker, device_frees, host_frees)
 
@@ -549,8 +550,6 @@ class TreeComponent(ABC):
         )
         self._evict_device_end()
         self.is_evict_device_ongoing = False
-        self._evict_device_pending_node = None
-        self._evict_device_pending_num_tokens = 0
 
     @abstractmethod
     def _evict_device_start(self, request_cnt: int) -> None:
@@ -563,8 +562,8 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance the walk by at most one allocator-relevant mutation."""
+    ) -> NodeId | InternalStateBackup | None:
+        """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
 
     @abstractmethod

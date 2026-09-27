@@ -760,9 +760,9 @@ class UnifiedRadixCache(BasePrefixCache):
             assert (
                 not result.device_frees and not result.host_frees and not result.tracker
             )
-            # Both cores yield before freeing internal state (#40680). Make
-            # room in the state pool, then drain the D->H ack before tombstoning.
-            # Allocation failure still permits the legacy drop to make progress.
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
             node_id = result.mamba_backup_node_id
             mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
             if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
@@ -774,9 +774,9 @@ class UnifiedRadixCache(BasePrefixCache):
             assert (
                 not result.device_frees and not result.host_frees and not result.tracker
             )
-            # Internal SWA write-back (#40712) can cover several unbacked
-            # segments. Make room for the whole window before the D->H backup.
-            # A failed allocation still resumes eviction to free device slots.
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
             node_id = result.swa_backup_node_id
             needed = result.swa_backup_num_tokens
             swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)

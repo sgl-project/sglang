@@ -2102,7 +2102,7 @@ def test_hybrid_backup_pool_pressure_preserves_host_victim(backend):
         [transfer for xfers in transfers.values() for transfer in xfers]
     )
     assert resolved is not None
-    # #40512 allocates by pool name, so Mamba pressure frees B's complete host
+    # Host allocation follows pool-name order, so Mamba pressure frees B's host
     # leaf first, satisfying both side pools regardless of transfer-map order.
     assert freed_full == [200, 201]
     core.sanity_check([], [])
@@ -2854,6 +2854,47 @@ def _assert_internal_eviction_pending(step, component, node, swa_tokens=0):
     assert step.swa_backup_num_tokens == swa_tokens
     assert not step.tracker and not step.device_frees and not step.host_frees
     assert step.unbacked_tokens == 0
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_python_component_returns_immutable_internal_backup_request(component):
+    from dataclasses import FrozenInstanceError
+
+    from sglang.srt.mem_cache.unified_cache.components import InternalStateBackup
+
+    case = _internal_swa_write_back_case("python", with_mamba=True, prefix_nodes=2)
+    _mock_swa_write_back_io(case)
+    cache, core = case.cache, case.core
+    first, second, leaf = case.nodes
+    if component == ComponentType.SWA:
+        cache.match_prefix(MatchPrefixParams(key=_key(list(range(case.segment)))))
+        victim, num_tokens = second, 2 * case.segment
+    else:
+        victim, num_tokens = first, 1
+    original = {
+        ct: core.get_component_device_value(victim, ct).clone()
+        for ct in cache.tree_components
+    }
+    tracker, device_frees, host_frees = {component: 0}, {}, {}
+    core.evict_device_start(component, num_tokens)
+    try:
+        request = cache.components[component].evict_device_next_node(
+            tracker, device_frees, host_frees
+        )
+        assert isinstance(request, InternalStateBackup)
+        assert (request.node_id, request.num_tokens) == (victim, num_tokens)
+        assert not case.events and not device_frees and not host_frees
+        assert tracker == {component: 0}
+        for ct, value in original.items():
+            assert torch.equal(core.get_component_device_value(victim, ct), value)
+        with pytest.raises(FrozenInstanceError):
+            request.num_tokens = 0
+    finally:
+        # The component returned directly to this caller; the core has not
+        # consumed the request, so only terminate the walk here.
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -3715,7 +3756,7 @@ def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
         ]
     for (node, ct), value in retained.items():
         assert torch.equal(core.get_component_device_value(node, ct), value)
-    # #41092 drains the earlier SWA ACK before attempting the failed backup.
+    # The earlier SWA ACK is drained before the failed backup attempt.
     assert not cache.ongoing_write_through
     core.sanity_check([(leaf, leaf)], [])
     cache.dec_lock_ref(leaf, leaf_lock)
@@ -3734,9 +3775,8 @@ def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
     ],
 )
 def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_pool):
-    # #38269: a request ring rebuilds its SWA window outside the tree, while
-    # paged SWA requires resident state even if HiCache has no SWA host pool
-    # (for example DSV4.1 encoder replay with DSpark, #38798).
+    # A request ring rebuilds its SWA window outside the tree, while paged SWA
+    # requires resident state even if HiCache has no SWA host pool.
     cache, allocator = _swa_cache(backend=backend, ring=ring)
     assert type(cache.tree_core).__name__ == (
         "RustUnifiedTreeCore" if backend == "rust" else "UnifiedTreeCore"

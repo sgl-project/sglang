@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
@@ -479,6 +480,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             if component.is_evict_device_ongoing:
                 component.evict_device_end()
+        # Internal victims awaiting the controller's backup and finish call.
+        self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -1592,10 +1595,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
         component = self.components_by_type[component_type]
+        assert component_type not in self._pending_internal_evictions, (
+            f"finish the pending internal {component_type.name} eviction "
+            "before advancing"
+        )
         updated_tracker = defaultdict(int, tracker)
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = component.evict_device_next_node(
+            step = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
@@ -1604,11 +1611,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
-        if component_type == ComponentType.MAMBA:
-            result.mamba_backup_node_id = component._evict_device_pending_node
-        elif component_type == ComponentType.SWA:
-            result.swa_backup_node_id = component._evict_device_pending_node
-            result.swa_backup_num_tokens = component._evict_device_pending_num_tokens
+        if isinstance(step, InternalStateBackup):
+            assert component_type in (ComponentType.MAMBA, ComponentType.SWA)
+            self._pending_internal_evictions[component_type] = step.node_id
+            if component_type == ComponentType.MAMBA:
+                result.mamba_backup_node_id = step.node_id
+            else:
+                result.swa_backup_node_id = step.node_id
+                result.swa_backup_num_tokens = step.num_tokens
+        else:
+            result.node_id = step
         result.made_progress = (
             result.node_id is not None
             or result.mamba_backup_node_id is not None
@@ -1631,11 +1643,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert component.is_evict_device_ongoing, (
             f"{component_type.name} device eviction not started"
         )
-        assert component._evict_device_pending_node == node_id, (
+        assert self._pending_internal_evictions.get(component_type) == node_id, (
             f"no matching pending internal {component_type.name} eviction"
         )
-        component._evict_device_pending_node = None
-        component._evict_device_pending_num_tokens = 0
+        del self._pending_internal_evictions[component_type]
         # Consuming the pending request advances the walk even if I/O changed
         # this victim's eligibility. No frees occur before backup completion.
         result = EvictDeviceNextNodeResult(made_progress=True)
@@ -1692,6 +1703,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_end(self, component_type: ComponentType) -> None:
         """Finish a component's device-eviction walk."""
         self.components_by_type[component_type].evict_device_end()
+        self._pending_internal_evictions.pop(component_type, None)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool

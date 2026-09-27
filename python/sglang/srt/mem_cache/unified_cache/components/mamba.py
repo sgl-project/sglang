@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -369,7 +370,7 @@ class MambaComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
         An internal tombstone is one complete step so the caller can apply its
@@ -415,8 +416,7 @@ class MambaComponent(TreeComponent):
         ):
             # Keep the state live until the controller has attempted its host
             # backup. Session cursors advance after the resumed tombstone.
-            self._evict_device_pending_node = x.id
-            return None
+            return InternalStateBackup(node_id=x.id, num_tokens=1)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,

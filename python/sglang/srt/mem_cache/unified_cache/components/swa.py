@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     PreparePrefetchResult,
@@ -711,7 +712,7 @@ class SWAComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
+    ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
         An internal tombstone is one complete step so the caller can apply its
@@ -764,9 +765,7 @@ class SWAComponent(TreeComponent):
             )
             if needed:
                 if ct == ComponentType.SWA:
-                    self._evict_device_pending_node = x.id
-                    self._evict_device_pending_num_tokens = needed
-                    return None
+                    return InternalStateBackup(node_id=x.id, num_tokens=needed)
                 # Custom SWA component types use Python's inherited inline
                 # path; the shared finish hook is for built-in SWA only.
                 if (
