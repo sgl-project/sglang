@@ -68,6 +68,97 @@ def modules_of(vae, cls):
     return [m for m in vae.modules() if isinstance(m, cls)]
 
 
+def first_divergence(reference, optimized, z):
+    """Where the optimized decoder first departs from the eager one, and which fast path is responsible.
+
+    Both models keep the original module names, so hooks on the residual /
+    up blocks and the output conv line up one to one (the wrapped norms are
+    skipped: the optimized one includes the SiLU). Then the decode is repeated
+    with one fast-path family disabled at a time on a fresh optimized copy,
+    so a mismatch names its family without an interactive session.
+    """
+    watched = (
+        "QwenImage21ResidualBlock",
+        "QwenImage21ResidualUpBlock",
+        "QwenImage21MidBlock",
+    )
+    outputs = {"reference": [], "optimized": []}
+    handles = []
+    for tag, model in (("reference", reference), ("optimized", optimized)):
+        for name, m in model.named_modules():
+            if type(m).__name__ in watched or name == "decoder.conv_out":
+                handles.append(
+                    m.register_forward_hook(
+                        lambda mod, inp, out, tag=tag, name=name: outputs[tag].append(
+                            (name, out.detach().clone())
+                        )
+                    )
+                )
+    try:
+        ref_out, opt_out = reference.decode(z), optimized.decode(z)
+    finally:
+        for h in handles:
+            h.remove()
+    blocks = []
+    for (name, ref), (_, opt) in zip(
+        outputs["reference"], outputs["optimized"], strict=True
+    ):
+        if ref.shape != opt.shape or not torch.equal(ref, opt):
+            diff = (ref.float() - opt.float()).abs()
+            blocks.append(
+                f"{name}: max|diff| {diff.max().item():.3e}, "
+                f"{(diff > 0).sum().item()}/{diff.numel()} elements"
+            )
+            if len(blocks) == 3:
+                break
+
+    def decode_without(family):
+        model = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+        saved = {
+            name: getattr(vae_opt, name)
+            for name in ("_BIAS_RESIDUAL_FUSION", "_UPSAMPLE_BIAS_FUSION")
+        }
+        try:
+            for name in saved:
+                gate = vae_opt.BitExactFusionGate(f"isolation {name}")
+                if family == name:
+                    gate.disable()
+                setattr(vae_opt, name, gate)
+            for m in model.modules():
+                if family == "padding fold" and isinstance(m, vae_opt.FoldedPadConv2d):
+                    m._gates["nchw"].disable()
+                    m._gates["nhwc"].disable()
+                if family == "norm+SiLU tail" and isinstance(
+                    m, vae_opt.FusedChannelRMSNormSiLU
+                ):
+                    m._exact_gate.disable()
+            model.decode(z)  # first sight for the remaining families
+            return torch.equal(model.decode(z), ref_out)
+        finally:
+            for name, gate in saved.items():
+                setattr(vae_opt, name, gate)
+
+    families = (
+        "padding fold",
+        "norm+SiLU tail",
+        "_BIAS_RESIDUAL_FUSION",
+        "_UPSAMPLE_BIAS_FUSION",
+    )
+    isolation = ", ".join(
+        f"without {family}: {'equal' if decode_without(family) else 'differs'}"
+        for family in families
+    )
+    return (
+        "decode "
+        + ("equal" if torch.equal(ref_out, opt_out) else "differs")
+        + f"; eager reproducible on this latent: {torch.equal(reference.decode(z), ref_out)}"
+        + "; first divergent blocks: "
+        + ("; ".join(blocks) if blocks else "none")
+        + "; "
+        + isolation
+    )
+
+
 @pytest.fixture(autouse=True)
 def deterministic_cudnn():
     # Bit-exactness is asserted against the eager chain, so both sides must run
@@ -126,7 +217,9 @@ def test_lossless_decode_is_bit_identical(module_gates):
     assert all(gate.verified or gate.disabled for gate in fold_gates)
 
     z.normal_()
-    assert torch.equal(optimized.decode(z), reference.decode(z))
+    assert torch.equal(optimized.decode(z), reference.decode(z)), first_divergence(
+        reference, optimized, z
+    )
 
 
 @torch.no_grad()
