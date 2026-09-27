@@ -391,5 +391,73 @@ def test_stage_conditioning_owns_output_but_preserves_vision_cache():
         assert model.calls == 4
 
 
+@pytest.mark.parametrize("capacity", [0, 1, 4096])
+@torch.no_grad()
+def test_group_cache_preserves_mutable_outputs_and_posterior_rng(capacity):
+    cache = ConditioningCache(capacity)
+    encoder = Encoder().eval()
+    vae = VAE().eval()
+    x = torch.ones(1, 4, 2, 2)
+    with cache.scope(), cache.group_scope():
+        first = encoder(x)
+        first.last_hidden_state.zero_()
+        second = encoder(x)
+        assert encoder.calls == 1
+        assert second.hidden_states[0] is second.last_hidden_state
+        torch.testing.assert_close(second.last_hidden_state, x, rtol=0, atol=0)
+        second.last_hidden_state.zero_()
+        torch.testing.assert_close(encoder(x).last_hidden_state, x, rtol=0, atol=0)
+        for seed in (13, 27):
+            generator = torch.Generator().manual_seed(seed)
+            control = torch.Generator().manual_seed(seed)
+            posterior = vae.encode(x).latent_dist
+            expected = DiagonalGaussianDistribution(x).sample(control)
+            torch.testing.assert_close(
+                posterior.sample(generator), expected, rtol=0, atol=0
+            )
+            assert torch.equal(generator.get_state(), control.get_state())
+            posterior.mean.zero_()
+        assert vae.calls == 1
+    assert cache._group_entries.get() is None
+
+
+@torch.no_grad()
+def test_group_cache_invalidates_and_releases_after_failure():
+    cache = ConditioningCache(0)
+    model = Encoder().eval()
+    x = torch.ones(4)
+    with pytest.raises(RuntimeError, match="stop"), cache.scope(), cache.group_scope():
+        model(x)
+        model(x)
+        invalidate_conditioning_caches([model])
+        model.weight.fill_(2)
+        torch.testing.assert_close(model(x).last_hidden_state, x * 2)
+        assert model.calls == 2
+        raise RuntimeError("stop")
+    assert cache._group_entries.get() is None
+    with cache.scope(), cache.group_scope():
+        model(x)
+    assert model.calls == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_group_cache_waits_for_producing_cuda_stream():
+    cache = ConditioningCache(0)
+    model = Encoder().cuda().eval()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with cache.scope(), cache.group_scope():
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            x = torch.ones(1024, device="cuda")
+            cache.run(model, "stream", (), {}, lambda: model.forward(x))
+        output = cache.run(model, "stream", (), {}, lambda: pytest.fail("cache miss"))
+        torch.testing.assert_close(
+            output.last_hidden_state, torch.ones_like(output.last_hidden_state)
+        )
+    assert model.calls == 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, *sys.argv[1:]]))

@@ -11,6 +11,8 @@ from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.cache import conditioning
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -20,6 +22,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+    SyncExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+    CAUSAL_BLOCK_PROMPTS_KEY,
+    CAUSAL_SCENE_CUT_MASK_KEY,
+    CAUSAL_SHOT_INDICES_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2 import (
+    LongLive2TextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -196,6 +210,122 @@ def make_server_args(**kwargs):
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
+
+
+def make_group_executor(stage_type, device, capacity):
+    encoder = FullHiddenStateEncoder().to(device).eval()
+    config = make_text_config()
+    config.supports_auto_residency = False
+    config.vae_config = SimpleNamespace(use_temporal_scaling_frames=False)
+    config.dit_config = SimpleNamespace(
+        arch_config=SimpleNamespace(num_frames_per_block=1)
+    )
+    args = make_server_args(
+        pipeline_config=config,
+        component_precisions={},
+        comfyui_mode=True,
+        enable_layerwise_nvtx_marker=False,
+        use_fsdp_inference=False,
+        disable_conditioning_cache=capacity == 0,
+        conditioning_cache_max_size_mb=capacity / 1024**2,
+        should_cpu_offload_component=lambda _: False,
+    )
+    with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+        stage = stage_type([encoder], [object()])
+    stage._text_encode_dp_group = Mock(return_value=None)
+    stage.encode_text = partial(stage.encode_text, device=device)
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": encoder},
+        _stage_name_mapping={"text": stage},
+        component_residency_strategies={},
+    )
+    executor = SyncExecutor(args)
+    manager = ComponentResidencyManager(pipeline, args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = False
+    manager.strategy_for = Mock(return_value=strategy)
+    executor.component_residency_manager = manager
+    return executor, stage, encoder, args
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 4096])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_grouped_conditioning_reuses_positive_and_negative_independently(
+    capacity, device
+):
+    executor, stage, encoder, args = make_group_executor(
+        TextEncodingStage, device, capacity
+    )
+
+    def requests():
+        return [
+            Req(
+                sampling_params=SamplingParams(
+                    prompt=prompt, negative_prompt="bad quality"
+                ),
+                do_classifier_free_guidance=True,
+            )
+            for prompt in ("hello", "different", "hello")
+        ]
+
+    first = executor.execute_group([stage], requests(), args)
+    assert encoder.calls == 3  # two positives, one shared negative
+    assert executor.conditioning_cache.group_hits == 3
+    assert first[0].prompt_embeds[0] is first[2].prompt_embeds[0]
+    assert first[0].negative_prompt_embeds[0] is first[1].negative_prompt_embeds[0]
+    assert first[0].prompt_seq_lens is not first[2].prompt_seq_lens
+    assert first[0].prompt_seq_lens[0] is not first[2].prompt_seq_lens[0]
+    expected = first[0].prompt_embeds[0].clone()
+    first[0].prompt_embeds[0].zero_()
+    first[0].prompt_seq_lens[0][0] = 0
+    assert executor.conditioning_cache._group_entries.get() is None
+
+    second = executor.execute_group([stage], requests(), args)
+    assert encoder.calls == (3 if capacity == 4096 else 6)
+    torch.testing.assert_close(second[0].prompt_embeds[0], expected, rtol=0, atol=0)
+    assert second[0].prompt_seq_lens == [[2]]
+    assert executor.conditioning_cache.bytes <= capacity
+
+
+@torch.no_grad()
+def test_grouped_longlive_conditioning_keeps_per_request_shot_metadata():
+    executor, stage, encoder, args = make_group_executor(
+        LongLive2TextEncodingStage, "cpu", 0
+    )
+    requests = [
+        Req(
+            sampling_params=LongLive2SamplingParams(
+                prompt="hello",
+                shot_prompts=["first", "second"],
+                shot_durations=[1, 1],
+                num_frames=2,
+            ),
+            do_classifier_free_guidance=False,
+        )
+        for _ in range(2)
+    ]
+    outputs = executor.execute_group([stage], requests, args)
+    assert encoder.calls == 1
+    for key in (
+        CAUSAL_BLOCK_PROMPTS_KEY,
+        CAUSAL_SCENE_CUT_MASK_KEY,
+        CAUSAL_SHOT_INDICES_KEY,
+    ):
+        assert key in outputs[0].extra and key in outputs[1].extra
+        assert outputs[0].extra[key] == outputs[1].extra[key]
+        assert outputs[0].extra[key] is not outputs[1].extra[key]
 
 
 def get_negative_embedding_twice(stage, server_args, first_req, second_req=None):
