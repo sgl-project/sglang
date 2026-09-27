@@ -520,7 +520,9 @@ def _inference_cache(model, *, share_in_group=False):
     if cache is None or model.training or torch.is_grad_enabled():
         return None
     # FSDP reuses only consumed stage outputs, never sharded intermediate states
-    if not _cross_request_cache.get() and not share_in_group:
+    if not _cross_request_cache.get() and (
+        not share_in_group or cache._group_entries.get() is None
+    ):
         return None
     # graph capture cannot hash or copy CUDA values through host memory
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
