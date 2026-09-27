@@ -1525,6 +1525,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notify, _ = self._await_handles(handles, failure_seen=True)
                 if notify:
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
+                    # Every handle settled => this chunk's writes are done, but
+                    # the normal-path decrement was never reached; without it
+                    # the abort ack for this room can never fire, so the
+                    # decode's deferred release always runs out the full
+                    # timeout (mooncake decrements + acks on its failure path).
+                    if kv_chunk.staging_counted:
+                        self._staging_outstanding[room] -= 1
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
