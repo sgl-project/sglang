@@ -44,7 +44,6 @@ python -m sglang.launch_server \
   --model-path /models/laya-sglang \
   --tokenizer-path /models/laya-hf/tokenizer \
   --is-embedding \
-  --attention-backend fa3 \
   --host 127.0.0.1 --port 30000
 ```
 
@@ -108,19 +107,36 @@ own evaluation harness (`mteb/amazon_massive_intent`, `en`, `test`, 100 cases, 2
 
 Per-case the two implementations agree on the chosen option in 100 of 100 cases.
 
-## Attention backend
+## Attention backend and CUDA graph
 
-ModernBERT alternates full and sliding (local) attention. The local layers keep keys within
-`|i - j| <= local_attention / 2`, and this implementation computes that window itself rather
-than relying on the attention backend, because the windowed path is not implemented
-consistently across backends: some apply it only for causal attention, and the
-FlashAttention window does not reproduce the same mask. Routing this model through the
-backend instead gives measurably different probabilities. Set
-`SGLANG_LAYA_ATTENTION_BACKEND=1` to use the backend anyway, for comparison.
+ModernBERT alternates full and sliding (local) attention. The local layers keep
+keys within `|i - j| <= local_attention / 2`, and this implementation computes
+that window itself rather than relying on the attention backend, because the
+windowed backend path is not implemented consistently across backends: some apply
+it only for causal attention, and the FlashAttention window does not reproduce the
+same mask. Routing this model through the backend instead gives measurably
+different probabilities. Set `SGLANG_LAYA_ATTENTION_BACKEND=1` to use the backend
+anyway, for comparison.
+
+Because the mask is built from device tensors that are refreshed on every step,
+and every loop bound comes from a shape, the encoder runs under a prefill CUDA
+graph with no extra flag: the server captures it automatically (`backend=breakable`).
+The decision head and the pooler stay eager, since they build one variable-length
+vector per request. On one A100-PCIE-40GB, with 177-197 token prompts, a
+single-request round trip is:
+
+| | p50 | mean |
+| --- | --- | --- |
+| CUDA graph | 12.96 ms | 13.46 ms |
+| no CUDA graph | 28.73 ms | 28.84 ms |
+
+Both configurations return the same values: per case the chosen option is
+identical in 100 of 100 evaluation cases and the probabilities agree to 0.0.
 
 ## Limitations
 
 - The encoder computes its own attention, so the paged KV cache is not used.
+- The decision head and the pooler run eagerly; only the encoder is captured.
 - Tensor parallelism is not supported: the decision head pools per request and is not
   sharded. Launch with `--tp-size 1`.
 - The `act` head carries little usable signal on the published checkpoint; the model card
