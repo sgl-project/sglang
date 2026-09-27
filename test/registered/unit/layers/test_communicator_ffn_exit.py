@@ -447,7 +447,15 @@ class TestSelectFfnCompletion(CustomTestCase):
 SRT_DIR = Path(sglang.__file__).resolve().parent / "srt"
 # Attributes a decoder layer holds its FFN, or parts of it, in. A layer that is
 # one FFN stage holds it in ``mixer``.
-FFN_ATTRS = {"mlp", "moe", "shared_expert", "shared_experts", "share_expert", "mixer"}
+FFN_ATTRS = {
+    "mlp",
+    "moe",
+    "shared_expert",
+    "shared_experts",
+    "share_expert",
+    "mixer",
+    "feed_forward",
+}
 
 
 def can_be_true(value, params):
