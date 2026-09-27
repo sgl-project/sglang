@@ -282,6 +282,15 @@ class UnifiedTreeCoreInterface(ABC):
         counts; the result carries the freed slots."""
         ...
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
+
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
     @abstractmethod
@@ -349,6 +358,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Evictable token count for one component (0 if the component is absent)."""
         ...
 
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
+
     @abstractmethod
     def full_evictable_size(self) -> int: ...
 
@@ -389,6 +402,21 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match a key against the tree; returns device indices + boundary NodeIds."""
+        ...
+
+    @abstractmethod
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Return (matched tokens, deepest node, FULL tokens pinned by it)."""
+        ...
+
+    @abstractmethod
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only FULL device values on the node's root path."""
+        ...
+
+    @abstractmethod
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        """Release a pin acquired by inc_full_pin."""
         ...
 
     def supports_fast_match_prefix(self) -> bool:
@@ -495,9 +523,13 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build a component's HiCache transfers for the given node and phase."""

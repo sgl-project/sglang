@@ -89,7 +89,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -637,12 +640,43 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
+        # TODO Need to create mxfp8 attention scheme and port the code below
+        from sglang.multimodal_gen import envs
+
+        quant_description = getattr(quant_config, "quant_description", {})
+        self.use_offline_qk_rotation = (
+            quant_description.get(f"{prefix}.q_rot") == "FLOAT"
+            and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
+            and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+        )
+        if self.use_offline_qk_rotation:
+            self.register_buffer(
+                "q_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            self.register_buffer(
+                "k_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            quant_config.use_offline_qk_rotation = True
+
         self.attn = USPAttention(
             num_heads=self.local_heads if self.shard_qkv else num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -736,6 +770,19 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 is_neox=False,
                 allow_inplace=True,
             )
+
+        # Offline rotations belong to the MXFP8 FA contract.
+        if (
+            self.use_offline_qk_rotation
+            and self.attn.backend is AttentionBackendEnum.FA
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        ):
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
 
         x = self.attn(
             query,

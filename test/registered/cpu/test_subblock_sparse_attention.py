@@ -17,9 +17,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SubBlockSparseAttentionImpl,
     _get_subblock_sparse_attention_runner,
+    _sage_key_block_size,
     _sm90_sage_fp8_sparse_attention,
     _sm90_sparse_attention,
     _sm100_sparse_attention,
+    _sm120_sage_fp8_sparse_attention,
     _sm120_sparse_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
@@ -160,11 +162,11 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
         self.assertIs(bf16_runner, _sm90_sparse_attention)
         self.assertIs(sage_runner, _sm90_sage_fp8_sparse_attention)
 
-    def test_rejects_sm90_sage_fp8_on_sm100_until_adapter_is_wired(self):
+    def test_rejects_sage_fp8_on_sm100(self):
         device = torch.device("cuda:0")
         with (
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-            self.assertRaisesRegex(RuntimeError, "currently targets SM90"),
+            self.assertRaisesRegex(RuntimeError, "does not support SubBlock"),
         ):
             _get_subblock_sparse_attention_runner(device, "sage_fp8")
 
@@ -174,6 +176,48 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
             runner = _get_subblock_sparse_attention_runner(device)
 
         self.assertIs(runner, _sm120_sparse_attention)
+
+    def test_sm120_sage_dispatch_and_block_geometry(self):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+        ):
+            self.assertEqual(_sage_key_block_size(), 64)
+            self.assertIs(
+                _get_subblock_sparse_attention_runner(
+                    torch.device("cuda:0"), "sage_fp8"
+                ),
+                _sm120_sage_fp8_sparse_attention,
+            )
+
+    def test_sm120_sage_preserves_partial_blocks_and_variable_counts(self):
+        q = torch.randn(1, 65, 2, 128, dtype=torch.bfloat16)
+        k = torch.randn(1, 129, 2, 128, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        index = torch.tensor([[[[2, 0], [1, 0]], [[0, 2], [2, 1]]]], dtype=torch.int32)
+        counts = torch.tensor([[[2, 1], [0, 2]]], dtype=torch.int32)
+        quantized = tuple(object() for _ in range(6))
+        quantize = Mock(return_value=quantized)
+        attention = Mock(return_value=q.transpose(1, 2).contiguous())
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "subblock_sparse_attn._load_sm120_sage_ops",
+            return_value=(quantize, attention),
+        ):
+            result = _sm120_sage_fp8_sparse_attention(q, k, v, index, 2, 0.125, counts)
+        torch.testing.assert_close(result, q)
+        for actual, source in zip(quantize.call_args.args, (q, k, v)):
+            torch.testing.assert_close(actual, source.transpose(1, 2))
+            self.assertTrue(actual.is_contiguous())
+        self.assertEqual(attention.call_args.args[:6], quantized)
+        torch.testing.assert_close(attention.call_args.args[6], index)
+        kwargs = attention.call_args.kwargs
+        torch.testing.assert_close(
+            kwargs["block_sizes"], torch.tensor([64, 64, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(kwargs["q2k_block_nums"], counts)
+        self.assertEqual(kwargs["backend"], "cute_dsl")
+        self.assertEqual(kwargs["softmax_scale"], 0.125)
 
     def test_platform_resolver_loads_sm120_dependency(self):
         capability = Mock(major=12, minor=0)
@@ -231,14 +275,6 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
         )
         self.assertIs(kwargs["q2k_block_nums"], block_counts)
         self.assertEqual(kwargs["softmax_scale"], 0.125)
-
-    def test_rejects_sage_fp8_on_sm120_until_adapter_is_wired(self):
-        device = torch.device("cuda:0")
-        with (
-            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
-            self.assertRaisesRegex(RuntimeError, "currently targets SM90"),
-        ):
-            _get_subblock_sparse_attention_runner(device, "sage_fp8")
 
     def test_rejects_unsupported_compute_capability(self):
         device = torch.device("cuda:0")
@@ -323,6 +359,68 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
 
         get_backend.assert_not_called()
 
+    def test_sm120_sage_dependency_is_checked_during_server_validation(self):
+        config = MiniMaxH3PipelineConfig()
+        server_args = self._subblock_server_args("sage_fp8")
+        loader = Mock()
+        with (
+            patch.object(current_platform, "is_mps", return_value=False),
+            patch.object(
+                current_platform,
+                "get_device_capability",
+                return_value=DeviceCapability(12, 0),
+            ),
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "get_global_forced_attn_backend",
+                return_value=None,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "subblock_sparse_attn._load_sm120_sage_ops",
+                loader,
+            ),
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "get_attn_backend"
+            ),
+        ):
+            config.validate_server_args(server_args)
+
+        loader.assert_called_once_with()
+
+    def test_missing_sm120_sage_dependency_fails_server_validation(self):
+        config = MiniMaxH3PipelineConfig()
+        server_args = self._subblock_server_args("sage_fp8")
+        with (
+            patch.object(current_platform, "is_mps", return_value=False),
+            patch.object(
+                current_platform,
+                "get_device_capability",
+                return_value=DeviceCapability(12, 0),
+            ),
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "get_global_forced_attn_backend",
+                return_value=None,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "subblock_sparse_attn._load_sm120_sage_ops",
+                side_effect=ImportError("FlashInfer SM120 Sage backend is unavailable"),
+            ),
+            patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "get_attn_backend"
+            ) as get_backend,
+            self.assertRaisesRegex(
+                ImportError, "FlashInfer SM120 Sage backend is unavailable"
+            ),
+        ):
+            config.validate_server_args(server_args)
+
+        get_backend.assert_not_called()
+
     def test_bf16_does_not_require_sparge_attention(self):
         config = MiniMaxH3PipelineConfig()
         server_args = self._subblock_server_args("bf16")
@@ -348,7 +446,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
 
         loader.assert_not_called()
 
-    def test_sage_fp8_rejects_non_sm90_during_server_validation(self):
+    def test_sage_fp8_rejects_sm100_during_server_validation(self):
         config = MiniMaxH3PipelineConfig()
         server_args = self._subblock_server_args("sage_fp8")
         with (

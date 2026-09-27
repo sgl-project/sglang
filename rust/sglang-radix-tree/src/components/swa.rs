@@ -925,9 +925,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         _mamba_pool_idx: Option<Tensor>,
-        host_indices: Option<Tensor>,
+        _host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
+        staging_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         // unified_kv keeps SWA as a device-only ring.
@@ -1024,12 +1025,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 }])
             }
             CacheTransferPhase::Prefetch => {
-                let host_indices = host_indices.expect("SWA PREFETCH build requires host indices");
-                let sw_pages = host_indices.numel() / tree_core.page_size;
+                // Staging is allocated once the hit is known; the placeholders
+                // carry the planned page count and the trailing hashes fill in
+                // at commit.
+                let num_pages = staging_tokens / tree_core.page_size;
+                if num_pages == 0 {
+                    return Ok(None);
+                }
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
-                    host_indices: Some(host_indices),
-                    keys: Some(vec!["__placeholder__".to_string(); sw_pages]),
+                    keys: Some(vec!["__placeholder__".to_string(); num_pages]),
                     hit_policy: PoolHitPolicy::TrailingPages,
                     ..Default::default()
                 }])
@@ -1227,11 +1232,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             cur = parent;
         }
 
-        if lock_host {
-            result.swa_uuid_for_host_lock = swa_uuid;
-        } else {
-            result.swa_uuid_for_lock = swa_uuid;
-        }
+        result.set_lock_uuid(SWA.idx() as u8, swa_uuid, lock_host);
         result
     }
 
@@ -1242,11 +1243,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         params: &DecLockRefParams,
         lock_host: bool,
     ) {
-        let swa_uuid_for_lock = if lock_host {
-            params.swa_uuid_for_host_lock
-        } else {
-            params.swa_uuid_for_lock
-        };
+        if tree_core.arena.node(node_id).is_root() {
+            return;
+        }
+        let swa_uuid_for_lock = params.get_lock_uuid(SWA.idx() as u8, lock_host);
 
         let mut cur = node_id;
         loop {
@@ -1306,10 +1306,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        swa_uuid_for_lock: Option<i64>,
+        params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
+        if tree_core.arena.node(node_id).is_root() {
+            return;
+        }
+        let swa_uuid_for_lock = params.get_lock_uuid(SWA.idx() as u8, false);
         let ct = SWA;
         let mut cur = node_id;
         loop {

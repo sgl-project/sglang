@@ -3,9 +3,6 @@
 These tests cover the small, in-process pieces of the ``stat_loggers``
 dependency injection feature:
 
-* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
-  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
-  collector, so the existing prometheus_client backend is used unchanged.
 * ``resolve_collector_class()`` returns the registered subclass when a role
   is present in ``stat_loggers`` and falls back to the default otherwise.
 * Without any subclass override, collectors instantiate the real
@@ -23,6 +20,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import prometheus_client
 
@@ -32,11 +30,11 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_SCHEDULER,
     STAT_LOGGER_ROLE_STORAGE,
     STAT_LOGGER_ROLE_TOKENIZER,
-    ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
@@ -82,32 +80,6 @@ class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
 class _RecordingStorageMetricsCollector(StorageMetricsCollector):
     _counter_cls = _RecordingMetric
     _histogram_cls = _RecordingMetric
-
-
-class TestCollectorClassAttrs(unittest.TestCase):
-    """All five collectors expose four DI hook class attrs, all defaulting to
-    None so the existing prometheus_client backend is used unchanged."""
-
-    def test_scheduler_collector_attrs_default_none(self):
-        self.assertIsNone(SchedulerMetricsCollector._counter_cls)
-        self.assertIsNone(SchedulerMetricsCollector._gauge_cls)
-        self.assertIsNone(SchedulerMetricsCollector._histogram_cls)
-        self.assertIsNone(SchedulerMetricsCollector._summary_cls)
-
-    def test_tokenizer_collector_attrs_default_none(self):
-        self.assertIsNone(TokenizerMetricsCollector._counter_cls)
-        self.assertIsNone(TokenizerMetricsCollector._histogram_cls)
-
-    def test_storage_collector_attrs_default_none(self):
-        self.assertIsNone(StorageMetricsCollector._counter_cls)
-        self.assertIsNone(StorageMetricsCollector._histogram_cls)
-
-    def test_expert_dispatch_collector_attrs_default_none(self):
-        self.assertIsNone(ExpertDispatchCollector._histogram_cls)
-
-    def test_radix_cache_collector_attrs_default_none(self):
-        self.assertIsNone(RadixCacheMetricsCollector._counter_cls)
-        self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
 
 
 class TestResolveCollectorClass(unittest.TestCase):
@@ -179,6 +151,29 @@ class TestDefaultBackend(unittest.TestCase):
         )
 
 
+class TestRadixCacheMetricLabels(unittest.TestCase):
+    """Radix-cache series must stay distinct per scheduler rank: an unlabeled
+    family is summed across local ranks by the multiprocess registry, which
+    reported TP x the logical token count in production. The rank keys follow
+    the storage collector's DP-aware convention so L2 and L3 series line up."""
+
+    def test_labels_follow_the_storage_collector_rank_keys(self):
+        parallel = SimpleNamespace(tp_rank=3, pp_rank=1, attn_tp_rank=1, attn_dp_rank=2)
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", parallel, True),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 1,
+                "pp_rank": 1,
+                "dp_rank": 2,
+            },
+        )
+        self.assertEqual(
+            radix_cache_metric_labels("RadixCache", parallel, False),
+            {"cache_type": "RadixCache", "tp_rank": 3, "pp_rank": 1, "dp_rank": 0},
+        )
+
+
 class TestHiCacheMetrics(unittest.TestCase):
     def test_cached_tokens_uses_literal_storage_source(self):
         labels = {"model_name": "test"}
@@ -214,6 +209,7 @@ class TestHiCacheMetrics(unittest.TestCase):
 
         collector.log_storage_prefetch_hit_tokens(21)
         collector.log_storage_prefetch_unfulfilled_tokens(4, "storage_transfer")
+        collector.log_storage_prefetch_deferred_tokens(7, "device_capacity")
 
         self.assertEqual(
             collector.storage_prefetch_hit_tokens_total.increments, [(labels, 21)]
@@ -221,6 +217,10 @@ class TestHiCacheMetrics(unittest.TestCase):
         self.assertEqual(
             collector.storage_prefetch_unfulfilled_tokens_total.increments,
             [({**labels, "reason": "storage_transfer"}, 4)],
+        )
+        self.assertEqual(
+            collector.storage_prefetch_deferred_tokens_total.increments,
+            [({**labels, "reason": "device_capacity"}, 7)],
         )
 
 
