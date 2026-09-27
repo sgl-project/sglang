@@ -18,10 +18,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -37,7 +34,6 @@ from sglang.srt.models.nemotron_h import (
     NemotronHForCausalLM,
     NemotronHMoEDecoderLayer,
 )
-from sglang.srt.models.nemotron_h_utils import is_attn_layer
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -115,6 +111,9 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         )
 
         if self.has_end_norm:
+            hidden_states, residual = self.layer_communicator.finish_layer_stack(
+                hidden_states, residual, forward_batch
+            )
             if residual is not None:
                 hidden_states = hidden_states + residual
                 residual = None
@@ -142,10 +141,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
-        _pat = config.mtp_hybrid_override_pattern
-        self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
-            _pat[(layer_idx - 1) % len(_pat)]
-        )
         self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
@@ -194,13 +189,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                     hidden_states, dim=-1
                 )
 
-        if (
-            is_dp_attention_enabled()
-            and self.prev_layer_is_attn
-            and residual is not None
-        ):
-            hidden_states = attn_tp_all_reduce(hidden_states)
-
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
@@ -208,6 +196,9 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
 
         if self.has_end_norm:
+            hidden_states, residual = self.layer_communicator.finish_layer_stack(
+                hidden_states, residual, forward_batch
+            )
             if residual is not None:
                 hidden_states = hidden_states + residual
                 residual = None
