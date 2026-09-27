@@ -161,12 +161,12 @@ CASES = {
 
 def build(case, num_layers, layer_id, config=None, **kwargs):
     """Construct one decoder layer with its submodules stubbed. Returns the
-    LayerCommunicator kwargs, the LayerScatterModes.init_new kwargs, and the
+    LayerCommunicator kwargs, the LayerFacts.init_new kwargs, and the
     names of the stubbed submodules it built."""
     module_name, class_name, make_config, stubs, _ = CASES[case]
     module = import_model(module_name)
     communicator = MagicMock()
-    scatter_modes = MagicMock()
+    facts = MagicMock()
     built = []
 
     def recording_stub(name):
@@ -176,7 +176,7 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
 
         return make
 
-    patches = dict(LayerCommunicator=communicator, LayerScatterModes=scatter_modes)
+    patches = dict(LayerCommunicator=communicator, LayerFacts=facts)
     patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
@@ -185,7 +185,7 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
             config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    return communicator.call_args.kwargs, scatter_modes.init_new.call_args.kwargs, built
+    return communicator.call_args.kwargs, facts.init_new.call_args.kwargs, built
 
 
 def planned_as_last(case, num_layers, layer_id, **kwargs):
@@ -268,7 +268,7 @@ class TestLastLayerCommunicator(CustomTestCase):
         self.assertTrue(planned["is_layer_sparse"])
 
 
-class TestLayerScatterModesLastLayer(CustomTestCase):
+class TestLayerFactsLastLayer(CustomTestCase):
     def test_the_plan_marks_the_last_layer(self):
         from sglang.srt.layers import communicator as comm
 
@@ -285,7 +285,7 @@ class TestLayerScatterModesLastLayer(CustomTestCase):
                 (1, 0),
             ):
                 with self.subTest(num_layers=num_layers, layer_id=layer_id):
-                    modes = comm.LayerScatterModes.init_new(
+                    modes = comm.LayerFacts.init_new(
                         layer_id=layer_id,
                         num_layers=num_layers,
                         is_layer_sparse=False,

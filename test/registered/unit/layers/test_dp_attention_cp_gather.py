@@ -245,7 +245,7 @@ class TestDpCpGather(CustomTestCase):
                         else patch.object(*target, value)
                     )
                 communicator = comm.LayerCommunicator(
-                    layer_scatter_modes=SimpleNamespace(
+                    layer_facts=SimpleNamespace(
                         is_first_layer=False,
                         is_last_layer=False,
                         is_layer_sparse=sparse,

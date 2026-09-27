@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.communicator import LayerCommunicator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -348,11 +348,10 @@ class TestAiterAllreduceFusionAmd(unittest.TestCase):
         )
 
 
-def _fake_self(*, mlp_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_size=8):
+def _fake_self(*, is_last_layer=False, tp_size=8):
     """Minimal stand-in for a LayerCommunicator with the fields the gate reads."""
     return types.SimpleNamespace(
         _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
         is_last_layer=is_last_layer,
         _context=types.SimpleNamespace(tp_size=tp_size),
     )
@@ -387,7 +386,6 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         aiter_enabled=True,
         use_aiter=True,
         tp_world_size=8,
-        mlp_mode=ScatterMode.TP_ATTN_FULL,
         is_last_layer=False,
         tp_size=8,
         forward_mode=ForwardMode.DECODE,
@@ -440,9 +438,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 patch_communicator("get_moe_a2a_backend", lambda: a2a_backend)
             )
 
-            fake_self = _fake_self(
-                mlp_mode=mlp_mode, is_last_layer=is_last_layer, tp_size=tp_size
-            )
+            fake_self = _fake_self(is_last_layer=is_last_layer, tp_size=tp_size)
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
                 fake_self, _fake_forward_batch(forward_mode=forward_mode)
             )

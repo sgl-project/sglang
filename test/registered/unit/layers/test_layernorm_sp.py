@@ -177,7 +177,7 @@ class TestSpRegionSteps(CustomTestCase):
         c._sp_steps = sp_region_steps()
         c._input_scattered_steps = None
         c._cp_steps = None
-        c.layer_scatter_modes = SimpleNamespace(
+        c.layer_facts = SimpleNamespace(
             is_first_layer=first_layer, is_layer_sparse=False
         )
         c.allow_reduce_scatter = False

@@ -51,7 +51,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -419,8 +419,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.mlp_layer_scatter_modes = [
-            LayerScatterModes.init_new(
+        self.mlp_layer_facts = [
+            LayerFacts.init_new(
                 layer_id=self.layer_id * 2 + i,
                 num_layers=config.num_hidden_layers,
                 is_layer_sparse=False,
@@ -432,7 +432,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         ]
         self.mlp_layer_communicator = [
             LayerCommunicator(
-                layer_scatter_modes=self.mlp_layer_scatter_modes[i],
+                layer_facts=self.mlp_layer_facts[i],
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
                 qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
@@ -441,7 +441,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             for i in range(2)
         ]
 
-        self.moe_layer_scatter_modes = LayerScatterModes.init_new(
+        self.moe_layer_facts = LayerFacts.init_new(
             layer_id=self.layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -450,7 +450,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             is_next_layer_sparse=True,
         )
         self.moe_layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.moe_layer_scatter_modes,
+            layer_facts=self.moe_layer_facts,
             input_layernorm=self.input_layernorm[0],
             post_attention_layernorm=self.post_attention_layernorm[0],
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,

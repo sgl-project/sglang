@@ -230,7 +230,7 @@ def test_communicator_publishes_layout_at_each_transition(
         expected_mlp = expected_attn = initial
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_scatter_modes = SimpleNamespace(is_first_layer=False)
+    communicator.layer_facts = SimpleNamespace(is_first_layer=False)
     communicator._context = SimpleNamespace()
     communicator._sp_steps = None
     communicator.post_attention_layernorm = None

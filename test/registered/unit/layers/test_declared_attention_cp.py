@@ -120,10 +120,6 @@ class TestAttentionCpBoundary(CustomTestCase):
                     lambda: SimpleNamespace(is_none=lambda: True),
                 ),
                 (
-                    (comm, "should_use_flashinfer_cutlass_moe_fp4_allgather"),
-                    lambda: False,
-                ),
-                (
                     (comm, "post_experts_reduction_group"),
                     lambda: moe_group or parallel.tp_group,
                 ),
@@ -165,7 +161,7 @@ class TestAttentionCpBoundary(CustomTestCase):
     def build(self, allow_reduce_scatter):
         # A MoE layer after a dense one; dense layers run on every rank here.
         return comm.LayerCommunicator(
-            layer_scatter_modes=SimpleNamespace(
+            layer_facts=SimpleNamespace(
                 is_first_layer=False,
                 is_last_layer=False,
                 is_layer_sparse=True,
