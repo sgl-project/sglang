@@ -517,7 +517,10 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.memcpy_triton import (
+    memcpy_triton,
+    memcpy_triton_with_zero_fill,
+)
 from sglang.srt.distributed.utils import all_gather_single
 
 
@@ -555,6 +558,20 @@ def memcpy(dst, src, dim, offset, sz, offset_src):
     memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
+def memcpy_cpu_with_zero_fill(dst, src, dim, offset, sz, offset_src):
+    dst.fill_(0)
+    memcpy_cpu(dst, src, dim, offset, sz, offset_src)
+
+
+memcpy_with_zero_fill_func = (
+    memcpy_cpu_with_zero_fill if _is_cpu else memcpy_triton_with_zero_fill
+)
+
+
+def memcpy_with_zero_fill(dst, src, dim, offset, sz, offset_src):
+    memcpy_with_zero_fill_func(dst, src, dim, offset, sz, offset_src)
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -563,7 +580,6 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -572,7 +588,11 @@ def _dp_gather_via_all_reduce(
             "aliasing between global_tokens and local_tokens not allowed"
         )
 
-        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
+        memcpy_with_zero_fill(
+            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+        )
+    else:
+        global_tokens.fill_(0)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
@@ -931,7 +951,6 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
@@ -939,7 +958,11 @@ def dp_scatter(
             "aliasing between local_tokens and global_tokens not allowed"
         )
 
-        memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
+        memcpy_with_zero_fill(
+            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+        )
+    else:
+        local_tokens.fill_(0)
 
 
 def can_use_dp_reduce_scatter() -> bool:
