@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNormNoWeight,
     apply_qk_norm,
 )
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
@@ -538,9 +539,12 @@ class TestFlux2EagerFusions(CustomTestCase):
 # -------------------------------------------------------------------------
 
 
-class _PackedAddedQKV(nn.Module):
+class _PackedAddedQKV(MergedColumnParallelLinear):
+    # The lossless split only applies to a MergedColumnParallelLinear (LoRA
+    # wrappers are called as they are), so the fake must be one; its __init__
+    # is skipped because it needs no parallel state.
     def __init__(self, dim: int):
-        super().__init__()
+        nn.Module.__init__(self)
         self.output_partition_sizes = [dim, dim, dim]
         self.quant_config = None
         self.weight = nn.Parameter(
