@@ -303,6 +303,9 @@ def _cake_prefill_gate_bound_ok(
     return math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0
 
 
+_CAKE_DEBUG_CHECKS = os.environ.get("SGLANG_KDA_CAKE_DEBUG_CHECKS", "0") == "1"
+
+
 def _cake_prefill_api_policy() -> str:
     """``auto`` (default), ``prepared`` or ``facade`` from SGLANG_KDA_CAKE_PREFILL_API.
 
@@ -785,6 +788,18 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             if needs_checkpoints
             else None
         )
+        if _CAKE_DEBUG_CHECKS:
+            self._debug_check_cake_prepared_inputs(
+                q,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc_fi=query_start_loc_fi,
+                sequence_lengths=sequence_lengths,
+                needs_checkpoints=needs_checkpoints,
+                num_state_checkpoints=num_state_checkpoints,
+                state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+                state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            )
         plan_cache = self._cake_prefill_plan_cache()
         prepare_kwargs = {}
         if plan_cache is not None:
@@ -828,6 +843,75 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             if callable(close):
                 close()
         return out, state_checkpoints, schedule
+
+    @staticmethod
+    def _debug_check_cake_prepared_inputs(
+        q: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc_fi: torch.Tensor,
+        sequence_lengths,
+        needs_checkpoints: bool,
+        num_state_checkpoints: int,
+        state_checkpoint_cu_starts: Optional[torch.Tensor],
+        state_checkpoint_every_n_tokens: int,
+    ) -> None:
+        """Host-side bounds/consistency audit of the prepared-prefill inputs.
+
+        Enabled with ``SGLANG_KDA_CAKE_DEBUG_CHECKS=1`` (synchronises the
+        stream; diagnostics only).  Raises ``ValueError`` naming the offending
+        input instead of letting the kernel fault on it.
+        """
+        total_tokens = int(q.shape[1])
+        num_seqs = len(sequence_lengths)
+        pool_rows = int(ssm_states.shape[0])
+        ci = cache_indices.detach().to("cpu", dtype=torch.int64)
+        qsl = query_start_loc_fi.detach().to("cpu", dtype=torch.int64)
+        problems = []
+        if ci.numel() != num_seqs:
+            problems.append(f"cache_indices has {ci.numel()} rows for {num_seqs} sequences")
+        if ci.numel():
+            lo, hi = int(ci.min()), int(ci.max())
+            if lo < 0 or hi >= pool_rows:
+                problems.append(f"cache_indices outside [0, {pool_rows}): min={lo} max={hi}")
+            if int(torch.unique(ci).numel()) != ci.numel():
+                problems.append("duplicate cache_indices in one batch")
+        if qsl.numel() != num_seqs + 1 or int(qsl[0]) != 0:
+            problems.append(f"query_start_loc shape/origin mismatch: {qsl.tolist()[:8]}")
+        else:
+            diffs = (qsl[1:] - qsl[:-1]).tolist()
+            if diffs != [int(n) for n in sequence_lengths]:
+                problems.append(f"query_start_loc diffs {diffs[:8]} != extend_seq_lens_cpu {list(sequence_lengths)[:8]}")
+            if int(qsl[-1]) != total_tokens:
+                problems.append(f"query_start_loc[-1]={int(qsl[-1])} != q tokens {total_tokens}")
+        if any(int(n) <= 0 for n in sequence_lengths):
+            problems.append(f"non-positive sequence length in {list(sequence_lengths)[:8]}")
+        ckpt_summary = "ckpt=off"
+        if needs_checkpoints:
+            every = int(state_checkpoint_every_n_tokens)
+            if state_checkpoint_cu_starts is None or every <= 0:
+                problems.append("checkpoints requested without cu_starts/interval")
+            else:
+                cs = state_checkpoint_cu_starts.detach().to("cpu", dtype=torch.int64)
+                counts = [(int(n) - 1) // every + 1 for n in sequence_lengths]
+                expected = [0]
+                for c in counts:
+                    expected.append(expected[-1] + c)
+                if cs.tolist() != expected:
+                    problems.append(f"checkpoint_cu_starts {cs.tolist()[:8]} != expected {expected[:8]}")
+                if int(cs[-1]) != int(num_state_checkpoints):
+                    problems.append(f"num_state_checkpoints={num_state_checkpoints} != cu_starts[-1]={int(cs[-1])}")
+                ckpt_summary = f"ckpt=every{every} rows={int(num_state_checkpoints)}"
+        summary = (
+            f"cake prepared prefill inputs: T={total_tokens} N={num_seqs} "
+            f"seq_lens(min/max)={min(sequence_lengths) if num_seqs else 0}/{max(sequence_lengths) if num_seqs else 0} "
+            f"cache_idx(min/max)={int(ci.min()) if ci.numel() else -1}/{int(ci.max()) if ci.numel() else -1} "
+            f"pool_rows={pool_rows} {ckpt_summary} q_contig={q.is_contiguous()}"
+        )
+        if problems:
+            raise ValueError(summary + " | PROBLEMS: " + "; ".join(problems))
+        logger.info(summary)
 
     def _cake_prefill_plan_cache(self):
         """Per-kernel FlashInfer plan cache shared by every KDA layer.
