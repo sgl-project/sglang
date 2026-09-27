@@ -2493,6 +2493,30 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         self.assertEqual(result.normal_text, "before")
 
+    def test_truncated_marker_suffix_stays_hidden(self):
+        """
+        Test that a final partial marker does not leak into visible text.
+
+        Scenario: a complete call followed by visible text that ends mid-marker
+        ("after<tool_call", "after<fun", a lone "after<"). The streaming parser
+        buffers such tails as a potential tag start and never emits them.
+        Purpose: one-shot parsing must truncate at the same point (PR review
+        probe at b942209).
+        """
+        call = (
+            "<tool_call>\n<function=get_current_weather>\n"
+            "<parameter=location>Paris</parameter>\n</function>\n</tool_call>"
+        )
+        for tail in ("after<tool_call", "after<fun", "after<"):
+            with self.subTest(tail=tail):
+                result = self.detector.detect_and_parse(
+                    "before" + call + tail, self.tools
+                )
+
+                self.assertEqual(result.normal_text, "beforeafter")
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "get_current_weather")
+
     # ==================== Streaming Tests ====================
 
     def test_streaming_single_tool_call(self):

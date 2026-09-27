@@ -243,6 +243,26 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 idx = normal_text.find(token)
                 if idx != -1:
                     cut = min(cut, idx)
+            # A trailing fragment that prefixes a marker ("<tool_call",
+            # "<fun", a lone "<") is buffered by the streaming parser as a
+            # potential tag start and never emitted. Truncate one-shot output
+            # at the same point. Only an end-of-string tail can prefix a
+            # marker, so mid-text "<" in ordinary prose is not affected.
+            markers = (
+                self.tool_call_start_token,
+                self.tool_call_end_token,
+                self.tool_call_prefix,
+                self.function_end_token,
+                self.parameter_prefix,
+                self.parameter_end_token,
+            )
+            for i, ch in enumerate(normal_text):
+                if ch != "<":
+                    continue
+                tail = normal_text[i:]
+                if any(marker.startswith(tail) for marker in markers):
+                    cut = min(cut, i)
+                    break
             normal_text = normal_text[:cut]
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
