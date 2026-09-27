@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 
 if TYPE_CHECKING:
+    from flashinfer.kda import RecurrentKDAPrefillWrapper
+
     from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -97,6 +99,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
 
+    def plan(self, query_start_loc: torch.Tensor) -> RecurrentKDAPrefillWrapper:
+        from flashinfer.kda import RecurrentKDAPrefillWrapper
+
+        wrapper = RecurrentKDAPrefillWrapper(query_start_loc.device)
+        wrapper.plan(query_start_loc)
+        return wrapper
+
     def extend(
         self,
         q: torch.Tensor,
@@ -119,6 +128,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         state_checkpoint_track_src: Optional[torch.Tensor] = None,
         state_checkpoint_indices: Optional[torch.Tensor] = None,
         track_ssm_h_batch_src: Optional[torch.Tensor] = None,
+        prefill_wrapper: Optional[RecurrentKDAPrefillWrapper] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
@@ -158,6 +168,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and g.shape[1] >= q.shape[1]
             and g[:, : q.shape[1]].is_contiguous()
             and num_sequences > 0
+            and query_start_loc.is_cuda
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and query_start_loc.is_contiguous()
             and q.shape[1] > num_sequences
             and cache_indices.ndim == 1
             and cache_indices.numel() == num_sequences
@@ -193,14 +206,14 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
                 **kwargs,
             )
 
-        from flashinfer.kda import recurrent_kda
-
+        if prefill_wrapper is None:
+            prefill_wrapper = self.plan(query_start_loc)
         checkpoints = (
             ssm_states.new_empty((num_state_checkpoints, *ssm_states.shape[1:]))
             if needs_checkpoint
             else None
         )
-        result = recurrent_kda(
+        result = prefill_wrapper.run(
             q=q.contiguous(),
             k=k.contiguous(),
             v=v.contiguous(),
@@ -215,7 +228,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
-            cu_seqlens=query_start_loc.to(torch.int64),
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,
@@ -228,7 +240,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             checkpoint_every_n_tokens=(
                 state_checkpoint_every_n_tokens if needs_checkpoint else 0
             ),
-            backend="cute-dsl",
         )
         if needs_checkpoint:
             kwargs["track_state"][track_ssm_h_batch_src] = checkpoints[

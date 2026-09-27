@@ -66,6 +66,7 @@ class ForwardMetadata:
     state_checkpoint_every_n_tokens: int = 0
     state_checkpoint_track_src: Optional[torch.Tensor] = None
     state_checkpoint_indices: Optional[torch.Tensor] = None
+    flashinfer_kda_prefill_wrapper: Optional[object] = None
     track_ssm_seq_idx: Optional[torch.Tensor] = None
     track_ssm_end_locs: Optional[torch.Tensor] = None
     track_ssm_recompute_dst: Optional[torch.Tensor] = None
