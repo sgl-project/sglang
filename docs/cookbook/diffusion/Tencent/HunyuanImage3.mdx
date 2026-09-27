@@ -60,6 +60,15 @@ sglang generate --model-path tencent/HunyuanImage-3.0-Instruct \
 
 ## 5. Deployment boundaries
 
+For an Ascend environment with four visible NPU devices and sufficient aggregate memory, the equivalent TP4 launch is:
+
+```bash
+sglang serve --model-path tencent/HunyuanImage-3.0-Instruct \
+  --num-gpus 4 --tp-size 4 --ulysses-degree 1 --port 30010
+```
+
+Here `--num-gpus` counts visible accelerator devices, including NPUs. Follow the platform installation guide for compatible PyTorch/CANN packages; do not install the CUDA extra into an NPU environment.
+
 Use TP to shard transformer weights; keep Ulysses and Ring at 1. This pipeline does not implement sequence-parallel attention or CFG-parallel execution. The vision encoder and VAE remain replicated, so increasing TP does not divide every component's memory usage. Approximately 160 GB of BF16 transformer weights is only a capacity estimate, not a peak-VRAM measurement: leave room for those components, activations, and loading buffers.
 
 Compatible requests can be grouped with `--batching-max-size` and `--batching-delay-ms`. Begin at batch size 1, then validate peak memory at the largest reference-image count and output size you intend to serve. Different prompt/seed values can share a batch; incompatible conditioning and sampling settings cannot.
