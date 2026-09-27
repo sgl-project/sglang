@@ -491,7 +491,7 @@ class TextEncodingDPGroup:
         return torch.cat(outputs, dim=dim)
 
 
-def run_text_encoding_dp(rank, rendezvous):
+def run_text_encoding_dp(rank, rendezvous, grouped):
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -507,7 +507,7 @@ def run_text_encoding_dp(rank, rendezvous):
         group = TextEncodingDPGroup(rank)
         stage._text_encode_dp_group = Mock(return_value=group)
         cache = ConditioningCache(4096)
-        with torch.no_grad(), cache.scope():
+        with torch.no_grad(), cache.scope(), cache.group_scope(enabled=grouped):
             for attempt in range(3):
                 if attempt == 1 and rank == 0:
                     cache.clear()
@@ -525,10 +525,11 @@ def run_text_encoding_dp(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_batch_dp_keeps_gathering_on_rank_local_encoder_hits(tmp_path):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_batch_dp_keeps_gathering_on_rank_local_encoder_hits(tmp_path, grouped):
     mp.spawn(
         run_text_encoding_dp,
-        args=(f"file://{tmp_path / 'dp-rendezvous'}",),
+        args=(f"file://{tmp_path / 'dp-rendezvous'}", grouped),
         nprocs=2,
         join=True,
     )
