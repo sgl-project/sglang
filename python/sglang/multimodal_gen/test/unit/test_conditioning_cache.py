@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -305,7 +306,7 @@ def test_cuda_graph_capture_bypasses_host_cache():
     assert cache.hits == 0
 
 
-def _rank_eviction(rank, init_method, disabled_rank):
+def _rank_eviction(rank, init_method, disabled_rank, grouped=False):
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -325,22 +326,23 @@ def _rank_eviction(rank, init_method, disabled_rank):
             dist.all_reduce(flag)
             return model.forward(x)
 
-        with torch.no_grad():
+        with torch.no_grad(), cache.group_scope() if grouped else nullcontext():
             for attempt in range(3):
                 if attempt == 1 and rank == 0:
                     cache.clear()
                 cache.run(model, "forward", (x,), {}, compute, group)
-        assert model.calls == (3 if disabled_rank else 2)
-        assert cache.hits == (0 if disabled_rank else 1)
+        assert model.calls == (3 if disabled_rank and not grouped else 2)
+        assert cache.hits == (0 if disabled_rank and not grouped else 1)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("disabled_rank", [False, True])
-def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank, grouped):
     mp.spawn(
         _rank_eviction,
-        args=(f"file://{tmp_path / 'rendezvous'}", disabled_rank),
+        args=(f"file://{tmp_path / 'rendezvous'}", disabled_rank, grouped),
         nprocs=2,
         join=True,
     )
