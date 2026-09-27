@@ -13,9 +13,15 @@ you have requirements for other formats, you can submit an issue through this
 ## ROCm W4A16 linear layers
 
 Symmetric 4-bit group/channel checkpoints can use the optional ROCm vLLM GPTQ
-operators (`gptq_gemm` with `use_v2_format`, and `gptq_shuffle`, as in vLLM 0.16).
-Supported group sizes are 32, 64, 128, or channelwise; activation ordering is
-unsupported, and each local weight partition must have K and N divisible by 128.
+operators (`gptq_gemm` with `use_v2_format`, and `gptq_shuffle`, as in vLLM
+0.16). Both that signature and the one after
+[vllm-project/vllm#54809](https://github.com/vllm-project/vllm/pull/54809),
+which dropped the `g_idx` argument, are supported: the installed signature is
+detected once per weight load and adapted to transparently. Supported group
+sizes are 32, 64, 128, or channelwise; activation ordering is unsupported (and
+with a post-#54809 vLLM, whose kernels dropped activation-order support
+entirely, cannot be requested at all), and each local weight partition must
+have K and N divisible by 128.
 The kernel uses FP16 arithmetic. BF16 activations and scales are converted to
 FP16, so models must stay within FP16's numerical range. Checkpoint scales that
 overflow FP16 are rejected during loading. CUDA continues to use Marlin.

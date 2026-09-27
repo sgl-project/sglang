@@ -7,7 +7,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import sys
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import create_autospec, patch
 
 import torch
 from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
@@ -49,14 +49,63 @@ def make_layer(
     return scheme, layer, reference
 
 
-class TestRocmWNA16(unittest.TestCase):
+def _old_api_gptq_shuffle(q_weight, g_idx, bit):
+    """Autospec template: gptq_shuffle before vllm-project/vllm#54809."""
+
+
+def _old_api_gptq_gemm(
+    a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_exllama, use_v2_format, bit
+):
+    """Autospec template: gptq_gemm before vllm-project/vllm#54809."""
+
+
+def _new_api_gptq_shuffle(q_weight, bit):
+    """Autospec template: gptq_shuffle after vllm-project/vllm#54809 dropped
+    g_idx (activation ordering was removed from the ROCm GPTQ kernels)."""
+
+
+def _new_api_gptq_gemm(
+    a, b_q_weight, b_gptq_qzeros, b_gptq_scales, use_exllama, use_v2_format, bit
+):
+    """Autospec template: gptq_gemm after vllm-project/vllm#54809 dropped
+    g_idx (activation ordering was removed from the ROCm GPTQ kernels)."""
+
+
+class _RocmWNA16TestMixin:
+    """Shared coverage for both vLLM ROCm GPTQ op signatures.
+
+    vllm-project/vllm#54809 ("[Quant][Kernel] Remove GPTQ Group/Dynamic
+    Activation Ordering", 2026-09-08) dropped the g_idx argument from
+    gptq_shuffle/gptq_gemm. The two concrete subclasses below run this whole
+    suite against mocks shaped like the old (<= vLLM 0.16, e.g.
+    rocm/sgl-dev:rocm7-vllm-20250904) and new signatures respectively, using
+    ``create_autospec`` so ``inspect.signature`` -- which
+    ``_bind_rocm_gptq_ops`` relies on -- sees the real parameter count.
+
+    This is a plain mixin, not a ``unittest.TestCase`` itself: both unittest
+    and pytest discover *every* TestCase subclass in a module regardless of
+    name, so if this carried the test methods directly it would also run
+    (with its default ``NEW_API = False``) as its own, third, duplicate test
+    case. Only the two concrete subclasses below are TestCases.
+    """
+
+    NEW_API = False
+
     def setUp(self):
         self.platform = patch.object(wna16, "_is_hip", True)
         self.platform.start()
         self.addCleanup(self.platform.stop)
         self.ops = types.ModuleType("vllm._custom_ops")
-        self.ops.gptq_shuffle = Mock()
-        self.ops.gptq_gemm = Mock(side_effect=self.reference_gemm)
+        if self.NEW_API:
+            self.ops.gptq_shuffle = create_autospec(_new_api_gptq_shuffle)
+            self.ops.gptq_gemm = create_autospec(
+                _new_api_gptq_gemm, side_effect=self._reference_gemm_new_api
+            )
+        else:
+            self.ops.gptq_shuffle = create_autospec(_old_api_gptq_shuffle)
+            self.ops.gptq_gemm = create_autospec(
+                _old_api_gptq_gemm, side_effect=self.reference_gemm
+            )
         modules = patch.dict(
             sys.modules,
             {
@@ -82,6 +131,13 @@ class TestRocmWNA16(unittest.TestCase):
             q.float() - zeros.repeat_interleave(group_size, 0)
         ) * scales.repeat_interleave(group_size, 0)
         return (x.float() @ weight).half()
+
+    @classmethod
+    def _reference_gemm_new_api(cls, x, qw, qz, scales, exllama, v2, bits):
+        # The bound wrapper never forwards a non-trivial g_idx to the new
+        # API (see _bind_rocm_gptq_ops), so plug in the identity value here.
+        empty_g_idx = torch.empty(0, dtype=torch.int32)
+        return cls.reference_gemm(x, qw, qz, scales, empty_g_idx, exllama, v2, bits)
 
     def test_conversion_and_output(self):
         for k, n, group in [
@@ -178,6 +234,118 @@ class TestRocmWNA16(unittest.TestCase):
                 with self.assertRaises(AttributeError):
                     scheme.process_weights_after_loading(torch.nn.Module())
                 rocm.assert_not_called()
+
+
+class TestRocmWNA16(_RocmWNA16TestMixin, unittest.TestCase):
+    """Runs against the pre-#54809 (old) gptq_gemm/gptq_shuffle signatures."""
+
+
+class TestRocmWNA16NewAPI(_RocmWNA16TestMixin, unittest.TestCase):
+    """Runs the same suite against the post-#54809 (new) signatures, which
+    dropped g_idx."""
+
+    NEW_API = True
+
+
+class TestSignatureKind(unittest.TestCase):
+    """Direct coverage of the old/new signature classifier.
+
+    Only vLLM's real Python wrappers are supported. In particular, an
+    opaque ``(*args, **kwargs)`` callable -- what an un-wrapped
+    ``torch.ops._C`` op looks like from Python -- must never be silently
+    classified as either API, even though it happens to have as few
+    apparent parameters as the new signature.
+    """
+
+    def test_old_and_new_param_counts_are_classified(self):
+        self.assertEqual(
+            wna16._signature_kind(_old_api_gptq_shuffle, "gptq_shuffle", 3, 2),
+            "old",
+        )
+        self.assertEqual(
+            wna16._signature_kind(_new_api_gptq_shuffle, "gptq_shuffle", 3, 2),
+            "new",
+        )
+        self.assertEqual(
+            wna16._signature_kind(_old_api_gptq_gemm, "gptq_gemm", 8, 7), "old"
+        )
+        self.assertEqual(
+            wna16._signature_kind(_new_api_gptq_gemm, "gptq_gemm", 8, 7), "new"
+        )
+
+    def test_opaque_varargs_signature_is_rejected(self):
+        def opaque(*args, **kwargs):
+            pass
+
+        with self.assertRaisesRegex(NotImplementedError, "opaque"):
+            wna16._signature_kind(opaque, "gptq_shuffle", 3, 2)
+
+    def test_unrecognized_param_count_is_rejected(self):
+        def three_params(a, b, c):
+            pass
+
+        with self.assertRaisesRegex(NotImplementedError, "does not recognize"):
+            wna16._signature_kind(three_params, "gptq_gemm", 8, 7)
+
+
+class TestBindRocmGptqOps(unittest.TestCase):
+    """Direct coverage of the signature detection/adaptation itself."""
+
+    def test_old_signature_is_passed_through_unchanged(self):
+        shuffle = create_autospec(_old_api_gptq_shuffle)
+        gemm = create_autospec(_old_api_gptq_gemm)
+        bound_shuffle, bound_gemm = wna16._bind_rocm_gptq_ops(shuffle, gemm)
+        self.assertIs(bound_shuffle, shuffle)
+        self.assertIs(bound_gemm, gemm)
+
+    def test_new_signature_drops_trivial_g_idx(self):
+        shuffle = create_autospec(_new_api_gptq_shuffle)
+        gemm = create_autospec(_new_api_gptq_gemm, return_value="gemm-out")
+        bound_shuffle, bound_gemm = wna16._bind_rocm_gptq_ops(shuffle, gemm)
+
+        q_weight = torch.zeros(1, dtype=torch.int32)
+        empty_g_idx = torch.empty(0, dtype=torch.int32)
+        bound_shuffle(q_weight, empty_g_idx, 4)
+        shuffle.assert_called_once_with(q_weight, 4)
+
+        args = (torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1))
+        result = bound_gemm(*args, empty_g_idx, True, False, 4)
+        self.assertEqual(result, "gemm-out")
+        gemm.assert_called_once_with(*args, True, False, 4)
+
+    def test_new_signature_rejects_nontrivial_g_idx(self):
+        shuffle = create_autospec(_new_api_gptq_shuffle)
+        gemm = create_autospec(_new_api_gptq_gemm)
+        bound_shuffle, bound_gemm = wna16._bind_rocm_gptq_ops(shuffle, gemm)
+
+        q_weight = torch.zeros(1, dtype=torch.int32)
+        act_order_g_idx = torch.tensor([1, 0], dtype=torch.int32)
+        with self.assertRaisesRegex(NotImplementedError, "activation ordering"):
+            bound_shuffle(q_weight, act_order_g_idx, 4)
+        args = (torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1))
+        with self.assertRaisesRegex(NotImplementedError, "activation ordering"):
+            bound_gemm(*args, act_order_g_idx, True, False, 4)
+        shuffle.assert_not_called()
+        gemm.assert_not_called()
+
+    def test_opaque_ops_are_rejected_not_treated_as_new(self):
+        # An un-wrapped torch.ops._C op is (*args, **kwargs) from Python and
+        # happens to be callable with either arity; it must be rejected, not
+        # silently guessed at as the new (g_idx-less) API.
+        def opaque_shuffle(*args, **kwargs):
+            pass
+
+        def opaque_gemm(*args, **kwargs):
+            pass
+
+        with self.assertRaisesRegex(NotImplementedError, "opaque"):
+            wna16._bind_rocm_gptq_ops(opaque_shuffle, opaque_gemm)
+
+    def test_mismatched_signature_pair_is_rejected(self):
+        shuffle = create_autospec(_old_api_gptq_shuffle)  # old (3 params)
+        gemm = create_autospec(_new_api_gptq_gemm)  # new (7 params)
+        with self.assertRaisesRegex(NotImplementedError, "mismatched"):
+            wna16._bind_rocm_gptq_ops(shuffle, gemm)
 
 
 @unittest.skipUnless(torch.version.hip and torch.cuda.is_available(), "requires ROCm")

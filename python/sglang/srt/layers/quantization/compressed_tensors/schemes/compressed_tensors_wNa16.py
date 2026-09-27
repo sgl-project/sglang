@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 import logging
 from typing import Callable, Optional
 
@@ -51,6 +52,115 @@ if _is_cuda:
 ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
+
+
+_OLD_SHUFFLE_NPARAMS = 3  # gptq_shuffle(q_weight, g_idx, bit)
+_NEW_SHUFFLE_NPARAMS = 2  # gptq_shuffle(q_weight, bit)
+_OLD_GEMM_NPARAMS = 8  # gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_exllama, use_v2_format, bit)
+_NEW_GEMM_NPARAMS = 7  # gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, use_exllama, use_v2_format, bit)
+
+
+def _signature_kind(fn: Callable, name: str, old_nparams: int, new_nparams: int) -> str:
+    """Classify a vLLM ROCm GPTQ op as "old" or "new", rejecting anything
+    else with a clear error.
+
+    Only vLLM's real Python wrappers (``vllm._custom_ops.gptq_shuffle`` /
+    ``gptq_gemm``) are supported: plain ``def``s with a fixed, introspectable
+    argument count. A raw/opaque callable -- e.g. an un-wrapped
+    ``torch.ops._C`` op, whose Python-visible signature is ``(*args,
+    **kwargs)`` -- is deliberately never classified as either API: it is
+    rejected instead of silently guessed at.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError) as exc:
+        raise NotImplementedError(
+            f"ROCm WNA16 could not read {name}'s signature ({fn!r}): {exc}. "
+            "Only vLLM's plain Python vllm._custom_ops wrapper is supported, "
+            "not an opaque or raw-bound callable."
+        ) from exc
+    if any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in params.values()
+    ):
+        raise NotImplementedError(
+            f"ROCm WNA16 does not support an opaque {name} signature "
+            f"{inspect.signature(fn)}; pass vLLM's plain Python "
+            f"vllm._custom_ops.{name} wrapper, not a raw/variadic callable."
+        )
+    nparams = len(params)
+    if nparams == old_nparams:
+        return "old"
+    if nparams == new_nparams:
+        return "new"
+    raise NotImplementedError(
+        f"ROCm WNA16 does not recognize {name}'s signature "
+        f"{inspect.signature(fn)} ({nparams} params); expected {old_nparams} "
+        f"(pre-vllm-project/vllm#54809) or {new_nparams} (post-#54809)."
+    )
+
+
+def _bind_rocm_gptq_ops(gptq_shuffle: Callable, gptq_gemm: Callable) -> tuple:
+    """Adapt to either GPTQ ROCm op signature vLLM may expose.
+
+    vllm-project/vllm#54809 ("[Quant][Kernel] Remove GPTQ Group/Dynamic
+    Activation Ordering", 2026-09-08) dropped the g_idx argument from
+    ``gptq_shuffle``/``gptq_gemm``: the ROCm kernels themselves no longer
+    accept an activation-order permutation (the CUDA-graph-friendly
+    identity-order path becomes the only path). This module never builds a
+    non-trivial g_idx -- activation ordering is already rejected in
+    __init__ -- so we bind wrappers that keep the old (pre-#54809, e.g.
+    rocm/sgl-dev:rocm7-vllm-20250904) call shape our callers use, dropping
+    the always-empty g_idx when the installed vLLM no longer accepts it.
+    """
+    shuffle_kind = _signature_kind(
+        gptq_shuffle, "gptq_shuffle", _OLD_SHUFFLE_NPARAMS, _NEW_SHUFFLE_NPARAMS
+    )
+    gemm_kind = _signature_kind(
+        gptq_gemm, "gptq_gemm", _OLD_GEMM_NPARAMS, _NEW_GEMM_NPARAMS
+    )
+    if shuffle_kind != gemm_kind:
+        raise NotImplementedError(
+            f"ROCm WNA16 found mismatched vLLM GPTQ op signatures: "
+            f"gptq_shuffle looks {shuffle_kind} ({inspect.signature(gptq_shuffle)}) "
+            f"but gptq_gemm looks {gemm_kind} ({inspect.signature(gptq_gemm)}). "
+            "Check the installed vLLM build."
+        )
+    if shuffle_kind == "old":
+        return gptq_shuffle, gptq_gemm
+
+    def shuffle(q_weight: torch.Tensor, g_idx: torch.Tensor, bit: int) -> None:
+        if g_idx.numel():
+            raise NotImplementedError(
+                "ROCm WNA16 activation ordering is unsupported: the installed "
+                "vLLM's gptq_shuffle no longer accepts g_idx "
+                "(vllm-project/vllm#54809)."
+            )
+        gptq_shuffle(q_weight, bit)
+
+    def gemm(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_gptq_qzeros: torch.Tensor,
+        b_gptq_scales: torch.Tensor,
+        g_idx: torch.Tensor,
+        use_exllama: bool,
+        use_v2_format: bool,
+        bit: int,
+    ) -> torch.Tensor:
+        if g_idx.numel():
+            raise NotImplementedError(
+                "ROCm WNA16 activation ordering is unsupported: the installed "
+                "vLLM's gptq_gemm no longer accepts g_idx "
+                "(vllm-project/vllm#54809)."
+            )
+        return gptq_gemm(
+            a, b_q_weight, b_gptq_qzeros, b_gptq_scales, use_exllama,
+            use_v2_format, bit,
+        )
+
+    return shuffle, gemm
+
 
 __all__ = ["CompressedTensorsWNA16", "XPUCompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {
@@ -237,7 +347,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 "providing gptq_gemm and gptq_shuffle."
             ) from exc
 
-        self._rocm_gptq_gemm = gptq_gemm
+        rocm_gptq_shuffle, self._rocm_gptq_gemm = _bind_rocm_gptq_ops(
+            gptq_shuffle, gptq_gemm
+        )
         k, n = self.kernel_config.partition_weight_shape
         group_size = k if self.group_size == -1 else self.group_size
         if k % group_size:
@@ -265,7 +377,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             device=qweight.device,
         )
         g_idx = torch.empty(0, dtype=torch.int32, device=qweight.device)
-        gptq_shuffle(qweight, g_idx, 4)
+        rocm_gptq_shuffle(qweight, g_idx, 4)
 
         # Replace the checkpoint parameters rather than retaining duplicate
         # packed weights/scales alongside the serving representation.
