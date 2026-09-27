@@ -145,7 +145,13 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(
         track_state=ref_track,
         **common,
     )
-    with patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")):
+    with (
+        patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")),
+        patch(
+            "flashinfer.kda_kernels.kda_chunked_bt16._cu_seqlens_contents",
+            side_effect=AssertionError("cu_seqlens copied to host"),
+        ),
+    ):
         fi_output, _ = flashinfer.extend(
             q.clone(),
             k.clone(),
@@ -248,7 +254,16 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
         fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel,
         FlashInferKDAPrefillKernel,
     )
-    flashinfer_output = run_kda_fixture_eager(fixture)
+    kernel = fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel
+    with (
+        patch.object(kernel, "plan", wraps=kernel.plan) as plan,
+        patch(
+            "flashinfer.kda_kernels.kda_chunked_bt16._cu_seqlens_contents",
+            side_effect=AssertionError("cu_seqlens copied to host"),
+        ),
+    ):
+        flashinfer_output = run_kda_fixture_eager(fixture)
+    plan.assert_called_once()
 
     torch.testing.assert_close(
         flashinfer_output.float(), triton_output.float(), atol=3e-2, rtol=3e-2
