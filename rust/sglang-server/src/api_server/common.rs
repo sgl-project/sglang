@@ -173,6 +173,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "max_context_length": server_args.model_config.context_len,
         "max_total_num_tokens": server_args.max_total_num_tokens,
         "version": server_args.version,
+        "frontend": "rust",
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
@@ -240,5 +241,6 @@ mod tests {
         assert!(state0.get("api_key").is_none());
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
+        assert_eq!(v["frontend"], "rust");
     }
 }

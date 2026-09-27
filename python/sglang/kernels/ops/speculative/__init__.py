@@ -25,6 +25,7 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
     ("row_argmax", "row_argmax"),
+    ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

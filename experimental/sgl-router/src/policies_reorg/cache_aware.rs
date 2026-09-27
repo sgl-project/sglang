@@ -26,7 +26,7 @@ use crate::state::load_monitor::engine_reported_load::{
 };
 use crate::workers::Worker;
 
-use super::admission::{AllowAll, Decision, EngineAdmission};
+use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
@@ -173,7 +173,7 @@ impl CacheAwarePolicy {
             fallback: Arc::new(PowerOfTwoPolicy::new(Arc::clone(&engine_load))),
             engine_load,
             config,
-            admission: Arc::new(AllowAll),
+            admission: Arc::new(AdmissionLimits::default()),
         })
     }
 
@@ -236,11 +236,10 @@ impl CacheAwarePolicy {
     fn check(
         &self,
         engine: &Worker,
-        request: &PickRequest<'_>,
         load: &EngineReportedLoadSnapshot,
     ) -> Result<Option<Rejection>, PickError> {
-        let load = load.fresh_load_for_url(&engine.url);
-        Ok(match self.admission.check(engine, request, load)? {
+        let metrics = EngineMetrics::observe(engine, load);
+        Ok(match self.admission.check(engine, &metrics)? {
             Decision::Allow => None,
             Decision::Reject(reason) => Some(Rejection {
                 engine: engine.id.clone(),
@@ -252,13 +251,12 @@ impl CacheAwarePolicy {
     fn admit<'e>(
         &self,
         candidates: &[Candidate<'e>],
-        request: &PickRequest<'_>,
         load: &EngineReportedLoadSnapshot,
         rejections: &mut Vec<Rejection>,
     ) -> Result<Vec<Candidate<'e>>, PickError> {
         let mut admitted = Vec::new();
         for &candidate in candidates {
-            match self.check(candidate.engine, request, load)? {
+            match self.check(candidate.engine, load)? {
                 None => admitted.push(candidate),
                 Some(rejection) => rejections.push(rejection),
             }
@@ -316,7 +314,6 @@ impl CacheAwarePolicy {
         &self,
         candidates: &[Candidate<'_>],
         engines: &[Arc<Worker>],
-        request: &PickRequest<'_>,
         load: &EngineReportedLoadSnapshot,
     ) -> Result<Option<Pick>, PickError> {
         let limit = self.config.worker_queue_limit;
@@ -333,7 +330,7 @@ impl CacheAwarePolicy {
             evaluated.extend(&gated);
         }
         let mut rejections = Vec::new();
-        let admitted = self.admit(&evaluated, request, load, &mut rejections)?;
+        let admitted = self.admit(&evaluated, load, &mut rejections)?;
         if let Some(&least) = admitted.iter().min_by_key(|c| c.uncached_tokens) {
             let loads = FreshLoadLookup::new(Some(load), evaluated.iter().map(|c| c.engine));
             let guarded = self.config.pressure_guard
@@ -377,7 +374,7 @@ impl CacheAwarePolicy {
         if pinned {
             let loads = FreshLoadLookup::new(Some(load), gated.iter().map(|c| c.engine));
             let owner = self
-                .admit(&gated, request, load, &mut rejections)?
+                .admit(&gated, load, &mut rejections)?
                 .into_iter()
                 .min_by(|left, right| {
                     loads
@@ -430,7 +427,7 @@ impl Policy for CacheAwarePolicy {
             // Capture load after remote I/O; selection and admission share it.
             let load = self.engine_load.capture_snapshot(Instant::now());
             let candidates = self.candidates(engines, request, signal.as_deref(), &load);
-            if let Some(pick) = self.resolve(&candidates, engines, request, &load)? {
+            if let Some(pick) = self.resolve(&candidates, engines, &load)? {
                 return Ok(pick);
             }
             // Miss: fall back within the unqueued tier when one exists.
@@ -448,7 +445,7 @@ impl Policy for CacheAwarePolicy {
             if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
                 return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
             }
-            if let Some(rejection) = self.check(&pick.engine, request, &load)? {
+            if let Some(rejection) = self.check(&pick.engine, &load)? {
                 return Err(PickError::AdmissionRejected(rejection));
             }
             pick.reason = "no_cache_candidate";
