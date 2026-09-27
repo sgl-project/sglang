@@ -890,17 +890,34 @@ class DeepseekV2MoE(nn.Module):
         self._moe_quant_once: Optional[bool] = None
 
         if get_moe_runner_backend().is_gluon():
-            if getattr(config, "model_type", None) != "glm_moe_dsa":
+            from sglang.srt.layers.moe.gluon_backend import (
+                bind_gluon_moe_backend,
+                use_native_moe_with_gluon,
+            )
+
+            model_type = getattr(config, "model_type", None)
+            if model_type == "glm_moe_dsa":
+                from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+                    GlmMxfp4GluonMoeBackend,
+                )
+
+                bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
+            elif is_deepseek_v4 and self.is_hash:
+                # DSV4's hash-routed prefix has no router projection/top-k
+                # boundary for the Gluon kernel to own. Keep that explicit
+                # model subpath on the AITER runner prepared by Fp8MoEMethod.
+                use_native_moe_with_gluon(self)
+            elif is_deepseek_v4:
+                from sglang.srt.layers.moe.deepseek_v4_pro_gluon import (
+                    DeepseekV4ProGluonMoeBackend,
+                )
+
+                bind_gluon_moe_backend(self, DeepseekV4ProGluonMoeBackend())
+            else:
                 raise RuntimeError(
                     "--moe-runner-backend gluon supports only GLM-5.2/5.3 "
-                    "Quark MXFP4 checkpoints"
+                    "Quark MXFP4 or DeepSeek-V4 Pro native FP4 checkpoints"
                 )
-            from sglang.srt.layers.moe.glm_mxfp4_gluon import (
-                GlmMxfp4GluonMoeBackend,
-            )
-            from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
-
-            bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert

@@ -208,3 +208,24 @@ The benchmark results will be saved as plots and data files in the specified out
 - `benchmark_torch_compile_fused_moe.py`: A tool for benchmarking the performance of the fused MoE kernel with `torch.compile` and original fused MoE kernel.
 
 Usage is similar to `benchmark_vllm_vs_sglang_fused_moe_triton.py`, note that `torch.compile` does not support `fp8_w8a8` and `int8_w8a8` fused_moe_kernel. Both tools now support EP mode with `--ep-size` parameter.
+
+### DeepSeek-V4 Pro Triton Gluon decode kernel
+
+SGLang also includes a separate, model-specific gfx950 kernel for the public
+DeepSeek-V4 Pro checkpoint, whose routed-expert weights are natively stored as
+packed FP4. They are not converted or requantized from FP8/BF16; the AITER
+post-load step only pads and shuffles the original FP4 payload into the device
+layout consumed by both backends. The kernel covers TP8/EP1 and the c=1 decode
+shapes `M=1` (target) and `M=4/6` (DSPARK). The learned router projection,
+ungrouped sqrtsoftplus top-6 selection, routed FP4 experts, clamped SwiGLU, and
+weighted route reduction are owned by the Gluon backend. The model's first
+three hash-routed layers remain on their explicitly declared AITER subpath, and
+the mixed-precision FP8 shared expert remains on SGLang's native linear path.
+
+Select it with `--moe-runner-backend gluon`. Other shapes, topologies, devices,
+expert formats, and DeepSeek-V4 variants fail closed; there is no
+shape-dependent runtime fallback from a learned-router Gluon layer.
+
+`Fp8MoEMethod` appears in the integration because that is the existing SGLang
+loader class used by this hybrid checkpoint. It does not mean that the routed
+expert weights are FP8; the separate shared expert remains FP8.

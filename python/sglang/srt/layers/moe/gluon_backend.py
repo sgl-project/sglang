@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 
 _BACKEND_ATTR = "_gluon_moe_backend"
+_NATIVE_ATTR = "_gluon_moe_native"
 
 
 class GluonMoeBackend(ABC):
@@ -67,6 +68,27 @@ def bind_gluon_moe_backend(layer: torch.nn.Module, backend: GluonMoeBackend) -> 
     setattr(experts, _BACKEND_ATTR, backend)
 
 
+def use_native_moe_with_gluon(layer: torch.nn.Module) -> None:
+    """Declare a model-owned native subpath under the global Gluon choice.
+
+    This is intentionally narrower than a runtime fallback: the model marks the
+    layer while it is constructed, before any request or shape is observed.
+    DeepSeek-V4 uses it for its hash-routed prefix, whose routing contract is
+    different from the learned-router layers owned by the Gluon backend.
+    """
+
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+    if not get_moe_runner_backend().is_gluon():
+        raise RuntimeError(
+            "A native Gluon subpath can only be declared when "
+            "--moe-runner-backend gluon is selected"
+        )
+    if getattr(layer, _BACKEND_ATTR, None) is not None:
+        raise RuntimeError("A bound Gluon backend cannot also use native MoE")
+    setattr(layer, _NATIVE_ATTR, True)
+
+
 def prepare_gluon_moe_weights(experts: torch.nn.Module) -> None:
     """Prepare an attached backend, if any, during quant post-processing."""
 
@@ -81,6 +103,8 @@ def should_use_gluon_moe(layer: torch.nn.Module) -> bool:
     from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
     if not get_moe_runner_backend().is_gluon():
+        return False
+    if getattr(layer, _NATIVE_ATTR, False):
         return False
     if getattr(layer, _BACKEND_ATTR, None) is None:
         raise RuntimeError(
