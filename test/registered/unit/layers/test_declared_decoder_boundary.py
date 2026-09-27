@@ -487,7 +487,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
 
     def assert_step(self, step, func, communicator, **keywords):
         self.assertIs(step.func, func)
-        self.assertIs(step.keywords["residual_ops"], communicator.mhc)
+        residual = communicator._residual
+        if "read" in step.keywords:
+            # The FFN input: the attention output's hc_post, then the FFN's read.
+            self.assertIs(step.keywords["read"], residual.ffn_read)
+            self.assertIs(step.keywords["update"], residual.attention_update)
+        else:
+            # The FFN output's move: its hc_post.
+            self.assertIs(step.keywords["update"], residual.ffn_update)
         for key, value in keywords.items():
             self.assertEqual(step.keywords[key], value, key)
 
@@ -1136,10 +1143,13 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     def unbound(self, steps):
         """``steps`` with the plain residual's binding taken off the FFN input
         and the attention input, whose input owes nothing in the region."""
-        self.assertEqual(steps.ffn_input.keywords, {"residual_ops": comm.ADD_AND_NORM})
+        self.assertEqual(
+            steps.ffn_input.keywords, {"read": comm.NORM_READ, "update": comm.ADD}
+        )
         attention = steps.attention_prepare.keywords
         self.assertIsNone(attention["layer_input"])
-        self.assertIs(attention["residual_ops"], comm.ADD_AND_NORM)
+        self.assertIs(attention["read"], comm.NORM_QUANT_READ)
+        self.assertIs(attention["update"], comm.ADD)
         return msgspec.structs.replace(
             steps,
             ffn_input=steps.ffn_input.func,
@@ -1259,7 +1269,9 @@ class TestInputScatteredAttention(CustomTestCase):
                     comm.tp_reduce_scatter,
                 )
                 self.assertIs(steps.attention_input, comm.CommunicateSimpleFn._trivial)
-                self.assertIs(steps.ffn_input, comm_ops._mlp_input_residual_into_sum)
+                self.assertIs(
+                    steps.ffn_input.func, comm_ops._mlp_input_residual_into_sum
+                )
                 self.assertIs(
                     steps.ffn_output_move,
                     comm.CommunicateSummableTensorPairFn._trivial,
@@ -2346,6 +2358,81 @@ class TestTwoLayers(CustomTestCase):
                         first_layer_hands_on,
                         UnreducedOutput if owes else torch.Tensor,
                     )
+
+
+class TestALayerThatIsOneStage(CustomTestCase):
+    """A layer that is one stage reads its input and writes its output into the
+    residual as its stage declares."""
+
+    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+
+    class ProbeRead:
+        norms_plainly = True
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, residual, norm, quant_format="", post_residual_addition=None):
+            self.reads += 1
+            return residual + 100, residual
+
+        def update_and_read(
+            self,
+            update,
+            hidden_states,
+            residual,
+            norm,
+            quant_format="",
+            post_residual_addition=None,
+        ):
+            return self.read(update.update(hidden_states, residual), norm)
+
+    def _stage(self, read, update):
+        rows = comm.Layout.sharded_over(axis_sizes=self.SIZES)
+        return comm.LayerStage(
+            reads=comm.InputRead.FFN,
+            edges=comm.stage_edges(
+                previous=None,
+                stage=comm.StageDecl(
+                    comm.StageInput(rows, read=read),
+                    comm.StageOutput(rows, update=update),
+                ),
+                rows=rows,
+            ),
+        )
+
+    def test_its_steps_run_the_declared_read_and_update(self):
+        read, update = self.ProbeRead(), SimpleNamespace(adds_plainly=True)
+        communicator = build(
+            layer_facts(1, 3),
+            parallel_of(attn_dp=1, attn_tp=2),
+            stage=self._stage(read, update),
+        )
+        into, out_of = communicator.stage_edges
+        self.assertIs(into.need.read, read)
+        self.assertIs(out_of.produced.update, update)
+        hidden, residual = torch.ones(2, HIDDEN), torch.full((2, HIDDEN), 3.0)
+        out, out_residual = communicator._steps.ffn_input(
+            hidden, residual, None, Norm(), None
+        )
+        self.assertEqual(read.reads, 1)
+        torch.testing.assert_close(out_residual, torch.full((2, HIDDEN), 4.0))
+        torch.testing.assert_close(out, torch.full((2, HIDDEN), 104.0))
+
+    def test_it_takes_no_residual_of_its_own(self):
+        own = comm.LayerResidual(
+            attention_read=self.ProbeRead(),
+            attention_update=comm.ADD,
+            ffn_read=comm.NORM_READ,
+            ffn_update=comm.ADD,
+        )
+        with self.assertRaises(ValueError):
+            build(
+                layer_facts(1, 3),
+                parallel_of(attn_dp=1, attn_tp=2),
+                stage=self._stage(comm.NORM_READ, comm.ADD),
+                residual=own,
+            )
 
 
 if __name__ == "__main__":
