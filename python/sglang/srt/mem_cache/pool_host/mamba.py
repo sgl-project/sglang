@@ -30,9 +30,7 @@ transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_direct,
         transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
     )
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
@@ -213,57 +211,31 @@ class MambaPoolHost(HostKVCache):
                 ),
             )
 
-        if self.layout in ["page_first", "page_first_direct"]:
-            # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
-            temporal_dims = (
-                self.size,
-                self.num_mamba_layers,
-                1,
-            ) + self.temporal_state_shape
-            self.temporal_buffer = alloc_func(
-                temporal_dims,
-                dtype=self.temporal_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-            self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
-                self.conv_buffer.append(
-                    alloc_func(
-                        conv_dims,
-                        dtype=self.conv_dtype,
-                        device=self.device,
-                        pin_memory=self.pin_memory,
-                        allocator=self.allocator,
-                    )
+        # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
+        temporal_dims = (
+            self.size,
+            self.num_mamba_layers,
+            1,
+        ) + self.temporal_state_shape
+        self.temporal_buffer = alloc_func(
+            temporal_dims,
+            dtype=self.temporal_dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        self.conv_buffer = []
+        for conv_shape in self.conv_state_shapes:
+            conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
+            self.conv_buffer.append(
+                alloc_func(
+                    conv_dims,
+                    dtype=self.conv_dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
                 )
-        else:
-            # layer-first: (num_layers, size, *shape)
-            temporal_dims = (
-                self.num_mamba_layers,
-                self.size,
-            ) + self.temporal_state_shape
-            self.temporal_buffer = alloc_func(
-                temporal_dims,
-                dtype=self.temporal_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
             )
-            self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.num_mamba_layers, self.size) + conv_shape
-                self.conv_buffer.append(
-                    alloc_func(
-                        conv_dims,
-                        dtype=self.conv_dtype,
-                        device=self.device,
-                        pin_memory=self.pin_memory,
-                        allocator=self.allocator,
-                    )
-                )
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -287,14 +259,9 @@ class MambaPoolHost(HostKVCache):
         return [self.temporal_buffer, *self.conv_buffer]
 
     def _iter_page_tensors(self, index: int):
-        if self.layout in ["page_first", "page_first_direct"]:
-            yield self.temporal_buffer[index]
-            for conv_buf in self.conv_buffer:
-                yield conv_buf[index]
-        else:
-            yield self.temporal_buffer[:, index : index + self.page_size]
-            for conv_buf in self.conv_buffer:
-                yield conv_buf[:, index : index + self.page_size]
+        yield self.temporal_buffer[index]
+        for conv_buf in self.conv_buffer:
+            yield conv_buf[index]
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -362,73 +329,6 @@ class MambaPoolHost(HostKVCache):
             and tensor.shape[0] > 0
             and tensor.stride(0) != tensor[0].numel()
         )
-
-    @staticmethod
-    def _copy_tensor(
-        src: torch.Tensor,
-        dst: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
-        io_backend: str,
-    ) -> None:
-        if src_indices.numel() == 0:
-            return
-        # Unified conv/SSM views span a whole state envelope per slot. Stage
-        # contiguously for transfer kernels; torch indexing respects the strides
-        # and runs on the caller's transfer stream.
-        if MambaPoolHost._slots_are_strided(src):
-            staged = src.index_select(0, src_indices.to(src.device))
-            MambaPoolHost._copy_tensor(
-                staged,
-                dst,
-                torch.arange(staged.shape[0], device=staged.device),
-                dst_indices,
-                io_backend,
-            )
-            return
-        if MambaPoolHost._slots_are_strided(dst):
-            staged = torch.empty(
-                (dst_indices.numel(), *dst.shape[1:]),
-                dtype=dst.dtype,
-                device=dst.device,
-            )
-            MambaPoolHost._copy_tensor(
-                src,
-                staged,
-                src_indices,
-                torch.arange(staged.shape[0], device=staged.device),
-                io_backend,
-            )
-            dst.index_copy_(0, dst_indices.to(dst.device), staged)
-            return
-        if io_backend == "kernel":
-            # TODO: Rename the interface for clarity.
-            # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
-            # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
-            transfer_kv_per_layer_mla(
-                src=src,
-                dst=dst,
-                src_indices=src_indices,
-                dst_indices=dst_indices,
-                item_size=MambaPoolHost._item_size_per_index(src),
-            )
-        elif io_backend == "direct":
-            transfer_kv_direct(
-                src_layers=[src],
-                dst_layers=[dst],
-                src_indices=src_indices,
-                dst_indices=dst_indices,
-                page_size=1,
-            )
-        elif io_backend == "kernel_ascend":
-            # Per-layer indexed copy: this method transfers a single layer
-            # (layer_first layout). The all-layer kernel path is handled by
-            # _copy_tensor_all_layers_lf_pf / load_to_device_per_layer.
-            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
-                dst.device
-            )
-        else:
-            raise ValueError(f"Unsupported io_backend: {io_backend}")
 
     @staticmethod
     def _copy_tensor_pf_lf(
@@ -609,119 +509,84 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
-                # NPU: transfer all layers at once via dedicated kernel.
-                # layer_id == 0 covers every layer, so later calls must skip.
-                if layer_id == 0:
-                    # no ssm state on conv-only models: a 0-size batched
-                    # transfer errors, same guard as the per-layer path below
-                    if self.temporal_state_elem_size > 0:
-                        transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.temporal,
-                            host_buf=self.temporal_buffer,
-                            device_indices=device_indices,
-                            host_indices=host_indices,
-                            direction=TransferDirection.H2D,
-                        )
-                    for conv_idx in range(len(self.conv_state_shapes)):
-                        transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.conv[conv_idx],
-                            host_buf=self.conv_buffer[conv_idx],
-                            device_indices=device_indices,
-                            host_indices=host_indices,
-                            direction=TransferDirection.H2D,
-                        )
-            else:
-                # no ssm state on conv-only models: nothing to transfer
+        if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
+            # NPU: transfer all layers at once via dedicated kernel.
+            # layer_id == 0 covers every layer, so later calls must skip.
+            if layer_id == 0:
+                # no ssm state on conv-only models: a 0-size batched
+                # transfer errors, same guard as the per-layer path below
                 if self.temporal_state_elem_size > 0:
-                    self._copy_tensor_pf_lf(
-                        src=self.temporal_buffer,
-                        dst=device_pool.mamba_cache.temporal[layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=layer_id,
-                        num_layers=self.num_mamba_layers,
-                        io_backend=io_backend,
+                    transfer_mamba_state(
+                        device_buf=device_pool.mamba_cache.temporal,
+                        host_buf=self.temporal_buffer,
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        direction=TransferDirection.H2D,
                     )
                 for conv_idx in range(len(self.conv_state_shapes)):
-                    self._copy_tensor_pf_lf(
-                        src=self.conv_buffer[conv_idx],
-                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=layer_id,
-                        num_layers=self.num_mamba_layers,
-                        io_backend=io_backend,
+                    transfer_mamba_state(
+                        device_buf=device_pool.mamba_cache.conv[conv_idx],
+                        host_buf=self.conv_buffer[conv_idx],
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        direction=TransferDirection.H2D,
                     )
         else:
-            self._copy_tensor(
-                self.temporal_buffer[layer_id],
-                device_pool.mamba_cache.temporal[layer_id],
-                host_indices,
-                device_indices,
-                io_backend,
-            )
+            # no ssm state on conv-only models: nothing to transfer
+            if self.temporal_state_elem_size > 0:
+                self._copy_tensor_pf_lf(
+                    src=self.temporal_buffer,
+                    dst=device_pool.mamba_cache.temporal[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                )
             for conv_idx in range(len(self.conv_state_shapes)):
-                self._copy_tensor(
-                    self.conv_buffer[conv_idx][layer_id],
-                    device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    host_indices,
-                    device_indices,
-                    io_backend,
+                self._copy_tensor_pf_lf(
+                    src=self.conv_buffer[conv_idx],
+                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
                 )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel" and host_indices.device != device_indices.device:
-                # The mamba JIT kernel wants both index tensors on the device;
-                # the staged MHA/MLA write path hands us CPU host indices.
-                # Convert once here rather than per conv/temporal tensor.
-                host_indices = host_indices.to(device_indices.device, non_blocking=True)
-            # no ssm state on conv-only models: a 0-size batched memcpy errors
-            if self.temporal_state_elem_size > 0:
-                self._copy_tensor_all_layers_lf_pf(
-                    src_layers=device_pool.mamba_cache.temporal,
-                    dst=self.temporal_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                    staging=self.temporal_staging_buffer,
-                    can_use_jit=self._temporal_can_use_jit,
-                    src_ptrs=self.temporal_device_ptrs,
-                )
-            for conv_idx in range(len(self.conv_state_shapes)):
-                self._copy_tensor_all_layers_lf_pf(
-                    src_layers=device_pool.mamba_cache.conv[conv_idx],
-                    dst=self.conv_buffer[conv_idx],
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                    staging=self.conv_staging_buffers[conv_idx],
-                    can_use_jit=self._conv_can_use_jit[conv_idx],
-                    src_ptrs=self.conv_device_ptrs[conv_idx],
-                )
-        else:
-            for layer_id in range(self.num_mamba_layers):
-                self._copy_tensor(
-                    device_pool.mamba_cache.temporal[layer_id],
-                    self.temporal_buffer[layer_id],
-                    device_indices,
-                    host_indices,
-                    io_backend,
-                )
-                for conv_idx in range(len(self.conv_state_shapes)):
-                    self._copy_tensor(
-                        device_pool.mamba_cache.conv[conv_idx][layer_id],
-                        self.conv_buffer[conv_idx][layer_id],
-                        device_indices,
-                        host_indices,
-                        io_backend,
-                    )
+        if io_backend == "kernel" and host_indices.device != device_indices.device:
+            # The mamba JIT kernel wants both index tensors on the device;
+            # the staged MHA/MLA write path hands us CPU host indices.
+            # Convert once here rather than per conv/temporal tensor.
+            host_indices = host_indices.to(device_indices.device, non_blocking=True)
+        # no ssm state on conv-only models: a 0-size batched memcpy errors
+        if self.temporal_state_elem_size > 0:
+            self._copy_tensor_all_layers_lf_pf(
+                src_layers=device_pool.mamba_cache.temporal,
+                dst=self.temporal_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                num_layers=self.num_mamba_layers,
+                io_backend=io_backend,
+                staging=self.temporal_staging_buffer,
+                can_use_jit=self._temporal_can_use_jit,
+                src_ptrs=self.temporal_device_ptrs,
+            )
+        for conv_idx in range(len(self.conv_state_shapes)):
+            self._copy_tensor_all_layers_lf_pf(
+                src_layers=device_pool.mamba_cache.conv[conv_idx],
+                dst=self.conv_buffer[conv_idx],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                num_layers=self.num_mamba_layers,
+                io_backend=io_backend,
+                staging=self.conv_staging_buffers[conv_idx],
+                can_use_jit=self._conv_can_use_jit[conv_idx],
+                src_ptrs=self.conv_device_ptrs[conv_idx],
+            )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(
@@ -761,10 +626,6 @@ class MambaPoolHost(HostKVCache):
         each page slot in temporal/conv buffers is directly addressable.
         """
         assert len(indices) % self.page_size == 0
-        if self.layout not in ["page_first", "page_first_direct"]:
-            raise ValueError(
-                f"Mamba storage zero-copy requires page_first layout, got {self.layout}"
-            )
         indices = indices.tolist()
         ptr_list = []
         element_size_list = []
@@ -817,8 +678,6 @@ class MambaPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ["page_first", "page_first_direct"]:
-            return False
         temporal_stride = (
             self.num_mamba_layers
             * self.temporal_state_elem_size
