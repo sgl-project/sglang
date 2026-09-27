@@ -49,9 +49,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
     MingImageEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
+    RealtimeTextEncodingStage,
+    RealtimeTextState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
@@ -272,6 +277,35 @@ def make_group_executor(
     manager.strategy_for = Mock(return_value=strategy)
     executor.component_residency_manager = manager
     return executor, stage, encoder, args
+
+
+@pytest.mark.parametrize("capacity", [0, 4096])
+@torch.no_grad()
+def test_grouped_realtime_text_updates_each_session(capacity):
+    executor, stage, encoder, args = make_group_executor(
+        RealtimeTextEncodingStage, "cpu", capacity
+    )
+    sessions = [RealtimeSession(), RealtimeSession()]
+    requests = [
+        Req(
+            sampling_params=SamplingParams(prompt="hello", num_inference_steps=4),
+            do_classifier_free_guidance=False,
+            session=session,
+        )
+        for session in sessions
+    ]
+
+    outputs = executor.execute_group([stage], requests, args)
+
+    assert encoder.calls == 1
+    for session, output in zip(sessions, outputs):
+        state = session.get_or_create_state(RealtimeTextState)
+        if capacity:
+            assert state.cache_key is not None
+            assert state.prompt_embeds[0] is output.prompt_embeds[0]
+            assert state.prompt_seq_lens[0] is not output.prompt_seq_lens[0]
+        else:
+            assert state.cache_key is None
 
 
 @pytest.mark.parametrize("native", [False, True])
