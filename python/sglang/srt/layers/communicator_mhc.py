@@ -23,6 +23,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    sparse_moe_gathers_over_moe_cp,
 )
 
 
@@ -169,6 +170,12 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_ffn_post_pre=hc_ffn_post_pre,
             is_last_layer=layer_scatter_modes.is_last_layer,
         )
+        if layer_scatter_modes.is_layer_sparse and sparse_moe_gathers_over_moe_cp():
+            raise NotImplementedError(
+                "MHCLayerCommunicator does not support a MoE gathered over the "
+                "MoE-CP group (moe_dp_size < attention_context_parallel_size). "
+                "Increase moe_dp_size to match attention_context_parallel_size."
+            )
         # The postprocess writes the FFN output into the streams, so the FFN's
         # sum never waits for the next layer.
         super().__init__(
@@ -180,6 +187,11 @@ class MHCLayerCommunicator(LayerCommunicator):
             allow_deferred_ffn_reduction=False,
             residual_ops=self.mhc,
         )
+        # MHC has not been run with input-scattered attention under attention CP.
+        if self._context.attn_cp_size > 1 and self._input_can_be_scattered():
+            raise NotImplementedError(
+                "MHCLayerCommunicator with input-scattered attention under attention CP"
+            )
 
     def _steps_from_declarations(
         self, sides: DecoderLayerSides, **kwargs

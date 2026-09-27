@@ -877,17 +877,13 @@ class LayerCommunicator:
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
         self._declared = sides
-        self._steps = (
-            self._steps_from_declarations(
-                sides,
-                fusions=self._select_mlp_input_fusions(),
-                force_layernorm_before_gather=force_layernorm_before_dp_gather,
-            )
-            if sides is not None
-            else self._select_boundaries_from_scatter_modes()
+        self._steps = self._steps_from_declarations(
+            sides,
+            fusions=self._select_mlp_input_fusions(),
+            force_layernorm_before_gather=force_layernorm_before_dp_gather,
         )
         # The steps a batch that shards its tokens over attention CP runs; None
-        # without CP or where the steps come from the scatter modes.
+        # when no batch does.
         self._cp_steps = (
             self._steps_from_declarations(
                 self._declared_sides(cp_active=True),
@@ -895,14 +891,14 @@ class LayerCommunicator:
                 force_layernorm_before_gather=force_layernorm_before_dp_gather,
                 cp_moves=_cp_moves(),
             )
-            if sides is not None and get_parallel().attn_cp_size > 1
+            if _generic_prefill_cp_shards_tokens()
             else None
         )
         # The steps a batch with input-scattered attention runs; None where it
-        # cannot run or the steps come from the scatter modes.
+        # cannot run.
         self._input_scattered_steps = (
             self._steps_for_input_scattered(sides)
-            if sides is not None and self._input_can_be_scattered()
+            if self._input_can_be_scattered()
             else None
         )
 
@@ -981,36 +977,41 @@ class LayerCommunicator:
 
     def _input_can_be_scattered(self) -> bool:
         """Whether a batch may run this layer with input-scattered attention:
-        configured, on pure TP without an a2a backend or a dense MLP on every
-        rank. The rest of what ``AttnTpContext.init_context`` requires is only
+        configured, on TP without attention DP, a prefill CP, an a2a backend or
+        a dense MLP on every rank. The rest of what ``AttnTpContext.init_context`` requires is only
         known once the model is built."""
         parallel = get_parallel()
         return (
             parallel.enable_attn_tp_input_scattered
             and parallel.tp_size > 1
             and parallel.attn_dp_size == 1
-            and parallel.attn_cp_size == 1
+            and not _generic_prefill_cp_shards_tokens()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
         )
 
-    def _declared_sides(
-        self, *, cp_active: bool = False
-    ) -> Optional[DecoderLayerSides]:
+    def _declared_sides(self, *, cp_active: bool = False) -> DecoderLayerSides:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN, in a layer whose previous layer is known, with
-        attention CP only for a prefill CP whose FFN gathers over the whole CP
-        group. None when the steps come from the scatter modes. ``cp_active``
-        gives a batch that shards its tokens over CP; the others hold every
-        token on each CP rank. An active LayerNorm SP region and input-scattered
-        attention have their own."""
+        attention and an FFN, in a layer whose previous layer is known.
+        ``cp_active`` gives a batch that shards its tokens over CP; the others
+        hold every token on each CP rank. An active LayerNorm SP region and
+        input-scattered attention have their own. Raises NotImplementedError
+        for the combinations the steps do not cover."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
+        if not (modes.is_first_layer or modes.is_previous_layer_sparse is not None):
+            raise NotImplementedError(
+                "a layer built without the facts of the layer before it"
+            )
         # A MoE dispatched per DP shard computes on this rank's local rows and
         # hands its layer's output on there; so does a dense MLP on every rank.
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
         dense_on_local_rows = enable_moe_dense_fully_dp()
 
+        # Some batch shards its tokens over attention CP.
+        cp_shards = _generic_prefill_cp_shards_tokens()
+        if parallel.attn_cp_size > 1 and modes.is_layer_sparse:
+            self._refuse_uncovered_cp_moe(moe_on_local_rows, cp_shards)
         # A MoE whose data-parallel groups are the CP ranks computes each CP
         # shard of a GQA prefill CP on its own ranks.
         ffn_on_cp_shards = (
@@ -1034,32 +1035,21 @@ class LayerCommunicator:
                 and bool(next_sparse)
             )
 
-        if not (
-            (parallel.attn_cp_size == 1 or _cp_on_declarations())
-            # A MoE dispatched per DP shard under attention DP and GQA prefill
-            # CP keeps the scatter-mode steps: it would dispatch each rank's CP
-            # shard of the tokens, which is not covered.
-            and not (
-                parallel.attn_cp_size > 1
-                and parallel.attn_dp_size > 1
-                and modes.is_layer_sparse
-                and moe_on_local_rows
-                and not _gathers_over_attention_cp()
-            )
-            and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
-        ):
-            return None
-        if parallel.attn_cp_size > 1 and _cp_moves().reduce_scatter is not None:
+        if cp_shards and _cp_moves().reduce_scatter is not None:
             # A CP extend's FFN may leave its sum to the reduce-scatter that
             # takes each rank's shard back (DSA and MLA CP).
             may_leave = not cp_active
             may_leave_to_reduce_scatter = True
-        else:
+        elif cp_shards or parallel.attn_dp_size > 1:
             # Otherwise under CP an FFN over every CP shard completes its own sum;
             # one on its own CP shard hands on its rows as without CP.
             may_leave = may_leave_to_reduce_scatter = (
                 parallel.attn_cp_size == 1 or ffn_on_cp_shards
             )
+        else:
+            # No batch shards its tokens and there is no attention DP: as
+            # without CP.
+            may_leave = may_leave_to_reduce_scatter = True
         return decoder_layer_sides(
             axis_sizes=token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
@@ -1087,6 +1077,33 @@ class LayerCommunicator:
             )
             and may_leave,
         )
+
+    @staticmethod
+    def _refuse_uncovered_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
+        """A MoE layer under attention CP whose tokens the steps cannot bring
+        to it: under a prefill CP, one dispatched per DP shard under attention DP
+        and GQA CP, and one on the TP group whose data-parallel groups are the CP
+        ranks under DSA or MLA CP; and under attention DP, one on the TP group
+        whose data-parallel groups are the CP ranks."""
+        parallel = get_parallel()
+        gqa = not _gathers_over_attention_cp()
+        if moe_on_local_rows:
+            if cp_shards and gqa and parallel.attn_dp_size > 1:
+                raise NotImplementedError(
+                    "a MoE dispatched per DP shard under attention DP and GQA "
+                    "prefill CP"
+                )
+        elif parallel.moe_dp_size == parallel.attn_cp_size:
+            if cp_shards and not gqa:
+                raise NotImplementedError(
+                    "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                    "DSA or MLA prefill CP"
+                )
+            if parallel.attn_dp_size > 1:
+                raise NotImplementedError(
+                    "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                    "attention DP and attention CP"
+                )
 
     def _select_boundaries_from_scatter_modes(self) -> "BoundarySteps":
         """The layer's steps chosen from its scatter modes, for the layers the
@@ -2147,15 +2164,23 @@ def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:
     return None
 
 
-def moe_cp_gathers_sparse_moe_input(forward_batch: ForwardBatch) -> bool:
-    """Whether a sparse MoE's input is gathered over the MoE-CP group on this
-    batch: a MoE on the TP group under a GQA prefill CP whose MoE-CP group is
-    wider than the MoE's data-parallel groups, on a CP extend. DSA and MLA CP
-    gather over attention CP instead."""
+def sparse_moe_gathers_over_moe_cp() -> bool:
+    """Whether a sparse MoE's input is gathered over the MoE-CP group on a CP
+    extend: a MoE on the TP group under GQA CP whose MoE-CP group is wider than
+    the MoE's data-parallel groups. DSA and MLA CP gather over attention CP
+    instead."""
     return (
         not is_moe_input_scattered_across_dp_ranks()
         and is_enable_moe_cp_allgather()
         and not _gathers_over_attention_cp()
+    )
+
+
+def moe_cp_gathers_sparse_moe_input(forward_batch: ForwardBatch) -> bool:
+    """Whether a sparse MoE's input is gathered over the MoE-CP group on this
+    batch: a CP extend, for a MoE that gathers there."""
+    return (
+        sparse_moe_gathers_over_moe_cp()
         and moe_cp_gathered_rows(forward_batch) is not None
     )
 
@@ -2425,22 +2450,6 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
         # TP, then take the slice of each half.
         return pair._gather, pair._scatter
     raise NotImplementedError(f"{layer_input_rows=}")
-
-
-def _cp_on_declarations() -> bool:
-    """Whether attention CP is one the declarations cover: a prefill CP that
-    shards tokens, with DSA or MLA attention, with the FFN input gathered over a
-    MoE-CP group that is the whole CP group, or, without attention DP, with the
-    MoE's data-parallel groups the CP ranks (a MoE then computes each CP shard
-    on its own ranks)."""
-    parallel = get_parallel()
-    return _generic_prefill_cp_shards_tokens() and (
-        _gathers_over_attention_cp()
-        or parallel.moe_dp_size == 1
-        or (
-            parallel.moe_dp_size == parallel.attn_cp_size and parallel.attn_dp_size == 1
-        )
-    )
 
 
 def _gathers_over_attention_cp() -> bool:
