@@ -1087,7 +1087,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(
-                    req, last_node=result.last_device_node
+                    req, leaf=result.last_device_node
                 )
 
     @rank_consensus(same_params=["req.rid", "chunked"])

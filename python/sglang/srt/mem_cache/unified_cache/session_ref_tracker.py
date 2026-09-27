@@ -53,9 +53,9 @@ class UnifiedSessionRefTracker:
             session_id = req.session.session_id
         return session_id
 
-    def register_session_ref(self, req: Req, last_node: NodeId) -> None:
-        """Register a non-streaming request's reusable leaves with each component.
-        ``last_node`` is the node the request's final insert ended on."""
+    def register_session_ref(self, req: Req, leaf: NodeId) -> None:
+        """Register the leaf a finished request's insert ended on with each
+        component; the lock anchor ``req.last_node`` is a different node."""
         if not self.enable_session_radix_cache:
             return
 
@@ -72,13 +72,13 @@ class UnifiedSessionRefTracker:
             logger.warning("register_session_ref called for stale request; Skip it.")
             return
 
-        last_node = self.tree_core.node_by_id(last_node)
-        if last_node is self.tree_core.root_node:
+        node = self.tree_core.node_by_id(leaf)
+        if node is self.tree_core.root_node:
             return
 
         for component in self.components:
-            leaf = component.resolve_session_leaf(req, last_node)
-            component.register_session_leaf(session_id, leaf)
+            component_leaf = component.resolve_session_leaf(req, node)
+            component.register_session_leaf(session_id, component_leaf)
 
     def _remember_closed_session(self, session_id: str) -> None:
         self._closed_session_ids[session_id] = None
