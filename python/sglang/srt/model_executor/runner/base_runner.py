@@ -341,9 +341,7 @@ class BaseRunner(ABC):
         reduction, the build lands inside another autotune context and tuning
         declines there.
         """
-        from sglang.srt.distributed import get_tp_group
-
-        pcie_ipc_comm = get_tp_group().pcie_ipc_comm
+        pcie_ipc_comm = get_parallel().tp_group.pcie_ipc_comm
         if pcie_ipc_comm is None:
             return
 
