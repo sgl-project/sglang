@@ -731,7 +731,8 @@ Router flags map to these values:
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
 - **Health Checks**: Runtime probes via `--health-check-interval-secs`, `--health-check-timeout-secs`, failure/success thresholds, and `--health-check-endpoint`. Use `--disable-health-check` to skip health checks entirely.
-- **Cache Management**: `/flush_cache` ensures LRU eviction when redeploying PD workers.
+- **Cache Management**: `/flush_cache` invalidates worker KV caches and the gateway response cache.
+- **Deterministic Response Cache**: Set `--api-key`, `--response-cache-max-entries`, and an immutable model/deployment revision in `--response-cache-namespace` to enable exact-response caching for explicitly greedy (`temperature: 0`), non-streaming `/generate`, `/v1/completions`, and `/v1/chat/completions` requests on regular HTTP workers. Change the namespace whenever the worker model or serving configuration changes. Each request must opt in with a nonempty `X-Response-Cache-Scope`; the byte-exact request, credential, scope, and routing-selector headers form the key. A hit replays the exact original payload, including response IDs, timestamps, and usage metadata, so clients should opt in only where idempotent replay is acceptable. Configure expiry and size limits with `--response-cache-ttl-secs` and `--response-cache-max-response-bytes`. Responses report `x-response-cache: MISS`, `HIT`, `COALESCED`, or `BYPASS`; concurrent identical misses are coalesced.
 
 ## Load Balancing Policies
 - `random`: uniform random worker selection.

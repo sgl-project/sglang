@@ -7,9 +7,9 @@ use smg::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+        PostgresConfig, RedisConfig, ResponseCacheConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -452,6 +452,23 @@ struct CliArgs {
     /// Maximum memory for L1 tokenizer cache in bytes
     #[arg(long, default_value_t = 52428800, help_heading = "Tokenizer")]
     tokenizer_cache_l1_max_memory: usize,
+
+    // ==================== Response Cache ====================
+    /// Maximum deterministic responses to cache; zero disables the cache
+    #[arg(long, default_value_t = 0, help_heading = "Response Cache")]
+    response_cache_max_entries: usize,
+
+    /// Immutable model/deployment revision included in cache keys
+    #[arg(long, default_value = "", help_heading = "Response Cache")]
+    response_cache_namespace: String,
+
+    /// Response cache TTL in seconds
+    #[arg(long, default_value_t = 300, help_heading = "Response Cache")]
+    response_cache_ttl_secs: u64,
+
+    /// Maximum cacheable response body size in bytes
+    #[arg(long, default_value_t = 4194304, help_heading = "Response Cache")]
+    response_cache_max_response_bytes: usize,
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
@@ -1044,6 +1061,12 @@ impl CliArgs {
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
+            })
+            .response_cache(ResponseCacheConfig {
+                max_entries: self.response_cache_max_entries,
+                namespace: self.response_cache_namespace.clone(),
+                ttl_secs: self.response_cache_ttl_secs,
+                max_response_bytes: self.response_cache_max_response_bytes,
             })
             .history_backend(history_backend)
             .log_level(&self.log_level)

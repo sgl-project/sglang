@@ -605,6 +605,52 @@ class TestParseRouterArgs:
             "https://example.com",
         ]
 
+    def test_parse_response_cache_args(self):
+        args = parse_router_args(
+            [
+                "--response-cache-max-entries",
+                "128",
+                "--response-cache-namespace",
+                "qwen-revision-a",
+                "--response-cache-ttl-secs",
+                "60",
+                "--response-cache-max-response-bytes",
+                "1048576",
+                "--api-key",
+                "secret",
+            ]
+        )
+
+        assert args.response_cache_max_entries == 128
+        assert args.response_cache_namespace == "qwen-revision-a"
+        assert args.response_cache_ttl_secs == 60
+        assert args.response_cache_max_response_bytes == 1048576
+        args._validate_router_args()
+
+    def test_response_cache_requires_namespace(self):
+        args = RouterArgs(response_cache_max_entries=1)
+        with pytest.raises(ValueError, match="response-cache-namespace"):
+            args._validate_router_args()
+
+    def test_response_cache_requires_api_key(self):
+        args = RouterArgs(
+            response_cache_max_entries=1,
+            response_cache_namespace="model-revision",
+        )
+        with pytest.raises(ValueError, match="--api-key"):
+            args._validate_router_args()
+
+    def test_response_cache_rejects_unsupported_modes(self):
+        common = {
+            "response_cache_max_entries": 1,
+            "response_cache_namespace": "model-revision",
+            "api_key": "secret",
+        }
+        with pytest.raises(ValueError, match="regular routing mode"):
+            RouterArgs(enable_igw=True, **common)._validate_router_args()
+        with pytest.raises(ValueError, match="regular routing mode"):
+            RouterArgs(pd_disaggregation=True, **common)._validate_router_args()
+
     def test_parse_tokenizer_args(self):
         """Test parsing tokenizer arguments."""
         # Note: model-path and tokenizer-path arguments are not available in current implementation

@@ -81,6 +81,8 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+    #[serde(default)]
+    pub response_cache: ResponseCacheConfig,
     /// Server TLS certificate (PEM)
     #[serde(skip)]
     pub server_cert: Option<Vec<u8>>,
@@ -167,6 +169,45 @@ impl Default for TokenizerCacheConfig {
             l0_max_entries: default_l0_max_entries(),
             enable_l1: default_enable_l1(),
             l1_max_memory: default_l1_max_memory(),
+        }
+    }
+}
+
+/// Exact response cache for deterministic, non-streaming generation requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponseCacheConfig {
+    #[serde(default)]
+    pub max_entries: usize,
+    /// Immutable model/deployment revision included in every cache key.
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default = "default_response_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    #[serde(default = "default_response_cache_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+const fn default_response_cache_ttl_secs() -> u64 {
+    300
+}
+
+const fn default_response_cache_max_response_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+impl ResponseCacheConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.max_entries > 0
+    }
+}
+
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 0,
+            namespace: String::new(),
+            ttl_secs: default_response_cache_ttl_secs(),
+            max_response_bytes: default_response_cache_max_response_bytes(),
         }
     }
 }
@@ -547,6 +588,7 @@ impl Default for RouterConfig {
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
+            response_cache: ResponseCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
             mcp_config: None,
@@ -638,6 +680,7 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
+        assert_eq!(config.response_cache, ResponseCacheConfig::default());
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);

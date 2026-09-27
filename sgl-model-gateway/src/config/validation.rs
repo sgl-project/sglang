@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
@@ -40,6 +41,7 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_response_cache(config)?;
 
         Ok(())
     }
@@ -530,6 +532,66 @@ impl ConfigValidator {
         Ok(())
     }
 
+    fn validate_response_cache(config: &RouterConfig) -> ConfigResult<()> {
+        let cache = &config.response_cache;
+        if !cache.is_enabled() {
+            return Ok(());
+        }
+        if config.api_key.is_none() {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.max_entries".to_string(),
+                value: cache.max_entries.to_string(),
+                reason:
+                    "Requires --api-key so cached responses cannot cross authentication boundaries"
+                        .to_string(),
+            });
+        }
+        if config.enable_igw {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.max_entries".to_string(),
+                value: cache.max_entries.to_string(),
+                reason: "The response cache is only supported by the regular router, not IGW"
+                    .to_string(),
+            });
+        }
+        if !matches!(config.mode, RoutingMode::Regular { .. }) {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.max_entries".to_string(),
+                value: cache.max_entries.to_string(),
+                reason: "The response cache is only supported in regular routing mode".to_string(),
+            });
+        }
+        if !matches!(config.connection_mode, ConnectionMode::Http) {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.max_entries".to_string(),
+                value: cache.max_entries.to_string(),
+                reason: "The response cache is only supported with HTTP workers".to_string(),
+            });
+        }
+        if cache.namespace.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.namespace".to_string(),
+                value: cache.namespace.clone(),
+                reason: "Must identify an immutable model/deployment revision when the response cache is enabled".to_string(),
+            });
+        }
+        if cache.ttl_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.ttl_secs".to_string(),
+                value: cache.ttl_secs.to_string(),
+                reason: "Must be > 0 when the response cache is enabled".to_string(),
+            });
+        }
+        if cache.max_response_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "response_cache.max_response_bytes".to_string(),
+                value: cache.max_response_bytes.to_string(),
+                reason: "Must be > 0 when the response cache is enabled".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_mtls(config: &RouterConfig) -> ConfigResult<()> {
         if let Some(identity) = &config.client_identity {
             if identity.is_empty() {
@@ -941,6 +1003,40 @@ mod tests {
             result.is_err(),
             "Decode policy should not be allowed to be bucket"
         );
+    }
+
+    #[test]
+    fn test_validate_response_cache() {
+        let mut config = RouterConfig::default();
+        config.response_cache.max_entries = 10;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.api_key = Some("secret".to_string());
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.response_cache.namespace = "model-revision".to_string();
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        let mut igw = config.clone();
+        igw.enable_igw = true;
+        assert!(ConfigValidator::validate_response_cache(&igw).is_err());
+
+        let mut pd = config.clone();
+        pd.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        assert!(ConfigValidator::validate_response_cache(&pd).is_err());
+
+        let mut grpc = config.clone();
+        grpc.connection_mode = ConnectionMode::Grpc { port: None };
+        assert!(ConfigValidator::validate_response_cache(&grpc).is_err());
+
+        config.response_cache.ttl_secs = 0;
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.response_cache.ttl_secs = 60;
+        config.response_cache.max_response_bytes = 0;
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod job_queue;
 pub mod metrics_aggregator;
 pub mod model_card;
 pub mod model_type;
+pub mod response_cache;
 pub mod retry;
 pub mod steps;
 pub mod token_bucket;
@@ -32,6 +33,9 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
+pub use response_cache::{
+    response_cache_key, CacheLookup, CachedResponse, ResponseCache, RESPONSE_CACHE_HEADER,
+};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
