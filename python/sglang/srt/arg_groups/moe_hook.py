@@ -699,6 +699,18 @@ def handle_nccl_ep_token_budget(server_args: Any):
         return
     if cfg.enable_single_batch_overlap or cfg.enable_two_batch_overlap:
         raise ValueError("NCCL EP LL does not support single/two batch overlap")
+    if cfg.moe_runner_backend == "triton":
+        if cfg.nccl_ep_layout != "expert_major":
+            raise ValueError("NCCL EP Triton requires expert_major layout")
+        unsupported = [
+            name
+            for name in ("enable_eplb", "enforce_shared_experts_fusion", "enable_lora")
+            if getattr(cfg, name)
+        ]
+        if unsupported:
+            raise ValueError(
+                "NCCL EP Triton does not support: " + ", ".join(unsupported)
+            )
     if not cfg.enable_nccl_ep_cuda_graph:
         graph_config = with_phase(
             cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED

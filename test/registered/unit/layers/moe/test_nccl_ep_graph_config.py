@@ -154,6 +154,7 @@ def test_opt_in_does_not_fall_back_on_an_unsupported_gpu(model_path, monkeypatch
     "overrides",
     [
         {"moe_a2a_backend": "none"},
+        {"nccl_ep_layout": "rank_major"},
         {"cuda_graph_backend_decode": "breakable"},
         {"cuda_graph_backend_decode": "tc_piecewise"},
         {"disable_cuda_graph": True},
