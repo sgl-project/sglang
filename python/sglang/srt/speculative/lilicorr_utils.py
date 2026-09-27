@@ -163,8 +163,6 @@ def per_request_last_row(
     if extend_lens is None or extend_lens.numel() == 0:
         return None
     lens = extend_lens.to(torch.int64).flatten()
-    if int(lens.sum()) != int(num_rows):
-        return None
     return (torch.cumsum(lens, dim=0) - 1).clamp_min(0)
 
 
