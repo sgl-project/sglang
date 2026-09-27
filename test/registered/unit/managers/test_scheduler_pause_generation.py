@@ -166,20 +166,24 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         req.output_ids.extend([4, 5, 6])
         req.kv.req_pool_idx = 0
+        # Committed == allocated: without spec decoding, release_kv_cache
+        # asserts there is no overallocated tail.
         req.kv.kv_committed_len = 5
-        req.kv.kv_allocated_len = 6
+        req.kv.kv_allocated_len = 5
 
         copy = _PendingCopy()
         controller = MagicMock(ack_write_queue=[])
         controller.ack_backup_queue.qsize.return_value = 0
 
-        def write(device_indices, node_id):
+        def write(device_indices, node_id, extra_pools=()):
             controller.ack_write_queue.append(HiCacheAck(None, copy, [node_id]))
             return torch.arange(len(device_indices))
 
         controller.write.side_effect = write
 
         manager = object.__new__(DecodeKVCacheOffloadManager)
+        # Not a UnifiedSWAKVPool, so offloads carry no extra SWA pool transfers.
+        manager.kv_cache = None
         manager.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(8).unsqueeze(0)
         )
@@ -200,12 +204,20 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         frees: List[Tuple[str, bool]] = []
 
-        def free_kv_row(released_req, **kwargs):
-            frees.append((released_req.rid, copy.done))
-            released_req.kv.req_pool_idx = None
-            released_req.kv.mark_kv_released()
+        def record_free(kv_info, ranges):
+            frees.append((req.rid, copy.done))
 
-        scheduler.tree_cache.cache_finished_req.side_effect = free_kv_row
+        # release_kv_cache: an unclaimed row is freed through free_kv_row, then
+        # the req_to_token row is given back (a real pool clears req_pool_idx).
+        scheduler.tree_cache.claim_kv_row.return_value = False
+        scheduler.tree_cache.free_kv_row.side_effect = record_free
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.tree_cache.token_to_kv_pool_allocator = (
+            scheduler.token_to_kv_pool_allocator
+        )
+        scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda released_req: (
+            setattr(released_req.kv, "req_pool_idx", None)
+        )
         return req, frees
 
     def _retract_by_pause(self, scheduler: Scheduler, req: Req):
