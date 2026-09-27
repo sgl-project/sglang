@@ -87,6 +87,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_memory,
     get_model,
     get_observability,
@@ -969,6 +970,12 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
+        if not chunked and get_exec().features.enable_decoder_swa_bounded_replay:
+            # Keep freshly replayed SWA KV request-owned through decode.
+            effective_cache_len = min(
+                effective_cache_len,
+                max(0, len(token_ids) - self.swa_reprefill_tail_tokens()),
+            )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -3050,12 +3057,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        unified_kv + HiCache needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never offloaded to host, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring
         (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        layout, except decoder SWA bounded replay: its late layers keep window KV
+        only for replayed rows.
         """
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
@@ -3063,6 +3071,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and swa is not None
             and not self.tree_core.has_swa_host_pool
         )
+        if swa is not None and get_exec().features.enable_decoder_swa_bounded_replay:
+            return swa.sliding_window_size
         return swa.sliding_window_size if unified_compress_only_hicache else 0
 
     def swa_retain_floor(self, req) -> int | None:

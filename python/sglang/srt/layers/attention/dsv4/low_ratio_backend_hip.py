@@ -659,7 +659,13 @@ def low_ratio_index_topk_hip_extend(
         raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
-    extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+    # Late layers index each request's replay rows.
+    tail = getattr(metadata, "late_layer_tail", None)
+    extend_lens_cpu = (
+        tail.extend_seq_lens_cpu
+        if tail is not None
+        else _as_int_list(forward_batch.extend_seq_lens_cpu)
+    )
     assert seq_lens_cpu is not None and extend_lens_cpu is not None
     lc_per_req = [s // ratio for s in seq_lens_cpu]
     if not any(lc_per_req):

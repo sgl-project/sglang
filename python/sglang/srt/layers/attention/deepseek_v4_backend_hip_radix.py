@@ -24,6 +24,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+    late_layer_tail_layout,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -139,6 +142,31 @@ def _create_flashmla_metadata():
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
+
+
+@dataclass(frozen=True)
+class LateLayerTail:
+    """Rows processed after the last KV-source layer."""
+
+    token_indices: torch.Tensor
+    positions: torch.Tensor
+    extend_seq_lens: torch.Tensor
+    extend_seq_lens_cpu: List[int]
+    # A single-request tail is a contiguous view.
+    contiguous_start: Optional[int] = None
+
+    def rows(self, t: torch.Tensor) -> torch.Tensor:
+        return _tail_rows(
+            t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
+        )
+
+
+def _tail_rows(
+    t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
+) -> torch.Tensor:
+    if contiguous_start is not None:
+        return t[contiguous_start:]
+    return t[token_indices]
 
 
 @dataclass
@@ -589,6 +617,8 @@ class DSV4Metadata:
     # AITER's rope kernels require int64 positions while the core metadata keeps
     # them int32, so widen once per forward instead of once per C4 layer.
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Replay rows; set only on the tail metadata.
+    late_layer_tail: Optional[LateLayerTail] = field(default=None, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -761,6 +791,11 @@ class DeepseekV4HipRadixBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
+        self.enable_decoder_swa_bounded_replay = (
+            model_runner.server_args.enable_decoder_swa_bounded_replay
+        )
+        # Late layers switch to this metadata during bounded replay.
+        self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -876,6 +911,7 @@ class DeepseekV4HipRadixBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
         attach_decode_streams: bool = False,
         low_ratio_decode_rows: bool = False,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> DSV4Metadata:
         """``low_ratio_decode_rows``: build the ratio-1/2 indexer metadata in the
         decode (clamp-1) form, for one-token rows such as target-verify."""
@@ -904,6 +940,14 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 padded_num_tokens=out_cache_loc.shape[0],
             )
+        if (
+            swa_replay_start is not None
+            and swa_replay_start.shape[0] < seq_lens_casual.shape[0]
+        ):
+            swa_replay_start = torch.nn.functional.pad(
+                swa_replay_start,
+                (0, seq_lens_casual.shape[0] - swa_replay_start.shape[0]),
+            )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -912,6 +956,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
+            swa_replay_start=swa_replay_start,
         )
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
@@ -1636,6 +1681,117 @@ class DeepseekV4HipRadixBackend(
         self.forward_metadata = metadata
         self.init_forward_metadata_in_graph(forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
+        self.tail_forward_metadata = (
+            self._build_late_layer_tail_metadata(forward_batch)
+            if self.enable_decoder_swa_bounded_replay
+            and not self.is_draft_worker
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.extend_seq_lens_cpu is not None
+            else None
+        )
+
+    def _build_late_layer_tail_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> DSV4Metadata:
+        """Build metadata for each request's final SWA window."""
+        extend_lens_cpu = list(forward_batch.extend_seq_lens_cpu)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert seq_lens_cpu is not None
+        device = forward_batch.out_cache_loc.device
+        token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
+            extend_lens_cpu=extend_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu.tolist(),
+            tail_len=SWA_WINDOW,
+            device=device,
+        )
+        contiguous_start = (
+            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+        )
+        out_cache_loc = _tail_rows(
+            forward_batch.out_cache_loc,
+            token_indices=token_indices,
+            contiguous_start=contiguous_start,
+        )
+        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        metadata = self.init_forward_metadata_prefill(
+            max_seq_len=int(seq_lens_cpu.max().item()),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens_cpu=seq_lens_cpu.tolist(),
+            out_cache_loc=out_cache_loc,
+            num_tokens=sum(tail_lens_cpu),
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            swa_replay_start=swa_replay_start,
+        )
+        swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            out_cache_loc
+        ).to(torch.int32)
+        metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
+        metadata.core_attn_metadata._aiter_sparse_masked_indices = None
+        metadata.low_ratio_req_indices = torch.repeat_interleave(
+            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+        )
+        positions = _tail_rows(
+            forward_batch.positions,
+            token_indices=token_indices,
+            contiguous_start=contiguous_start,
+        )
+        metadata.low_ratio_pos_i64 = positions.to(torch.int64)
+        if metadata.core_metadata.low_ratios:
+            metadata.fp4_low_ratio_prefill_workspaces = (
+                refresh_low_ratio_prefill_workspaces(
+                    metadata.low_ratio_indexer_metadata_by_ratio(),
+                    metadata.fp4_low_ratio_prefill_workspaces,
+                )
+            )
+        metadata.late_layer_tail = LateLayerTail(
+            token_indices=token_indices,
+            positions=positions,
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            contiguous_start=contiguous_start,
+        )
+        return metadata
+
+    def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
+        """Switch attention metadata and candidate state to the tail."""
+        tail_metadata = self.tail_forward_metadata
+        assert tail_metadata is not None, "no tail metadata for this forward"
+        saved = (self.forward_metadata, self.candidate_masks)
+        tail = tail_metadata.late_layer_tail
+        if isinstance(self.candidate_masks, list) and self.candidate_masks:
+            self.candidate_masks = [
+                mask[mask.shape[0] - t :]
+                for mask, t in zip(self.candidate_masks, tail.extend_seq_lens_cpu)
+            ]
+        # Carry the last index source's tail rows to late consumers; the rest stays -1.
+        full_core = saved[0].core_attn_metadata
+        tail_core = tail_metadata.core_attn_metadata
+        for ratio in tail_core.low_ratios:
+            for full_buf, tail_buf in (
+                (
+                    full_core.sparse_page_indices(ratio),
+                    tail_core.sparse_page_indices(ratio),
+                ),
+                (
+                    full_core.sparse_topk_lengths(ratio),
+                    tail_core.sparse_topk_lengths(ratio),
+                ),
+                (
+                    full_core.sparse_raw_indices(ratio),
+                    tail_core.sparse_raw_indices(ratio),
+                ),
+            ):
+                if full_buf is None or tail_buf is None:
+                    continue
+                rows = tail.rows(full_buf)
+                tail_buf[: rows.shape[0]].copy_(rows)
+        self.forward_metadata = tail_metadata
+        return saved
+
+    def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
+        self.forward_metadata, self.candidate_masks = saved
 
     def _init_forward_metadata_prefill_from_batch(
         self,
@@ -2088,6 +2244,12 @@ class DeepseekV4HipRadixBackend(
         cached = core.swa_out_cache_loc if core is not None else None
         if (
             cached is not None
+            and getattr(self.forward_metadata, "late_layer_tail", None) is not None
+        ):
+            # Tail metadata stores write locations only for replay rows.
+            return cached
+        if (
+            cached is not None
             and not forward_batch.forward_mode.is_idle()
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
@@ -2392,6 +2554,7 @@ class DeepseekV4HipRadixBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -2423,6 +2586,19 @@ class DeepseekV4HipRadixBackend(
                 swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
             )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+            if swa_replay_start is not None:
+                # Column j holds position (pos - j); slots below the floor were
+                # never written at the late layers, so drop them from the window.
+                floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
+                swa_topk_lengths = torch.minimum(
+                    swa_topk_lengths, floored.clamp_min(0).to(swa_topk_lengths.dtype)
+                )
+                cols = torch.arange(
+                    swa_page_indices.shape[-1], device=swa_page_indices.device
+                )
+                swa_page_indices = swa_page_indices.masked_fill(
+                    cols[None, :] >= swa_topk_lengths[:, None].to(cols.dtype), -1
+                )
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size

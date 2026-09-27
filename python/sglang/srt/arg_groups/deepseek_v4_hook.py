@@ -330,6 +330,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             # input_ids_global is a DP-wide gather, not a per-local-token tensor,
             # so the tail slice does not apply to it.
             ("DP attention", cfg.enable_dp_attention),
+            # A running request mixed into a prefill batch is a one-token extend,
+            # whose window would be floored at its own position.
+            (
+                "mixed prefill/decode on ROCm",
+                get_platform().is_hip and cfg.enable_mixed_chunk,
+            ),
+            # The HIP backend lays the tail out without the CP split.
+            (
+                "prefill context parallelism on ROCm",
+                get_platform().is_hip
+                and (
+                    cfg.enable_prefill_cp
+                    or cfg.enable_prefill_context_parallel
+                    or cfg.attn_cp_size > 1
+                ),
+            ),
+            # Draft and verify extends are not validated with the HIP tail.
+            (
+                "speculative decoding on ROCm",
+                get_platform().is_hip and cfg.speculative_algorithm is not None,
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

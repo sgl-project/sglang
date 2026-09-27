@@ -3400,7 +3400,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
-    # Rows outside the tail are never read (see _check_late_layer_tail_readers),
+    # Rows outside the tail are never read (see _late_layer_tail),
     # so the buffer is left uninitialized: one copy, no fill.
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
@@ -3586,28 +3586,32 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer,
-        # so anything reading hidden states of earlier prompt tokens cannot be served.
+    def _late_layer_tail(self, forward_batch: ForwardBatch) -> Optional[LateLayerTail]:
+        """Return replay rows, or None when the batch needs every prompt row."""
+        if (
+            self.late_layer_start is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        tail_metadata = get_attn_backend().tail_forward_metadata
+        tail = tail_metadata.late_layer_tail if tail_metadata is not None else None
+        if tail is None:
+            return None
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
         ):
-            raise ValueError(
-                "decoder SWA bounded replay cannot capture hidden states of all "
-                "prompt tokens"
-            )
+            return None
         if forward_batch.return_logprob and any(
-            start < n
-            for start, n in zip(
+            start < n - t
+            for start, n, t in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
                 forward_batch.extend_seq_lens_cpu,
+                tail.extend_seq_lens_cpu,
             )
         ):
-            raise ValueError(
-                "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
-                "set logprob_start_len to the prompt length"
-            )
+            return None
+        return tail
 
     def _forward_layers_hc_pre_from_prev(
         self,
@@ -3660,14 +3664,8 @@ class DeepseekV4Model(nn.Module):
                     hash_ids[:, engram.layer_hash_index]
                 )
             hash_ids.record_stream(prefetch_stream)
-        tail = None
-        if (
-            self.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._check_late_layer_tail_readers(forward_batch)
-            attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
+        tail = self._late_layer_tail(forward_batch)
+        attn_backend = get_attn_backend() if tail is not None else None
         saved_full = None
         prev_pre = None
         # the fused boundary leaves the FFN hc_post unapplied; readers of the residual stream materialize it
@@ -3677,8 +3675,12 @@ class DeepseekV4Model(nn.Module):
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
-                    tail.rows(hidden_states),
+                if pending_post is not None:
+                    # The fused boundary carries the residual state in pending_post.
+                    pending_post = tuple(tail.rows(t) for t in pending_post)
+                else:
+                    hidden_states = tail.rows(hidden_states)
+                prev_pre, input_ids, input_ids_global = (
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
                     tail.rows(input_ids_global),
@@ -4425,13 +4427,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = None
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        tail = (
+            self.model._late_layer_tail(forward_batch)
+            if self.capture_aux_hidden_states
+            else None
+        )
+        if tail is not None:
             input_ids = tail.rows(input_ids)
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens

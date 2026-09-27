@@ -550,6 +550,13 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
+        # Keep the prompt's final replay window in one prefill chunk.
+        self.replay_window = (
+            getattr(tree_cache, "sliding_window_size", None) or 0
+            if get_exec().features.enable_decoder_swa_bounded_replay
+            else 0
+        )
+
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
         # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
@@ -1000,6 +1007,13 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _keep_replay_window_whole(self, extend_len: int, chunk_len: int) -> int:
+        """Avoid a final chunk shorter than the replay window."""
+        rest = extend_len - chunk_len
+        if 0 < rest < self.replay_window < extend_len:
+            return extend_len - self.replay_window
+        return chunk_len
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -1032,8 +1046,10 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        truncated = cand_extend_input_len > _rem_tokens
-        new_len = min(cand_extend_input_len, _rem_tokens)
+        new_len = self._keep_replay_window_whole(
+            cand_extend_input_len, min(cand_extend_input_len, _rem_tokens)
+        )
+        truncated = new_len < cand_extend_input_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1183,7 +1199,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._keep_replay_window_whole(
+                cand_extend_input_len, self.rem_chunk_tokens
+            )
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1388,6 +1406,12 @@ class PrefillAdder:
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
+
+                # Flooring to pages below only lengthens the final chunk.
+                trunc_len = self._keep_replay_window_whole(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices),
+                    trunc_len,
+                )
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
