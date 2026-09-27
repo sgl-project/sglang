@@ -237,7 +237,7 @@ def create_moe_dispatcher(
 
         return NcclEpDispatcher(
             moe_runner_config=moe_runner_config,
-            ep_group=get_tp_group(),
+            ep_group=get_parallel().tp_group,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")

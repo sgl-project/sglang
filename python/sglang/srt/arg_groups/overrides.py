@@ -1525,12 +1525,19 @@ def _nccl_ep_capability_fallback(view: Any) -> dict:
         nccl_ep_unavailable_reason,
     )
 
-    reason = nccl_ep_unavailable_reason()
+    reason = nccl_ep_unavailable_reason(require_graph=view.enable_nccl_ep_cuda_graph)
     if reason is None:
         return {}
+    if view.enable_nccl_ep_cuda_graph:
+        raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
     import importlib.util
 
-    fallback = "deepep" if importlib.util.find_spec("deep_ep") is not None else "none"
+    fallback = (
+        "deepep"
+        if view.moe_runner_backend != "triton"
+        and importlib.util.find_spec("deep_ep") is not None
+        else "none"
+    )
     logger.warning(
         "NCCL EP MoE requested but unavailable (%s); falling back to "
         "moe_a2a_backend='%s'. Install nccl4py[cu13] on a CUDA13 + NCCL>=2.29 "

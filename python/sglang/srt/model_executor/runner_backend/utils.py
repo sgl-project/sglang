@@ -64,6 +64,11 @@ def resolve_decode_backend(
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
     enable_memory_saver = get_exec().features.enable_memory_saver
+    nccl_ep_capacity = None
+    if getattr(getattr(get_exec(), "moe", None), "enable_nccl_ep_cuda_graph", False):
+        if model_runner.device != "cuda" or backend_name != Backend.FULL:
+            raise ValueError("NCCL EP CUDA Graph requires the full CUDA decode backend")
+        nccl_ep_capacity = cuda_graph_runner.max_num_token
 
     if model_runner.device == "npu":
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
@@ -109,6 +114,11 @@ def resolve_decode_backend(
     return full_backend_cls(
         cuda_graph_runner,
         enable_memory_saver=enable_memory_saver,
+        **(
+            {"nccl_ep_capacity": nccl_ep_capacity}
+            if nccl_ep_capacity is not None
+            else {}
+        ),
     )
 
 

@@ -815,6 +815,10 @@ class ExecMoe(msgspec.Struct):
         Literal["low_latency", "auto"],
         "NCCL EP dispatch algorithm. Only `low_latency` is implemented; `auto` resolves to it. The high-throughput (prefill) path is a follow-up.",
     ] = "low_latency"
+    enable_nccl_ep_cuda_graph: A[
+        bool,
+        "Enable serialized full decode CUDA Graphs with persistent NCCL EP LL resources.",
+    ] = False
     nccl_ep_layout: A[
         Literal["expert_major", "rank_major"],
         "NCCL EP low-latency layout. `expert_major` is the established default. `rank_major` transports BF16 source-rank slots and packs them locally for W4AFP8 expert compute.",

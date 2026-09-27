@@ -689,3 +689,60 @@ def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:
     if cfg.cuda_graph_max_bs_decode is not None:
         required = max(required, cfg.cuda_graph_max_bs_decode)
     return required
+
+
+def handle_nccl_ep_token_budget(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.enable_nccl_ep_cuda_graph and cfg.moe_a2a_backend != "nccl_ep":
+        raise ValueError("NCCL EP CUDA Graph requires the resolved NCCL EP backend")
+    if cfg.moe_a2a_backend != "nccl_ep":
+        return
+    if cfg.enable_single_batch_overlap or cfg.enable_two_batch_overlap:
+        raise ValueError("NCCL EP LL does not support single/two batch overlap")
+    if not cfg.enable_nccl_ep_cuda_graph:
+        graph_config = with_phase(
+            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+        )
+        declare_resolution(
+            server_args,
+            "handle_nccl_ep_token_budget",
+            cuda_graph_config=with_phase(
+                graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+        _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK,
+        _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP,
+    )
+
+    budget = cfg.nccl_ep_num_max_dispatch_tokens_per_rank
+    if not 0 <= budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP:
+        raise ValueError("NCCL EP LL dispatch budget must be in [0, 1024]")
+    budget = budget or _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
+    if cfg.disaggregation_mode == "decode":
+        return
+    if cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "NCCL EP LL requires chunked prefill; set --chunked-prefill-size"
+        )
+    if cfg.enable_dynamic_chunking and cfg.pp_size > 1:
+        raise ValueError("NCCL EP LL does not support PP dynamic chunking")
+
+    # DP has already divided the chunk size. Bound the local scheduler's
+    # budget, including mixed decode tokens, by the native LL capacity.
+    chunk = min(cfg.chunked_prefill_size, budget)
+    page_size = cfg.page_size
+    chunk = chunk // page_size * page_size
+    if chunk <= 0:
+        raise ValueError("NCCL EP LL dispatch budget must fit at least one KV page")
+    if chunk != cfg.chunked_prefill_size:
+        logger.warning(
+            "NCCL EP LL limits per-rank chunked prefill from %s to %s tokens "
+            "(dispatch budget %s).",
+            cfg.chunked_prefill_size,
+            chunk,
+            budget,
+        )
+        declare_resolution(
+            server_args, "handle_nccl_ep_token_budget", chunked_prefill_size=chunk
+        )
