@@ -2830,6 +2830,87 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_tp_size, 2)
                 self.assertEqual(parallel.dp_size, 2)
 
+    def test_a_narrowed_draft_still_indexes_the_targets_dp_sync(self):
+        """A draft scope that owns its attention answers the DP gather width and
+        slot of the target's sync, and stops answering once the scope exits."""
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        group = self._group(world_size=1, rank=0)
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(tp_rank=2, attn_tp_rank=0, attn_dp_rank=2),
+            patch.object(parallel_state, "_TP", group),
+        ):
+            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+                self.assertEqual(get_parallel().attn_dp_size, 1)
+                self.assertEqual(get_parallel().attn_dp_rank, 0)
+                self.assertEqual(dp_gather_width(), 4)
+                self.assertEqual(dp_gather_slot(), 2)
+            self.assertIsNone(get_flags().dp.scoped_gather_slot)
+            self.assertEqual(dp_gather_slot(), 2)
+
+    def _draft_scope_at_slot_two(self):
+        """A rank in slot 2 of a four-replica gather, inside a draft scope."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        group = self._group(world_size=1, rank=0)
+        outer = [
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(tp_rank=2, attn_tp_rank=0, attn_dp_rank=2),
+            patch.object(parallel_state, "_TP", group),
+        ]
+        for entered in outer:
+            entered.__enter__()
+            self.addCleanup(entered.__exit__, None, None, None)
+        scope = parallel_state.patch_tensor_parallel_group(group, owns_attention=True)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+
+    def test_a_sequence_is_read_at_this_process_s_slot(self):
+        from sglang.srt.layers.dp_attention import dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        self.assertEqual(dp_slot_in([9, 5, 6, 4]), 2)
+
+    def test_a_sequence_of_one_is_this_process_s_own_entry(self):
+        """The scheduler skips the all-gather for a single entry, and does so
+        even where the gather is wider than one."""
+        from sglang.srt.layers.dp_attention import dp_gather_width, dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        self.assertEqual(dp_gather_width(), 4)
+        self.assertEqual(dp_slot_in([7]), 0)
+
+    def test_a_sequence_the_gather_did_not_produce_is_refused(self):
+        """The width and the slot have to come from one topology: a sequence
+        sized by another is what a stale slot reads at the wrong index."""
+        from sglang.srt.layers.dp_attention import dp_slot_in
+
+        self._draft_scope_at_slot_two()
+        with self.assertRaises(ValueError) as caught:
+            dp_slot_in([9, 5, 6, 4, 3])
+        self.assertIn("5 entries", str(caught.exception))
+        self.assertIn("width 4", str(caught.exception))
+
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.utils.weight_checker import WeightChecker
@@ -2843,6 +2924,106 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().pp_size, 2)
         info = checker._parallelism_info(role="target")
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
+
+
+def _calls_named(text: str, name: str) -> int:
+    """How many times ``name`` is called in ``text``."""
+    import ast as _ast
+
+    return sum(
+        1
+        for node in _ast.walk(_ast.parse(text))
+        if isinstance(node, _ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
+    )
+
+
+def _sequences_indexed_by_the_attention_rank(text: str) -> list:
+    """Per-replica sequences subscripted by the attention-DP rank.
+
+    That rank is the process's place in the attention topology, which a draft
+    scope narrows; the sequence is sized by the gather. Indexing one with the
+    other reads whatever sits at the wrong slot.
+    """
+    import ast as _ast
+
+    offenders = []
+    for node in _ast.walk(_ast.parse(text)):
+        if not isinstance(node, _ast.Subscript):
+            continue
+        base = getattr(node.value, "attr", getattr(node.value, "id", "")) or ""
+        if not base.startswith("global_num_tokens"):
+            continue
+        if "attn_dp_rank" in _ast.unparse(node.slice):
+            offenders.append(
+                f"{base}[{_ast.unparse(node.slice)}] at line {node.lineno}"
+            )
+    return offenders
+
+
+class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
+    """A per-replica sequence is read at the slot of the gather that produced
+    it. ``dp_slot_in`` is where the two are checked against each other, so a
+    bare slot read has to be one of the places that legitimately has no
+    sequence to check against.
+    """
+
+    #: Defines the helpers; captures the slot on draft-scope entry; and asserts
+    #: what the bare slot answers, which is this file.
+    MAY_READ_THE_BARE_SLOT = (
+        "srt/layers/dp_attention.py",
+        "srt/distributed/parallel_state.py",
+        "unit/test_runtime_context.py",
+    )
+
+    def test_nothing_else_reads_the_bare_slot(self):
+        offenders, exercised = [], set()
+        for path in _sources():
+            text = path.read_text(encoding="utf-8-sig")
+            if not _calls_named(text, "dp_gather_slot"):
+                continue
+            rel = str(path).replace("\\", "/")
+            allowed = [a for a in self.MAY_READ_THE_BARE_SLOT if rel.endswith(a)]
+            if allowed:
+                exercised.update(allowed)
+            else:
+                offenders.append(rel)
+        self.assertEqual(
+            offenders,
+            [],
+            "read the slot through dp_slot_in(<the sequence>) instead, so the "
+            "width it came from is checked:\n  " + "\n  ".join(offenders),
+        )
+        # An allowlist entry that stopped calling it would hide a new offender.
+        self.assertEqual(exercised, set(self.MAY_READ_THE_BARE_SLOT))
+
+    def test_no_sequence_is_indexed_by_the_attention_rank(self):
+        offenders = []
+        for path in _sources():
+            found = _sequences_indexed_by_the_attention_rank(
+                path.read_text(encoding="utf-8-sig")
+            )
+            offenders.extend(f"{path}: {one}" for one in found)
+        self.assertEqual(
+            offenders,
+            [],
+            "a draft scope narrows attn_dp_rank to 0; index with "
+            "dp_slot_in(<the sequence>):\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_censuses_would_notice_one(self):
+        planted = (
+            "def f(fb):\n"
+            "    x = global_num_tokens[get_parallel().attn_dp_rank]\n"
+            "    y = fb.global_num_tokens_cpu[parallel.attn_dp_rank]\n"
+            "    return dp_gather_slot(), x, y\n"
+        )
+        self.assertEqual(len(_sequences_indexed_by_the_attention_rank(planted)), 2)
+        self.assertEqual(_calls_named(planted, "dp_gather_slot"), 1)
+        # A legal shape stays quiet.
+        legal = "def f(s):\n    return s[dp_slot_in(s)]\n"
+        self.assertEqual(_sequences_indexed_by_the_attention_rank(legal), [])
+        self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
 
 
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):

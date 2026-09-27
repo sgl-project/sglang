@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
 @dataclass
@@ -75,6 +77,33 @@ class HostPoolGroup:
 
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
+
+    @contextmanager
+    def layout_lease(self):
+        domains = shared_host_layout_domains(entry.host_pool for entry in self.entries)
+        for domain in domains:
+            domain.acquire_layout()
+        try:
+            yield
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout()
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
+        anchor_pool = self.anchor_entry.host_pool
+        if (
+            not isinstance(anchor_pool, HostKVCache)
+            or anchor_pool.shared_allocation_domain is None
+        ):
+            return anchor_pool.get_page_buffer_element_size(split_factor)
+
+        element_sizes = set()
+        for entry in self.entries:
+            element_size = entry.host_pool.get_page_buffer_element_size(split_factor)
+            if element_size is None:
+                return None
+            element_sizes.add(element_size)
+        return element_sizes.pop() if len(element_sizes) == 1 else None
 
     def get_contiguous_buf_infos(self):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
@@ -174,7 +203,9 @@ class HostPoolGroup:
                 self.free(indices, pool=transfer.name)
                 transfer.host_indices = None
 
-        for transfer in transfers:
+        # Reclaiming one pool can evict another's slots. Keep allocation order
+        # identical across TP ranks even when transfers come from a Rust HashMap.
+        for transfer in sorted(transfers, key=lambda transfer: transfer.name):
             if transfer.indices_from_pool is not None:
                 derived_transfers.append(transfer)
                 continue
@@ -197,7 +228,8 @@ class HostPoolGroup:
         for transfer in derived_transfers:
             if transfer.indices_from_pool == self.anchor_entry.name:
                 transfer.host_indices = primary_host_indices
-                transfer.device_indices = primary_device_indices
+                if transfer.device_indices is None:
+                    transfer.device_indices = primary_device_indices
                 continue
 
             source = next(
@@ -213,7 +245,8 @@ class HostPoolGroup:
                 rollback()
                 return None
             transfer.host_indices = source.host_indices
-            transfer.device_indices = source.device_indices
+            if transfer.device_indices is None:
+                transfer.device_indices = source.device_indices
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
