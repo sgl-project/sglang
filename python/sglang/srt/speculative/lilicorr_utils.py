@@ -1,8 +1,5 @@
-"""Serving support for the LiLiCorr candidate-lattice reranker on DFLASH drafts.
-
-Head geometry, the candidate lattice, the eager draft seam and the CUDA-graph-folded
-draft sampler. The head itself is `sglang.srt.models.lilicorr`.
-"""
+"""Serving support for the LiLiCorr reranker head on DFLASH drafts; the head itself
+lives in `sglang.srt.models.lilicorr`."""
 
 from __future__ import annotations
 
@@ -32,9 +29,7 @@ def _env_bool(name: str, message: str) -> bool:
     return raw in ("1", "on", "true")
 
 
-# Off is byte-identical to the greedy commit: same kernel, same argmax, no proposal.
-# Read at import, not per call: a per-call os.environ read would be a host-side branch
-# inside a CUDA-graph replay.
+# Read at import: a per-call read would be a host-side branch inside a graph replay.
 SAMPLING_ENABLED = _env_bool(
     "LILICORR_SAMPLING",
     "Refusing rather than defaulting: a typo would report the greedy number under the "
@@ -86,8 +81,7 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
         return None
 
     def required(key: str, cast, *, positive: bool = True):
-        # No field may be defaulted: logit_scale and vector_eps change no tensor shape,
-        # so weight load would not catch them.
+        # No defaults: logit_scale and vector_eps change no shape, so load cannot catch them.
         full_key = f"lilicorr_{key}"
         if full_key not in dflash_cfg:
             raise ValueError(
@@ -176,13 +170,8 @@ def lilicorr_candidates(
     tp_group=None,
     chunk_size: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-row top-k over the target LM head, as normalized log-probs and global ids.
-
-    Returns (log_probs [N, topk] fp32, tokens [N, topk] int64), equivalent to
-    log_softmax(logits).topk(topk): the head scores log-probs normalized over the FULL
-    vocabulary, so the log-partition is part of the contract. tp_group is required when
-    the head is vocabulary-sharded.
-    """
+    """log_softmax(logits).topk(topk) over the full vocabulary, as
+    (log_probs [N, topk] fp32, global tokens [N, topk] int64)."""
     topk = int(topk)
     if topk > int(num_org):
         raise ValueError(
@@ -208,8 +197,7 @@ def lilicorr_candidates(
             )
         return vals - lse.unsqueeze(-1), tokens
 
-    # The folded path supplies a preallocated buffer so no large allocation lands in a
-    # CUDA graph's private pool, and is one span by construction.
+    # Folded path: a static buffer keeps the logits out of the graph's private pool.
     if logits_out is not None:
         return one_span(hidden_states, logits_out)
 
@@ -232,8 +220,8 @@ def _combine_across_ranks(
     topk: int,
     tp_group,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Three per-step collectives fused into one all-gather by packing
-    # [vals | tokens as fp32 | lse] per row; ids below 2**24 are exact in fp32.
+    # One all-gather of [vals | tokens as fp32 | lse] per row;
+    # ids below 2**24 are exact in fp32.
     tp_size = int(tp_group.world_size)
     rows = int(vals.shape[0])
     width = 2 * topk + 1
@@ -270,12 +258,8 @@ def per_request_last_row(
     extend_lens: Optional[torch.Tensor],
     commit_lens: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Index of each request's last committed row, or None if not recoverable.
-
-    The callers hand over different layouts: verify passes commit_lens against a buffer
-    padded to [bs, block_size] and flattened, so requests sit at a constant stride;
-    prefill/extend passes extend_lens against a packed request-major buffer, ragged.
-    """
+    # Verify's commit_lens index a [bs, block_size]-padded buffer (constant stride);
+    # prefill/extend's extend_lens index a packed ragged one.
     if commit_lens is not None:
         bs = int(commit_lens.shape[0])
         if bs == 0 or num_rows % bs != 0:
@@ -298,12 +282,7 @@ def publish_anchor(
     extend_lens: Optional[torch.Tensor] = None,
     commit_lens: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Each request's last committed context row, as the head's anchor.
-
-    ctx_hidden is the fc-projected target context the caller already computed for the KV
-    write. None means "no anchor", which the head scores as invalid; fabricating one
-    would be a silent acceptance regression.
-    """
+    # None means "no anchor", which the head scores as invalid.
     ends = per_request_last_row(
         num_rows=int(ctx_hidden.shape[0]),
         extend_lens=extend_lens,
@@ -328,16 +307,8 @@ def propose_lilicorr_block(
     sampling_info=None,
     sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Reranked draft block in place of the per-slot greedy argmax.
-
-    Serves the steps the draft CUDA graph cannot: prefill, extend, batches past the
-    captured buckets, and tp>1. draft_hidden is [bs, block_size, hidden], slot 0 being
-    the anchor position. Returns (tokens [bs, block_size - 1], candidate_tokens,
-    q_rows); the latter two are None unless sampling_enabled.
-
-    sampling_enabled is the worker's DEVICE gate, not the module constant: this path
-    publishes into an accept kernel that does not run everywhere the env var can be set.
-    """
+    # Eager fallback for steps the draft graph cannot serve. draft_hidden is
+    # [bs, block_size, hidden]; candidate_tokens and q_rows are None unless sampling.
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
     pass_hidden = draft_hidden[:, 1:, :]
@@ -356,8 +327,7 @@ def propose_lilicorr_block(
 
     feat = int(head.context_proj.in_features)
     if anchor is None or int(anchor.shape[0]) != bs:
-        # A row count disagreeing with the batch means the batch resized between the
-        # write and this read, so the whole batch scores invalid rather than misaligned.
+        # The batch resized since the anchor write; score invalid rather than misaligned.
         anchor_hidden = torch.zeros(
             (bs, feat), device=draft_hidden.device, dtype=draft_hidden.dtype
         )
@@ -377,13 +347,11 @@ def propose_lilicorr_block(
     )
     device = draft_hidden.device
     if sampling_enabled and sampling_info is not None:
-        # Clamped as DSpark and the DFlash2 selector do: a greedy row's temperature may
-        # be exactly 0, and it divides before greedy_mask discards its pick.
+        # A greedy row's temperature may be 0, and it divides before greedy_mask applies.
         temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
     else:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-    # Sampling off is an all-greedy mask, which the walk commits by argmax and whose
-    # uniforms it never reads.
+    # Sampling off is an all-greedy mask: argmax commit, uniforms unread.
     greedy_mask = (
         resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         if sampling_enabled
@@ -404,12 +372,7 @@ def propose_lilicorr_block(
 
 
 class LiLiCorrDraftSampler:
-    """LiLiCorr select, run inside the draft CUDA graph.
-
-    Follows the DFLASH draft sampler contract: __call__(hidden_states, input_ids) writes
-    the drafted tokens for block positions 1.. into self.out. The worker registers it on
-    draft_model_runner.capture_tail_hooks and reads self.out after the replay.
-    """
+    """LiLiCorr select inside the draft CUDA graph; writes drafted tokens to self.out."""
 
     def __init__(
         self,
@@ -425,8 +388,7 @@ class LiLiCorrDraftSampler:
         sampling_enabled: bool,
     ) -> None:
         self.head = head
-        # Device-gated by the worker, as the selector's sampler is: the sampled accept
-        # path needs chain_speculative_sampling_triton, which does not run on NPU.
+        # Device-gated by the worker: the sampled accept kernel does not run on NPU.
         self.sampling_enabled = bool(sampling_enabled)
         self.embed_tokens = embed_tokens
         self.weight = weight
@@ -451,14 +413,11 @@ class LiLiCorrDraftSampler:
         self.anchor_valid = torch.zeros((self.max_bs,), dtype=torch.bool, device=device)
         self.token_table = head.build_token_table(embed_tokens)
 
-        # Sampling state: temperatures and greedy_mask written by the worker before the
-        # replay, uniforms drawn inside it, q_out and candidate_out read after it.
-        # Allocated unconditionally: ~90 KiB, so both paths share one object graph.
+        # Sampling state, allocated unconditionally (~90 KiB).
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
-        # Defaults are the all-greedy commit, and stage_sampling_params is a no-op with
-        # sampling off, so the buffers stay valid for a run that never touches them.
+        # Defaults are the all-greedy commit, valid for a run with sampling off.
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.zeros(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
@@ -466,24 +425,14 @@ class LiLiCorrDraftSampler:
         self.q_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.float32, device=device
         )
-        # Verify needs the ids q is indexed against, and the candidate tensor is a
-        # graph-internal intermediate, so it is copied to this fixed address.
+        # Fixed-address copy of the candidates q is indexed against, read by verify.
         self.candidate_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.int64, device=device
         )
 
     def set_anchor(self, rows: Optional[torch.Tensor], bs: int) -> None:
-        """Publish this step's anchor into the buffer the graph reads.
-
-        Unsupplied rows are zeroed and marked invalid rather than left stale, because the
-        graph runs at the padded bucket batch size.
-
-        Row i is the same request across steps only while the batch composition holds, so
-        filter/merge can hand a row a neighbour's anchor; that feeds the drafter and not
-        verify, so it costs acceptance, never correctness. Carrying the anchor on
-        DFlashDraftInputV2 so filter/merge reorder it measured -4.67% acceptance at
-        concurrency 32; measure before trying it again.
-        """
+        # Rows past bs are zeroed, not left stale: the graph runs at the bucket size.
+        # Filter/merge can hand a row a neighbour's anchor, costing acceptance only.
         count = int(bs)
         if rows is None or int(rows.shape[0]) != count or count > self.max_bs:
             count = 0
@@ -495,11 +444,7 @@ class LiLiCorrDraftSampler:
             self.anchor_valid[count:].fill_(False)
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Refresh the static sampling params; must run before the replay that reads them.
-
-        Rows past bs are left alone: they score a zeroed anchor and the worker discards
-        them with out[: bs * slots].
-        """
+        # Must run before the replay; rows past bs are discarded by the worker.
         if not self.sampling_enabled:
             return
         if sampling_info is None:
@@ -522,8 +467,7 @@ class LiLiCorrDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         rows = bs * self.slots
 
-        # max_bs sizes every static buffer here, so a larger replay would return short
-        # slices rather than fail.
+        # A larger replay would silently return short slices of the static buffers.
         if bs > self.max_bs:
             raise RuntimeError(
                 f"LiLiCorrDraftSampler was built for max_bs={self.max_bs} but the draft "
@@ -587,15 +531,8 @@ def build_lilicorr_draft_sampler(
     block_size: int,
     sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Optional[LiLiCorrDraftSampler]:
-    """Build the graph-folded LiLiCorr sampler, or None to keep the head eager.
-
-    None is not a neutral choice: the eager head costs a large fraction of throughput and
-    drops the anchor for the whole batch on any resize, so each refusal is logged.
-    """
-
+    # None keeps the head eager, which costs a large fraction of throughput.
     def eager(reason: str) -> None:
-        # "kept eager (reason=...)" is the string that diagnosed a -17% third-party
-        # reproduction; the reason is what names the cause, so keep both.
         logger.warning(
             "LiLiCorr head kept eager (reason=%s): a bring-up path, not a serving "
             "configuration. Expect a large throughput regression and numbers that are "

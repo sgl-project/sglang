@@ -1,13 +1,5 @@
-"""Triton kernels for the LiLiCorr candidate-lattice reranker.
-
-lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits and the
-full-vocab log-partition from one pass over [n, V].
-
-lilicorr_sample_path commits one path through the candidate lattice and emits the
-per-slot proposal verify needs to accept it by rejection sampling; an all-greedy mask
-makes it the plain argmax commit. It adapts the head's factors to DFlash2's
-selector_walk_triton, and dispatches to a value-identical torch implementation off CUDA.
-"""
+"""Triton kernels for the LiLiCorr reranker; each falls back to a value-identical torch
+implementation off CUDA."""
 
 from __future__ import annotations
 
@@ -20,14 +12,13 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 
-# Tile width for the scan, and tiles per program (TILE * TPP is the load block). Launch
-# geometry tuned for an H100-class vocabulary head, not a property of the method.
+# Launch geometry tuned on H100 for a ~150k vocabulary; TILE * TPP is the load block.
 _TILE = 1024
 _TILES_PER_PROGRAM = 8
 _NUM_WARPS = 4
 
-# Widest candidate pool the selector walk holds in one lane group. Exported because the
-# config refuses a wider head rather than serving it; the two must not drift.
+# Widest candidate pool the selector walk holds in one lane group;
+# the config refuses a wider head.
 MAX_FUSED_CANDIDATE_TOPK = 16
 
 _NEG = -3.0e38
@@ -47,10 +38,7 @@ def _tiled_scan(
     TILE: tl.constexpr,
     TPP: tl.constexpr,
 ):
-    """One pass over [N, V]: per-tile maxima plus one (m, s) partial per program.
-
-    grid = (N, cdiv(T, TPP)); each program covers TPP contiguous tiles, block [TPP, TILE].
-    """
+    # grid = (N, cdiv(T, TPP)): per-tile maxima plus one (m, s) partial per program.
     neg = -3.0e38
     row = tl.program_id(0)
     grp = tl.program_id(1)
@@ -134,18 +122,10 @@ def lilicorr_topk_lse(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact per-row top-k and full-vocab logsumexp from one [N, V] read.
 
-    Returns (vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32). The
-    candidate log-prob the head consumes is val - lse.
-
-    The tile pre-selection is exact, not approximate: a true top-k element in tile T has
-    max(T) >= it, so T cannot be outside the k largest-max tiles.
-
-    Exactness is about the values. Which of an exactly-tied set is returned is
-    unspecified here and in CUDA torch.topk alike, so the two can pick different token
-    ids for a row; the tied candidates carry equal log-probs.
-
-    k must be a power of two to take the tiled path, enforced at config parse on
-    lilicorr_candidate_topk.
+    Returns (vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32). The tile
+    pre-selection is exact: a top-k element's tile has a max at least as large, so it is
+    among the k largest-max tiles. Which of an exactly-tied set is returned is
+    unspecified, as in CUDA torch.topk.
     """
     if not logits.is_cuda:
         return _topk_lse_torch(logits, k)
@@ -155,8 +135,7 @@ def lilicorr_topk_lse(
     K = int(k)
     T = (V + _TILE - 1) // _TILE
     if min(K, T) & (min(K, T) - 1):
-        # With k validated at config parse, this can only mean the vocabulary spans
-        # fewer than k tiles, where the pre-selection is vacuous anyway.
+        # k is a power of two, so the vocabulary spans fewer than k tiles here.
         return _topk_lse_torch(logits, k)
     P = (T + _TILES_PER_PROGRAM - 1) // _TILES_PER_PROGRAM
     device = logits.device
@@ -205,12 +184,8 @@ def lilicorr_topk_lse(
 
 
 def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
-    """Pack the head's factors into the selector's [bs, slots, K, K] layout.
-
-    log_start [bs, K] is slot 0, log_pair [bs, slots-1, K, K] every slot after it. The
-    walk only reads scores[:, 0, 0, :] at slot 0, so the broadcast over the "from" axis
-    is sound. fp32 because the commit's argmax runs on these values.
-    """
+    # Pack into the selector's [bs, slots, K, K] layout; the walk reads only
+    # scores[:, 0, 0, :] at slot 0, so broadcasting log_start over "from" is sound.
     topk = int(log_start.shape[-1])
     start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
     return torch.cat([start, log_pair.float()], dim=1)
@@ -224,9 +199,7 @@ def _selector_walk_torch(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Value-identical reference for selector_walk_triton, and the arm off CUDA. Both
-    # picks are computed for every row and selected rather than branched on, because the
-    # rows of one batch disagree.
+    # Value-identical reference for selector_walk_triton, and the arm off CUDA.
     _, num_slots, topk = candidate_ids.shape
     temps = temperatures.view(-1, 1).to(torch.float32)
     greedy = greedy_mask.view(-1)
@@ -268,19 +241,10 @@ def lilicorr_sample_path(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Left-to-right commit over the candidate lattice, plus the proposal it used.
 
-    Shapes (single block): log_start [bs, k], log_pair [bs, slots-1, k, k],
-    candidate_tokens [bs, slots, k], uniforms [bs, slots], temperatures [bs] and
-    greedy_mask [bs]. Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32).
-    q_rows[b, s] is the distribution slot s was drawn from, over that slot's k candidates
-    and zero elsewhere; the caller scatters it into the dense q the verify kernel reads.
-
-    The proposal is softmax(psi_s / T), psi_s being the head's own log-factor row and no
-    other term, because the head was trained with no unary factor and no log-prob prior.
-    A greedy_mask row takes the argmax and reports a point mass, so min(1, p/q) stays the
-    right acceptance test for a deterministic pick.
-
-    The walk is DFlash2's candidate selector. Fixed trip count and no host syncs, so the
-    draft CUDA graph can capture it.
+    log_start [bs, k], log_pair [bs, slots - 1, k, k], candidate_tokens [bs, slots, k].
+    Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32). The proposal is the head's
+    own log-factor row over T with no log-prob prior, since the head was trained without
+    one; a greedy_mask row reports a point mass so min(1, p/q) stays exact.
     """
     scores = _lattice_scores(log_start, log_pair)
     walk = selector_walk_triton if scores.is_cuda else _selector_walk_torch
