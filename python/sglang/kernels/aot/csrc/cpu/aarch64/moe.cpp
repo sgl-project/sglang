@@ -242,7 +242,8 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& /*w2_bias*/,
     const std::optional<double>& /*alpha*/,
     const std::optional<double>& /*limit*/,
-    bool /*is_vnni*/) {
+    bool /*is_vnni*/,
+    const std::optional<std::string>& activation) {
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(w13);
@@ -255,6 +256,10 @@ at::Tensor fused_experts_cpu(
   CHECK_DIM(2, topk_ids);
 
   CHECK_EQ(topk_ids.scalar_type(), at::kInt);
+
+  if (activation.has_value() && activation.value() != "silu") {
+    TORCH_CHECK(false, "fused_experts_cpu on ARM64 only supports activation='silu', got: ", activation.value());
+  }
 
   // TODO: support topk_weights to be bf16 or fp16 in the kernel
   auto topk_weights_ = topk_weights.to(at::kFloat);

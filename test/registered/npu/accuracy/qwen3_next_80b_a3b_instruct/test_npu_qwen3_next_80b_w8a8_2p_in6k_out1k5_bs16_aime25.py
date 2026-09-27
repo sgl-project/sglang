@@ -10,10 +10,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="",
+    est_time=4800,
+    suite="full-acc-4-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 QWEN3_NEXT_80B_A3B_ENVS = {
@@ -81,7 +80,7 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     -1,
     "--max-running-requests",
     16,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     8,
@@ -113,7 +112,7 @@ class TestQwen3Next80BA3B_aime25(TestNpuAccuracyTestCaseBase):
     max_concurrency = 16
 
     def test_aime25(self):
-        self.run_accuracy_multiple(n_runs=3)
+        self.run_accuracy()
 
 
 if __name__ == "__main__":

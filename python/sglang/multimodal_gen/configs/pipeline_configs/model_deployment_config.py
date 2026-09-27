@@ -11,13 +11,12 @@ OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
 
 @dataclass(frozen=True)
 class ModelDeploymentConfig:
-    auto_dit_layerwise_offload: bool = False
-    # if the available memory is bigger than this value, keep dit resident instead of apply layerwise-offload
-    auto_dit_layerwise_offload_high_memory_disable_gb: float | None = None
+    dit_layerwise_offload_modes: tuple[Literal["auto", "memory"], ...] = ()
+    auto_dit_offload_prefetch_size: float | None = None
     keep_resident_min_available_gb: float | None = None
-    # only vae -- it is tiny so keeping it resident barely shifts memory; large
-    # encoders stay offloaded and dit placement stays with the FSDP/dit-layerwise
-    # policy
+    # Per-model resident defaults. Auto mode additionally keeps an image DiT
+    # resident above the image workload memory threshold; video DiT placement
+    # stays with the model's FSDP/layerwise policy.
     keep_resident_components: tuple[OffloadComponentName, ...] = ("vae",)
     fsdp_auto_min_available_memory_gb: float | None = None
     fsdp_auto_requires_cfg: bool = True

@@ -4,8 +4,8 @@
 # Usage:
 #   build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 #
-# Writes CUDA-tagged wheels to <deepep-source>/dist. CUDA 13 builds also write
-# PyPI-ready wheels without the local CUDA version to <deepep-source>/dist-pypi.
+# Writes CUDA-tagged wheels to <deepep-source>/dist, plus PyPI-ready wheels
+# without the local CUDA version in <deepep-source>/dist-pypi.
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ usage() {
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 
   python-version:     3.10, 3.11, 3.12, or 3.13
-  cuda-version:       12.9 or 13.0
+  cuda-version:       13.0
   deepep-source:      checkout of the selected DeepEP implementation branch
   packaging-overlay: path to the shared DeepEP sgl_deep_ep directory
   architecture:       x86_64 or aarch64 (defaults to the current machine)
@@ -45,9 +45,6 @@ case "${PYTHON_VERSION}" in
 esac
 
 case "${CUDA_VERSION}" in
-    12.9)
-        CUDA_TAG=cu129
-        ;;
     13.0)
         CUDA_TAG=cu130
         ;;
@@ -126,7 +123,7 @@ docker run --rm \
     --env CUDA_VERSION="${CUDA_VERSION}" \
     --env MAX_JOBS="${MAX_JOBS:-8}" \
     --volume "${DEEPEP_SOURCE}:/deepep:ro" \
-    --volume "${PACKAGING_OVERLAY}:/packaging:ro" \
+    --volume "${PACKAGING_OVERLAY}:/sgl-deep-ep-packaging:ro" \
     --volume "${DIST_DIR}:/output/dist" \
     --volume "${PYPI_DIST_DIR}:/output/dist-pypi" \
     "${IMAGE_TAG}" \
@@ -136,8 +133,8 @@ find /output/dist-pypi -maxdepth 1 -type f -name "sgl_deep_ep-*.whl" -delete
 raw_dir="$(mktemp -d -t sgl-deep-ep-raw.XXXXXX)"
 trap '\''rm -rf -- "${raw_dir}"'\'' EXIT
 
-bash /packaging/build_sgl_deep_ep.sh \
-    /deepep /packaging "${raw_dir}" "${CUDA_VERSION}" "${ARCHITECTURE}"
+bash /sgl-deep-ep-packaging/build_sgl_deep_ep.sh \
+    /deepep /sgl-deep-ep-packaging "${raw_dir}" "${CUDA_VERSION}" "${ARCHITECTURE}"
 
 shopt -s nullglob
 raw_wheels=("${raw_dir}"/*.whl)

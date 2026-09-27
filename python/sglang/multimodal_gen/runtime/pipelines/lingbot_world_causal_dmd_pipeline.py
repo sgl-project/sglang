@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flo
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     AuxiliaryConditionEncodingStage,
     DMDTimestepPreparationStage,

@@ -13,6 +13,7 @@
 --------------------------------------------------------------------------------
 
 <p align="center">
+<a href="https://www.sglang.io/"><b>🌐 Website</b></a> |
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |
 <a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
@@ -74,6 +75,7 @@ Its core features include:
 ## Getting Started
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
 - [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
+- [Cookbook](https://docs.sglang.io/cookbook) — the deployment command we recommend for each supported model
 - [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 - [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
 - [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)

@@ -11,6 +11,7 @@ import os
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -25,7 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class Cosmos3Pipeline(ComposedPipelineBase):
+class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
     """Cosmos3 diffusion pipeline shared by T2V, I2V, and T2I.
 
     Text is tokenized and embedded directly inside the transformer; there is
@@ -33,7 +34,10 @@ class Cosmos3Pipeline(ComposedPipelineBase):
     stages from ``batch.data_type`` and ``batch.preprocessed_image``.
     """
 
-    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+    # Canonical ``_class_name`` in newer checkpoints' ``model_index.json``.
+    # Older checkpoints declare ``Cosmos3OmniDiffusersPipeline`` (see the
+    # back-compat alias below).
+    pipeline_name = "Cosmos3OmniPipeline"
     is_video_pipeline = True
 
     _required_config_modules = [
@@ -96,7 +100,11 @@ class Cosmos3Pipeline(ComposedPipelineBase):
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
-        self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
+        self.add_stage(
+            Cosmos3DenoisingStage(
+                transformer, scheduler, server_args=server_args, vae=vae
+            )
+        )
         self.add_stage(
             Cosmos3DecodingStage(
                 vae, guardrails=guardrails_on, sound_tokenizer=sound_tokenizer
@@ -109,4 +117,15 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = Cosmos3Pipeline
+class Cosmos3OmniDiffusersPipeline(Cosmos3Pipeline):
+    """Back-compat alias for checkpoints whose ``model_index.json`` still
+    declares the legacy ``_class_name`` ``Cosmos3OmniDiffusersPipeline``.
+
+    Registering both names lets old (Nano/Super) and new (Edge) checkpoints
+    resolve to the same native pipeline.
+    """
+
+    pipeline_name = "Cosmos3OmniDiffusersPipeline"
+
+
+EntryClass = [Cosmos3Pipeline, Cosmos3OmniDiffusersPipeline]

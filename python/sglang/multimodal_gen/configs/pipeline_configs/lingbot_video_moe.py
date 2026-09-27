@@ -58,7 +58,7 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         self.vae_config.load_decoder = True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(auto_dit_layerwise_offload=True)
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]
@@ -84,3 +84,18 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
             1, -1, 1, 1, 1
         )
         return 1.0 / std, mean
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+        LingBotVideoMoESamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LingBotVideoMoESamplingParams,
+        pipeline_config_cls=LingBotVideoMoEPipelineConfig,
+        model_detectors=[
+            lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )

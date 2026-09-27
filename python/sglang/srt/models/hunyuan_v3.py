@@ -18,10 +18,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -31,7 +27,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -191,17 +187,7 @@ class HYV3MoEFused(nn.Module):
                 hidden_states=hidden_states, topk_output=topk_output
             )
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -226,17 +212,7 @@ class HYV3MoEFused(nn.Module):
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 

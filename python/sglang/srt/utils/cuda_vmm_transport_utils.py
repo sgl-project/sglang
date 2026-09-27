@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
 import secrets
@@ -10,22 +12,16 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.distributed.device_communicators.vmm_utils import (
-    _FD_SEND_TIMEOUT_S,
-    _get_cuda_driver,
-    _recv_fd,
-    _send_fd,
-    check_drv,
-    import_and_map_alloc,
-    make_rw_access_desc,
-    release_mappings,
-)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     MM_FEATURE_CACHE_SIZE,
@@ -33,23 +29,27 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     CudaIpcTensorTransportProxy,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.utils.cuda_vmm_utils import (
+    _FD_SEND_TIMEOUT_S,
+    VmmReservation,
+    _get_cuda_driver,
+    _recv_fd,
+    _send_fd,
+    align_up,
+    allocation_handle_type_name,
+    check_drv,
+    get_allocation_granularity,
+    get_device_allocation_handle_type,
+    import_and_map_alloc,
+    make_device_allocation_prop,
+    release_mappings,
+    tensor_from_pointer,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONTROL_ALIGNMENT = 256
 _CONTROL_WORD_BYTES = 4
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-def _tensor_from_pointer(pointer: int, size: int, device_index: int) -> torch.Tensor:
-    device = torch.device(f"cuda:{device_index}")
-    storage = torch._C._construct_storage_from_data_pointer(pointer, device, size)
-    return torch.empty(0, dtype=torch.uint8, device=device).set_(
-        storage, 0, (size,), (1,)
-    )
 
 
 class _PosixFdBroker:
@@ -143,7 +143,7 @@ def _build_packed_tensor_layout(
     layouts = []
     next_offset = 0
     for tensor in tensors:
-        next_offset = _align_up(next_offset, tensor.element_size())
+        next_offset = align_up(next_offset, tensor.element_size())
         data_nbytes = tensor.numel() * tensor.element_size()
         layouts.append(
             _CudaVmmPackedTensorLayout(
@@ -157,6 +157,33 @@ def _build_packed_tensor_layout(
     return layouts, next_offset
 
 
+def _prepare_pinned_copy_source(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if tensor.device.type == "cpu" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    return tensor
+
+
+def _pack_pinned_copy_sources(
+    tensors: Sequence[torch.Tensor],
+    layouts: Sequence[_CudaVmmPackedTensorLayout],
+    packed_data_nbytes: int,
+) -> torch.Tensor | None:
+    if not all(tensor.device.type == "cpu" for tensor in tensors):
+        return None
+
+    staging = torch.empty(
+        packed_data_nbytes, dtype=torch.uint8, device="cpu", pin_memory=True
+    )
+    for tensor, layout in zip(tensors, layouts, strict=True):
+        source = tensor if tensor.is_contiguous() else tensor.contiguous()
+        staging[
+            layout.relative_offset : layout.relative_offset + layout.data_nbytes
+        ].copy_(source.reshape(-1).view(torch.uint8))
+    return staging
+
+
 def _contains_tensor_container(value) -> bool:
     return isinstance(value, (list, tuple)) and any(
         isinstance(item, torch.Tensor) or _contains_tensor_container(item)
@@ -164,10 +191,10 @@ def _contains_tensor_container(value) -> bool:
     )
 
 
-def get_vmm_feature_consumer_count(server_args) -> int:
-    if server_args.enable_dp_attention:
-        return server_args.tp_size // server_args.dp_size
-    return server_args.tp_size
+def get_vmm_feature_consumer_count() -> int:
+    if get_parallel().enable_dp_attention:
+        return get_parallel().tp_size // get_parallel().dp_size
+    return get_parallel().tp_size
 
 
 class CudaVmmMemoryPool:
@@ -201,28 +228,39 @@ class CudaVmmMemoryPool:
         self._pool_error: BaseException | None = None
         self._closed = False
 
-        self._allocation_handle = None
-        self._pool_pointer = None
-        self._allocation_mapped = False
+        self._allocation: VmmReservation | None = None
         self.allocation_size = 0
         self.shareable_handle = None
         self.memory_pool = None
         self._fd_broker: _PosixFdBroker | None = None
         self.posix_socket_path: str | None = None
+        self._publish_stream = None
         self._recycle_stream = None
         self._recycle_thread = None
 
-        self.use_fabric = True
+        drv = _get_cuda_driver()
+        fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        posix_fd = (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        self.handle_type = get_device_allocation_handle_type(self.device_index)
+        if self.handle_type == posix_fd and not allow_posix_fallback:
+            raise RuntimeError(
+                "CUDA VMM multimodal transport selected POSIX_FD, but this "
+                "pool requires FABRIC"
+            )
+        self.use_fabric = self.handle_type == fabric
         try:
             self._allocate(memory_size)
         except RuntimeError as error:
-            if not allow_posix_fallback:
+            if not allow_posix_fallback or self.handle_type != fabric:
                 raise
             logger.warning(
                 "CUDA FABRIC VMM allocation is unavailable; falling back to "
                 "a POSIX FD handle: %s",
                 error,
             )
+            self.handle_type = posix_fd
             self.use_fabric = False
             self._allocate(memory_size)
         try:
@@ -232,6 +270,7 @@ class CudaVmmMemoryPool:
 
             self.available_chunks = [_CudaVmmMemoryChunk(0, self.allocation_size)]
             self.occupied_chunks = []
+            self._publish_stream = torch.cuda.Stream(device=self.device_index)
             self._recycle_stream = torch.cuda.Stream(device=self.device_index)
             self._recycle_thread = threading.Thread(
                 target=self._recycle_loop,
@@ -271,30 +310,14 @@ class CudaVmmMemoryPool:
 
     def _allocate(self, memory_size: int) -> None:
         drv = _get_cuda_driver()
-        handle_type = (
-            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            if self.use_fabric
-            else drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        prop = make_device_allocation_prop(
+            self.device_index,
+            handle_types=self.handle_type,
+            gpu_direct_rdma=self.use_fabric,
         )
-        prop = drv.CUmemAllocationProp()
-        prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location.id = self.device_index
-        prop.requestedHandleTypes = handle_type
-        if self.use_fabric:
-            prop.allocFlags.gpuDirectRDMACapable = 1
 
-        recommended = (
-            drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-        )
         with torch.cuda.device(self.device_index):
-            check_drv(drv.cuInit(0), "cuInit")
-            granularity = int(
-                check_drv(
-                    drv.cuMemGetAllocationGranularity(prop, recommended),
-                    "cuMemGetAllocationGranularity(VMM transport)",
-                )
-            )
+            granularity = get_allocation_granularity(prop)
             allocation_size = memory_size // granularity * granularity
             if allocation_size == 0:
                 raise ValueError(
@@ -302,59 +325,47 @@ class CudaVmmMemoryPool:
                     f"granularity={granularity}"
                 )
 
-            handle = pointer = exported = None
-            mapped = False
+            allocation = VmmReservation(
+                allocation_size,
+                prop,
+                self.device_index,
+                alignment=granularity,
+            )
+            exported = None
             try:
-                handle = check_drv(
-                    drv.cuMemCreate(allocation_size, prop, 0),
-                    "cuMemCreate(VMM transport)",
-                )
-                pointer = int(
-                    check_drv(
-                        drv.cuMemAddressReserve(allocation_size, granularity, 0, 0),
-                        "cuMemAddressReserve(VMM transport)",
-                    )
-                )
-                check_drv(
-                    drv.cuMemMap(pointer, allocation_size, 0, handle, 0),
-                    "cuMemMap(VMM transport)",
-                )
-                mapped = True
-                access = make_rw_access_desc(self.device_index)
-                check_drv(
-                    drv.cuMemSetAccess(pointer, allocation_size, [access], 1),
-                    "cuMemSetAccess(VMM transport)",
+                handle = allocation.map(
+                    0,
+                    allocation_size,
+                    retain_handle=True,
                 )
                 exported = check_drv(
-                    drv.cuMemExportToShareableHandle(handle, handle_type, 0),
+                    drv.cuMemExportToShareableHandle(handle, self.handle_type, 0),
                     "cuMemExportToShareableHandle(VMM transport)",
                 )
-                memory_pool = _tensor_from_pointer(
-                    pointer, allocation_size, self.device_index
+                memory_pool = tensor_from_pointer(
+                    allocation.base, allocation_size, device_id=self.device_index
                 )
             except BaseException:
-                if mapped:
-                    drv.cuMemUnmap(pointer, allocation_size)
-                if pointer is not None:
-                    drv.cuMemAddressFree(pointer, allocation_size)
-                if handle is not None:
-                    drv.cuMemRelease(handle)
+                allocation.close()
                 if not self.use_fabric and exported is not None:
                     os.close(int(exported))
                 raise
 
-        self._allocation_handle = handle
-        self._pool_pointer = pointer
-        self._allocation_mapped = True
+        self._allocation = allocation
         self.allocation_size = allocation_size
         self.shareable_handle = (
             bytes(exported.data) if self.use_fabric else int(exported)
+        )
+        logger.info(
+            "CUDA VMM multimodal pool uses %s backing on device %d",
+            allocation_handle_type_name(self.handle_type),
+            self.device_index,
         )
         self.memory_pool = memory_pool
 
     @property
     def control_size(self) -> int:
-        return _align_up(self.consumer_count * _CONTROL_WORD_BYTES, _CONTROL_ALIGNMENT)
+        return align_up(self.consumer_count * _CONTROL_WORD_BYTES, _CONTROL_ALIGNMENT)
 
     def _raise_if_failed(self) -> None:
         if self._pool_error is not None:
@@ -380,11 +391,8 @@ class CudaVmmMemoryPool:
 
     def wrap_tensor(self, tensor: torch.Tensor):
         self._raise_if_failed()
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
         data_nbytes = tensor.numel() * tensor.element_size()
-        required_size = _align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
-        source_bytes = tensor.reshape(-1).view(torch.uint8)
+        required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
 
         chunk = self._reserve_for_publish(required_size)
         if chunk is None:
@@ -394,8 +402,13 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
-            with torch.cuda.device(self.device_index):
-                producer_stream = torch.cuda.current_stream(self.device_index)
+            with (
+                torch.cuda.device(self.device_index),
+                torch.cuda.stream(self._publish_stream),
+            ):
+                producer_stream = self._publish_stream
+                copy_source = _prepare_pinned_copy_source(tensor)
+                source_bytes = copy_source.reshape(-1).view(torch.uint8)
                 control_offset = chunk.start
                 data_offset = control_offset + self.control_size
                 control_end = control_offset + self.control_size
@@ -454,7 +467,7 @@ class CudaVmmMemoryPool:
             return []
 
         layouts, packed_data_nbytes = _build_packed_tensor_layout(tensors)
-        required_size = _align_up(
+        required_size = align_up(
             self.control_size + packed_data_nbytes, _CONTROL_ALIGNMENT
         )
         chunk = self._reserve_for_publish(required_size)
@@ -464,21 +477,31 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
-            contiguous_tensors = [
-                tensor if tensor.is_contiguous() else tensor.contiguous()
-                for tensor in tensors
-            ]
-            with torch.cuda.device(self.device_index):
-                producer_stream = torch.cuda.current_stream(self.device_index)
+            with (
+                torch.cuda.device(self.device_index),
+                torch.cuda.stream(self._publish_stream),
+            ):
+                producer_stream = self._publish_stream
+                packed_source = _pack_pinned_copy_sources(
+                    tensors, layouts, packed_data_nbytes
+                )
                 control_offset = chunk.start
                 data_offset = control_offset + self.control_size
                 control_end = control_offset + self.control_size
                 self.memory_pool[control_offset:control_end].zero_()
-                for tensor, layout in zip(contiguous_tensors, layouts):
-                    data_start = data_offset + layout.relative_offset
+                if packed_source is not None:
                     self.memory_pool[
-                        data_start : data_start + layout.data_nbytes
-                    ].copy_(tensor.reshape(-1).view(torch.uint8), non_blocking=True)
+                        data_offset : data_offset + packed_data_nbytes
+                    ].copy_(packed_source, non_blocking=True)
+                else:
+                    copy_sources = [
+                        _prepare_pinned_copy_source(tensor) for tensor in tensors
+                    ]
+                    for tensor, layout in zip(copy_sources, layouts, strict=True):
+                        data_start = data_offset + layout.relative_offset
+                        self.memory_pool[
+                            data_start : data_start + layout.data_nbytes
+                        ].copy_(tensor.reshape(-1).view(torch.uint8), non_blocking=True)
                 # A single synchronization publishes every child together.
                 producer_stream.synchronize()
                 copy_synchronized = True
@@ -590,24 +613,35 @@ class CudaVmmMemoryPool:
                 self._stop_recycler.set()
 
     def _recycle_chunks(self) -> None:
+        if not self.occupied_chunks:
+            return
+
         remaining = []
         recycled = []
         with (
             torch.cuda.device(self.device_index),
             torch.cuda.stream(self._recycle_stream),
         ):
-            for chunk in self.occupied_chunks:
-                ack_start = chunk.start
-                ack_end = ack_start + self.consumer_count * _CONTROL_WORD_BYTES
-                ack_count = int(
-                    torch.count_nonzero(
-                        self.memory_pool[ack_start:ack_end].view(torch.int32)
-                    ).item()
-                )
-                if ack_count == self.consumer_count:
-                    recycled.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
-                else:
-                    remaining.append(chunk)
+            acknowledgement_words = torch.stack(
+                [
+                    self.memory_pool[
+                        chunk.start : chunk.start
+                        + self.consumer_count * _CONTROL_WORD_BYTES
+                    ].view(torch.int32)
+                    for chunk in self.occupied_chunks
+                ]
+            )
+            acknowledgement_counts = (
+                torch.count_nonzero(acknowledgement_words, dim=1).cpu().tolist()
+            )
+
+        for chunk, acknowledgement_count in zip(
+            self.occupied_chunks, acknowledgement_counts, strict=True
+        ):
+            if acknowledgement_count == self.consumer_count:
+                recycled.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
+            else:
+                remaining.append(chunk)
 
         self.available_chunks.extend(recycled)
         self.occupied_chunks = remaining
@@ -626,28 +660,11 @@ class CudaVmmMemoryPool:
         if not self.use_fabric and self.shareable_handle is not None:
             os.close(self.shareable_handle)
             self.shareable_handle = None
-        if self._pool_pointer is None and self._allocation_handle is None:
+        if self._allocation is None:
             return
-        drv = _get_cuda_driver()
         with torch.cuda.device(self.device_index):
-            if self._allocation_mapped:
-                check_drv(
-                    drv.cuMemUnmap(self._pool_pointer, self.allocation_size),
-                    "cuMemUnmap(VMM transport pool)",
-                )
-                self._allocation_mapped = False
-            if self._pool_pointer is not None:
-                check_drv(
-                    drv.cuMemAddressFree(self._pool_pointer, self.allocation_size),
-                    "cuMemAddressFree(VMM transport pool)",
-                )
-                self._pool_pointer = None
-            if self._allocation_handle is not None:
-                check_drv(
-                    drv.cuMemRelease(self._allocation_handle),
-                    "cuMemRelease(VMM transport pool)",
-                )
-                self._allocation_handle = None
+            self._allocation.close()
+        self._allocation = None
 
     def shutdown(self) -> None:
         with self._shutdown_lock:
@@ -727,8 +744,8 @@ def _get_imported_pool(
                     peer_rank=-1,
                 )
                 try:
-                    memory = _tensor_from_pointer(
-                        pointer, allocation_size, device_index
+                    memory = tensor_from_pointer(
+                        pointer, allocation_size, device_id=device_index
                     )
                 except Exception:
                     release_mappings(
@@ -941,6 +958,13 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
             "Packed CUDA VMM features must be reconstructed before release"
         )
 
+    def release_without_reconstruction(self, consumer_count: int | None = None) -> None:
+        """Release the shared packed allocation when its request is abandoned."""
+        if self._consumer_acknowledged:
+            return
+        self._packed_owner.acknowledge_consumption(consumer_count)
+        self._consumer_acknowledged = True
+
     def reconstruct_on_target_device(
         self, rebuild_device_idx, consumer_count: int | None = None
     ):
@@ -971,7 +995,8 @@ class CudaVmmFeatureTransport:
 
     def __init__(self, server_args, mm_processor) -> None:
         self.pool: CudaVmmMemoryPool | None = None
-        if server_args.mm_feature_transport != "cuda_vmm":
+        self._publisher_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        if get_mm().mm_feature_transport != "cuda_vmm":
             return
         if mm_processor is None:
             raise RuntimeError(
@@ -979,15 +1004,46 @@ class CudaVmmFeatureTransport:
             )
 
         per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-            MM_FEATURE_CACHE_SIZE, server_args.tokenizer_worker_num
+            MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num
         )
         self.pool = CudaVmmMemoryPool(
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+            # Per-worker placement; policy above reads the bags.
             base_gpu_id=server_args.base_gpu_id,
-            consumer_count=get_vmm_feature_consumer_count(server_args),
-            allow_posix_fallback=server_args.nnodes == 1,
+            consumer_count=get_vmm_feature_consumer_count(),
+            allow_posix_fallback=get_parallel().nnodes == 1,
         )
+        self._publisher_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="cuda-vmm-publisher",
+        )
+
+    async def prepare_for_dispatch_async(
+        self,
+        mm_inputs_batch: Iterable[MultimodalProcessorOutput | None],
+    ) -> list[MultimodalDataItem]:
+        """Publish features without blocking the tokenizer event loop."""
+        mm_inputs_batch = tuple(mm_inputs_batch)
+        if self.pool is None or not any(
+            mm_inputs is not None and mm_inputs.mm_items
+            for mm_inputs in mm_inputs_batch
+        ):
+            return []
+        if self._publisher_executor is None:
+            raise RuntimeError("CUDA VMM feature transport is shutting down")
+
+        future = asyncio.get_running_loop().run_in_executor(
+            self._publisher_executor,
+            self.prepare_for_dispatch,
+            mm_inputs_batch,
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            prepared_mm_items = await future
+            self.cancel_for_dispatch(prepared_mm_items)
+            raise
 
     def prepare_for_dispatch(
         self,
@@ -1020,7 +1076,7 @@ class CudaVmmFeatureTransport:
             pack_candidates = [
                 (item, item.feature)
                 for item in mm_items
-                if item.modality == Modality.IMAGE
+                if item.modality in (Modality.IMAGE, Modality.VIDEO)
                 and isinstance(item.feature, torch.Tensor)
                 and item.feature.numel() > 0
                 and not item.model_specific_data.get(
@@ -1039,8 +1095,11 @@ class CudaVmmFeatureTransport:
                         updates.append((item, "feature", tensor, proxy))
 
             for item in mm_items:
-                for field in ("feature", "precomputed_embeddings"):
-                    tensor = getattr(item, field)
+                fields = (
+                    ("feature", item.feature),
+                    ("precomputed_embeddings", item.precomputed_embeddings),
+                )
+                for field, tensor in fields:
                     if _contains_tensor_container(tensor):
                         raise TypeError(
                             "CUDA VMM feature transport requires each feature "
@@ -1074,8 +1133,11 @@ class CudaVmmFeatureTransport:
 
         errors = []
         for item in mm_items:
-            for field in ("feature", "precomputed_embeddings"):
-                proxy = getattr(item, field)
+            fields = (
+                ("feature", item.feature),
+                ("precomputed_embeddings", item.precomputed_embeddings),
+            )
+            for field, proxy in fields:
                 if not isinstance(proxy, CudaVmmTensorTransportProxy):
                     continue
                 try:
@@ -1092,4 +1154,8 @@ class CudaVmmFeatureTransport:
     def shutdown(self) -> None:
         if self.pool is None:
             return
+        publisher_executor = self._publisher_executor
+        if publisher_executor is not None:
+            publisher_executor.shutdown(wait=True, cancel_futures=True)
+            self._publisher_executor = None
         self.pool.shutdown()

@@ -4,7 +4,7 @@ metatags:
     description: "Benchmark diffusion model serving throughput and latency with SGLang - supports image and video generation with flexible configurations."
 ---
 
-`sglang.multimodal_gen.benchmarks.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of Diffusion Models. It supports two backends (`sglang-image`, `sglang-video`) and offers flexible configurations for request rates, dataset types, and profiling.
+`sglang.multimodal_gen.benchmarks.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of diffusion models. It selects the image or video API from the requested task and offers flexible configurations for request rates, dataset types, and profiling.
 
 ## 1. Quick Start
 
@@ -15,23 +15,23 @@ Run a benchmark on a local server (port 30000) generating 1 videos/images from t
 ```bash Command
 # For text to video: such as Wan2.2-T2V-A14B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
 
 # For image to video: such as Wan2.2-I2V-A14B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task i2v --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task image-to-video --num-prompts 1 --max-concurrency 1
 
 # For image-text to video: such as Wan2.2-TI2V-5B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task ti2v --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task image-to-video --num-prompts 1 --max-concurrency 1
 
 # For text to image: such as Qwen-Image
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task t2i --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
 
 # For image-text to image: such as Qwen-Image-Edit
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task ti2i --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task image-to-image --num-prompts 1 --max-concurrency 1
 ```
 
 ### 1.2 Benchmarking in High Concurrency
@@ -41,28 +41,28 @@ Run a benchmark on a local server (port 30000) generating 20 videos/images from 
 ```bash Command
 # For text to video: such as Wan2.2-T2V-A14B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task text-to-video --num-prompts 20 --max-concurrency 20
 
 # For image to video: such as Wan2.2-I2V-A14B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task i2v --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task image-to-video --num-prompts 20 --max-concurrency 20
 
 # For image-text to video: such as Wan2.2-TI2V-5B-Diffusers
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-video --dataset vbench --task ti2v --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task image-to-video --num-prompts 20 --max-concurrency 20
 
 # For text to image: such as Qwen-Image
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task t2i --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
 
 # For image-text to image: such as Qwen-Image-Edit
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task ti2i --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task image-to-image --num-prompts 20 --max-concurrency 20
 ```
 
 ## 2. Parameter Reference
 
-### 2.1 Connection & Backend Settings
+### 2.1 Connection Settings
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -78,11 +78,6 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     </tr>
   </thead>
   <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**Required**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The backend type to use. Choices: `sglang-image`, `sglang-video`.</td>
-    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--base-url`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
@@ -124,8 +119,8 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--task`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`t2v`, `i2v`, `ti2v`, `t2i`, `ti2i`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Defines the generation task: `t2v` (Text-to-Video), `i2v` (Image-to-Video), `ti2v` (Text+Image-to-Video), `t2i` (Text-to-image), `ti2i` (Text+Image-to-Image).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`text-to-video`, `image-to-video`, `text-to-image`, `image-to-image`, `video-to-video`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Defines the generation task when it cannot be inferred from the model metadata.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dataset`</td>

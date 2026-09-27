@@ -38,7 +38,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
@@ -492,6 +492,21 @@ class TgvGemmCuteExtKernel:
                 c_dtype,
                 d_layout,
             )
+
+        if cutlass.const_expr(self.use_2cta):
+            # Cluster-wide exit barrier (sgl-project/sglang#32907): cluster
+            # sync previously existed only at kernel entry, so one CTA could
+            # retire while its peer still had in-flight peer-redirected
+            # mbarrier arrives / multicast tcgen05.commit / TMEM dealloc
+            # targeting it -> CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT
+            # (Xid 13 "CTA Not Present"). All 8 warps (256 threads) of both
+            # cluster CTAs arrive here after their dispatch branch returns,
+            # so no CTA can exit until the peer's tail work has landed.
+            # relaxed arrive (matches the entry barrier at L378): this fence is
+            # only about CTA lifetime, not inter-CTA smem visibility -- every
+            # cross-CTA datum above already flows through mbarrier phases.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.

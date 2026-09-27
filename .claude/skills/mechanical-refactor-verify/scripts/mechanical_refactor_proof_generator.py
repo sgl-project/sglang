@@ -256,7 +256,9 @@ def _module_assign_names(text: str) -> set:
         targets = (
             node.targets
             if isinstance(node, ast.Assign)
-            else [node.target] if isinstance(node, ast.AnnAssign) else []
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
         )
         names |= {t.id for t in targets if isinstance(t, ast.Name)}
     return names

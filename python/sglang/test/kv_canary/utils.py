@@ -17,7 +17,7 @@ def build_canary_server_args(
     args = [
         "--kv-canary",
         kv_canary_mode.value,
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--context-length",
         "16384",
         *extra_server_args,

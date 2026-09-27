@@ -10,7 +10,6 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -20,7 +19,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe import (
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
@@ -44,7 +43,7 @@ from sglang.srt.models.qwen3_5 import (
     _enable_qwen35_fused_ar_quant,
     _linear_accepts_fp8_tuple,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -91,6 +90,10 @@ def _normalize_mobius_weight_name(name: str) -> str:
     return name
 
 
+def _is_optional_mobius_parameter(name: str) -> bool:
+    return name.endswith((".attn.k_scale", ".attn.v_scale"))
+
+
 def _load_fused_mobius_expert_weight(
     *,
     name: str,
@@ -99,8 +102,17 @@ def _load_fused_mobius_expert_weight(
     num_experts: int,
     record_slot,
 ) -> None:
-    if name.endswith("experts.gate_up_proj"):
-        parameter_name = name.replace("experts.gate_up_proj", "experts.w13_weight")
+    gate_up_suffixes = {
+        "experts.gate_up_proj": "experts.w13_weight",
+        "experts.gate_up_proj_scale_inv": "experts.w13_weight_scale_inv",
+    }
+    gate_up_suffix = next(
+        (suffix for suffix in gate_up_suffixes if name.endswith(suffix)), None
+    )
+    if gate_up_suffix is not None:
+        parameter_name = (
+            name.removesuffix(gate_up_suffix) + gate_up_suffixes[gate_up_suffix]
+        )
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused gate/up destination is missing: {parameter_name}"
@@ -127,8 +139,15 @@ def _load_fused_mobius_expert_weight(
                 )
         return
 
-    if name.endswith("experts.down_proj"):
-        parameter_name = name.replace("experts.down_proj", "experts.w2_weight")
+    down_suffixes = {
+        "experts.down_proj": "experts.w2_weight",
+        "experts.down_proj_scale_inv": "experts.w2_weight_scale_inv",
+    }
+    down_suffix = next(
+        (suffix for suffix in down_suffixes if name.endswith(suffix)), None
+    )
+    if down_suffix is not None:
+        parameter_name = name.removesuffix(down_suffix) + down_suffixes[down_suffix]
         if parameter_name not in params_dict:
             raise KeyError(
                 f"Mobius fused down destination is missing: {parameter_name}"
@@ -166,11 +185,15 @@ def _expected_mobius_load_slots(
         if parameter_id in seen_parameters:
             continue
         seen_parameters.add(parameter_id)
-        if ".meta_mlp." in name and name.endswith("experts.w13_weight"):
+        if ".meta_mlp." in name and name.endswith(
+            ("experts.w13_weight", "experts.w13_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w1", expert_id))
                 expected.add((name, "w3", expert_id))
-        elif ".meta_mlp." in name and name.endswith("experts.w2_weight"):
+        elif ".meta_mlp." in name and name.endswith(
+            ("experts.w2_weight", "experts.w2_weight_scale_inv")
+        ):
             for expert_id in range(num_experts):
                 expected.add((name, "w2", expert_id))
         elif ".qkv_proj." in name and name.startswith("model.layers."):
@@ -185,6 +208,8 @@ def _expected_mobius_load_slots(
         elif ".in_proj_ba." in name:
             expected.add((name, 0, None))
             expected.add((name, 1, None))
+        elif _is_optional_mobius_parameter(name):
+            continue
         else:
             expected.add((name, None, None))
     return expected
@@ -215,7 +240,12 @@ def _load_mobius_weights_strict(
 
         name = _normalize_mobius_weight_name(source_name)
         if ".meta_mlp." in name and name.endswith(
-            ("experts.gate_up_proj", "experts.down_proj")
+            (
+                "experts.gate_up_proj",
+                "experts.down_proj",
+                "experts.gate_up_proj_scale_inv",
+                "experts.down_proj_scale_inv",
+            )
         ):
             _load_fused_mobius_expert_weight(
                 name=name,
@@ -250,6 +280,8 @@ def _load_mobius_weights_strict(
                 )
             parameter = params_dict[name]
             loader = getattr(parameter, "weight_loader", default_weight_loader)
+            if _is_optional_mobius_parameter(name):
+                expected_slots.add((name, None, None))
             record_slot(name)
             loader(parameter, loaded_weight)
 
@@ -339,15 +371,6 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
         return output.reshape(original_shape)
 
 
-def _mobius_reduce_combined_output(combined: torch.Tensor) -> torch.Tensor:
-    """Apply the one ordinary TP reduction unless the scoped runtime owns it."""
-    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
-    ):
-        return tensor_model_parallel_all_reduce(combined)
-    return combined
-
-
 def _get_mobius_routed_bank(meta_mlp: nn.ModuleList, layer_id: int) -> nn.Module:
     if not meta_mlp:
         raise ValueError(
@@ -388,7 +411,7 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return _mobius_reduce_combined_output(routed + shared)
+        return reduce_moe_output(routed + shared)
 
     def _forward_after_attention(
         self,
@@ -400,20 +423,11 @@ class _InternS2MobiusDecoderMixin:
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        # Model-side all-reduce fusion is intentionally disabled for baseline.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self._forward_mobius_mlp(
                 hidden_states, forward_batch, meta_mlp
             )
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -482,9 +496,9 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -616,9 +630,9 @@ class InternS2MobiusAttentionDecoderLayer(
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            allow_deferred_ffn_reduction=False,
         )
         self.alt_stream = alt_stream
 
@@ -662,7 +676,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.world_size != 1:
             raise ValueError(
                 "Intern-S2-Mobius baseline does not support pipeline parallelism"
@@ -802,6 +816,16 @@ class InternS2MobiusForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         language_model_cls=InternS2MobiusForCausalLM,
     ) -> None:
+        ignored_layers = getattr(quant_config, "ignored_layers", None)
+        if (
+            getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+            and ignored_layers
+        ):
+            # HF treats these parent entries as exact names; SGLang prefix matching
+            # would also skip their quantized qkv/z and output projections.
+            quant_config.ignored_layers = [
+                name for name in ignored_layers if not name.endswith(".linear_attn")
+            ]
         super().__init__(config, quant_config, prefix, language_model_cls)
 
     def should_apply_lora(self, module_name: str) -> bool:

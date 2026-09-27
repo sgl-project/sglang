@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pytest
 
-from sglang.srt.multimodal._core import inkling as _rs_inkling
+from sglang.srt.rust_extensions._multimodal import inkling as _rs_inkling
 
 GOLDEN_DIR = os.environ.get(
     "INKLING_MM_GOLDEN_DIR",

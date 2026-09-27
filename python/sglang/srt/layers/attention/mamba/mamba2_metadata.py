@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    logical_num_tokens: Optional[int] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
@@ -55,12 +56,27 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_chunk_idx: Optional[torch.Tensor] = None
+    # Batch rows of the chunk-unaligned tracked seqs; indexes the fp32
+    # h_track_buf snapshot (KDA path) with plain integer indexing, so the
+    # copy into the track slots does not nonzero()-sync the stream.
+    track_ssm_h_batch_src: Optional[torch.Tensor] = None
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    track_ssm_seq_idx: Optional[torch.Tensor] = None
+    track_ssm_end_locs: Optional[torch.Tensor] = None
+    track_ssm_recompute_dst: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
+
+    # KDA fused-accept: the [N, T] slot-indexed scratch rows and the per-request
+    # accept length that seed the verify kernel. Every KDA layer of a forward
+    # sees the same slots and draft window, so these are built once and shared:
+    # a cuda-graph capture then holds one build instead of one per layer.
+    fused_accept_state_indices: Optional[torch.Tensor] = None
+    fused_accept_num_accepted: Optional[torch.Tensor] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
@@ -159,7 +175,6 @@ class Mamba2Metadata(ForwardMetadata):
 
         p = 0  # num of insertions
         for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
             # if does not divide chunk_size, then there is one chunk insertion
             p += s % chunk_size > 0
 
@@ -181,7 +196,6 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
-        num_decodes: Optional[int] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
@@ -196,8 +210,11 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_seq_idx=forward_metadata.track_ssm_seq_idx,
+            track_ssm_end_locs=forward_metadata.track_ssm_end_locs,
+            track_ssm_recompute_dst=forward_metadata.track_ssm_recompute_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
-            num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
+            num_decodes=len(seq_lens),
             num_prefills=0,
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
@@ -218,15 +235,11 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
-            num_decodes = getattr(forward_batch, "_original_batch_size", None)
-            if num_decodes is None:
-                num_decodes = len(forward_batch.seq_lens)
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
-                num_decodes=num_decodes,
             )
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         if extend_seq_lens_cpu is None:
@@ -237,10 +250,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
-        batch_size = getattr(forward_batch, "_original_batch_size", None)
-        if batch_size is None:
-            batch_size = len(forward_batch.seq_lens)
-        num_decodes = max(0, batch_size - num_prefills)
+        num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
@@ -297,6 +307,9 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_seq_idx=forward_metadata.track_ssm_seq_idx,
+            track_ssm_end_locs=forward_metadata.track_ssm_end_locs,
+            track_ssm_recompute_dst=forward_metadata.track_ssm_recompute_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             mamba_track_mask_indices=mamba_track_mask_indices,
             conv_states_mask_indices=conv_states_mask_indices,

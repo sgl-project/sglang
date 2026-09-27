@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components.base import (
         TreeComponent,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore

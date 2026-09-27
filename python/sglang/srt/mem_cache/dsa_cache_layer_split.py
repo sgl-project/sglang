@@ -72,7 +72,9 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         layer_id = self.pool.start_layer + layer_idx
-        return num_pages if self.pool._is_layer_owned(layer_id) else 0
+        if not self.pool._is_layer_owned(layer_id):
+            return 0
+        return super()._layer_num_pages(layer_idx, num_pages)
 
     def clear(self) -> None:
         super().clear()
@@ -150,7 +152,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         ]
         data_ptrs = [self.buffer[i].data_ptr() for i in owned_layer_ids]
         data_lens = [self.buffer[i].nbytes for i in owned_layer_ids]
-        item_lens = [self.buffer[i][0].nbytes for i in owned_layer_ids]
+        item_lens = [self._item_len(i) for i in owned_layer_ids]
         return data_ptrs, data_lens, item_lens
 
     def cpu_copy(self, indices):
@@ -199,9 +201,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_shard_size: int,
         **kwargs,
     ):
-        assert (
-            layer_shard_rank is not None and layer_shard_size > 1
-        ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        assert layer_shard_rank is not None and layer_shard_size > 1, (
+            "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+        )
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
@@ -549,7 +551,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         from sglang.srt.utils import current_platform
 
         current_platform.synchronize()
@@ -567,9 +569,18 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
 
-        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
+        return {
+            "kv": kv_cache_cpu,
+            "index_k": self.index_key_cache.cpu_copy(indices),
+        }
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu_dict,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+    ):
         from sglang.srt.utils import current_platform
 
         kv_cache_cpu = kv_cache_cpu_dict["kv"]

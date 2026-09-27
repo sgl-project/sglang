@@ -555,7 +555,7 @@ class TraceReqContextAsync:
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
         self.rid: str = str(rid)
-        self.trace_level = _trace_mod.global_trace_level
+        self.trace_level = _trace_mod.get_global_trace_level()
         self.tracing_enable: bool = (
             is_async_tracing_available()
             and _trace_mod.opentelemetry_initialized
@@ -976,7 +976,7 @@ class TraceReqContextAsync:
             return
 
         self.rid = state["rid"]
-        self.trace_level = state.get("trace_level", _trace_mod.global_trace_level)
+        self.trace_level = state.get("trace_level", _trace_mod.get_global_trace_level())
         self._init_args = state["init_args"]
         self._operations = []
         self._flush_threshold = envs.SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD.get()
