@@ -9,11 +9,12 @@ import unittest
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-c-test-4-gpu-amd")
+# gfx950 only: DeepSeek-V4.1 fuses this all-reduce on MI35x
+register_amd_ci(est_time=60, stage="stage-c", runner_config="large-8-gpu-amd-mi35x")
 
 WORLD_SIZE = 4
 HIDDEN = 5120
@@ -97,8 +98,8 @@ def _run(rank: int, port: int) -> None:
 
 class TestAllReduceMhcHip(CustomTestCase):
     @unittest.skipUnless(
-        is_hip() and torch.cuda.device_count() >= WORLD_SIZE,
-        "needs four ROCm GPUs",
+        is_gfx95_supported() and torch.cuda.device_count() >= WORLD_SIZE,
+        "needs four gfx950 GPUs",
     )
     def test_matches_unfused_all_reduce_and_hc_post(self):
         port = _get_open_port()

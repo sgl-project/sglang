@@ -30,6 +30,18 @@ def all_reduce_mhc_post(
     """TP4 all-reduce of input fused with hc_post onto residual; the kernel checks the
     shapes (1-8 contiguous rows of DeepSeek-V4.1's hidden size)."""
     assert communicator.world_size == 4 and not communicator.disabled
+    for name, tensor, dtype in (
+        ("input", input, torch.bfloat16),
+        ("residual", residual, torch.bfloat16),
+        ("post", post, torch.float32),
+        ("comb", comb, torch.float32),
+    ):
+        if tensor.device != communicator.device:
+            raise RuntimeError(
+                f"{name} must be on {communicator.device}, got {tensor.device}"
+            )
+        if tensor.dtype != dtype:
+            raise RuntimeError(f"{name} must be {dtype}, got {tensor.dtype}")
     capturing = torch.cuda.is_current_stream_capturing()
     # capture() registers the peer addresses when the enclosing graph scope exits.
     assert not capturing or (
