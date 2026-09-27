@@ -191,6 +191,8 @@ A detector holding both keys splits the distinct contexts by the coin, scores ea
 
 `WatermarkDetector` implements the [detection rules](#detection) above. Construct it with the same key, key B, mixing probability, and context window that generation used:
 
+A minimal [reference detection server](../../../examples/watermark/README.md) exposes the in-tree detector over HTTP and reads keys only from its environment.
+
 ```python
 WatermarkDetector(
     key,                      # hex key A

@@ -1,15 +1,19 @@
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import msgspec
 import pytest
+import requests
 import torch
 
 import sglang.srt.sampling.watermarking.detector as detector_module
+from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.sampling.watermarking import (
     WatermarkDetector,
     WatermarkStatistics,
@@ -28,8 +32,9 @@ from sglang.srt.sampling.watermarking.detector import (
     watermark_hash,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _KEY_A = "0123456789abcdef"
 _KEY_B = "fedcba9876543210"
@@ -157,6 +162,84 @@ def _generate_watermarked_tokens(key_a, key_b=None, mixing_probability=0.5):
             max(range(64), key=lambda token: watermark_hash(key, context_hash, token))
         )
     return tokens
+
+
+class TestWatermarkDetectionServer(CustomTestCase):
+    def test_http_detection_uses_environment_keys(self):
+        with socket.socket() as server_socket:
+            server_socket.bind(("127.0.0.1", 0))
+            port = server_socket.getsockname()[1]
+
+        repository_root = Path(__file__).resolve().parents[4]
+        command = [
+            sys.executable,
+            str(repository_root / "examples/watermark/detection_server.py"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--mixing-probability",
+            "0.3",
+            "--p-value-threshold",
+            "0.0001",
+        ]
+        with envs.SGLANG_WATERMARK_KEY.override(_KEY_A):
+            with envs.SGLANG_WATERMARK_KEY_B.override(_KEY_B):
+                exported = exportable_env_vars()
+                self.assertNotIn("SGLANG_WATERMARK_KEY", exported)
+                self.assertNotIn("SGLANG_WATERMARK_KEY_B", exported)
+                process = subprocess.Popen(command)
+
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.fail(f"detection server exited with {process.returncode}")
+                try:
+                    if requests.get(f"{base_url}/health", timeout=1).status_code == 200:
+                        break
+                except requests.RequestException:
+                    time.sleep(0.1)
+            else:
+                self.fail("detection server did not become ready")
+
+            positive_tokens = _generate_watermarked_tokens(
+                _KEY_A, _KEY_B, mixing_probability=0.3
+            )
+            positive = requests.post(
+                f"{base_url}/detect",
+                json={"token_ids": positive_tokens},
+                timeout=5,
+            )
+            self.assertEqual(positive.status_code, 200, positive.text)
+            positive_body = positive.json()
+            self.assertTrue(positive_body["watermarked"])
+            self.assertLess(positive_body["p_value"], 1e-4)
+            self.assertLess(
+                positive_body["per_key"]["key_a_partition"]["p_value"], 1e-4
+            )
+            self.assertLess(
+                positive_body["per_key"]["key_b_partition"]["p_value"], 1e-4
+            )
+
+            negative_tokens = _generate_watermarked_tokens("deadbeef")
+            negative = requests.post(
+                f"{base_url}/detect",
+                json={"token_ids": negative_tokens},
+                timeout=5,
+            )
+            self.assertEqual(negative.status_code, 200, negative.text)
+            self.assertFalse(negative.json()["watermarked"])
+
+            injected_key = requests.post(
+                f"{base_url}/detect",
+                json={"token_ids": negative_tokens, "key": "deadbeef"},
+                timeout=5,
+            )
+            self.assertEqual(injected_key.status_code, 422)
+        finally:
+            terminate_and_kill_process_tree(process)
 
 
 def test_dual_partition_and_cross_key_isolation():
