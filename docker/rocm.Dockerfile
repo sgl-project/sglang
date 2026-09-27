@@ -793,7 +793,7 @@ RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
 
 RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[TileLang] Building TileLang for ${GPU_ARCH}"; \
-  # System dependencies (NO llvm-dev to avoid llvm-config-16 shadowing)
+  # System dependencies
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential git wget curl ca-certificates gnupg \
       libgtest-dev libgmock-dev \
@@ -822,48 +822,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # Locate ROCm llvm-config. The pytorch bases ship /opt/rocm/llvm/bin/clang
-  # but not llvm-config (that binary is in rocm-llvm-dev, which these images
-  # do not install). amd-docker-scale cannot reliably reach apt.llvm.org
-  # (curl: (7) Couldn't connect to server), so install the distro toolchain
-  # instead: jammy ships llvm-15, noble ships llvm-18. TVM requires LLVM >= 6
-  # when USE_LLVM is on. Do not install unversioned llvm-dev; it would
-  # shadow the llvm-config-16 shim below.
-  LLVM_CONFIG_PATH=""; \
-  for p in \
-      /opt/rocm/llvm/bin/llvm-config \
-      /opt/rocm/lib/llvm/bin/llvm-config \
-      /opt/rocm/llvm-*/bin/llvm-config \
-      /opt/rocm-*/llvm/bin/llvm-config \
-      /opt/rocm-*/lib/llvm/bin/llvm-config \
-      /opt/rocm-*/llvm*/bin/llvm-config; do \
-    if [ -x "$p" ]; then LLVM_CONFIG_PATH="$p"; break; fi; \
-  done; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    LLVM_CONFIG_PATH="$(find /opt/rocm /opt/rocm-* -maxdepth 6 -path "*/bin/llvm-config" \( -type f -o -type l \) -executable -print -quit 2>/dev/null || true)"; \
-  fi; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    . /etc/os-release; \
-    case "${VERSION_ID}" in \
-      22.04*) distro_llvm_pkg="llvm-15"; distro_llvm_bin="llvm-config-15" ;; \
-      *) distro_llvm_pkg="llvm-18"; distro_llvm_bin="llvm-config-18" ;; \
-    esac; \
-    echo "[TileLang] ROCm llvm-config not found; installing Ubuntu ${distro_llvm_pkg}"; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends "${distro_llvm_pkg}"; \
-    rm -rf /var/lib/apt/lists/*; \
-    LLVM_CONFIG_PATH="$(command -v "${distro_llvm_bin}" || true)"; \
-    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: ${distro_llvm_bin} not found after install"; exit 1; fi; \
-  fi; \
-  echo "[TileLang] Using LLVM_CONFIG at: $LLVM_CONFIG_PATH"; \
-  export PATH="$(dirname "$LLVM_CONFIG_PATH"):/usr/local/bin:${PATH}"; \
-  export LLVM_CONFIG="$LLVM_CONFIG_PATH"; \
-  \
-  # Optional shim for tools that expect llvm-config-16
-  mkdir -p /usr/local/bin && \
-  printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
-  chmod +x /usr/local/bin/llvm-config-16; \
-  \
   # TVM Python bits need Cython + z3 before configure.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
   "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
@@ -879,7 +837,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
