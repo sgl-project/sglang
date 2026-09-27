@@ -308,11 +308,11 @@ def test_grouped_realtime_text_updates_each_session(capacity):
             assert state.cache_key is None
 
 
-@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("fsdp, native", [(True, False), (True, True), (False, False)])
 @torch.no_grad()
-def test_one_unique_stage_skips_group_only_cache_lookup(native, monkeypatch):
+def test_one_unique_stage_skips_group_only_cache_lookup(fsdp, native, monkeypatch):
     executor, stage, encoder, args = make_group_executor(
-        TextEncodingStage, "cpu", 4096, fsdp=True, native=native
+        TextEncodingStage, "cpu", 4096, fsdp=fsdp, native=native
     )
     fingerprint = Mock(wraps=conditioning._fingerprint)
     monkeypatch.setattr(conditioning, "_fingerprint", fingerprint)

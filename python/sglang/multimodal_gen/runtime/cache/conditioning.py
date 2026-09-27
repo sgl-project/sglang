@@ -513,14 +513,14 @@ class ConditioningCache:
         return output
 
 
-def _inference_cache(model, *, share_in_group=False):
+def _inference_cache(model, *, share_in_group=False, cross_request=True):
     if torch.compiler.is_compiling():
         return None
     cache = _active_cache.get()
     if cache is None or model.training or torch.is_grad_enabled():
         return None
     # FSDP reuses only consumed stage outputs, never sharded intermediate states
-    if not _cross_request_cache.get() and (
+    if not (cross_request and _cross_request_cache.get()) and (
         not share_in_group or cache._group_entries.get() is None
     ):
         return None
@@ -542,7 +542,9 @@ def cached_encoder_call(
     share_in_group=False,
     cross_request=True,
 ):
-    cache = _inference_cache(model, share_in_group=share_in_group)
+    cache = _inference_cache(
+        model, share_in_group=share_in_group, cross_request=cross_request
+    )
     if (
         cache is None
         or model is _stage_encoder.get()
