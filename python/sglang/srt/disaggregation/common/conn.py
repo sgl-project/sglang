@@ -732,8 +732,11 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        # Snapshot before target: the worker pops the target first, so writing
+        # the target first would let a drain racing this registration consume
+        # the target and strand the snapshot written after it.
         self._deferred_ack_fanout_snapshots[room] = self._abort_ack_fanout_targets(room)
+        self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
