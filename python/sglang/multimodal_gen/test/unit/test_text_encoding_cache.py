@@ -277,6 +277,7 @@ def make_group_executor(
 @pytest.mark.parametrize("capacity", [0, 1, 4096])
 @pytest.mark.parametrize("fsdp", [False, True])
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize(
     "device",
     [
@@ -291,7 +292,7 @@ def make_group_executor(
 )
 @torch.no_grad()
 def test_grouped_conditioning_reuses_positive_and_negative_independently(
-    capacity, device, fsdp, native
+    capacity, device, fsdp, native, warmup
 ):
     executor, stage, encoder, args = make_group_executor(
         TextEncodingStage, device, capacity, fsdp=fsdp, native=native
@@ -304,6 +305,7 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
                     prompt=prompt, negative_prompt="bad quality"
                 ),
                 do_classifier_free_guidance=True,
+                is_warmup=warmup,
             )
             for prompt in ("hello", "different", "hello")
         ]
@@ -321,7 +323,7 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
     assert executor.conditioning_cache._group_entries.get() is None
 
     second = executor.execute_group([stage], requests(), args)
-    persistent = capacity == 4096 and not fsdp and native
+    persistent = capacity == 4096 and not fsdp and native and not warmup
     assert encoder.calls == (3 if persistent else 6)
     torch.testing.assert_close(second[0].prompt_embeds[0], expected, rtol=0, atol=0)
     assert second[0].prompt_seq_lens == [[2]]

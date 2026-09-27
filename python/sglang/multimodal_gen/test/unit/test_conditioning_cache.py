@@ -481,6 +481,20 @@ def test_group_only_scope_ignores_host_entries_and_nested_encoder_caches():
 
 
 @torch.no_grad()
+def test_warmup_refreshes_existing_group_then_reuses_fresh_results():
+    cache = ConditioningCache(4096)
+    encoder = Encoder().eval()
+    x = torch.ones(4)
+    with cache.scope(), cache.group_scope():
+        encoder(x)
+        with cache.scope(refresh=True):
+            encoder(x)
+            encoder(x)
+        assert encoder.calls == 2
+        assert cache.group_hits == 1
+
+
+@torch.no_grad()
 def test_group_cache_invalidates_and_releases_after_failure():
     cache = ConditioningCache(0)
     model = Encoder().eval()

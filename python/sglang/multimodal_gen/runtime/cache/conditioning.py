@@ -319,6 +319,8 @@ class ConditioningCache:
     @contextmanager
     def scope(self, enabled=True, *, refresh=False, cross_request=True):
         # Zero-capacity ranks still participate in encoder hit consensus.
+        if refresh and self._group_entries.get() is not None:
+            self._group_entries.get().clear()
         token = _active_cache.set(self if enabled else None)
         refresh_token = _refresh_cache.set(refresh or _refresh_cache.get())
         cross_request_token = _cross_request_cache.set(
@@ -374,9 +376,9 @@ class ConditioningCache:
             key = None
         entry = self._entries.get(key) if cross_request else None
         group_entry = group_entries.get(key) if group_entries is not None else None
-        hit = (
-            group_entry is not None or entry is not None
-        ) and not _refresh_cache.get()
+        hit = group_entry is not None or (
+            entry is not None and not _refresh_cache.get()
+        )
         if group is not None and group.world_size > 1:
             # Encoders may issue TP/folding collectives. A rank-local eviction
             # must never leave another rank returning early from the encoder.
