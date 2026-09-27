@@ -76,7 +76,7 @@ pub(super) fn load_chat_formatter(
             &model_type.map(str::to_lowercase),
             &model_path.unwrap_or_default().to_lowercase(),
         )
-        .map(ChatFormatter::HuggingFace),
+        .map(ChatFormatter::Native),
         Some(_) => None,
     };
 

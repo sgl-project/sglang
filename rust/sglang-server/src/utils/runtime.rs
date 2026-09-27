@@ -181,9 +181,18 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     )?;
     // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
     // worker path (which encodes the placeholder-expanded prompt itself).
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> =
+        dyn_tokenizer.as_ref().map(|t| {
+            let tokenizer_config = tokenizer::resolve_model_file(
+                &cfg.server_args.tokenizer_path,
+                cfg.server_args.revision.as_deref(),
+                "tokenizer_config.json",
+            );
+            Arc::new(tokenizer::DynamoTokenizer::new(
+                t.clone(),
+                tokenizer_config.as_deref(),
+            )) as _
+        });
 
     // Shared: MM workers park, the Python drain pops.
     let mm_results: crate::multi_modality::result_store::MmResultStore = Default::default();

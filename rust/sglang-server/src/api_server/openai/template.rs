@@ -9,8 +9,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput};
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+};
+use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput, may_be_fix_tool_schema};
 use thiserror::Error;
 
 use crate::message::types::OneOrMany;
@@ -24,33 +26,56 @@ pub(super) use super::template_legacy::LegacySpec;
 use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
+#[path = "template_tools.rs"]
+mod template_tools;
+pub(super) use template_tools::{normalize_prompt_tools, python_bool};
+
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
-/// A chat prompt formatter: either the model's HuggingFace Jinja template (or
-/// Dynamo's built-in encoder for models that ship none) or a legacy SGLang
-/// conversation template.
+/// A chat prompt formatter, retaining whether it uses a Jinja template,
+/// a native encoder, or a legacy SGLang conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
+    Native(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
 impl ChatFormatter {
-    /// Render the request's messages to a single prompt string.
-    pub(super) fn render(
+    /// Render with Python's prompt-visible tools, retaining the raw typed request.
+    pub(super) fn render_with_tools(
         &self,
         request: &CreateChatCompletionRequest,
         kwargs: Option<&ChatTemplateKwargs>,
+        prompt_tools: Option<&serde_json::Value>,
+        prompt_messages: Option<&minijinja::Value>,
     ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
-                .render(&TemplateRequest { request, kwargs })
+            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter))
+            | ChatFormatter::Native(PromptFormatter::OAI(formatter)) => formatter
+                .render(&TemplateRequest {
+                    request,
+                    kwargs,
+                    filter_named_tools: matches!(self, ChatFormatter::HuggingFace(_)),
+                    prompt_tools,
+                    prompt_messages,
+                })
                 .map_err(|error| TemplateError::Renderer {
                     message: error.to_string(),
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
         }
+    }
+
+    /// Render the request's messages to a single prompt string.
+    #[cfg(test)]
+    pub(super) fn render(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+    ) -> Result<String, TemplateError> {
+        self.render_with_tools(request, kwargs, None, None)
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -59,8 +84,17 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::Native(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
+        }
+    }
+
+    /// Whether this Jinja formatter requires structured OpenAI content parts.
+    /// Native and legacy renderers stay outside the Jinja normalization path.
+    pub(super) fn requires_content_arrays(&self) -> bool {
+        match self {
+            ChatFormatter::HuggingFace(formatter) => formatter.requires_content_arrays(),
+            ChatFormatter::Native(_) | ChatFormatter::Legacy(_) => false,
         }
     }
 }
@@ -70,6 +104,9 @@ impl ChatFormatter {
 struct TemplateRequest<'a> {
     request: &'a CreateChatCompletionRequest,
     kwargs: Option<&'a ChatTemplateKwargs>,
+    filter_named_tools: bool,
+    prompt_tools: Option<&'a serde_json::Value>,
+    prompt_messages: Option<&'a minijinja::Value>,
 }
 
 impl OAIChatLikeRequest for TemplateRequest<'_> {
@@ -77,12 +114,41 @@ impl OAIChatLikeRequest for TemplateRequest<'_> {
         self.request.model()
     }
     fn messages(&self) -> minijinja::Value {
-        self.request.messages()
+        self.prompt_messages
+            .cloned()
+            .unwrap_or_else(|| self.request.messages())
     }
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
         self.request.typed_messages()
     }
     fn tools(&self) -> Option<minijinja::Value> {
+        if self.filter_named_tools
+            && let Some(prompt_tools) = self.prompt_tools
+        {
+            let tools = prompt_tools.as_array()?;
+            let selected = tools
+                .iter()
+                .filter(|tool| match &self.request.tool_choice {
+                    Some(ChatCompletionToolChoiceOption::Named(choice)) => {
+                        tool["function"]["name"].as_str() == Some(choice.function.name.as_str())
+                    }
+                    _ => true,
+                })
+                .collect::<Vec<_>>();
+            return (!selected.is_empty()).then(|| minijinja::Value::from_serialize(selected));
+        }
+        if self.filter_named_tools
+            && let Some(ChatCompletionToolChoiceOption::Named(choice)) = &self.request.tool_choice
+            && let Some(tools) = &self.request.tools
+        {
+            // Python limits the Jinja prompt to the named tool. Keep the full
+            // request available to validation, constraints, and output parsing.
+            let selected = tools
+                .iter()
+                .filter(|tool| tool.function.name == choice.function.name)
+                .collect::<Vec<_>>();
+            return may_be_fix_tool_schema(serde_json::to_value(selected).unwrap());
+        }
         self.request.tools()
     }
     fn tool_choice(&self) -> Option<minijinja::Value> {
@@ -731,6 +797,150 @@ mod tests {
         );
     }
 
+    fn tools_request(choice: Option<serde_json::Value>) -> CreateChatCompletionRequest {
+        let mut value = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "get_weather", "description": "first", "strict": false,
+                    "parameters": {"properties": {
+                        "z": {"type": "string"}, "a": {"type": "integer"}
+                    }, "type": "object"}
+                }},
+                {"type": "function", "function": {
+                    "name": "get_time", "description": "unselected",
+                    "parameters": {"type": "object", "properties": {}}
+                }},
+                {"type": "function", "function": {
+                    "name": "get_weather", "description": "second", "strict": true,
+                    "parameters": {"type": "object", "properties": {
+                        "b": {"type": "boolean"}
+                    }}
+                }}
+            ]
+        });
+        if let Some(choice) = choice {
+            value["tool_choice"] = choice;
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn named_tool_prompt_keeps_all_matches_and_their_schema_order() {
+        let config = temp_config(
+            &serde_json::json!({
+                "chat_template": "{% for tool in tools or [] %}{{ tool.function.name }}={{ tool.function.description }};{% for key, value in tool.function.parameters.properties.items() %}{{ key }}={{ value.type }};{% endfor %}{{ 'strict' if tool.function.strict else 'loose' }}\n{% endfor %}"
+            })
+            .to_string(),
+        );
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        let request = tools_request(Some(serde_json::json!({
+            "type": "function", "function": {"name": "get_weather"}
+        })));
+        let before = serde_json::to_value(&request).unwrap();
+        let tools = super::normalize_prompt_tools(&before["tools"]).unwrap();
+        for prompt_tools in [None, tools.as_ref()] {
+            assert_eq!(
+                formatter
+                    .render_with_tools(&request, None, prompt_tools, None)
+                    .unwrap(),
+                "get_weather=first;z=string;a=integer;loose\nget_weather=second;b=boolean;strict\n"
+            );
+        }
+        assert_eq!(serde_json::to_value(&request).unwrap(), before);
+    }
+
+    #[test]
+    fn unnamed_tool_prompt_controls_keep_existing_behavior() {
+        let config = temp_config(
+            r#"{"chat_template": "{% for tool in tools or [] %}{{ tool.function.name }}|{% endfor %}"}"#,
+        );
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        for choice in [None, Some(serde_json::json!("auto"))] {
+            assert_eq!(
+                formatter.render(&tools_request(choice), None).unwrap(),
+                "get_weather|get_time|get_weather|"
+            );
+        }
+        assert_eq!(
+            formatter
+                .render(&tools_request(Some(serde_json::json!("none"))), None)
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn python_tool_tojson_preserves_declared_and_nested_order() {
+        let config = temp_config(r#"{"chat_template":"{{ tools[0] | tojson }}"}"#);
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"[{"type":"function","function":{"parameters":{"properties":{"z":{"type":"string"},"a":{"enum":["x","y"]}}},"name":"weather"}}]"#,
+        )
+        .unwrap();
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test", "messages":[{"role":"user","content":"hi"}], "tools":raw
+        }))
+        .unwrap();
+        let tools = super::normalize_prompt_tools(&raw).unwrap();
+        assert_eq!(
+            formatter
+                .render_with_tools(&request, None, tools.as_ref(), None)
+                .unwrap(),
+            r#"{"type": "function", "function": {"description": null, "name": "weather", "parameters": {"properties": {"z": {"type": "string"}, "a": {"enum": ["x", "y"]}}}, "strict": false}, "defer_loading": null}"#
+        );
+    }
+
+    #[test]
+    fn python_no_tools_view_is_none_for_null_empty_and_choice_none() {
+        let config =
+            temp_config(r#"{"chat_template":"{{ 'absent' if tools is none else 'present' }}"}"#);
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        for raw in [serde_json::Value::Null, serde_json::json!([])] {
+            assert_eq!(
+                formatter
+                    .render_with_tools(&request(), None, Some(&raw), None)
+                    .unwrap(),
+                "absent"
+            );
+        }
+        let request = tools_request(Some(serde_json::json!("none")));
+        let tools =
+            super::normalize_prompt_tools(&serde_json::to_value(&request.tools).unwrap()).unwrap();
+        assert_eq!(
+            formatter
+                .render_with_tools(&request, None, tools.as_ref(), None)
+                .unwrap(),
+            "absent"
+        );
+    }
+
+    #[test]
+    fn named_tool_filter_does_not_change_native_or_legacy_rendering() {
+        let request = tools_request(Some(serde_json::json!({
+            "type": "function", "function": {"name": "get_weather"}
+        })));
+        let native = load_chat_formatter(None, None, Some("deepseek_v4"), None).unwrap();
+        let rendered = native
+            .render_with_tools(&request, None, Some(&serde_json::Value::Null), None)
+            .unwrap();
+        assert!(rendered.contains("get_weather"));
+        assert!(rendered.contains("get_time"));
+
+        let legacy = load_chat_formatter(None, None, None, Some("chatml")).unwrap();
+        assert_eq!(
+            legacy.render(&request, None).unwrap(),
+            legacy
+                .render(&tools_request(Some(serde_json::json!("auto"))), None)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn missing_template_falls_back_to_native_formatter() {
         let config = temp_config("{}");
@@ -740,7 +950,8 @@ mod tests {
         };
 
         let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
-        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
+        assert!(matches!(formatter, ChatFormatter::Native(_)));
+        assert!(formatter.stop_strs().is_none());
         let kwargs = HashMap::from([("thinking".into(), serde_json::json!(false))]);
         assert_eq!(
             formatter.render(&request(), Some(&kwargs)).unwrap(),
@@ -748,12 +959,14 @@ mod tests {
         );
         assert!(matches!(
             load(None, Some("deepseek_v4"), None),
-            Ok(ChatFormatter::HuggingFace(_))
+            Ok(ChatFormatter::Native(_))
         ));
 
         // A template, `--chat-template`, or an unknown architecture wins.
         let templated = temp_config(r#"{"chat_template": "Hi"}"#);
         let formatter = load(Some(templated.to_str().unwrap()), Some("deepseek_v4"), None).unwrap();
+        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
+        assert!(formatter.stop_strs().is_none());
         assert_eq!(formatter.render(&request(), None).unwrap(), "Hi");
         assert!(matches!(
             load(Some(config), Some("deepseek_v4"), Some("chatml")),
