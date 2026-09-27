@@ -55,9 +55,7 @@ class TestHunyuanImage3TPBroadcast(CustomTestCase):
             for node in ast.walk(function)
             if isinstance(node, ast.For)
             and any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "enumerate"
+                isinstance(child, ast.Name) and child.id == "timesteps"
                 for child in ast.walk(node.iter)
             )
         ]

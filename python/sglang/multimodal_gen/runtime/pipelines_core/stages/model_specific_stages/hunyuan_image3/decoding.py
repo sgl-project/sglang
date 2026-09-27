@@ -334,6 +334,8 @@ class HunyuanImage3DecodingStage(DecodingStage):
         if not envs.SGLANG_HI3_OUTPUT_CROP:
             # Env-gated escape hatch: return the full decoded bucket
             # uncropped; the geometry contract stays in extra.
+            batch.width = output_batch.output.shape[-1]
+            batch.height = output_batch.output.shape[-2]
             return output_batch
 
         source_size = output_batch.output.shape[-1], output_batch.output.shape[-2]

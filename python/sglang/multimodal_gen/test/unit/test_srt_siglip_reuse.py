@@ -160,3 +160,35 @@ def test_hunyuan_siglip2_attention_does_not_mix_images():
     torch.testing.assert_close(actual, expected)
     v[6:] += 100
     torch.testing.assert_close(attention(q, k, v, boundaries)[:6], actual[:6])
+
+
+def test_hunyuan_siglip2_loads_unfused_checkpoint_weights():
+    model = HunyuanImage3VisionModel(
+        dict(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            num_patches=16,
+            patch_size=2,
+        )
+    )
+    checkpoint = {}
+    expected = {}
+    for name, param in model.named_parameters():
+        value = torch.arange(param.numel(), dtype=param.dtype).reshape(param.shape)
+        expected[name] = value
+        checkpoint_name = name.removeprefix("vision_model.")
+        if "attn.qkv_proj" in name:
+            for projection, weight in zip(("q", "k", "v"), value.chunk(3)):
+                checkpoint[
+                    checkpoint_name.replace("attn.qkv_proj", f"{projection}_proj")
+                ] = weight
+        else:
+            checkpoint[checkpoint_name.replace("attn.proj", "out_proj")] = value
+
+    loaded = model.load_weights(checkpoint.items())
+
+    assert loaded == set(expected)
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, expected[name], rtol=0, atol=0)
