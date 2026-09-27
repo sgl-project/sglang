@@ -1,7 +1,7 @@
 """gfx950 small-M W8A8 FP8 GEMM (per-token x per-channel, bf16 out) on aiter's (16, 16)-preshuffled weights.
 
 `smallm_fp8_gemm.hip` is built with hipcc at first use and launched like smallm_moe_gfx950. On by default for the
-Qwen3.5-397B AttnFP8 TP4 projection shapes below; SGLANG_ROCM_SMALLM_FP8_PROJ=0 turns it off.
+Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below; SGLANG_ROCM_SMALLM_FP8_PROJ=0 turns it off.
 """
 
 import ctypes
@@ -23,9 +23,14 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_fp8_gemm
 # (N, K) -> ((max M, n-tiles per block, k steps per wave, waves, LDS-staged activations), ...), first match wins.
 # Measured faster than aiter gemm_a8w8_bpreshuffle: packed GDN in_proj, attention qkv_proj, out_proj / o_proj.
 SHAPES = {
+    # TP4
     (5184, 4096): ((16, 2, 8, 8, 1), (28, 2, 4, 16, 0)),
     (4608, 4096): ((16, 2, 8, 8, 1), (28, 2, 4, 16, 0)),
     (4096, 2048): ((12, 1, 8, 4, 0), (36, 1, 4, 8, 0)),
+    # TP2
+    (10304, 4096): ((8, 1, 16, 4, 1), (16, 4, 8, 8, 1), (32, 4, 4, 16, 0)),
+    (8704, 4096): ((4, 1, 16, 4, 1), (16, 4, 8, 8, 1)),
+    (4096, 4096): ((8, 1, 8, 8, 0), (16, 1, 8, 8, 1), (40, 1, 4, 16, 0)),
 }
 _mod = None
 _kernels = {}

@@ -1,4 +1,4 @@
-"""gfx950 small-M W8A8 FP8 GEMM (Qwen3.5 AttnFP8 TP4 shapes) and fused output-side FP8 quant (TP4 and TP2)."""
+"""gfx950 small-M W8A8 FP8 GEMM and fused output-side FP8 quant, Qwen3.5 AttnFP8 TP4 and TP2 shapes."""
 
 import itertools
 import os
@@ -31,9 +31,17 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
 
         cls.fp8_utils, cls.quant = fp8_utils, staticmethod(per_token_group_quant_fp8)
         torch.manual_seed(0)
-        # packed GDN in_proj, attention qkv_proj, GDN out_proj / attention o_proj; max M sent to the new kernel
+        # packed GDN in_proj, attention qkv_proj, GDN out_proj / attention o_proj at TP4 then TP2; max M sent to
+        # the new kernel
         cls.shapes = []
-        for n, k, max_m in ((5184, 4096, 28), (4608, 4096, 28), (4096, 2048, 36)):
+        for n, k, max_m in (
+            (5184, 4096, 28),
+            (4608, 4096, 28),
+            (4096, 2048, 36),
+            (10304, 4096, 32),
+            (8704, 4096, 16),
+            (4096, 4096, 40),
+        ):
             w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
             s = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3
             cls.shapes.append((shuffle_weight(w, (16, 16)).t(), s, max_m))
@@ -54,7 +62,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
         from aiter import gemm_a8w8_bpreshuffle
 
         for w, s, max_m in self.shapes:
-            for m in (1, 4, 16, 24, 29, 36, 41):
+            for m in (1, 4, 8, 9, 16, 17, 24, 29, 33, 36, 41):
                 with self.subTest(n=w.shape[1], m=m):
                     x = torch.randn(m, w.shape[0], device="cuda", dtype=torch.bfloat16)
                     q, xs = self.quant(x, group_size=x.shape[1])
@@ -128,7 +136,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                     self.assertTrue(torch.equal(s, rs))
 
     def test_graph_replay_matches_eager(self):
-        (w_in, s_in, _), _, (w_out, s_out, _) = self.shapes
+        (w_in, s_in, _), _, (w_out, s_out, _) = self.shapes[:3]
         x = torch.randn(4, 4096, device="cuda", dtype=torch.bfloat16)
         (norm_q, sig_q), _ = self.producers(4)
 
