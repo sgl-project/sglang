@@ -306,8 +306,10 @@ jobs:
             bash scripts/ci/amd/check_hf_cache_space.sh \
             Qwen/Qwen3.8-Flash-Next-FP8 250
 
+      # Shard loading from the MI300 HF cache runs at 15-30 s/shard (131 shards),
+      # so server launch alone can exceed 30 minutes.
       - name: Qwen3.8-Flash-Next-FP8 Accuracy MI30x ROCm
-        timeout-minutes: 60
+        timeout-minutes: 150
         run: |
           : > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -315,7 +317,8 @@ jobs:
             -e QWEN38_FLASH_NEXT_FP8_TP_SIZE=2 \
             -e QWEN38_FLASH_NEXT_FP8_EP_SIZE=2 \
             -e QWEN38_FLASH_NEXT_FP8_MEM_FRACTION_STATIC=0.75 \
-            python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            -e QWEN38_FLASH_NEXT_FP8_SERVER_LAUNCH_TIMEOUT=3600 \
+            python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE:-0}
 

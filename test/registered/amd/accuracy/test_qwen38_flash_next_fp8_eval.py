@@ -3,9 +3,10 @@
 The released FP8 checkpoint uses TP1 on gfx950 and TP2+EP2 on gfx942, where
 the 192 GiB device capacity cannot hold the target, MTP draft, and graph/KV
 state on one GPU. These nightly tests pin the checkpoint revision and exercise
-the same AITER decode-graph path with EAGLE speculation on both architectures.
-Direct AITER paged QSA remains disabled here so the core model correctness gate
-does not depend on an unreleased AITER API.
+the same AITER-attention decode-graph path with EAGLE speculation on both
+architectures. SGLANG_USE_AITER=0 keeps direct AITER paged QSA disabled so the
+core model correctness gate does not depend on an unreleased AITER API; with it
+off, the FP8 MoE layers resolve to the Triton runner.
 
 Registries:
   nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8 suite
@@ -47,7 +48,9 @@ MODEL_ID = "Qwen/Qwen3.8-Flash-Next-FP8"
 MODEL_PATH = os.environ.get("QWEN38_FLASH_NEXT_FP8_MODEL_PATH", MODEL_ID)
 MODEL_REVISION = "bcd9f01ddc9cff2316eb84281bebcd5b058bddce"
 ACCURACY_THRESHOLD = 0.94
-SERVER_LAUNCH_TIMEOUT = 1800
+SERVER_LAUNCH_TIMEOUT = int(
+    os.environ.get("QWEN38_FLASH_NEXT_FP8_SERVER_LAUNCH_TIMEOUT", "1800")
+)
 NUM_REQUESTED_EXAMPLES = 1319
 NUM_SHOTS = 5
 NUM_EVALUATED_EXAMPLES = NUM_REQUESTED_EXAMPLES - NUM_SHOTS
@@ -73,8 +76,6 @@ SERVER_ARGS = [
     "--ep-size",
     str(EP_SIZE),
     "--attention-backend",
-    "aiter",
-    "--moe-runner-backend",
     "aiter",
     "--kv-cache-dtype",
     "auto",
