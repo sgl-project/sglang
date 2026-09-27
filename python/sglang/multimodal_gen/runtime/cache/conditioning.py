@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact, bounded host caching at deterministic conditioning boundaries."""
+"""Exact conditioning reuse within grouped stages and across requests."""
 
 import copy
 import hashlib
@@ -209,7 +209,7 @@ def _map_output(value, tensor_fn, *, restore=False):
 
 
 class ConditioningCache:
-    """One cache per executor/rank. Stored tensors never alias request tensors."""
+    """One cache per executor/rank with private host entries and scoped device reuse."""
 
     def __init__(self, max_bytes: int):
         if max_bytes < 0:
