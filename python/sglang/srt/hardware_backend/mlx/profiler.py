@@ -252,7 +252,8 @@ def _unique_gputrace_path_for_chrome_trace(path: str) -> Path:
 
 def _write_empty_chrome_trace(path: str):
     trace = {"traceEvents": []}
-    Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
     if str(path).endswith(".gz"):
         with gzip.open(path, "wt") as f:
             json.dump(trace, f)
