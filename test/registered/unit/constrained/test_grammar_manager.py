@@ -417,7 +417,7 @@ class TestAbortRequests(unittest.TestCase):
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
-    def test_abort_by_rid_prefix(self):
+    def test_abort_by_rid(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
@@ -470,8 +470,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = ""
         mgr.abort_requests(abort_req)  # Should not raise
 
-    def test_abort_prefix_match(self):
-        """rid.startswith means prefix matching, not exact matching."""
+    def test_abort_does_not_match_rid_prefix(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123-suffix")
         req.grammar = MagicMock(spec=Future)
@@ -482,7 +481,7 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = "req-123"
 
         mgr.abort_requests(abort_req)
-        req.set_finish_with_abort.assert_called_once()
+        req.set_finish_with_abort.assert_not_called()
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):
