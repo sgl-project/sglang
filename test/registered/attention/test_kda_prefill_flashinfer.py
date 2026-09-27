@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -47,10 +48,17 @@ from sglang.test.kits.attention_unittest.attention_methods.kda_attention import 
 
 
 @pytest.mark.parametrize(
-    "state_dtype,padded_slots",
-    [(torch.bfloat16, False), (torch.float32, False), (torch.bfloat16, True)],
+    "state_dtype,padded_slots,strided_beta",
+    [
+        (torch.bfloat16, False, False),
+        (torch.float32, False, False),
+        (torch.bfloat16, True, False),
+        (torch.float32, False, True),
+    ],
 )
-def test_kda_prefill_indexed_state_and_130_token_checkpoint(state_dtype, padded_slots):
+def test_kda_prefill_indexed_state_and_130_token_checkpoint(
+    state_dtype, padded_slots, strided_beta
+):
     torch.manual_seed(7)
     lengths = [130, 128]
     total_tokens = sum(lengths)
@@ -66,7 +74,11 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(state_dtype, padded_
     k = randn(1, total_tokens, heads, dim, scale=0.01)
     v = randn(1, total_tokens, heads, dim, scale=0.01)
     g = randn(1, total_tokens + 14, heads, dim, scale=0.1)
-    beta = randn(1, total_tokens + 14, heads)
+    beta = (
+        randn(1, total_tokens + 14, heads * 12)[..., :heads]
+        if strided_beta
+        else randn(1, total_tokens + 14, heads)
+    )
     a_log = torch.zeros(heads, device="cuda", dtype=torch.float32)
     dt_bias = torch.zeros(heads, dim, device="cuda", dtype=torch.float32)
     initial_values = (
@@ -133,24 +145,25 @@ def test_kda_prefill_indexed_state_and_130_token_checkpoint(state_dtype, padded_
         track_state=ref_track,
         **common,
     )
-    fi_output, _ = flashinfer.extend(
-        q.clone(),
-        k.clone(),
-        v.clone(),
-        g.clone(),
-        beta.clone(),
-        ssm_states=fi_state,
-        cache_indices=slots,
-        query_start_loc=cu_seqlens,
-        track_state=fi_track,
-        state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
-        num_state_checkpoints=metadata.num_state_checkpoints,
-        state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
-        state_checkpoint_track_src=metadata.state_checkpoint_track_src,
-        state_checkpoint_indices=metadata.state_checkpoint_indices,
-        track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
-        **common,
-    )
+    with patch.object(triton, "extend", side_effect=AssertionError("Triton fallback")):
+        fi_output, _ = flashinfer.extend(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            g.clone(),
+            beta,
+            ssm_states=fi_state,
+            cache_indices=slots,
+            query_start_loc=cu_seqlens,
+            track_state=fi_track,
+            state_checkpoint_cu_starts=metadata.state_checkpoint_cu_starts,
+            num_state_checkpoints=metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=metadata.state_checkpoint_every_n_tokens,
+            state_checkpoint_track_src=metadata.state_checkpoint_track_src,
+            state_checkpoint_indices=metadata.state_checkpoint_indices,
+            track_ssm_h_batch_src=metadata.track_ssm_h_batch_src,
+            **common,
+        )
 
     assert torch.isfinite(fi_output).all()
     assert torch.isfinite(fi_state).all()

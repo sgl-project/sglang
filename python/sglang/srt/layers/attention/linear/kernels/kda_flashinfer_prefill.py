@@ -158,7 +158,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             and beta.shape[1] >= q.shape[1]
             and beta.shape[2] == q.shape[2]
             and beta.data_ptr() % 16 == 0
-            and beta[:, : q.shape[1]].is_contiguous()
             and g.shape[1] >= q.shape[1]
             and g[:, : q.shape[1]].is_contiguous()
             and num_sequences > 0
@@ -209,7 +208,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             k=k.contiguous(),
             v=v.contiguous(),
             g=g,
-            beta=beta,
+            # Kimi-K3 slices beta from a fused projection, so its token stride
+            # can exceed the number of heads even in a normal prefill.
+            beta=beta[:, : q.shape[1]].contiguous(),
             A_log=A_log.reshape(-1).float().contiguous(),
             dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
             initial_state=ssm_states,
