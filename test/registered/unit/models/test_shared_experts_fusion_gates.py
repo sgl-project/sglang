@@ -61,7 +61,15 @@ class _FusionGateCase(CustomTestCase):
     def _reason(self, model_class, hf_config, quant_config=None, moe_ep_size=1):
         # The gates consult the live EP size; without a group installed the
         # canonical getter asserts, so every case states a topology.
-        with get_parallel().override(moe_ep_size=moe_ep_size):
+        with get_parallel().override(
+            tp_size=moe_ep_size,
+            attn_tp_size=moe_ep_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=moe_ep_size,
+            moe_dp_size=1,
+            moe_tp_size=1,
+        ):
             return model_class.shared_experts_fusion_disable_reason(
                 hf_config, quant_config
             )

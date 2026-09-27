@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
 )
@@ -32,6 +33,10 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
 from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -261,14 +266,35 @@ def test_cached_prefix_matches_full_recomputation(model, edit):
 def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
     first = batched_inputs([inputs(5 + i, edit) for i in range(sample_count)])
     second = batched_inputs([inputs(9 + i, edit) for i in range(sample_count)])
+    for kwargs in (first, second):
+        kwargs["encoder_hidden_states_mask"] = torch.ones(
+            kwargs["encoder_hidden_states"].shape[:2], device="cuda", dtype=torch.bool
+        )
+    stage = object.__new__(QwenImage21DenoisingStage)
     runner = DiffusionBreakableCudaGraphRunner(model, torch.device("cuda"))
     try:
-        with torch.no_grad(), set_forward_context(None, None):
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams(), is_warmup=True),
+            ),
+        ):
             model(**first)
-            assert runner.capture(**first)
+            stage._bcg_run(runner, first, model)
+        assert len(runner.entries) == 1
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams()),
+            ),
+        ):
             model(**second)
             expected = model(**second)
-            actual = runner(**second)
+            actual = stage._bcg_run(runner, second, model)
         assert len(runner.entries) == 1
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
     finally:

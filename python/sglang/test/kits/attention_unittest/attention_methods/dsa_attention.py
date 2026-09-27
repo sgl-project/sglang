@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -322,7 +321,6 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
