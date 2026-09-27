@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared SRT rotary embedding adapter for Qwen-VL text encoders."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -8,6 +10,20 @@ import torch
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.hf_transformers.common import get_rope_config
+
+_construction_rope_cache: ContextVar[dict | None] = ContextVar(
+    "qwen_vl_construction_rope_cache", default=None
+)
+
+
+@contextmanager
+def isolated_qwen_vl_rope_cache():
+    """Keep intra-model RoPE ties without borrowing another model's buffers."""
+    token = _construction_rope_cache.set({})
+    try:
+        yield
+    finally:
+        _construction_rope_cache.reset(token)
 
 
 def build_qwen_vl_text_rope(
@@ -26,6 +42,11 @@ def build_qwen_vl_text_rope(
         base=rope_theta,
         is_neox_style=True,
         rope_scaling=rope_scaling,
+        **(
+            {"cache": _construction_rope_cache.get()}
+            if _construction_rope_cache.get() is not None
+            else {}
+        ),
     )
 
 

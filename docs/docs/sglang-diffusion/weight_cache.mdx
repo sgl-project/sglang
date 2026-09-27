@@ -1,0 +1,253 @@
+---
+title: "Weight cache for fast recovery"
+sidebarTitle: "Weight cache"
+description: "Restart diffusion workers by importing GPU-resident model weights from a standalone cache owner."
+---
+
+Weight cache keeps selected model components in a separate GPU-resident **owner**
+process. When you restart a compatible diffusion worker, it imports those CUDA
+storages through CUDA IPC instead of loading the cached weights again from the
+checkpoint. The owner must remain alive across worker restarts.
+
+This optimizes weight loading during recovery, not denoising. Unlike
+[Cache-DiT, TeaCache, and Spectrum](/docs/sglang-diffusion/caching-acceleration), it
+does not skip computation or approximate model outputs. It reuses the common
+weight-cache and SRT IPC utilities, while diffusion loaders define the component
+state to share.
+
+## Supported configurations
+
+| Model | Cached components | Scope |
+| --- | --- | --- |
+| `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | `dit` | Native Wan2.1 T2V 1.3B only |
+| `Qwen/Qwen-Image` | `dit` | Original Qwen-Image, not Edit, Layered, or 2512 |
+| `MiniMaxAI/MiniMax-H3` | `dit`, or `dit text_encoder` | Original native FL2VA partition with `--model-variant fl2va` |
+
+`dit` is the default selector and an alias for `transformer`. Selecting
+`text_encoder` without `dit` is not supported. VAE caching and other models' text
+encoders are not supported. H3 text encoder caching requires the original
+Qwen3-VL-32B encoder with its first 50 language layers and original vision tower;
+replacement encoders and ClipProj variants are not supported.
+
+### Prerequisites
+
+- Linux with working `pidfd_open` and `pidfd_send_signal`, and NVIDIA CUDA.
+  Owner and clients must use the same user, Linux PID namespace, and physical GPU.
+- A SGLang build that includes the weight-cache CLI options and satisfies the
+  [diffusion installation requirements](/docs/sglang-diffusion/installation).
+  Use identical SGLang source and compatible installed dependency builds for the
+  owner and clients. Do not edit or upgrade the installation while an owner is live.
+- One GPU, rank, and node; all TP/SP/CFG/DP parallelism degrees must be `1`.
+- Native, unquantized bf16 loading, eager execution, and FA attention. H3 retains
+  its model-required fp32 parameters. Cached components must stay GPU-resident
+  without FSDP, CPU offload, or layerwise offload.
+- A stable published checkpoint accessible to both processes at the same path.
+  The examples use local Hugging Face cache snapshots pinned to commit hashes.
+  Keep the checkpoint files and metadata available even though recovery does not
+  read the cached weight tensors. Uncached components still load normally.
+
+An arbitrary copied model directory needs an exact consumed-file content manifest
+named `sglang_weight_cache_manifest.json`; a directory name or file timestamps
+alone are insufficient. Prefer the pinned snapshot examples below. Keep the
+development-only `--weight-cache-allow-weak-checkpoint-identity` and
+`--weight-cache-allow-unverified-build` switches disabled for production.
+
+LoRA, quantization, `torch.compile`, breakable CUDA graphs, disaggregation, and
+Diffusers-backend pipelines are not supported in cache mode. H3 Ref2VA/hybrid,
+FastH3, pruning, and offline/online AdaLN caches are also outside this support
+scope. Weight updates, LoRA mutation, and memory-release operations that would
+invalidate shared weights are rejected in cache mode.
+
+## Start an owner and a client
+
+The following Bash example caches the original Qwen-Image DiT. Run the setup in
+each terminal so that the owner, client, and status command use the same
+`CACHE_ARGS`. The download uses a public model; it needs no authentication token
+unless your Hub environment requires one. It downloads the checkpoint if it is
+not already cached.
+
+```bash
+MODEL_PATH="$(python -c 'from huggingface_hub import snapshot_download; print(snapshot_download("Qwen/Qwen-Image", revision="75e0b4be04f60ec59a75f475837eced720f823b6"))')"
+CACHE_ARGS=(
+  --model-path "$MODEL_PATH"
+  --num-gpus 1
+  --performance-mode manual
+  --attention-backend fa
+  --use-fsdp-inference false
+  --component-residency transformer=resident
+  --weight-cache-components dit
+)
+```
+
+In terminal 1, start the standalone owner:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.runtime.weight_cache.daemon \
+  "${CACHE_ARGS[@]}" --weight-cache-max-deliveries 128
+```
+
+Wait for `[WeightCache] ready:` in its log. The initial owner still loads weights
+from the checkpoint; the cache accelerates subsequent compatible worker starts.
+The owner is not an HTTP inference server and is not started automatically by
+`sglang serve`.
+
+In terminal 2, start the inference server:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 sglang serve "${CACHE_ARGS[@]}" \
+  --weight-cache-mode client --port 30000
+```
+
+Use the existing [HTTP APIs](/docs/sglang-diffusion/api/openai_api) for requests.
+When you stop and restart this client with the same configuration, leave the
+owner running. Each new worker imports a fresh delivery from the same bundle.
+Client mode also supports `sglang generate`; for example, after stopping the
+HTTP server:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 sglang generate "${CACHE_ARGS[@]}" \
+  --weight-cache-mode client \
+  --prompt "A small boat on a calm lake at sunrise" --save-output
+```
+
+The launcher validates compatibility before spawning workers. A missing owner,
+incompatible configuration, or exhausted budget is an error, not an automatic
+disk-loading fallback. `--weight-cache-timeout` controls each socket exchange;
+it does not wait for a missing owner to become ready.
+
+## Cache the H3 text encoder and DiT
+
+Stop the previous owner and its clients before switching the cached bundle on
+the same GPU. Replace the Qwen setup above with this setup in each terminal, then
+use the same owner, client, and status commands:
+
+```bash
+MODEL_PATH="$(python -c 'from huggingface_hub import snapshot_download; print(snapshot_download("MiniMaxAI/MiniMax-H3", revision="42ed227ee7df40d41602854ae760620d6eb651fe", allow_patterns=["*.json", "FL2VA/**"]))')"
+CACHE_ARGS=(
+  --model-path "$MODEL_PATH" --model-variant fl2va
+  --num-gpus 1
+  --performance-mode manual
+  --attention-backend fa
+  --use-fsdp-inference false
+  --component-residency transformer=resident text_encoder=resident vae=component-offload
+  --weight-cache-components dit text_encoder
+)
+```
+
+Point `--model-path` at the snapshot root, not its `FL2VA` subdirectory. The
+two components form one bundle with one generation, one IPC delivery per worker,
+and a shared recovery budget. Uncached VAEs, tokenizers, and processors keep their
+ordinary loading paths.
+
+<Warning>
+H3's cached weights alone occupy about 110 GiB: 61.73 GiB for the DiT and
+48.09 GiB for the text encoder. Leave additional GPU memory for CUDA contexts,
+activations, VAEs, and temporary allocations. This is not a way to fit the model
+on an 80 GiB GPU.
+</Warning>
+
+Use the global `--attention-backend fa` shown above. The H3 encoder's language
+layers use FA, while its vision tower follows the ordinary loader's SDPA
+fallback. A strict `text_encoder=fa` component override is not equivalent.
+
+If you need text encoder offload, select only `--weight-cache-components dit`
+and use `text_encoder=layerwise-offload` in `--component-residency`. Pinned CPU
+memory and its host-to-device transfers remain part of that uncached encoder's
+execution. GPU weight cache does not turn pinned host memory into shared GPU
+storage or remove those transfers.
+
+## Query the remaining recovery budget
+
+With the matching setup, query the owner without starting a worker or consuming
+a delivery:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.runtime.weight_cache.daemon \
+  --status "${CACHE_ARGS[@]}"
+```
+
+The JSON response includes:
+
+| Field | Meaning |
+| --- | --- |
+| `components`, `generation` | The owner's selected component bundle and generation identity |
+| `unique_storage_bytes`, `storage_count` | Unique shared storage size and count across the bundle |
+| `active_consumers` | Consumers whose processes are still alive |
+| `deliveries_reserved`, `deliveries_remaining` | Used and remaining delivery reservations |
+| `storage_exports_reserved`, `storage_exports_remaining` | Used and remaining storage-handle exports |
+| `fetches_remaining` | Remaining whole-bundle fetches allowed by both limits |
+| `failed_deliveries` | Export attempts that failed after reserving budget |
+| `budget_exhausted`, `accepting_fetches` | Whether the owner can admit another fetch |
+
+The owner defaults to 128 deliveries and 65,536 storage exports per generation.
+`--weight-cache-max-deliveries N` sets the owner's delivery limit; it does not
+increase the storage-export limit. One bundle fetch spends one delivery and one
+export for each distinct storage, not one delivery per component:
+
+```text
+fetches_remaining = min(deliveries_remaining,
+                        floor(storage_exports_remaining / storage_count))
+```
+
+For example, the audited H3 DiT + text encoder bundle has 1,440 storages, so the
+default storage-export budget permits 45 fetches, not 128. Check `--status` for
+your actual remaining budget rather than assuming a fixed recovery count.
+
+Reservations are not refunded when a client exits, crashes, or fails after an
+export reservation. Repeated `--status` calls do not spend budget. After
+exhaustion, existing clients can continue serving and status queries still work,
+but new clients cannot attach. To obtain a new budget, stop the clients, restart
+the owner, wait for readiness, and restart the clients.
+
+## Lifecycle and deployment boundaries
+
+<Warning>
+The owner is part of the serving lifetime. If it exits unexpectedly, mapped
+consumers terminate rather than continue using potentially invalid CUDA storage.
+Normal owner shutdown also drains its consumers before releasing allocations.
+Restarting an owner is therefore a coordinated restart, not transparent failover.
+</Warning>
+
+- Supervise the owner separately from the inference server. This feature recovers
+  worker processes while the owner survives; it does not survive GPU reset,
+  node loss, or owner loss without reloading weights.
+- Use one owner per physical GPU in a shared runtime directory. Different socket
+  names do not create an independent cache pool on that GPU. All processes must
+  see the same Unix socket, checkpoint publication, and installation.
+- By default, sockets and coordination files live under
+  `$XDG_RUNTIME_DIR/sglang_diffusion_weight_cache`, or
+  `/tmp/sglang_diffusion_weight_cache` when `XDG_RUNTIME_DIR` is unset. Set
+  `SGLANG_DIFFUSION_WEIGHT_CACHE_DIR` to the same absolute directory in all
+  processes to override this. `--weight-cache-socket` overrides the socket path;
+  specify the same path for owner, client, and status. Keep Unix socket paths
+  short and do not delete a live owner's coordination files to bypass a lock.
+- Normal shutdown retains the owner's allocations until consumers have exited.
+  If a consumer cannot be confirmed dead, shutdown can remain blocked; do not
+  assume a fixed-time shutdown frees its GPU memory safely.
+- Compatibility covers the selected components, frozen loader recipes, checkpoint
+  identity, runtime/source builds, and physical GPU. Metadata reads and uncached
+  component loads still occur during recovery. Do not modify a published
+  checkpoint in place or expect hot weight replacement in cache mode.
+- Worker allocator statistics do not include all owner-held GPU memory. Account
+  for the owner's allocations and all processes when sizing the deployment.
+
+## Verify a deployment
+
+Look for `[WeightCache] transformer imported in ...` or
+`[WeightCache] transformer,text_encoder imported in ...` in the worker log.
+These timings cover the import path, not the entire time until the HTTP service
+is ready. Python imports, distributed initialization, uncached components, and
+warmup still contribute to startup latency.
+
+Before rollout, compare ordinary loading with cache loading using the same
+checkpoint, configuration, prompt, and seed. Test worker restarts and owner-loss
+handling with your supervisor. Startup benefits depend on which components
+dominate loading; do not infer an end-to-end speedup from the import timer alone.
+
+The H3 dual-component path has been validated on H200 with 4/8-step t2va output
+parity, complete parameter checksums, two successive workers, a cached-tensor
+read guard, recovery budgets, and owner-loss/restart checks. This does not cover
+all image-conditioned requests, GPU types, or multi-GPU configurations.
+
+For all flags and defaults, see the
+[CLI reference](/docs/sglang-diffusion/api/cli#weight-cache-for-fast-recovery).

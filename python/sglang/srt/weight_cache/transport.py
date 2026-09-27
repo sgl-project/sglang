@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import struct
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 
@@ -23,6 +24,10 @@ TORCH_IPC_BACKEND = "torch_ipc"
 VMM_FD_BACKEND = "vmm_fd"
 
 _FD_INDEX_STRUCT = struct.Struct("<Q")
+
+
+class DeliveryBudgetExceeded(RuntimeError):
+    """Non-refundable producer generation budget is exhausted."""
 
 
 def _send_fd(sock: socket.socket, fd: int, index: int) -> None:
@@ -63,7 +68,10 @@ class WeightCacheTransportBackend(ABC):
     def prepare_export(
         self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
-        """Prepare daemon-side entries for all tensors."""
+        """Prepare reusable daemon-side state, retaining its tensor owners.
+
+        The result is local state, NOT a replayable serialized IPC payload.
+        """
 
     @abstractmethod
     def send_fetch_state_response(
@@ -91,20 +99,62 @@ class WeightCacheTransportBackend(ABC):
 class TorchIpcTransportBackend(WeightCacheTransportBackend):
     name = TORCH_IPC_BACKEND
 
+    def __init__(self, *, max_deliveries: int = 128):
+        if type(max_deliveries) is not int or max_deliveries <= 0:
+            raise ValueError("IPC delivery budget must be a positive integer")
+        self.max_deliveries = max_deliveries
+        self.deliveries_reserved = 0
+        self._owner_pid = os.getpid()
+        self._export_lock = threading.Lock()
+
     def prepare_export(
         self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
         entries: Dict[str, Dict[str, Any]] = {}
         for name, (tensor, is_param) in state_tensors.items():
             entries[name] = {
-                "handle": MultiprocessingSerializer.serialize(
-                    tensor.data, output_str=True
-                ),
+                "tensor": tensor.detach(),
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype).replace("torch.", ""),
+                "device_type": tensor.device.type,
                 "is_param": is_param,
             }
         return entries
+
+    def export_entries(
+        self, entries: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Create ONE delivery. Never replay this result, even on retry.
+
+        Each CUDA reduction creates one counted send reference. Keeping the
+        allocation alive does not make its serialized reduction replayable.
+        Disconnected/fatal consumers can retain send bookkeeping until producer
+        exit; callers must bound admission and retain all tensor owners.
+        """
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError("An IPC backend cannot export after fork")
+        with self._export_lock:
+            if self.deliveries_reserved >= self.max_deliveries:
+                raise DeliveryBudgetExceeded(
+                    "Weight-cache IPC delivery budget exhausted; drain consumers "
+                    "and restart the producer"
+                )
+            # A send may be lost or only partially imported. Never refund it or
+            # attempt to repair Torch's counters without consumer ownership.
+            self.deliveries_reserved += 1
+        if any(entry["tensor"].is_cuda for entry in entries.values()):
+            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+            monkey_patch_torch_reductions()
+        return {
+            name: {
+                **{key: value for key, value in entry.items() if key != "tensor"},
+                "handle": MultiprocessingSerializer.serialize(
+                    entry["tensor"], output_str=True
+                ),
+            }
+            for name, entry in entries.items()
+        }
 
     def send_fetch_state_response(
         self,
@@ -115,12 +165,13 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:
+        exported = self.export_entries(entries)
         send_msg(
             conn,
             {
                 "status": "ok",
                 "config": config,
-                "entries": entries,
+                "entries": exported,
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
@@ -132,7 +183,21 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
     ) -> Dict[str, Any]:
         return result
 
+    def stats(self) -> dict:
+        with self._export_lock:
+            remaining = self.max_deliveries - self.deliveries_reserved
+            return {
+                "max_deliveries": self.max_deliveries,
+                "deliveries_reserved": self.deliveries_reserved,
+                "fetches_remaining": remaining,
+                "budget_exhausted": remaining == 0,
+            }
+
     def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
+        if entry.get("device_type") == "cuda":
+            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+            monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(entry["handle"])
 
 
@@ -189,12 +254,14 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
+    *,
+    max_deliveries: int = 128,
 ) -> WeightCacheTransportBackend:
     if VmmFdTransportBackend.can_export_state(state_tensors):
         logger.info("[weight_cache] Using transport backend: %s", VMM_FD_BACKEND)
         return VmmFdTransportBackend()
     logger.info("[weight_cache] Using transport backend: %s", TORCH_IPC_BACKEND)
-    return TorchIpcTransportBackend()
+    return TorchIpcTransportBackend(max_deliveries=max_deliveries)
 
 
 def get_client_transport_backend(name: Optional[str]) -> WeightCacheTransportBackend:

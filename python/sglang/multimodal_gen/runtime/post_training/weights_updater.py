@@ -355,6 +355,11 @@ class WeightsUpdater:
     """
 
     def __init__(self, pipeline):
+        from sglang.multimodal_gen.runtime.weight_cache.guards import (
+            reject_cached_weight_mutation,
+        )
+
+        reject_cached_weight_mutation(pipeline, "Weight update")
         self.pipeline = pipeline
         try:
             self._module_weight_dirs = pipeline._weights_updater_module_weight_dirs

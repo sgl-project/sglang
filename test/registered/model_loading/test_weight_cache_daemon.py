@@ -29,8 +29,8 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=313, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=68, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=400, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).
@@ -346,6 +346,44 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
             "Expected the client server to load weights via IPC, but the IPC "
             "load log line was not found — the loader likely fell back to disk.",
         )
+
+    def test_repeated_clients_under_one_owner(self):
+        """Two fresh model-loader imports must not replay counted IPC sends."""
+        payload = {
+            "model": self.model,
+            "prompt": "The capital of France is",
+            "max_tokens": 16,
+            "temperature": 0,
+        }
+        reference = requests.post(
+            f"{self.base_url}/v1/completions", json=payload, timeout=60
+        )
+        reference.raise_for_status()
+        reference = reference.json()["choices"][0]["text"]
+        for _ in range(2):
+            kill_process_tree(type(self).process.pid)
+            self.assertIsNone(self.daemon_process.poll())
+            type(self).process = popen_launch_server(
+                self.model,
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--tp", "1", "--weight-cache-mode", "client"],
+                return_stdout_stderr=(self.stdout, self.stderr),
+            )
+            response = requests.post(
+                f"{self.base_url}/v1/completions", json=payload, timeout=60
+            )
+            response.raise_for_status()
+            self.assertEqual(response.json()["choices"][0]["text"], reference)
+        self.stdout.flush()
+        self.stderr.flush()
+        with (
+            open(SMOKE_STDOUT_FILENAME) as stdout,
+            open(SMOKE_STDERR_FILENAME) as stderr,
+        ):
+            self.assertEqual(
+                (stdout.read() + stderr.read()).count("Loaded model via IPC"), 3
+            )
 
 
 class TestWeightCacheDaemonQwen3MoeDP(TestWeightCacheDaemonTP2):

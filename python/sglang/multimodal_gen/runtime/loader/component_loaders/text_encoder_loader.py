@@ -1,7 +1,11 @@
+import copy
 import os
+import pickle
 import re
 from collections.abc import Generator
+from pathlib import Path
 
+import msgspec
 import torch
 import transformers
 from torch import nn
@@ -64,6 +68,8 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    _select_safetensors_index_file,
     checkpoint_bytes,
     get_param_names_mapping,
     initialize_model,
@@ -106,6 +112,37 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 )
 
 logger = init_logger(__name__)
+
+
+class ResolvedTextEncoderLoad(msgspec.Struct):
+    """Native loader decisions; no model, tensors or process groups are stored."""
+
+    model_cls: type[nn.Module]
+    config: EncoderConfig
+    hf_config: dict
+    model_path: str
+    weights_path: str
+    server_args: ServerArgs
+    component_name: str
+    dtype: str
+    component_starts_on_cpu: bool | None
+    weight_files: tuple[str, ...] | None = None
+    metadata_files: tuple[str, ...] = ()
+
+    def freeze(self):
+        return FrozenTextEncoderLoad(
+            pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+
+
+class FrozenTextEncoderLoad(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Trusted process-local snapshot, never accepted from a cache peer."""
+
+    _payload: bytes
+
+    def thaw(self) -> ResolvedTextEncoderLoad:
+        return pickle.loads(self._payload)
+
 
 _ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
 
@@ -430,6 +467,149 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
     component_names = ["text_encoder"]
     expected_library = "transformers"
 
+    def prepare_weight_cache(self, spec, server_args, *, planned_device=None):
+        from sglang.multimodal_gen.runtime.loader.component_state import (
+            PreparedComponent,
+        )
+        from sglang.multimodal_gen.runtime.loader.native_encoder_state import for_model
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+        if type(self) is not TextEncoderLoader:
+            raise ValueError("Weight cache has no audited custom text encoder loader")
+        name = spec.module_name
+        if (
+            name in server_args.component_weights_paths
+            or "conditioning_projection" in server_args.component_paths
+        ):
+            raise ValueError(
+                "Text encoder cache does not support weight/projection overrides"
+            )
+        backend, _ = server_args.resolve_component_attention_backend(
+            name, spec.load_module_name
+        )
+        backend = backend or AttentionBackendEnum.FA
+        recipe = self.prepare_customized(
+            spec.component_model_path,
+            server_args,
+            name,
+            False,
+            planned_device=planned_device or torch.device("cuda", 0),
+        )
+        recipe.weight_files = tuple(
+            _list_safetensors_files(
+                recipe.weights_path, index_file=SAFE_WEIGHTS_INDEX_NAME
+            )
+        )
+        if not recipe.weight_files:
+            raise ValueError("Text encoder cache requires safetensors weights")
+        metadata_files = [str(Path(recipe.model_path) / "config.json")]
+        generation = Path(recipe.model_path) / "generation_config.json"
+        if generation.exists():
+            metadata_files.append(str(generation))
+        index = _select_safetensors_index_file(
+            recipe.weights_path, SAFE_WEIGHTS_INDEX_NAME
+        )
+        if index is not None:
+            metadata_files.append(index)
+        recipe.metadata_files = tuple(metadata_files)
+        recipe.server_args.model_paths[name] = recipe.model_path
+        frozen = recipe.freeze()
+        contract = for_model(recipe.model_cls)
+        contract.validate_supported(frozen, attention=str(backend))
+        return PreparedComponent(
+            name,
+            spec.load_module_name,
+            spec.architecture,
+            type(self),
+            frozen,
+            contract,
+            backend,
+        )
+
+    def load_prepared(self, frozen, *, attention_backend):
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+            isolated_qwen_vl_rope_cache,
+        )
+
+        recipe = frozen.thaw()
+        with isolated_qwen_vl_rope_cache():
+            return self.load(
+                recipe.model_path,
+                recipe.server_args,
+                recipe.component_name,
+                self.expected_library,
+                component_attn_backend=attention_backend,
+                component_attn_name=recipe.component_name,
+                allow_native_fallback=False,
+                prepared_load=recipe,
+            )
+
+    def build_prepared_meta(self, frozen, *, attention_backend):
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+            isolated_qwen_vl_rope_cache,
+        )
+
+        recipe = frozen.thaw()
+        group = get_folding_tp_group(recipe.config)
+        with (
+            use_tensor_parallel_group(group),
+            isolated_qwen_vl_rope_cache(),
+            self.component_attention_backend_context(
+                attention_backend,
+                recipe.component_name,
+                require_backend_selection=(
+                    recipe.server_args.requested_component_attention_backend(
+                        recipe.component_name
+                    )
+                    is not None
+                ),
+            ),
+        ):
+            model = initialize_model(
+                recipe.model_cls,
+                {"config": recipe.config},
+                PRECISION_TO_TYPE[recipe.dtype],
+                torch.device("meta"),
+            )
+            model.bind_encoder_tp_group(group)
+        return model.eval().requires_grad_(False)
+
+    def apply_prepared_config(self, frozen, server_args):
+        recipe = frozen.thaw()
+        configs = list(server_args.pipeline_config.text_encoder_configs)
+        configs[
+            self._extract_encoder_index(
+                self.structural_component_name(recipe.component_name)
+            )
+        ] = recipe.config
+        server_args.pipeline_config.text_encoder_configs = tuple(configs)
+        server_args.model_paths[recipe.component_name] = recipe.model_path
+
+    def prepared_checkpoint_files(self, frozen):
+        recipe = frozen.thaw()
+        return tuple(
+            Path(path) for path in (*recipe.metadata_files, *recipe.weight_files)
+        )
+
+    def prepared_fingerprint(self, frozen):
+        recipe = frozen.thaw()
+        arch = recipe.config.arch_config
+        return {
+            "model_cls": f"{recipe.model_cls.__module__}.{recipe.model_cls.__qualname__}",
+            "hf_config": recipe.hf_config,
+            "text_config": arch.text_config.to_dict(),
+            "vision_config": arch.vision_config.to_dict(),
+            "generation_config": recipe.config.generation_config,
+            "selected_lm_layer": arch.num_hidden_layers,
+            "dtype": recipe.dtype,
+            "quantization": None,
+            "resident": True,
+            "fsdp": False,
+            "parallel_folding_mode": recipe.config.parallel_folding_mode,
+            "enable_image_understanding": recipe.config.enable_image_understanding,
+            "honor_cache_free_padding_mask": recipe.config.honor_cache_free_padding_mask,
+        }
+
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
     ) -> str | None:
@@ -498,7 +678,29 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         component_name: str,
         component_starts_on_cpu: bool | None = None,
     ):
-        """Load the text encoders based on the model path, and inference args."""
+        recipe = self.prepare_customized(
+            component_model_path, server_args, component_name, component_starts_on_cpu
+        )
+        return self.materialize_prepared(recipe)
+
+    def prepare_customized(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        component_starts_on_cpu: bool | None = None,
+        *,
+        planned_device: torch.device | None = None,
+    ) -> ResolvedTextEncoderLoad:
+        """Resolve the ordinary native path without constructing a module.
+
+        Cache preparation uses a copied, single-rank configuration before any
+        process group exists. The ordinary path keeps its existing folding policy.
+        """
+        if planned_device is not None:
+            if server_args.num_gpus != 1:
+                raise ValueError("Prepared encoder loading currently requires one GPU")
+            server_args = copy.deepcopy(server_args)
         component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
@@ -525,39 +727,61 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 encoder_config,
                 server_args.component_paths,
             )
-        encoder_dp_group = get_encoder_data_parallel_group()
-        prefer_dp = (
-            server_args.batching_max_size > 1
-            and encoder_dp_group is not None
-            and encoder_dp_group.world_size > 1
-            and issubclass(model_cls, TextEncoder)
-            and model_cls.supports_dp_encode
-        )
-        # real dims are populated now; resolve fold vs replicate
-        finalize_encoder_folding(
-            encoder_config,
-            server_args.encoder_parallel,
-            prefer_dp=prefer_dp,
-        )
+        if planned_device is not None:
+            encoder_config.parallel_folding_mode = None
+        else:
+            encoder_dp_group = get_encoder_data_parallel_group()
+            prefer_dp = (
+                server_args.batching_max_size > 1
+                and encoder_dp_group is not None
+                and encoder_dp_group.world_size > 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            )
+            # Real dims are populated now; resolve fold vs replicate.
+            finalize_encoder_folding(
+                encoder_config, server_args.encoder_parallel, prefer_dp=prefer_dp
+            )
         encoder_dtype = self.component_load_precision(server_args, component_name)
         assert encoder_dtype is not None
-        # TODO(will): add support for other dtypes
+        encoder_config.enable_image_understanding = isinstance(
+            server_args.pipeline_config,
+            (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
+        )
+        encoder_config.honor_cache_free_padding_mask = isinstance(
+            server_args.pipeline_config, LongCatImagePipelineConfig
+        )
+        return ResolvedTextEncoderLoad(
+            model_cls,
+            encoder_config,
+            model_config,
+            component_model_path,
+            component_weights_path,
+            server_args,
+            component_name,
+            encoder_dtype,
+            component_starts_on_cpu,
+        )
+
+    def materialize_prepared(self, prepared_load):
+        recipe = prepared_load
         try:
             return self.load_model(
-                component_weights_path,
-                encoder_config,
-                server_args,
-                encoder_dtype,
-                component_starts_on_cpu=component_starts_on_cpu,
-                component_name=component_name,
+                recipe.weights_path,
+                recipe.config,
+                recipe.server_args,
+                recipe.dtype,
+                component_starts_on_cpu=recipe.component_starts_on_cpu,
+                component_name=recipe.component_name,
+                prepared_load=recipe,
             )
         except ComponentCheckpointUnsupportedError:
             raise
         except Exception as error:
-            if encoder_config.quant_config is None:
+            if recipe.config.quant_config is None:
                 raise
             raise ComponentCheckpointUnsupportedError(
-                f"Failed to load quantized native {component_name!r}: {error}"
+                f"Failed to load quantized native {recipe.component_name!r}: {error}"
             ) from error
 
     def build_model_config(
@@ -618,6 +842,8 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         dtype: str = "fp16",
         component_starts_on_cpu: bool | None = None,
         component_name: str = "text_encoder",
+        *,
+        prepared_load: ResolvedTextEncoderLoad | None = None,
     ):
         local_torch_device = get_local_torch_device()
         quant_config = model_config.quant_config
@@ -682,17 +908,20 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             use_tensor_parallel_group(encoder_tp_group),
             set_default_torch_dtype(PRECISION_TO_TYPE[dtype]),
         ):
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                model_config.arch_config.architectures
-            )
-            model_config.enable_image_understanding = isinstance(
-                server_args.pipeline_config,
-                (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
-            )
-            # longcat consumes the padded body without an attention cache
-            model_config.honor_cache_free_padding_mask = isinstance(
-                server_args.pipeline_config, LongCatImagePipelineConfig
-            )
+            if prepared_load is None:
+                model_cls, _ = ModelRegistry.resolve_model_cls(
+                    model_config.arch_config.architectures
+                )
+                model_config.enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
+                )
+                # LongCat consumes the padded body without an attention cache.
+                model_config.honor_cache_free_padding_mask = isinstance(
+                    server_args.pipeline_config, LongCatImagePipelineConfig
+                )
+            else:
+                model_cls = prepared_load.model_cls
             model = initialize_model(
                 model_cls, {"config": model_config}, param_dtype, model_device
             )
@@ -727,6 +956,19 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model_path,
                     quant_config.tensor_meta,
                     key_filter=model.should_materialize_checkpoint_weight,
+                )
+            elif prepared_load is not None and prepared_load.weight_files is not None:
+                from sglang.multimodal_gen.runtime.loader.weight_utils import (
+                    safetensors_weights_iterator,
+                )
+
+                checkpoint_weights = safetensors_weights_iterator(
+                    list(prepared_load.weight_files),
+                    to_cpu=component_starts_on_cpu,
+                    key_filter=lambda name: (
+                        not name.endswith(".comfy_quant")
+                        and model.should_materialize_checkpoint_weight(name)
+                    ),
                 )
             else:
                 checkpoint_weights = self._get_all_weights(

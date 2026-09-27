@@ -278,6 +278,11 @@ def handle_load_format(server_args: Any):
     # Speculative decoding loads an extra draft model whose weights the
     # daemon does not export, so refuse the combination up front instead of
     # failing deep inside draft-worker load (draft-model daemon TBD).
+    if (
+        type(cfg.weight_cache_max_deliveries) is not int
+        or cfg.weight_cache_max_deliveries <= 0
+    ):
+        raise ValueError("weight_cache_max_deliveries must be a positive integer")
     if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm is not None:
         raise ValueError(
             "--weight-cache-mode is not supported together with speculative "

@@ -7,6 +7,7 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
+import json
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
@@ -100,12 +101,14 @@ class ComposedPipelineBase(ABC):
         required_config_modules: list[str] | None = None,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
+        prepared=None,
     ):
         """
         Initialize the pipeline. After __init__, the pipeline should be ready to
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
+        self._prepared = prepared
         self._disagg_role = server_args.disagg_role
         self.validate_disagg_role(self._disagg_role)
 
@@ -151,7 +154,25 @@ class ComposedPipelineBase(ABC):
         self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
-        self.modules = self.load_modules(server_args, loaded_modules)
+        if prepared is not None:
+            self.model_path = prepared.model_path
+            prepared.apply_config(server_args)
+            self.configure_model_index(json.loads(prepared.model_index_json))
+            if set(self.required_config_modules) != {
+                s.module_name for s in prepared.specs
+            }:
+                raise ValueError(
+                    "Prepared components differ from pipeline requirements"
+                )
+            self.modules = self._materialize_component_specs(
+                server_args,
+                prepared.specs,
+                dict(loaded_modules or {}),
+                self.required_config_modules,
+                prepared=prepared,
+            )
+        else:
+            self.modules = self.load_modules(server_args, loaded_modules)
 
         self.__post_init__()
 
@@ -177,18 +198,20 @@ class ComposedPipelineBase(ABC):
     def add_module(self, module_name: str, module: Any):
         self.modules[module_name] = module
 
-    def _load_config(self) -> dict[str, Any]:
-        model_subfolder = self.server_args.model_subfolder
+    @classmethod
+    def resolve_model_config(cls, model_path: str, server_args: ServerArgs):
+        """Resolve repository/partition config without constructing any modules."""
+        model_subfolder = server_args.model_subfolder
         if model_subfolder is None and not os.path.isfile(
-            os.path.join(self.model_path, "model_index.json")
+            os.path.join(model_path, "model_index.json")
         ):
-            model_subfolder = self.default_model_subfolder
+            model_subfolder = cls.default_model_subfolder
 
         if model_subfolder is None:
             model_path = maybe_download_model(
-                self.model_path,
+                model_path,
                 force_diffusers_model=True,
-                revision=self.server_args.revision,
+                revision=server_args.revision,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
@@ -201,16 +224,25 @@ class ComposedPipelineBase(ABC):
                     f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
                 )
             model_root = maybe_download_model(
-                self.model_path,
+                model_path,
                 allow_patterns=[f"{model_subfolder}/**"],
-                revision=self.server_args.revision,
+                revision=server_args.revision,
             )
             model_path = os.path.join(model_root, model_subfolder)
 
-        self.model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
-        return cast(dict[str, Any], config)
+        return model_path, cast(dict[str, Any], config)
+
+    def configure_model_index(self, model_index: dict[str, Any]) -> None:
+        """Apply model-specific metadata on both ordinary and prepared paths."""
+
+    def _load_config(self) -> dict[str, Any]:
+        self.model_path, config = self.resolve_model_config(
+            self.model_path, self.server_args
+        )
+        self.configure_model_index(config)
+        return config
 
     @property
     def required_config_modules(self) -> list[str]:
@@ -592,6 +624,23 @@ class ComposedPipelineBase(ABC):
         component_load_specs: ComponentLoadSpec = order_component_load_specs(
             component_load_specs
         )
+        return self._materialize_component_specs(
+            server_args, component_load_specs, loaded_components, required_modules
+        )
+
+    def _materialize_component_specs(
+        self,
+        server_args,
+        component_load_specs,
+        loaded_components,
+        required_modules,
+        *,
+        prepared=None,
+    ):
+        """One load loop and accounting path for ordinary and prepared pipelines."""
+        unexpected = loaded_components.keys() - set(required_modules)
+        if unexpected:
+            raise ValueError(f"Unexpected provided components: {sorted(unexpected)}")
         logger.info(
             "Memory-aware component load order: %s",
             [spec.module_name for spec in component_load_specs],
@@ -601,6 +650,9 @@ class ComposedPipelineBase(ABC):
             iterable=component_load_specs, desc="Loading required modules"
         ):
             module_name: str = spec.module_name
+            if module_name in loaded_components:
+                logger.info("Using module %s already provided", module_name)
+                continue
             load_module_name: str = spec.load_module_name
             transformers_or_diffusers: str = spec.transformers_or_diffusers
             architecture: str = spec.architecture
@@ -617,17 +669,23 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=module_name,
-                component_type=load_module_name,
-                loader_cls=self.component_loaders.get(module_name),
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-                component_architecture=architecture,
-                component_attn_backend=attn_backend,
-                component_attn_name=matched_backend_key or module_name,
+            prepared_component = (
+                prepared.component(module_name) if prepared is not None else None
             )
+            if prepared_component is not None:
+                module, memory_usage = prepared_component.load_ordinary()
+            else:
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=module_name,
+                    component_type=load_module_name,
+                    loader_cls=self.component_loaders.get(module_name),
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                    component_architecture=architecture,
+                    component_attn_backend=attn_backend,
+                    component_attn_name=matched_backend_key or module_name,
+                )
 
             self.memory_usages[module_name] = memory_usage
 

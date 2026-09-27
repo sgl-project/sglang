@@ -27,18 +27,48 @@ _WORLD = 2
 
 def _worker() -> int:
     """One rank: compare every A2A path against its NCCL result."""
+    from types import SimpleNamespace
+
     import torch.distributed as dist
 
     from sglang.multimodal_gen import envs
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        maybe_init_distributed_environment_and_model_parallel,
+    from sglang.multimodal_gen.runtime.distributed.bootstrap import (
+        bootstrap_diffusion_runtime,
     )
+    from sglang.srt.utils.network import NetworkAddress
 
     rank = int(os.environ["RANK"])
-    torch.cuda.set_device(rank)
-    maybe_init_distributed_environment_and_model_parallel(
-        tp_size=1, sp_size=_WORLD, ulysses_degree=_WORLD
-    )
+    # Exercise actual ordinary worker bootstrap: a global UUID reduction patch
+    # here previously broke IPC-A2A's local-device handle reconstruction.
+    if "--bootstrap-only" in sys.argv:
+        bootstrap_diffusion_runtime(
+            SimpleNamespace(
+                num_gpus=_WORLD,
+                nnodes=1,
+                tp_size=1,
+                sp_degree=_WORLD,
+                ulysses_degree=_WORLD,
+                ring_degree=1,
+                cfg_parallel_degree=1,
+                dp_size=1,
+                dist_timeout=120,
+                weight_cache_mode="off",
+            ),
+            local_rank=rank,
+            rank=rank,
+            rendezvous=NetworkAddress(
+                os.environ["MASTER_ADDR"], int(os.environ["MASTER_PORT"])
+            ),
+        )
+    else:
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            maybe_init_distributed_environment_and_model_parallel,
+        )
+
+        torch.cuda.set_device(rank)
+        maybe_init_distributed_environment_and_model_parallel(
+            tp_size=1, sp_size=_WORLD, ulysses_degree=_WORLD
+        )
 
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
         IPC_A2A,
@@ -90,6 +120,19 @@ def _worker() -> int:
         nccl_out, ipc_out = both_paths(_usp_output_all_to_all, x_out, head_dim=2)
         if not torch.equal(nccl_out, ipc_out):
             failures.append(f"output a2a {(b, s_local, h_global, d)}")
+
+    if "--bootstrap-only" in sys.argv:
+        if not IPC_A2A.inited or IPC_A2A.failed or IPC_A2A.calls == 0:
+            failures.append("IPC never engaged after ordinary bootstrap")
+        verdict = torch.tensor([len(failures)], device="cuda")
+        dist.all_reduce(verdict)
+        print(
+            f"IPC_A2A_PARITY {'FAIL' if verdict.item() else 'PASS'} after bootstrap: {failures}",
+            flush=True,
+        )
+        dist.barrier()
+        dist.destroy_process_group()
+        return 1 if verdict.item() else 0
 
     # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention: zimage's
     # secondary attention, wan-VSA, hunyuanvideo) and routes through the same
@@ -193,6 +236,12 @@ def _worker() -> int:
 
 class TestIpcA2ATwoGpu(CustomTestCase):
     def test_ipc_matches_nccl_bitwise(self):
+        self._run_parity()
+
+    def test_ordinary_bootstrap_preserves_ipc_device_mapping(self):
+        self._run_parity("--bootstrap-only")
+
+    def _run_parity(self, *extra_args):
         # CUDA only: the transport opens torch IPC handles through libcudart and
         # cudaDeviceEnablePeerAccess. On ROCm/NPU it correctly refuses and both
         # arms run over NCCL, which the evidence assertion below reads -- rightly
@@ -210,6 +259,7 @@ class TestIpcA2ATwoGpu(CustomTestCase):
                 "--master-port=29517",
                 __file__,
                 "--worker",
+                *extra_args,
             ],
             capture_output=True,
             text=True,

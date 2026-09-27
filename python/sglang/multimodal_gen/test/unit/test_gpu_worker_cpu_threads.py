@@ -4,8 +4,8 @@
 import unittest
 from unittest.mock import patch
 
-from sglang.multimodal_gen.runtime.managers.gpu_worker import (
-    _worker_cpu_intra_op_threads,
+from sglang.multimodal_gen.runtime.distributed.bootstrap import (
+    worker_cpu_intra_op_threads,
 )
 
 
@@ -18,10 +18,10 @@ class TestWorkerCpuIntraOpThreads(unittest.TestCase):
             import os
 
             os.environ.pop("OMP_NUM_THREADS", None)
-            self.assertEqual(_worker_cpu_intra_op_threads(8), 16)
-            self.assertEqual(_worker_cpu_intra_op_threads(4), 16)  # capped
-            self.assertEqual(_worker_cpu_intra_op_threads(128), 1)
-            self.assertEqual(_worker_cpu_intra_op_threads(256), 1)  # floor
+            self.assertEqual(worker_cpu_intra_op_threads(8), 16)
+            self.assertEqual(worker_cpu_intra_op_threads(4), 16)  # capped
+            self.assertEqual(worker_cpu_intra_op_threads(128), 1)
+            self.assertEqual(worker_cpu_intra_op_threads(256), 1)  # floor
 
     def test_single_gpu_keeps_cap(self):
         with (
@@ -31,11 +31,11 @@ class TestWorkerCpuIntraOpThreads(unittest.TestCase):
             import os
 
             os.environ.pop("OMP_NUM_THREADS", None)
-            self.assertEqual(_worker_cpu_intra_op_threads(1), 8)
+            self.assertEqual(worker_cpu_intra_op_threads(1), 8)
 
     def test_explicit_omp_setting_wins(self):
         with patch.dict("os.environ", {"OMP_NUM_THREADS": "32"}):
-            self.assertIsNone(_worker_cpu_intra_op_threads(8))
+            self.assertIsNone(worker_cpu_intra_op_threads(8))
 
 
 if __name__ == "__main__":

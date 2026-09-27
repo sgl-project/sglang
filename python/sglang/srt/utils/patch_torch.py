@@ -71,9 +71,11 @@ def register_sgl_tp_rank(rank: int):
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(
-        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
-    )
+    # CPU/meta tensors use different reduction signatures and no CUDA ordinal.
+    if output_fn is reductions.rebuild_cuda_tensor:
+        output_args = _modify_tuple(
+            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+        )
     return output_fn, output_args
 
 
