@@ -15,7 +15,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import cached_property, partial
+from functools import partial
 from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import msgspec
@@ -877,17 +877,13 @@ class LayerCommunicator:
         # The steps the layer's ordinary batches run.
         sides = self._declared_sides()
         self._declared = sides
-        self._steps = (
-            self._steps_from_declarations(
-                sides,
-                fusions=self._select_mlp_input_fusions(),
-                force_layernorm_before_gather=force_layernorm_before_dp_gather,
-            )
-            if sides is not None
-            else self._select_boundaries_from_scatter_modes()
+        self._steps = self._steps_from_declarations(
+            sides,
+            fusions=self._select_mlp_input_fusions(),
+            force_layernorm_before_gather=force_layernorm_before_dp_gather,
         )
         # The steps a batch that shards its tokens over attention CP runs; None
-        # without CP or where the steps come from the scatter modes.
+        # when no batch does.
         self._cp_steps = (
             self._steps_from_declarations(
                 self._declared_sides(cp_active=True),
@@ -895,14 +891,14 @@ class LayerCommunicator:
                 force_layernorm_before_gather=force_layernorm_before_dp_gather,
                 cp_moves=_cp_moves(),
             )
-            if sides is not None and get_parallel().attn_cp_size > 1
+            if _generic_prefill_cp_shards_tokens()
             else None
         )
         # The steps a batch with input-scattered attention runs; None where it
-        # cannot run or the steps come from the scatter modes.
+        # cannot run.
         self._input_scattered_steps = (
             self._steps_for_input_scattered(sides)
-            if sides is not None and self._input_can_be_scattered()
+            if self._input_can_be_scattered()
             else None
         )
 
@@ -963,47 +959,52 @@ class LayerCommunicator:
         runs its ordinary steps."""
         if self._declared is not None:
             return self._declared.input_rows
-        if self.stage_edges is not None:
-            return self.stage_edges[0].residual
-        # Such a batch holds every token on each CP rank.
-        return scatter_mode_layouts(
-            attn_dp_size=self._context.attn_dp_size,
-            attn_cp_size=1,
-            attn_tp_size=self._context.attn_tp_size,
-        )[self.layer_scatter_modes.layer_input_mode]
+        return self.stage_edges[0].residual
+
+    @property
+    def input_on_attention_tp_slices(self) -> bool:
+        """Whether the layer's input arrives on each attention-TP rank's slice
+        of its rows (after a layer on local rows), in a batch that runs its
+        ordinary steps."""
+        return TokenAxis.ATTN_TP_SCATTER in self.input_rows.sharded
 
     def _input_can_be_scattered(self) -> bool:
         """Whether a batch may run this layer with input-scattered attention:
-        configured, on pure TP without an a2a backend or a dense MLP on every
-        rank. The rest of what ``AttnTpContext.init_context`` requires is only
+        configured, on TP without attention DP, a prefill CP, an a2a backend or
+        a dense MLP on every rank. The rest of what ``AttnTpContext.init_context`` requires is only
         known once the model is built."""
         parallel = get_parallel()
         return (
             parallel.enable_attn_tp_input_scattered
             and parallel.tp_size > 1
             and parallel.attn_dp_size == 1
-            and parallel.attn_cp_size == 1
+            and not _generic_prefill_cp_shards_tokens()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
         )
 
-    def _declared_sides(
-        self, *, cp_active: bool = False
-    ) -> Optional[DecoderLayerSides]:
+    def _declared_sides(self, *, cp_active: bool = False) -> DecoderLayerSides:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN, in a layer whose previous layer is known, with
-        attention CP only for a prefill CP whose FFN gathers over the whole CP
-        group. None when the steps come from the scatter modes. ``cp_active``
-        gives a batch that shards its tokens over CP; the others hold every
-        token on each CP rank. An active LayerNorm SP region and input-scattered
-        attention have their own."""
+        attention and an FFN, in a layer whose previous layer is known.
+        ``cp_active`` gives a batch that shards its tokens over CP; the others
+        hold every token on each CP rank. An active LayerNorm SP region and
+        input-scattered attention have their own. Raises NotImplementedError
+        for the combinations the steps do not cover."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
+        if not (modes.is_first_layer or modes.is_previous_layer_sparse is not None):
+            raise NotImplementedError(
+                "a layer built without the facts of the layer before it"
+            )
         # A MoE dispatched per DP shard computes on this rank's local rows and
         # hands its layer's output on there; so does a dense MLP on every rank.
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
         dense_on_local_rows = enable_moe_dense_fully_dp()
 
+        # Some batch shards its tokens over attention CP.
+        cp_shards = _generic_prefill_cp_shards_tokens()
+        if parallel.attn_cp_size > 1 and modes.is_layer_sparse:
+            self._refuse_uncovered_cp_moe(moe_on_local_rows, cp_shards)
         # A MoE whose data-parallel groups are the CP ranks computes each CP
         # shard of a GQA prefill CP on its own ranks.
         ffn_on_cp_shards = (
@@ -1027,32 +1028,21 @@ class LayerCommunicator:
                 and bool(next_sparse)
             )
 
-        if not (
-            (parallel.attn_cp_size == 1 or _cp_on_declarations())
-            # A MoE dispatched per DP shard under attention DP and GQA prefill
-            # CP keeps the scatter-mode steps: it would dispatch each rank's CP
-            # shard of the tokens, which is not covered.
-            and not (
-                parallel.attn_cp_size > 1
-                and parallel.attn_dp_size > 1
-                and modes.is_layer_sparse
-                and moe_on_local_rows
-                and not _gathers_over_attention_cp()
-            )
-            and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
-        ):
-            return None
-        if parallel.attn_cp_size > 1 and _cp_moves().reduce_scatter is not None:
+        if cp_shards and _cp_moves().reduce_scatter is not None:
             # A CP extend's FFN may leave its sum to the reduce-scatter that
             # takes each rank's shard back (DSA and MLA CP).
             may_leave = not cp_active
             may_leave_to_reduce_scatter = True
-        else:
+        elif cp_shards or parallel.attn_dp_size > 1:
             # Otherwise under CP an FFN over every CP shard completes its own sum;
             # one on its own CP shard hands on its rows as without CP.
             may_leave = may_leave_to_reduce_scatter = (
                 parallel.attn_cp_size == 1 or ffn_on_cp_shards
             )
+        else:
+            # No batch shards its tokens and there is no attention DP: as
+            # without CP.
+            may_leave = may_leave_to_reduce_scatter = True
         return decoder_layer_sides(
             axis_sizes=token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
@@ -1081,52 +1071,32 @@ class LayerCommunicator:
             and may_leave,
         )
 
-    def _select_boundaries_from_scatter_modes(self) -> "BoundarySteps":
-        """The layer's steps chosen from its scatter modes, for the layers the
-        declarations do not cover yet."""
-        attention_input, postprocess = self._post_init_communicate()
-        ffn_input, fused = self._select_mlp_input()
-        modes = self.layer_scatter_modes
-        ops = self._residual_ops
-        ffn_rows = self._context.layouts[modes.mlp_mode]
-        ffn_output = StageOutput(
-            ffn_rows,
-            group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
-            leaves_for_next_layer=self.allow_deferred_ffn_reduction,
-            leaves_for_reduce_scatter=self.allow_reduce_scatter,
-            # A MoE block leaves its sum to reduce_scatterv whenever it applies
-            # (should_skip_post_experts_all_reduce); a dense MLP does only under
-            # the published mlp_reduce_scatter.
-            leaves_for_reduce_scatterv=(
-                self.allow_reduce_scatter or modes.is_layer_sparse
-            ),
-        )
-        return BoundarySteps(
-            attention_input=attention_input,
-            ffn_input=ffn_input,
-            ffn_input_rows=ffn_rows,
-            ffn_output=ffn_output,
-            # Under attention DP the base postprocess scatters the FFN output
-            # back to this rank's tokens, which the next layer's input can run
-            # instead; the MHC and DSA-CP postprocess do more.
-            ffn_output_move=(
-                None
-                if postprocess is CommunicateSummableTensorPairFn._scatter_hidden_states
-                else partial(postprocess, residual_ops=ops)
-            ),
-            # Not when the way back is the MoE-CP scatter, nor when a SCATTERED
-            # FFN computes whole tokens with nothing left to sum.
-            ffn_sum_is_movable=modes.mlp_mode
-            not in (ScatterMode.MOE_FULL, ScatterMode.SCATTERED),
-            fused=fused,
-            attention_prepare=partial(
-                _attention_input_step,
-                layer_input=_complete_scattered_input,
-                fusions=self._attn_input_fusions,
-                enters_stack=modes.is_first_layer,
-                residual_ops=ops,
-            ),
-        )
+    @staticmethod
+    def _refuse_uncovered_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
+        """A MoE layer under attention CP whose tokens the steps cannot bring
+        to it: under a prefill CP, one dispatched per DP shard under attention DP
+        and GQA CP, and one on the TP group whose data-parallel groups are the CP
+        ranks under DSA or MLA CP; and under attention DP, one on the TP group
+        whose data-parallel groups are the CP ranks."""
+        parallel = get_parallel()
+        gqa = not _gathers_over_attention_cp()
+        if moe_on_local_rows:
+            if cp_shards and gqa and parallel.attn_dp_size > 1:
+                raise NotImplementedError(
+                    "a MoE dispatched per DP shard under attention DP and GQA "
+                    "prefill CP"
+                )
+        elif parallel.moe_dp_size == parallel.attn_cp_size:
+            if cp_shards and not gqa:
+                raise NotImplementedError(
+                    "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                    "DSA or MLA prefill CP"
+                )
+            if parallel.attn_dp_size > 1:
+                raise NotImplementedError(
+                    "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                    "attention DP and attention CP"
+                )
 
     def _steps_for_input_scattered(self, sides: DecoderLayerSides) -> "BoundarySteps":
         """The steps a batch with input-scattered attention runs at this layer,
@@ -1168,28 +1138,6 @@ class LayerCommunicator:
             attention_fusions=self._attn_input_fusions,
             enters_stack=self.layer_scatter_modes.is_first_layer,
             **kwargs,
-        )
-
-    def _post_init_communicate(self) -> Tuple[Callable, Callable]:
-        """The attention input move and the postprocess the scatter modes
-        choose."""
-        if _generic_prefill_cp_shards_tokens() and _gathers_over_attention_cp():
-            # These tables have no attention-CP gather.
-            raise NotImplementedError(
-                "a DSA or MLA prefill CP layer outside the declarations"
-            )
-        return (
-            CommunicateSimpleFn.get_fn(
-                input_mode=self.layer_scatter_modes.layer_input_mode,
-                output_mode=self.layer_scatter_modes.attn_mode,
-                context=self._context,
-            ),
-            CommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
-                residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
-                output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._context,
-            ),
         )
 
     def prepare_attn_and_capture_last_layer_outputs(
@@ -1391,42 +1339,6 @@ class LayerCommunicator:
             hidden_states, residual, use_attn_tp_group=False
         )
 
-    def _select_mlp_input(self) -> Tuple[Callable, Tuple["FusedMlpInput", ...]]:
-        """The attention-TP -> FFN boundary's steps, chosen from the layouts, and
-        the fused kernels they try first."""
-        kind = mlp_input_kind(self.layer_scatter_modes, self._context)
-        residual_input_mode = self.layer_scatter_modes.layer_input_mode
-        ops = self._residual_ops
-        if kind is MlpInputKind.NORM:
-            return partial(_mlp_input_norm, residual_ops=ops), ()
-        if kind is MlpInputKind.ATTN_TP_ALL_REDUCE:
-            return partial(_mlp_input_attn_tp_all_reduce, residual_ops=ops), ()
-        if kind is MlpInputKind.SCATTER:
-            return (
-                partial(
-                    _mlp_input_scatter,
-                    scatters_residual=residual_input_mode == ScatterMode.TP_ATTN_FULL,
-                    residual_ops=ops,
-                ),
-                (),
-            )
-        # Neither fused kernel runs under attention DP.
-        fusions = (
-            self._select_mlp_input_fusions() if self._context.attn_dp_size == 1 else ()
-        )
-        steps = partial(
-            _mlp_input_gather,
-            order=_mlp_input_order(
-                self._context,
-                residual_input_mode,
-                tuple(f.run for f in fusions),
-                residual_ops=ops,
-            ),
-        )
-        if kind is MlpInputKind.GATHER_MOE_CP:
-            steps = partial(_mlp_input_gather_moe_cp, gather=steps)
-        return steps, fusions
-
     def _select_mlp_input_fusions(self) -> Tuple["FusedMlpInput", ...]:
         """The fused kernels that can take the attention -> FFN steps, in the
         order they are tried. They add the residual plainly."""
@@ -1536,15 +1448,6 @@ class LayerCommunicator:
         if not steps.ffn_output.leaves_for_reduce_scatter:
             return False
         if dp_step is not None or steps.ffn_output_move_completes_sum:
-            return True
-        # The scatter-mode steps of a DSA or MLA CP extend (the subclasses that
-        # pick their own steps). Prefill CP predicates must stay out of decode
-        # graph capture.
-        if (
-            self._cp_steps is None
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and (dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch))
-        ):
             return True
         return get_attn_tp_context().input_scattered and not self.is_last_layer
 
@@ -1672,15 +1575,10 @@ class LayerCommunicator:
                 "a branch on a batch with attention CP, LayerNorm SP or "
                 "input-scattered attention"
             )
-        if self._declared is not None:
-            sides = self._declared
-            return sides.ffn.layout, sides.ffn_residual_rows, sides.output_rows
-        layouts, modes = self._context.layouts, self.layer_scatter_modes
-        return (
-            layouts[modes.mlp_mode],
-            layouts[modes.middle_residual_mode],
-            layouts[modes.layer_output_mode],
-        )
+        if self._declared is None:
+            raise NotImplementedError("a branch on a layer that is one stage")
+        sides = self._declared
+        return sides.ffn.layout, sides.ffn_residual_rows, sides.output_rows
 
     def branch_input(
         self,
@@ -1846,33 +1744,6 @@ class LayerCommunicator:
         )
 
 
-# MOE_FULL gathers across the MoE-CP group, which spans every CP rank when CP is on.
-_SCATTER_MODE_SHARDED_AXES = {
-    ScatterMode.SCATTERED: (
-        TokenAxis.ATTN_DP,
-        TokenAxis.ATTN_CP,
-        TokenAxis.ATTN_TP_SCATTER,
-    ),
-    ScatterMode.TP_ATTN_FULL: (TokenAxis.ATTN_DP, TokenAxis.ATTN_CP),
-    ScatterMode.FULL: (TokenAxis.ATTN_CP,),
-    ScatterMode.MOE_FULL: (),
-}
-
-
-def scatter_mode_layouts(
-    *, attn_dp_size: int, attn_cp_size: int, attn_tp_size: int
-) -> Dict[ScatterMode, Layout]:
-    axis_sizes = {
-        TokenAxis.ATTN_DP: attn_dp_size,
-        TokenAxis.ATTN_CP: attn_cp_size,
-        TokenAxis.ATTN_TP_SCATTER: attn_tp_size,
-    }
-    return {
-        mode: Layout.sharded_over(*axes, axis_sizes=axis_sizes)
-        for mode, axes in _SCATTER_MODE_SHARDED_AXES.items()
-    }
-
-
 class FfnExitFusion(Enum):
     """What an FFN exit does when a fused kernel of the next layer's input takes
     its sum."""
@@ -1998,20 +1869,6 @@ class CommunicateContext:
     tp_rank: int
     force_layernorm_before_dp_gather: bool = False
 
-    def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
-        return self.process_group_sizes[a] == self.process_group_sizes[b]
-
-    @cached_property
-    def layouts(self) -> Dict[ScatterMode, Layout]:
-        return scatter_mode_layouts(
-            attn_dp_size=self.attn_dp_size,
-            attn_cp_size=self.attn_cp_size,
-            attn_tp_size=self.attn_tp_size,
-        )
-
-    def is_same_layout(self, a: ScatterMode, b: ScatterMode):
-        return self.layouts[a] == self.layouts[b]
-
     @classmethod
     def init_new(cls):
         attn_tp_rank = get_parallel().attn_tp_rank
@@ -2044,24 +1901,6 @@ class CommunicateContext:
 
 
 class CommunicateSimpleFn:
-    @staticmethod
-    def get_fn(
-        input_mode: ScatterMode,
-        output_mode: ScatterMode,
-        context: CommunicateContext,
-    ):
-        if context.is_same_layout(input_mode, output_mode):
-            return CommunicateSimpleFn._trivial
-
-        if (input_mode == ScatterMode.SCATTERED) and (
-            output_mode == ScatterMode.TP_ATTN_FULL
-        ):
-            if _use_ag_after_qlora:
-                return CommunicateSimpleFn._trivial
-            return CommunicateSimpleFn._scattered_to_tp_attn_full
-
-        raise NotImplementedError(f"{input_mode=} {output_mode=}")
-
     @staticmethod
     def _trivial(
         hidden_states: torch.Tensor,
@@ -2138,6 +1977,27 @@ def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:
     ):
         return forward_batch.attn_cp_metadata.per_rank_actual_token
     return None
+
+
+def sparse_moe_gathers_over_moe_cp() -> bool:
+    """Whether a sparse MoE's input is gathered over the MoE-CP group on a CP
+    extend: a MoE on the TP group under GQA CP whose MoE-CP group is wider than
+    the MoE's data-parallel groups. DSA and MLA CP gather over attention CP
+    instead."""
+    return (
+        not is_moe_input_scattered_across_dp_ranks()
+        and is_enable_moe_cp_allgather()
+        and not _gathers_over_attention_cp()
+    )
+
+
+def moe_cp_gathers_sparse_moe_input(forward_batch: ForwardBatch) -> bool:
+    """Whether a sparse MoE's input is gathered over the MoE-CP group on this
+    batch: a CP extend, for a MoE that gathers there."""
+    return (
+        sparse_moe_gathers_over_moe_cp()
+        and moe_cp_gathered_rows(forward_batch) is not None
+    )
 
 
 def _redistribute_input_to_moe_cp(
@@ -2338,38 +2198,6 @@ def _mlp_input_dp_partial(
     return hidden_states, residual
 
 
-def _mlp_input_order(
-    context: CommunicateContext,
-    residual_input_mode: ScatterMode,
-    fusions: Tuple[Callable, ...],
-    residual_ops: ResidualOps = ADD_AND_NORM,
-) -> Callable:
-    """The steps from the attention output to the FFN input, chosen from facts
-    fixed at construction."""
-    gathers_residual = (
-        residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1
-    )
-    if context.attn_dp_size == 1:
-        return partial(
-            _mlp_input_without_dp,
-            gathers_residual=gathers_residual,
-            fusions=fusions,
-            residual_ops=residual_ops,
-        )
-    if (
-        context.force_layernorm_before_dp_gather
-        or context.attn_tp_size == 1
-        or not residual_ops.adds_plainly
-    ):
-        return partial(
-            _mlp_input_dp_replicate,
-            gathers_residual=gathers_residual,
-            reduces_attention_tp=context.attn_tp_size > 1,
-            residual_ops=residual_ops,
-        )
-    return partial(_mlp_input_dp_partial, gathers_residual=gathers_residual)
-
-
 def _sum_group(group: SumGroup) -> GroupCoordinator:
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
@@ -2405,22 +2233,6 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
         # TP, then take the slice of each half.
         return pair._gather, pair._scatter
     raise NotImplementedError(f"{layer_input_rows=}")
-
-
-def _cp_on_declarations() -> bool:
-    """Whether attention CP is one the declarations cover: a prefill CP that
-    shards tokens, with DSA or MLA attention, with the FFN input gathered over a
-    MoE-CP group that is the whole CP group, or, without attention DP, with the
-    MoE's data-parallel groups the CP ranks (a MoE then computes each CP shard
-    on its own ranks)."""
-    parallel = get_parallel()
-    return _generic_prefill_cp_shards_tokens() and (
-        _gathers_over_attention_cp()
-        or parallel.moe_dp_size == 1
-        or (
-            parallel.moe_dp_size == parallel.attn_cp_size and parallel.attn_dp_size == 1
-        )
-    )
 
 
 def _gathers_over_attention_cp() -> bool:
@@ -2788,19 +2600,6 @@ def _select_boundary_steps(
     )
 
 
-def _complete_scattered_input(
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    context: "CommunicateContext",
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """The scatter-mode path's input completion: with input-scattered
-    attention the layer's input is a TP partial that a reduce-scatter completes
-    onto this rank's slice."""
-    if get_attn_tp_context().input_scattered:
-        return tp_reduce_scatter(hidden_states, residual, context)
-    return hidden_states, residual
-
-
 def _select_attention_input_move(rows: Layout, need: StageInput) -> Callable:
     """How the rows a layer takes become its attention's input: as they are,
     or gathered over attention TP from each rank's slice, unless the attention
@@ -3030,61 +2829,6 @@ def _select_ffn_output_move(
     return True, None, False
 
 
-class MlpInputKind(Enum):
-    """What the attention-TP -> FFN boundary does, given the two sides' layouts."""
-
-    # The layouts agree: add the residual and normalize.
-    NORM = auto()
-    # All-reduce over attention TP, normalize, and gather for the FFN group.
-    GATHER = auto()
-    # The same, then gather over the MoE-CP group (moe_dp_size < attn_cp_size).
-    GATHER_MOE_CP = auto()
-    # Reduce-scatter over attention TP to this rank's tokens, then normalize.
-    SCATTER = auto()
-    # All-reduce over attention TP for a dense MLP on that group.
-    ATTN_TP_ALL_REDUCE = auto()
-
-
-def mlp_input_kind(
-    modes: LayerScatterModes, context: CommunicateContext
-) -> MlpInputKind:
-    hidden_in, residual_in = modes.attn_mode, modes.layer_input_mode
-    hidden_out, residual_out = modes.mlp_mode, modes.middle_residual_mode
-    if (
-        context.is_same_layout(hidden_in, hidden_out)
-        and context.is_same_layout(residual_in, residual_out)
-        and context.attn_tp_size == 1
-    ):
-        return MlpInputKind.NORM
-    if hidden_in == ScatterMode.TP_ATTN_FULL and residual_in in (
-        ScatterMode.SCATTERED,
-        ScatterMode.TP_ATTN_FULL,
-    ):
-        kind = {
-            (ScatterMode.FULL, ScatterMode.TP_ATTN_FULL): MlpInputKind.GATHER,
-            (
-                ScatterMode.MOE_FULL,
-                ScatterMode.TP_ATTN_FULL,
-            ): MlpInputKind.GATHER_MOE_CP,
-            (ScatterMode.SCATTERED, ScatterMode.SCATTERED): MlpInputKind.SCATTER,
-        }.get((hidden_out, residual_out))
-        if kind is not None:
-            return kind
-        if (
-            hidden_out == ScatterMode.TP_ATTN_FULL
-            and residual_out == ScatterMode.TP_ATTN_FULL
-            and context.attn_tp_size > 1
-        ):
-            # Used when the dense MLP is tensor-parallelized along the
-            # attention TP group (``moe_dense_tp_size > 1``): hidden states
-            # need an all-reduce inside the attention TP group before the
-            # next layernorm, while staying in TP_ATTN_FULL on both sides.
-            return MlpInputKind.ATTN_TP_ALL_REDUCE
-    raise NotImplementedError(
-        f"{hidden_in=} {residual_in=} {hidden_out=} {residual_out=}"
-    )
-
-
 def _mlp_input_completing_owed(
     hidden_states: Union[torch.Tensor, "UnreducedOutput"],
     residual: torch.Tensor,
@@ -3110,25 +2854,6 @@ def _mlp_input_norm(
     *,
     residual_ops: ResidualOps = ADD_AND_NORM,
 ):
-    return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
-
-
-def _mlp_input_attn_tp_all_reduce(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
-    context: CommunicateContext,
-    *,
-    residual_ops: ResidualOps = ADD_AND_NORM,
-):
-    """All-reduce hidden states inside the attention TP group, then layernorm.
-
-    Used when the dense MLP shares the attention TP group
-    (``moe_dense_tp_size > 1``): both hidden states and residual stay in
-    ``TP_ATTN_FULL`` across the boundary.
-    """
-    hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
     return residual_ops.update_and_read_ffn_input(hidden_states, residual, layernorm)
 
 
@@ -3214,24 +2939,6 @@ def _tp_all_reduce_with_scattered_residual(
     residual = tensor_model_parallel_all_reduce(hidden_states)
     hidden_states = layernorm(residual)
     return hidden_states, residual
-
-
-def _mlp_input_gather(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
-    context: CommunicateContext,
-    *,
-    order: Callable,
-):
-    """Run ``order``, the steps ``_mlp_input_order`` chose at construction,
-    unless this batch's attention input is scattered."""
-    if get_attn_tp_context().input_scattered:
-        return _tp_all_reduce_with_scattered_residual(
-            hidden_states, residual, layernorm, context
-        )
-    return order(hidden_states, residual, forward_batch, layernorm, context)
 
 
 def _mlp_input_gather_attention_cp(
@@ -3374,47 +3081,6 @@ def _all_reduce_then_to_local_tokens(
 
 class CommunicateSummableTensorPairFn:
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
-
-    @staticmethod
-    def get_fn(
-        hidden_states_input_mode: ScatterMode,
-        residual_input_mode: ScatterMode,
-        output_mode: ScatterMode,
-        context: CommunicateContext,
-    ):
-        if context.is_same_layout(
-            hidden_states_input_mode, output_mode
-        ) and context.is_same_layout(residual_input_mode, output_mode):
-            return CommunicateSummableTensorPairFn._trivial
-
-        fn = {
-            (
-                ScatterMode.FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._scatter_hidden_states,
-            (
-                ScatterMode.SCATTERED,
-                ScatterMode.SCATTERED,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._gather,
-            (
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.SCATTERED,
-            ): CommunicateSummableTensorPairFn._scatter,
-            (
-                ScatterMode.MOE_FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
-        }.get((hidden_states_input_mode, residual_input_mode, output_mode))
-        if fn is not None:
-            return fn
-
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
-        )
 
     @staticmethod
     def _trivial(

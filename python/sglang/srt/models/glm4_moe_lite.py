@@ -638,7 +638,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
         )
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]

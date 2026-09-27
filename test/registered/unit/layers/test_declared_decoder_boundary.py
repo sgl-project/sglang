@@ -34,7 +34,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
     UnreducedOutput,
-    scatter_mode_layouts,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.moe import utils as moe_utils
@@ -228,92 +227,6 @@ def planned_modes(
         )
 
 
-class TestDeclarationsMatchScatterModes(CustomTestCase):
-    """The layouts derived from the groups each side computes over are the
-    layouts of the modes layer planning gives the same layers."""
-
-    def test_every_attention_dp_and_tp(self):
-        for (
-            attn_dp,
-            attn_tp,
-            layer_id,
-            sparse,
-            previous_sparse,
-            a2a,
-        ) in itertools.product(
-            (1, 2, 4, 8),
-            (1, 2, 4),
-            (0, 1, 3),
-            (False, True),
-            (False, True),
-            (False, True),
-        ):
-            with self.subTest(
-                attn_dp=attn_dp,
-                attn_tp=attn_tp,
-                layer_id=layer_id,
-                sparse=sparse,
-                previous_sparse=previous_sparse,
-                a2a=a2a,
-            ):
-                parallel = parallel_of(attn_dp=attn_dp, attn_tp=attn_tp)
-                modes = planned_modes(
-                    layer_id,
-                    4,
-                    sparse=sparse,
-                    previous_sparse=previous_sparse,
-                    parallel=parallel,
-                    a2a=a2a,
-                )
-                sizes = {
-                    TokenAxis.ATTN_DP: attn_dp,
-                    TokenAxis.ATTN_CP: 1,
-                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                }
-                layouts = scatter_mode_layouts(
-                    attn_dp_size=attn_dp, attn_cp_size=1, attn_tp_size=attn_tp
-                )
-                sides = sides_of(
-                    sizes,
-                    sparse=sparse,
-                    a2a=a2a,
-                    previous_a2a=layer_id > 0 and previous_sparse and a2a,
-                    last=layer_id == 3,
-                    leaves_next=True,
-                    leaves_rs=True,
-                )
-                self.assertEqual(sides.input_rows, layouts[modes.layer_input_mode])
-                self.assertEqual(
-                    sides.ffn_residual_rows, layouts[modes.middle_residual_mode]
-                )
-                self.assertEqual(sides.output_rows, layouts[modes.layer_output_mode])
-                self.assertEqual(sides.attention.layout, layouts[modes.attn_mode])
-                self.assertEqual(sides.ffn.layout, layouts[modes.mlp_mode])
-                self.assertEqual(
-                    sides.attention_output.layout, layouts[modes.attn_mode]
-                )
-                self.assertEqual(sides.ffn_output.layout, sides.ffn.layout)
-                # A MoE dispatched per DP shard hands on a complete output.
-                self.assertIs(sides.ffn_output.group is None, sparse and a2a)
-
-    def test_the_attention_output_owes_the_attention_tp_sum(self):
-        for attn_tp in (1, 2):
-            sides = sides_of(
-                {
-                    TokenAxis.ATTN_DP: 2,
-                    TokenAxis.ATTN_CP: 1,
-                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                }
-            )
-            owed = attn_tp > 1
-            self.assertIs(
-                sides.attention_output.group, SumGroup.ATTN_TP if owed else None
-            )
-            self.assertIs(sides.attention_output.always_leaves, owed)
-            self.assertIs(sides.ffn_output.group, SumGroup.TP)
-            self.assertFalse(sides.ffn_output.always_leaves)
-
-
 class TestWhichLayersUseDeclarations(CustomTestCase):
     """The layer is the unit: all three boundary sides it owns follow the
     declarations, or none do."""
@@ -501,30 +414,27 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             layer = build(modes, parallel, a2a=True)
         self.assertIs(layer._steps.attention_input, comm.CommunicateSimpleFn._trivial)
 
-    def test_layers_that_keep_the_scatter_modes(self):
-        dp = parallel_of(attn_dp=2, attn_tp=2)
-        cases = {
-            "attention CP": (
-                layer_facts(1, 3),
-                parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
-            ),
-        }
-        two_batch_overlap = SimpleNamespace(
-            overlap=SimpleNamespace(enable_two_batch_overlap=True)
+    def test_cp_without_prefill_cp(self):
+        """No batch shards its tokens, so no CP steps. Under attention DP the
+        reduce-scatter back runs over the TP group, which spans the CP ranks,
+        so the FFN completes its own sum; without attention DP it may leave it
+        and input-scattered attention runs, as without CP."""
+        under_dp = build(
+            layer_facts(1, 3), parallel_of(attn_dp=2, attn_tp=1, attn_cp=2)
         )
-        for name, (facts, parallel) in cases.items():
-            with self.subTest(name):
-                with (
-                    planning(parallel),
-                    patch.object(comm, "get_exec", lambda: two_batch_overlap),
-                ):
-                    communicator = LayerCommunicator.__new__(LayerCommunicator)
-                    communicator.layer_scatter_modes = facts
-                    communicator.allow_deferred_ffn_reduction = True
-                    communicator.allow_reduce_scatter = False
-                    self.assertIsNone(communicator._declared_sides())
-        # Modes given directly (Nemotron-H's stages) do not say which rows the
-        # layer takes.
+        self.assertIsNone(under_dp._cp_steps)
+        self.assertFalse(under_dp._steps.ffn_output.leaves_for_next_layer)
+        self.assertFalse(under_dp._steps.ffn_output.leaves_for_reduce_scatterv)
+        without_dp = build(
+            layer_facts(1, 3),
+            parallel_of(
+                attn_dp=1, attn_tp=2, attn_cp=2, enable_attn_tp_input_scattered=True
+            ),
+        )
+        self.assertTrue(without_dp._steps.ffn_output.leaves_for_next_layer)
+        self.assertIsNotNone(without_dp._input_scattered_steps)
+
+    def test_a_layer_without_the_previous_layer_s_facts_is_refused(self):
         direct = LayerScatterModes(
             layer_input_mode=ScatterMode.TP_ATTN_FULL,
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -532,7 +442,8 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             middle_residual_mode=ScatterMode.TP_ATTN_FULL,
             layer_output_mode=ScatterMode.TP_ATTN_FULL,
         )
-        self.assertFalse(self.declared(build(direct, dp)))
+        with self.assertRaises(NotImplementedError):
+            build(direct, parallel_of(attn_dp=2, attn_tp=2))
 
 
 def build_mhc(
@@ -809,6 +720,48 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
         build_mhc(modes, parallel, dsa_cp=True, allow_reduce_scatter=True)
 
+    def test_input_scattered_attention_under_attention_cp_is_rejected(self):
+        scattered = dict(enable_attn_tp_input_scattered=True)
+        parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, **scattered)
+        with self.assertRaisesRegex(NotImplementedError, "input-scattered"):
+            build_mhc(
+                planned_modes(
+                    1, 3, sparse=False, previous_sparse=False, parallel=parallel
+                ),
+                parallel,
+            )
+        parallel = parallel_of(attn_dp=1, attn_tp=2, **scattered)
+        build_mhc(
+            planned_modes(1, 3, sparse=False, previous_sparse=False, parallel=parallel),
+            parallel,
+        )
+
+    def test_a_moe_gathered_over_moe_cp_is_rejected(self):
+        # A MoE-CP gather (MoE DP narrower than CP), which MHC has not been run with.
+        for prefill_cp in (True, False):
+            with self.subTest(prefill_cp=prefill_cp):
+                parallel = parallel_of(
+                    attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=prefill_cp
+                )
+                modes = planned_modes(
+                    1, 3, sparse=True, previous_sparse=True, parallel=parallel
+                )
+                with self.assertRaisesRegex(NotImplementedError, "MoE-CP group"):
+                    build_mhc(modes, parallel)
+        # A dense layer builds, and so does a MoE on its own CP shard (MoE DP = CP).
+        parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2)
+        build_mhc(
+            planned_modes(1, 3, sparse=False, previous_sparse=False, parallel=parallel),
+            parallel,
+        )
+        parallel = parallel_of(
+            attn_dp=1, attn_tp=2, attn_cp=2, moe_dp_size=2, moe_tp_size=2
+        )
+        build_mhc(
+            planned_modes(1, 3, sparse=True, previous_sparse=True, parallel=parallel),
+            parallel,
+        )
+
 
 class TestTwoBatchOverlap(CustomTestCase):
     """Two-batch overlap splits the attention's rows. A dense MLP on every rank
@@ -860,14 +813,6 @@ class TestTwoBatchOverlap(CustomTestCase):
                         after._steps.attention_input,
                         comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
                     )
-                # The declarations give the rows the scatter modes planned.
-                for layer in (first, before, after, last):
-                    layouts = layer._context.layouts
-                    modes = layer.layer_scatter_modes
-                    self.assertEqual(layer.input_rows, layouts[modes.layer_input_mode])
-                    self.assertEqual(
-                        layer._declared.output_rows, layouts[modes.layer_output_mode]
-                    )
 
     def test_the_split_moves_from_the_first_layer_s_rows(self):
         pair = comm.CommunicateSummableTensorPairFn
@@ -884,54 +829,13 @@ class TestTwoBatchOverlap(CustomTestCase):
             with self.assertRaises(NotImplementedError):
                 comm.tbo_split_moves(comm.Layout(frozenset()))
 
-    def test_a_layer_off_the_declarations_takes_its_rows_from_its_modes(self):
-        dp = parallel_of(attn_dp=2, attn_tp=2)
-        direct = LayerScatterModes(
-            layer_input_mode=ScatterMode.SCATTERED,
-            attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=ScatterMode.FULL,
-            middle_residual_mode=ScatterMode.TP_ATTN_FULL,
-            layer_output_mode=ScatterMode.TP_ATTN_FULL,
-        )
-        communicator = build(direct, dp)
-        self.assertIsNone(communicator._declared)
-        self.assertEqual(
-            communicator.input_rows,
-            comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER})),
-        )
-        # Under attention CP the rows are those of a batch that holds every
-        # token on each CP rank, which the two-batch-overlap split takes.
-        cp = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2)
-        communicator = build(direct, cp)
-        self.assertIsNone(communicator._declared)
-        slice_ = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-        self.assertEqual(communicator.input_rows, slice_)
-        pair = comm.CommunicateSummableTensorPairFn
-        with planning(cp):
-            self.assertEqual(
-                comm.tbo_split_moves(communicator.input_rows),
-                (pair._gather, pair._scatter),
-            )
-
-
-class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
-    """Under attention DP, LoRA routes the FFN's rows TP-global exactly when the
-    batch's FFN input step gathers them over attention DP."""
-
-    def build(self, modes, parallel, *, a2a, two_batch_overlap, declared):
+    def build(self, modes, parallel, *, a2a, two_batch_overlap):
         overlap = SimpleNamespace(
             overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap)
         )
         with (
             planning(parallel, a2a=a2a),
             patch.object(comm, "get_exec", lambda: overlap),
-            # Otherwise the scatter-mode steps, which a layer off the
-            # declarations runs.
-            nullcontext()
-            if declared
-            else patch.object(
-                LayerCommunicator, "_declared_sides", lambda self, **kwargs: None
-            ),
         ):
             communicator = LayerCommunicator(
                 layer_scatter_modes=modes,
@@ -951,7 +855,6 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
             a2a,
             dense_fully_dp,
             two_batch_overlap,
-            declared,
         ) in itertools.product(
             (1, 2, 4),
             (1, 2),
@@ -961,7 +864,6 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
             (False, True),
             (False, True),
             (False, True),
-            (True, False),
         ):
             if two_batch_overlap and attn_dp == 1:
                 continue
@@ -974,7 +876,6 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
                 a2a=a2a,
                 dense_fully_dp=dense_fully_dp,
                 two_batch_overlap=two_batch_overlap,
-                declared=declared,
             ):
                 parallel = parallel_of(
                     attn_dp=attn_dp,
@@ -994,11 +895,10 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
                     parallel,
                     a2a=a2a,
                     two_batch_overlap=two_batch_overlap,
-                    declared=declared,
                 )
                 steps = communicator._steps
                 self.assertEqual(
-                    steps.ffn_input_rows, communicator._context.layouts[modes.mlp_mode]
+                    steps.ffn_input_rows, communicator._declared.ffn.layout
                 )
                 published = {}
                 with patch.object(
@@ -1023,6 +923,23 @@ class TestTheLoraLayoutFollowsTheFfnInput(CustomTestCase):
 class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
     """prepare_mlp completes the attention-TP sum exactly when the attention
     output's declaration says it is owed, whatever the attention-TP size."""
+
+    def test_the_attention_output_owes_the_attention_tp_sum(self):
+        for attn_tp in (1, 2):
+            sides = sides_of(
+                {
+                    TokenAxis.ATTN_DP: 2,
+                    TokenAxis.ATTN_CP: 1,
+                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
+                }
+            )
+            owed = attn_tp > 1
+            self.assertIs(
+                sides.attention_output.group, SumGroup.ATTN_TP if owed else None
+            )
+            self.assertIs(sides.attention_output.always_leaves, owed)
+            self.assertIs(sides.ffn_output.group, SumGroup.TP)
+            self.assertFalse(sides.ffn_output.always_leaves)
 
     def run_steps(self, produced, *, force=False):
         sizes = {
@@ -1492,52 +1409,13 @@ class TestOneRepresentation(CustomTestCase):
         "_mlp_input_may_return_new_residual",
     )
 
-    def test_both_entries_hold_steps_only(self):
-        parallel = parallel_of(attn_dp=2, attn_tp=2)
-        direct = LayerScatterModes(
-            layer_input_mode=ScatterMode.TP_ATTN_FULL,
-            attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=ScatterMode.FULL,
-            middle_residual_mode=ScatterMode.TP_ATTN_FULL,
-            layer_output_mode=ScatterMode.TP_ATTN_FULL,
-        )
-        for name, communicator in (
-            ("declarations", build(layer_facts(1, 3), parallel)),
-            ("scatter modes", build(direct, parallel)),
-        ):
-            with self.subTest(name):
-                self.assertIsInstance(communicator._steps, comm.BoundarySteps)
-                for attribute in self.SEPARATE:
-                    self.assertFalse(hasattr(communicator, attribute), attribute)
-                self.assertIs(communicator._batch_steps(None), communicator._steps)
-                # Under attention DP both bring the FFN output back to this
-                # rank's tokens with the step the FFN exit chooses.
-                self.assertTrue(communicator._steps.returns_over_dp)
-
-    def test_the_scatter_mode_steps_complete_a_scattered_input(self):
-        # The scatter-mode path's input completion reads the batch fact itself.
-        steps = build(
-            LayerScatterModes(
-                layer_input_mode=ScatterMode.TP_ATTN_FULL,
-                attn_mode=ScatterMode.TP_ATTN_FULL,
-                mlp_mode=ScatterMode.FULL,
-                middle_residual_mode=ScatterMode.TP_ATTN_FULL,
-                layer_output_mode=ScatterMode.TP_ATTN_FULL,
-            ),
-            parallel_of(attn_dp=1, attn_tp=2),
-        )._steps
-        self.assertIs(
-            steps.attention_prepare.keywords["layer_input"],
-            comm._complete_scattered_input,
-        )
-        hidden, residual = torch.ones(2, HIDDEN), torch.ones(2, HIDDEN)
-        with patch.object(
-            comm, "get_attn_tp_context", lambda: SimpleNamespace(input_scattered=False)
-        ):
-            self.assertEqual(
-                steps.attention_prepare.keywords["layer_input"](hidden, residual, None),
-                (hidden, residual),
-            )
+    def test_the_layer_holds_steps_only(self):
+        communicator = build(layer_facts(1, 3), parallel_of(attn_dp=2, attn_tp=2))
+        self.assertIsInstance(communicator._steps, comm.BoundarySteps)
+        for attribute in self.SEPARATE:
+            self.assertFalse(hasattr(communicator, attribute), attribute)
+        self.assertIs(communicator._batch_steps(None), communicator._steps)
+        self.assertTrue(communicator._steps.returns_over_dp)
 
 
 class TestTheAttentionInputHalf(CustomTestCase):
@@ -1733,15 +1611,6 @@ class TestPrefillCP(CustomTestCase):
         dense = build(layer_facts(1, 3), parallel, allow_deferred_ffn_reduction=True)
         self.assertIs(dense._cp_steps.ffn_input.func, comm._mlp_input_gather_moe_cp)
         self.assertFalse(dense._cp_steps.ffn_output.leaves_for_next_layer)
-        # DSA and MLA CP gather the MoE's input over attention CP whatever its DP.
-        dsa = self.dsa_parallel(moe_dp_size=2, moe_tp_size=1)
-        modes = planned_modes(
-            1, 3, sparse=True, previous_sparse=False, parallel=dsa, dsa_cp=True
-        )
-        communicator = build(modes, dsa, dsa_cp=True, allow_reduce_scatter=True)
-        self.assertIs(
-            communicator._cp_steps.ffn_input.func, comm._mlp_input_gather_attention_cp
-        )
 
     def test_the_fused_kernels_run_on_each_chunk(self):
         with planning(self.cp_parallel()):
@@ -1756,97 +1625,97 @@ class TestPrefillCP(CustomTestCase):
             (communicator._mlp_input_reduce_output_and_update_and_read_residual,),
         )
 
-    def test_which_cp_the_declarations_cover(self):
-        dp_cp = parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True)
-        dsa_dp_cp = parallel_of(
-            attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
+    def cp_outcome(self, parallel, *, sparse=True, a2a=False, dsa_cp=False):
+        """A layer under attention CP: "cp steps" for the batches that shard
+        their tokens, "ordinary" when no batch does, or "refused"."""
+        modes = planned_modes(
+            1,
+            3,
+            sparse=sparse,
+            previous_sparse=sparse,
+            parallel=parallel,
+            a2a=a2a,
+            dsa_cp=dsa_cp,
         )
-        for name, parallel, sparse, declared, dsa_cp, a2a in (
-            ("DSA or MLA CP", self.dsa_parallel(), True, True, True, False),
+        try:
+            layer = build(
+                modes, parallel, a2a=a2a, dsa_cp=dsa_cp, allow_reduce_scatter=True
+            )
+        except NotImplementedError:
+            return "refused"
+        return "ordinary" if layer._cp_steps is None else "cp steps"
+
+    def test_which_cp_the_steps_cover(self):
+        dp_cp = dict(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True)
+        moe_dp_eq_cp = dict(attn_cp=2, enable_prefill_cp=True, moe_dp_size=2)
+        dense = dict(sparse=False)
+        for expected, name, parallel, kwargs in (
+            ("cp steps", "DSA or MLA CP", self.dsa_parallel(), dict(dsa_cp=True)),
             (
-                "DSA or MLA CP, a MoE under attention DP",
-                dsa_dp_cp,
-                True,
-                True,
-                True,
-                True,
+                "cp steps",
+                "DSA or MLA CP, an a2a MoE under attention DP",
+                parallel_of(**dp_cp, moe_dense_tp_size=1),
+                dict(dsa_cp=True, a2a=True),
             ),
-            ("prefill CP", self.cp_parallel(), False, True, False, False),
+            ("cp steps", "prefill CP", self.cp_parallel(), dense),
+            ("cp steps", "CP under attention DP", parallel_of(**dp_cp), dense),
             (
+                "cp steps",
+                "a MoE under attention DP and GQA CP",
+                parallel_of(**dp_cp),
+                {},
+            ),
+            (
+                "cp steps",
+                "MoE DP equal to CP",
+                parallel_of(attn_dp=1, attn_tp=2, **moe_dp_eq_cp),
+                {},
+            ),
+            (
+                "cp steps",
+                "a dense layer beside it under attention DP",
+                parallel_of(attn_dp=2, attn_tp=1, **moe_dp_eq_cp),
+                dense,
+            ),
+            (
+                "ordinary",
                 "CP without prefill CP",
                 parallel_of(attn_dp=1, attn_tp=2, attn_cp=2),
-                False,
-                False,
-                False,
-                False,
-            ),
-            ("CP under attention DP", dp_cp, False, True, False, False),
-            ("a MoE under attention DP and GQA CP", dp_cp, True, True, False, False),
-            (
-                "a MoE dispatched per DP shard under attention DP and GQA CP",
-                dp_cp,
-                True,
-                False,
-                False,
-                True,
+                {},
             ),
             (
-                "a MoE whose data-parallel groups are the CP ranks",
-                parallel_of(
-                    attn_dp=1,
-                    attn_tp=2,
-                    attn_cp=2,
-                    enable_prefill_cp=True,
-                    moe_dp_size=2,
-                ),
-                True,
-                True,
-                False,
-                False,
+                "ordinary",
+                "an a2a MoE under attention DP, CP without prefill CP",
+                parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
+                dict(a2a=True),
             ),
             (
-                "a MoE whose data-parallel groups are the CP ranks, under attention DP",
-                parallel_of(
-                    attn_dp=2,
-                    attn_tp=1,
-                    attn_cp=2,
-                    enable_prefill_cp=True,
-                    moe_dp_size=2,
-                ),
-                True,
-                False,
-                False,
-                False,
+                "refused",
+                "DSA or MLA CP, MoE DP equal to CP",
+                self.dsa_parallel(moe_dp_size=2, moe_tp_size=1),
+                dict(dsa_cp=True),
             ),
             (
-                "a MoE-CP group narrower than CP",
-                parallel_of(
-                    attn_dp=1,
-                    attn_tp=1,
-                    attn_cp=4,
-                    enable_prefill_cp=True,
-                    moe_dp_size=2,
-                ),
-                False,
-                False,
-                False,
-                False,
+                "refused",
+                "an a2a MoE under attention DP and GQA CP",
+                parallel_of(**dp_cp),
+                dict(a2a=True),
+            ),
+            (
+                "refused",
+                "MoE DP equal to CP under attention DP",
+                parallel_of(attn_dp=2, attn_tp=1, **moe_dp_eq_cp),
+                {},
+            ),
+            (
+                "refused",
+                "the same without prefill CP",
+                parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, moe_dp_size=2),
+                {},
             ),
         ):
             with self.subTest(name):
-                modes = planned_modes(
-                    1,
-                    3,
-                    sparse=sparse,
-                    previous_sparse=sparse,
-                    parallel=parallel,
-                    a2a=a2a,
-                    dsa_cp=dsa_cp,
-                )
-                communicator = build(
-                    modes, parallel, a2a=a2a, dsa_cp=dsa_cp, allow_reduce_scatter=True
-                )
-                self.assertIs(communicator._cp_steps is not None, declared)
+                self.assertEqual(self.cp_outcome(parallel, **kwargs), expected)
 
     def test_under_attention_dp_one_dp_sum_gathers_both_axes(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
