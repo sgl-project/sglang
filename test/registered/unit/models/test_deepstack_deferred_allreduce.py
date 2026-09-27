@@ -135,5 +135,55 @@ class TestDeepstackOnDeferredReduction(CustomTestCase):
                 )
 
 
+class TestSplitPrefillCompletion(CustomTestCase):
+    def test_only_the_final_segment_completes_the_carried_output(self):
+        from sglang.srt.models.qwen2_moe import Qwen2MoeForCausalLM
+        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+        from sglang.srt.models.sarvam_moe import (
+            SarvamMLAForCausalLM,
+            SarvamMoEForCausalLM,
+        )
+
+        for model_cls in (
+            Qwen2MoeForCausalLM,
+            Qwen3ForCausalLM,
+            Qwen3MoeForCausalLM,
+            SarvamMLAForCausalLM,
+            SarvamMoEForCausalLM,
+        ):
+            for tokens in (0, TOKENS):
+                with self.subTest(model=model_cls.__name__, tokens=tokens):
+                    # Also leave the final output: the stack exit must handle it
+                    # independently of the last layer's fusion decision.
+                    wrapper = SimpleNamespace(
+                        model=SimpleNamespace(
+                            layers=[DeferringLayer(False) for _ in range(NUM_LAYERS)],
+                            config=SimpleNamespace(num_hidden_layers=NUM_LAYERS),
+                            norm=SumNorm(),
+                        ),
+                        lm_head=None,
+                        logits_processor=lambda ids, hidden, head, batch: hidden,
+                    )
+                    batch = SimpleNamespace(residual=None)
+                    first = model_cls.forward_split_prefill(
+                        wrapper,
+                        None,
+                        None,
+                        batch,
+                        (0, 2),
+                        input_embeds=torch.zeros(tokens, HIDDEN),
+                    )
+                    self.assertIsNone(first)
+                    self.assertIsInstance(batch.hidden_states, UnreducedOutput)
+                    result = model_cls.forward_split_prefill(
+                        wrapper, None, None, batch, (2, NUM_LAYERS)
+                    )
+                    self.assertIsInstance(result, torch.Tensor)
+                    torch.testing.assert_close(
+                        result, torch.full((tokens, HIDDEN), float(NUM_LAYERS))
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1136,6 +1136,10 @@ class MossVLTextModel(nn.Module):
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
 
+        hidden_states, residual = LayerCommunicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         if residual is not None:
             hidden_states, _ = self.norm(hidden_states, residual)
         else:

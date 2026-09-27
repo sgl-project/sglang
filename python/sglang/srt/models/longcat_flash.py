@@ -642,6 +642,11 @@ class LongcatFlashModel(nn.Module):
                     topk_indices,
                 )
 
+        last_layer = self.layers[-1]
+        hidden_states, residual = last_layer.moe_layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)

@@ -115,6 +115,10 @@ class GigaChat35ModelNextN(nn.Module):
             zero_allocator=zero_allocator,
         )
 
+        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             hidden_states_before_norm = (

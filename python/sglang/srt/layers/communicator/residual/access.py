@@ -22,6 +22,7 @@ from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
     reduce_output,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def buffer(
@@ -52,3 +53,20 @@ def fold(hidden_states, residual) -> Tuple[torch.Tensor, None]:
     if residual is not None:
         hidden_states = hidden_states + residual
     return hidden_states, None
+
+
+def finish_layer_stack(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+    *,
+    final_norm_takes_handoff: bool = False,
+) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
+    """Complete what this layer left for a next layer. Call it on the last
+    layer of this rank before its output reaches the final norm, the next
+    pipeline rank, or any other consumer outside the layers. A final norm
+    that does a producer's handoff together with its own work
+    (``final_norm_takes_handoff``) receives it as it is."""
+    if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
+        return hidden_states, residual
+    return reduce_output(hidden_states), residual

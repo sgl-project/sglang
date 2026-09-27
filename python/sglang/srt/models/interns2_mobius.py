@@ -787,6 +787,10 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                     input_deepstack_embeds[:, start : start + self.hidden_size]
                 )
 
+        hidden_states, residual = self.layers[-1].layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)

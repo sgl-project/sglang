@@ -68,12 +68,15 @@ from sglang.srt.layers.communicator.ops import (
     move_rows,
 )
 from sglang.srt.layers.communicator.output import (
-    HandoffOutput,
     UnreducedOutput,
-    reduce_output,
 )
 from sglang.srt.layers.communicator.residual import LayerResidual
-from sglang.srt.layers.communicator.residual.access import add_to_output, buffer, fold
+from sglang.srt.layers.communicator.residual.access import (
+    add_to_output,
+    buffer,
+    finish_layer_stack,
+    fold,
+)
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
     aiter_all_reduce_fusion_enabled_for,
@@ -225,6 +228,7 @@ class LayerCommunicator:
     add_to_output = staticmethod(add_to_output)
     buffer = staticmethod(buffer)
     fold = staticmethod(fold)
+    finish_layer_stack = staticmethod(finish_layer_stack)
 
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
@@ -1026,23 +1030,6 @@ class LayerCommunicator:
         hidden_states = move_rows(hidden_states, rows, to, forward_batch)
         residual = move_rows(residual, rows, to, forward_batch)
         return contribution + hidden_states, residual
-
-    def finish_layer_stack(
-        self,
-        hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
-        residual: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-        *,
-        final_norm_takes_handoff: bool = False,
-    ) -> Tuple[Union[torch.Tensor, HandoffOutput], Optional[torch.Tensor]]:
-        """Complete what this layer left for a next layer. Call it on the last
-        layer of this rank before its output reaches the final norm, the next
-        pipeline rank, or any other consumer outside the layers. A final norm
-        that does a producer's handoff together with its own work
-        (``final_norm_takes_handoff``) receives it as it is."""
-        if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
-            return hidden_states, residual
-        return reduce_output(hidden_states), residual
 
     def _select_ffn_exit_fusions(
         self,

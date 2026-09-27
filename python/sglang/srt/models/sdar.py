@@ -415,6 +415,10 @@ class SDARModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        hidden_states, residual = self.layers[
+            self.end_layer - 1
+        ].layer_communicator.finish_layer_stack(hidden_states, residual, forward_batch)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}

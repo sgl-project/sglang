@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator.residual.access import finish_layer_stack
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -424,6 +425,10 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        hidden_states, residual = finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

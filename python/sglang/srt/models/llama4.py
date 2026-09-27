@@ -530,6 +530,10 @@ class Llama4Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        hidden_states, residual = self.layers[-1].layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 

@@ -1252,6 +1252,10 @@ class Qwen3LLMModel(Qwen3Model):
                         input_deepstack_embeds[:, sep : sep + self.hidden_size]
                     )
 
+        hidden_states, residual = self.layers[
+            self.end_layer - 1
+        ].layer_communicator.finish_layer_stack(hidden_states, residual, forward_batch)
+
         # Handle deepstack for the last processed layer (HF-order path only).
         last_deepstack = (
             self.get_deepstack_embeds(self.end_layer - 1, input_deepstack_embeds)

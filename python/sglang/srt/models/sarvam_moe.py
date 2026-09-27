@@ -1279,6 +1279,11 @@ class SarvamMLAForCausalLM(nn.Module):
                 )
 
         if end == self.model.config.num_hidden_layers:
+            forward_batch.hidden_states, forward_batch.residual = self.model.layers[
+                end - 1
+            ].layer_communicator.finish_layer_stack(
+                forward_batch.hidden_states, forward_batch.residual, forward_batch
+            )
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
             else:
@@ -1462,6 +1467,11 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
                 )
 
         if end == self.model.config.num_hidden_layers:
+            forward_batch.hidden_states, forward_batch.residual = self.model.layers[
+                end - 1
+            ].layer_communicator.finish_layer_stack(
+                forward_batch.hidden_states, forward_batch.residual, forward_batch
+            )
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
             else:
