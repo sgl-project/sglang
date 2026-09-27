@@ -1,7 +1,11 @@
 """Native 16-head MFMA layouts for gfx950 paged attention."""
 
+import functools
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+from .decode_attention_sm100 import swapab_attention as _swapab_attention
 
 # the V4 page load is plain gluon (no Blackwell ops), so the SM100 kernel's serves gfx950 too
 from .decode_attention_sm100_gluon import _load_v4
@@ -120,3 +124,7 @@ def partial_gluon(
     hs = gl.arange(0, H, stat)
     gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat))
     gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat))
+
+
+# the SM100 host path (sink, combine, inverse RoPE) on the gfx950 split-KV kernel above
+swapab_attention = functools.partial(_swapab_attention, partial_gluon=partial_gluon)

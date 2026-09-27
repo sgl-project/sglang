@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import inverse_rop
 
 
 @triton.jit
-def _aiter_sparse_decode_reduce_kernel(
+def _gfx_sparse_decode_reduce_kernel(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,
@@ -75,7 +75,7 @@ def _aiter_sparse_decode_reduce_kernel(
     tl.store(out_ptr + t * out_stride_t + h * out_stride_h + d, out)
 
 
-def aiter_sparse_split_reduce(
+def gfx_sparse_split_reduce(
     part_acc: torch.Tensor,
     part_m: torch.Tensor,
     part_l: torch.Tensor,
@@ -107,7 +107,7 @@ def aiter_sparse_split_reduce(
     else:
         freqs_real = positions = out  # unread placeholders
         rope_dim = 0
-    _aiter_sparse_decode_reduce_kernel[(T, H)](
+    _gfx_sparse_decode_reduce_kernel[(T, H)](
         part_m,
         part_l,
         part_acc,

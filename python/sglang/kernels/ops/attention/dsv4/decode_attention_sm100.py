@@ -1,13 +1,11 @@
-"""SM100 / gfx950 small-batch paged attention with the heads on the MMA N dimension;
-the inverse RoPE is applied by the caller, or by the combine when inv_rope is given."""
+"""SM100 small-batch paged attention with the heads on the MMA N dimension; the
+inverse RoPE is applied by the caller, or by the combine when inv_rope is given."""
 
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.utils import is_hip
 
 from .kv_layout import KVLayout
 
@@ -106,12 +104,12 @@ def swapab_attention(
     extra_indices=None,
     extra_lengths=None,
     inv_rope=None,
+    partial_gluon=None,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
-    to each request's keys, and the attention sink is folded in exactly once."""
-    if is_hip():
-        from .swapab_gluon_hip import partial_gluon
-    else:
+    to each request's keys, and the attention sink is folded in exactly once.
+    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's)."""
+    if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
     block = 64

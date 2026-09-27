@@ -254,6 +254,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32
   }
 }
 
+#ifdef USE_ROCM
 // Bitonic sort of n (a power of two, 64 <= n <= kMaxTopK) 32-bit keys, one per thread: strides
 // below the wavefront width exchange through lane shuffles, the wider ones through LDS.
 #if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
@@ -266,7 +267,7 @@ constexpr uint32_t kWaveSize = 64;
 // is an LDS round trip on every stage's dependent chain.
 template <uint32_t J>
 __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
-#if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+#if defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
   if constexpr (J == 1) {  // quad_perm [1, 0, 3, 2]
     return static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0xB1, 0xF, 0xF, true));
   }
@@ -282,7 +283,7 @@ __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
     return (__lane_id() & J) ? shr : shl;
   }
 #endif
-#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx950__)
+#if defined(__gfx950__)
   if constexpr (J == 16) {
     // rows 1 and 3 of the first operand swap with rows 0 and 2 of the second
     const auto pair = __builtin_amdgcn_permlane16_swap(v, v, false, false);
@@ -361,6 +362,7 @@ __device__ __forceinline__ uint32_t next_pow2_at_least_64(uint32_t x) {
     n <<= 1;
   return n;
 }
+#endif  // USE_ROCM
 
 __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(const TopKParams params) {
   const auto bid = blockIdx.x;
@@ -373,7 +375,6 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
       params.raw_indices != nullptr ? params.raw_indices + bid * params.output_stride : nullptr;
 
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  __shared__ uint32_t s_sort_vals[kMaxTopK];
 
   // key: the position when the row has raw indices, else the slot
   const bool key_is_position = raw_indices_ptr != nullptr;
@@ -394,7 +395,9 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
   }
   __syncthreads();
 
+#ifdef USE_ROCM
   if (params.sort_output) {
+    __shared__ uint32_t s_sort_vals[kMaxTopK];
     const uint32_t n = next_pow2_at_least_64(count);
     for (uint32_t i = threadIdx.x; i < n; i += kBlockSize) {
       uint32_t key = ~0u;
@@ -426,6 +429,7 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
     }
     return;
   }
+#endif
 
   for (uint32_t i = threadIdx.x; i < topk; i += kBlockSize) {
     const auto raw = s_topk_indices[i];
@@ -467,6 +471,9 @@ void deepseek_v4_topk_transform_512(
   CHECK_CUDA(seq_lens);
   CHECK_CUDA(page_table);
   CHECK_CUDA(page_indices);
+#ifndef USE_ROCM
+  TORCH_CHECK(!sort_output, "deepseek_v4_topk_transform_512: sort_output is only built for ROCm");
+#endif
   if (raw_indices_opt.has_value()) {
     CHECK_CUDA(raw_indices_opt.value());
   }

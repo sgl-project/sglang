@@ -8,10 +8,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import _q
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
-    aiter_sparse_split_reduce,
-)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.sparse_decode_reduce_hip import (
+    gfx_sparse_split_reduce,
+)
 
 RCP_LN2 = gl.constexpr(1.4426950408889634)  # exp(x) = exp2(x * RCP_LN2)
 TILE_SLOTS = 64
@@ -398,6 +398,6 @@ def compact_attention_hip(
     )
     if splits == 1:
         return out
-    return aiter_sparse_split_reduce(
+    return gfx_sparse_split_reduce(
         acc, maximum, denominator, sink, q.dtype, inv_rope=inv_rope
     )
