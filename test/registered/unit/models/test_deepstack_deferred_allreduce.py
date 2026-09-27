@@ -4,12 +4,11 @@ partial sum, and an embedding added to it is counted once per rank."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,12 +18,15 @@ TP_SIZE = 2
 HIDDEN = 4
 TOKENS = 3
 NUM_LAYERS = 4
-MARKER = "_sglang_needs_allreduce_fusion"
 
 
 def all_reduce(hidden_states):
     # Every rank holds the same partial sum in this single-process stand-in.
     return hidden_states * TP_SIZE
+
+
+# The group a deferred FFN output owes its sum over.
+GROUP = SimpleNamespace(all_reduce=all_reduce)
 
 
 class DeferringLayer(nn.Module):
@@ -41,14 +43,15 @@ class DeferringLayer(nn.Module):
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_
     ):
-        if getattr(hidden_states, MARKER, False):
-            hidden_states = all_reduce(hidden_states)
+        if isinstance(hidden_states, UnreducedOutput):
+            hidden_states = all_reduce(hidden_states.partial)
         residual = hidden_states if residual is None else hidden_states + residual
         if self.is_last_layer:
             return torch.ones_like(residual), residual
-        partial = torch.full_like(residual, 1 / TP_SIZE)
-        setattr(partial, MARKER, True)
-        return partial, residual
+        return (
+            UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP),
+            residual,
+        )
 
 
 class SumNorm(nn.Module):
@@ -102,12 +105,6 @@ MODELS = (qwen3_vl_moe, qwen3_5)
 
 class TestDeepstackOnDeferredReduction(CustomTestCase):
     def setUp(self):
-        patcher = patch(
-            "sglang.srt.layers.communicator.deferred_post_experts_all_reduce",
-            all_reduce,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.embeds = torch.zeros(TOKENS, HIDDEN)
 
     def run_model(self, build, deepstack):

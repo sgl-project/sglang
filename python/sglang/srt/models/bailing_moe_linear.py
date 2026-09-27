@@ -781,7 +781,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = self._is_layer_sparse(config, self.layer_id)
+        is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
         is_previous_moe_layer = self._is_layer_sparse(config, self.layer_id - 1)
         is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
         if self.expert_num == 1:
@@ -815,7 +815,8 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            # A NextN draft is a one-layer model.
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=is_moe_layer,
             is_previous_layer_sparse=is_previous_moe_layer,
             is_next_layer_sparse=is_next_layer_moe_layer,
@@ -831,7 +832,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=False,
-            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
             qkv_latent_func=qkv_latent_func,
         )
 
