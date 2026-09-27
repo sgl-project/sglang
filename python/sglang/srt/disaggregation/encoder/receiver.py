@@ -252,7 +252,7 @@ class EncoderBootstrapServer:
         """Probe registered (and previously evicted) encoders periodically.
 
         A URL is evicted only after ``_health_fail_threshold`` consecutive
-        probe failures — a busy encoder may miss a single short-timeout probe
+        probe failures 鈥?a busy encoder may miss a single short-timeout probe
         under load. Evicted URLs keep being probed and re-register
         automatically once they respond again. After ``_evicted_ttl`` seconds
         without a successful probe (when > 0), they are permanently dropped
@@ -1260,8 +1260,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
 
     def _try_stage_into_pool(self) -> bool:
         """Copy the received parts into one pooled GPU slot, packed in part
-        order (modality-contiguous by construction, see _extract_url_data —
-        _view_pool_buffer_by_modality asserts this).
+        order (modality-contiguous by construction, see _extract_url_data 鈥?        _view_pool_buffer_by_modality asserts this).
 
         Returns True once ``self.embeddings_buffer`` views the slot; False
         when the pool is currently full (retry next tick) or the request can
@@ -1491,7 +1490,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                         self.embedding_pool.alloc, total_bytes
                     )
                     if alloc_result is None:
-                        # Oversize or alloc timeout — fatal for this request.
+                        # Oversize or alloc timeout 鈥?fatal for this request.
                         self._record_receive_error(
                             f"EmbeddingPool could not allocate "
                             f"{total_bytes // (1024 * 1024)}MB (oversize or "
@@ -1609,7 +1608,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
 async def _extract_encoder_error(responses, endpoint, context, encode_requests=None):
     """Return the first ``(message, status)`` error, or None.
 
-    Pure check — logs each error but has no other side effects; the caller
+    Pure check 鈥?logs each error but has no other side effects; the caller
     decides how to react. ``encode_requests`` optionally enriches each log
     line with the matching request's encoder label.
     """
@@ -1697,7 +1696,7 @@ class EmbeddingPool:
     def try_alloc(self, nbytes: int) -> Optional[Tuple[torch.Tensor, int, int]]:
         """Non-blocking alloc: ``(tensor_view, gpu_addr, slot_id)``, or
         ``None`` when the pool is currently full (oversize requests also get
-        ``None`` — callers detect those via ``size_bytes``)."""
+        ``None`` 鈥?callers detect those via ``size_bytes``)."""
         aligned = (nbytes + self._ALIGN - 1) & ~(self._ALIGN - 1)
         with self._lock:
             return self._try_alloc_locked(nbytes, aligned)
@@ -1739,7 +1738,7 @@ class EmbeddingPool:
         calling thread on a Condition until a peer ``release()`` opens
         enough contiguous space.
 
-        NOTE: no ordering guarantee — notify_all + lock race means
+        NOTE: no ordering guarantee 鈥?notify_all + lock race means
         large requests can starve behind small ones, plus thundering-herd.
         """
         if nbytes > self.size_bytes:
@@ -1821,7 +1820,7 @@ class EmbeddingPool:
 
 def _iter_part_ranges(embedding_data, dtype):
     """Yield ``(part_idx, shape, byte_start, byte_end)`` for each non-None
-    part, packed in part order — the buffer layout shared by the encoder's
+    part, packed in part order 鈥?the buffer layout shared by the encoder's
     RDMA writes and EmbeddingPool.try_stage."""
     elem_size = torch.tensor([], dtype=dtype).element_size()
     offset = 0
@@ -1839,7 +1838,7 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
 
     Parts of the same modality are contiguous in raw_buffer (the encoder
     writes them modality-outer), so each modality is one reshape of the byte
-    range — no per-part split, no torch.cat copy.
+    range 鈥?no per-part split, no torch.cat copy.
 
     Caller must keep raw_buffer's storage alive while the returned views are
     in use. The pool path binds slot release to mm_inputs GC via finalize.
@@ -2038,7 +2037,7 @@ class MMReceiverBase(ABC):
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not (recv_req.abort_all or waiting_req.rid == recv_req.rid):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
@@ -2973,3 +2972,4 @@ def create_mm_receiver(
         scheduler=scheduler,
         encode_urls=encode_urls,
     )
+
