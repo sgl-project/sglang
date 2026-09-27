@@ -228,9 +228,9 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert (
-                        "arguments" not in obj
-                    ), "model generated both parameters and arguments"
+                    assert "arguments" not in obj, (
+                        "model generated both parameters and arguments"
+                    )
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
@@ -404,10 +404,8 @@ class BaseFormatDetector(ABC):
                 (the typical case when --reasoning-parser is configured) so
                 only one layer constrains the reasoning section.
             parallel_tool_calls: Whether multiple tool calls may appear in one
-                assistant response. xgrammar's get_model_structural_tag does
-                not expose this knob, so this base implementation ignores it;
-                only detectors that build their own tags (e.g. Kimi K3)
-                honor it.
+                assistant response. Forwarded to XGrammar to constrain the
+                number of tool calls in the generated structural tag.
 
         Returns:
             StructuralTag if this detector supports model-native tags, otherwise None
@@ -427,6 +425,7 @@ class BaseFormatDetector(ABC):
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
     def get_auto_tool_call_structural_tag(

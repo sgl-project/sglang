@@ -196,9 +196,9 @@ class TestMultiModelSelectorIsolation:
             # No URL should appear in both views — that would mean a
             # selector mismatch leaked a worker into the wrong gateway.
             cross_talk = set(llama_urls) & set(qwen_urls)
-            assert (
-                not cross_talk
-            ), f"Workers leaked across model selectors: {cross_talk}"
+            assert not cross_talk, (
+                f"Workers leaked across model selectors: {cross_talk}"
+            )
         finally:
             for name in llama_workers + qwen_workers:
                 _safe_force_delete(name)

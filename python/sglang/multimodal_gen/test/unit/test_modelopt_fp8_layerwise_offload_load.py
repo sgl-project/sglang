@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized ModelOpt FP8 checkpoints must postprocess on device even under
-layerwise offload: requantize_with_max_scale() runs scaled_fp8_quant(), a
-CUDA-only kernel, so a CPU-resident postprocess must never come back."""
+"""Serialized ModelOpt FP8 checkpoints must postprocess correctly even when
+layerwise offload moves the component back to CPU after loading."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -82,9 +82,6 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
             ensure_distributed_env_defaults()
             maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
-        state_dict, weight_ref = _make_serialized_fp8_checkpoint()
-        expected_max_scale = state_dict["qkv.weight_scale"].max()
-
         # The plan a layerwise-offload component gets when
         # _needs_device_weight_postprocess() returns True: load and postprocess
         # on GPU, then defer the CPU placement.
@@ -95,50 +92,79 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
         )
         self.assertTrue(load_plan.defer_cpu_placement)
 
-        model = fsdp_load.maybe_load_fsdp_model(
-            model_cls=_FusedFp8Model,
-            init_params={
-                "quant_config": ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-            },
-            weight_dir_list=[],
-            device=torch.device("cuda"),
-            hsdp_replicate_dim=1,
-            hsdp_shard_dim=1,
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            component_starts_on_cpu=True,
-            weight_load_plan=load_plan,
-            weights_iterator=iter(state_dict.items()),
-        )
+        for cutlass_supported in (False, True):
+            with self.subTest(cutlass_supported=cutlass_supported):
+                state_dict, weight_ref = _make_serialized_fp8_checkpoint()
+                checkpoint_weight = state_dict["qkv.weight"].clone()
+                checkpoint_scales = state_dict["qkv.weight_scale"].clone()
+                expected_max_scale = checkpoint_scales.max()
 
-        # Postprocess ran: the weight was requantized to the shared max scale
-        # and rebound transposed.
-        weight = model.qkv.weight
-        self.assertEqual(weight.dtype, torch.float8_e4m3fn)
-        self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
-        weight_scale = model.qkv.weight_scale
-        torch.testing.assert_close(
-            weight_scale.flatten(),
-            expected_max_scale.expand(weight_scale.numel()),
-            check_device=False,
-        )
-        torch.testing.assert_close(
-            model.qkv.input_scale.flatten().max(), torch.tensor(0.5), check_device=False
-        )
+                with patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization."
+                    "modelopt_quant.cutlass_fp8_supported",
+                    return_value=cutlass_supported,
+                ):
+                    model = fsdp_load.maybe_load_fsdp_model(
+                        model_cls=_FusedFp8Model,
+                        init_params={
+                            "quant_config": ModelOptFp8Config(
+                                is_checkpoint_fp8_serialized=True
+                            )
+                        },
+                        weight_dir_list=[],
+                        device=torch.device("cuda"),
+                        hsdp_replicate_dim=1,
+                        hsdp_shard_dim=1,
+                        param_dtype=torch.bfloat16,
+                        reduce_dtype=torch.float32,
+                        component_starts_on_cpu=True,
+                        weight_load_plan=load_plan,
+                        weights_iterator=iter(state_dict.items()),
+                    )
 
-        # The round trip through both quantizations stays close to the source.
-        # Loose on purpose: this guards against garbage (wrong scale, wrong
-        # shard order), not fp8 precision.
-        dequant = weight.t().float().cpu() * expected_max_scale
-        torch.testing.assert_close(
-            dequant, weight_ref, rtol=0.5, atol=float(expected_max_scale) * 8
-        )
+                # Both paths rebind the runtime weight transposed. CUTLASS can
+                # consume a channelwise scale, so it preserves the checkpoint's
+                # FP8 shards; the fallback requantizes them to one max scale.
+                weight = model.qkv.weight
+                self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+                self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
+                weight_scale = model.qkv.weight_scale.flatten()
+                if cutlass_supported:
+                    expected_scales = torch.repeat_interleave(
+                        checkpoint_scales, _SHARD_OUT
+                    )
+                    self.assertTrue(torch.equal(weight.t(), checkpoint_weight))
+                else:
+                    expected_scales = expected_max_scale.expand(weight_scale.numel())
+                torch.testing.assert_close(
+                    weight_scale,
+                    expected_scales,
+                    check_device=False,
+                )
+                torch.testing.assert_close(
+                    model.qkv.input_scale.flatten().max(),
+                    torch.tensor(0.5),
+                    check_device=False,
+                )
 
-        # Layerwise offload contract: the component lands on CPU afterwards,
-        # with the non-checkpoint buffer rebuilt.
-        self.assertEqual(weight.device.type, "cpu")
-        self.assertFalse(model.inv_freq.is_meta)
-        self.assertEqual(model.inv_freq.device.type, "cpu")
+                # The round trip stays close to the source. Loose on purpose:
+                # this guards against garbage (wrong scale or shard order), not
+                # FP8 precision.
+                dequant = weight.t().float().cpu() * weight_scale.float().cpu().view(
+                    -1, 1
+                )
+                torch.testing.assert_close(
+                    dequant,
+                    weight_ref,
+                    rtol=0.5,
+                    atol=float(expected_max_scale) * 8,
+                )
+
+                # Layerwise offload contract: the component lands on CPU
+                # afterwards, with the non-checkpoint buffer rebuilt.
+                self.assertEqual(weight.device.type, "cpu")
+                self.assertFalse(model.inv_freq.is_meta)
+                self.assertEqual(model.inv_freq.device.type, "cpu")
 
 
 if __name__ == "__main__":

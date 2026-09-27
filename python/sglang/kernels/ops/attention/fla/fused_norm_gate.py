@@ -390,9 +390,9 @@ class FusedRMSNormGated(nn.Module):
         residual_in_fp32: bool = False,
     ) -> torch.Tensor:
         if _use_cpu:
-            assert (
-                self.activation == "silu"
-            ), "CPU rmsnorm_gated currently only supports activation silu"
+            assert self.activation == "silu", (
+                "CPU rmsnorm_gated currently only supports activation silu"
+            )
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, g, self.eps
             )

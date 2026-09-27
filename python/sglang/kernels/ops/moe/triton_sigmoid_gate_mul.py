@@ -37,6 +37,8 @@ def _sigmoid_gate_mul_kernel(
 
 def sigmoid_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Compute ``x * sigmoid(gate)`` in a single fused kernel (same-shape)."""
+    assert x.shape == gate.shape, f"shape mismatch: {x.shape=} {gate.shape=}"
+    assert x.is_contiguous() and gate.is_contiguous(), "inputs must be contiguous"
     out = torch.empty_like(x)
     n = x.numel()
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)

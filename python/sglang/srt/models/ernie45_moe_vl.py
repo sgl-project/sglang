@@ -23,7 +23,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -41,6 +40,7 @@ from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
@@ -226,7 +226,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             layer_id >= vision_moe_layer_start_index
             and layer_id <= vision_moe_layer_end_index
         ):
-
             self.vision_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[1],
@@ -282,7 +281,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = get_is_capture_mode()
 
         if visual_token_mask is not None and not capturing:
             all_visual = visual_token_mask.all()
@@ -472,7 +471,7 @@ class Ernie4_5_VLMoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(

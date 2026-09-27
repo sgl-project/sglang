@@ -112,7 +112,7 @@ class MOVAPipelineConfig(PipelineConfig):
         )
         return image
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         if num_frames is None:
             return num_frames
         if num_frames % self.time_division_factor != self.time_division_remainder:
@@ -122,12 +122,13 @@ class MOVAPipelineConfig(PipelineConfig):
                 * self.time_division_factor
                 + self.time_division_remainder
             )
-            logger.warning(
-                "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
-                "Rounding to %s.",
-                num_frames,
-                adjusted,
-            )
+            if log_adjustment:
+                logger.warning(
+                    "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
+                    "Rounding to %s.",
+                    num_frames,
+                    adjusted,
+                )
             return adjusted
         return num_frames
 
@@ -194,3 +195,26 @@ class MOVA720PConfig(MOVAPipelineConfig):
     """Configuration for MOVA 720P (text+image -> video+audio) pipelines."""
 
     max_area: int = 720 * 1280
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.mova import (
+        MOVA_360P_SamplingParams,
+        MOVA_720P_SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )

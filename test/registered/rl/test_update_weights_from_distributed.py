@@ -43,7 +43,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=120, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
@@ -98,6 +98,7 @@ def _warmup_update(
 ):
     """Run one update round to warm up RCCL before timing."""
     if backend == "Engine":
+        engine.begin_weight_update()
         engine.update_weights_from_distributed(
             names,
             dtypes=dtypes,
@@ -105,7 +106,9 @@ def _warmup_update(
             group_name="test_parameter_update_group",
             load_format=load_format,
         )
+        engine.end_weight_update()
     else:
+        requests.post(f"{url}/begin_weight_update", json={})
         requests.post(
             f"{url}/update_weights_from_distributed",
             json={
@@ -117,6 +120,7 @@ def _warmup_update(
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
+        requests.post(f"{url}/end_weight_update", json={})
 
 
 def init_process(
@@ -439,6 +443,7 @@ def init_process_sgl(
 
     time_begin_update = time.perf_counter()
     if backend == "Engine":
+        engine.begin_weight_update()
         engine.update_weights_from_distributed(
             names,
             dtypes=dtypes,
@@ -446,7 +451,9 @@ def init_process_sgl(
             group_name="test_parameter_update_group",
             load_format=load_format,
         )
+        engine.end_weight_update()
     else:
+        requests.post(f"{url}/begin_weight_update", json={})
         requests.post(
             f"{url}/update_weights_from_distributed",
             json={
@@ -458,6 +465,7 @@ def init_process_sgl(
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
+        requests.post(f"{url}/end_weight_update", json={})
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:
@@ -636,9 +644,9 @@ def test_update_weights_from_distributed(
                 f"sgl_dp_2_instruct_params rank {i}",
             )
 
-    assert len(params["hf_instruct"]) == len(
-        params["hf_base"]
-    ), "hf_instruct_params and hf_base_params have different lengths"
+    assert len(params["hf_instruct"]) == len(params["hf_base"]), (
+        "hf_instruct_params and hf_base_params have different lengths"
+    )
 
     # Check if the weights of lm_head are tied with embed_tokens.
     params_to_check = [
@@ -688,18 +696,18 @@ def test_update_weights_from_distributed(
     # On local H100, it's 1 / 2
     time_limit = 3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 6
 
-    assert (
-        params["broadcast_time"] < time_limit
-    ), f"broadcast_time exceeds time limit {time_limit}s"
+    assert params["broadcast_time"] < time_limit, (
+        f"broadcast_time exceeds time limit {time_limit}s"
+    )
 
-    assert (
-        params["update_sgl_dp_1_time"] < time_limit
-    ), f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    assert params["update_sgl_dp_1_time"] < time_limit, (
+        f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    )
 
     if dp_size == 2:
-        assert (
-            params["update_sgl_dp_2_time"] < time_limit
-        ), f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        assert params["update_sgl_dp_2_time"] < time_limit, (
+            f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        )
 
     # Delete the context and close the parameter queue.
     del context
@@ -710,7 +718,6 @@ def test_update_weights_from_distributed(
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
-
     def test_update_weights_from_distributed(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

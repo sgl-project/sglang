@@ -613,37 +613,37 @@ def fused_qk_rope_reshape_and_cache(
             value_shuffle_layout = False
     (t_slot,) = slot_mapping.shape
 
-    assert (
-        t == tk == tv and t_slot <= tk
-    ), f"Number of tokens should be identical for q, kand v. The number of tokens of slot_mapping should no more than that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
-    assert (
-        block_size == block_size_v
-    ), f"block size should be identical for key_cache, and value_cache {block_size} {block_size_v}"
-    assert (
-        kh == vh == kh_cache == vh_cache
-    ), "KV head should be identical for k, v, key_cache, and value_cache"
-    assert (
-        t_cache == t_cache_v
-    ), "Number of tokens should be identical for key_cache, and value_cache"
+    assert t == tk == tv and t_slot <= tk, (
+        f"Number of tokens should be identical for q, kand v. The number of tokens of slot_mapping should no more than that of q, k and v, {t=} {tk=} {tv=} {t_slot=}"
+    )
+    assert block_size == block_size_v, (
+        f"block size should be identical for key_cache, and value_cache {block_size} {block_size_v}"
+    )
+    assert kh == vh == kh_cache == vh_cache, (
+        "KV head should be identical for k, v, key_cache, and value_cache"
+    )
+    assert t_cache == t_cache_v, (
+        "Number of tokens should be identical for key_cache, and value_cache"
+    )
     if flash_layout:
-        assert (
-            d == dk == dv == dk_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
+        assert d == dk == dv == dk_cache == dv_cache, (
+            "D dimension should be identical for q, k, and v"
+        )
     else:
-        assert (
-            d == dk == dv == dkx_cache * x_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
+        assert d == dk == dv == dkx_cache * x_cache == dv_cache, (
+            "D dimension should be identical for q, k, and v"
+        )
         assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
 
     assert d == triton.next_power_of_2(d), "D dimension should be power of 2"
-    assert block_size == triton.next_power_of_2(
-        block_size
-    ), "block_size should be power of 2"
+    assert block_size == triton.next_power_of_2(block_size), (
+        "block_size should be power of 2"
+    )
     assert qh % kh == 0, "Q heads must be multiple of H heads"
     d_freq = cos_sin.shape[-1] // 2
-    assert (d_freq == d // 2) or (
-        d_freq == d
-    ), "cos/sin last dim should be the same or half of the qk last dim"
+    assert (d_freq == d // 2) or (d_freq == d), (
+        "cos/sin last dim should be the same or half of the qk last dim"
+    )
     reuse_freqs_front_part = d_freq == d // 2
 
     if q_out is None:
@@ -654,9 +654,9 @@ def fused_qk_rope_reshape_and_cache(
 
     if zeros_out is not None:
         tz, qhz, dz = zeros_out.shape
-        assert (
-            t == tz and qh == qhz and d == dz
-        ), f"q and zeros shape mismatch {q.shape=} {zeros_out.shape=}"
+        assert t == tz and qh == qhz and d == dz, (
+            f"q and zeros shape mismatch {q.shape=} {zeros_out.shape=}"
+        )
         output_zeros = True
     elif output_zeros:
         zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)

@@ -33,7 +33,7 @@ def _clamped_swiglu(
 ) -> torch.Tensor:
     if limit is not None:
         if gate.is_cuda:
-            from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+            from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 
             gate_up = torch.cat((gate, up), dim=-1)
             output = torch.empty_like(gate)
@@ -49,6 +49,7 @@ class ExpertPackConfig(GGUFConfig):
 
     is_fp4_experts = True
     supports_kimi_k3_quantized_latent_projections = True
+    supports_kimi_k3_split_gguf_kv_b = True
 
     def __init__(self, store: ExpertPackStore) -> None:
         super().__init__()
