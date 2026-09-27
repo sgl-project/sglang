@@ -238,7 +238,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(single_dcp_rank):
 
     cache.conv[0].copy_(initial_conv)
     cache.temporal.copy_(initial_ssm)
-    fixture.b = fixture.b_raw.unsqueeze(0)  # FlashInfer consumes beta logits.
+    fixture.b = fixture.b_raw.unsqueeze(0)
     fixture.backend.linear_attn_backend.kernel_dispatcher = KDAKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
         LinearAttnKernelBackend.FLASHINFER,

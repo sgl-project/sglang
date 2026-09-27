@@ -527,8 +527,6 @@ class KimiDeltaAttention(nn.Module):
                 not forward_batch.forward_mode.is_target_verify()
                 and not use_flashinfer_kda_prefill()
             ):
-                # Triton extend takes probabilities; FlashInfer prefill and the
-                # verify/decode kernels take logits.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
