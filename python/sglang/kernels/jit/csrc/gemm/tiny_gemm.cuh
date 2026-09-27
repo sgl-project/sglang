@@ -59,6 +59,37 @@ struct GEMMTraitK {
   static_assert(kBlockSize <= kMaxBlockThreads, "block size exceeds the maximum block size");
 };
 
+template <uint32_t V>
+SGL_DEVICE void warp_reduce_sum_store(float (&v)[V], float* dst, uint32_t lane) {
+  constexpr uint32_t kSteps = __builtin_ctz(V | 32);
+  constexpr uint32_t kOwned = V >> kSteps;
+  uint32_t base = 0;
+#pragma unroll
+  for (uint32_t s = 0; s < kSteps; ++s) {
+    const uint32_t offset = 16 >> s, half = V >> (s + 1);
+    const bool upper = lane & offset;
+#pragma unroll
+    for (uint32_t i = 0; i < half; ++i) {
+      const float send = upper ? v[i] : v[i + half];
+      v[i] = (upper ? v[i + half] : v[i]) + __shfl_xor_sync(0xffffffff, send, offset);
+    }
+    if (upper) base += half;
+  }
+#pragma unroll
+  for (uint32_t offset = 16 >> kSteps; offset > 0; offset /= 2) {
+#pragma unroll
+    for (uint32_t i = 0; i < kOwned; ++i) {
+      v[i] += __shfl_xor_sync(0xffffffff, v[i], offset);
+    }
+  }
+  if (lane % (32 >> kSteps) == 0) {
+#pragma unroll
+    for (uint32_t i = 0; i < kOwned; ++i) {
+      dst[base + i] = v[i];
+    }
+  }
+}
+
 #define TINY_GEMM_KERNEL __global__ __launch_bounds__(Trait::kBlockSize, 1)  // grid: 1 block per SM
 
 struct TinyGEMMParams {
@@ -108,18 +139,18 @@ TINY_GEMM_KERNEL void tiny_n_gemm_kernel(const TinyGEMMParams params) {
   __shared__ float s_acc[kNumWarps][M * N_SPLIT];
   const uint32_t warp_id = tx / kWarpThreads;
 
+  float partial[M * N_SPLIT] = {};
 #pragma unroll
   for (uint32_t m = 0; m < M; ++m) {
 #pragma unroll
     for (uint32_t n = 0; n < N_SPLIT; ++n) {
-      float acc = 0.0f;
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) {
-        dot_product_vec(xv[m][u], wv[n][u], acc);
+        dot_product_vec(xv[m][u], wv[n][u], partial[m * N_SPLIT + n]);
       }
-      s_acc[warp_id][m * N_SPLIT + n] = warp::reduce_sum(acc);
     }
   }
+  warp_reduce_sum_store(partial, s_acc[warp_id], tx % kWarpThreads);
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
