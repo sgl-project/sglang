@@ -545,7 +545,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
-            # Only the Triton chain takes precomputed padded chunk tables.
+            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
             and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
             # Fused-accept staging (flashinfer verify) writes per extend.
             and self.accept_lens_pool is None
