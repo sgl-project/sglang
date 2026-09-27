@@ -33,24 +33,33 @@ support branch (0.9704 on rocm720, 0.9712 on rocm724, TP8 with graphs off), so
 the sgl-eval zero-shot/\\boxed{}/math_verify path and the checkpoint's sampling
 defaults are not costing accuracy relative to #36607's harness.
 
-Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
-scorer. GLM-5.3-Flash thinks by default, and the completion scorer takes the
-last number in the response, which a reasoning trace makes meaningless. The
-sgl-eval path is zero-shot chat with \\boxed{} extraction and math_verify
-grading, and the parameters below are the accuracy command the cookbook
-publishes for this model: 64 threads, 32768 max tokens, temperature 1.0,
-top_p 0.95, thinking on. The seed pins the sampling so a failure is a
-regression rather than a reroll.
+Eval harness: sgl-eval's gsm8k (zero-shot chat, \\boxed{} extraction,
+math_verify grading) through run_sgl_eval, rather than the legacy few-shot
+scorer that run_combined_tests routes gsm8k to. GLM-5.3-Flash thinks by
+default, and the legacy scorer takes the last number in the response, which a
+reasoning trace makes meaningless. The parameters below are the accuracy
+command the cookbook publishes for this model: 64 threads, 32768 max tokens,
+temperature 1.0, top_p 0.95, thinking on. The seed pins the sampling so a
+failure is a regression rather than a reroll.
 
 Registry: nightly-amd-8-gpu-mi35x-glm53-flash suite
 """
 
 import unittest
+from types import SimpleNamespace
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
+from sglang.srt.utils import kill_process_tree
+from sglang.test.accuracy_test_runner import (
+    AccuracyTestResult,
+    write_accuracy_github_summary,
+)
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.sgl_eval_utils import run_sgl_eval
+from sglang.test.test_utils import (
+    DEFAULT_URL_FOR_TEST,
+    ModelLaunchSettings,
+    popen_launch_server,
+)
 
 # Register for AMD CI - MI35x GLM-5.3-Flash accuracy test. Measured 3322 s
 # on rocm720 and 2673 s on rocm724; 5400 s covers a cold-cache load of the
@@ -62,6 +71,7 @@ register_amd_ci(
 )
 
 GLM_53_FLASH_MODEL_PATH = "zai-org/GLM-5.3-Flash"
+BASELINE_ACCURACY = 0.92
 
 # Fetching and loading a 328 GB checkpoint against a cold cache is what this
 # budget has to cover; the default launch timeout is nowhere near enough.
@@ -94,33 +104,61 @@ class TestGLM53FlashEvalMI35x(unittest.TestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]
-
-        variants = [
-            ModelLaunchSettings(
-                GLM_53_FLASH_MODEL_PATH,
-                tp_size=8,
-                extra_args=cookbook_args,
-                env={"SGLANG_USE_AITER": "1"},
-                variant="TP8-EP8",
-                launch_timeout=SERVER_LAUNCH_TIMEOUT,
-            ),
-        ]
-
-        run_combined_tests(
-            models=variants,
-            test_name="GLM-5.3-Flash (MI35x)",
-            accuracy_params=AccuracyTestParams(
-                dataset="gsm8k",
-                baseline_accuracy=0.92,
-                api="sgl_eval",
-                num_threads=64,
-                max_tokens=32768,
-                temperature=1.0,
-                top_p=0.95,
-                seed=42,
-                sgl_eval_thinking=True,
-            ),
+        model = ModelLaunchSettings(
+            GLM_53_FLASH_MODEL_PATH,
+            tp_size=8,
+            extra_args=cookbook_args,
+            env={"SGLANG_USE_AITER": "1"},
+            variant="TP8-EP8",
         )
+
+        # run_combined_tests routes gsm8k to the legacy scorer, so launch the
+        # server here and hand the eval to sgl-eval directly.
+        base_url = DEFAULT_URL_FOR_TEST
+        process = popen_launch_server(
+            model.model_path,
+            base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=model.extra_args,
+            env=model.env,
+        )
+        try:
+            metrics = run_sgl_eval(
+                SimpleNamespace(
+                    base_url=base_url,
+                    model=model.model_path,
+                    eval_name="gsm8k",
+                    num_examples=None,
+                    num_threads=64,
+                    max_tokens=32768,
+                    temperature=1.0,
+                    top_p=0.95,
+                    seed=42,
+                    sgl_eval_thinking=True,
+                )
+            )
+        finally:
+            kill_process_tree(process.pid)
+
+        score = metrics["score"]
+        passed = score >= BASELINE_ACCURACY
+        write_accuracy_github_summary(
+            "GLM-5.3-Flash (MI35x)",
+            "gsm8k",
+            [
+                AccuracyTestResult(
+                    model=model.model_path,
+                    dataset="gsm8k",
+                    passed=passed,
+                    score=score,
+                    baseline_accuracy=BASELINE_ACCURACY,
+                    error=None if passed else "below baseline",
+                    latency=metrics.get("latency"),
+                    variant=model.variant,
+                )
+            ],
+        )
+        self.assertGreaterEqual(score, BASELINE_ACCURACY)
 
 
 if __name__ == "__main__":
