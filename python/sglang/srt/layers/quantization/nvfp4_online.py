@@ -198,10 +198,9 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
 
     The weight keeps one FP32 decode scale for the whole shard; activations get
     one per token, computed each forward. The GEMM alpha is therefore a vector
-    of ``per_token_scale * weight_scale_2``, which only the FlashInfer backends
-    whose epilogue applies a row scale can consume: cute-dsl on SM10X and
-    cutlass on SM12X. Layers the FP4 GEMM cannot serve belong in
-    SGLANG_FP4_IGNORED_LAYERS.
+    of ``per_token_scale * weight_scale_2``, which only FlashInfer's cute-dsl
+    backend on SM100/SM103 can consume, since its epilogue applies a row scale.
+    Layers the FP4 GEMM cannot serve belong in SGLANG_FP4_IGNORED_LAYERS.
     """
 
     def __init__(self, quant_config: NvFp4OnlineConfig) -> None:
