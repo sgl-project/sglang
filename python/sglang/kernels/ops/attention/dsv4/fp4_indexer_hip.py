@@ -6,6 +6,8 @@ import os
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -129,23 +131,30 @@ def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
     return min(available_ctas, target_ctas)
 
 
-def _guarded_pages(logical_width: int) -> int:
+# FlyDSL compiles one kernel per page-table width; the V4.1 low-ratio indexers bucket
+# the width so a new context length does not pay a JIT
+LOW_RATIO_PAGE_TABLE_BUCKET = 64
+
+
+def _guarded_pages(logical_width: int, bucket: int = 4) -> int:
     """Page columns after padding for 256-token scheduling."""
-    return max(4, (logical_width + 3) // 4 * 4)
+    return max(4, (logical_width + bucket - 1) // bucket * bucket)
 
 
-def _guard_page_table(page_table: torch.Tensor, out: Optional[torch.Tensor] = None):
+def _guard_page_table(
+    page_table: torch.Tensor, out: Optional[torch.Tensor] = None, bucket: int = 4
+):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         pad_page_table,
     )
 
-    return pad_page_table(page_table, out=out)
+    return pad_page_table(page_table, out=out, bucket=bucket)
 
 
-def logits_rows_per_chunk(page_table: torch.Tensor) -> int:
+def logits_rows_per_chunk(page_table: torch.Tensor, bucket: int = 4) -> int:
     """Rows whose logits fit the pooled block, for callers that loop by row."""
-    width = _guarded_pages(page_table.shape[1]) * _KV_BLOCK_SIZE
+    width = _guarded_pages(page_table.shape[1], bucket) * _KV_BLOCK_SIZE
     return max(1, _LOGITS_BUDGET_ELEMS // width)
 
 
@@ -188,6 +197,7 @@ def _alloc_logits(
 def prepare_fp4_decode_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
+    bucket: int = 4,
 ) -> FP4DecodeWorkspace:
     """Build the decode page-table, schedule, and logits buffers.
 
@@ -199,7 +209,7 @@ def prepare_fp4_decode_workspace(
         compute_varctx_schedule,
     )
 
-    guarded, max_seq_len = _guard_page_table(page_table)
+    guarded, max_seq_len = _guard_page_table(page_table, bucket=bucket)
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     num_queries = guarded.shape[0]
     cta_count = _decode_cta_count(num_queries, max_seq_len)
@@ -225,6 +235,7 @@ def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
     workspace: Optional[FP4PrefillWorkspace] = None,
+    bucket: int = 4,
 ) -> FP4PrefillWorkspace:
     """Build or refresh the prefill page-table, schedule, and logits buffers.
 
@@ -247,7 +258,7 @@ def prepare_fp4_prefill_workspace(
 
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     if workspace is None:
-        rows, _, padded_width = padded_page_table_shape(page_table)
+        rows, _, padded_width = padded_page_table_shape(page_table, bucket)
         cta_count = max(_PREFILL_BASE_CTA_TARGET, rows)
         device = page_table.device
         buffers = PrefillScheduleBuffers(rows, device)
@@ -280,6 +291,7 @@ def prepare_fp4_prefill_workspace(
         block_k=256,
         guarded_out=workspace.guarded_page_table,
         buffers=workspace.schedule_buffers,
+        bucket=bucket,
     )
     return workspace
 
@@ -297,6 +309,7 @@ def aiter_fp4_paged_mqa_logits(
     is_decode: bool,
     decode_workspace: Optional[FP4DecodeWorkspace] = None,
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
+    page_table_bucket: int = 4,
 ) -> torch.Tensor:
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
     from aiter.ops.flydsl import (
@@ -318,7 +331,9 @@ def aiter_fp4_paged_mqa_logits(
         page_table = workspace.guarded_page_table
         max_seq_len = workspace.max_seq_len
     elif is_decode:
-        page_table, max_seq_len = _guard_page_table(page_table)
+        page_table, max_seq_len = _guard_page_table(
+            page_table, bucket=page_table_bucket
+        )
     else:
         # No usable workspace (DP padding or truncated activations): build the
         # schedule here rather than letting AITER rebuild it from ~29 torch ops
@@ -332,7 +347,7 @@ def aiter_fp4_paged_mqa_logits(
             padded_page_table_shape,
         )
 
-        _, _, padded_width = padded_page_table_shape(page_table)
+        _, _, padded_width = padded_page_table_shape(page_table, page_table_bucket)
         max_seq_len = padded_width * _KV_BLOCK_SIZE
         cta_count = max(_PREFILL_BASE_CTA_TARGET, num_tokens)
         cta_info = torch.empty(
@@ -347,6 +362,7 @@ def aiter_fp4_paged_mqa_logits(
             parallel_unit_num=cta_count,
             max_seq_len=max_seq_len,
             block_k=256,
+            bucket=page_table_bucket,
         )
         fallback_schedule = (cta_info, cta_count, buffers)
     q_payload = q_fp4.view(torch.uint8)
@@ -374,7 +390,7 @@ def aiter_fp4_paged_mqa_logits(
             }
         )
         logits = flydsl_pa_mqa_logits_fp4(
-            q_payload.reshape(num_tokens, 1, _HEADS, _HEAD_DIM // 2),
+            q_payload.reshape(num_tokens, 1, q_fp4.shape[-2], _HEAD_DIM // 2),
             q_scale.reshape(num_tokens, 1, *_Q_SCALE_SHAPE),
             k_payload,
             k_scale,
@@ -497,3 +513,179 @@ def aiter_k_indexer_fp4_cache_write(
         shuffle_scale=True,
         do_rotate_act=True,
     )
+
+
+# Indexer K in the FlyDSL split payload / scale layout; bytes equal AITER's fp4 writer up to the sign of zero
+@triton.jit
+def _store_fp4_index_k_split_kernel(
+    k_fp4,
+    k_sf,
+    payload,
+    scale,
+    loc,
+    page_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    cache_loc = tl.load(loc + token_id)
+    page = cache_loc // page_size
+    page_offset = cache_loc - page * page_size
+
+    # payload [page, 1, 4 chunks, page_size, 16 bytes]: chunk c holds dims [32c, 32c + 32).
+    offsets = tl.arange(0, BLOCK)
+    chunk = offsets // 16
+    byte = offsets - chunk * 16
+    k = tl.load(k_fp4 + token_id * BLOCK + offsets)
+    tl.store(
+        payload
+        + page * (4 * page_size * 16)
+        + chunk * (page_size * 16)
+        + page_offset * 16
+        + byte,
+        k,
+    )
+    # scale [page, 1, 4, page_size]: the slot axis is the transpose of a 16 x 4 tile (the FlyDSL K ABI)
+    shuffled = (page_offset % 16) * 4 + page_offset // 16
+    sf = tl.load(k_sf + token_id)
+    sf_offsets = tl.arange(0, 4)
+    sf_bytes = ((sf >> (sf_offsets * 8)) & 0xFF).to(tl.uint8)
+    tl.store(
+        scale + page * (4 * page_size) + sf_offsets * page_size + shuffled, sf_bytes
+    )
+
+
+def store_fp4_index_k_cache_split(
+    input: torch.Tensor,
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    page_size: int,
+    rne: bool = False,
+) -> None:
+    """Quantize `input` [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
+    loc[i] of the split FlyDSL K layout (`payload` [pages, 1, 4, page_size, 16],
+    `scale` [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        quantize_fp4_indexer_tensor,
+    )
+
+    assert input.shape[-1] == _HEAD_DIM
+    assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
+    assert scale.shape[1:] == (1, 4, page_size), scale.shape
+    k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
+    n_tokens = k_fp4.shape[0]
+    if n_tokens == 0:
+        return
+    _store_fp4_index_k_split_kernel[(n_tokens,)](
+        k_fp4.view(torch.uint8),
+        k_sf,
+        payload.view(torch.uint8),
+        scale,
+        loc,
+        page_size,
+        BLOCK=64,
+    )
+
+
+def read_fp4_index_k_split(
+    payload: torch.Tensor, scale: torch.Tensor, slots: torch.Tensor, *, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of `store_fp4_index_k_cache_split`: (payload int8 [n, 64], scales
+    int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
+    `quantize_fp4_indexer_tensor`."""
+    slots = slots.to(torch.int64)
+    page, off = slots // page_size, slots % page_size
+    rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
+    rows = rows.reshape(-1, 64).view(torch.int8)
+    shuffled = (off % 16) * 4 + off // 16
+    sf = scale[page, 0, :, shuffled].to(torch.int32)  # [n, 4]
+    packed = sf[:, 0] | (sf[:, 1] << 8) | (sf[:, 2] << 16) | (sf[:, 3] << 24)
+    return rows, packed
+
+
+def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp4-grid query [T, H, 128] -> (payload int8 [T, H, 64], scale uint8
+    [T, 1, 4, 16, 4]) in the FlyDSL MQA-logits layout: the e8m0 byte of head h,
+    chunk c sits at [t, 0, c, h % 16, h // 16] (H <= 64). Ties round to even
+    (`rne=True`), the same quantizer and convention as the CUDA low-ratio path."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        quantize_fp4_indexer_tensor,
+    )
+
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+    q_fp4 = q_fp4.view(num_tokens, heads, 64)
+    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
+    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
+    return q_fp4, q_scale
+
+
+# the router module is ROCm-only and this is consulted at indexer init on every platform, so import lazily
+def rocm_indexer_head_weights_max_tokens(
+    n_heads: int, hidden_size: int, weight_dtype: torch.dtype
+) -> int:
+    """Rows up to which :func:`rocm_indexer_head_weights` serves ``weights_proj``,
+    -1 when the device (non-gfx95) or the shape rules it out."""
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_gemv_split_k_max_tokens
+
+    return rocm_gemv_split_k_max_tokens(
+        n=n_heads, k=hidden_size, weight_dtype=weight_dtype
+    )
+
+
+@triton.jit
+def _reduce_scale_bf16_kernel(
+    part_ptr,
+    out_ptr,
+    M,
+    stride_ps,
+    stride_pm,
+    stride_om,
+    scale,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs // N
+    n = offs % N
+    mask = m < M
+    acc = tl.load(part_ptr + m * stride_pm + n, mask=mask, other=0.0)
+    for s in tl.static_range(1, SPLIT_K):
+        acc += tl.load(
+            part_ptr + s * stride_ps + m * stride_pm + n, mask=mask, other=0.0
+        )
+    # bf16(bf16(sum) * scale): the linear's bf16 output, then the aten multiply rounded to bf16
+    w = acc.to(tl.bfloat16).to(tl.float32) * scale
+    tl.store(out_ptr + m * stride_om + n, w.to(tl.bfloat16), mask=mask)
+
+
+def rocm_indexer_head_weights(
+    x: torch.Tensor, weight: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """``bf16(bf16(x @ weight.T) * scale)`` as a contiguous bf16 ``[M, N]``, the
+    layout the FlyDSL logits kernels take.  ``x`` bf16 ``[M, K]`` with
+    ``M <= rocm_indexer_head_weights_max_tokens(...)``, ``weight`` bf16 ``[N, K]``."""
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+
+    partials = rocm_router_gemv_split_k(x, weight)
+    split_k, M, N = partials.shape
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    block = triton.next_power_of_2(M * N)
+    _reduce_scale_bf16_kernel[(triton.cdiv(M * N, block),)](
+        partials,
+        out,
+        M,
+        partials.stride(0),
+        partials.stride(1),
+        out.stride(0),
+        float(scale),
+        N=N,
+        SPLIT_K=split_k,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out

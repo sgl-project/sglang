@@ -17,7 +17,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_gfx942_supported
+
+_is_hip = is_hip()
 
 # gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
 # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
@@ -836,6 +839,14 @@ def _prune_dual_scope_configs(configs, named_args, **kwargs):
     h_q = named_args.get("h_q", 128)
     if h_q <= 64:
         pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= 16]
+        if _is_hip:
+            # the autotuner's pick varies per launch and fixes the fp32 accumulation order, so pin one tile
+            pinned = [
+                c
+                for c in pruned
+                if c.kwargs.get("BLOCK_N", 64) == 16 and c.num_warps == 4
+            ]
+            pruned = pinned if pinned else pruned
     else:
         pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= h_q]
     return pruned if pruned else configs
@@ -855,7 +866,16 @@ def _prune_dual_scope_configs(configs, named_args, **kwargs):
         # warps=8: for memory-bound scenarios
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-    ],
+    ]
+    # the 16- and 32-key tiles the HIP prune considers; kept out of the CUDA autotune space
+    + (
+        [
+            triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        ]
+        if _is_hip
+        else []
+    ),
     key=["total_tokens_bucket", "h_q", "topk_main", "topk_extra"],
     prune_configs_by={"early_config_prune": _prune_dual_scope_configs},
 )

@@ -17,7 +17,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
 )
@@ -41,7 +40,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -300,7 +298,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
-        Cosmos3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -524,7 +521,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
-            "cosmos3_omni",
         ):
             return None
 
@@ -660,7 +656,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
-                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -770,7 +765,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
-            "cosmos3_omni",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,
@@ -898,7 +892,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
         if not (
             self.keep_mm_features_on_device
-            and get_mm().mm_enable_dp_encoder
+            and self.server_args.mm_enable_dp_encoder
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):

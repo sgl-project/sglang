@@ -26,7 +26,7 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
             MultimodalDataItem(
                 modality=Modality.IMAGE,
                 offsets=offsets,
-                precomputed_embeddings=embeddings[Modality.IMAGE],
+                precomputed_embeddings=embeddings,
             )
         ]
 

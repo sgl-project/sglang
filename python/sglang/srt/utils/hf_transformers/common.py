@@ -25,11 +25,6 @@ from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
     ChatGLMConfig,
-    Cosmos3Config,
-    Cosmos3EdgeConfig,
-    Cosmos3EdgeProjectorConfig,
-    Cosmos3EdgeTextConfig,
-    Cosmos3EdgeVisionConfig,
     DbrxConfig,
     DeepseekVL2Config,
     Dots3Config,
@@ -37,10 +32,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
-    Glm5NextConfig,
-    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
-    HYV4Config,
     InklingAudioConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -65,7 +57,6 @@ from sglang.srt.configs import (
     MultiModalityConfig,
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
-    NanbeigeConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -83,6 +74,10 @@ from sglang.srt.configs import (
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.srt.configs.deepseek_v41 import (
+    DEEPSEEK_V41_CONFIG_CLASSES,
+    normalize_deepseek_v4_fields,
+)
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -122,13 +117,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MuseGlimmerConfig,
         MuseGlimmerAssistantConfig,
         KimiK3Config,
-        Glm5NextConfig,
-        Glm5NextTextConfig,
         KimiLinearConfig,
         Qwen3NextConfig,
         FalconH1Config,
         GraniteMoeHybridConfig,
-        HYV4Config,
         DotsVLMConfig,
         DotsOCRConfig,
         Dots3Config,
@@ -136,7 +128,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
         NemotronHPuzzleConfig,
-        NanbeigeConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
@@ -176,9 +167,31 @@ try:
 
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
+        hc_pre_from_prev_sublayer = False
+        # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
+        q_head_norm = True
+        kv_source_layer_ids = ()
+        index_source_layer_ids = ()
+        candidate_source_layer_id = -1
+        candidate_topk_blocks = 0
+        candidate_block_size = 0
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_token_id = 2
+        engram_compressed_vocab_size = 0
+
+        def __init__(self, **kwargs):
+            super().__init__(**normalize_deepseek_v4_fields(kwargs))
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+    _CONFIG_REGISTRY.update(
+        {cls.model_type: cls for cls in DEEPSEEK_V41_CONFIG_CLASSES}
+    )
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):
@@ -235,42 +248,6 @@ for name, cls in _CONFIG_REGISTRY.items():
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:
             logger.warning("Failed to register config %s: %s", name, e)
-
-# Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
-# with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
-# flattened onto the top-level config in `get_config` — the same path the base
-# Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
-# `from_pretrained` reload that drops that flattening.
-try:
-    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
-except ValueError as e:
-    err = str(e).lower()
-    if "already registered" not in err and "already used" not in err:
-        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
-
-# Cosmos3-Edge native text support starts from the checkpoint root config, then
-# consumes ``text_config`` in ``sglang.srt.models.cosmos3_edge``. Keep it out of
-# `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
-# root config after `AutoConfig.from_pretrained`, matching other multimodal
-# configs that use a text sub-config.
-for _cosmos3_edge_config_cls in (
-    Cosmos3EdgeTextConfig,
-    Cosmos3EdgeVisionConfig,
-    Cosmos3EdgeProjectorConfig,
-    Cosmos3EdgeConfig,
-):
-    try:
-        AutoConfig.register(
-            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
-        )
-    except ValueError as e:
-        err = str(e).lower()
-        if "already registered" not in err and "already used" not in err:
-            logger.warning(
-                "Failed to register config %s: %s",
-                _cosmos3_edge_config_cls.model_type,
-                e,
-            )
 
 
 # ---------------------------------------------------------------------------

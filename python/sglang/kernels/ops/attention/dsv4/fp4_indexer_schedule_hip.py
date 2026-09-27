@@ -167,7 +167,9 @@ def _pad_page_table_kernel(
     )
 
 
-def padded_page_table_shape(page_table: torch.Tensor) -> Tuple[int, int, int]:
+def padded_page_table_shape(
+    page_table: torch.Tensor, bucket: int = 4
+) -> Tuple[int, int, int]:
     """Rows, logical width, and the 256-token-scheduling padded width.
 
     The padding rule is shared with the logits sizing in ``fp4_indexer_hip``;
@@ -176,7 +178,7 @@ def padded_page_table_shape(page_table: torch.Tensor) -> Tuple[int, int, int]:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import _guarded_pages
 
     rows, logical_width = page_table.shape
-    return rows, logical_width, _guarded_pages(logical_width)
+    return rows, logical_width, _guarded_pages(logical_width, bucket)
 
 
 def _as_int32_2d(page_table: torch.Tensor) -> torch.Tensor:
@@ -189,7 +191,7 @@ def _as_int32_2d(page_table: torch.Tensor) -> torch.Tensor:
 
 
 def pad_page_table(
-    page_table: torch.Tensor, out: Optional[torch.Tensor] = None
+    page_table: torch.Tensor, out: Optional[torch.Tensor] = None, bucket: int = 4
 ) -> Tuple[torch.Tensor, int]:
     """Pad a page table for 256-token scheduling in a single dispatch.
 
@@ -197,7 +199,7 @@ def pad_page_table(
     output element, so the destination never needs pre-zeroing.
     """
     page_table = _as_int32_2d(page_table)
-    rows, logical_width, padded_width = padded_page_table_shape(page_table)
+    rows, logical_width, padded_width = padded_page_table_shape(page_table, bucket)
     if out is None:
         out = page_table.new_empty((rows, padded_width + 4))
     else:
@@ -269,6 +271,7 @@ def build_prefill_schedule(
     block_k: int = 256,
     guarded_out: Optional[torch.Tensor] = None,
     buffers: Optional[PrefillScheduleBuffers] = None,
+    bucket: int = 4,
 ) -> Tuple[torch.Tensor, PrefillScheduleBuffers]:
     """Pad the page table and build the FP4 prefill schedule in two dispatches.
 
@@ -282,7 +285,7 @@ def build_prefill_schedule(
     )
 
     page_table = _as_int32_2d(page_table)
-    rows, logical_width, padded_width = padded_page_table_shape(page_table)
+    rows, logical_width, padded_width = padded_page_table_shape(page_table, bucket)
     total_rows = local_ends.shape[0]
     assert total_rows <= rows, (
         f"local_ends rows {total_rows} exceed the page table's {rows}; the "

@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -68,8 +68,8 @@ def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
-    remote_instance_weight_info: Any | None
-    startup_weight_load: Any | None = None
+    remote_instance_weight_info: Optional[Any]
+    startup_weight_load: Optional[Any] = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
@@ -87,7 +87,7 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, tp_rank: int, load_format: str | None = None
+    *, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
@@ -132,11 +132,12 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0."
+                "provided. Defaulting to scaling factors of 1.0. "
+                "This may lead to less accurate results!"
             )
 
 
-def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
+def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
     # Parse other args
     sliding_window_size = None
     if hasattr(model, "get_attention_sliding_window_size"):
@@ -196,12 +197,12 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
-    load_format: str | None = None,
+    load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
-    draft_model_idx: int | None,
+    draft_model_idx: Optional[int],
     weight_cache_mode: str,
-    weight_cache_socket: str | None,
+    weight_cache_socket: Optional[str],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -255,6 +256,7 @@ def maybe_enable_ipc_weight_cache(
 
 def load_model_with_memory_saver(
     *,
+    server_args: ServerArgs,
     model_config: ModelConfig,
     load_config: LoadConfig,
     device: str,
@@ -290,7 +292,7 @@ def load_model_with_memory_saver(
             model_config=model_config,
         )
         device_config = DeviceConfig(device, gpu_id)
-        if get_model().is_startup_weight_load_overlap:
+        if server_args.is_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
             )
@@ -328,7 +330,7 @@ def load_model_with_memory_saver(
 
 def dist_barrier_after_load(
     *,
-    elastic_ep_backend: str | None,
+    elastic_ep_backend: Optional[str],
     tp_rank: int,
     is_ep_joiner: bool = False,
 ) -> None:

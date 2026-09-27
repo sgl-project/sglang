@@ -537,11 +537,8 @@ class UnifiedTreeCoreInterface(ABC):
     write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
-    def mark_write_through_pending(
-        self, node_ids: list[NodeId], ack_id: NodeId
-    ) -> list[NodeId]:
-        """Mark every node covered by one in-flight write-through backup, and return
-        them ancestors first: publish links each host store event to its parent."""
+    def mark_write_through_pending(self, node_id: NodeId) -> None:
+        """Mark a node as having an in-flight write-through backup."""
         ...
 
     @abstractmethod

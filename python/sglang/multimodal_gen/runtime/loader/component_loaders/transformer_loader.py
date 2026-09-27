@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
@@ -524,14 +525,20 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         # Model construction resolves attention implementations, so apply the
         # quantization-specific default around FSDP initialization and loading.
         with attn_backend_context:
-            model = self.load_state_dict_model(
+            model = maybe_load_fsdp_model(
                 model_cls=model_cls,
                 init_params=init_params,
-                weight_files=safetensors_list,
-                server_args=component_server_args,
-                component_name=component_name,
+                weight_dir_list=safetensors_list,
+                device=local_torch_device,
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
                 component_starts_on_cpu=component_starts_on_cpu,
-                dtype=quant_spec.param_dtype,
+                pin_cpu_memory=component_server_args.pin_cpu_memory,
+                fsdp_inference=use_fsdp,
+                param_dtype=quant_spec.param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
                 weight_load_plan=weight_load_plan,
                 checkpoint_key_filter=checkpoint_key_filter,
                 weights_iterator=(

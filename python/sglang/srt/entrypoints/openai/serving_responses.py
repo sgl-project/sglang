@@ -73,7 +73,6 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -2032,7 +2031,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None
         flushed = False
         stream_offset = 0
-        incremental = get_serving().incremental_streaming_output
+        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
 
         def _open_reasoning_item() -> str:
             nonlocal current_output_index

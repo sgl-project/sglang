@@ -34,6 +34,7 @@ class OperationsStrategy:
     def init_new_tbo(
         layers: torch.nn.ModuleList,
         forward_mode: ForwardMode,
+        use_cp: bool = False,
     ) -> "OperationsStrategy":
         layer_name = layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
@@ -67,7 +68,7 @@ class OperationsStrategy:
             return OperationsStrategy.concat(
                 [
                     _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
-                        layer, forward_mode
+                        layer, forward_mode, use_cp=use_cp
                     )
                     for layer in layers
                 ]
@@ -170,9 +171,10 @@ def _compute_moe_deepseek_blog_decode(layer):
 def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
+    use_cp: bool = False,
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
-        return _compute_moe_deepseek_v4_prefill(layer)
+        return _compute_moe_deepseek_v4_prefill(layer, use_cp=use_cp)
     else:
         # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
         # regresses; needs cuda-graph capture work). Prefill-only for now.
@@ -181,10 +183,28 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
         )
 
 
-def _compute_moe_deepseek_v4_prefill(layer):
+def _compute_moe_deepseek_v4_prefill(layer, use_cp: bool = False):
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
-    if get_moe_a2a_backend().is_none():
+    if use_cp:
+        assert get_moe_a2a_backend().is_none(), (
+            "DSA prefill CP + TBO is only wired for the non-EP TP-MoE path "
+            "(moe_a2a_backend == none)."
+        )
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_cp_gather_a,
+            operations.YieldOperation(),
+            layer.op_cp_gather_b,
+            layer.op_cp_moe,
+            layer.op_cp_combine_a,
+            operations.YieldOperation(),
+            layer.op_cp_combine_b,
+            layer.op_mhc_postprocess,
+        ]
+    elif get_moe_a2a_backend().is_none():
         # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv
         # (combine) with the other ubatch's attn+MoE compute (ATOM's DSV4 path).
         ops = [

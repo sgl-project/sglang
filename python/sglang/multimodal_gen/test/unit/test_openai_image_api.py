@@ -1,4 +1,3 @@
-import inspect
 import os
 from dataclasses import fields
 
@@ -24,16 +23,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
-    edits,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-
-
-def test_image_edits_declares_perf_dump_path_form_field():
-    assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
 def test_url_response_returns_one_item_per_output_path():

@@ -201,9 +201,6 @@ class PipelineConfig:
     native_only_components: ClassVar[tuple[str, ...]] = ()
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
-    # False when changing component placement after a calibration request is
-    # known to alter the pipeline's numerical path.
-    supports_auto_residency: bool = True
     # Components that cannot fall back to a native Transformers/Diffusers
     # implementation because their pipeline requires SGLang-specific behavior.
     native_only_components: tuple[str, ...] = ()
@@ -236,15 +233,11 @@ class PipelineConfig:
     # dtype resident so lossless requests never consume pre-rounded weights.
     vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
-    vae_slicing: bool = False
-    vae_sp: bool = True
-
-    # Diffusion Decoder configuration
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.
     diffusion_decoder_tiling: bool = True
-    # Splits those tiles across the decode-parallel ranks.
-    diffusion_decoder_parallel_tiling: bool = True
+    vae_slicing: bool = False
+    vae_sp: bool = True
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -384,7 +377,7 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
+    def adjust_num_frames(self, num_frames):
         return num_frames
 
     # tokenize the prompt
@@ -868,19 +861,6 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
             default=PipelineConfig.diffusion_decoder_tiling,
             help="Enable tiling for the LTX-2.5 diffusion decoder",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}diffusion-decoder-parallel-tiling",
-            action=StoreBoolean,
-            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_parallel_tiling",
-            default=PipelineConfig.diffusion_decoder_parallel_tiling,
-            help=(
-                "Split the LTX-2.5 diffusion decoder's tiles across the "
-                "decode-parallel ranks (TP/SP/PP/CFG within a replica). "
-                "Requires --diffusion-decoder-tiling, since the tiles it "
-                "splits only exist on that path; inert otherwise, and at a "
-                "single rank"
-            ),
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",

@@ -5,9 +5,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    StageParallelismType,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -79,13 +76,9 @@ class LTX2AVDecodingStage(DecodingStage):
         It is a diffusion model in its own right, so it needs a generator; the
         request's seed keeps a decode reproducible.
         """
-        # Untiled, every stage attends over the whole volume
+        # Untiled, every stage attends over the whole volume -- minutes at a
+        # full-length 121-frame grid.
         decoder.use_tiling = bool(server_args.pipeline_config.diffusion_decoder_tiling)
-        # Splitting the tiles is a collective over the decode-parallel group
-        decoder.use_parallel_tiling = (
-            bool(server_args.pipeline_config.diffusion_decoder_parallel_tiling)
-            and self.parallelism_type == StageParallelismType.REPLICATED
-        )
         generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed))
         return decoder(latents, generator=generator)
 

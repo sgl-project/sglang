@@ -13,7 +13,8 @@ consumed as-is) and the activation is MXFP8-quantized in one fused pass.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import functools
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -331,3 +332,195 @@ def dot_scaled_mxfp8_blockscaled_linear(
     if bias is not None:
         out = out + bias
     return out.to(output_dtype).view(*output_shape)
+
+
+# bf16-dequant route: both operands are exact in bf16, so only the fp32 summation order differs from MXFP8
+class Fp8GridActivation(NamedTuple):
+    """A bf16 activation already on the fp8 e4m3 grid with a per-32 ue8m0 scale; the bf16-dequant
+    linear skips ``fake_quant_fp8_activation`` for it, every other consumer unwraps ``.x``."""
+
+    x: torch.Tensor
+
+
+class Mxfp8Activation(NamedTuple):
+    """An activation quantized as the CUDA MXFP8 route quantizes it: ``q`` fp8 e4m3 ``[M, K]`` and
+    ``scale`` ue8m0 exponent bytes ``[M, K // 32]``; dequantized it is the ``Fp8GridActivation`` of
+    the same input."""
+
+    q: torch.Tensor
+    scale: torch.Tensor
+
+
+@triton.jit
+def fp8_grid_quant(xg, eps):
+    """``xg`` is fp32 ``[G, 32]``; returns ``(q, exp)``: the fp8 e4m3 codes of each
+    group scaled by the smallest power of two >= amax / 448, and that scale's
+    ue8m0 exponent per group (the same rule as ``fp8_grid_round``)."""
+    amax = tl.max(tl.abs(xg), axis=1)
+    amax = tl.maximum(amax, eps)
+    raw = amax * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exp = (bits >> 23) & 0xFF
+    exp = exp + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    exp = tl.minimum(tl.maximum(exp, 1), 254)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    scaled = tl.clamp(xg / scale[:, None], -448.0, 448.0)
+    return scaled.to(tl.float8e4nv), exp
+
+
+@triton.jit
+def fp8_grid_round(xg, eps):
+    """``xg`` is fp32 ``[G, 32]``, one ue8m0 group per row; returns it rounded to the
+    fp8 e4m3 grid of its group scale (smallest power of two >= amax / 448)."""
+    amax = tl.max(tl.abs(xg), axis=1)
+    amax = tl.maximum(amax, eps)
+    # Smallest power of two >= amax / 448, on the IEEE bits (exact at powers of two).
+    raw = amax * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exp = (bits >> 23) & 0xFF
+    exp = exp + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    exp = tl.minimum(tl.maximum(exp, 1), 254)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    scaled = tl.clamp(xg / scale[:, None], -448.0, 448.0)
+    return scaled.to(tl.float8e4nv).to(tl.float32) * scale[:, None]
+
+
+@triton.jit
+def _fake_quant_fp8_kernel(
+    x_ptr,
+    out_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_om,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Per-32 ue8m0 fp8 e4m3 quantize-dequantize, one program per [BLOCK_M, BLOCK_K]."""
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    x = tl.load(
+        x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
+        mask=m_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    xg = tl.reshape(x, (BLOCK_M * (BLOCK_K // 32), 32))
+    q = fp8_grid_round(xg, eps)
+    out = tl.reshape(q, (BLOCK_M, BLOCK_K))
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_k[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=m_mask[:, None],
+    )
+
+
+def fake_quant_fp8_activation(x: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """bf16 [M, K] -> bf16 [M, K] on the fp8 e4m3 grid with a per-32 ue8m0 scale
+    (the same rule as the CUDA path's `sglang_per_token_group_quant_fp8(scale_ue8m0=True)`)."""
+    assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
+    x = x.contiguous()
+    M, K = x.shape
+    out = torch.empty_like(x)
+    if M == 0:
+        return out
+    # per-element op, so the tile never changes the result
+    if M >= 1024 and K % 512 == 0:
+        BLOCK_M, BLOCK_K, num_warps = 32, 512, 8
+    else:
+        BLOCK_K = 256 if K % 256 == 0 else (128 if K % 128 == 0 else 32)
+        BLOCK_M, num_warps = (16 if M >= 1024 else 8), 4
+    grid = (triton.cdiv(M, BLOCK_M), K // BLOCK_K)
+    _fake_quant_fp8_kernel[grid](
+        x,
+        out,
+        M,
+        K,
+        x.stride(0),
+        out.stride(0),
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def dequant_block_fp8_weight_to_bf16(
+    weight: torch.Tensor, weight_scale: torch.Tensor, block_size
+) -> torch.Tensor:
+    """fp8 e4m3 [N, K] with fp32 power-of-two block scales [ceil(N / bn), K // bk]
+    -> bf16 [N, K], exact (an e4m3 value times a power of two fits bf16)."""
+    n, k = weight.shape
+    block_n, block_k = block_size
+    scale = weight_scale.float().repeat_interleave(block_n, dim=0)[:n]
+    scale = scale.repeat_interleave(block_k, dim=1)[:, :k]
+    return (weight.float() * scale).to(torch.bfloat16)
+
+
+# at one or two rows aiter's wvSpltK (fixed-order split-K) beats hipBLASLt's small-M kernels
+SKINNY_GEMM_MAX_TOKENS = 2
+
+
+@functools.cache
+def _skinny_cu_count() -> int:
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num
+    except ImportError:
+        return 0
+    return int(get_cu_num())
+
+
+def _skinny_gemm_eligible(weight: torch.Tensor) -> bool:
+    return (
+        _skinny_cu_count() > 0
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and weight.shape[1] % 8 == 0
+    )
+
+
+def _skinny_gemm_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    import aiter
+
+    out = torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+    aiter.wvSpltK(weight, x, out, x.shape[0], _skinny_cu_count())
+    return out
+
+
+def bf16_dequant_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+    input_on_fp8_grid: bool = False,
+) -> torch.Tensor:
+    """`weight` is the dequantized bf16 weight (`dequant_block_fp8_weight_to_bf16`);
+    `weight_scale` / `input_scale` are unused and kept for the linear signature.
+    `input_on_fp8_grid` says a fused upstream kernel (`rmsnorm_fake_quant_fp8`)
+    already put `input` on the fp8 grid, so the fake-quant here is skipped."""
+    assert weight.dtype == torch.bfloat16, weight.dtype
+    assert input_scale is None, "pre-quantized inputs do not reach this route"
+    input_2d = input.view(-1, input.shape[-1])
+    if input_on_fp8_grid:
+        x = input_2d.to(torch.bfloat16)
+    else:
+        x = fake_quant_fp8_activation(input_2d.to(torch.bfloat16))
+    if (
+        bias is None
+        and x.shape[0] <= SKINNY_GEMM_MAX_TOKENS
+        and _skinny_gemm_eligible(weight)
+    ):
+        out = _skinny_gemm_bf16(x, weight)
+    else:
+        out = F.linear(x, weight, bias)
+    if output_dtype is not None and out.dtype != output_dtype:
+        out = out.to(output_dtype)
+    return out.view(*input.shape[:-1], weight.shape[0])

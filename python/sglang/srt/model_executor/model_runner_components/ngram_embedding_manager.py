@@ -23,7 +23,8 @@ class NgramEmbeddingManager:
     enabled: bool
     table: Optional[torch.Tensor]
     n: int
-    k: int
+    # Draft runners have no hasher even when their config has engram layers.
+    engram_hasher: Optional[torch.nn.Module] = None
 
     @classmethod
     def from_model(
@@ -36,8 +37,6 @@ class NgramEmbeddingManager:
         device: str,
     ):
         token_table = None
-        ngram_embedding_n = 0
-        ngram_embedding_k = 0
         use_ngram_embedding = model_config.use_ngram_embedding
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
@@ -58,14 +57,20 @@ class NgramEmbeddingManager:
                     module.init_buffers(
                         max_running_requests, chunked_prefill_size, device
                     )
-            hf_config = model_config.hf_config
-            ngram_embedding_n = hf_config.ngram_embedding_n
-            ngram_embedding_k = hf_config.ngram_embedding_k
+        engram_hasher = None
+        if model_config.engram_ngram_size > 0:
+            from sglang.srt.layers.engram import EngramHasher
+
+            for module in model.modules():
+                if isinstance(module, EngramHasher):
+                    assert engram_hasher is None, "one engram hasher per model"
+                    module.init_history(req_to_token_pool.req_to_token.shape[0], device)
+                    engram_hasher = module
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
-            n=ngram_embedding_n,
-            k=ngram_embedding_k,
+            n=model_config.ngram_context_size,
+            engram_hasher=engram_hasher,
         )
 
     def update_after_decode(
@@ -85,14 +90,30 @@ class NgramEmbeddingManager:
             batch_size=forward_batch.batch_size,
         )
 
+    def update_after_verify(
+        self,
+        *,
+        verify_ids_2d: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        if self.engram_hasher is None:
+            return
+        self.engram_hasher.commit_after_verify(
+            verify_ids_2d, req_pool_indices, commit_lens
+        )
+
     def prepare_for_forward(
         self,
         batch: Optional[ScheduleBatch],
         *,
         chunked_req: Optional[Req],
     ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.enabled:
+        if batch is None:
+            return batch
+        if self.engram_hasher is not None:
+            self._prepare_engram_history(batch)
+        if not self.enabled:
             return batch
         batch.ne_token_table = self.table
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -143,6 +164,42 @@ class NgramEmbeddingManager:
                     else None
                 )
         return batch
+
+    def _prepare_engram_history(self, batch: ScheduleBatch) -> None:
+        """Refresh extend predecessors after prefix hits, retraction, or slot reuse,
+        and seed the history row of a request whose prefill ran on another server."""
+        n1 = self.engram_hasher.max_ngram_size - 1
+        if batch.forward_mode.is_prebuilt():
+            # PD decode runs no EXTEND for this request, so the row its first
+            # DECODE reads is written here: the n - 1 tokens before the one
+            # prefill sampled, which is the token decode feeds next.
+            history = self.engram_hasher.history
+            rows = []
+            for req in batch.reqs:
+                fill_ids = req.origin_input_ids + req.output_ids
+                end = len(fill_ids) - 1
+                ids = fill_ids[max(0, end - n1) : end]
+                rows.append([0] * (n1 - len(ids)) + list(ids))
+            slots = torch.tensor(
+                [req.kv.req_pool_idx for req in batch.reqs],
+                dtype=torch.int64,
+                device=history.device,
+            )
+            history[slots] = torch.tensor(
+                rows, dtype=history.dtype, device=history.device
+            ).view(len(rows), n1)
+            return
+        if not batch.forward_mode.is_extend_without_speculative():
+            return
+        rows = []
+        for req in batch.reqs:
+            start = req.extend_range.start
+            lo = max(0, start - n1)
+            ids = req.full_untruncated_fill_ids[lo:start]
+            rows.append([0] * (n1 - len(ids)) + list(ids))
+        batch.ne_history = torch.tensor(
+            rows, dtype=torch.int32, device=self.engram_hasher.history.device
+        ).view(len(rows), n1)
 
 
 def update_ngram_token_table_after_sampling(

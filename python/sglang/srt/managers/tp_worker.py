@@ -389,7 +389,7 @@ class TpModelWorker(BaseTpWorker):
         # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
             self.random_seed = random_seed
-        elif get_exec().moe.is_ep_joiner:
+        elif server_args.is_ep_joiner:
             self.random_seed = get_device().random_seed
         else:
             self.random_seed = broadcast_pyobj(
@@ -600,6 +600,12 @@ class TpModelWorker(BaseTpWorker):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
+        if batch is not None and get_exec().features.enable_encoder_swa_bounded_replay:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                run_encoder_swa_replay,
+            )
+
+            run_encoder_swa_replay(self, batch)
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch

@@ -29,8 +29,16 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #else
+// load_jit's -DHIP_FP8_TYPE_FNUZ=1 (gfx942, jit/utils/arch.py), read before hip_fp8.h
+// redefines the macro per compilation pass.
+#if defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ
+#define SGL_HIP_FP8_FNUZ 1
+#else
+#define SGL_HIP_FP8_FNUZ 0
+#endif
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #ifndef __grid_constant__
 #define __grid_constant__
@@ -74,15 +82,28 @@ using fp32x4_t = float4;
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
+// HIP's fp8 structs rather than integers, so the matcher tells fp8 from bytes as on CUDA.
+#if SGL_HIP_FP8_FNUZ
+using fp8_e4m3_t = __hip_fp8_e4m3_fnuz;
+using fp8_e5m2_t = __hip_fp8_e5m2_fnuz;
+#else
+using fp8_e4m3_t = __hip_fp8_e4m3;
+using fp8_e5m2_t = __hip_fp8_e5m2;
+#endif
 using fp32x2_t = float2;
 using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = uint16_t;
-using fp8x2_e5m2_t = uint16_t;
-using fp8x4_e4m3_t = uint32_t;
-using fp8x4_e5m2_t = uint32_t;
+#if SGL_HIP_FP8_FNUZ
+using fp8x2_e4m3_t = __hip_fp8x2_e4m3_fnuz;
+using fp8x2_e5m2_t = __hip_fp8x2_e5m2_fnuz;
+using fp8x4_e4m3_t = __hip_fp8x4_e4m3_fnuz;
+using fp8x4_e5m2_t = __hip_fp8x4_e5m2_fnuz;
+#else
+using fp8x2_e4m3_t = __hip_fp8x2_e4m3;
+using fp8x2_e5m2_t = __hip_fp8x2_e5m2;
+using fp8x4_e4m3_t = __hip_fp8x4_e4m3;
+using fp8x4_e5m2_t = __hip_fp8x4_e5m2;
+#endif
 using fp32x4_t = float4;
 #endif
 

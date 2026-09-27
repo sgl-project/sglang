@@ -2,13 +2,6 @@ from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
-from sglang.srt.configs.cosmos3 import (
-    Cosmos3Config,
-    Cosmos3EdgeConfig,
-    Cosmos3EdgeProjectorConfig,
-    Cosmos3EdgeTextConfig,
-    Cosmos3EdgeVisionConfig,
-)
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots3 import Dots3Config
@@ -16,9 +9,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.configs.hy_v4 import HYV4Config
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -53,7 +44,6 @@ from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
 )
-from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
@@ -84,11 +74,6 @@ __all__ = [
     "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
-    "Cosmos3Config",
-    "Cosmos3EdgeConfig",
-    "Cosmos3EdgeTextConfig",
-    "Cosmos3EdgeVisionConfig",
-    "Cosmos3EdgeProjectorConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
     "LongcatFlashConfig",
@@ -103,8 +88,6 @@ __all__ = [
     "Olmo3Config",
     "MuseGlimmerConfig",
     "MuseGlimmerAssistantConfig",
-    "Glm5NextConfig",
-    "Glm5NextTextConfig",
     "KimiLinearConfig",
     "KimiK3Config",
     "KimiK25Config",
@@ -123,7 +106,6 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
-    "HYV4Config",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
@@ -134,7 +116,6 @@ __all__ = [
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
-    "NanbeigeConfig",
     "JetNemotronConfig",
     "JetVLMConfig",
     "MiniCPMHybridConfig",

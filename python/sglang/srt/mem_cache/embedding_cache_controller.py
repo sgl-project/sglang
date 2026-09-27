@@ -979,32 +979,13 @@ class EmbeddingCacheController:
         handles: List[Tuple["EmbeddingCacheEntry", "AsyncCopyHandle"]],
     ):
         """Wait for async D2H copies and mark entries READY."""
-        completed = []
-        errors = []
         for entry, handle in handles:
-            try:
-                handle.wait()
-                completed.append(True)
-            except BaseException as error:
-                completed.append(False)
-                errors.append(error)
-
+            handle.wait()
         with self.lock:
-            for (entry, _), success in zip(handles, completed, strict=True):
+            for entry, handle in handles:
                 current = self.entries.get(entry.hash)
                 if current is entry and current.state == EntryState.FILLING:
-                    if success:
-                        self._mark_ready(current)
-                    else:
-                        self._evict_entry(entry.hash)
-
-        if errors:
-            first_error = errors[0]
-            if len(errors) > 1:
-                first_error.add_note(
-                    f"{len(errors) - 1} additional embedding copy operation(s) failed"
-                )
-            raise first_error
+                    self._mark_ready(current)
 
     def _copy_tensor_to_pool(
         self, tensor: torch.Tensor, entry: EmbeddingCacheEntry, pool: EmbeddingPool

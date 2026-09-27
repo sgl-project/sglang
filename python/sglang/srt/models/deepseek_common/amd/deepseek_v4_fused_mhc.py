@@ -421,3 +421,103 @@ def apply_mhc_post_pre_boundary(
     )
     post_out = post_out.squeeze(-1) if post_out.ndim == 3 else post_out
     return residual, layer_input_out, post_out, comb_out, True
+
+
+def hc_boundary(
+    layer,
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post: Optional[torch.Tensor],
+    comb: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto
+    ``residual`` (when given), collapse the new residual with ``pre_prev``
+    (copy 0 when None) and compute its mixing coefficients. Returns
+    (new_residual, y, pre, post, comb)."""
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import hc_boundary_fused
+
+    new_residual, y, pre, post, comb = hc_boundary_fused(
+        x,
+        residual,
+        post,
+        comb,
+        pre_prev,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        layer.hc_mult,
+        layer.hc_sinkhorn_iters,
+        layer.rms_norm_eps,
+        layer.hc_eps,
+    )
+    if new_residual is None:
+        new_residual = residual
+    if y is None:
+        y = new_residual[:, 0, :].contiguous()
+    return new_residual, y, pre, post, comb
+
+
+def forward_hc_pre_from_prev_fused_boundary(
+    layer,
+    positions: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    input_ids: torch.Tensor,
+    forward_batch,
+    input_ids_global: torch.Tensor,
+    prev_pre: Optional[torch.Tensor],
+    pending_post: Optional[Tuple[torch.Tensor, ...]],
+    defer_post: bool,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
+    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``
+    (``layer.hc_boundary_fused``): each sublayer boundary is one fused launch.
+    ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual,
+    post, comb)`` (``hidden_states`` is then unused); with ``defer_post`` this layer's
+    is returned the same way and the returned ``hidden_states`` is None."""
+    if pending_post is not None:
+        residual, x, attn_pre, attn_post, attn_comb = hc_boundary(
+            layer,
+            *pending_post,
+            prev_pre,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
+    else:
+        residual, x, attn_pre, attn_post, attn_comb = hc_boundary(
+            layer,
+            None,
+            hidden_states,
+            None,
+            None,
+            prev_pre,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+        )
+    x, x_quant = layer._input_norm(x, allow_aiter_quant=False)
+    with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        x = layer.self_attn(
+            x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
+        )
+    residual, x, ffn_pre, ffn_post, ffn_comb = hc_boundary(
+        layer,
+        x,
+        residual,
+        attn_post,
+        attn_comb,
+        attn_pre,
+        layer.hc_ffn_fn,
+        layer.hc_ffn_scale,
+        layer.hc_ffn_base,
+    )
+    x = layer.post_attention_layernorm(x)
+    x = layer._run_moe_ffn_dp_sync(
+        x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+    )
+    if defer_post:
+        return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
+    return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None

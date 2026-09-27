@@ -173,7 +173,6 @@ class SchedulerLoadInquirer:
         prefill_bootstrap = prefill_inflight = 0
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
-        num_prealloc_ready_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
@@ -185,13 +184,11 @@ class SchedulerLoadInquirer:
             decode_retracted = len(
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
-            ready_reqs = [
-                decode_req.req
+            decode_prealloc_ready = sum(
+                1
                 for decode_req in self.get_disagg_decode_prealloc_queue().queue
                 if decode_req.waiting_for_input
-            ]
-            decode_prealloc_ready = len(ready_reqs)
-            num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
+            )
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
@@ -223,7 +220,6 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
-            num_prealloc_ready_tokens=num_prealloc_ready_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

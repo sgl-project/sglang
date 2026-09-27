@@ -166,7 +166,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
     ):
-        with torch.device(self.device):
+        with torch.device("cuda"):
             self.cuda_graph_batch_info = TorchNativeLoRABatchInfo(
                 use_cuda_graph=True,
                 bs=max_bs_in_cuda_graph,

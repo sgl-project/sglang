@@ -19,6 +19,10 @@ from typing import Optional
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    normalize_deepseek_v41_config,
+)
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -136,6 +140,8 @@ class HfModelConfigParser(ModelConfigParserBase):
             _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
+        elif isinstance(config, DeepseekV41Config):
+            config._name_or_path = model
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
@@ -264,6 +270,8 @@ def get_config(
     )
 
     if model_override_args:
+        if isinstance(config, DeepseekV41Config):
+            model_override_args = normalize_deepseek_v41_config(model_override_args)
         # A plain update() setattrs a dict-valued override straight onto the
         # config, so '{"text_config": {...}}' on a VLM would replace the whole
         # sub-config with a dict and break attribute access downstream.

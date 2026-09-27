@@ -503,11 +503,10 @@ class FullComponent(TreeComponent):
         if isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
-                # tree values are page-aligned copies of a kv row: page-exact segments
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
+                    alloc.full_attn_allocator.free(indices)
                 else:
-                    alloc.free_segment(indices, start_pos=0)
+                    alloc.free(indices)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"

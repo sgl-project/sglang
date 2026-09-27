@@ -259,11 +259,7 @@ def _get_quantization_config(
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
-        get_hf_to_sglang_mapper = getattr(model_class, "get_hf_to_sglang_mapper", None)
-        if get_hf_to_sglang_mapper is not None:
-            hf_to_sglang_mapper = get_hf_to_sglang_mapper(model_config.hf_config)
-        else:
-            hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
         # pass mappings by reference to quant_config
         if hf_to_sglang_mapper is not None and quant_config is not None:
             quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -382,12 +378,6 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
-        allow_patterns_overrides: Optional[list[str]] = None
-        """If defined, weights will load exclusively using these patterns.
-
-        Used by checkpoints whose weights live in subfolders (e.g. the Cosmos3
-        diffusers-style layout with ``transformer/`` and ``vision_encoder/``)."""
-
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
@@ -398,9 +388,6 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
-                allow_patterns_overrides=getattr(
-                    model, "allow_patterns_overrides", None
-                ),
                 model_config=model_config,
             )
 
@@ -450,11 +437,7 @@ class DefaultModelLoader(BaseModelLoader):
         return model
 
     def _prepare_weights(
-        self,
-        model_name_or_path: str,
-        revision: Optional[str],
-        fall_back_to_pt: bool,
-        allow_patterns_overrides: Optional[list[str]] = None,
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -494,9 +477,6 @@ class DefaultModelLoader(BaseModelLoader):
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
-        if allow_patterns_overrides is not None:
-            allow_patterns = allow_patterns_overrides
-
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
@@ -519,7 +499,7 @@ class DefaultModelLoader(BaseModelLoader):
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
-                if pattern.endswith(".safetensors"):
+                if pattern == "*.safetensors":
                     use_safetensors = True
                 break
 
@@ -537,12 +517,7 @@ class DefaultModelLoader(BaseModelLoader):
                     revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                hf_folder,
-                index_file,
-                allow_patterns=(
-                    allow_patterns if allow_patterns_overrides is not None else None
-                ),
+                hf_weights_files, hf_folder, index_file
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -582,13 +557,9 @@ class DefaultModelLoader(BaseModelLoader):
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
-
         if resolved_source is None:
             hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-                source.model_or_path,
-                source.revision,
-                source.fall_back_to_pt,
-                source.allow_patterns_overrides,
+                source.model_or_path, source.revision, source.fall_back_to_pt
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -644,7 +615,7 @@ class DefaultModelLoader(BaseModelLoader):
                     {"enable_multithread_load", "num_threads"} & extra_config.keys()
                 )
             ):
-                logger.debug(
+                logger.warning(
                     "Checkpoint prefetching is active; falling "
                     "back to single-threaded weight loading to avoid I/O "
                     "oversubscription with the prefetch threads. Set "
@@ -756,7 +727,6 @@ class DefaultModelLoader(BaseModelLoader):
                 source.model_or_path,
                 source.revision,
                 source.fall_back_to_pt,
-                source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(

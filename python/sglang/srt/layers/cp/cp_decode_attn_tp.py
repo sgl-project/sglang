@@ -60,6 +60,7 @@ class CpDecodeAttnTpContext:
         else:
             self.decode_tp_rank = None
             self.decode_tp_size = None
+            logger.info("Disable CP decode attention TP")
 
         self.use_decode_attn_tp = False
         self._slice_cache: Dict = {}

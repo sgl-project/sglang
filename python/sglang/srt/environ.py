@@ -433,10 +433,6 @@ class Envs:
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
-    # profile_by_stage: do not start the decode-stage capture until a decode batch
-    # reaches this many requests (0 = first decode batch). Lets a batch-size bench
-    # capture steady-state full-admission decode steps instead of the ramp-up.
-    SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_NVTX"
     )
@@ -545,9 +541,6 @@ class Envs:
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
-    # Per-call move cap on a non-urgent lazy-compaction flush, so a large
-    # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
-    SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -869,7 +862,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm sparse decode attention kernel. "auto" (the default) is resolved by
+    # hip_flash_mla.resolve_hip_flashmla_backend to aiter_sparse on gfx950 and
+    # tilelang elsewhere; set explicitly to force one of tilelang | triton |
+    # aiter_sparse | torch | comparison.
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
@@ -1040,15 +1037,6 @@ class Envs:
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
-    # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
-    # cached-prefix shapes. Validated at 98% GSM8K accuracy.
-    SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
-    # Route Triton MLA prefill that carries a cached prefix through dense
-    # (non-absorbed) one-shot MHA: up-project the prefix out of the latent KV
-    # cache and run a single dense FP8 kernel instead of the absorbed 576/512
-    # prefill. Materializes K/V for the whole batch, so it only engages when
-    # the batch fits the chunk budget.
-    SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
@@ -1138,10 +1126,6 @@ class Envs:
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
-    # by the model-specific dispatcher configuration; all other paths retain
-    # their existing behavior.
-    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
@@ -1398,6 +1382,9 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
+    # low/high/xhigh/max or an integer budget in [1, 100].
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr("high")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
@@ -1417,6 +1404,28 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
+    # rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
+    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
+    # Pin and map the host table with cudaHostRegister. False leaves the plain
+    # mapping to the platform (Grace-Blackwell ATS reaches it directly).
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
+    # How the host table is laid out: "shared" is one memfd copy for the TP group
+    # with no all-reduce; "private" is one anonymous mapping per rank holding its
+    # row range, gathered with the all-reduce. "auto" picks shared when shmem THP
+    # (transparent_hugepage/shmem_enabled) is on, else private when anonymous THP
+    # is on, else shared without huge pages.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("auto")
+    # With the host table on, drop the checkpoint's page cache (posix_fadvise
+    # DONTNEED on the safetensors) before pre-faulting the table and again after
+    # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
+    # huge-page faults. Costs the next restart its warm page cache.
+    SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
@@ -1427,9 +1436,9 @@ class Envs:
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
-    # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # tuned batched_gemm_bf16 (gfx95). ON on ROCm, OFF elsewhere; the call sites also
+    # require SGLANG_USE_AITER on gfx95. Set False to force the einsum.
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
@@ -1794,6 +1803,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
+    # The direct dense BF16 GEMM source is vendored in-tree.
+    "SGLANG_FLASHINFER_PR4266_SOURCE": _DeprecatedEnv(),
     # DSV4 compressor V2 is always used.
     "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(

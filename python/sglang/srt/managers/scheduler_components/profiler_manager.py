@@ -421,12 +421,8 @@ class SchedulerProfilerManager:
             elif batch.forward_mode.is_decode():
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
-                        # force trace flush (a prefill capture must not absorb decode steps)
+                        # force trace flush
                         self._stop_profile(stage=ForwardMode.EXTEND)
-                    min_bs = envs.SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS.get()
-                    if min_bs > 0 and batch.batch_size() < min_bs:
-                        # Wait for full admission before capturing the decode stage
-                        return
                     self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:

@@ -7,13 +7,6 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
-    ListLorasReq,
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    ShutdownReq,
-    UnmergeLoraWeightsReq,
-)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -21,6 +14,13 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core import Req

@@ -273,13 +273,27 @@ def fused_k_norm_rope_flashmla(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    q: Optional[torch.Tensor] = None,
 ) -> None:
+    """K rmsnorm + RoPE + FlashMLA paged store. With ``q`` ([B, H, head_dim], the same tokens)
+    the trailing ``rope_dim`` of every query head is rotated in place by the same launch,
+    bitwise what ``fused_rope_inplace`` produces."""
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
+        assert q is None, "the XPU K kernel does not rope q"
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
+        )
+    elif q is not None:
+        # HIP only: the query rope rides the K launch
+        from sglang.kernels.ops.attention.dsv4.elementwise_hip import (
+            fused_k_norm_rope_flashmla_with_q,
+        )
+
+        fused_k_norm_rope_flashmla_with_q(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size, q
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(

@@ -1,0 +1,483 @@
+"""HIP fused mHC sublayer boundary: `hc_boundary_fused`, hc_post + collapse +
+mixing statistics in one launch, then the reduce + sinkhorn kernel shared with
+`hc_mix_stats_sinkhorn`."""
+
+import functools
+from typing import Optional, Tuple
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _IS_HIP
+from sglang.srt.utils.common import is_gfx95_supported
+
+# a CTA owns every HC copy of its tile, so a row's fp32 operation sequence depends on (H, HC), never on M
+_HC_BOUNDARY_BLOCK_M = 16
+_HC_BOUNDARY_BLOCK_K = 64
+_HC_BOUNDARY_NUM_WARPS = 2
+_HC_BOUNDARY_NUM_STAGES = 1
+
+
+@triton.jit
+def _hc_mix_reduce_sinkhorn_vec_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scratch_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """HIP form of ``_hc_mix_reduce_sinkhorn_kernel``: one vector load per operand over all
+    slices; the tree order depends on NUM_SLICES only, never on M. ``scratch_ptr`` ([m, 32] fp32)
+    round-trips the reduced mixes so the sinkhorn starts from a plain blocked layout.
+    """
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    j = tl.arange(0, HC)
+    jj = j[:, None]
+    kk = j[None, :]
+
+    s_idx = tl.arange(0, SLICES_PAD)
+    s_ok = s_idx < NUM_SLICES
+    off = (s_idx * m + row) * MIX
+    a_pre = tl.sum(
+        tl.load(
+            part_mix_ptr + off[:, None] + j[None, :],
+            mask=s_ok[:, None],
+            other=0.0,
+        ),
+        axis=0,
+    )
+    a_post = tl.sum(
+        tl.load(
+            part_mix_ptr + off[:, None] + HC + j[None, :],
+            mask=s_ok[:, None],
+            other=0.0,
+        ),
+        axis=0,
+    )
+    a_comb = tl.sum(
+        tl.load(
+            part_mix_ptr
+            + off[:, None, None]
+            + 2 * HC
+            + jj[None, :, :] * HC
+            + kk[None, :, :],
+            mask=s_ok[:, None, None],
+            other=0.0,
+        ),
+        axis=0,
+    )
+    sq = tl.sum(tl.load(part_sq_ptr + s_idx * m + row, mask=s_ok, other=0.0), axis=0)
+    sp = scratch_ptr + row * 32
+    tl.store(sp + j, a_pre)
+    tl.store(sp + HC + j, a_post)
+    tl.store(sp + 2 * HC + jj * HC + kk, a_comb)
+    tl.debug_barrier()
+    a_pre = tl.load(sp + j)
+    a_post = tl.load(sp + HC + j)
+    a_comb = tl.load(sp + 2 * HC + jj * HC + kk)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+
+
+def hc_mix_reduce_sinkhorn_vec(
+    part_mix: torch.Tensor,
+    part_sq: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    *,
+    k: int,
+    rms_eps: float,
+    mix: int,
+    hc_mult: int,
+    num_slices: int,
+    sinkhorn_iters: int,
+    hc_eps: float,
+) -> None:
+    """Reduce the [num_slices, m, mix] partials and run the sinkhorn into pre/post/comb."""
+    m = part_sq.shape[1]
+    # Layout round trip for the vector-reduce kernel (see its docstring).
+    scratch = torch.empty((m, 32), dtype=torch.float32, device=part_mix.device)
+    _hc_mix_reduce_sinkhorn_vec_kernel[(m,)](
+        part_mix,
+        part_sq,
+        scratch,
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=num_slices,
+        SLICES_PAD=triton.next_power_of_2(num_slices),
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _hc_boundary_partial_kernel(
+    x_ptr,
+    res_ptr,
+    post_in_ptr,
+    comb_in_ptr,
+    pre_prev_ptr,
+    w_ptr,
+    res_out_ptr,
+    y_ptr,
+    part_mix_ptr,
+    part_sq_ptr,
+    M,
+    H,
+    x_stride_m,
+    res_stride_m,
+    w_stride_n,
+    HC: tl.constexpr,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+    HAS_POST: tl.constexpr,
+    HAS_COMBINE: tl.constexpr,
+):
+    """Grid (cdiv(M, BLOCK_M), H // BLOCK_K); slice pid_t covers hidden columns [pid_t*BLOCK_K, +BLOCK_K)
+    of every copy. HAS_POST: copy k of the new residual is post[k]*x + sum_j comb[j,k]*res[j] in
+    aiter::mhc_post's order, stored and read back as bf16 for the statistics; HAS_COMBINE:
+    y = sum_k pre_prev[k] * copy_k in _hc_combine_kernel's order.
+    """
+    tl.static_assert(HC == 4, "the weight tiles are prefetched by name")
+    pid_m = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < M
+    offs_h = pid_t * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_n = offs_n < MIX
+    m2 = mask_m[:, None]
+    w_off = offs_n[None, :] * w_stride_n + offs_h[:, None]
+    # Prefetching only reorders memory issue; each tile still feeds its own dot.
+    w0 = tl.load(w_ptr + w_off + 0 * H, mask=mask_n[None, :], other=0.0)
+    w1 = tl.load(w_ptr + w_off + 1 * H, mask=mask_n[None, :], other=0.0)
+    w2 = tl.load(w_ptr + w_off + 2 * H, mask=mask_n[None, :], other=0.0)
+    w3 = tl.load(w_ptr + w_off + 3 * H, mask=mask_n[None, :], other=0.0)
+    if HAS_POST:
+        xa = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_h[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        r_off = offs_m[:, None] * res_stride_m + offs_h[None, :]
+        r0 = tl.load(res_ptr + r_off + 0 * H, mask=m2, other=0.0).to(tl.float32)
+        r1 = tl.load(res_ptr + r_off + 1 * H, mask=m2, other=0.0).to(tl.float32)
+        r2 = tl.load(res_ptr + r_off + 2 * H, mask=m2, other=0.0).to(tl.float32)
+        r3 = tl.load(res_ptr + r_off + 3 * H, mask=m2, other=0.0).to(tl.float32)
+        # one tile load per coefficient tensor; a one-hot sum extracts a column exactly (one nonzero term)
+        cj = tl.arange(0, HC)
+        post_tile = tl.load(
+            post_in_ptr + offs_m[:, None] * HC + cj[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        cc = tl.arange(0, HC * HC)
+        comb_tile = tl.load(
+            comb_in_ptr + offs_m[:, None] * (HC * HC) + cc[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+    if HAS_COMBINE:
+        pj = tl.arange(0, HC)
+        pre_tile = tl.load(
+            pre_prev_ptr + offs_m[:, None] * HC + pj[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        y = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        if HAS_POST:
+            pk = tl.sum(tl.where((cj == k)[None, :], post_tile, 0.0), axis=1)
+            c0 = tl.sum(tl.where((cc == 0 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c1 = tl.sum(tl.where((cc == 1 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c2 = tl.sum(tl.where((cc == 2 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            c3 = tl.sum(tl.where((cc == 3 * HC + k)[None, :], comb_tile, 0.0), axis=1)
+            v = xa * pk[:, None]
+            v += r0 * c0[:, None]
+            v += r1 * c1[:, None]
+            v += r2 * c2[:, None]
+            v += r3 * c3[:, None]
+            vb = v.to(res_out_ptr.dtype.element_ty)
+            tl.store(
+                res_out_ptr + offs_m[:, None] * (HC * H) + k * H + offs_h[None, :],
+                vb,
+                mask=m2,
+            )
+            xt = vb.to(tl.float32)
+        else:
+            xt = tl.load(
+                x_ptr + offs_m[:, None] * x_stride_m + k * H + offs_h[None, :],
+                mask=m2,
+                other=0.0,
+            ).to(tl.float32)
+        if HAS_COMBINE:
+            pp = tl.sum(tl.where((pj == k)[None, :], pre_tile, 0.0), axis=1)
+            y += pp[:, None] * xt
+        if k == 0:
+            w_tile = w0
+        elif k == 1:
+            w_tile = w1
+        elif k == 2:
+            w_tile = w2
+        else:
+            w_tile = w3
+        acc += tl.dot(xt, w_tile, input_precision=DOT_PRECISION)
+        sq += tl.sum(xt * xt, axis=1)
+    tl.store(
+        part_mix_ptr + (pid_t * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        acc,
+        mask=m2 & mask_n[None, :],
+    )
+    tl.store(part_sq_ptr + pid_t * M + offs_m, sq, mask=mask_m)
+    if HAS_COMBINE:
+        tl.store(
+            y_ptr + offs_m[:, None] * H + offs_h[None, :],
+            y.to(y_ptr.dtype.element_ty),
+            mask=m2,
+        )
+
+
+# the gfx950 prefill kernel is bitwise the Triton kernel per row, so the switch below is a pure speed choice
+_HC_BOUNDARY_PREFILL_MIN_M = 1024
+
+
+def _hc_boundary_prefill_available() -> bool:
+    """The prefill kernel needs gfx950 (v_permlane*_swap, 16-byte LDS DMA)."""
+    return _IS_HIP and torch.cuda.is_available() and is_gfx95_supported()
+
+
+@functools.lru_cache(maxsize=None)
+def _hc_boundary_prefill_module():
+    from sglang.kernels.jit.utils import load_jit
+
+    kernel = "hc_boundary_hip::HcBoundaryPrefillKernel"
+    return load_jit(
+        "hc_boundary_prefill_rocm",
+        cuda_files=["deepseek_v4/hc_boundary_hip.cuh"],
+        cuda_wrappers=[
+            ("post_combine", f"{kernel}<true, true>::run"),
+            ("stats_only", f"{kernel}<false, false>::run"),
+        ],
+        # the hc_post chain must stay separate multiplies and adds, as in the Triton binary
+        extra_cuda_cflags=["-ffp-contract=off"],
+    )
+
+
+def _hc_boundary_prefill_ctas(num_row_blocks: int) -> int:
+    """CTAs per hidden slice (8 waves each, one CTA per CU by LDS)."""
+    return max(6, min(16, num_row_blocks // 64))
+
+
+def _hc_boundary_use_prefill(
+    m: int, has_post: bool, has_combine: bool, x: Optional[torch.Tensor]
+) -> bool:
+    if m < _HC_BOUNDARY_PREFILL_MIN_M or not _hc_boundary_prefill_available():
+        return False
+    if (has_post, has_combine) not in ((True, True), (False, False)):
+        return False
+    # The LDS DMA moves 16-byte chunks: rows of x must stay 16-byte aligned.
+    return x is None or x.stride(0) % 8 == 0
+
+
+def _hc_boundary_partials(
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post_in: Optional[torch.Tensor],
+    comb_in: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    residual_out: Optional[torch.Tensor],
+    y: Optional[torch.Tensor],
+    *,
+    hc_mult: int,
+    prefill: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The boundary's first launch: writes ``residual_out`` / ``y`` when given
+    and returns the ``[slices, M, MIX]`` mixing partials and ``[slices, M]`` row
+    sums of squares. ``prefill`` forces a regime (tests); None selects by M."""
+    m, _, h = residual.shape
+    mix = hc_fn.shape[0]
+    dev = residual.device
+    has_post = x is not None
+    has_combine = pre_prev is not None
+    num_slices = h // _HC_BOUNDARY_BLOCK_K
+    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+    if m == 0:
+        return part_mix, part_sq
+    if prefill is None:
+        prefill = _hc_boundary_use_prefill(m, has_post, has_combine, x)
+    dummy = part_sq
+    if prefill:
+        mod = _hc_boundary_prefill_module()
+        ctas = _hc_boundary_prefill_ctas(triton.cdiv(m, _HC_BOUNDARY_BLOCK_M))
+        fn = mod.post_combine if has_post else mod.stats_only
+        fn(
+            x if has_post else dummy,
+            residual,
+            post_in if has_post else dummy,
+            comb_in if has_post else dummy,
+            pre_prev if has_combine else dummy,
+            hc_fn,
+            residual_out if has_post else dummy,
+            y if has_combine else dummy,
+            part_mix,
+            part_sq,
+            ctas,
+        )
+        return part_mix, part_sq
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    block_m = _HC_BOUNDARY_BLOCK_M
+    grid_m = triton.cdiv(m, block_m)
+    _hc_boundary_partial_kernel[(grid_m, num_slices)](
+        x if has_post else residual,
+        residual,
+        post_in if has_post else dummy,
+        comb_in if has_post else dummy,
+        pre_prev if has_combine else dummy,
+        hc_fn,
+        residual_out if has_post else dummy,
+        y if has_combine else dummy,
+        part_mix,
+        part_sq,
+        m,
+        h,
+        x.stride(0) if has_post else residual.stride(0),
+        residual.stride(0),
+        hc_fn.stride(0),
+        HC=hc_mult,
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        BLOCK_M=block_m,
+        BLOCK_K=_HC_BOUNDARY_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        HAS_POST=has_post,
+        HAS_COMBINE=has_combine,
+        num_warps=_HC_BOUNDARY_NUM_WARPS,
+        num_stages=_HC_BOUNDARY_NUM_STAGES,
+    )
+    return part_mix, part_sq
+
+
+def hc_boundary_fused(
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post_in: Optional[torch.Tensor],
+    comb_in: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+) -> Tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """HIP mHC sublayer boundary in two launches.
+
+    With ``x`` (the sublayer output, [M, H]) and ``post_in`` / ``comb_in``: ``residual_out =
+    hc_post(x, residual, post_in, comb_in)`` and the mixing statistics of ``residual_out``;
+    without ``x`` the statistics are those of ``residual`` ([M, HC, H]). With ``pre_prev`` the
+    collapsed input ``y = sum_k pre_prev[k] * copy_k`` is also produced. Returns ``(residual_out,
+    y, pre, post, comb)``, the first two None when not requested. Batch-invariant and repeatable;
+    pre/post/comb are not bitwise ``hc_mix_stats_sinkhorn``'s. Only hc_mult == 4 is supported.
+    """
+    assert _IS_HIP, "hc_boundary_fused is the HIP path"
+    assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
+    assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
+    assert hc_fn.dtype == torch.float32 and hc_fn.stride(1) == 1
+    m, _, h = residual.shape
+    k = hc_mult * h
+    mix = hc_fn.shape[0]
+    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
+    assert h % _HC_BOUNDARY_BLOCK_K == 0, h
+    dev = residual.device
+    has_post = x is not None
+    has_combine = pre_prev is not None
+    if has_post:
+        assert post_in is not None and comb_in is not None
+        assert x.shape == (m, h) and x.stride(1) == 1
+        post_in = post_in.contiguous().float()
+        comb_in = comb_in.contiguous().float()
+        residual_out = torch.empty_like(residual)
+    else:
+        residual_out = None
+    if has_combine:
+        pre_prev = pre_prev.contiguous()
+        y = torch.empty((m, h), dtype=residual.dtype, device=dev)
+    else:
+        y = None
+    pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
+    if m == 0:
+        return residual_out, y, pre, post, comb
+
+    part_mix, part_sq = _hc_boundary_partials(
+        x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, hc_mult=hc_mult
+    )
+    num_slices = h // _HC_BOUNDARY_BLOCK_K
+    hc_mix_reduce_sinkhorn_vec(
+        part_mix,
+        part_sq,
+        hc_scale,
+        hc_base,
+        pre,
+        post,
+        comb,
+        k=k,
+        rms_eps=rms_eps,
+        mix=mix,
+        hc_mult=hc_mult,
+        num_slices=num_slices,
+        sinkhorn_iters=sinkhorn_iters,
+        hc_eps=hc_eps,
+    )
+    return residual_out, y, pre, post, comb

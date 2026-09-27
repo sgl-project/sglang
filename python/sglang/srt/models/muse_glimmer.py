@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -56,7 +57,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
+from sglang.srt.models.utils import apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
@@ -83,26 +84,22 @@ _VISION_NAME_FRAGMENTS = (
     "perception_emb_norm",
 )
 
-# Shared by _vendor_weight_name and hf_to_sglang_mapper;
-# a rule missing from one silently breaks the other.
-_VENDOR_TO_SGLANG = WeightsMapper(
-    orig_to_new_prefix={
-        "model.language_model.": "model.",
-        # The vision modules hang off the entry class, not off ``model``.
-        "model.vision_": "vision_",
-    },
-    # Only the first matching substring is applied; keep these non-overlapping.
-    orig_to_new_substr={
-        "post_attention_layernorm": "post_attn_norm",
-        "pre_feedforward_layernorm": "post_attention_layernorm",
-        "post_feedforward_layernorm": "post_ffn_norm",
-        "self_attn.gate_proj": "self_attn.output_gate_proj",
-    },
-)
+# Vendor tensor names -> this port's; applied simultaneously.
+_VENDOR_RENAMES = {
+    "post_attention_layernorm": "post_attn_norm",
+    "pre_feedforward_layernorm": "post_attention_layernorm",
+    "post_feedforward_layernorm": "post_ffn_norm",
+    "self_attn.gate_proj": "self_attn.output_gate_proj",
+}
+
+_VENDOR_RENAME_RE = re.compile("|".join(re.escape(key) for key in _VENDOR_RENAMES))
 
 
 def _vendor_weight_name(name: str) -> str:
-    return _VENDOR_TO_SGLANG.apply_list([name])[0]
+    name = name.replace("model.language_model.", "model.", 1)
+    # The vision modules hang off the entry class, not off ``model``.
+    name = name.replace("model.vision_", "vision_", 1)
+    return _VENDOR_RENAME_RE.sub(lambda m: _VENDOR_RENAMES[m.group(0)], name)
 
 
 def get_attention_sliding_window_size(config) -> int:
@@ -931,8 +928,6 @@ class MuseGlimmerForCausalLM(nn.Module):
 class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
     """Vendor multimodal HF export: the MuseGlimmerForCausalLM decoder plus the image tower."""
 
-    # Only this class reads vendor-named checkpoints, so only it needs the mapper.
-    hf_to_sglang_mapper = _VENDOR_TO_SGLANG
     checkpoint_uses_vendor_names = True
     builds_vision_tower = True
 

@@ -7,13 +7,8 @@
 #include <cstdint>
 #ifndef USE_ROCM
 #include <cuda_fp8.h>
-#elif defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
-// Only on the arches that take the hardware branch below. hip_fp8.h is what defines
-// HIP_FP8_TYPE_FNUZ, and nothing else in this include tree pulls it in, so gating on
-// those macros instead would also flip the software cast's arch constants on gfx942 --
-// it picks fn today because the macro is not visible there.
-#include <hip/hip_fp8.h>
-#define SGL_ROCM_FP8_HW_CVT 1
+#else
+#include <bit>
 #endif
 
 // Small helpers shared by the DeepSeek-V4 FP8/UE8M0 quantization kernels
@@ -52,21 +47,8 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
 #else
-#ifdef SGL_ROCM_FP8_HW_CVT
-// gfx950/gfx12xx do both lanes in one v_cvt_pk_fp8_f32 (RNE), and the flavour it produces
-// is the OCP one kFP8E4M3Max already assumes there. Clip first rather than passing
-// __HIP_SATFINITE -- the x2 fast path converts the value it was handed, not the clamped
-// one (ROCm 7.2).
-//
-// gfx942 keeps the software cast below, top-segment bug and all -- this instruction does
-// not produce the fnuz flavour that arch needs, so it takes a separate fix.
-SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
-  const fp32x2_t v{fp8_e4m3_clip(x), fp8_e4m3_clip(y)};
-  return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
-}
-#else
-// Software float -> FP8 E4M3 conversion for the archs the branch above skips: gfx942,
-// plus any target with no native fp8 convert.
+// Software float -> FP8 E4M3 conversion for ROCm/HIP.
+// Supports both E4M3FN (MI350X, gfx950) and E4M3FNUZ (MI300X, gfx942).
 SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
   val = fp8_e4m3_clip(val);
   if (val == 0.0f) return 0;
@@ -126,18 +108,37 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
       mant3 = 0;
       exp8++;
     }
-    if (exp8 >= kMaxExp) return sign | kSaturate;
+    // Exponent field 15 is a normal binade (E4M3FN: 256..448, E4M3FNUZ:
+    // 128..240); only values past the largest finite encoding saturate.
+#if HIP_FP8_TYPE_FNUZ
+    if (exp8 > kMaxExp) return sign | kSaturate;
+#else
+    if (exp8 > kMaxExp || (exp8 == kMaxExp && mant3 == 7)) return sign | kSaturate;
+#endif
   }
   return sign | (static_cast<uint8_t>(exp8) << 3) | mant3;
 }
 
-// Pack two fp32 values into a single fp8x2_e4m3 (uint16_t on HIP).
+// Pack two fp32 values into a single fp8x2_e4m3 from its 16-bit storage (x in the low byte).
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
-  uint8_t x8 = cvt_float_to_fp8_e4m3(x);
-  uint8_t y8 = cvt_float_to_fp8_e4m3(y);
-  return static_cast<uint16_t>(x8) | (static_cast<uint16_t>(y8) << 8);
+  const uint8_t x8 = cvt_float_to_fp8_e4m3(x);
+  const uint8_t y8 = cvt_float_to_fp8_e4m3(y);
+  return std::bit_cast<fp8x2_e4m3_t>(static_cast<uint16_t>(x8 | (y8 << 8)));
 }
-#endif  // HIP_FP8_TYPE_OCP && !HIP_FP8_TYPE_FNUZ
+
+// `pack_fp8` rounding to nearest even as CUDA's `__nv_fp8x2_e4m3` does (gfx942/gfx950's
+// `v_cvt_pk_fp8_f32`, checked bitwise against torch's float8_e4m3fn cast); the software
+// encoder above rounds ties away from zero.
+namespace rn {
+SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx950__) || defined(__gfx942__))
+  const auto packed = __builtin_amdgcn_cvt_pk_fp8_f32(fp8_e4m3_clip(x), fp8_e4m3_clip(y), 0, false);
+  return std::bit_cast<fp8x2_e4m3_t>(static_cast<uint16_t>(static_cast<uint32_t>(packed) & 0xFFFFu));
+#else
+  return fp8::pack_fp8(x, y);
+#endif
+}
+}  // namespace rn
 #endif
 
 }  // namespace deepseek_v4::fp8

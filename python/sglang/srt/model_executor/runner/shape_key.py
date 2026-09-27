@@ -30,9 +30,10 @@ class ShapeKey:
     variant_label: optional execution variant (for example, "lora",
         "nolora", or "chunked_prefix"), or None for runners that don't
         record per-variant graphs.
-    dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
-        when DSA dual-graph capture is not enabled. Composes with variant_label
-        so LoRA and DSA variants can be captured independently.
+    dsa_variant: DSA indexer ("dense" / "sparse") or V4.1 indexer variant
+        ("candidate_all", "candidate_c2_all", "candidate_unfiltered",
+        "candidate_filtered"), or None.
+        Composes with variant_label so LoRA and DSA variants are independent.
     """
 
     size: int

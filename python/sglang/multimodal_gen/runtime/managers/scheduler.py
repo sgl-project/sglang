@@ -16,15 +16,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
-    GetDisaggStatsReq,
-    ListLorasReq,
-    MergeLoraWeightsReq,
-    ReleaseRealtimeSessionReq,
-    SetLoraReq,
-    ShutdownReq,
-    UnmergeLoraWeightsReq,
-)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -32,6 +23,15 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    GetDisaggStatsReq,
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,

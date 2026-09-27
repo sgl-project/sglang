@@ -55,12 +55,10 @@ class RustServer:
     def __init__(
         self,
         server: Server,
-        http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
-        self.http_port = http_port
         self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
@@ -153,7 +151,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, http_port=listen_port, mm_spec=mm_spec)
+        return cls(server, mm_spec=mm_spec)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -207,13 +205,14 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers were parked in the Rust result store before the
-                # ring push; wrapping them into tensors is the only Python step
-                # of the Rust path. `None` for a text-only request on a
-                # multimodal model.
-                encoded = self.server.take_mm_result(obj.rid)
-                if encoded is not None:
-                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
+                # The buffers rode the Rust sidecar, parked before the ring push;
+                # wrapping them into tensors is the only Python step of the Rust
+                # path. `None` for a text-only request on a multimodal model.
+                mm_result = self.server.take_mm_result(obj.rid)
+                if mm_result is not None:
+                    obj.mm_inputs = RustMmProcessor.build_output(
+                        self.mm_spec, mm_result
+                    )
             out.append(obj)
         return out
 

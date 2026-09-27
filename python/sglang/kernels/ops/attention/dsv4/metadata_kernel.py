@@ -5,6 +5,66 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _fill_all_compressed_indices_kernel(
+    page_table,
+    seq_lens,
+    page_indices,
+    raw_indices,
+    PAGE_STRIDE: tl.constexpr,
+    TOPK: tl.constexpr,
+    RATIO: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    positions = tl.arange(0, BLOCK)
+    length = tl.load(seq_lens + row)
+    valid = (positions < length) & (positions < TOPK)
+    slots_per_page = PAGE_SIZE // RATIO
+    pages = tl.load(
+        page_table + row * PAGE_STRIDE + positions // slots_per_page,
+        mask=valid,
+        other=0,
+    )
+    slots = pages * slots_per_page + positions % slots_per_page
+    tl.store(
+        page_indices + row * TOPK + positions,
+        tl.where(valid, slots, -1),
+        positions < TOPK,
+    )
+    if raw_indices is not None:
+        tl.store(
+            raw_indices + row * TOPK + positions,
+            tl.where(valid, positions, -1),
+            positions < TOPK,
+        )
+
+
+def fill_all_compressed_indices(
+    page_table: torch.Tensor,
+    compressed_seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    *,
+    compress_ratio: int,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Fill all reachable slots; the caller guarantees compressed length <= top-k."""
+    topk = page_indices.shape[1]
+    _fill_all_compressed_indices_kernel[(compressed_seq_lens.numel(),)](
+        page_table,
+        compressed_seq_lens,
+        page_indices,
+        raw_indices,
+        page_table.stride(0),
+        topk,
+        compress_ratio,
+        page_size,
+        triton.next_power_of_2(topk),
+    )
+
+
 @triton.jit(do_not_specialize=["bs", "num_write_tokens", "c128_cur_max_seq_len"])
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,

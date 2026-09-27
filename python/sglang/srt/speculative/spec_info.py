@@ -10,7 +10,6 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
-    _RESERVED_ALIASES,
     CustomSpecAlgo,
     ServerArgsValidator,
     WorkerFactory,
@@ -58,8 +57,6 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
-        if upper in _RESERVED_ALIASES:
-            return cls.EAGLE
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec

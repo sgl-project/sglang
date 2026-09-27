@@ -45,7 +45,10 @@ class PetitNvFp4Config(QuantizationConfig):
     ) -> None:
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.info("Detected nvfp4 checkpoint.")
+            logger.warning(
+                "Detected nvfp4 checkpoint. Please note that the "
+                "format is experimental and subject to change."
+            )
         self.group_size = group_size
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.exclude_modules = exclude_modules

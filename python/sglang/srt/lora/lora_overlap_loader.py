@@ -44,18 +44,15 @@ class LoRAOverlapLoader:
         lora_pipeline_load_status = self._check_overlap_load_status(lora_id)
         if lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADING:
             return False
-        elif lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADED:
-            return True
+        elif lora_pipeline_load_status == LoRAOverlapLoadStatus.NOT_LOADED:
+            res = self._try_start_overlap_load(lora_id, running_loras)
+            if res:
+                logger.debug(f"Loading LoRA adapter {lora_id} asynchronously")
 
-        assert lora_pipeline_load_status == LoRAOverlapLoadStatus.NOT_LOADED
-        if not self._try_start_overlap_load(lora_id, running_loras):
             return False
-        logger.debug(f"Loading LoRA adapter {lora_id} asynchronously")
-
-        # Report an already-finished copy as LOADED, or a sibling's load could
-        # evict it before it is ever scheduled. No-op while still in flight.
-        self._drain_completed_overlap_loads()
-        return self._check_overlap_load_status(lora_id) == LoRAOverlapLoadStatus.LOADED
+        else:
+            assert lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADED
+            return True
 
     def _check_overlap_load_status(
         self, lora_id: Optional[str]
@@ -77,7 +74,7 @@ class LoRAOverlapLoader:
             if event.query()
         ]
         for lora_id, event in completed_loads:
-            self.device_module.current_stream().wait_event(event)
+            torch.cuda.current_stream().wait_event(event)
             del self.lora_to_overlap_load_event[lora_id]
 
     def _try_start_overlap_load(

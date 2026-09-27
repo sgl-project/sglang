@@ -17,7 +17,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -78,21 +77,18 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 decode_cuda_graph_config.max_bs = 8
         elif gpu_mem < 35 * 1024:
             # A10, 4090, 5090
-            # (chunked_prefill_size 4k, max_bs 48 if tp < 4 else 160)
-            # 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past
-            # bs=24; the previous cap forced eager decode at bs>=32 and
-            # collapsed high-concurrency throughput vs vLLM.
+            # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
             if cfg.chunked_prefill_size is None:
                 declare_resolution(
                     server_args,
                     "_handle_gpu_memory_settings",
-                    chunked_prefill_size=4096,
+                    chunked_prefill_size=2048,
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 48
+                    decode_cuda_graph_config.max_bs = 24
                 else:
-                    decode_cuda_graph_config.max_bs = 160
+                    decode_cuda_graph_config.max_bs = 80
         elif gpu_mem < 60 * 1024:
             # A100 (40GB), L40,
             # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
@@ -280,11 +276,6 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 reserved_mem = max(reserved_mem, 10 * 1024)
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
-            # XPU: oneDNN allocates scratch space for matmul when
-            # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
-            # headroom so non-aligned prefill lengths don't hit OOM.
-            if get_platform().is_xpu:
-                reserved_mem += 2 * 1024
 
         mem_fraction_static = (
             round((gpu_mem - reserved_mem) / gpu_mem, 3)

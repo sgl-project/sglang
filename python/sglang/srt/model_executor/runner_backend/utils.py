@@ -122,7 +122,6 @@ def resolve_prefill_backend(
         return FullCudaGraphBackend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            reuse_output_buffer=True,
         )
     # Default: tc_piecewise.
     return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

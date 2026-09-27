@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import inspect
 import logging
@@ -20,7 +22,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -81,6 +83,10 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    # rows at and past this count are padding that select_experts left for the fused sorting launch to mask
+    num_token_non_padded: Optional[torch.Tensor] = None
+    # standard dispatch only: sglang's one-launch sort when the row count allows (see _FusedSortingRequest)
+    fused_sorting: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -126,6 +132,184 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     from aiter.fused_moe import fused_moe
 
     return "no_combine" in inspect.signature(fused_moe).parameters
+
+
+# aiter has no hook for a caller's sort: moe_sorting is wrapped once and answers only inside a scoped request
+
+
+@dataclass
+class _FusedSortingRequest:
+    num_token_non_padded: Optional[torch.Tensor]
+    fired: bool = False  # the wrapper answered a call (fused or fallback)
+
+
+_fused_sorting_request: contextvars.ContextVar[Optional[_FusedSortingRequest]] = (
+    contextvars.ContextVar("aiter_fused_sorting_request", default=None)
+)
+_AITER_MOE_SORTING_PARAMS = (
+    "topk_ids",
+    "topk_weights",
+    "num_experts",
+    "model_dim",
+    "moebuf_dtype",
+    "block_size",
+    "expert_mask",
+    "num_local_tokens",
+    "dispatch_policy",
+    "return_local_topk_ids",
+    "accumulate",
+    "flat",
+    "output_aux",
+)
+
+
+def _fill_padded_rows_pair(topk_ids, topk_weights, num_token_non_padded) -> None:
+    """The two fills select_experts deferred: ids to 0, weights to 0.0."""
+    from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
+
+    _fill_padded_rows(topk_ids, num_token_non_padded, 0)
+    _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
+
+
+def _local_expert_ids(
+    expert_mask: Optional[torch.Tensor],
+    num_experts: int,
+    device,
+    cache: dict[tuple, tuple[torch.Tensor, int]],
+) -> Optional[tuple[torch.Tensor, int]]:
+    """``(local ids, local expert count)`` for a mask, cached in ``cache`` by its storage; None
+    while a CUDA graph is being captured (counting the mask is a device sync), so that call keeps
+    aiter's sorting."""
+    from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
+        local_expert_ids_from_mask,
+    )
+
+    if expert_mask is None:
+        key = (None, num_experts, str(device))
+    else:
+        key = (expert_mask.data_ptr(), expert_mask.numel(), str(expert_mask.device))
+    entry = cache.get(key)
+    if entry is None:
+        if expert_mask is None:
+            num_local = num_experts
+        elif torch.cuda.is_current_stream_capturing():
+            return None
+        else:
+            num_local = int(expert_mask.count_nonzero().item())
+        entry = (
+            local_expert_ids_from_mask(expert_mask, num_experts, device),
+            num_local,
+        )
+        cache[key] = entry
+    return entry
+
+
+@functools.cache
+def _install_fused_sorting_override() -> bool:
+    """Wrap ``aiter.fused_moe.moe_sorting`` once; False when aiter differs."""
+    try:
+        import aiter.fused_moe as aiter_fused_moe
+    except ImportError:
+        return False
+    original = getattr(aiter_fused_moe, "moe_sorting", None)
+    if original is None:
+        return False
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return False
+    if tuple(signature.parameters) != _AITER_MOE_SORTING_PARAMS:
+        logger.warning(
+            "aiter.fused_moe.moe_sorting has an unexpected signature; keeping "
+            "aiter's sorting kernel"
+        )
+        return False
+
+    from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
+        AITER_FUSED_SORT_MAX_TOKENS,
+        fused_aiter_moe_sorting,
+    )
+
+    # masks are static per layer, so the table lives with the override installed once per process
+    local_expert_ids_by_mask: dict[tuple, tuple[torch.Tensor, int]] = {}
+
+    def moe_sorting_with_fused_small_m(*args, **kwargs):
+        request = _fused_sorting_request.get()
+        if request is None:
+            return original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        a = bound.arguments
+        topk_ids, topk_weights = a["topk_ids"], a["topk_weights"]
+        expert_mask = a["expert_mask"]
+        num_experts = int(a["num_experts"])
+        block_size = int(a["block_size"])
+        request.fired = True
+        eligible = (
+            topk_ids.shape[0] <= AITER_FUSED_SORT_MAX_TOKENS
+            and a["num_local_tokens"] is None
+            and a["dispatch_policy"] == 0
+            and not a["return_local_topk_ids"]
+            and not a["flat"]
+            and not a["output_aux"]
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and topk_weights.dtype == torch.float32
+            and topk_weights.is_contiguous()
+            and block_size > 0
+            and block_size & (block_size - 1) == 0
+            and (
+                expert_mask is None
+                or (expert_mask.dim() == 1 and expert_mask.numel() == num_experts)
+            )
+        )
+        local = (
+            _local_expert_ids(
+                expert_mask, num_experts, topk_ids.device, local_expert_ids_by_mask
+            )
+            if eligible
+            else None
+        )
+        if local is None:
+            if request.num_token_non_padded is not None:
+                _fill_padded_rows_pair(
+                    topk_ids, topk_weights, request.num_token_non_padded
+                )
+            return original(*args, **kwargs)
+        local_ids, num_local = local
+        return fused_aiter_moe_sorting(
+            topk_ids,
+            topk_weights,
+            local_ids,
+            num_local,
+            num_experts,
+            int(a["model_dim"]),
+            a["moebuf_dtype"],
+            block_size,
+            zero_moe_buf=(expert_mask is not None) or bool(a["accumulate"]),
+            num_token_non_padded=request.num_token_non_padded,
+        )
+
+    aiter_fused_moe.moe_sorting = moe_sorting_with_fused_small_m
+    return True
+
+
+@contextlib.contextmanager
+def _fused_sorting_scope(num_token_non_padded: Optional[torch.Tensor]):
+    request = _FusedSortingRequest(num_token_non_padded)
+    token = _fused_sorting_request.set(request)
+    try:
+        yield request
+    finally:
+        _fused_sorting_request.reset(token)
+
+
+@functools.cache
+def _warn_fused_sorting_unused() -> None:
+    logger.warning(
+        "aiter fused_moe did not call moe_sorting; the padded rows of this "
+        "batch were not masked (their outputs are discarded)"
+    )
 
 
 _RECV_BOUND_LOGGED: set[int] = set()
@@ -291,7 +475,35 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
-        output = fused_moe(
+        num_token_non_padded = runner_input.num_token_non_padded
+        use_fused_sorting = (
+            runner_input.fused_sorting
+            and is_hip()
+            and runner_input.num_local_tokens is None
+            and _install_fused_sorting_override()
+        )
+        if num_token_non_padded is not None and not use_fused_sorting:
+            # select_experts deferred the padded-row masks to this runner.
+            _fill_padded_rows_pair(
+                runner_input.topk_ids, runner_input.topk_weights, num_token_non_padded
+            )
+            num_token_non_padded = None
+        scope = (
+            _fused_sorting_scope(num_token_non_padded)
+            if use_fused_sorting
+            else contextlib.nullcontext()
+        )
+        with scope as request:
+            output = self._fused_moe(
+                fused_moe, runner_input, quant_info, a1_scale, extra
+            )
+        if request is not None and not request.fired:
+            # fused_moe took a route that never sorts (grouped GEMM), so the padded rows were not masked
+            _warn_fused_sorting_unused()
+        return AiterRunnerOutput(hidden_states=output)
+
+    def _fused_moe(self, fused_moe, runner_input, quant_info, a1_scale, extra):
+        return fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
@@ -311,7 +523,6 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
-        return AiterRunnerOutput(hidden_states=output)
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -333,12 +544,21 @@ def pre_permute_standard_to_aiter(
     hidden_states = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(torch.float32)
+    # Padded rows select_experts left for the fused sorting launch to mask.
+    num_token_non_padded = getattr(
+        dispatch_output.topk_output, "num_token_non_padded", None
+    )
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
         assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
             "apply_router_weight_on_input requires topk=1"
         )
+        if num_token_non_padded is not None:
+            # The weights are consumed here, so mask the padded rows now.
+            topk_ids = topk_ids.to(torch.int32)
+            _fill_padded_rows_pair(topk_ids, topk_weights, num_token_non_padded)
+            num_token_non_padded = None
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
@@ -347,6 +567,8 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        num_token_non_padded=num_token_non_padded,
+        fused_sorting=True,
     )
 
 

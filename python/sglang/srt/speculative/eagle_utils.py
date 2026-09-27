@@ -507,43 +507,21 @@ def get_draft_recurrent_hidden_state_spec(
     )
 
 
-_PREPARE_FOR_VERIFY_DEPS = None
-
-
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    # Imports must stay lazy (import-cycle safety) but only need to resolve
-    # once, not on every decode cycle of this hot path.
-    global _PREPARE_FOR_VERIFY_DEPS
-    if _PREPARE_FOR_VERIFY_DEPS is None:
-        from sglang.kernels.ops.speculative.cache_locs import (
-            assign_extend_cache_locs_uniform_func,
-        )
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-        )
-        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-
-        _PREPARE_FOR_VERIFY_DEPS = (
-            assign_extend_cache_locs_uniform_func,
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-            prepare_mamba_track_for_verify,
-        )
-    (
+    from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
+    )
+    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-        prepare_mamba_track_for_verify,
-    ) = _PREPARE_FOR_VERIFY_DEPS
+    )
+    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -781,7 +759,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -847,23 +825,15 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if _is_npu:
-            from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_triton,
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-        else:
-            from sgl_kernel import (
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+            tree_speculative_sampling_target_only,
+        )
 
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 

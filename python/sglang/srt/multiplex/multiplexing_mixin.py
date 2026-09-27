@@ -114,7 +114,8 @@ class SchedulerMultiplexMixin:
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                self.ingest_requests()
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
                 running_batch = self.running_batch
 
             with torch.cuda.stream(prefill_stream):
