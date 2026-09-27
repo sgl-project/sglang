@@ -34,7 +34,6 @@ from sglang.srt.layers.communicator import (
     UnreducedOutput,
     scatter_mode_layouts,
 )
-from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusionLayerCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -62,18 +61,22 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         dwdp_size=1,
         enable_dp_attention=attn_dp > 1,
         enable_attn_tp_input_scattered=False,
-        tp_group=SimpleNamespace(name="tp"),
-        attn_tp_group=SimpleNamespace(name="attn_tp"),
+        tp_group=SimpleNamespace(
+            name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
+        ),
+        attn_tp_group=SimpleNamespace(name="attn_tp", ranks=list(range(attn_tp))),
+        attn_cp_group=SimpleNamespace(name="attn_cp", ranks=list(range(attn_cp))),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
 
 @contextmanager
-def planning(parallel, *, sp=False, a2a=False):
+def planning(parallel, *, sp=False, a2a=False, dsa_cp=False):
     """What layer planning and communicator construction read, without the
     process-wide parallel state. ``parallel`` may be a callable, for a
-    per-thread parallel state."""
+    per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
+    the same to the communicator)."""
     get_parallel = parallel if callable(parallel) else (lambda: parallel)
 
     def moe_cp_gathers():
@@ -81,7 +84,7 @@ def planning(parallel, *, sp=False, a2a=False):
 
     with (
         patch.object(comm, "get_parallel", get_parallel),
-        patch.object(comm, "is_dsa_enable_prefill_cp", lambda: False),
+        patch.object(comm, "is_dsa_enable_prefill_cp", lambda: dsa_cp),
         patch.object(comm, "is_mla_cp_enabled", lambda: False),
         patch.object(
             comm,
@@ -103,6 +106,18 @@ def planning(parallel, *, sp=False, a2a=False):
         ),
         patch.object(comm, "is_enable_moe_cp_allgather", moe_cp_gathers),
         patch.object(comm, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
+        # A MoE whose EP and TP sums merge: its output's group is the TP group.
+        patch.object(
+            comm, "post_experts_reduction_group", lambda: get_parallel().tp_group
+        ),
+        # Planning asks whether a dense layer gathers for two-batch overlap.
+        patch.object(
+            comm,
+            "get_exec",
+            lambda: SimpleNamespace(
+                overlap=SimpleNamespace(enable_two_batch_overlap=False)
+            ),
+        ),
     ):
         yield
 
@@ -168,8 +183,17 @@ def sides_of(
     )
 
 
-def build(modes, parallel, *, cls=LayerCommunicator, sp=False, a2a=False, **kwargs):
-    with planning(parallel, sp=sp, a2a=a2a):
+def build(
+    modes,
+    parallel,
+    *,
+    cls=LayerCommunicator,
+    sp=False,
+    a2a=False,
+    dsa_cp=False,
+    **kwargs,
+):
+    with planning(parallel, sp=sp, a2a=a2a, dsa_cp=dsa_cp):
         return cls(
             layer_scatter_modes=modes,
             input_layernorm=Norm(),
@@ -179,9 +203,16 @@ def build(modes, parallel, *, cls=LayerCommunicator, sp=False, a2a=False, **kwar
 
 
 def planned_modes(
-    layer_id, num_layers, *, sparse, previous_sparse, parallel, a2a=False
+    layer_id,
+    num_layers,
+    *,
+    sparse,
+    previous_sparse,
+    parallel,
+    a2a=False,
+    dsa_cp=False,
 ):
-    with planning(parallel, a2a=a2a):
+    with planning(parallel, a2a=a2a, dsa_cp=dsa_cp):
         return LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=num_layers,
@@ -401,6 +432,46 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 )
                 self.assertTrue(layers[3]._steps.ffn_input.keywords["gathers_residual"])
 
+    def test_a_dense_mlp_on_every_rank(self):
+        # moe_dense_tp_size 1: each rank runs the dense MLP on its own slice, as
+        # an a2a MoE does, and owes no sum.
+        parallel = parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        no_overlap = SimpleNamespace(
+            overlap=SimpleNamespace(enable_two_batch_overlap=False)
+        )
+        for a2a in (False, True):
+            with (
+                self.subTest(a2a=a2a),
+                patch.object(comm, "get_exec", lambda: no_overlap),
+            ):
+                layers = [
+                    build(
+                        planned_modes(
+                            i,
+                            4,
+                            sparse=sparse,
+                            previous_sparse=previous,
+                            parallel=parallel,
+                            a2a=a2a,
+                        ),
+                        parallel,
+                        a2a=a2a,
+                        allow_reduce_scatter=True,
+                    )
+                    for i, (sparse, previous) in enumerate(
+                        ((False, False), (False, False), (True, False), (True, True))
+                    )
+                ]
+                self.assertEqual([self.declared(layer) for layer in layers], [True] * 4)
+                for dense in layers[:2]:
+                    self.assertIs(dense._steps.ffn_input.func, comm._mlp_input_scatter)
+                    self.assertIsNone(dense._steps.ffn_output.group)
+                for after_dense in layers[1:3]:
+                    self.assertIs(
+                        after_dense._steps.attention_input,
+                        comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
+                    )
+
     def test_the_last_a2a_layer_folds_the_residual_back(self):
         parallel = parallel_of(attn_dp=2, attn_tp=2)
         last = build(
@@ -431,14 +502,21 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
             ),
-            "dense MLP fully DP": (
+            # The layer before a sparse one gathers its output for the split.
+            "dense MLP fully DP under two-batch overlap": (
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1),
             ),
         }
+        two_batch_overlap = SimpleNamespace(
+            overlap=SimpleNamespace(enable_two_batch_overlap=True)
+        )
         for name, (facts, parallel) in cases.items():
             with self.subTest(name):
-                with planning(parallel):
+                with (
+                    planning(parallel),
+                    patch.object(comm, "get_exec", lambda: two_batch_overlap),
+                ):
                     communicator = LayerCommunicator.__new__(LayerCommunicator)
                     communicator.layer_scatter_modes = facts
                     communicator.allow_deferred_ffn_reduction = True
@@ -456,11 +534,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
         self.assertFalse(self.declared(build(direct, dp)))
 
     def test_subclasses_that_pick_their_own_steps(self):
-        for cls in (
-            MHCLayerCommunicator,
-            DSACPLayerCommunicator,
-            CuteDSLFusionLayerCommunicator,
-        ):
+        for cls in (MHCLayerCommunicator, CuteDSLFusionLayerCommunicator):
             with self.subTest(cls.__name__):
                 self.assertFalse(cls._takes_declared_boundaries)
         self.assertTrue(LayerCommunicator._takes_declared_boundaries)
@@ -948,6 +1022,99 @@ class TestPrefillCP(CustomTestCase):
             attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=True, **overrides
         )
 
+    def dsa_parallel(self, **overrides):
+        # DSA and MLA CP run attention TP 1 and the dense MLP on every rank.
+        return parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            moe_dense_tp_size=1,
+            **overrides,
+        )
+
+    def test_a_dsa_cp_extend_leaves_its_sum_to_the_reduce_scatter(self):
+        # A MoE on the TP group, as under DSA interleave CP without a2a.
+        parallel = self.dsa_parallel()
+        modes = planned_modes(
+            1, 3, sparse=True, previous_sparse=False, parallel=parallel, dsa_cp=True
+        )
+        communicator = build(modes, parallel, dsa_cp=True, allow_reduce_scatter=True)
+        cp, ordinary = communicator._cp_steps, communicator._steps
+        self.assertIs(cp.ffn_input.func, comm._mlp_input_gather_attention_cp)
+        self.assertIs(cp.ffn_input.keywords["gather"], comm._mlp_input_norm)
+        self.assertIs(
+            cp.ffn_output_move,
+            comm.CommunicateSummableTensorPairFn._reduce_scatter_over_cp,
+        )
+        self.assertTrue(cp.ffn_output.leaves_for_reduce_scatter)
+        self.assertFalse(cp.ffn_output.leaves_for_next_layer)
+        # The dense layer before it ran on the same shard: nothing to move.
+        self.assertIs(cp.attention_input, comm.CommunicateSimpleFn._trivial)
+        # Other batches hold every token on each CP rank: the MoE sums itself.
+        self.assertIs(ordinary.ffn_input, comm._mlp_input_norm)
+        self.assertIs(
+            ordinary.ffn_output_move, comm.CommunicateSummableTensorPairFn._trivial
+        )
+        with (
+            patch.object(comm, "get_forward", lambda: SimpleNamespace(sp_active=False)),
+            patch.object(
+                comm,
+                "get_attn_tp_context",
+                lambda: SimpleNamespace(input_scattered=False),
+            ),
+        ):
+            for shards, leaves in ((True, True), (False, False)):
+                with (
+                    self.subTest(cp_extend=shards),
+                    patch.object(comm, "_batch_shards_over_cp", lambda fb: shards),
+                ):
+                    self.assertIs(
+                        communicator._ffn_leaves_sum_to_reduce_scatter(
+                            SimpleNamespace(
+                                forward_mode=SimpleNamespace(
+                                    is_context_parallel_extend=lambda: False
+                                )
+                            ),
+                            None,
+                        ),
+                        leaves,
+                    )
+
+    def test_dsa_cp_asks_its_own_predicates_for_a_cp_extend(self):
+        def batch(cp_extend):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_context_parallel_extend=lambda: cp_extend
+                )
+            )
+
+        with planning(self.dsa_parallel(), dsa_cp=True):
+            for cp_extend, active, shards in (
+                (True, True, True),
+                (True, False, False),
+                (False, True, False),
+            ):
+                with (
+                    self.subTest(cp_extend=cp_extend, active=active),
+                    patch.object(comm, "dsa_use_prefill_cp", lambda fb: active),
+                    patch.object(comm, "is_mla_cp_active", lambda fb: False),
+                ):
+                    self.assertIs(comm._batch_shards_over_cp(batch(cp_extend)), shards)
+
+    def test_dsa_cp_dense_layers_run_on_their_shard(self):
+        parallel = self.dsa_parallel()
+        modes = planned_modes(
+            1, 3, sparse=False, previous_sparse=False, parallel=parallel, dsa_cp=True
+        )
+        communicator = build(modes, parallel, dsa_cp=True, allow_reduce_scatter=True)
+        for steps in (communicator._steps, communicator._cp_steps):
+            self.assertIs(steps.ffn_input, comm._mlp_input_norm)
+            self.assertIsNone(steps.ffn_output.group)
+            self.assertIs(
+                steps.ffn_output_move, comm.CommunicateSummableTensorPairFn._trivial
+            )
+
     def test_a_cp_extend_gathers_over_cp_and_takes_its_chunk_back(self):
         communicator = build(layer_facts(1, 3), self.cp_parallel())
         cp = communicator._cp_steps
@@ -982,16 +1149,30 @@ class TestPrefillCP(CustomTestCase):
 
     def test_which_cp_the_declarations_cover(self):
         dp_cp = parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True)
-        for name, parallel, sparse, declared in (
-            ("prefill CP", self.cp_parallel(), False, True),
+        dsa_dp_cp = parallel_of(
+            attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
+        )
+        for name, parallel, sparse, declared, dsa_cp, a2a in (
+            ("DSA or MLA CP", self.dsa_parallel(), True, True, True, False),
+            (
+                "DSA or MLA CP, a MoE under attention DP",
+                dsa_dp_cp,
+                True,
+                True,
+                True,
+                True,
+            ),
+            ("prefill CP", self.cp_parallel(), False, True, False, False),
             (
                 "CP without prefill CP",
                 parallel_of(attn_dp=1, attn_tp=2, attn_cp=2),
                 False,
                 False,
+                False,
+                False,
             ),
-            ("CP under attention DP", dp_cp, False, True),
-            ("a MoE under attention DP and CP", dp_cp, True, False),
+            ("CP under attention DP", dp_cp, False, True, False, False),
+            ("a MoE under attention DP and GQA CP", dp_cp, True, False, False, False),
             (
                 "a MoE-CP group narrower than CP",
                 parallel_of(
@@ -1003,13 +1184,23 @@ class TestPrefillCP(CustomTestCase):
                 ),
                 False,
                 False,
+                False,
+                False,
             ),
         ):
             with self.subTest(name):
                 modes = planned_modes(
-                    1, 3, sparse=sparse, previous_sparse=sparse, parallel=parallel
+                    1,
+                    3,
+                    sparse=sparse,
+                    previous_sparse=sparse,
+                    parallel=parallel,
+                    a2a=a2a,
+                    dsa_cp=dsa_cp,
                 )
-                communicator = build(modes, parallel)
+                communicator = build(
+                    modes, parallel, a2a=a2a, dsa_cp=dsa_cp, allow_reduce_scatter=True
+                )
                 self.assertIs(communicator._cp_steps is not None, declared)
 
     def test_under_attention_dp_one_dp_sum_gathers_both_axes(self):
@@ -1031,13 +1222,26 @@ class TestPrefillCP(CustomTestCase):
 
     def test_a_batch_runs_them_only_on_a_cp_extend(self):
         communicator = build(layer_facts(1, 3), self.cp_parallel())
-        for rows, expected in (
-            (None, communicator._steps),
-            ([2, 1], communicator._cp_steps),
+
+        def batch(cp_extend):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_context_parallel_extend=lambda: cp_extend
+                )
+            )
+
+        def unread(fb):
+            raise AssertionError("read for a batch that is not a CP extend")
+
+        for fb, rows, expected in (
+            (batch(False), unread, communicator._steps),
+            (batch(True), lambda fb: None, communicator._steps),
+            (batch(True), lambda fb: [2, 1], communicator._cp_steps),
         ):
             with (
-                self.subTest(gathered_rows=rows),
-                patch.object(comm, "moe_cp_gathered_rows", lambda fb: rows),
+                self.subTest(expected=expected is communicator._cp_steps),
+                planning(self.cp_parallel()),
+                patch.object(comm, "moe_cp_gathered_rows", rows),
                 patch.object(
                     comm, "get_forward", lambda: SimpleNamespace(sp_active=False)
                 ),
@@ -1047,7 +1251,7 @@ class TestPrefillCP(CustomTestCase):
                     lambda: SimpleNamespace(input_scattered=False),
                 ),
             ):
-                self.assertIs(communicator._batch_steps(None), expected)
+                self.assertIs(communicator._batch_steps(fb), expected)
 
 
 # ---------------------------------------------------------------------------
