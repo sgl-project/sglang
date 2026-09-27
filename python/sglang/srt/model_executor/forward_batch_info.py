@@ -1124,8 +1124,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information (None on a draft runner: it is unadapted)
-        if model_runner.lora_manager is not None:
+        # Init lora information
+        if (
+            model_runner.lora_manager is not None
+            and not model_runner.lora_manager.enable_dp_attention
+        ):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
@@ -1875,29 +1878,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
-            # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
-            # a disjoint subset of the fields below, so getattr-guard each one.
+            # Draft input types carry different subsets of the shared fields.
             if getattr(spec_info, "topk_p", None) is not None:
                 spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
             if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if getattr(spec_info, "draft_probs", None) is not None:
-                spec_info.draft_probs = self._pad_tensor_to_size(
-                    spec_info.draft_probs, bs
-                )
-            if getattr(spec_info, "num_correct_drafts", None) is not None:
-                spec_info.num_correct_drafts = self._pad_tensor_to_size(
-                    spec_info.num_correct_drafts, bs
-                )
-                spec_info.num_accept_tokens = self._pad_tensor_to_size(
-                    spec_info.num_accept_tokens, bs
-                )
             if spec_info.hidden_states is not None:
                 spec_info.hidden_states = self._pad_tensor_to_size(
                     spec_info.hidden_states, num_tokens
                 )
+            spec_info.pad_batch(self._pad_tensor_to_size, bs)
 
     def _forward_num_tokens(self) -> int:
         """Token width of this forward (``input_embeds`` over ``input_ids``), as

@@ -83,18 +83,19 @@ def match_len(cache, token_ids) -> int:
 def register(cache, token_ids, session_id, generation=None):
     if generation is None:
         generation = cache.ensure_session_generation(session_id)
+    leaf = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).last_device_node
     cache.session_refs.register_session_ref(
         SimpleNamespace(
             session_id=session_id,
             session_generation=generation,
             session=None,
-            last_node=cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-            ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
             extra_key=None,
-        )
+        ),
+        leaf=leaf,
     )
 
 
