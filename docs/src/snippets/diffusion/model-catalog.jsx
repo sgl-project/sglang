@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "HunyuanImage-3.0",
+      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
+      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",

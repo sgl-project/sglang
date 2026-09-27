@@ -1462,6 +1462,12 @@
                 "pages": [
                   "cookbook/diffusion/intro",
                   {
+                    "group": "Tencent",
+                    "pages": [
+                      "cookbook/diffusion/Tencent/HunyuanImage3"
+                    ]
+                  },
+                  {
                     "group": "Cosmos",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"

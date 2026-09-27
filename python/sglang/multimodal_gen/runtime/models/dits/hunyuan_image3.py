@@ -17,7 +17,6 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DitConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
@@ -29,7 +28,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -38,6 +36,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.models.hunyuan import (
+    HunYuanMLP,
     _get_cla_factor,
     _is_moe,
 )
@@ -450,46 +449,6 @@ def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, defaul
         assert layer_id >= 0 and len(value) > layer_id, f"{field}[{layer_id}] missing"
         return value[layer_id]
     return value
-
-
-class HunYuanMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        bias: bool = False,
-        prefix: str = "",
-        reduce_results: bool = True,
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size] * 2,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=f"{prefix}.down_proj",
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class HunYuanSparseMoeBlock(nn.Module):

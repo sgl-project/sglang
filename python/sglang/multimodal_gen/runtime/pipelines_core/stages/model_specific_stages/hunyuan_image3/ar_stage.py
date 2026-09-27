@@ -36,12 +36,12 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import load_dict
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
-from .prompts import resolve_system_prompt
-from .resolution import (
+from .decoding import (
     OUTPUT_GEOMETRY_EXTRA_KEY,
     build_hunyuan_image3_output_geometry,
     resolve_hunyuan_image3_output_resolution,
 )
+from .prompts import resolve_system_prompt
 from .tokenizer import (
     HunyuanImage3TokenizerWrapper,
     ImageInfo,

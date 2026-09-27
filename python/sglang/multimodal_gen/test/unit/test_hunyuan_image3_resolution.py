@@ -19,12 +19,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HunyuanImage3AR,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.decoding import (
+    OUTPUT_GEOMETRY_EXTRA_KEY,
     HunyuanImage3DecodingStage,
     _build_spatial_plan,
     apply_hunyuan_image3_spatial_plan,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.resolution import (
-    OUTPUT_GEOMETRY_EXTRA_KEY,
     build_hunyuan_image3_output_geometry,
     resolve_hunyuan_image3_output_resolution,
 )

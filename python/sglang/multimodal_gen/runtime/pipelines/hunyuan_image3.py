@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_checkpoint_files,
 )
-from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
+from sglang.multimodal_gen.runtime.loader.utils import (
+    load_model_state_dict,
+    set_default_torch_dtype,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -27,6 +30,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
     HunyuanImage3ForCausalMM,
     LightProjector,
+)
+from sglang.multimodal_gen.runtime.models.encoders.hunyuan_image3 import (
+    HunyuanImage3VisionModel,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -115,8 +121,18 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             "tokenizer": self._load_tokenizer(server_args, model_path),
             "scheduler": FlowMatchEulerDiscreteScheduler(shift=flow_shift),
             "processor": self._load_processor(server_args, model_path, hf_config),
-            "vision_model": self._load_vision_model(model_path, config_dict),
-            "vision_aligner": self._load_vision_aligner(model_path, config_dict),
+            "vision_model": self._load_component(
+                HunyuanImage3VisionModel(config_dict["vit"]),
+                "vision_model",
+                model_path,
+                server_args,
+            ),
+            "vision_aligner": self._load_component(
+                LightProjector(config_dict["vit_aligner"]),
+                "vision_aligner",
+                model_path,
+                server_args,
+            ),
         }
 
     def _load_ar_model(
@@ -221,7 +237,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             reshard_after_forward=True,
             mp_policy=mp_policy,
             mesh=device_mesh,
-            fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
+            fsdp_shard_conditions=model._fsdp_shard_conditions,
             pin_cpu_memory=server_args.pin_cpu_memory,
         )
 
@@ -237,32 +253,17 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         vae_params.setdefault("in_channels", 3)
         vae_params.setdefault("out_channels", 3)
         vae_params.setdefault("ffactor_temporal", 4)
-        vae = AutoencoderKLConv3D(**vae_params)
-
         dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
-        vae.to(dtype=dtype)
-
-        state_dict = self._collect_prefixed_weights(model_path, "vae.")
-        missing_keys, _unexpected = vae.load_state_dict(state_dict, strict=False)
-        if missing_keys:
-            logger.warning(
-                "VAE missing %d key(s), e.g. %s",
-                len(missing_keys),
-                missing_keys[:3],
-            )
-
-        device = (
-            torch.device("cpu")
-            if server_args.should_cpu_offload_component("vae")
-            else get_local_torch_device()
+        vae = self._load_component(
+            AutoencoderKLConv3D(**vae_params).to(dtype=dtype),
+            "vae",
+            model_path,
+            server_args,
         )
-        vae.to(device=device)
-        vae.eval()
         if server_args.pipeline_config.vae_tiling:
             vae.enable_tiling()
         if server_args.pipeline_config.vae_slicing:
             vae.enable_slicing()
-        self.memory_usages["vae"] = _module_memory_gb(vae)
         return vae
 
     @staticmethod
@@ -281,65 +282,29 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
         return processor_cls(hf_config)
 
-    def _load_vision_model(
+    def _load_component(
         self,
+        model: torch.nn.Module,
+        component_name: str,
         model_path: str,
-        config_dict: dict[str, Any],
+        server_args: ServerArgs,
     ) -> torch.nn.Module:
-        vit_config = config_dict["vit"]
-        # Reference SigLIP2 ViT (plain PyTorch, F.sdpa packed attention)
-        # instead of SRT Siglip2Model, matching the official cond-image path.
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.vision import (
-            Siglip2VisionTransformer,
+        state_dict = self._collect_prefixed_weights(model_path, f"{component_name}.")
+        if isinstance(model, HunyuanImage3VisionModel):
+            loaded = model.load_weights(state_dict.items())
+            missing = set(dict(model.named_parameters())) - loaded
+            if missing:
+                raise ValueError(f"Missing {component_name} weights: {sorted(missing)}")
+        else:
+            load_model_state_dict(model, state_dict)
+        device = (
+            torch.device("cpu")
+            if server_args.should_cpu_offload_component(component_name)
+            else get_local_torch_device()
         )
-
-        vision_model = Siglip2VisionTransformer(vit_config)
-
-        state_dict = self._collect_prefixed_weights(model_path, "vision_model.")
-        missing_keys, _unexpected = vision_model.load_state_dict(
-            state_dict, strict=False
-        )
-        if missing_keys:
-            logger.warning(
-                "vision_model missing %d key(s), e.g. %s",
-                len(missing_keys),
-                sorted(missing_keys)[:3],
-            )
-
-        device = get_local_torch_device()
-        vision_model.to(device=device)
-        vision_model.eval()
-        self.memory_usages["vision_model"] = _module_memory_gb(vision_model)
-        logger.info(
-            "Loaded vision_model (%.2f GiB)", self.memory_usages["vision_model"]
-        )
-        return vision_model
-
-    def _load_vision_aligner(
-        self,
-        model_path: str,
-        config_dict: dict[str, Any],
-    ) -> torch.nn.Module:
-        vision_aligner = LightProjector(config_dict["vit_aligner"])
-        state_dict = self._collect_prefixed_weights(model_path, "vision_aligner.")
-        missing_keys, _unexpected = vision_aligner.load_state_dict(
-            state_dict, strict=False
-        )
-        if missing_keys:
-            logger.warning(
-                "vision_aligner missing %d key(s), e.g. %s",
-                len(missing_keys),
-                missing_keys[:3],
-            )
-
-        device = get_local_torch_device()
-        vision_aligner.to(device=device)
-        vision_aligner.eval()
-        self.memory_usages["vision_aligner"] = _module_memory_gb(vision_aligner)
-        logger.info(
-            "Loaded vision_aligner (%.2f GiB)", self.memory_usages["vision_aligner"]
-        )
-        return vision_aligner
+        model.to(device=device).requires_grad_(False).eval()
+        self.memory_usages[component_name] = _module_memory_gb(model)
+        return model
 
     @staticmethod
     def _collect_prefixed_weights(
