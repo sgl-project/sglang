@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.communicator import (
-    ADD_AND_NORM,
+    ADD,
+    NORM_QUANT_READ,
     FfnExitFusion,
     LayerCommunicator,
     Layout,
@@ -56,7 +57,8 @@ def _communicator():
             layer_input=None,
             fusions=comm._attn_input_fusions,
             enters_stack=False,
-            residual_ops=ADD_AND_NORM,
+            read=NORM_QUANT_READ,
+            update=ADD,
         )
     )
     return comm

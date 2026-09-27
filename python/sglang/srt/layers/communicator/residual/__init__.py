@@ -11,50 +11,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""How a layer writes its stages' outputs into the residual and reads the next
-stage's input back."""
+"""How a stage writes its output into the residual (its update) and how a
+stage reads its input back from it (its read). The producer of a boundary
+declares the update, the consumer the read; the boundary steps complete sums
+and move tokens around the two."""
 
-from typing import Protocol, Tuple
+from typing import NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
 
-class ResidualOps(Protocol):
-    """How a layer writes each stage's output into its residual and reads the
-    next stage's input from it. The boundary steps complete sums and move
-    tokens around these operations. AddAndNorm adds and normalizes; MHC's
-    hyper-connection streams implement the same operations (residual.mhc)."""
+class StageUpdate(Protocol):
+    """How a stage's output is written into the residual."""
 
-    # The write-back is a plain add, which one rank may run before the sum it
-    # adds into completes: the DP partial order, and a residual that joins the
-    # attention output's sum.
+    # A plain add, which one rank may run before the sum it adds into
+    # completes (the DP partial order, a residual that joins the attention
+    # output's sum), and which a fused add + norm kernel may run.
     adds_plainly: bool
-    # The layer writes its FFN output into the residual itself instead of
-    # leaving that to the next layer's input.
-    updates_residual_after_ffn: bool
+    # The stage writes its output into the residual itself at its end, instead
+    # of leaving that to the next stage's read.
+    at_producer: bool
 
-    def enter(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The residual the layer stack starts from, given its input."""
-
-    def read_attention_input(self, residual, norm, quant_format: str) -> Tuple:
-        """The attention input and the residual, from a residual that already
-        holds the previous layer's output."""
-
-    def update_and_read_attention_input(
-        self, hidden_states, residual, norm, quant_format: str, post_residual_addition
-    ) -> Tuple:
-        """Write the previous layer's output into the residual, then read the
-        attention input from it."""
-
-    def update_and_read_ffn_input(self, hidden_states, residual, norm) -> Tuple:
-        """Write the attention output into the residual, then read the FFN
-        input from it."""
-
-    def update_residual(self, hidden_states, residual) -> torch.Tensor:
-        """The residual with the FFN output written into it."""
+    def update(self, hidden_states, residual) -> torch.Tensor:
+        """The residual with the output written into it."""
 
     def residual_to_attn_tp_shard(self, residual, context) -> torch.Tensor:
-        """This attention-TP rank's slice of the residual."""
+        """This attention-TP rank's slice of the residual, with whatever the
+        update reads along with it."""
 
     def residual_from_attn_tp_shards(self, residual) -> torch.Tensor:
         """The residual gathered from every attention-TP rank's slice."""
+
+
+class StageRead(Protocol):
+    """How a stage reads its input from the residual."""
+
+    # The input is the residual's norm, in the quantization the call asks for,
+    # and the residual is left as it is: what a fused add + norm kernel computes,
+    # and what may run on the rows a sum completes onto.
+    norms_plainly: bool
+
+    def enter(self, hidden_states) -> torch.Tensor:
+        """The residual the layer stack starts from, given its input."""
+
+    def read(
+        self,
+        residual,
+        norm,
+        quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple:
+        """The input and the residual, from a residual that already holds the
+        previous stage's output."""
+
+    def update_and_read(
+        self,
+        update: StageUpdate,
+        hidden_states,
+        residual,
+        norm,
+        quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple:
+        """Write the previous stage's output into the residual with its
+        producer's ``update``, then read the input."""
+
+
+class LayerResidual(NamedTuple):
+    """The reads and updates a decoder layer declares for its attention and
+    its FFN."""
+
+    attention_read: StageRead
+    attention_update: StageUpdate
+    ffn_read: StageRead
+    ffn_update: StageUpdate

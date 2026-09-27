@@ -65,7 +65,8 @@ def communicator(norm):
             layer_input=None,
             fusions=c._attn_input_fusions,
             enters_stack=False,
-            residual_ops=comm.ADD_AND_NORM,
+            read=comm.NORM_QUANT_READ,
+            update=comm.ADD,
         ),
         attention_input=lambda hidden_states, **_: hidden_states,
         ffn_input=comm_ops._mlp_input_norm,
@@ -245,7 +246,8 @@ class TestPrepareAttnSteps(CustomTestCase):
                     layer_input=None,
                     fusions=(takes_anything,),
                     enters_stack=False,
-                    residual_ops=comm.ADD_AND_NORM,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
                 ),
             )
             partial_sum = torch.ones(3, 4)

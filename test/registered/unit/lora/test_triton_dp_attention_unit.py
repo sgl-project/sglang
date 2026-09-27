@@ -10,7 +10,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.communicator import (
-    ADD_AND_NORM,
+    ADD,
+    NORM_QUANT_READ,
     LayerCommunicator,
     Layout,
     TokenAxis,
@@ -246,7 +247,8 @@ def test_communicator_publishes_layout_at_each_transition(
             layer_input=None,
             fusions=(),
             enters_stack=False,
-            residual_ops=ADD_AND_NORM,
+            read=NORM_QUANT_READ,
+            update=ADD,
         ),
         attention_input=lambda hidden_states, **kwargs: hidden_states,
         attention_handoff=lambda hidden_states, *args: hidden_states,
