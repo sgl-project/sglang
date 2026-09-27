@@ -21,7 +21,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -34,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -275,6 +275,27 @@ def load_model_with_memory_saver(
             )
         if is_qwen4_exp:
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
+            model_config.hf_text_config.ple_offload_backend = (
+                get_exec().offload.ple_offload_backend
+            )
+            if get_exec().offload.ple_offload_backend != "file":
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                )
+            else:
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                    default_ple_table_dir,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                    or default_ple_table_dir(get_model().model_path)
+                )
+                if ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(
+                        torch.cuda.current_device() if torch.cuda.is_available() else 0
+                    )
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
@@ -352,12 +373,12 @@ def dist_barrier_after_load(
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
         if not is_ep_joiner:
-            dist.barrier(group=get_tp_group().cpu_group)
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
         try:
             dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
+                group=get_parallel().tp_group.cpu_group,
                 timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
                 wait_all_ranks=True,
             )

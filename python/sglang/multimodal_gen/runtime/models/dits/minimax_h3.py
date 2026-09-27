@@ -18,14 +18,19 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_mxfp8_swizzled,
+    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_mxfp8_,
+    silu_mul_mxfp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -63,7 +68,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -78,6 +85,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+    MiniMaxH3VDNHybridAttention,
 )
 from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
@@ -362,6 +372,12 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _accepts_mxfp8_input(linear: nn.Module) -> bool:
+    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
+        linear
+    )
+
+
 def _modulate_scale_shift(
     x: torch.Tensor,
     shift: torch.Tensor,
@@ -414,13 +430,16 @@ def _modulate_gate(
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
-        reuse_input
-        and hidden.is_cuda
+        hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
         and hidden.is_contiguous()
         and hidden.shape[-1] % 16 == 0
     ):
-        return silu_and_mul_with_activation_rounding_(hidden)
+        if reuse_input:
+            return silu_and_mul_with_activation_rounding_(hidden)
+        # Quantized fc2 needs contiguous rows, so keep the fused result out of
+        # the packed fc1 buffer while preserving the eager BF16 SiLU rounding.
+        return silu_and_mul_with_activation_rounding(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
 
@@ -827,6 +846,10 @@ class MiniMaxH3Attention(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.to_gate_compress",
             )
+        # VDN-H3: None for the dense model and for the token refiner
+        self.hybrid = MiniMaxH3VDNHybridAttention.build(
+            arch, quant_config, prefix=prefix, local_heads=self.num_heads
+        )
 
     def _set_attention_backend(self, backend) -> None:
         if (
@@ -1032,8 +1055,11 @@ class MiniMaxH3Attention(nn.Module):
         subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
+
+        ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1054,11 +1080,29 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        if (
+            self.hybrid is not None
+            and self._attention_backend_enum
+            is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+        ):
+            return self.hybrid(
+                self,
+                x,
+                q,
+                k,
+                v,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                ulysses_active=ulysses_active,
+                ring_active=ring_active,
+            )
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1160,7 +1204,7 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "mps":
+        if not isinstance(x, tuple) and x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
@@ -1173,6 +1217,9 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
+        if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
+            out, _ = self.fc2(silu_mul_mxfp8(hidden))
+            return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1384,11 +1431,20 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
-        )
+        h_prequant = None
+        if _accepts_mxfp8_input(self.attn.qkv_proj) and can_use_mxfp8_swizzled(h):
+            # the bf16 modulated rows stay in h for the VDN branch projections
+            h, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
+                h, shift_msa, scale_msa, combined_indices, keep_bf16=True
+            )
+            h_prequant = (h_fp8, h_scales)
+        else:
+            h = _modulate_scale_shift(
+                h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+            )
         h = self.attn(
             h,
+            x_prequant=h_prequant,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1408,10 +1464,16 @@ class MiniMaxH3DiTBlock(nn.Module):
 
         residual = x
         h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-        )
-        h = self.mlp(h)
+        if _accepts_mxfp8_input(self.mlp.fc1) and can_use_mxfp8_swizzled(h):
+            _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
+                h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+            )
+            h = self.mlp((h_fp8, h_scales))
+        else:
+            h = _modulate_scale_shift(
+                h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+            )
+            h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(
@@ -1470,6 +1532,58 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.audio_out",
         )
+        # Parallel Decoding Distillation heads, one per denoise step, loaded by
+        # `load_pdd_fused_heads`. None on every ordinary run.
+        self._pdd_heads: dict[str, torch.Tensor] | None = None
+
+    def load_pdd_fused_heads(self, path: str) -> None:
+        """Swap the two output heads for a per-step stack (PDD).
+
+        PDD replicates the final linear layer once per time interval and lets one
+        backbone evaluation advance a whole block of them; the per-block heads
+        fuse into one because H3's euler-eta0 step is linear in the predicted
+        velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline,
+        leaving one head per denoise step.
+        """
+        from safetensors import safe_open
+
+        with safe_open(path, "pt") as f:
+            heads = {k: f.get_tensor(k) for k in f.keys()}
+        steps = heads["video_out.weight"].shape[0]
+        for name in ("video_out", "audio_out"):
+            projection = getattr(self, name)
+            for suffix, shape in (
+                ("weight", (steps, projection.output_size, projection.input_size)),
+                ("bias", (steps, projection.output_size)),
+            ):
+                key = f"{name}.{suffix}"
+                if steps == 0 or heads[key].shape != shape:
+                    raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}")
+                width = projection.output_size_per_partition
+                heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
+        self._pdd_heads = heads
+        logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
+
+    def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
+        heads = self._pdd_heads
+        step = int(get_forward_context().current_timestep)
+        stack = heads[f"{name}.weight"]
+        if not 0 <= step < stack.shape[0]:
+            raise ValueError(
+                f"MiniMax-H3 PDD has {stack.shape[0]} fused heads but the loop is at "
+                f"step {step}; run with --num-inference-steps {stack.shape[0] + 1} "
+                "(H3 counts sigma grid points, so that is one more than the steps)."
+            )
+        weight = stack[step].to(device=h.device, dtype=h.dtype)
+        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
+        return torch.nn.functional.linear(h, weight, bias)
+
+    def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._pdd_heads is not None:
+            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
+        video, _ = self.video_out(h)
+        audio, _ = self.audio_out(h)
+        return video, audio
 
     def forward(
         self,
@@ -1503,8 +1617,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                     inverse_indices[start:stop],
                     dtype=_BF16_DTYPE,
                 ).to(_FP32_DTYPE)
-                video_chunk, _ = self.video_out(h)
-                audio_chunk, _ = self.audio_out(h)
+                video_chunk, audio_chunk = self._project(h)
                 if video is None:
                     video = torch.empty(
                         (x.shape[0], video_chunk.shape[-1]),
@@ -1527,9 +1640,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
-        video, _ = self.video_out(h)
-        audio, _ = self.audio_out(h)
-        return video, audio
+        return self._project(h)
 
 
 def _reject_adaln_lora(names: list[str]) -> None:
@@ -1929,6 +2040,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
             use_adaln_cache=self._adaln_precomputed,
         )
+        pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        if pdd_heads:
+            self.final_layer.load_pdd_fused_heads(pdd_heads)
         self.adaln_cache = (
             MiniMaxH3AdalnCache(
                 arch,

@@ -28,7 +28,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import NgramEmbeddingInfo
+from sglang.srt.model_executor.forward_batch_info import (
+    NgramEmbeddingInfo,
+    enable_num_token_non_padded,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
@@ -64,6 +67,7 @@ def _allocate_pp_proxy_tensors(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_dspark_hidden_size: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """Allocate the stable buffers consumed by an incoming PP proxy."""
     is_mhc = hc_hidden_size is not None
@@ -84,6 +88,10 @@ def _allocate_pp_proxy_tensors(
         pp_proxy_tensors["topk_indices"] = torch.zeros(
             (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
         )
+    if pp_proxy_dspark_hidden_size:
+        pp_proxy_tensors["dspark_hidden_states"] = torch.zeros(
+            (max_num_tokens, pp_proxy_dspark_hidden_size), dtype=dtype
+        )
     return pp_proxy_tensors
 
 
@@ -97,7 +105,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
-    num_token_non_padded: torch.Tensor
+    num_token_non_padded: Optional[torch.Tensor]
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     mamba_track_indices: Optional[torch.Tensor]
@@ -133,6 +141,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_hidden_size: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -142,7 +151,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            # Refreshed at replay only under expert parallelism.
+            num_token_non_padded = (
+                torch.zeros((1,), dtype=torch.int32)
+                if enable_num_token_non_padded()
+                else None
+            )
             custom_mask = torch.ones(
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
                 dtype=torch.bool,
@@ -165,6 +179,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                    pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
                 )
                 if pp_size > 1
                 else None
@@ -267,6 +282,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_hidden_size: int = 0,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -303,6 +319,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
+                    pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
                 )
                 if pp_size > 1 and not is_first_pp_rank
                 else None

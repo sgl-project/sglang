@@ -24,6 +24,10 @@ import torch
 import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
+    extract_extra_tensors,
+    restore_extra_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
@@ -205,18 +209,6 @@ def _is_default(value, field_info) -> bool:
     return False
 
 
-def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
-    """Extract JSON-serializable entries from Req.extra into scalar_fields."""
-    for key, value in extra.items():
-        if key.startswith("_"):
-            continue
-        try:
-            json.dumps(value)
-            scalar_fields[f"_extra_{key}"] = value
-        except (TypeError, ValueError, OverflowError):
-            pass
-
-
 def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
@@ -300,7 +292,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     extra = getattr(req, "extra", None)
     if extra:
-        _extract_extra_fields(extra, scalar_fields)
+        extract_extra_tensors(extra, tensor_fields, scalar_fields)
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
@@ -1411,6 +1403,7 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default_factory())
         # Ensure sampling_params is not None so __getattr__ delegation works
         object.__setattr__(req, "sampling_params", SamplingParams())
+        restore_extra_tensors(req.extra, tensors, scalar_fields)
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:

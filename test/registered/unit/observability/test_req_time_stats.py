@@ -46,6 +46,26 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
 
 
+class TestOutputMetaInfo(CustomTestCase):
+    def test_first_token_latency_requires_valid_timestamps(self):
+        for created, first, expected in (
+            (1.0, 1.5, 0.5),
+            (0.0, 1.5, None),
+            (1.0, 0.0, None),
+            (1.0, 1.0, None),
+            (1.0, 0.5, None),
+        ):
+            with self.subTest(created=created, first=first):
+                stats = rts.APIServerReqTimeStats()
+                stats.created_time = created
+                stats.first_token_time = first
+                meta_info = stats.convert_to_output_meta_info()
+                if expected is None:
+                    self.assertNotIn("first_token_latency", meta_info)
+                else:
+                    self.assertAlmostEqual(meta_info["first_token_latency"], expected)
+
+
 class TestConvertToGenAiSpanAttrs(CustomTestCase):
     def _stats_after_first_token(self) -> rts.APIServerReqTimeStats:
         stats = rts.APIServerReqTimeStats()
@@ -124,6 +144,91 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
         stats.set_finished_time(ts=2.0, span_attrs=caller_attrs)
 
         self.assertEqual(caller_attrs, {"gen_ai.request.id": "rid-1"})
+
+
+class TestQueueTimeAcrossRetraction(CustomTestCase):
+    """A retracted request re-enters the waiting queue after its first forward.
+
+    queue_time must be the total time spent waiting across every entry. It used
+    to be first-forward minus the latest queue entry, which went negative.
+    """
+
+    T0 = 1000.0
+
+    def _stats(self, disagg_mode=rts.DisaggregationMode.NULL):
+        stats = rts.SchedulerReqTimeStats(disagg_mode=disagg_mode)
+        stats.enable_metrics = True
+        stats.metrics_collector = mock.MagicMock()
+        return stats
+
+    def _retract_once(self, stats, forward_calls=(0.10,), readmit_calls=(1.50,)):
+        # waits: [0.00, 0.10) before the first forward, [1.00, 1.50) after retraction
+        stats.set_wait_queue_entry_time(self.T0 + 0.00)
+        for dt in forward_calls:
+            stats.set_forward_entry_time(self.T0 + dt)
+        stats.set_wait_queue_entry_time(self.T0 + 1.00)
+        for dt in readmit_calls:
+            stats.set_forward_entry_time(self.T0 + dt)
+        stats.set_completion_time(self.T0 + 2.00)
+
+    def test_retracted_request_reports_total_queue_time(self):
+        stats = self._stats()
+        self._retract_once(stats)
+
+        self.assertAlmostEqual(stats.convert_to_output_meta_info()["queue_time"], 0.6)
+        with mock.patch.object(rts, "SGLANG_TEST_REQUEST_TIME_STATS", True):
+            self.assertIn("queue_duration=600.00ms", stats.convert_to_duration())
+
+    def test_queue_time_survives_clock_rebase_across_hops(self):
+        stats = self._stats()
+        self._retract_once(stats)
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
+            blob = pickle.dumps(stats)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
+            blob = pickle.dumps(pickle.loads(blob))
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
+            tokenizer_side = pickle.loads(blob)
+
+        self.assertAlmostEqual(tokenizer_side.get_queueing_time(), 0.6)
+
+    def test_prefill_chunks_do_not_extend_queue_time(self):
+        stats = self._stats()
+        self._retract_once(
+            stats, forward_calls=(0.10, 0.30, 0.50), readmit_calls=(1.50, 1.70)
+        )
+
+        self.assertAlmostEqual(stats.get_queueing_time(), 0.6)
+
+    def test_queue_time_histogram_keeps_one_first_wait_sample(self):
+        stats = self._stats()
+        self._retract_once(stats)
+
+        stats.metrics_collector.observe_queue_time.assert_called_once()
+        (sample,) = stats.metrics_collector.observe_queue_time.call_args.args
+        self.assertAlmostEqual(sample, 0.1)
+
+    def test_decode_rebootstrap_counts_both_waits(self):
+        stats = self._stats(disagg_mode=rts.DisaggregationMode.DECODE)
+        stats.set_wait_queue_entry_time(self.T0 + 0.00)
+        stats.set_forward_entry_time(self.T0 + 0.10)
+        # held for re-bootstrap: not in the waiting queue until [1.00, 1.25)
+        stats.set_retract_time(self.T0 + 0.50)
+        stats.set_wait_queue_entry_time(self.T0 + 1.00)
+        stats.set_forward_entry_time(self.T0 + 1.25)
+        stats.set_quick_finish_time(self.T0 + 1.30)
+
+        self.assertAlmostEqual(stats.get_queueing_time(), 0.35)
+
+    def test_prefill_retry_reset_discards_earlier_attempt_waits(self):
+        stats = self._stats(disagg_mode=rts.DisaggregationMode.PREFILL)
+        stats.set_wait_queue_entry_time(self.T0 + 0.00)
+        stats.set_forward_entry_time(self.T0 + 0.30)
+        stats.reset_prefill_retry_time()
+        stats.set_wait_queue_entry_time(self.T0 + 1.00)
+        stats.set_forward_entry_time(self.T0 + 1.20)
+
+        self.assertAlmostEqual(stats.get_queueing_time(), 0.2)
 
 
 if __name__ == "__main__":

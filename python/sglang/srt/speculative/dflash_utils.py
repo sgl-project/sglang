@@ -41,7 +41,16 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda():
+    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+
+    from sglang.kernels.ops.speculative.sampling import (
+        tree_speculative_sampling_target_only,
+    )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+elif is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -544,6 +553,8 @@ class DFlashDraftConfig:
     pure_draft_prefix_len: Optional[int]
     gru_hidden_dim: Optional[int]
     emb_dim: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
 
     @property
     def is_domino(self) -> bool:
@@ -708,6 +719,29 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    # MiMo DFlash draft extras: per-head attention sink bias and V value scale.
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} (type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+
     projector_type = dflash_cfg.get(
         "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
     )
@@ -792,6 +826,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         pure_draft_prefix_len=pure_draft_prefix_len,
         gru_hidden_dim=gru_hidden_dim,
         emb_dim=emb_dim,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
     )
 
 

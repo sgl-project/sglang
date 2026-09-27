@@ -795,14 +795,16 @@ fn abort_cancels_parked_mm_request() {
     // The worker parks its result, as it always does before MmEncoded.
     intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::result_store::MmEncodedEntry {
-            features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
-            grids: vec![],
-            hashes: vec![],
-            offsets: vec![],
-            mrope: vec![],
-            mrope_delta: 0,
-        },
+        crate::multi_modality::result_store::MmEncodedEntry::Qwen(
+            crate::multi_modality::result_store::QwenMmEncodedEntry {
+                features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
+                grids: vec![],
+                hashes: vec![],
+                offsets: vec![],
+                mrope: vec![],
+                mrope_delta: 0,
+            },
+        ),
     );
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
     assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");

@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
 from sglang.multimodal_gen.runtime.entrypoints.action import openpi
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    PromptEnhancer,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -41,6 +45,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
+)
+from sglang.srt.utils.common import (
+    add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
 )
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -52,6 +60,7 @@ logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 SERVER_WARMUP_BYPASS_PATHS = (
+    "/metrics",
     "/liveness",
     "/health",
     "/health_generate",
@@ -130,6 +139,11 @@ async def lifespan(app: FastAPI):
         warmup_done.set()
 
     try:
+        app.state.prompt_enhancer = (
+            PromptEnhancer.from_file(server_args.prompt_enhancer_config)
+            if server_args.prompt_enhancer_config is not None
+            else None
+        )
         yield
     finally:
         if warmup_task is not None and not warmup_task.done():
@@ -140,6 +154,8 @@ async def lifespan(app: FastAPI):
         # On shutdown
         logger.info("FastAPI app is shutting down...")
         await shutdown_video_jobs()
+        if app.state.prompt_enhancer is not None:
+            await app.state.prompt_enhancer.close()
         broker_task.cancel()
         with suppress(asyncio.CancelledError):
             await broker_task
@@ -397,6 +413,10 @@ def create_app(server_args: ServerArgs):
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
+    if server_args.enable_metrics:
+        configure_metrics()
+        add_prometheus_middleware(app)
+        add_prometheus_track_response_middleware(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -434,4 +454,5 @@ def create_app(server_args: ServerArgs):
     app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
+    app.state.prompt_enhancer = None
     return app

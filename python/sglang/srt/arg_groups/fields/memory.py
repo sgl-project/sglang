@@ -1,11 +1,4 @@
-"""Config fields of the ``memory`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``memory`` bag, which is what ``get_memory()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``memory`` namespace."""
 
 from __future__ import annotations
 
@@ -35,23 +28,33 @@ class Memory(msgspec.Struct):
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
-                "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first. See "
+                "stands for Segmented Least Recently Used, 'priority' evicts "
+                "lower-priority requests first, and 'tlru' stands for "
+                "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
+                "a conversation that cannot affect tail TTFT before falling back "
+                "to LRU. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            resolvable=True,
         ),
     ] = "lru"
+    # The value alone cannot distinguish the default from an explicit LRU
+    # choice, which model-specific defaults must preserve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
             help=(
                 "Tuning parameters for --radix-eviction-policy, as a json object "
-                "passed to the policy as keyword arguments. Only 'slru' takes any "
-                "today: protected_threshold (int, default 2), e.g. "
-                "'{\"protected_threshold\": 4}'. An unrecognized key fails at "
-                "startup, naming the key and the policy. See "
+                "passed to the policy as keyword arguments. 'slru' takes "
+                "protected_threshold (int, default 2), e.g. "
+                "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
+                "next_prompt_estimate (ints, tokens), e.g. "
+                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                "unrecognized key fails at startup, naming the key and the "
+                "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
                 "for the full parameter list."
             ),
@@ -78,8 +81,8 @@ class Memory(msgspec.Struct):
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends; not yet compatible with PD disaggregation or speculative "
-        "decoding.",
+        "backends. Supported PD-disaggregation and speculative-decoding "
+        "configurations are validated at startup.",
     ] = False
     enable_session_radix_cache: A[
         bool,
@@ -109,6 +112,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_host_memory_fraction: A[
+        Optional[float],
+        "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
+    ] = 0.8
     hicache_write_policy: A[
         str,
         Arg(
@@ -139,11 +146,12 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
                 "mooncake",
+                "npu_memcache",
                 "hf3fs",
                 "nixl",
                 "aibrix",
@@ -152,6 +160,7 @@ class Memory(msgspec.Struct):
                 "simm",
                 "mori",
                 "shm",
+                "tensorcast",
             ],
         ),
     ] = None
@@ -170,17 +179,26 @@ class Memory(msgspec.Struct):
         int,
         Arg(
             help=(
-                "Scheduling passes a queued request waits after a storage "
-                "prefetch miss before the availability check is retried "
-                "(under load the first check can run before the needed "
-                "backup commits). 0 disables retries."
+                "Scheduling passes a queued request waits before its storage "
+                "availability check is re-issued, when the prefetch found "
+                "nothing and a backup may still be committing (under load the "
+                "first check can run before it does). A re-issue that waits on "
+                "staging or a moved match instead goes out on the next pass. "
+                "Only passes that reach prefill scheduling count. 0 disables "
+                "miss retries; known-hit deferrals are always re-issued."
             ),
         ),
-    ] = 0
+    ] = 8
     hicache_storage_prefetch_retry_max_attempts: A[
         int,
-        "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
-    ] = 4
+        Arg(
+            help=(
+                "Storage availability re-issues a queued request may make, paced "
+                "miss polls and immediate re-issues alike; past the cap it is "
+                "admitted with whatever the device holds. 0 disables re-issues."
+            ),
+        ),
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache
@@ -196,6 +214,10 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    enable_linker_mla_dedup: A[
+        bool,
+        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
