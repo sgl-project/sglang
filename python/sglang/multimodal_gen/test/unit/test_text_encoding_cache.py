@@ -316,6 +316,8 @@ def test_one_unique_stage_skips_group_only_cache_lookup(native, monkeypatch):
     )
     fingerprint = Mock(wraps=conditioning._fingerprint)
     monkeypatch.setattr(conditioning, "_fingerprint", fingerprint)
+    capture_query = Mock(wraps=torch.cuda.is_current_stream_capturing)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capture_query)
     stage.forward = Mock(wraps=stage.forward)
     requests = [
         Req(
@@ -331,6 +333,7 @@ def test_one_unique_stage_skips_group_only_cache_lookup(native, monkeypatch):
     assert encoder.calls == 1
     assert outputs[0].prompt_embeds[0] is outputs[2].prompt_embeds[0]
     fingerprint.assert_not_called()
+    capture_query.assert_not_called()
 
 
 @pytest.mark.parametrize("capacity", [0, 1, 4096])
