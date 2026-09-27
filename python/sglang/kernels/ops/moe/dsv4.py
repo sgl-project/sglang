@@ -166,11 +166,7 @@ def mega_moe_pre_dispatch(
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
 ) -> None:
-    """Quantize routing inputs and optionally emit DeepGEMM's shared L1 scales.
-
-    ``shared_x_sf`` is a column-major int32 buffer for group-32 scales. Its
-    paged row layout requires the same ``shared_block_m`` as the consuming MoE.
-    """
+    # shared_block_m must match the consuming MoE's paged scale layout
     module = _jit_mega_moe_pre_dispatch_module(
         quant_group_size, shared_x_sf is not None
     )

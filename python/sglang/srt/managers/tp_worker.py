@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -535,9 +536,14 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # The runner already reports logical DCP capacity.
+        kv_capacity = (
+            self.model_runner.effective_logical_max_total_num_tokens
+            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_logical_max_total_num_tokens - 1,
+            kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
