@@ -6,12 +6,10 @@ from typing import Any, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.lilicorr import (
-    MAX_FUSED_CANDIDATE_TOPK,
-    lilicorr_topk_lse,
-)
+from sglang.kernels.ops.speculative.lilicorr import MAX_FUSED_CANDIDATE_TOPK
 from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.models.dflash import candidate_topk
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
@@ -106,16 +104,17 @@ def parse_lilicorr_draft_config(*, draft_hf_config: Any) -> LiLiCorrConfig:
     return config
 
 
-def resolve_vocab_shard(lm_head) -> Tuple[int, int]:
+def reject_added_vocab(lm_head) -> None:
+    # Checked once at build, not per call: the candidate top-k is contiguous over the
+    # base shard, and added rows sit past its padded tail, so they would be skipped
+    # silently rather than raising.
     if not isinstance(lm_head, VocabParallelEmbedding):
-        return int(lm_head.weight.shape[0]), 0
-    shard = lm_head.shard_indices
-    if int(shard.num_added_elements) != 0:
+        return
+    if int(lm_head.shard_indices.num_added_elements) != 0:
         raise NotImplementedError(
             "LiLiCorr's candidate head does not support added vocabulary: those rows "
             "sit past the padded base shard, so a contiguous top-k would skip them."
         )
-    return int(shard.num_org_elements), int(shard.org_vocab_start_index)
 
 
 def target_input_embeddings(target_model):
@@ -128,94 +127,22 @@ def target_input_embeddings(target_model):
 
 
 def lilicorr_candidates(
-    *,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    num_org: int,
-    org_vocab_start: int,
-    topk: int,
-    logits_out: Optional[torch.Tensor] = None,
-    tp_group=None,
-    chunk_size: int = 256,
+    *, hidden_states: torch.Tensor, lm_head, topk: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    topk = int(topk)
-    if topk > int(num_org):
-        raise ValueError(
-            f"LiLiCorr candidate topk={topk} exceeds this rank's vocabulary slice "
-            f"({num_org} rows), so the lattice cannot be filled."
-        )
-    tp_size = 1 if tp_group is None else int(tp_group.world_size)
-    num_rows = int(hidden_states.shape[0])
+    """Per-row top-k over the target head, as normalized log-probs and global ids.
 
-    def one_span(rows: torch.Tensor, logits_buf: Optional[torch.Tensor]):
-        if rows.dtype != weight.dtype:
-            rows = rows.to(weight.dtype)
-        if logits_buf is None:
-            logits = torch.matmul(rows, weight[:num_org].T)
-        else:
-            logits = logits_buf
-            torch.matmul(rows, weight[:num_org].T, out=logits)
-        vals, tokens, lse = lilicorr_topk_lse(logits, topk)
-        tokens = tokens + org_vocab_start
-        if tp_size > 1:
-            vals, tokens, lse = _combine_across_ranks(
-                vals=vals, tokens=tokens, lse=lse, topk=topk, tp_group=tp_group
-            )
-        return vals - lse.unsqueeze(-1), tokens
+    Returns (log_probs [N, topk] fp32, tokens [N, topk] int64), equivalent to
+    log_softmax(logits).topk(topk): the head scores log-probs normalized over the FULL
+    vocabulary, so the log-partition is part of the contract rather than an optimization.
 
-    # Folded path: a static buffer keeps the logits out of the graph's private pool.
-    if logits_out is not None:
-        return one_span(hidden_states, logits_out)
-
-    device = hidden_states.device
-    out_vals = torch.empty((num_rows, topk), dtype=torch.float32, device=device)
-    out_tokens = torch.empty((num_rows, topk), dtype=torch.int64, device=device)
-    for start in range(0, num_rows, int(chunk_size)):
-        end = min(num_rows, start + int(chunk_size))
-        vals, tokens = one_span(hidden_states[start:end], None)
-        out_vals[start:end] = vals
-        out_tokens[start:end] = tokens
-    return out_vals, out_tokens
-
-
-def _combine_across_ranks(
-    *,
-    vals: torch.Tensor,
-    tokens: torch.Tensor,
-    lse: torch.Tensor,
-    topk: int,
-    tp_group,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # One all-gather of [vals | tokens as fp32 | lse] per row;
-    # ids below 2**24 are exact in fp32.
-    tp_size = int(tp_group.world_size)
-    rows = int(vals.shape[0])
-    width = 2 * topk + 1
-    packed = torch.empty((rows, width), dtype=torch.float32, device=vals.device)
-    packed[:, :topk] = vals.float()
-    packed[:, topk : 2 * topk] = tokens.to(torch.float32)
-    packed[:, 2 * topk] = lse.float()
-
-    gathered = torch.empty(
-        tp_size * rows * width, dtype=torch.float32, device=vals.device
+    The candidates, the TP gather and the partition all come from DFlash's `candidate_topk`
+    -- which is also what gives LiLiCorr a quantized lm_head, since the projection goes
+    through `quant_method` there instead of reading the weight directly.
+    """
+    ids, vals, lse = candidate_topk(
+        hidden_states, lm_head, int(topk), with_partition=True
     )
-    tp_group.all_gather_into_tensor(gathered, packed.contiguous().view(-1))
-    gathered = gathered.view(tp_size, rows, width)
-
-    all_vals = gathered[:, :, :topk].permute(1, 0, 2).reshape(rows, tp_size * topk)
-    all_tokens = (
-        gathered[:, :, topk : 2 * topk]
-        .permute(1, 0, 2)
-        .reshape(rows, tp_size * topk)
-        .round()
-        .to(torch.int64)
-    )
-    top_vals, top_idx = torch.topk(all_vals, topk, dim=-1)
-    return (
-        top_vals,
-        torch.gather(all_tokens, 1, top_idx),
-        torch.logsumexp(gathered[:, :, 2 * topk], dim=0),
-    )
+    return vals.float() - lse.unsqueeze(-1), ids
 
 
 def per_request_last_row(
@@ -272,16 +199,11 @@ def propose_lilicorr_block(
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
     pass_hidden = draft_hidden[:, 1:, :]
-    tp_group = get_parallel().tp_group
-    num_org, org_vocab_start = resolve_vocab_shard(lm_head)
 
     log_probs, candidate_tokens = lilicorr_candidates(
         hidden_states=pass_hidden.reshape(bs * slots, hidden_size),
-        weight=lm_head.weight,
-        num_org=num_org,
-        org_vocab_start=org_vocab_start,
+        lm_head=lm_head,
         topk=int(head.candidate_topk),
-        tp_group=tp_group if int(tp_group.world_size) > 1 else None,
     )
     candidate_tokens = candidate_tokens.view(bs, slots, int(head.candidate_topk))
 
@@ -333,10 +255,8 @@ class LiLiCorrDraftSampler:
         *,
         head,
         embed_tokens,
-        weight: torch.Tensor,
+        lm_head,
         block_size: int,
-        num_org: int,
-        org_vocab_start: int,
         max_bs: int,
         anchor_features: int,
         sampling_enabled: bool,
@@ -344,19 +264,19 @@ class LiLiCorrDraftSampler:
         self.head = head
         self.sampling_enabled = bool(sampling_enabled)
         self.embed_tokens = embed_tokens
-        self.weight = weight
+        self.lm_head = lm_head
         self.block_size = int(block_size)
         self.slots = self.block_size - 1
-        self.num_org = int(num_org)
-        self.org_vocab_start = int(org_vocab_start)
         self.topk = int(head.candidate_topk)
         self.max_bs = int(max_bs)
 
-        device, dtype = weight.device, weight.dtype
+        # From the head, not from lm_head.weight: a quantized head's weight is packed,
+        # so its dtype is not the dtype these buffers carry.
+        anchor_row = next(head.parameters())
+        device, dtype = anchor_row.device, anchor_row.dtype
         max_rows = self.max_bs * self.slots
 
         self.out = torch.empty((max_rows,), dtype=torch.int64, device=device)
-        self.logits = torch.empty((max_rows, self.num_org), dtype=dtype, device=device)
         self.anchor = torch.zeros(
             (self.max_bs, int(anchor_features)), dtype=dtype, device=device
         )
@@ -422,11 +342,8 @@ class LiLiCorrDraftSampler:
         pass_hidden = hidden_states.view(bs, self.block_size, hidden_size)[:, 1:, :]
         log_probs, candidate_tokens = lilicorr_candidates(
             hidden_states=pass_hidden.reshape(rows, hidden_size),
-            weight=self.weight,
-            num_org=self.num_org,
-            org_vocab_start=self.org_vocab_start,
+            lm_head=self.lm_head,
             topk=self.topk,
-            logits_out=self.logits[:rows],
         )
         candidate_tokens = candidate_tokens.view(bs, self.slots, self.topk)
 
@@ -491,28 +408,23 @@ def build_lilicorr_draft_sampler(
         return eager("no draft graph batch sizes to size the static buffers from")
     max_bs = batch_sizes[-1]
 
-    num_org, org_vocab_start = resolve_vocab_shard(lm_head)
-    device, dtype = lm_head.weight.device, lm_head.weight.dtype
-
-    head.materialize_inference_buffers(device, dtype)
+    reject_added_vocab(lm_head)
+    parameter = next(head.parameters())
+    head.materialize_inference_buffers(parameter.device, parameter.dtype)
 
     sampler = LiLiCorrDraftSampler(
         head=head,
         embed_tokens=embed_tokens,
-        weight=lm_head.weight,
+        lm_head=lm_head,
         block_size=int(block_size),
-        num_org=num_org,
-        org_vocab_start=org_vocab_start,
         max_bs=int(max_bs),
         anchor_features=int(draft_model.fc.out_features),
         sampling_enabled=sampling_enabled,
     )
     logger.info(
-        "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d K=%d, "
-        "logits buffer %.1f MiB.",
+        "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d K=%d.",
         max_bs,
         int(block_size),
         sampler.topk,
-        sampler.logits.numel() * sampler.logits.element_size() / 2**20,
     )
     return sampler

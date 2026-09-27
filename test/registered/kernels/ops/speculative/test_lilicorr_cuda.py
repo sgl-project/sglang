@@ -6,9 +6,7 @@ import torch
 from sglang.kernels.ops.speculative.lilicorr import (
     _lattice_scores,
     _selector_walk_torch,
-    _topk_lse_torch,
     lilicorr_sample_path,
-    lilicorr_topk_lse,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -17,62 +15,6 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="LiLiCorr Triton kernels require CUDA"
 )
-
-
-# 151936 is Qwen3's vocabulary; the rest straddle the 1024-wide tile boundary.
-@pytest.mark.parametrize("vocab", [1024, 1025, 2047, 151936])
-def test_tiled_topk_lse_is_exact_against_the_reference(vocab):
-    torch.manual_seed(0)
-    logits = torch.randn(6, vocab, device="cuda", dtype=torch.float32)
-
-    vals, tokens, lse = lilicorr_topk_lse(logits, 8)
-    ref_vals, ref_tokens, ref_lse = _topk_lse_torch(logits.cpu(), 8)
-
-    torch.testing.assert_close(vals.cpu(), ref_vals)
-    torch.testing.assert_close(tokens.cpu(), ref_tokens)
-    torch.testing.assert_close(lse.cpu(), ref_lse)
-
-
-def test_tiled_topk_lse_survives_bf16_logits():
-    """Asserted on values, not tokens: bf16 rounds several near-max entries together."""
-    torch.manual_seed(2)
-    logits = torch.randn(4, 151936, device="cuda", dtype=torch.bfloat16)
-
-    vals, tokens, lse = lilicorr_topk_lse(logits, 8)
-    ref_vals, ref_tokens, ref_lse = _topk_lse_torch(logits.cpu(), 8)
-
-    torch.testing.assert_close(
-        (vals - lse.unsqueeze(-1)).cpu(),
-        ref_vals - ref_lse.unsqueeze(-1),
-        rtol=2e-3,
-        atol=2e-3,
-    )
-    # Summation order differs from the sequential reference; measured ~1.7e-5 relative.
-    torch.testing.assert_close(lse.cpu(), ref_lse, rtol=1e-4, atol=1e-3)
-
-
-def test_tied_bf16_logits_return_a_valid_selection():
-    torch.manual_seed(6)
-    logits = torch.randint(0, 64, (4, 8192), device="cuda").to(torch.bfloat16)
-
-    vals, tokens, _ = lilicorr_topk_lse(logits, 8)
-    ref_vals, _, _ = _topk_lse_torch(logits.cpu(), 8)
-
-    torch.testing.assert_close(vals.cpu(), ref_vals)
-    gathered = torch.gather(logits, 1, tokens).float()
-    torch.testing.assert_close(gathered.cpu(), vals.cpu())
-
-
-def test_a_vocabulary_narrower_than_k_tiles_takes_the_exact_reference_path():
-    torch.manual_seed(3)
-    logits = torch.randn(3, 3072, device="cuda", dtype=torch.float32)
-
-    vals, tokens, lse = lilicorr_topk_lse(logits, 8)
-    ref_vals, ref_tokens, ref_lse = _topk_lse_torch(logits.cpu(), 8)
-
-    torch.testing.assert_close(vals.cpu(), ref_vals)
-    torch.testing.assert_close(tokens.cpu(), ref_tokens)
-    torch.testing.assert_close(lse.cpu(), ref_lse)
 
 
 def _walk_reference(

@@ -808,15 +808,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         if lm_head is None:
             return _eager("no target lm_head")
 
+        # A gate-admitted quantized head is capture-safe: the target's own logits path
+        # already runs the same kernel under CUDA graphs. Both candidate_topk callers
+        # screen on this.
+        head_supported = is_dense_head_weight(
+            getattr(lm_head, "weight", None)
+        ) or should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        )
+
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
-            # A gate-admitted quantized head is capture-safe: the target's own
-            # logits path already runs the same kernel under CUDA graphs.
-            if not is_dense_head_weight(
-                getattr(lm_head, "weight", None)
-            ) and not should_apply_lm_head_quant_method(
-                lm_head, getattr(lm_head, "quant_method", None)
-            ):
+            if not head_supported:
                 return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
@@ -832,12 +835,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
             )
-        if not hasattr(lm_head, "weight"):
-            return _eager("quantized lm_head has no dense weight")
-        if not is_dense_head_weight(lm_head.weight):
-            # Quantized lm_head (FP8/INT) would break the static matmul.
-            return _eager("quantized lm_head")
         if self.lilicorr is not None:
+            # LiLiCorr takes its candidates from the same candidate_topk the selector
+            # uses, so a quantized head folds here rather than dropping to the eager
+            # path -- which, before that reuse, could not project a packed weight at all.
+            if not head_supported:
+                return _eager("unsupported quantized lm_head")
             return build_lilicorr_draft_sampler(
                 sampling_enabled=self._lilicorr_sampling_enabled,
                 head=self.lilicorr,
@@ -846,6 +849,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
                 block_size=self.block_size,
             )
+        if not hasattr(lm_head, "weight"):
+            return _eager("quantized lm_head has no dense weight")
+        if not is_dense_head_weight(lm_head.weight):
+            # Quantized lm_head (FP8/INT) would break the static matmul.
+            return _eager("quantized lm_head")
         tp_group = get_parallel().tp_group
         if self._is_domino:
             prefix_gru = self.draft_model.prefix_gru

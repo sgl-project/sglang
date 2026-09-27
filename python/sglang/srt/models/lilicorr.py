@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
@@ -15,24 +16,6 @@ from sglang.srt.speculative.lilicorr_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class LiLiCorrRMSNorm(nn.Module):
-    # Not layers.layernorm.RMSNorm: its custom op is not capturable here. Same weight key.
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = float(eps)
-        self._normalized_shape = (int(hidden_size),)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(
-            hidden_states,
-            self._normalized_shape,
-            self.weight,
-            self.variance_epsilon,
-        )
 
 
 class LiLiCorrLatticeAttention(nn.Module):
@@ -82,9 +65,9 @@ class LiLiCorrLayer(nn.Module):
         rms_norm_eps: float,
     ) -> None:
         super().__init__()
-        self.attn_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.attn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.attn = LiLiCorrLatticeAttention(hidden_size, num_heads)
-        self.mlp_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.mlp_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         mlp_hidden_size = int(hidden_size * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_size),
@@ -159,8 +142,8 @@ class LiLiCorrHead(nn.Module):
                 for _ in range(int(config.num_layers))
             ]
         )
-        self.output_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.anchor_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.output_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.anchor_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.factor_input_proj = nn.Linear(hidden_size * 3, hidden_size)
         self.out_head = nn.Linear(hidden_size, self.factor_dim)
         self.in_head = nn.Linear(hidden_size, self.factor_dim)
