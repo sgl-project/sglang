@@ -25,10 +25,15 @@ released SDK does (set ``SGLANG_LAYA_TEMPERATURE_CLAMP=0`` to score with the raw
 fitted bucket temperatures).
 
 Attention note: ModernBERT alternates global and *sliding* (local) bidirectional
-attention, and the local layers need a symmetric window. Only the ``fa3``/``fa4``
-attention backend implements a symmetric window for ``ENCODER_ONLY`` layers; the
-other backends silently fall back to full attention, which changes the numbers.
-Serve with ``--attention-backend fa3``.
+attention, and the local layers keep keys within
+``|i - j| <= local_attention / 2``. The encoder computes that mask itself rather
+than delegating to the attention backend, because the windowed backend path does
+not reproduce the same mask on every backend (some apply it only for causal
+attention, and the FlashAttention window measures differently). The mask is
+built from device tensors whose values are refreshed on every step, and every
+loop bound comes from a shape, so the encoder body is safe to capture in a
+prefill CUDA graph. Set ``SGLANG_LAYA_ATTENTION_BACKEND=1`` to route attention
+through the backend instead, for comparison.
 """
 
 import logging
@@ -67,6 +72,13 @@ QTYPE_NAMES = ("choice", "score", "noul")
 # probabilities identical to the official runtime.
 TEMP_MIN = 0.5
 TEMP_MAX = 5.0
+
+# Bounds for the self-computed attention. The query axis is processed in chunks
+# so the score tensor stays within a fixed budget regardless of prompt length;
+# both numbers are shape-derived, so a captured CUDA graph keeps a fixed number
+# of iterations for a given capture bucket.
+_SDPA_QUERY_CHUNK = 1024
+_SDPA_SCORE_BUDGET = 1 << 24
 
 
 class LayaEmbeddings(nn.Module):
@@ -156,57 +168,52 @@ class LayaAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        token_req: torch.Tensor,
     ) -> torch.Tensor:
-        """Bidirectional per-request attention with an explicit local window.
+        """Bidirectional attention with an explicit local window, per request.
 
         ModernBERT alternates full and sliding (local) layers, and the local
         layers keep keys with ``|i - j| <= sliding_window``. Computing that mask
         here keeps the numerics identical to the reference implementation on
         every attention backend, which matters because the windowed path is not
         implemented consistently across them.
+
+        Everything is derived from tensors whose values are refreshed on every
+        step, and every loop bound comes from a shape, so the whole block is
+        safe to capture in a CUDA graph: a host value read here would be frozen
+        at capture time and silently reused for later batches.
         """
-        lengths = forward_batch.extend_seq_lens_cpu
-        if lengths is None:
-            lengths = forward_batch.extend_seq_lens.tolist()
+        total = q.shape[0]
         heads, head_dim = self.total_num_heads, self.head_dim
+        qh = q.view(total, heads, head_dim).transpose(0, 1)
+        kh = k.view(total, heads, head_dim).transpose(0, 1)
+        vh = v.view(total, heads, head_dim).transpose(0, 1)
         window = self.sliding_window_size
-        out = torch.empty_like(q)
-        start = 0
-        for length in lengths:
-            length = int(length)
-            end = start + length
-            qh = q[start:end].view(length, heads, head_dim).transpose(0, 1)
-            kh = k[start:end].view(length, heads, head_dim).transpose(0, 1)
-            vh = v[start:end].view(length, heads, head_dim).transpose(0, 1)
+
+        # Chunk the query axis so the score matrix stays bounded. The chunk size
+        # is derived from shapes only, so the number of iterations is fixed for
+        # a given capture bucket.
+        chunk = max(1, min(_SDPA_QUERY_CHUNK, _SDPA_SCORE_BUDGET // max(total, 1)))
+        out = torch.empty_like(qh)
+        for offset in range(0, total, chunk):
+            rows = slice(offset, offset + chunk)
+            mask = token_req[rows][:, None] == token_req[None, :]
             if window is not None and window > -1:
-                positions = torch.arange(length, device=q.device)
-                mask = (positions[:, None] - positions[None, :]).abs() <= window
-                attn_mask = mask[None]
-            else:
-                attn_mask = None
-            # Chunk the query dimension so the score matrix stays bounded even
-            # for very long prompts.
-            chunk = 1024
-            pieces = []
-            for offset in range(0, length, chunk):
-                qc = qh[:, offset : offset + chunk]
-                mc = (
-                    attn_mask[:, offset : offset + chunk]
-                    if attn_mask is not None
-                    else None
+                mask = mask & (
+                    (positions[rows][:, None] - positions[None, :]).abs() <= window
                 )
-                pieces.append(F.scaled_dot_product_attention(qc, kh, vh, attn_mask=mc))
-            o = torch.cat(pieces, dim=1)
-            out[start:end] = o.transpose(0, 1).reshape(length, -1)
-            start = end
-        return out
+            out[:, rows] = F.scaled_dot_product_attention(
+                qh[:, rows], kh, vh, attn_mask=mask[None]
+            )
+        return out.transpose(0, 1).reshape(total, -1)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        token_req: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
@@ -221,7 +228,9 @@ class LayaAttention(nn.Module):
         if envs.SGLANG_LAYA_ATTENTION_BACKEND.get():
             output = self.attn(q, k, v, forward_batch)
         else:
-            output = self._sdpa_attention(q, k, v, forward_batch)
+            output = self._sdpa_attention(
+                q=q, k=k, v=v, positions=positions, token_req=token_req
+            )
         output, _ = self.out_proj(output)
         return output
 
@@ -304,9 +313,13 @@ class LayaEncoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        token_req: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
-            positions, self.attn_norm(hidden_states), forward_batch
+            positions=positions,
+            hidden_states=self.attn_norm(hidden_states),
+            forward_batch=forward_batch,
+            token_req=token_req,
         )
         hidden_states = hidden_states + self.mlp(self.mlp_norm(hidden_states))
         return hidden_states
@@ -344,6 +357,20 @@ class LayaEncoder(nn.Module):
             bias=getattr(config, "norm_bias", False),
         )
 
+    @staticmethod
+    def _token_request_ids(positions: torch.Tensor) -> torch.Tensor:
+        """Which request each packed token belongs to, as a device tensor.
+
+        Derived from ``positions``, which restarts at zero for every request and
+        is refreshed in full on each step. Per-request lengths are deliberately
+        *not* used: inside a captured graph the batch-size-length buffers are
+        static views, and a shorter live batch only refreshes their prefix, so
+        their tail keeps the values from capture time. Positions carry no such
+        tail: the padded region sits after every real token, where an extra
+        boundary cannot shift the mapping of a real one.
+        """
+        return torch.cumsum((positions == 0).to(torch.int64), dim=0) - 1
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -352,8 +379,14 @@ class LayaEncoder(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(input_ids, inputs_embeds)
+        token_req = self._token_request_ids(positions)
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states, forward_batch)
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                token_req=token_req,
+            )
         return self.final_norm(hidden_states)
 
 
@@ -380,10 +413,10 @@ class LayaForDecision(nn.Module):
                 f"parallel ranks (got tp_size={tp_size}); serve with --tp-size 1."
             )
 
-        self.encoder = LayaEncoder(
+        self.model = LayaEncoder(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("encoder", prefix),
+            prefix=add_prefix("model", prefix),
         )
 
         self.head_layers = int(getattr(config, "head_layers", 2))
@@ -455,13 +488,21 @@ class LayaForDecision(nn.Module):
     def _request_slices(
         self, forward_batch: ForwardBatch, total_tokens: int
     ) -> List[Tuple[int, int]]:
-        """Per-request ``(start, end)`` token ranges inside the packed batch."""
-        seq_lens = forward_batch.extend_seq_lens_cpu
-        if seq_lens is None:
-            seq_lens = forward_batch.extend_seq_lens.tolist()
+        """Per-request ``(start, end)`` token ranges inside the packed batch.
+
+        Read the device tensor rather than ``extend_seq_lens_cpu``: this runs in
+        the eager tail of a captured prefill graph, whose static batch carries
+        the host list from capture time, while the device tensor is refreshed on
+        every step.
+        """
+        seq_lens = forward_batch.extend_seq_lens
+        if seq_lens is not None:
+            lengths = seq_lens.tolist()
+        else:
+            lengths = forward_batch.extend_seq_lens_cpu
         slices: List[Tuple[int, int]] = []
         start = 0
-        for length in seq_lens:
+        for length in lengths:
             end = min(start + int(length), total_tokens)
             slices.append((start, end))
             start = end
@@ -625,12 +666,13 @@ class LayaForDecision(nn.Module):
             "with embedding mode enabled."
         )
 
-        hidden_states = self.encoder(
+        hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
         )
+
         _, lengths, markers, qtypes = self._request_layout(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -640,21 +682,22 @@ class LayaForDecision(nn.Module):
             hidden_states=hidden_states, lengths=lengths, qtypes=qtypes
         )
         logits_flat = self._marker_logits(encoded=encoded, markers=markers)
-        return EmbeddingPoolerOutput(
-            embeddings=self._request_outputs(
-                encoded=encoded,
-                markers=markers,
-                qtypes=qtypes,
-                logits_flat=logits_flat,
-            )
+        outputs = self._request_outputs(
+            encoded=encoded,
+            markers=markers,
+            qtypes=qtypes,
+            logits_flat=logits_flat,
         )
+        return EmbeddingPoolerOutput(embeddings=outputs)
 
     # ------------------------------------------------------------------ weights
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        # The checkpoint stores the attention projections under their
-        # transformers names; everything else already matches our module names.
-        # `mlp.Wo` keeps its name -- only the *attention* `Wo` becomes `out_proj`.
+        # The checkpoint names the encoder ``encoder.*`` and stores the attention
+        # projections under their transformers names; everything else already
+        # matches our module names. ``mlp.Wo`` keeps its name -- only the
+        # *attention* ``Wo`` becomes ``out_proj``.
         rename = (
+            ("encoder.", "model."),
             (".attn.Wqkv.", ".attn.qkv_proj."),
             (".attn.Wo.", ".attn.out_proj."),
         )
@@ -671,9 +714,10 @@ class LayaForDecision(nn.Module):
                 continue
             mapped = name
             for old, new in rename:
+                # Every rule applies; the encoder prefix and the attention
+                # projection names are independent rewrites.
                 if old in mapped:
                     mapped = mapped.replace(old, new)
-                    break
             param = params_dict.get(mapped)
             if param is None:
                 logger.warning(
