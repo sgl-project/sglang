@@ -1,17 +1,18 @@
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from sglang.srt.layers.boundary_layout import SumGroup
+from sglang.srt.layers.boundary_layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     ADD_AND_NORM,
+    FfnExitFusion,
     LayerCommunicator,
-    ScatterMode,
     UnreducedOutput,
     _attention_input_step,
+    reduce_output,
 )
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
@@ -93,12 +94,16 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
     unreduced output reaches the final norm; it must not skip its own."""
     last = _communicator()
-    last.successor_absorbs_all_reduce = False
-    last.fusion_service = SimpleNamespace(
-        all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
-            local_contribution + 1,
-            residual + 1,
-        )
+    last.install(
+        SimpleNamespace(
+            all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
+                local_contribution + 1,
+                residual + 1,
+            )
+        ),
+        hands_off_finalize=False,
+        next_input_absorbs=False,
+        output_is_replicated=False,
     )
     hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
@@ -119,7 +124,7 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
         out_hidden, _ = last.prepare_attn(hidden_states, torch.zeros(8, 8), _DECODE)
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
-    assert last._can_absorb_post_moe_all_reduce(_DECODE, 8) is False
+    assert last._ffn_exit_fusions == (last._next_input_norm_takes_ffn_sum,)
 
 
 def test_cutedsl_entries_come_before_the_base_fused_kernel():
@@ -135,20 +140,65 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
-        comm.layer_scatter_modes = SimpleNamespace(
-            layer_input_mode=ScatterMode.TP_ATTN_FULL
-        )
+        comm._declared = SimpleNamespace(input_rows=Layout(frozenset()))
         fusions = comm._select_mlp_input_fusions()
         assert [f.run for f in fusions] == [cutedsl, base]
-        # The workspace reduces over the TP group, which is the attention-TP
-        # group here; both kernels hand back a new residual.
-        assert [f.completes for f in fusions] == [SumGroup.TP, SumGroup.ATTN_TP]
+        # The workspace reduces over the TP group, which is the attention-TP group here.
+        assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
         assert all(f.may_return_new_residual for f in fusions)
-        # A scattered residual is gathered first, which the workspace does not do.
-        comm.layer_scatter_modes = SimpleNamespace(
-            layer_input_mode=ScatterMode.SCATTERED
+        # A residual on each rank's slice is gathered first, which the
+        # workspace does not do.
+        comm._declared = SimpleNamespace(
+            input_rows=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
         )
         assert [f.run for f in comm._select_mlp_input_fusions()] == [base]
+
+
+def test_the_fusion_runs_only_on_the_ffn_full_rows():
+    """The finalize and the AR + norm sum over the whole TP group, so they need
+    the batch's FFN input on the full rows, not each rank's own slice (a2a, the
+    fp4 all-gather, DWDP or a dense MLP on every rank)."""
+    comm = _communicator()
+    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
+    comm._context = SimpleNamespace(tp_size=2)
+    with (
+        patch(
+            f"{_MODULE}.get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1),
+        ),
+        patch(f"{_MODULE}.is_dp_attention_enabled", return_value=False),
+        patch(
+            f"{_MODULE}.get_attn_tp_context",
+            return_value=SimpleNamespace(input_scattered=False),
+        ),
+        patch(
+            f"{_MODULE}.get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+    ):
+        for sharded, eligible in (
+            (frozenset(), True),
+            (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
+        ):
+            comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
+                ffn_input_rows=rows
+            )
+            assert comm._common_eligible(_DECODE, 8) is eligible
+
+
+def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel():
+    comm = _communicator()
+    comm.install(
+        SimpleNamespace(),
+        hands_off_finalize=True,
+        next_input_absorbs=True,
+        output_is_replicated=False,
+    )
+    assert comm._ffn_exit_fusions == (
+        comm._defer_moe_finalize_cutedsl,
+        comm._absorb_all_reduce_cutedsl,
+        comm._next_input_norm_takes_ffn_sum,
+    )
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
@@ -161,13 +211,19 @@ def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
     _install(layers, requires_local_reduction=lambda layer: layer.replicated)
     replicated, plain = (layer.layer_communicator for layer in layers[:2])
 
+    def exit_fusion(communicator):
+        return next(
+            filter(None, (fused(_DECODE) for fused in communicator._ffn_exit_fusions)),
+            None,
+        )
+
     with patch.object(
         LayerCommunicator,
         "should_fuse_mlp_allreduce_with_next_layer",
         return_value=False,
     ):
-        assert replicated.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is False
-        assert plain.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is True
+        assert exit_fusion(replicated) is None
+        assert exit_fusion(plain) is FfnExitFusion.NEXT_INPUT
     # Consuming what a predecessor skipped stays independently eligible.
     assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
 
@@ -251,11 +307,107 @@ def test_the_handoff_views_the_producer_storage():
         ),
         gated_shared_output=torch.empty(m, 16, dtype=torch.bfloat16),
         m=m,
+        reduce=lambda h: h,
     )
 
     assert handoff.routed_output.data_ptr() == gemm2_out.data_ptr()
     assert handoff.permuted_indices.data_ptr() == permuted_indices.data_ptr()
     assert tuple(handoff.expert_weights.shape) == (m, top_k)
+
+
+def _handoff(finish):
+    rows = torch.zeros(2, 8)
+    return MoeFinalizeHandoff(
+        routed_output=rows,
+        expert_weights=rows,
+        permuted_indices=rows,
+        gated_shared_output=rows,
+        m=2,
+        finish=finish,
+    )
+
+
+def test_its_producer_completes_a_handoff_for_any_other_reader():
+    """Only the fused kernel reads the handoff's parts; everything else gets
+    the MoE's own unfused tail, run once."""
+    finished = torch.full((2, 8), 3.0)
+    finish = MagicMock(return_value=finished)
+    assert reduce_output(_handoff(finish)) is finished
+    finish.assert_called_once_with()
+
+
+def test_from_flashinfer_completes_with_the_moe_s_own_sum():
+    deferred = SimpleNamespace(
+        gemm2_out=torch.zeros(4, 8),
+        expert_weights=torch.zeros(2, 2),
+        expanded_idx_to_permuted_idx=torch.zeros(2, 2, dtype=torch.int32),
+        top_k=2,
+    )
+    shared = torch.ones(2, 8)
+    with patch(
+        "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm."
+        "finalize_flashinfer_trtllm_deferred_output",
+        side_effect=lambda d, s: s + 1,
+    ) as finalize:
+        handoff = MoeFinalizeHandoff.from_flashinfer(
+            deferred, gated_shared_output=shared, m=2, reduce=lambda h: h * 10
+        )
+        finalize.assert_not_called()
+        torch.testing.assert_close(handoff.complete(), torch.full((2, 8), 20.0))
+    finalize.assert_called_once_with(deferred, shared)
+
+
+def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
+    """The consumer asks only whether its own kernel takes the batch; when it
+    does not, the handoff is completed and the input read as usual."""
+
+    class AddNorm(torch.nn.Module):
+        def forward(self, x, residual=None, post_residual_addition=None):
+            residual.add_(x)
+            return residual * 2, residual
+
+    comm = _communicator()
+    comm.input_layernorm = AddNorm()
+    comm.fusion_service = SimpleNamespace(
+        finalize=lambda **kw: pytest.fail("the kernel does not take this batch")
+    )
+    finish = MagicMock(return_value=torch.ones(2, 8))
+    with (
+        # A norm the kernel could fold in, on a batch it does not take.
+        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_should_use_finalize", return_value=False
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=False
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator,
+            "_finish_prepare_attn",
+            lambda self, *, hidden_states, residual, forward_batch: (
+                hidden_states,
+                residual,
+            ),
+        ),
+    ):
+        hidden, residual = comm.prepare_attn(
+            _handoff(finish), torch.full((2, 8), 2.0), _DECODE
+        )
+    finish.assert_called_once_with()
+    torch.testing.assert_close(residual, torch.full((2, 8), 3.0))
+    torch.testing.assert_close(hidden, torch.full((2, 8), 6.0))
+
+
+def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
+    comm = LayerCommunicator.__new__(LayerCommunicator)
+    for takes, completed in ((True, 0), (False, 1)):
+        finish = MagicMock(return_value=torch.ones(2, 8))
+        handoff = _handoff(finish)
+        hidden, _ = comm.finish_layer_stack(
+            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
+        )
+        assert finish.call_count == completed
+        assert (hidden is handoff) == takes
 
 
 def test_early_shared_load_touches_only_the_finalize_routes():
