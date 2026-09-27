@@ -859,7 +859,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
+                MoeFinalizeHandoff,
+            )
 
             return MoeFinalizeHandoff.from_flashinfer(
                 final_hidden_states,

@@ -217,7 +217,7 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
 def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
     """The CuTe DSL kernels a layer tries before its own, when they are on."""
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
+        from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
     return None
@@ -1730,7 +1730,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
                 install_cutedsl_fusion,
             )
 
@@ -1877,7 +1877,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         # The final layer has no successor to consume its deferred MoE tail.
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
+                MoeFinalizeHandoff,
+            )
 
             is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
 

@@ -74,7 +74,7 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
     layer_input_buffer,
 )
-from sglang.srt.layers.communicator_dsa_cp import (
+from sglang.srt.layers.communicator.adapters.context_parallel import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -1107,7 +1107,9 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
+            from sglang.srt.layers.communicator.fusions.cutedsl import (
+                MoeFinalizeHandoff,
+            )
 
             return MoeFinalizeHandoff.from_flashinfer(
                 final_hidden_states,
@@ -2639,7 +2641,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and _use_mnnvl_cutedsl_fusion()
         ):
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
+            from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
         return LayerCommunicator(
@@ -2971,7 +2973,9 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+        from sglang.srt.layers.communicator.fusions.cutedsl import (
+            install_cutedsl_fusion,
+        )
 
         install_cutedsl_fusion(
             # PP pads self.layers with PPMissingLayer, which has no communicator.
