@@ -774,6 +774,7 @@ fn lock_walks_stop_at_the_root_of_a_salted_chain() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -816,6 +817,7 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -838,6 +840,7 @@ fn dec_lock_ref_unlocks_and_restores_sizes() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -892,6 +895,7 @@ fn dec_lock_ref_replays_the_skip_set() {
         .inc_lock_ref(tc.arena.node(n3).id, ComponentSet::EMPTY)
         .expect("live test node");
     let params = DecLockRefParams {
+        node_id: Some(tc.arena.node(n3).id),
         skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
@@ -963,6 +967,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 2);
     // Each release takes back exactly its own refs.
     let temp_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: temp_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -976,6 +981,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
     let second_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: second_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -1023,6 +1029,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1033,6 +1040,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1051,6 +1059,7 @@ fn dec_lock_ref_with_skip_swa_still_releases_full() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1073,6 +1082,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1087,6 +1097,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1108,6 +1119,7 @@ fn dec_lock_ref_panics_on_an_unlocked_node() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1180,6 +1192,7 @@ fn dec_lock_ref_panics_on_protected_underflow() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1322,8 +1335,14 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
     tc.component_state_mut(FULL).evictable_size = 7;
     tc.inc_host_lock_ref(tc.arena.node(node).id)
         .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
     let state = tc.component_state(FULL);
@@ -1335,8 +1354,14 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
 fn dec_host_lock_ref_on_an_unlocked_anchor_is_a_noop() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
 }
 
@@ -1348,8 +1373,14 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
     tc.inc_host_lock_ref(tc.arena.node(node).id)
         .expect("live test node");
     let _ = tc.arena.take_host_value(node, FULL);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
 }
 
@@ -1359,8 +1390,14 @@ fn host_lock_round_trip_under_write_back_is_a_pure_counter() {
     let (_n1, n2) = lock_chain(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(n2).id)
         .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(n2).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(n2).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(n2, FULL), 0);
     let state = tc.component_state(FULL);
     assert_eq!(state.evictable_size, 5);
@@ -1403,12 +1440,24 @@ fn nested_host_locks_release_pairwise() {
         .expect("live test node");
     tc.inc_host_lock_ref(tc.arena.node(node).id)
         .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     assert!(!tc.evictable_host_leaves.contains(node));
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
 }
