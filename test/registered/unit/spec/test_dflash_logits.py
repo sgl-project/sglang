@@ -287,7 +287,7 @@ def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypat
         lilicorr=object(),
         _lilicorr_sampling_enabled=False,
         _warned_sampling_fallback=False,
-        ps=SimpleNamespace(tp_rank=0),
+        model_runner=SimpleNamespace(tp_rank=0),
     )
     batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
 

@@ -2653,7 +2653,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if (
                 self._lilicorr_sampling_enabled
                 and not self._warned_lilicorr_eager
-                and self.ps.tp_rank == 0
+                and self.model_runner.tp_rank == 0
             ):
                 logger.warning(
                     "LiLiCorr sampled draft ran the eager head on a decode step "
