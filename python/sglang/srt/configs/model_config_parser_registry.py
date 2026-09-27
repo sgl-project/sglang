@@ -54,6 +54,10 @@ def register_model_config_parser(name: str):
 
 def get_model_config_parser(name: str) -> ModelConfigParserBase:
     """``"auto"`` is not handled here -- the caller must resolve it first."""
+    if name == "flashloop" and name not in _MODEL_CONFIG_PARSER_REGISTRY:
+        from sglang.srt.configs.flashloop import register_parser
+
+        register_parser()
     if name not in _MODEL_CONFIG_PARSER_REGISTRY:
         raise ValueError(
             f"Unknown model-config parser {name!r}. "
