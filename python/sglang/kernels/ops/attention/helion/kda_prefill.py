@@ -1389,6 +1389,8 @@ def chunk_kda(
     track_state: torch.Tensor | None = None,
     track_chunk_idx: torch.Tensor | None = None,
     beta_is_raw: bool = False,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
     **kwargs: object,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Match the public forward contract of SGLang's Triton ``chunk_kda``."""
@@ -1432,6 +1434,8 @@ def chunk_kda(
             output_intermediate_states=output_intermediate_states,
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
         )
 
     q = q.contiguous()
@@ -1441,11 +1445,8 @@ def chunk_kda(
     v = v.contiguous()
     g = g.contiguous()
     beta = beta.contiguous()
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
     g, qg, wk, kg, chunk_decay = gate_chunk_cumsum_operands(
         g,
         q,
@@ -1473,7 +1474,8 @@ def chunk_kda(
 
     is_varlen = cu_seqlens is not None
     if is_varlen:
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, CHUNK_SIZE)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens, CHUNK_SIZE)
         metadata = cu_seqlens
     else:
         metadata = torch.empty(0, device=q.device, dtype=torch.int32)
