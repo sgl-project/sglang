@@ -248,6 +248,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker = SimpleNamespace(
         block_size=8,
         selector=object(),
+        model_runner=SimpleNamespace(tp_rank=0),
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
@@ -282,6 +283,7 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
         selector=object(),
         _selector_sampling_enabled=False,
         _warned_sampling_fallback=False,
+        model_runner=SimpleNamespace(tp_rank=0),
         ps=SimpleNamespace(tp_rank=0),
     )
     batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))

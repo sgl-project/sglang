@@ -149,6 +149,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            reduce_results=True,
             prefix=add_prefix(f"mlps", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
