@@ -369,7 +369,7 @@ def _sort_blocks(
 
 def candidate_blocks(scores, lens, width, topk_blocks, block_size):
     """Publish a compact list using prefix scores and non-cluster TopK."""
-    from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateBlocks
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sm90_decode import CandidateBlocks
 
     selected, block_scores = _candidate_block_topk(
         scores, lens, width, topk_blocks, block_size

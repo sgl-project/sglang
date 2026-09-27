@@ -297,7 +297,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         lock_host: bool,
     ) {
         assert!(!lock_host);
-        assert!(params.swa_uuid_for_lock.is_some());
+        assert!(params.component_lock_uuids[&(SWA.idx() as u8)].is_some());
         panic!("low-priority release dispatched");
     }
 }
@@ -639,7 +639,7 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         &DecLockRefParams {
-            swa_uuid_for_lock: Some(7),
+            component_lock_uuids: HashMap::from([(SWA.idx() as u8, Some(7))]),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -683,11 +683,7 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(a).id,
-        &DecLockRefParams {
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
     )
@@ -710,8 +706,8 @@ fn next_swa_uuid_counts_up_from_two() {
 #[test]
 fn inc_lock_ref_result_defaults_carry_no_uuids() {
     let result = IncLockRefResult::default();
-    assert_eq!(result.swa_uuid_for_lock, None);
-    assert_eq!(result.swa_uuid_for_host_lock, None);
+    assert!(result.component_lock_uuids.is_empty());
+    assert!(result.component_host_lock_uuids.is_empty());
 }
 
 // A tree with the Swa stub registered and a node carrying an SWA device value.
@@ -8527,12 +8523,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 let lock = tc
                     .inc_lock_ref(anchor, ComponentSet::EMPTY)
                     .expect("live match anchor");
-                let params = DecLockRefParams {
-                    node_id: None,
-                    swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                    swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skipped_lock_components: lock.skipped_lock_components,
-                };
+                let params = lock.to_dec_params();
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }
@@ -8551,12 +8542,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     &mut mamba_next,
                     mamba,
                 ));
-                let params = DecLockRefParams {
-                    node_id: None,
-                    swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                    swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    skipped_lock_components: lock.skipped_lock_components,
-                };
+                let params = lock.to_dec_params();
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }

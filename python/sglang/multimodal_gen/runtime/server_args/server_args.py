@@ -190,7 +190,9 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "anima-base-v1.0-diffusers",
         "black-forest-labs/flux.1-dev",
+        "circlestone-labs/anima-base-v1.0-diffusers",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -212,10 +214,15 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
+        "meituan-longcat/longcat-image-edit-turbo",
         "ltx-2",
         "ltx-2.3",
         "minimax-h3",
         "minimaxai/minimax-h3",
+        "inclusionai/ming-image-0.1-design",
+        "inclusionai/ming-image-0.1-design-layer",
+        "ming-image-0.1-design",
+        "ming-image-0.1-design-layer",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen/qwen-image-2.1",
@@ -232,6 +239,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "AnimaPipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -239,7 +247,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
+        "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MingImagePipelineConfig",
+        "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
@@ -611,6 +622,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
+    prompt_enhancer_config: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -784,7 +796,7 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
+            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
             "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
             "Qwen/Qwen-Image-2.1, SANA1.5, "
@@ -3051,6 +3063,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+        parser.add_argument(
+            "--prompt-enhancer-config",
+            type=str,
+            default=ServerArgs.prompt_enhancer_config,
+            help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
         return parser

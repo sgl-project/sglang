@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -369,7 +370,7 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
-        torch.distributed.all_gather_into_tensor(
+        all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,
             group=self._gather_group,

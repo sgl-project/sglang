@@ -25,15 +25,13 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator import UnreducedOutput, reduce_output
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -52,7 +50,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -372,10 +370,7 @@ class NemotronHMoE(nn.Module):
         elif shared_output is not None:
             final_hidden_states += shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -432,7 +427,9 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         ):
             hidden_states = self.mixer.forward(hidden_states)
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(
+                hidden_states, group=self.layer_communicator.ffn_reduction_group()
+            )
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -536,7 +533,9 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
                 hidden_states, forward_batch, skip_reduce
             )
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(
+                hidden_states, group=get_parallel().tp_group
+            )
         return hidden_states, residual
 
 
@@ -813,11 +812,7 @@ class NemotronHModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                if residual is not None and getattr(
-                    hidden_states, "_sglang_needs_allreduce_fusion", False
-                ):
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states._sglang_needs_allreduce_fusion = False
+                hidden_states = reduce_output(hidden_states)
                 aux_hidden_states.append(
                     self._capture_hidden_states(hidden_states, residual, i)
                 )
@@ -830,16 +825,15 @@ class NemotronHModel(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         if self.end_layer in self.layers_to_capture:
-            if residual is not None and getattr(
-                hidden_states, "_sglang_needs_allreduce_fusion", False
-            ):
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states._sglang_needs_allreduce_fusion = False
             aux_hidden_states.append(
                 self._capture_hidden_states(hidden_states, residual, self.end_layer)
             )

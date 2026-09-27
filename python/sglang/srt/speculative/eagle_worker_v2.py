@@ -1602,8 +1602,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         target_local_only = len(batch.global_num_tokens) == 1
         draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
-        if is_prefill and batch.decoding_reqs:
-            raise RuntimeError("Local mixed prefill/verify is not implemented")
         draft_batch = batch
         if is_prefill:
             draft_batch = ScheduleBatch.init_new(
