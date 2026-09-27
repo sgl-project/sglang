@@ -7,14 +7,13 @@ import types
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest import mock
 
 import torch
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
@@ -400,27 +399,25 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
 
         with ExitStack() as stack:
             stack.enter_context(
-                mock.patch.object(comm, "is_enable_moe_cp_allgather", lambda: False)
+                patch_communicator("is_enable_moe_cp_allgather", lambda: False)
             )
             stack.enter_context(
-                mock.patch.object(
-                    comm,
+                patch_communicator(
                     "get_attn_tp_context",
                     lambda: types.SimpleNamespace(input_scattered=False),
                 )
             )
             # Force the NVIDIA/flashinfer term off so the aiter branch decides.
             stack.enter_context(
-                mock.patch.object(
-                    comm, "apply_flashinfer_allreduce_fusion", lambda batch_size: False
+                patch_communicator(
+                    "apply_flashinfer_allreduce_fusion", lambda batch_size: False
                 )
             )
-            stack.enter_context(mock.patch.object(comm, "_use_aiter", use_aiter))
+            stack.enter_context(patch_communicator("_use_aiter", use_aiter))
             # moe_ep_size/moe_tp_size of 1 keep the hybrid EP+TP guard inactive
             # so the aiter branch is what decides.
             stack.enter_context(
-                mock.patch.object(
-                    comm,
+                patch_communicator(
                     "get_parallel",
                     lambda: types.SimpleNamespace(
                         tp_size=tp_world_size, moe_ep_size=1, moe_tp_size=1
@@ -440,7 +437,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
 
             stack.enter_context(get_flags().dp.override(enabled=dp_attention))
             stack.enter_context(
-                mock.patch.object(comm, "get_moe_a2a_backend", lambda: a2a_backend)
+                patch_communicator("get_moe_a2a_backend", lambda: a2a_backend)
             )
 
             fake_self = _fake_self(

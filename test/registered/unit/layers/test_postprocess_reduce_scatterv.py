@@ -18,6 +18,8 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
     should_skip_mlp_all_reduce,
@@ -25,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -35,14 +38,14 @@ def steps(*, ffn_output_move):
     back over attention DP."""
     return comm.BoundarySteps(
         attention_prepare=partial(
-            comm._attention_input_step,
+            comm_boundary._attention_input_step,
             layer_input=None,
             fusions=(),
             enters_stack=False,
             residual_ops=comm.ADD_AND_NORM,
         ),
         attention_input=comm.CommunicateSimpleFn._trivial,
-        ffn_input=comm._mlp_input_norm,
+        ffn_input=comm_ops._mlp_input_norm,
         ffn_input_rows=comm.Layout(frozenset()),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=ffn_output_move,
@@ -53,7 +56,7 @@ def steps(*, ffn_output_move):
 @contextlib.contextmanager
 def reduce_scatterv_applies():
     with (
-        patch.object(comm, "should_use_dp_reduce_scatterv", return_value=True),
+        patch_communicator("should_use_dp_reduce_scatterv", return_value=True),
         patch.object(moe_utils, "should_use_dp_reduce_scatterv", return_value=True),
     ):
         yield
@@ -73,11 +76,11 @@ def postprocess_sums(*, allow_reduce_scatter, is_layer_sparse):
     )
     with (
         reduce_scatterv_applies(),
-        patch.object(comm, "get_parallel", return_value=parallel),
-        patch.object(comm, "get_local_dp_buffer", return_value=torch.empty(1, 4)),
-        patch.object(comm, "get_dp_global_num_tokens", return_value=[1, 1]),
-        patch.object(
-            comm, "dp_scatter", side_effect=lambda *args: calls.append("dp_scatter")
+        patch_communicator("get_parallel", return_value=parallel),
+        patch_communicator("get_local_dp_buffer", return_value=torch.empty(1, 4)),
+        patch_communicator("get_dp_global_num_tokens", return_value=[1, 1]),
+        patch_communicator(
+            "dp_scatter", side_effect=lambda *args: calls.append("dp_scatter")
         ),
     ):
         CommunicateSummableTensorPairFn._scatter_hidden_states(
@@ -141,12 +144,12 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         for sparse in (False, True):
             with (
                 self.subTest(sparse=sparse),
-                patch.object(
-                    comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
+                patch_communicator(
+                    "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
                 ),
-                patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
-                patch.object(
-                    comm, "_generic_prefill_cp_shards_tokens", return_value=False
+                patch_communicator("enable_moe_dense_fully_dp", return_value=False),
+                patch_communicator(
+                    "_generic_prefill_cp_shards_tokens", return_value=False
                 ),
             ):
                 modes = LayerScatterModes.init_new(
@@ -184,14 +187,14 @@ class TestPostprocessReduceScatterv(CustomTestCase):
                 communicator._cp_steps = None
                 communicator._steps = steps(ffn_output_move=None)
                 communicator._postprocess_dp_step = lambda forward_batch: step
-                with patch.object(
-                    comm, "_to_local_tokens", side_effect=lambda s, fb, h: (s, h)
+                with patch_communicator(
+                    "_to_local_tokens", side_effect=lambda s, fb, h: (s, h)
                 ):
                     hidden_states, residual = communicator.postprocess_layer(
                         "h", "r", "fb"
                     )
                 self.assertEqual(
-                    hidden_states, (step or comm._redistribute_output, "h")
+                    hidden_states, (step or comm_ops._redistribute_output, "h")
                 )
                 self.assertEqual(residual, "r")
 
@@ -205,11 +208,11 @@ class TestReduceAndRedistributeOutputStep(CustomTestCase):
             dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: max_len)
         )
         with (
-            patch.object(comm, "should_use_dp_reduce_scatterv", return_value=varlen),
-            patch.object(comm, "can_use_dp_reduce_scatter", return_value=tiles),
+            patch_communicator("should_use_dp_reduce_scatterv", return_value=varlen),
+            patch_communicator("can_use_dp_reduce_scatter", return_value=tiles),
         ):
             # A MoE block leaves its sum to reduce_scatterv whenever it applies.
-            return comm._reduce_and_redistribute_output_step(
+            return comm_ops._reduce_and_redistribute_output_step(
                 forward_batch,
                 leaves_for_reduce_scatter=allow,
                 leaves_for_reduce_scatterv=allow or sparse,
@@ -220,9 +223,9 @@ class TestReduceAndRedistributeOutputStep(CustomTestCase):
             (False, True), repeat=5
         ):
             if varlen and (allow or sparse):
-                expected = comm._reduce_and_redistribute_output_varlen
+                expected = comm_ops._reduce_and_redistribute_output_varlen
             elif allow and max_len and tiles:
-                expected = comm._reduce_and_redistribute_output_max_len
+                expected = comm_ops._reduce_and_redistribute_output_max_len
             else:
                 expected = None
             case = dict(

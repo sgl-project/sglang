@@ -3,21 +3,19 @@
 from typing import Optional
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
+    InputRead,
+    LayerCommunicator,
+    LayerScatterModes,
+    LayerStage,
     Layout,
+    ScatterMode,
     StageDecl,
     StageInput,
     StageOutput,
     SumGroup,
     TokenAxis,
     stage_edges,
-)
-from sglang.srt.layers.communicator import (
-    InputRead,
-    LayerCommunicator,
-    LayerScatterModes,
-    LayerStage,
-    ScatterMode,
     token_axis_sizes,
 )
 from sglang.srt.layers.layernorm import RMSNorm

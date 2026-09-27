@@ -19,6 +19,7 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import communicator_dsa_cp as dsa_cp
 from sglang.srt.layers import layernorm_sp
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -154,7 +155,11 @@ class TestAttentionCpBoundary(CustomTestCase):
                     collectives["reduce_scatter"],
                 ),
             ]:
-                stack.enter_context(patch.object(*target, value))
+                stack.enter_context(
+                    patch_communicator(target[1], value)
+                    if target[0] is comm
+                    else patch.object(*target, value)
+                )
             yield SimpleNamespace(parallel=parallel, flags=flags)
 
     def build(self, allow_reduce_scatter):

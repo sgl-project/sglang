@@ -14,9 +14,9 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.boundary_layout import Layout
 from sglang.srt.layers.communicator import (
     CommunicateContext,
+    Layout,
     reduce_output,
     tbo_split_moves,
 )

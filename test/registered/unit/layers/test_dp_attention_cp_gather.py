@@ -14,12 +14,14 @@ import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import dp_attention, layernorm_sp
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import padding as cp_padding
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -237,7 +239,11 @@ class TestDpCpGather(CustomTestCase):
                         ).double(),
                     ),
                 ]:
-                    stack.enter_context(patch.object(*target, value))
+                    stack.enter_context(
+                        patch_communicator(target[1], value)
+                        if target[0] is comm
+                        else patch.object(*target, value)
+                    )
                 # A layer in the middle of the model: its steps come from the
                 # declarations, the modes only give the layer facts.
                 communicator = comm.LayerCommunicator(
@@ -387,7 +393,7 @@ class TestDpCpGather(CustomTestCase):
             norm=rms_norm,
             norm_rows=rms_rows,
             force_layernorm_before_dp_gather=True,
-            ffn_input=comm._mlp_input_dp_replicate,
+            ffn_input=comm_ops._mlp_input_dp_replicate,
         )
 
 

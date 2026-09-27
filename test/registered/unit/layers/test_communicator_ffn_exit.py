@@ -3,26 +3,29 @@ import types
 import unittest
 from functools import partial
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
 import sglang
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
     Layout,
     StageOutput,
     SumGroup,
     TokenAxis,
-    sequence_parallel_layer_sides,
-)
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
     UnreducedOutput,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import (
     reduce_output,
+    sequence_parallel_layer_sides,
 )
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -30,7 +33,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 def sp_region_steps():
     """The steps a layer runs while a LayerNorm SP region is active."""
-    return comm._select_boundary_steps(
+    return comm_boundary._select_boundary_steps(
         sequence_parallel_layer_sides(
             axis_sizes={
                 TokenAxis.ATTN_DP: 1,
@@ -51,14 +54,14 @@ def ordinary_steps(ffn_output, *, returns_over_dp=False):
     reads and whether the output goes back over attention DP."""
     return comm.BoundarySteps(
         attention_prepare=partial(
-            comm._attention_input_step,
+            comm_boundary._attention_input_step,
             layer_input=None,
             fusions=(),
             enters_stack=False,
             residual_ops=comm.ADD_AND_NORM,
         ),
         attention_input=comm.CommunicateSimpleFn._trivial,
-        ffn_input=comm._mlp_input_norm,
+        ffn_input=comm_ops._mlp_input_norm,
         ffn_input_rows=Layout(frozenset()),
         ffn_output=ffn_output,
         ffn_output_move=(
@@ -157,7 +160,7 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(seen, (False, True))
         self.assertIsInstance(hidden_states, UnreducedOutput)
         bound = hidden_states.reduce_and_redistribute
-        self.assertIs(bound.func, comm._to_local_tokens)
+        self.assertIs(bound.func, comm_ops._to_local_tokens)
         self.assertEqual(bound.args, (step, self.forward_batch))
         self.assertIs(residual, self.residual)
         communicator._complete_ffn_output_now.assert_not_called()
@@ -171,7 +174,7 @@ class TestFfnExit(CustomTestCase):
         _, (hidden_states, _) = self.run_exit(communicator)
         self.assertIsInstance(hidden_states, UnreducedOutput)
         bound = hidden_states.reduce_and_redistribute
-        self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
+        self.assertIs(bound.func, comm_ops._all_reduce_then_to_local_tokens)
         self.assertEqual(bound.args, (group, self.forward_batch))
         communicator._complete_ffn_output_now.assert_not_called()
         group.all_reduce.assert_not_called()
@@ -371,8 +374,8 @@ class TestSelectFfnCompletion(CustomTestCase):
         return communicator
 
     def left(self, communicator, step, forward_batch=None):
-        with patch.object(
-            comm, "_reduce_and_redistribute_output_step", return_value=step
+        with patch_communicator(
+            "_reduce_and_redistribute_output_step", return_value=step
         ):
             completion = communicator._select_ffn_completion(forward_batch)
         hidden_states, _ = completion.complete(torch.ones(3, 4), None)
@@ -381,17 +384,17 @@ class TestSelectFfnCompletion(CustomTestCase):
     def test_a_reduce_scatter_is_bound_for_the_next_layer(self):
         forward_batch = object()
         for step in (
-            comm._reduce_and_redistribute_output_varlen,
-            comm._reduce_and_redistribute_output_max_len,
+            comm_ops._reduce_and_redistribute_output_varlen,
+            comm_ops._reduce_and_redistribute_output_max_len,
         ):
             with self.subTest(step=step.__name__):
                 left = self.left(self.communicator(), step, forward_batch)
                 bound = left.reduce_and_redistribute
-                self.assertIs(bound.func, comm._to_local_tokens)
+                self.assertIs(bound.func, comm_ops._to_local_tokens)
                 self.assertEqual(bound.args, (step, forward_batch))
 
     def test_postprocess_keeps_everything_else(self):
-        reduce_scatter = comm._reduce_and_redistribute_output_varlen
+        reduce_scatter = comm_ops._reduce_and_redistribute_output_varlen
         for name, communicator, step in (
             ("scatter only", self.communicator(), None),
             ("last layer", self.communicator(is_last_layer=True), reduce_scatter),
@@ -404,7 +407,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         communicator = self.communicator(sp_region=True)
         with get_forward().scoped(sp_active=True):
             self.assertIsNone(
-                self.left(communicator, comm._reduce_and_redistribute_output_varlen)
+                self.left(communicator, comm_ops._reduce_and_redistribute_output_varlen)
             )
 
     def test_a_deferred_sum_keeps_its_layout_or_scatters_back(self):
@@ -415,7 +418,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         moved = self.left(self.communicator(fuse=True), None, forward_batch)
         self.assertIsNone(moved.group)
         bound = moved.reduce_and_redistribute
-        self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
+        self.assertIs(bound.func, comm_ops._all_reduce_then_to_local_tokens)
         self.assertEqual(bound.args, (self.group, forward_batch))
 
     def test_the_all_reduce_runs_before_the_scatter(self):
@@ -426,19 +429,17 @@ class TestSelectFfnCompletion(CustomTestCase):
             all_reduce=lambda x: calls.append(("all_reduce", x)) or x * 2
         )
         with (
-            patch.object(comm, "_dp_scatter_group", return_value="group"),
-            patch.object(
-                comm,
+            patch_communicator("_dp_scatter_group", return_value="group"),
+            patch_communicator(
                 "get_local_dp_buffer",
                 side_effect=lambda group: calls.append(("buffer", group)) or local,
             ),
-            patch.object(
-                comm,
+            patch_communicator(
                 "dp_scatter",
                 side_effect=lambda out, full, fb: calls.append(("scatter", out)),
             ),
         ):
-            result = comm._all_reduce_then_to_local_tokens(group, object(), partial)
+            result = comm_ops._all_reduce_then_to_local_tokens(group, object(), partial)
         self.assertEqual([c[0] for c in calls], ["all_reduce", "buffer", "scatter"])
         self.assertIs(calls[0][1], partial)
         self.assertIs(result, local)

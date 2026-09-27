@@ -6,18 +6,23 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
     EdgeDecl,
+    InputRead,
     Layout,
     StageInput,
     StageOutput,
     SumGroup,
     TokenAxis,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import (
     decoder_layer_edges,
     decoder_layer_sides,
     input_scattered_layer_sides,
+    make_boundary,
 )
-from sglang.srt.layers.communicator import InputRead, make_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -152,7 +157,7 @@ class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
             )
         self.assertEqual(len(halves), 1)
         ((func, keywords, move),) = halves
-        self.assertIs(func, comm._attention_input_step)
+        self.assertIs(func, comm_boundary._attention_input_step)
         self.assertIsNone(dict(keywords)["layer_input"])
         self.assertIs(move, comm.CommunicateSimpleFn._trivial)
 
@@ -194,7 +199,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual_to=attention,
         )
         step = make_boundary(complete, reads=InputRead.FFN).prepare
-        self.assertIs(step.func, comm._mlp_input_dp_replicate)
+        self.assertIs(step.func, comm_ops._mlp_input_dp_replicate)
         self.assertFalse(step.keywords["reduces_attention_tp"])
         # An FFN that may leave its TP sum for a batch hands it on with the
         # value, which completes onto the rows the layer hands on; the next
@@ -208,8 +213,8 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual_to=attention,
         )
         step = make_boundary(leaves, reads=InputRead.FFN).prepare
-        self.assertIs(step.func, comm._mlp_input_completing_owed)
-        self.assertIs(step.keywords["step"].func, comm._mlp_input_dp_replicate)
+        self.assertIs(step.func, comm_ops._mlp_input_completing_owed)
+        self.assertIs(step.keywords["step"].func, comm_ops._mlp_input_dp_replicate)
         # A producer that always leaves a sum other than the attention TP's is
         # not supported.
         always = EdgeDecl(

@@ -5,16 +5,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
     Layout,
+    MixerExit,
     StageDecl,
     StageInput,
     StageOutput,
     SumGroup,
     TokenAxis,
+    UnreducedOutput,
     stage_edges,
 )
-from sglang.srt.layers.communicator import MixerExit, UnreducedOutput
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
 from sglang.srt.runtime_context import get_parallel

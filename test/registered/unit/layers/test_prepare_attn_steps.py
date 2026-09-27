@@ -5,13 +5,16 @@ import contextlib
 import unittest
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -58,14 +61,14 @@ def communicator(norm):
     # A layer whose attention takes its input as it is and owes nothing on it.
     c._steps = comm.BoundarySteps(
         attention_prepare=partial(
-            comm._attention_input_step,
+            comm_boundary._attention_input_step,
             layer_input=None,
             fusions=c._attn_input_fusions,
             enters_stack=False,
             residual_ops=comm.ADD_AND_NORM,
         ),
         attention_input=lambda hidden_states, **_: hidden_states,
-        ffn_input=comm._mlp_input_norm,
+        ffn_input=comm_ops._mlp_input_norm,
         ffn_input_rows=comm.Layout(frozenset()),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
@@ -85,29 +88,27 @@ def platform(*, use_aiter=False, gfx95=False, fusion=False, kernel_group=True):
     group = SimpleNamespace(all_reduce=all_reduce)
     with contextlib.ExitStack() as stack:
         for name, mock in kernels.items():
-            stack.enter_context(patch.object(comm, name, mock, create=True))
-        stack.enter_context(patch.object(comm, "_use_aiter", use_aiter))
-        stack.enter_context(patch.object(comm, "_is_gfx95_supported", gfx95))
+            stack.enter_context(patch_communicator(name, mock, create=True))
+        stack.enter_context(patch_communicator("_use_aiter", use_aiter))
+        stack.enter_context(patch_communicator("_is_gfx95_supported", gfx95))
         stack.enter_context(
-            patch.object(comm, "_use_aiter_bpreshuffle_gfx95", False, create=True)
+            patch_communicator("_use_aiter_bpreshuffle_gfx95", False, create=True)
         )
         stack.enter_context(
-            patch.object(comm, "apply_aiter_all_reduce_fusion", return_value=False)
+            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False)
         )
         stack.enter_context(
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fusion)
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fusion)
         )
         # The group the fused kernel reduces over.
         stack.enter_context(
-            patch.object(
-                comm,
+            patch_communicator(
                 "post_experts_reduction_group",
                 return_value=group if kernel_group else SimpleNamespace(),
             )
         )
         stack.enter_context(
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False, is_dsa=False),
             )
@@ -241,7 +242,7 @@ class TestPrepareAttnSteps(CustomTestCase):
             c._steps = msgspec.structs.replace(
                 c._steps,
                 attention_prepare=partial(
-                    comm._attention_input_step,
+                    comm_boundary._attention_input_step,
                     layer_input=None,
                     fusions=(takes_anything,),
                     enters_stack=False,

@@ -11,19 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Hyper-connection residual streams."""
+
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
-from sglang.srt.layers.boundary_layout import DecoderLayerSides, TokenAxis
-from sglang.srt.layers.communicator import (
-    BoundarySteps,
-    LayerCommunicator,
-    LayerScatterModes,
-    sparse_moe_gathers_over_moe_cp,
-)
 
 
 @dataclass
@@ -141,61 +136,3 @@ class MHCState:
         raise NotImplementedError(
             "Unsupported: h_res/h_post allgather not implemented."
         )
-
-
-class MHCLayerCommunicator(LayerCommunicator):
-    """A layer whose residual is hyper-connection streams: the shared boundary
-    steps, run with MHCState's residual operations."""
-
-    def __init__(
-        self,
-        layer_scatter_modes: LayerScatterModes,
-        input_layernorm: torch.nn.Module,
-        post_attention_layernorm: torch.nn.Module,
-        allow_reduce_scatter: bool = False,
-        qkv_latent_func: Optional[Callable] = None,
-        *,
-        hc_mult: int,
-        hc_attn_pre: Callable,
-        hc_ffn_pre: Callable,
-        hc_post: Callable,
-        hc_ffn_post_pre: Optional[Callable] = None,
-    ):
-        self.mhc = MHCState(
-            hc_mult=hc_mult,
-            hc_attn_pre=hc_attn_pre,
-            hc_ffn_pre=hc_ffn_pre,
-            hc_post=hc_post,
-            hc_ffn_post_pre=hc_ffn_post_pre,
-            is_last_layer=layer_scatter_modes.is_last_layer,
-        )
-        if layer_scatter_modes.is_layer_sparse and sparse_moe_gathers_over_moe_cp():
-            raise NotImplementedError(
-                "MHCLayerCommunicator does not support a MoE gathered over the "
-                "MoE-CP group (moe_dp_size < attention_context_parallel_size). "
-                "Increase moe_dp_size to match attention_context_parallel_size."
-            )
-        # The postprocess writes the FFN output into the streams, so the FFN's
-        # sum never waits for the next layer.
-        super().__init__(
-            layer_scatter_modes,
-            input_layernorm,
-            post_attention_layernorm,
-            allow_reduce_scatter,
-            qkv_latent_func,
-            allow_deferred_ffn_reduction=False,
-            residual_ops=self.mhc,
-        )
-
-    def _steps_from_declarations(
-        self, sides: DecoderLayerSides, **kwargs
-    ) -> BoundarySteps:
-        # MHC has not been run with an FFN input gathered over attention CP.
-        if (
-            TokenAxis.ATTN_CP
-            in sides.attention_output.layout.sharded - sides.ffn.layout.sharded
-        ):
-            raise NotImplementedError(
-                f"MHCLayerCommunicator with a gather over attention CP: {sides=}"
-            )
-        return super()._steps_from_declarations(sides, **kwargs)

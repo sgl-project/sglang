@@ -1,15 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 from torch import nn
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -53,12 +53,12 @@ class TestNemotronMTPReduction(CustomTestCase):
                         moe_dp_rank=0,
                         moe_dp_size=1,
                     ),
-                    patch.object(comm, "get_moe_cp_size", return_value=1),
-                    patch.object(
-                        comm, "apply_flashinfer_allreduce_fusion", return_value=False
+                    patch_communicator("get_moe_cp_size", return_value=1),
+                    patch_communicator(
+                        "apply_flashinfer_allreduce_fusion", return_value=False
                     ),
-                    patch.object(
-                        comm, "apply_aiter_all_reduce_fusion", return_value=False
+                    patch_communicator(
+                        "apply_aiter_all_reduce_fusion", return_value=False
                     ),
                 ):
                     layer = nemotron_h_mtp.NemotronHMTPMoEDecoderLayer.__new__(

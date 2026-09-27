@@ -1,9 +1,8 @@
 import unittest
-from unittest.mock import patch
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerScatterModes, ScatterMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -16,10 +15,10 @@ class TestDenseMlpScatterModeUnderPrefillCP(CustomTestCase):
 
     def test_dense_mlp_gathers_across_cp(self):
         with (
-            patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=True),
-            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_cp_enabled", return_value=False),
-            patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
+            patch_communicator("_generic_prefill_cp_shards_tokens", return_value=True),
+            patch_communicator("is_dsa_enable_prefill_cp", return_value=False),
+            patch_communicator("is_mla_cp_enabled", return_value=False),
+            patch_communicator("enable_moe_dense_fully_dp", return_value=False),
         ):
             modes = LayerScatterModes.init_new(
                 layer_id=1,

@@ -15,11 +15,14 @@ import torch
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
     Layout,
     StageOutput,
     SumGroup,
     TokenAxis,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import (
     sequence_parallel_layer_sides,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -31,6 +34,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -38,7 +42,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 def sp_region_steps():
     """The steps a layer runs while a LayerNorm SP region is active."""
-    return comm._select_boundary_steps(
+    return comm_boundary._select_boundary_steps(
         sequence_parallel_layer_sides(
             axis_sizes={
                 TokenAxis.ATTN_DP: 1,
@@ -188,7 +192,7 @@ class TestSpRegionSteps(CustomTestCase):
         """The layer's steps outside the region, which must not run inside it."""
         return comm.BoundarySteps(
             attention_prepare=partial(
-                comm._attention_input_step,
+                comm_boundary._attention_input_step,
                 layer_input=None,
                 fusions=(),
                 enters_stack=False,
@@ -207,8 +211,7 @@ class TestSpRegionSteps(CustomTestCase):
         with (
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=False),
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ),
@@ -258,8 +261,7 @@ class TestSpRegionSteps(CustomTestCase):
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=True),
         ):
-            with patch.object(
-                comm,
+            with patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ):

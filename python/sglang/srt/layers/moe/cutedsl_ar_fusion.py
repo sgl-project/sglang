@@ -12,12 +12,13 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.boundary_layout import SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     FfnExitFusion,
     FusedMlpInput,
     HandoffOutput,
     LayerCommunicator,
+    SumGroup,
+    TokenAxis,
     UnreducedOutput,
     get_attn_tp_context,
 )
