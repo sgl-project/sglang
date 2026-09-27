@@ -300,6 +300,28 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
 
 
 @torch.no_grad()
+def test_batched_request_reuses_conditioning_without_changing_output_seeds():
+    executor, stage, encoder, args = make_group_executor(TextEncodingStage, "cpu", 0)
+    for _ in range(2):
+        request = Req(
+            sampling_params=SamplingParams(
+                prompt="hello",
+                negative_prompt="hello",
+                num_outputs_per_prompt=3,
+                seed=[7, 8, 9],
+            ),
+            do_classifier_free_guidance=True,
+        )
+        output = executor.execute([stage], request, args)
+        assert output.seed == [7, 8, 9]
+        assert output.num_outputs_per_prompt == 3
+        assert output.prompt_embeds[0] is output.negative_prompt_embeds[0]
+        assert executor.conditioning_cache._group_entries.get() is None
+    assert encoder.calls == 2
+    assert executor.conditioning_cache.group_hits == 2
+
+
+@torch.no_grad()
 def test_grouped_longlive_conditioning_keeps_per_request_shot_metadata():
     executor, stage, encoder, args = make_group_executor(
         LongLive2TextEncodingStage, "cpu", 0
