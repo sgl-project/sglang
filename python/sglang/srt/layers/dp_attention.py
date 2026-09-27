@@ -258,27 +258,14 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-
-        dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
-
-    @classmethod
-    def get_local_dp_buffer_mhc(
-        cls, group: GroupCoordinator, n: int = 1
+    def get_local_dp_buffer(
+        cls, group: GroupCoordinator, hidden_size: Optional[int] = None
     ) -> torch.Tensor:
-        from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),
+                (cls._local_dp_buffer_len, hidden_size or dp.buffer_hidden_size),
                 dtype=dp.buffer_dtype,
                 device=dp.buffer_device,
             )
@@ -344,12 +331,14 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
-
-
-def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)
+def get_local_dp_buffer(
+    group: GroupCoordinator, hidden_size: Optional[int] = None
+) -> torch.Tensor:
+    """A buffer for this rank's local DP rows, ``hidden_size`` wide (the model's
+    hidden size by default)."""
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(
+        group=group, hidden_size=hidden_size
+    )
 
 
 def get_global_dp_buffer_len() -> int:

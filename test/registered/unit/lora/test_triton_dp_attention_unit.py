@@ -220,7 +220,9 @@ def test_communicator_publishes_layout_at_each_transition(
         expected_mlp = expected_attn = initial
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
+    communicator.layer_scatter_modes = SimpleNamespace(
+        mlp_mode=mlp_mode, is_first_layer=False
+    )
     communicator._context = SimpleNamespace()
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
@@ -231,6 +233,7 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator._steps = SimpleNamespace(
         attention_input=lambda hidden_states, **kwargs: hidden_states,
         layer_input=None,
+        attention_handoff=lambda hidden_states, *args: hidden_states,
         ffn_input=lambda hidden_states, residual, *args: (hidden_states, residual),
     )
     communicator._attn_input_fusions = ()
