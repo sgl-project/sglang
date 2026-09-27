@@ -30,6 +30,25 @@ def _get_best_config(total_q: int):
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
+def _use_fp8_chunk_pipeline(
+    total_q: int,
+    max_q: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    group_size: int,
+    topk: int,
+) -> bool:
+    return (
+        total_q >= 4096
+        and max_q >= 4096
+        and kv_dtype == torch.float8_e4m3fn
+        and head_dim == 256
+        and group_size == 12
+        and topk == 2051
+        and "H20" in torch.cuda.get_device_name(0)
+    )
+
+
 @triton.jit
 def _sparse_gqa_prefill(
     q,
@@ -201,6 +220,7 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     SLOT_INDICES: tl.constexpr,
+    USE_FP8_PIPELINE: tl.constexpr,
 ):
     """One query row x one KV head group over its ``topk`` selected tokens.
 
@@ -235,6 +255,10 @@ def _sparse_gqa_chunk_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
+    if USE_FP8_PIPELINE:
+        q_absmax = tl.max(tl.abs(q_values), axis=1)
+        q_scale = tl.where(q_absmax > 0, q_absmax / 448.0, 1.0)
+        q_values_fp8 = (q_values / q_scale[:, None]).to(tl.float8e4nv)
     k_base = k + k_start * sk_n + group * sk_h
     v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
@@ -259,11 +283,19 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # Direct callers and the KV pool can be FP8; packing uses Q's dtype.
-        # QSA stores unscaled K/V, so a plain cast supports both callers.
-        keys = keys.to(q_values.dtype)
-        values = values.to(q_values.dtype)
-        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        # The long-H20 path keeps staged Q/K/V and softmax probabilities in
+        # FP8, avoiding full-tile widening before the dot operations. Other
+        # architectures, dtypes, and shorter chunks preserve the BF16 path.
+        if USE_FP8_PIPELINE:
+            scores = tl.where(
+                valid[None, :],
+                tl.dot(q_values_fp8, keys) * q_scale[:, None],
+                -float("inf"),
+            )
+        else:
+            keys = keys.to(q_values.dtype)
+            values = values.to(q_values.dtype)
+            scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.math.exp2(scores - next_max[:, None])
@@ -395,6 +427,16 @@ def sparse_gqa_fwd_interface_triton_ck(
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    use_fp8_pipeline = _use_fp8_chunk_pipeline(
+        total_q,
+        max_q,
+        k.dtype,
+        head_dim,
+        group_size,
+        indices.shape[-1],
+    )
+    if use_fp8_pipeline:
+        block_n = 32
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -428,6 +470,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=False,
+        USE_FP8_PIPELINE=use_fp8_pipeline,
         num_warps=warps,
         num_stages=stages,
     )
@@ -481,6 +524,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=False,
+        USE_FP8_PIPELINE=False,
         num_warps=warps,
         num_stages=stages,
     )
@@ -561,6 +605,11 @@ def sparse_gqa_paged_prefill_triton(
     )
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    use_fp8_pipeline = _use_fp8_chunk_pipeline(
+        total_q, max_q, k_cache.dtype, head_dim, group_size, topk
+    )
+    if use_fp8_pipeline:
+        block_n = 32
     _sparse_gqa_chunk_prefill[(max_q, num_entries * num_kv_heads)](
         q,
         k_cache,
@@ -593,6 +642,7 @@ def sparse_gqa_paged_prefill_triton(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         SLOT_INDICES=True,
+        USE_FP8_PIPELINE=use_fp8_pipeline,
         num_warps=warps,
         num_stages=stages,
     )
