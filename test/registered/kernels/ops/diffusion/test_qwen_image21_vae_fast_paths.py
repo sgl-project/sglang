@@ -72,6 +72,19 @@ def conv_fold_gates(vae):
     ]
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_cudnn():
+    # Bit-exactness is asserted against the eager chain, so both sides must run
+    # deterministic conv algorithms; cuDNN may otherwise pick split-K engines
+    # whose atomics reorder the sum between two calls.
+    previous = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.deterministic = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
 @torch.no_grad()
 def test_decode_is_bit_identical_and_paths_verify(monkeypatch):
     reference = make_vae()
@@ -100,6 +113,9 @@ def test_decode_is_bit_identical_and_paths_verify(monkeypatch):
     assert len(norms) >= 8 and len(folds) >= 8
     z = torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
     expected = reference.decode(z)
+    assert torch.equal(reference.decode(z), expected), (
+        "the eager decode itself is not reproducible on this platform"
+    )
     actual = optimized.decode(z)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     # Kernels that are exact by construction must have engaged.

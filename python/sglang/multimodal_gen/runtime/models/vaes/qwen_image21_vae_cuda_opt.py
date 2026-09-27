@@ -174,17 +174,32 @@ class FoldedPadConv2d(nn.Module):
         verified = gate.is_verified(sig)
         if not verified and torch.cuda.is_current_stream_capturing():
             return self._reference(x, cache_x, with_bias)
-        folded = F.conv2d(
-            x.squeeze(2),
-            self.weight,
-            self.bias if with_bias else None,
-            conv.stride,
-            self._padding,
-            conv.dilation,
-            conv.groups,
-        ).unsqueeze(2)
+
+        def folded_conv() -> torch.Tensor:
+            return F.conv2d(
+                x.squeeze(2),
+                self.weight,
+                self.bias if with_bias else None,
+                conv.stride,
+                self._padding,
+                conv.dilation,
+                conv.groups,
+            ).unsqueeze(2)
+
+        folded = folded_conv()
         if verified:
             return folded
+        # First sight: cuDNN may pick an engine that is not reproducible (split-K
+        # with atomics), which a single lucky match against the reference would
+        # not reveal; only a kernel that repeats itself can be accepted.
+        if not torch.equal(folded, folded_conv()):
+            gate.disable()
+            logger.warning(
+                "%s: cuDNN's kernel for the folded descriptor is not reproducible "
+                "on this platform; keeping the padded conv.",
+                gate.name,
+            )
+            return self._reference(x, cache_x, with_bias)
         return gate.accept_or_fallback(
             folded, self._reference(x, cache_x, with_bias), sig=sig, logger=logger
         )
