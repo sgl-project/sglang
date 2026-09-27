@@ -1522,6 +1522,12 @@
                     ]
                   },
                   {
+                    "group": "CircleStone",
+                    "pages": [
+                      "cookbook/diffusion/CircleStone/Anima"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "tag": "NEW",
                     "pages": [

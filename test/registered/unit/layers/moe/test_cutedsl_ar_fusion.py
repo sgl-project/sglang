@@ -4,7 +4,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    ScatterMode,
+    UnreducedOutput,
+)
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -33,6 +37,8 @@ def _communicator():
     comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
     comm.input_layernorm = RMSNorm(8, eps=1e-6)
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+    comm.enable_fused_ar_quant = False
+    comm._attn_input_fusions = comm._select_attn_input_fusions()
     return comm
 
 
@@ -89,9 +95,8 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
                 residual,
             ),
         ),
-        patch.object(
-            LayerCommunicator,
-            "prepare_attn",
+        patch(
+            "sglang.srt.layers.communicator.reduce_output",
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):
@@ -99,6 +104,27 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
     assert last._can_absorb_post_moe_all_reduce(_DECODE, 8) is False
+
+
+def test_cutedsl_entries_come_before_the_base_fused_kernel():
+    comm = _communicator()
+    assert comm._attn_input_fusions == (
+        comm._finalize_output_and_update_and_read_residual_cutedsl,
+        comm._reduce_output_and_update_and_read_residual_cutedsl,
+        comm._reduce_output_and_update_and_read_residual,
+    )
+    base = comm._mlp_input_reduce_output_and_update_and_read_residual
+    cutedsl = comm._mlp_input_reduce_output_and_update_and_read_residual_cutedsl
+    with patch(
+        f"{_MODULE}.get_parallel",
+        return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
+    ):
+        assert comm._select_mlp_input_fusions(ScatterMode.TP_ATTN_FULL) == (
+            cutedsl,
+            base,
+        )
+        # A scattered residual is gathered first, which the workspace does not do.
+        assert comm._select_mlp_input_fusions(ScatterMode.SCATTERED) == (base,)
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):

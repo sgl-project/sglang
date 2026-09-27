@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -24,6 +25,11 @@ def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._speculative_algo = None
     communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
+    # Fixed at construction by the scatter-mode path from the MLP's mode.
+    communicator._ffn_sum_is_movable = mlp_mode not in (
+        ScatterMode.MOE_FULL,
+        ScatterMode.SCATTERED,
+    )
     communicator.is_last_layer = False
     communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
@@ -322,11 +328,14 @@ class TestDeferFfnReduction(CustomTestCase):
     ):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
-        communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
-        communicator._sp_variant = object() if sp_active else None
-        communicator.allow_reduce_scatter = True
-        communicator.layer_scatter_modes.is_layer_sparse = True
+        communicator._sp_region = sp_active
+        communicator._ffn_output = StageOutput(
+            Layout(frozenset()),
+            group=SumGroup.MOE_OUTPUT,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        )
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(batch_size,)),
             global_dp_buffer_len=global_tokens,
@@ -379,7 +388,9 @@ class TestDeferFfnReduction(CustomTestCase):
                 moe_ep_size=1, moe_tp_size=4, moe_dp_size=1, tp_size=4
             ),
         ):
-            return communicator.should_defer_ffn_reduction(forward_batch)
+            return communicator._ffn_sum_moves_to_next_layer(
+                forward_batch, mlp_reduce_scatter=reduce_scatter, dp_step=step
+            )
 
     def test_defers_whether_or_not_the_fused_kernel_takes_the_batch(self):
         self.assertTrue(self._should_defer(fused=True))

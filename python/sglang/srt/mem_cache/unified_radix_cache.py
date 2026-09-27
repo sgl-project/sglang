@@ -204,7 +204,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        self._tree_core_backend = (
+            params.tree_core_backend
+            if params.tree_core_backend is not None
+            else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -1053,25 +1057,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # The caller frees [cache_protected_len, up_to): the unaligned tail,
-        # plus the deferred truncation tail. After a rotation decline nothing
-        # was inserted, so everything past the protected prefix goes.
+        # Everything past the inserted key goes back to the caller, the
+        # protected prefix never does. After a rotation decline nothing was
+        # inserted.
         free_from = (
-            # min(): the protected prefix can already run past a truncated
-            # cache_len, and free_kv_row takes ascending ranges only.
             min(req.kv.cache_protected_len, len(kv_indices))
             if result.rotation_tail_declined
             else page_aligned_len
         )
-        if tail_free_start is not None and not (
-            free_from < len(kv_indices) and tail_free_start <= len(kv_indices)
-        ):
-            # Truncated below the protected prefix: the piece before it is not
-            # part of the suffix the caller frees.
-            self.free_kv_row(req.kv, [(free_from, len(kv_indices))])
-            req.kv.cache_protected_len = tail_free_start
-        else:
-            req.kv.cache_protected_len = free_from
+        if tail_free_start is not None and tail_free_start > len(kv_indices):
+            # Truncated below the protected prefix: only an untracked mamba
+            # request gets here, with an empty key, and owns nothing before it.
+            assert free_from == len(kv_indices), (
+                f"{free_from=} {len(kv_indices)=} {req.kv.cache_protected_len=}"
+            )
+            free_from = tail_free_start
+        req.kv.cache_protected_len = free_from
 
         # cleanup
         for comp in self._components_tuple:

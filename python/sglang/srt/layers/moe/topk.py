@@ -86,7 +86,7 @@ except ImportError:
     pass
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )

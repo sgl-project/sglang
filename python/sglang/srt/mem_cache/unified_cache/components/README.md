@@ -122,7 +122,7 @@ Insert a key-value pair into the tree.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Insert token sequence + KV indices, reusing existing prefix and freeing duplicate KV slots |
-| **Inputs** | `params.key: RadixKey`, `params.value: Tensor` (KV pool indices), plus component-specific fields (`mamba_value`, `swa_evicted_seqlen`, `prev_prefix_len`) |
+| **Inputs** | `params.key: RadixKey`, `params.value: Tensor` (KV pool indices), plus component-specific fields (`mamba_value`, `component_evicted_seqlens`, `prev_prefix_len`) |
 | **Output** | `InsertResult(prefix_len, mamba_exist)` — `prefix_len` = length of reused prefix |
 | **Mutation** | Creates new leaf nodes; updates component data on overlapping nodes; frees duplicate KV indices; may split nodes; updates LRU lists and evictable sizes |
 | **Complexity** | **O(K + D·C)** |
@@ -132,7 +132,7 @@ Insert a key-value pair into the tree.
 2. If key diverges mid-node, calls `_split_node` → `redistribute_on_node_split()` per component
 3. For each overlapping node, calls `update_component_on_insert_overlap()` per component — returns `consumed_from` index; the tree frees `value[dup_start:consumed_from]` as duplicate pool indices
    - Full: returns `prefix_len` (no consumption, default behavior)
-   - SWA: checks if the overlapping node is a tombstone (SWA value = None) within the SWA window boundary (`swa_evicted_seqlen`):
+   - SWA: checks if the overlapping node is a tombstone (SWA value = None) within the SWA window boundary (`params.get_evicted_seqlen(ComponentType.SWA)`):
      - If entirely within window: **recovers tombstone** — frees old `full_value`, clones `value_slice`, translates to SWA indices, inserts into SWA LRU (returns `0` = all consumed)
      - If partially within window: **splits node** at boundary, recovers SWA on the window portion (returns `start_idx`)
      - If entirely outside window: returns `prefix_len` (no consumption)
@@ -181,7 +181,7 @@ Lock a node to protect it (and its ancestors) from eviction.
 |--------|--------|
 | **Purpose** | Called when a request begins using a cached prefix — prevents eviction of nodes it depends on |
 | **Inputs** | `node` — the last matched node (deepest); `skip_lock_components` names components to leave untaken (the decode hold passes `(MAMBA,)`) |
-| **Output** | `IncLockRefResult(node_id, swa_uuid_for_lock, skipped_lock_components)` — the receipt the matching release must replay: the anchor node, the SWA boundary, and the skipped set |
+| **Output** | `IncLockRefResult(node_id, skipped_lock_components, component_lock_uuids)` — the receipt the matching release must replay: the anchor node, the skipped set, and each component's device boundary. Host acquires use `component_host_lock_uuids`. |
 | **Mutation** | Increments `lock_ref` per component along its contiguous segment; moves data-bearing tokens from evictable to protected size counters |
 | **Complexity** | **O(D)** — Full: node to root; SWA: up to window boundary O(min(D, W)); Mamba: O(1).|
 
@@ -204,7 +204,7 @@ Unlock a previously locked node path by replaying the acquire's receipt.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Called when a request finishes — releases eviction protection |
-| **Inputs** | `node`; required `params` receipt (`node_id` anchor, `swa_uuid_for_lock` boundary, `skipped_lock_components`); `skip_swa=True` after an earlier `dec_swa_lock_only`. A receipt whose anchor is not `node` is a protocol violation (assert): a mispaired release would otherwise walk another holder's segment. |
+| **Inputs** | `node`; required `params` receipt (`node_id` anchor, `component_lock_uuids` boundaries, `skipped_lock_components`); `skip_swa=True` after an earlier `dec_swa_lock_only`. A receipt whose anchor is not `node` is a protocol violation (assert): a mispaired release would otherwise walk another holder's segment. |
 | **Output** | `DecLockRefResult()` |
 | **Mutation** | Decrements `lock_ref` per component along the same segment the acquire counted; moves tokens from protected back to evictable when `lock_ref` reaches 0 |
 | **Complexity** | **O(D)** — symmetric to `inc_lock_ref` |
@@ -241,7 +241,7 @@ Cache a completed request's KV data into the tree.
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
-1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
+1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: copies its cursor with `set_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
 2. Truncates if `effective_cache_len < len(token_ids)`: frees excess pool indices
 3. Converts token IDs (bigram if EAGLE), page-aligns keys, then calls `insert()`
 4. Frees unaligned tail KV indices beyond page boundary
@@ -320,7 +320,7 @@ Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `prepare_for_caching_req()` | Prepare component-specific data before insert, fill fields in `InsertParams`, return effective cache length. Full: no-op. SWA: sets `swa_evicted_seqlen`. Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen`. | `cache_finished/unfinished_req` | returns `None` |
+| `prepare_for_caching_req()` | Prepare component-specific data before insert, fill fields in `InsertParams`, return effective cache length. Full: no-op. SWA: copies its cursor with `set_evicted_seqlen`. Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen`. | `cache_finished/unfinished_req` | returns `None` |
 | `cleanup_after_caching_req()` | Post-cache cleanup. Full/SWA: no-op. Mamba: frees forked `mamba_value` based on `mamba_exist`, handles ping-pong buffer `keep_idx`, resets `mamba_last_track_seqlen` on unfinished. | `cache_finished/unfinished_req` | no-op |
 
 ### Utility
