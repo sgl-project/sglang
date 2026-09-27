@@ -45,12 +45,8 @@ class LiLiCorrLatticeAttention(nn.Module):
         q = q.view(shape).transpose(1, 2)
         k = k.view(shape).transpose(1, 2)
         v = v.view(shape).transpose(1, 2)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_bias.reshape(bsz, self.num_heads, seq_len, seq_len),
-        )
+        # attention_bias is [1, heads, L, L]; SDPA broadcasts it over the batch.
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias)
         return self.out_proj(
             out.transpose(1, 2).reshape(bsz, seq_len, self.hidden_size)
         )
@@ -275,13 +271,7 @@ class LiLiCorrHead(nn.Module):
         )
 
         anchor_state = self._project_anchor(anchor_hidden, anchor_valid)
-        # Materialized rather than a stride-0 broadcast, which measured -1.75pp.
-        lattice = self._attn_bias.shape[-1]
-        attention_bias = (
-            self._attn_bias.unsqueeze(0)
-            .expand(bsz * n_blocks, -1, -1, -1)
-            .reshape(bsz * n_blocks * self.num_heads, lattice, lattice)
-        )
+        attention_bias = self._attn_bias.unsqueeze(0)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_bias)
         hidden_states = self.output_norm(hidden_states).reshape(
