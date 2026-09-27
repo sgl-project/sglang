@@ -36,6 +36,7 @@ from sglang.srt.multimodal.cache import (
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.segmented_features import SegmentedFeatures
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -915,8 +916,10 @@ class BaseMultimodalProcessor(ABC):
             ):
                 # move feature tensors to cpu
                 for feature_name in self.FEATURE_NAMES:
+                    # SegmentedFeatures also has .to(); it moves each owning
+                    # buffer once and keeps the per-item views.
                     if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
+                        result[feature_name], (torch.Tensor, SegmentedFeatures)
                     ):
                         result[feature_name] = result[feature_name].to("cpu")
 
