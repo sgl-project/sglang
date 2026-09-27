@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::forward::{forward_chat_request, SelectedWorkers};
-use super::nonempty_header;
 use super::preparation::{parse_routing_fields, PreparedChatRequest};
-use crate::buckets_reorg::{BucketRequest, BucketResolver};
+use super::{
+    nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
+    X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
+};
+use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::ModelId;
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
@@ -45,8 +48,23 @@ pub(super) async fn chat_completions(
         })
         .transpose()?;
 
+    let ttft_ms = if resolver.ttft_slo != SloPreference::Disabled {
+        parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?
+    } else {
+        None
+    };
+    let tokens_per_second = if resolver.tps_slo != SloPreference::Disabled {
+        parse_optional_positive_f64_header(&headers, &X_SGL_TPS_SLO, "TPS SLO")?
+    } else {
+        None
+    };
     let buckets = resolver
-        .resolve(input_tokens, expected_peak_tokens)
+        .resolve(
+            input_tokens,
+            expected_peak_tokens,
+            ttft_ms,
+            tokens_per_second,
+        )
         .map_err(|error| selection_error(error, &request.model, None))?;
     if buckets.is_empty() {
         return Err(selection_error(

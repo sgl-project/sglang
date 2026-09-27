@@ -35,7 +35,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -57,7 +56,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1000,7 +999,7 @@ class XllmSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
                 ),
@@ -1061,13 +1060,8 @@ class XllmSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not use_reduce_scatter
-            and not should_skip_post_experts_all_reduce(is_tp_path=True)
-            and not get_moe_a2a_backend().is_flashinfer()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if not use_reduce_scatter:
+            final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1548,7 +1542,7 @@ class XllmDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == config.num_hidden_layers - 1),
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -1575,20 +1569,17 @@ class XllmDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if isinstance(self.mlp, XllmMLP):
-            hidden_states = self.mlp(
-                hidden_states, use_reduce_scatter=use_reduce_scatter
-            )
-        else:
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            use_reduce_scatter = ffn_exit.mlp_reduce_scatter
+            if isinstance(self.mlp, XllmMLP):
+                hidden_states = self.mlp(
+                    hidden_states, use_reduce_scatter=use_reduce_scatter
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, forward_batch, use_reduce_scatter
+                )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
