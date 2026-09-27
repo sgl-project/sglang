@@ -302,7 +302,7 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
         return [
             Req(
                 sampling_params=SamplingParams(
-                    prompt=prompt, negative_prompt="bad quality"
+                    prompt=prompt, negative_prompt="bad quality", num_inference_steps=4
                 ),
                 do_classifier_free_guidance=True,
                 is_warmup=warmup,

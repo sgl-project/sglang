@@ -154,15 +154,22 @@ class _GroupEntry:
     output: object
     owner: int
     copied_bytes: int
-    ready: tuple[tuple[torch.device, torch.cuda.Event], ...]
+    streams: tuple[torch.cuda.Stream, ...]
 
     def wait(self):
-        for device, event in self.ready:
-            torch.cuda.current_stream(device).wait_event(event)
+        consumers = {}
+        for producer in self.streams:
+            consumer = torch.cuda.current_stream(producer.device)
+            if consumer != producer:
+                consumer.wait_stream(producer)
+                consumers[producer.device] = consumer
+
+        if not consumers:
+            return
 
         def record(t):
-            if t.device.type == "cuda":
-                t.record_stream(torch.cuda.current_stream(t.device))
+            if t.device in consumers:
+                t.record_stream(consumers[t.device])
             return t
 
         _map_output(self.output, record)
@@ -309,12 +316,13 @@ class ConditioningCache:
         ):
             return
         stored = _copy_output(output, share_tensors=share_in_group)
-        ready = []
-        for device in {t.device for t in tensors.values() if t.device.type == "cuda"}:
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(device))
-            ready.append((device, event))
-        entries[key] = _GroupEntry(stored, owner, size, tuple(ready))
+        streams = tuple(
+            torch.cuda.current_stream(device)
+            for device in {
+                t.device for t in tensors.values() if t.device.type == "cuda"
+            }
+        )
+        entries[key] = _GroupEntry(stored, owner, size, streams)
 
     @contextmanager
     def scope(self, enabled=True, *, refresh=False, cross_request=True):
