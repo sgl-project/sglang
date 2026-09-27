@@ -434,7 +434,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._lilicorr_sampling_enabled = (
             _LILICORR_SAMPLING_ENABLED and self._selector_sampling_enabled
         )
-        # Set by LiLiCorrDraftModel, None on every other DFLASH draft.
         self.lilicorr = self.draft_model.lilicorr
         self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
@@ -2542,7 +2541,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
         )
 
-        # LiLiCorr stages the same sampling params and publishes the same sparse q.
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             if self._draft_sampler is not None:
@@ -2616,7 +2614,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 and self._lilicorr_sampling_enabled
                 and not _is_all_greedy(batch.sampling_info)
             ):
-                # An all-greedy batch publishes nothing and takes the target-only verify.
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
@@ -2631,7 +2628,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     sampling_info=batch.sampling_info,
                 )
         elif self.lilicorr is not None:
-            # Measured about -17% throughput, invisible in acceptance.
             if (
                 self._lilicorr_sampling_enabled
                 and not self._warned_lilicorr_eager

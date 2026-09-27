@@ -1,6 +1,3 @@
-"""LiLiCorr drafts serve under plain DFLASH args; accept floors catch a head that
-silently loads as its head-free parent."""
-
 import unittest
 from contextlib import ExitStack
 
@@ -23,8 +20,7 @@ register_cuda_ci(
     disabled="no LiLiCorr draft checkpoint is published yet",
 )
 
-# Set DRAFT_MODEL and drop `disabled=` once a drafter is published; the setUpClass
-# skip covers `/rerun-test` and direct runs, which ignore `disabled=`.
+# The setUpClass skip covers `/rerun-test` and direct runs, which ignore `disabled=`.
 UNPUBLISHED = "<unpublished>"
 TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFT_MODEL = UNPUBLISHED
@@ -35,13 +31,11 @@ class TestLiLiCorrServer(CustomTestCase, GSM8KMixin, SpecDecodingMixin):
     draft_model = DRAFT_MODEL
     # The floors below were measured on fa3 only.
     attention_backend = "fa3"
-    # Floors under H100 measurements; gsm8k scored 0.955.
     gsm8k_accuracy_thres = 0.85
     # 5.07 with the head against 4.17 for the head-free DFLASH control.
     gsm8k_accept_length_thres = 4.6
     # One prompt at 2048 tokens: 8.19 with the head against 7.31 for the control.
     accept_length_thres = 7.7
-    # 883.8 tok/s against the control's 788.0; only catches a collapse.
     bs_1_speed_thres = 600.0
 
     @classmethod

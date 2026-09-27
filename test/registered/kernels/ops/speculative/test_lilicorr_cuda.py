@@ -1,5 +1,3 @@
-"""GPU parity of the LiLiCorr Triton kernels against their torch references."""
-
 import sys
 
 import pytest
@@ -19,9 +17,6 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="LiLiCorr Triton kernels require CUDA"
 )
-
-
-# --- the tiled top-k + log-partition ---------------------------------------
 
 
 # 151936 is Qwen3's vocabulary; the rest straddle the 1024-wide tile boundary.
@@ -57,9 +52,7 @@ def test_tiled_topk_lse_survives_bf16_logits():
 
 
 def test_tied_bf16_logits_return_a_valid_selection():
-    """Among ties any token may be returned, but it must hold the returned value."""
     torch.manual_seed(6)
-    # 64 distinct values over 8192 columns, so the top-8 is almost all ties.
     logits = torch.randint(0, 64, (4, 8192), device="cuda").to(torch.bfloat16)
 
     vals, tokens, _ = lilicorr_topk_lse(logits, 8)
@@ -71,7 +64,6 @@ def test_tied_bf16_logits_return_a_valid_selection():
 
 
 def test_a_vocabulary_narrower_than_k_tiles_takes_the_exact_reference_path():
-    """Fewer than k tiles must fall back rather than fail to compile."""
     torch.manual_seed(3)
     logits = torch.randn(3, 3072, device="cuda", dtype=torch.float32)
 
@@ -81,9 +73,6 @@ def test_a_vocabulary_narrower_than_k_tiles_takes_the_exact_reference_path():
     torch.testing.assert_close(vals.cpu(), ref_vals)
     torch.testing.assert_close(tokens.cpu(), ref_tokens)
     torch.testing.assert_close(lse.cpu(), ref_lse)
-
-
-# --- the selector walk ------------------------------------------------------
 
 
 def _walk_reference(
@@ -128,7 +117,6 @@ def _greedy_reference(log_start, log_pair, candidate_tokens):
     return tokens
 
 
-# 16 is the widest pool the selector walk holds in one lane group.
 @pytest.mark.parametrize("topk", [1, 8, 16])
 def test_greedy_path_matches_the_reference(topk):
     torch.manual_seed(4)
@@ -144,7 +132,6 @@ def test_greedy_path_matches_the_reference(topk):
 
 
 def test_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
-    """The Triton and torch walks must both break ties toward the lower index."""
     log_start = torch.zeros(2, 8, device="cuda")
     log_pair = torch.zeros(2, 14, 8, 8, device="cuda")
     tokens = torch.arange(2 * 15 * 8, device="cuda").view(2, 15, 8)
@@ -170,7 +157,6 @@ def _sampled_inputs(bs, slots, k, *, seed=0):
 
 @pytest.mark.parametrize("k", [1, 2, 8, 16])
 def test_sampled_path_matches_the_reference(k):
-    """Triton and torch must consume the uniforms identically and commit the same ids."""
     a = _sampled_inputs(4, 5, k, seed=k)
     tokens, q = lilicorr_sample_path(**a)
     ref_tokens, ref_q = _walk_reference(**a)

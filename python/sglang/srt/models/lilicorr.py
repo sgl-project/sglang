@@ -1,11 +1,3 @@
-"""DFLASH backbone plus the LiLiCorr candidate-lattice reranker.
-
-The head scores the slots x top-k candidate lattice jointly and emits an `in` and an
-`out` vector per candidate; a transition scores the cosine of the earlier `out` with
-the later `in`. Selected by architectures=["LiLiCorrDraftModel"] under DFLASH.
-Paper: https://arxiv.org/abs/2608.20530
-"""
-
 from __future__ import annotations
 
 import logging
@@ -63,7 +55,6 @@ class LiLiCorrLatticeAttention(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attention_bias: torch.Tensor
     ) -> torch.Tensor:
-        # attention_bias arrives [batch * heads, L, L], the eager module's layout.
         bsz, seq_len, _ = hidden_states.shape
         qkv = F.linear(hidden_states, self.in_proj_weight, self.in_proj_bias)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -111,8 +102,6 @@ class LiLiCorrLayer(nn.Module):
 
 
 class LiLiCorrHead(nn.Module):
-    """Anchor-conditioned chain factors over the per-slot top-k candidates."""
-
     # [log_probs, probs, logprob_gap, rank_frac, is_top1], in the trained Linear's order.
     num_candidate_features = 5
 
@@ -136,7 +125,6 @@ class LiLiCorrHead(nn.Module):
         self.vector_eps = float(config.vector_eps)
         self.logit_scale = float(config.logit_scale)
 
-        # Identity when the head is as wide as the draft.
         self.token_proj = (
             nn.Identity()
             if model_hidden_size == hidden_size
@@ -159,7 +147,6 @@ class LiLiCorrHead(nn.Module):
             torch.zeros(self.num_heads, 2 * self.block_size - 1)
         )
         self.same_slot_bias = nn.Parameter(torch.zeros(self.num_heads))
-        # The anchor is a row of the target hidden state: model_hidden_size wide.
         self.context_proj = nn.Linear(model_hidden_size, hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -174,14 +161,11 @@ class LiLiCorrHead(nn.Module):
         )
         self.output_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
         self.anchor_norm = LiLiCorrRMSNorm(hidden_size, eps=rms_norm_eps)
-        # The factor heads read [self, anchor, self*anchor] (3*h).
         self.factor_input_proj = nn.Linear(hidden_size * 3, hidden_size)
-        # pair = out_vec[s] . in_vec[s+1].
         self.out_head = nn.Linear(hidden_size, self.factor_dim)
         self.in_head = nn.Linear(hidden_size, self.factor_dim)
         self.anchor_out_head = nn.Linear(hidden_size, self.factor_dim)
 
-        # Built by materialize_inference_buffers after weight load.
         self._attn_bias: Optional[torch.Tensor] = None
         self._fused_edge_weight: Optional[torch.Tensor] = None
         self._fused_edge_bias: Optional[torch.Tensor] = None
@@ -197,7 +181,6 @@ class LiLiCorrHead(nn.Module):
         topk = self.candidate_topk
         self._attn_bias = self._build_attention_bias(device=device, dtype=dtype)
 
-        # Parity-safe: each fused row is the split head's own dot product, same input.
         self._fused_edge_weight = (
             torch.cat([self.out_head.weight, self.in_head.weight], dim=0)
             .to(device=device, dtype=dtype)
@@ -209,7 +192,6 @@ class LiLiCorrHead(nn.Module):
             .contiguous()
         )
 
-        # W . cat([h, a, h*a]) == W1.h + W2.a + W3.(h*a); avoids materializing the concat.
         weight = self.factor_input_proj.weight
         hdim = self.hidden_size
         self._factor_input_splits = (
@@ -232,7 +214,6 @@ class LiLiCorrHead(nn.Module):
     def _build_attention_bias(
         self, *, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        # [num_heads, S, S], S = slots * topk.
         topk = self.candidate_topk
         slot_ids = torch.arange(
             self.num_candidate_slots, device=device, dtype=torch.long
@@ -270,8 +251,6 @@ class LiLiCorrHead(nn.Module):
         anchor_valid: torch.Tensor,
         already_projected: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Returns (start_scores [bsz, n_blocks, topk],
-        # pair_scores [bsz, n_blocks, slots - 1, topk, topk]).
         self._require_materialized()
         bsz, n_blocks, n_slots, topk = candidate_log_probs.shape
         if topk != self.candidate_topk:
@@ -280,7 +259,6 @@ class LiLiCorrHead(nn.Module):
                 f"lattice carries {topk}; both are sized for the trained width."
             )
 
-        # The candidate embeddings come from the target's table, in the target's dtype.
         proj_dtype = self.pass_hidden_proj.weight.dtype
         if token_embeddings.dtype != proj_dtype:
             token_embeddings = token_embeddings.to(proj_dtype)
@@ -335,7 +313,6 @@ class LiLiCorrHead(nn.Module):
         pre = pre + F.linear(hidden_states * anchor_row, w_cross)
         factor_hidden = F.silu(pre)
 
-        # One GEMM over [out | in], then one normalize over the [.., 2, factor_dim] view.
         edges = F.linear(factor_hidden, self._fused_edge_weight, self._fused_edge_bias)
         out_vec, in_vec = F.normalize(
             edges.unflatten(-1, (2, self.factor_dim)),
@@ -347,7 +324,6 @@ class LiLiCorrHead(nn.Module):
         )
 
         start_scores = (anchor_out[:, :, None, :] * in_vec[:, :, 0, :, :]).sum(dim=-1)
-        # One batched matmul, so the [.., K, K, factor_dim] intermediate never exists.
         pair_scores = torch.matmul(
             out_vec[:, :, :-1], in_vec[:, :, 1:].transpose(-1, -2)
         )
@@ -356,7 +332,6 @@ class LiLiCorrHead(nn.Module):
     def log_factors(
         self, start_scores: torch.Tensor, pair_scores: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # fp32 because the commit's argmax runs on these values.
         return (
             self.logit_scale * start_scores.float(),
             self.logit_scale * pair_scores.float(),
@@ -376,8 +351,6 @@ class LiLiCorrHead(nn.Module):
         greedy_mask: torch.Tensor,
         already_projected: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Returns (tokens [bs, slots], q_rows [bs, slots, topk]);
-        # an all-greedy mask is the argmax commit.
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),
             candidate_log_probs=candidate_log_probs.unsqueeze(1),
@@ -398,7 +371,6 @@ class LiLiCorrHead(nn.Module):
 
     @torch.no_grad()
     def build_token_table(self, embed_tokens: nn.Module) -> Optional[torch.Tensor]:
-        # Rows gathered from this need already_projected; None means nothing to fold.
         if isinstance(self.token_proj, nn.Identity):
             return None
         weight = embed_tokens.weight
@@ -476,8 +448,6 @@ def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
 
 
 class LiLiCorrDraftModel(DFlashDraftModel):
-    """DFlash backbone plus the LiLiCorr reranker. Reuses the DFLASH worker."""
-
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.lilicorr = LiLiCorrHead(

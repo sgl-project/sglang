@@ -272,7 +272,6 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
 
 
 def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
-    """Without the sampled accept kernel, LiLiCorr must warn and take the argmax verify."""
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     warnings = []

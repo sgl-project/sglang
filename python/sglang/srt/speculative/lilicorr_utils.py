@@ -1,6 +1,3 @@
-"""Serving support for the LiLiCorr reranker head on DFLASH drafts; the head itself
-lives in `sglang.srt.models.lilicorr`."""
-
 from __future__ import annotations
 
 import logging
@@ -36,9 +33,6 @@ if envs.SGLANG_LILICORR_REQUIRE_SAMPLING.get() and not SAMPLING_ENABLED:
     )
 
 
-# ===== Head geometry =====
-
-
 class LiLiCorrConfig(msgspec.Struct, frozen=True):
     candidate_topk: int
     hidden_size: int
@@ -55,7 +49,6 @@ class LiLiCorrConfig(msgspec.Struct, frozen=True):
 
 
 def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
-    # Absence and an explicit lilicorr_enabled: false both mean "no head".
     if not any(key.startswith("lilicorr_") for key in dflash_cfg):
         return None
     enabled = dflash_cfg.get("lilicorr_enabled")
@@ -116,11 +109,7 @@ def parse_lilicorr_draft_config(*, draft_hf_config: Any) -> LiLiCorrConfig:
     return config
 
 
-# ===== The candidate lattice =====
-
-
 def resolve_vocab_shard(lm_head) -> Tuple[int, int]:
-    """(num_org, org_vocab_start) for this rank's slice of the target head."""
     if not isinstance(lm_head, VocabParallelEmbedding):
         return int(lm_head.weight.shape[0]), 0
     shard = lm_head.shard_indices
@@ -152,8 +141,6 @@ def lilicorr_candidates(
     tp_group=None,
     chunk_size: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """log_softmax(logits).topk(topk) over the full vocabulary, as
-    (log_probs [N, topk] fp32, global tokens [N, topk] int64)."""
     topk = int(topk)
     if topk > int(num_org):
         raise ValueError(
@@ -264,7 +251,6 @@ def publish_anchor(
     extend_lens: Optional[torch.Tensor] = None,
     commit_lens: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    # None means "no anchor", which the head scores as invalid.
     ends = per_request_last_row(
         num_rows=int(ctx_hidden.shape[0]),
         extend_lens=extend_lens,
@@ -274,9 +260,6 @@ def publish_anchor(
     if draft_sampler is not None:
         draft_sampler.set_anchor(anchor, 0 if anchor is None else int(anchor.shape[0]))
     return anchor
-
-
-# ===== The eager draft seam =====
 
 
 def propose_lilicorr_block(
@@ -289,8 +272,6 @@ def propose_lilicorr_block(
     sampling_info=None,
     sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    # Eager fallback for steps the draft graph cannot serve. draft_hidden is
-    # [bs, block_size, hidden]; candidate_tokens and q_rows are None unless sampling.
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
     pass_hidden = draft_hidden[:, 1:, :]
@@ -333,7 +314,6 @@ def propose_lilicorr_block(
         temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
     else:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-    # Sampling off is an all-greedy mask: argmax commit, uniforms unread.
     greedy_mask = (
         resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         if sampling_enabled
@@ -350,12 +330,7 @@ def propose_lilicorr_block(
     return selected.to(torch.long), candidate_tokens, q_rows
 
 
-# ===== The graph-folded draft sampler =====
-
-
 class LiLiCorrDraftSampler:
-    """LiLiCorr select inside the draft CUDA graph; writes drafted tokens to self.out."""
-
     def __init__(
         self,
         *,
@@ -370,7 +345,6 @@ class LiLiCorrDraftSampler:
         sampling_enabled: bool,
     ) -> None:
         self.head = head
-        # Device-gated by the worker: the sampled accept kernel does not run on NPU.
         self.sampling_enabled = bool(sampling_enabled)
         self.embed_tokens = embed_tokens
         self.weight = weight
@@ -384,22 +358,17 @@ class LiLiCorrDraftSampler:
         device, dtype = weight.device, weight.dtype
         max_rows = self.max_bs * self.slots
 
-        # Read by the worker after the replay.
         self.out = torch.empty((max_rows,), dtype=torch.int64, device=device)
-        # Static, so the in-graph GEMM allocates nothing in each bucket's graph pool.
         self.logits = torch.empty((max_rows, self.num_org), dtype=dtype, device=device)
-        # Written by the worker before each replay.
         self.anchor = torch.zeros(
             (self.max_bs, int(anchor_features)), dtype=dtype, device=device
         )
         self.anchor_valid = torch.zeros((self.max_bs,), dtype=torch.bool, device=device)
         self.token_table = head.build_token_table(embed_tokens)
 
-        # Sampling state, allocated unconditionally (~90 KiB).
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
-        # Defaults are the all-greedy commit, valid for a run with sampling off.
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
         self.uniforms = torch.zeros(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
@@ -407,7 +376,6 @@ class LiLiCorrDraftSampler:
         self.q_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.float32, device=device
         )
-        # Fixed-address copy of the candidates q is indexed against, read by verify.
         self.candidate_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.int64, device=device
         )
@@ -426,7 +394,6 @@ class LiLiCorrDraftSampler:
             self.anchor_valid[count:].fill_(False)
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        # Must run before the replay; rows past bs are discarded by the worker.
         if not self.sampling_enabled:
             return
         if sampling_info is None:
@@ -445,11 +412,10 @@ class LiLiCorrDraftSampler:
         )
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
-        del input_ids  # the lattice is scored from hidden states and the anchor
+        del input_ids
         bs = hidden_states.shape[0] // self.block_size
         rows = bs * self.slots
 
-        # A larger replay would silently return short slices of the static buffers.
         if bs > self.max_bs:
             raise RuntimeError(
                 f"LiLiCorrDraftSampler was built for max_bs={self.max_bs} but the draft "
@@ -483,7 +449,6 @@ class LiLiCorrDraftSampler:
             already_projected=pre_projected,
         )
         if self.sampling_enabled:
-            # In-graph philox draw: each replay advances the generator and redraws.
             self.uniforms[:bs].uniform_()
         selected, q_rows = self.head.select_with_proposal(
             uniforms=self.uniforms[:bs],
@@ -498,7 +463,6 @@ class LiLiCorrDraftSampler:
 
 
 def draft_graph_batch_sizes() -> list[int]:
-    """Every batch size the draft decode graph is captured for, ascending."""
     return sorted(
         {int(bs) for bs in get_exec().graph.cuda_graph_config.decode.bs if bs > 0}
     )
@@ -513,7 +477,6 @@ def build_lilicorr_draft_sampler(
     block_size: int,
     sampling_enabled: bool = SAMPLING_ENABLED,
 ) -> Optional[LiLiCorrDraftSampler]:
-    # None keeps the head eager, which costs a large fraction of throughput.
     def eager(reason: str) -> None:
         logger.warning(
             "LiLiCorr head kept eager (reason=%s): a bring-up path, not a serving "
@@ -525,7 +488,6 @@ def build_lilicorr_draft_sampler(
 
     tp_group = get_parallel().tp_group
     if int(tp_group.world_size) != 1:
-        # tp>1 needs the packed all-gather inside the graph. Legal but unwritten.
         return eager("tp>1")
     batch_sizes = draft_graph_batch_sizes()
     if not batch_sizes:
@@ -535,7 +497,6 @@ def build_lilicorr_draft_sampler(
     num_org, org_vocab_start = resolve_vocab_shard(lm_head)
     device, dtype = lm_head.weight.device, lm_head.weight.dtype
 
-    # Must exist before capture; load_weights already built them, and this is idempotent.
     head.materialize_inference_buffers(device, dtype)
 
     sampler = LiLiCorrDraftSampler(

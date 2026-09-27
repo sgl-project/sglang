@@ -1,6 +1,3 @@
-"""Triton kernels for the LiLiCorr reranker; each falls back to a value-identical torch
-implementation off CUDA."""
-
 from __future__ import annotations
 
 from typing import Tuple
@@ -17,8 +14,7 @@ _TILE = 1024
 _TILES_PER_PROGRAM = 8
 _NUM_WARPS = 4
 
-# Widest candidate pool the selector walk holds in one lane group;
-# the config refuses a wider head.
+# One Triton lane group in the selector walk; the config refuses a wider head.
 MAX_FUSED_CANDIDATE_TOPK = 16
 
 _NEG = -3.0e38
@@ -38,23 +34,21 @@ def _tiled_scan(
     TILE: tl.constexpr,
     TPP: tl.constexpr,
 ):
-    # grid = (N, cdiv(T, TPP)): per-tile maxima plus one (m, s) partial per program.
     neg = -3.0e38
     row = tl.program_id(0)
     grp = tl.program_id(1)
 
     t0 = grp * TPP
-    tile_off = t0 + tl.arange(0, TPP)  # [TPP]
+    tile_off = t0 + tl.arange(0, TPP)
     offs = tile_off[:, None] * TILE + tl.arange(0, TILE)[None, :]
     mask = (tile_off[:, None] < T) & (offs < V)
 
     x = tl.load(lp + row * stride_lp_n + offs, mask=mask, other=neg)
     x = x.to(tl.float32)
 
-    tm = tl.max(x, axis=1)  # [TPP]
+    tm = tl.max(x, axis=1)
     tl.store(tmax + row * stride_tmax_n + tile_off, tm, mask=tile_off < T)
 
-    # Online-softmax partial for this program's whole block.
     m = tl.max(tm, axis=0)
     s = tl.sum(tl.exp(x - m), axis=0)
     s = tl.sum(s, axis=0)
@@ -78,12 +72,11 @@ def _tiled_select(
     K: tl.constexpr,
     NSEL: tl.constexpr,
 ):
-    """Exact top-K over the KT selected tiles of one row, in registers."""
     neg = -3.0e38
     row = tl.program_id(0)
 
-    tid = tl.load(tids + row * stride_tid_n + tl.arange(0, KT))  # [KT]
-    offs2 = tid[:, None] * TILE + tl.arange(0, TILE)[None, :]  # [KT, TILE]
+    tid = tl.load(tids + row * stride_tid_n + tl.arange(0, KT))
+    offs2 = tid[:, None] * TILE + tl.arange(0, TILE)[None, :]
     mask2 = offs2 < V
     x2 = tl.load(lp + row * stride_lp_n + offs2, mask=mask2, other=neg)
 
@@ -109,7 +102,6 @@ def _combine_lse(pm: torch.Tensor, ps: torch.Tensor) -> torch.Tensor:
 def _topk_lse_torch(
     logits: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Value-identical reference for the tiled path, and the fallback off CUDA.
     vals, ids = torch.topk(logits, k, dim=-1)
     rowmax = vals[:, 0:1]  # topk is sorted descending
     sumexp = (logits - rowmax).exp().sum(dim=-1, dtype=torch.float32)
@@ -120,13 +112,8 @@ def _topk_lse_torch(
 def lilicorr_topk_lse(
     logits: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact per-row top-k and full-vocab logsumexp from one [N, V] read.
-
-    Returns (vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32). The tile
-    pre-selection is exact: a top-k element's tile has a max at least as large, so it is
-    among the k largest-max tiles. Which of an exactly-tied set is returned is
-    unspecified, as in CUDA torch.topk.
-    """
+    # Tile pre-selection is exact: a top-k element's tile has a max at least as large,
+    # so it is among the k largest-max tiles.
     if not logits.is_cuda:
         return _topk_lse_torch(logits, k)
 
@@ -135,7 +122,6 @@ def lilicorr_topk_lse(
     K = int(k)
     T = (V + _TILE - 1) // _TILE
     if min(K, T) & (min(K, T) - 1):
-        # k is a power of two, so the vocabulary spans fewer than k tiles here.
         return _topk_lse_torch(logits, k)
     P = (T + _TILES_PER_PROGRAM - 1) // _TILES_PER_PROGRAM
     device = logits.device
@@ -184,8 +170,7 @@ def lilicorr_topk_lse(
 
 
 def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
-    # Pack into the selector's [bs, slots, K, K] layout; the walk reads only
-    # scores[:, 0, 0, :] at slot 0, so broadcasting log_start over "from" is sound.
+    # The walk reads only scores[:, 0, 0, :] at slot 0, so broadcasting is sound.
     topk = int(log_start.shape[-1])
     start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
     return torch.cat([start, log_pair.float()], dim=1)
@@ -199,7 +184,6 @@ def _selector_walk_torch(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Value-identical reference for selector_walk_triton, and the arm off CUDA.
     _, num_slots, topk = candidate_ids.shape
     temps = temperatures.view(-1, 1).to(torch.float32)
     greedy = greedy_mask.view(-1)
@@ -227,7 +211,6 @@ def _selector_walk_torch(
         tokens.append(
             torch.gather(candidate_ids[:, slot], 1, previous.view(-1, 1)).squeeze(1)
         )
-    # int64 tokens, because that is selector_walk_triton's output contract.
     return torch.stack(tokens, dim=-1).to(torch.int64), torch.stack(q_rows, dim=1)
 
 
@@ -239,13 +222,8 @@ def lilicorr_sample_path(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Left-to-right commit over the candidate lattice, plus the proposal it used.
-
-    log_start [bs, k], log_pair [bs, slots - 1, k, k], candidate_tokens [bs, slots, k].
-    Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32). The proposal is the head's
-    own log-factor row over T with no log-prob prior, since the head was trained without
-    one; a greedy_mask row reports a point mass so min(1, p/q) stays exact.
-    """
+    # No log-prob prior in the proposal: the head was trained without one. Greedy rows
+    # report a point mass so min(1, p/q) stays the right acceptance test.
     scores = _lattice_scores(log_start, log_pair)
     walk = selector_walk_triton if scores.is_cuda else _selector_walk_torch
     return walk(
