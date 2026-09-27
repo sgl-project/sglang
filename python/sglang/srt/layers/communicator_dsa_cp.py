@@ -14,7 +14,7 @@
 
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -25,10 +25,9 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
-    LayerScatterModes,
     ScatterMode,
+    _mlp_input_norm,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
@@ -85,24 +84,8 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
-    def __init__(
-        self,
-        layer_scatter_modes: LayerScatterModes,
-        input_layernorm: torch.nn.Module,
-        post_attention_layernorm: torch.nn.Module,
-        # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
-        allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
-        qkv_latent_func: Optional[Callable] = None,
-    ):
-        super().__init__(
-            layer_scatter_modes,
-            input_layernorm,
-            post_attention_layernorm,
-            allow_reduce_scatter,
-            is_last_layer,
-            qkv_latent_func,
-        )
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
 
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
@@ -115,19 +98,22 @@ class DSACPLayerCommunicator(LayerCommunicator):
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode=ScatterMode.SCATTERED,
-            residual_input_mode=ScatterMode.SCATTERED,
-            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_output_mode=ScatterMode.SCATTERED,
-            context=self._context,
-        )
         self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+
+    def _select_mlp_input(self):
+        fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+            hidden_states_input_mode=ScatterMode.SCATTERED,
+            residual_input_mode=ScatterMode.SCATTERED,
+            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+            residual_output_mode=ScatterMode.SCATTERED,
+            context=self._context,
+        )
+        return fn, False
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
@@ -143,9 +129,7 @@ class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
-class DSACPCommunicateWithAllReduceAndLayerNormFn(
-    CommunicateWithAllReduceAndLayerNormFn
-):
+class DSACPCommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
     2. Apply layer norm
@@ -163,7 +147,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         assert residual_input_mode == ScatterMode.SCATTERED
         assert residual_output_mode == ScatterMode.SCATTERED
         if hidden_states_output_mode == ScatterMode.SCATTERED:
-            return DSACPCommunicateWithAllReduceAndLayerNormFn._simple
+            return _mlp_input_norm
 
         if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
@@ -231,6 +215,7 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        **kwargs,
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full

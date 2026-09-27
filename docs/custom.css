@@ -8,14 +8,16 @@
   height: 0;
 }
 
-:where(pre, code, .code-block, .code-group, #request-example, #response-example),
-:where(pre, code, .code-block, .code-group, #request-example, #response-example) * {
+/* Anything that scrolls must be listed here or it scrolls invisibly.
+   .sg-bench-scroll is the cookbook benchmark table's scroll box. */
+:where(pre, code, .code-block, .code-group, #request-example, #response-example, .sg-bench-scroll),
+:where(pre, code, .code-block, .code-group, #request-example, #response-example, .sg-bench-scroll) * {
   scrollbar-width: auto;
   -ms-overflow-style: auto;
 }
 
-:where(pre, code, .code-block, .code-group, #request-example, #response-example)::-webkit-scrollbar,
-:where(pre, code, .code-block, .code-group, #request-example, #response-example) *::-webkit-scrollbar {
+:where(pre, code, .code-block, .code-group, #request-example, #response-example, .sg-bench-scroll)::-webkit-scrollbar,
+:where(pre, code, .code-block, .code-group, #request-example, #response-example, .sg-bench-scroll) *::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }

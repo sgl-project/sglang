@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -50,12 +50,13 @@ fn config(_worker_url: &str) -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 

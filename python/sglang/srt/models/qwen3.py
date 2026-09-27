@@ -30,6 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
@@ -380,6 +381,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -420,12 +422,11 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -676,8 +677,8 @@ class Qwen3ForCausalLM(nn.Module):
             del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
