@@ -22,7 +22,7 @@ register_amd_ci(est_time=18000, suite="nightly-perf-8-gpu-deepseek-v3", nightly=
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns."""
+    """Generate a simplified markdown report without cost columns."""
     model_header = results[0].model_path
     if results[0].run_name and results[0].run_name != "default":
         model_header += f" ({results[0].run_name})"
@@ -46,7 +46,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 DEEPSEEK_V3_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V3_MODEL_PATH", "deepseek-ai/DeepSeek-V3-0324"
 )
-PROFILE_DIR = "performance_profiles_deepseek_v3"
+RESULT_DIR = "performance_results_deepseek_v3"
 
 
 class TestNightlyDeepseekV3Performance(unittest.TestCase):
@@ -99,9 +99,9 @@ class TestNightlyDeepseekV3Performance(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
-        # Override full_report to remove traces help text
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
+        # Set the report header for this test
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -119,7 +119,6 @@ class TestNightlyDeepseekV3Performance(unittest.TestCase):
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
-                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
@@ -127,7 +126,7 @@ class TestNightlyDeepseekV3Performance(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    # Use simplified report format without traces
+                    # Use the simplified report format
                     if results:
                         self.runner.full_report += (
                             generate_simple_markdown_report(results) + "\n"

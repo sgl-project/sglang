@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.kernels.ops.attention.fla.op import exp, safe_exp
+from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
@@ -60,8 +60,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    stride_init_state,
     cu_seqlens,
     chunk_offsets,
+    track_state,
+    track_chunk_idx,
+    stride_track_state,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -76,13 +80,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    TRACK_STATE: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -112,16 +119,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    # Slot stride comes from the caller (initial_state.stride(0)): the state pool
+    # may be an envelope-strided view (page-major / unified memory), where the
+    # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
+    # overflow an int32 index product.
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    # Padded rows carry the -1 sentinel; the decode kernel guards on it
+    # (fused_recurrent.py), the chunked extend path did not.
+    valid_state = index >= 0
+    h0 = initial_state + index * stride_init_state
+    ht = initial_state + index * stride_init_state
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
         ht = ht + i_h * V * K
 
+    if TRACK_STATE:
+        i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
+        p_track_base = track_state + (i_n * stride_track_state + i_h * V * K).to(
+            tl.int64
+        )
+    else:
+        i_track = -1
+        p_track_base = track_state
+
     # load initial state
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and valid_state:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -161,6 +184,27 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+
+        if TRACK_STATE and i_t == i_track:
+            p_t1 = tl.make_block_ptr(
+                p_track_base, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+            )
+            tl.store(p_t1, b_h1, boundary_check=(0, 1))
+            if K > 64:
+                p_t2 = tl.make_block_ptr(
+                    p_track_base, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                tl.store(p_t2, b_h2, boundary_check=(0, 1))
+            if K > 128:
+                p_t3 = tl.make_block_ptr(
+                    p_track_base, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                )
+                tl.store(p_t3, b_h3, boundary_check=(0, 1))
+            if K > 192:
+                p_t4 = tl.make_block_ptr(
+                    p_track_base, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                )
+                tl.store(p_t4, b_h4, boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -220,7 +264,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=(o_k1 < K),
                 other=0.0,
             )
-            b_h1 *= exp(b_gk_last1)[None, :]
+            if USE_EXP2:
+                b_h1 *= exp2(b_gk_last1)[None, :]
+            else:
+                b_h1 *= exp(b_gk_last1)[None, :]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -228,7 +275,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k2 < K),
                     other=0.0,
                 )
-                b_h2 *= exp(b_gk_last2)[None, :]
+                if USE_EXP2:
+                    b_h2 *= exp2(b_gk_last2)[None, :]
+                else:
+                    b_h2 *= exp(b_gk_last2)[None, :]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -236,7 +286,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k3 < K),
                     other=0.0,
                 )
-                b_h3 *= exp(b_gk_last3)[None, :]
+                if USE_EXP2:
+                    b_h3 *= exp2(b_gk_last3)[None, :]
+                else:
+                    b_h3 *= exp(b_gk_last3)[None, :]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -244,7 +297,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k4 < K),
                     other=0.0,
                 )
-                b_h4 *= exp(b_gk_last4)[None, :]
+                if USE_EXP2:
+                    b_h4 *= exp2(b_gk_last4)[None, :]
+                else:
+                    b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
         p_k = tl.make_block_ptr(
@@ -272,7 +328,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
-    if INPLACE_UPDATE:
+    if INPLACE_UPDATE and valid_state:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -303,7 +359,23 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
+    use_exp2: bool = False,
+    inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert not (use_exp2 and g is not None), (
+        "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+    )
+    assert (track_state is None) == (track_chunk_idx is None), (
+        "track_state and track_chunk_idx must be passed together"
+    )
+    if track_state is not None:
+        # The caller rounds once to the pool dtype; a narrower buffer would
+        # silently double-round the snapshot.
+        assert track_state.dtype == torch.float32, (
+            f"track_state must be fp32, got {track_state.dtype}"
+        )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -338,8 +410,14 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
+        stride_track_state=(track_state.stride(0) if track_state is not None else 0),
         T=T,
         H=H,
         Hg=Hg,
@@ -349,9 +427,11 @@ def chunk_gated_delta_rule_fwd_h(
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
-        INPLACE_UPDATE=True,
+        INPLACE_UPDATE=inplace_update,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        USE_EXP2=use_exp2,
+        TRACK_STATE=track_state is not None,
     )
     return h, v_new

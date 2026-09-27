@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -25,6 +32,17 @@ class DSATopKBackend(Enum):
     TORCH = "torch"
     FLASHINFER = "flashinfer"
 
+    @classmethod
+    def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
+        """Resolve the DSA top-k backend for one model runner.
+
+        ``--dsa-topk-backend`` selects the target backend, while
+        ``--speculative-dsa-topk-backend`` independently selects the draft.
+        """
+        if model_runner.is_draft_worker:
+            return cls(get_spec().speculative_dsa_topk_backend)
+        return cls(get_exec().kernel.dsa_topk_backend)
+
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
 
@@ -33,6 +51,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def should_use_topk_v2(self) -> bool:
+        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
     def topk_func(
         self,
@@ -88,18 +109,19 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
-        # Decode-shaped PAGED top-k (plain decode AND spec verify / draft-extend,
-        # whose expanded rows match the same shape) routes to the DeepSeek-V4 top-k
-        # v2 JIT kernel, which fuses top-k selection and the page-table transform in
-        # one launch and consumes the indexer's own page_size>=1 table directly, so
-        # no page_size=1 table is materialized. Shared by DeepSeek-V3.2 and GLM DSA.
+        # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
+        # verify / draft-extend, whose expanded rows match the same shape) routes
+        # to the DeepSeek-V4 top-k v2 JIT kernel. It fuses top-k selection and the
+        # page-table transform in one launch and consumes the indexer's own
+        # page_size>=1 table directly, so no page_size=1 table is materialized.
+        # Shared by DeepSeek-V3.2 and GLM DSA.
         # This is a deterministic dispatch on the work shape, not a best-effort
         # attempt: the fused-decode CUDA graph drops the page_size=1 table for
         # exactly this case (see dsa_drop_wide_page_table), so once the shape
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
@@ -109,6 +131,58 @@ class DSATopKBackend(Enum):
             == attn_metadata.real_page_table.shape[0]
         ):
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+
+        # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
+        # kernel through its ragged entry point: no page table (the columns are
+        # already flattened-KV positions), no plan (prefill has enough rows that
+        # the cluster path never applies), just a per-row window and an additive
+        # output transform. `batch_idx_list` is not None only on the prefill-CP
+        # path, whose `topk_indices_offset` is built from cu_seqlens_q rather
+        # than the KV bases -- leave that one on the legacy kernel.
+        if (
+            self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.RAGGED
+            and topk_indices_offset is not None
+            and batch_idx_list is None
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
+        ):
+            return _topk_transform_v2_ragged(
+                logits, lengths, topk, topk_indices_offset, row_starts
+            )
+
+        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
+        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
+        # The row -> request map is `token_to_batch_idx` for a whole-forward call
+        # and the chunk's own `batch_idx_list` when the indexer split the logits.
+        if batch_idx_list is None:
+            row_to_batch = attn_metadata.token_to_batch_idx
+        elif isinstance(batch_idx_list, torch.Tensor):
+            row_to_batch = batch_idx_list
+        else:
+            # The prefill-CP list selects requests, not rows: leave it on legacy.
+            row_to_batch = None
+        if (
+            _is_hip
+            and self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0]
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+            and row_starts is not None
+            and row_to_batch is not None
+            and row_to_batch.shape[0] == logits.shape[0]
+        ):
+            return _topk_transform_v2_packed(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                row_starts=row_starts,
+                row_to_batch=row_to_batch,
+            )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
@@ -154,7 +228,7 @@ class DSATopKBackend(Enum):
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                row_to_batch, local_row_starts = _build_flashinfer_paged_args(
+                row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
                     row_starts=row_starts,
                     cu_seqlens_q_topk=cu_seqlens_q_topk,
@@ -171,7 +245,8 @@ class DSATopKBackend(Enum):
                     deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
-                    row_starts=local_row_starts,
+                    row_starts=row_starts,
+                    page_table_row_starts=page_table_row_starts,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
@@ -252,6 +327,9 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
+    For DSA extend's packed batch-global scores see
+    :func:`_topk_transform_v2_packed`.
+
     This is a committed contract, not a best-effort path: ``topk_transform`` routes
     here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
     drops the page_size=1 table for exactly this case (see
@@ -267,8 +345,7 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.jit_kernel.dsv4.topk import topk_transform_512_v2
-    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 
     num_rows = logits.shape[0]
 
@@ -281,25 +358,104 @@ def _topk_transform_v2_paged(
         logits.dtype == torch.float32
         and logits.stride(1) == 1
         and logits.stride(0) % 4 == 0
-    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
-    assert page_table.dtype == torch.int32
-    lengths_i32 = lengths.to(torch.int32)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
     # rather than silently recompute it per layer.
     plan = attn_metadata.topk_v2_plan
-    assert (
-        plan is not None and plan.shape[0] == num_rows + 1
-    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    assert plan is not None and plan.shape[0] == num_rows + 1, (
+        "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    )
 
-    page_size = get_token_to_kv_pool().page_size
-    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    page_size = attn_metadata.page_size
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    return out
+
+
+def _topk_transform_v2_packed(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    row_starts: torch.Tensor,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused packed-row top-k + page-table transform (DSA extend prefill).
+
+    Same output contract as :func:`_topk_transform_v2_paged` -- ``(num_rows,
+    topk)`` int32 physical KV slots, ``-1`` padded -- but the scores are packed:
+    row ``i`` owns the window at ``row_starts[i]`` of one batch-global buffer and
+    maps through page-table row ``row_to_batch[i]`` (prefill expands one request
+    into many query-token rows). Selected indices stay row-local.
+
+    Being a prefill-only path it dispatches per row inside the kernel, so unlike
+    the paged entry point it needs no ``topk_v2_plan``.
+
+    NOTE: ``logits`` is MODIFIED IN PLACE (the <= 3 columns ahead of each window
+    are masked); the caller must not reuse it. ``lengths`` must be NON-NEGATIVE,
+    for the same reason as in :func:`_topk_transform_v2_paged`.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_packed_v2
+
+    num_rows = logits.shape[0]
+    assert (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_packed_v2(
+        logits,
+        lengths,
+        attn_metadata.real_page_table,
+        out,
+        attn_metadata.page_size,
+        row_starts=row_starts.to(torch.int32),
+        row_to_batch=(None if row_to_batch is None else row_to_batch.to(torch.int32)),
+    )
+    return out
+
+
+def _topk_transform_v2_ragged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_indices_offset: torch.Tensor,
+    row_starts: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fused ragged top-k via the DeepSeek-V4 v2 JIT kernel.
+
+    ``logits`` is written in place: the kernel reads from a 16-byte-aligned base
+    and masks the <= 3 columns that pulls in ahead of the window. Those columns
+    belong to a preceding request of the same row, and the score buffer is dead
+    after the top-k (see ``DSAIndexer._get_topk_ragged``).
+
+    Preconditions match the paged helper: fp32 scores with unit row stride and a
+    16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
+    construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    topk_transform_ragged_v2(
+        logits,
+        lengths,
+        out_offsets=topk_indices_offset,
+        out_indices=out,
+        row_starts=row_starts,
+    )
     return out
 
 
@@ -317,6 +473,8 @@ def _build_flashinfer_paged_args(
         else None
     )
 
+    # Both dynamic mappings contain one entry per logit row. Supplying the known
+    # size avoids synchronizing CUDA to infer the sum of the repeat counts.
     if (
         row_to_batch is not None
         and cu_seqlens_q_topk is not None
@@ -325,7 +483,9 @@ def _build_flashinfer_paged_args(
         q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
             dtype=torch.int32, device=device
         )
-        row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
+        row_to_batch = torch.repeat_interleave(
+            row_to_batch, q_lens, output_size=num_rows
+        )
 
     if row_to_batch is None and cu_seqlens_q_topk is not None:
         # Decode-like case (one query row per batch) does not need an explicit mapping.
@@ -338,6 +498,7 @@ def _build_flashinfer_paged_args(
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
                 q_lens,
+                output_size=num_rows,
             )
 
     if row_starts is not None and row_to_batch is None:
@@ -345,13 +506,13 @@ def _build_flashinfer_paged_args(
             "PAGED topk_transform with row_starts requires cu_seqlens_q metadata."
         )
 
-    local_row_starts = row_starts
-    if local_row_starts is not None and row_to_batch is not None:
-        local_row_starts = (
-            local_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
+    page_table_row_starts = row_starts
+    if page_table_row_starts is not None and row_to_batch is not None:
+        page_table_row_starts = (
+            page_table_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
         )
 
-    return row_to_batch, local_row_starts
+    return row_to_batch, page_table_row_starts
 
 
 def _flashinfer_tie_break_value() -> int:

@@ -41,16 +41,20 @@ class MpsPlatform(Platform):
         return torch.device("mps")
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        pass
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
+        return None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
+        return "Apple Silicon MPS"
 
     @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
+        return "mps"
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -116,6 +120,13 @@ class MpsPlatform(Platform):
     def get_device_communicator_cls(cls) -> str:
         # Use base communicator for MPS
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+
+    @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:

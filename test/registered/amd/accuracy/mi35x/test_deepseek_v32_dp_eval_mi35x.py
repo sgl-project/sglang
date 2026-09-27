@@ -81,7 +81,7 @@ class TestDeepseekV32DP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -89,8 +89,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32 DP MI35x)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32 DP MI35x)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
@@ -103,8 +102,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 DP MI35x)\n"
-                f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32 DP MI35x)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 10)
 

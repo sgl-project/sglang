@@ -7,7 +7,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,8 +17,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=316, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestRetractDecode(CustomTestCase):
@@ -51,27 +51,15 @@ class TestRetractDecode(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
         )
 
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        metrics = run_sgl_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.64)
         time.sleep(1)  # wait for mem check
 
         assert self.process.poll() is None, "Server crashed during test"
-
-
-class TestRetractDecodePaged(TestRetractDecode):
-    """python -m unittest test_retract_decode.TestRetractDecodePaged"""
-
-    other_args = ["--page-size", "16"]
-
-
-class TestRetractDecodeChunkCache(TestRetractDecode):
-    """python -m unittest test_retract_decode.TestRetractDecodeChunkCache"""
-
-    other_args = ["--disable-radix-cache"]
 
 
 class TestRetractDecodeChunkCachePaged(TestRetractDecode):

@@ -19,17 +19,21 @@ _GROUPS = (
     "attention",
     "communication",
     "diffusion",
+    "elementwise",
+    "embeddings",
     "gemm",
     "grammar",
     "kvcache",
     "layernorm",
     "mamba",
     "memory",
+    "mm",
     "moe",
     "quantization",
     "sampling",
-    "spatial",
     "speculative",
+    "lplb",
+    "kv_canary",
 )
 
 for _group in _GROUPS:

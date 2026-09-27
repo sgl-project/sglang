@@ -30,7 +30,7 @@ from sglang.kernels.ops.attention.verify_splitkv import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # Split-KV accumulates the prefix in parallel splits and merges via log-sum-exp;
@@ -232,6 +232,20 @@ class TestVerifySplitKV(CustomTestCase):
         q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
         self.assertFalse(
             can_handle(q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle + 1)
+        )
+
+    def test_fallback_mla_head_dim_mismatch(self):
+        # MLA (DeepSeek) has head_dim != v_head_dim (576 vs 512): the shared
+        # latent KV / absorbed layout is not something the split-KV verify
+        # kernel is built for -- it GPU-faults on that shape. can_handle() must
+        # reject it so the backend falls back to extend_attention_fwd.
+        q, k, v, kb, vb, qo, kvp, kvi, mle = _build_verify_inputs(
+            [512, 512], 4, 16, 1, 576, 512, torch.bfloat16, "cuda"
+        )
+        self.assertEqual(q.shape[2], 576)
+        self.assertEqual(v.shape[2], 512)
+        self.assertFalse(
+            can_handle(q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
         )
 
 

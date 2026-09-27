@@ -23,6 +23,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 
+_SGL_TRTLLM_MODULE_WARMED = False
+
+
+def _warm_sgl_trtllm_moe_module() -> None:
+    """Build (JIT-compile + load) the sgl_trtllm MoE module at LoRA init time.
+
+    The LoRA MoE ops call ``get_sgl_trtllm_moe_sm100_raw_module()`` lazily on
+    their first forward. On a cold flashinfer JIT cache that fires a ninja
+    build taking tens of minutes (observed >30 min on GB300 aarch64) -- and the
+    first forward happens INSIDE decode cuda-graph capture, so the boot looks
+    hung mid-capture with an idle main thread. Building here (module init,
+    before capture) makes the cost visible at startup and keeps capture fast.
+    """
+    global _SGL_TRTLLM_MODULE_WARMED
+    if _SGL_TRTLLM_MODULE_WARMED:
+        return
+    from sglang.kernels.ops.moe.trtllm_lora_temp.core import (
+        get_sgl_trtllm_moe_sm100_raw_module,
+    )
+
+    get_sgl_trtllm_moe_sm100_raw_module()
+    _SGL_TRTLLM_MODULE_WARMED = True
+
+
 def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     """Build and store the trtllm FP8 LoRA quant info on the layer.
 
@@ -36,6 +60,8 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         get_activation_type,
     )
     from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    _warm_sgl_trtllm_moe_module()
 
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see
@@ -114,15 +140,15 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         layer._quant_info.w2_weight = _g2.reshape(_g2.shape[0], _g2.shape[1], -1)
         return
 
-    assert getattr(
-        quant_method, "block_quant", False
-    ), "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
-    assert (
-        not use_mxfp8
-    ), "experimental_sgl_trtllm LoRA currently targets the non-MX FP8 Qwen path."
-    assert (
-        weight_block_size is not None
-    ), "experimental_sgl_trtllm LoRA needs the FP8 weight block size."
+    assert getattr(quant_method, "block_quant", False), (
+        "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
+    )
+    assert not use_mxfp8, (
+        "experimental_sgl_trtllm LoRA currently targets the non-MX FP8 Qwen path."
+    )
+    assert weight_block_size is not None, (
+        "experimental_sgl_trtllm LoRA needs the FP8 weight block size."
+    )
     w13_weight_scale = getattr(base_layer, "w13_weight_scale_inv", None)
     if w13_weight_scale is None:
         w13_weight_scale = getattr(base_layer, "w13_weight_scale", None)

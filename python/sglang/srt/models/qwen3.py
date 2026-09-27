@@ -5,9 +5,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -33,7 +30,8 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -111,7 +109,7 @@ class Qwen3Attention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_server_args().rl_on_policy_target is not None
+            if get_exec().deterministic.rl_on_policy_target is not None
             else {}
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -271,14 +269,14 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_server_args().rl_on_policy_target is None
+            and get_exec().deterministic.rl_on_policy_target is None
         )
 
         if use_aiter_fused:
@@ -298,7 +296,7 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -362,7 +360,7 @@ class Qwen3DecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_server_args().rl_on_policy_target is not None
+            if get_exec().deterministic.rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(
@@ -383,6 +381,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -423,12 +422,11 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -476,7 +474,7 @@ class Qwen3ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3Model(
@@ -492,7 +490,7 @@ class Qwen3ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -679,8 +677,8 @@ class Qwen3ForCausalLM(nn.Module):
             del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

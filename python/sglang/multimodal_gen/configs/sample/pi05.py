@@ -3,11 +3,11 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
+from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 
 
 @dataclass
-class Pi05SamplingParams(VLASamplingParams):
+class Pi05SamplingParams(ActionSamplingParams):
     """Sampling parameters for Pi0.5 flow-matching action inference."""
 
     num_inference_steps: int = 10

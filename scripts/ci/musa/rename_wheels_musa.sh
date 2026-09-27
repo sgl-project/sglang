@@ -10,7 +10,7 @@
 # Usage:
 #   rename_wheels_musa.sh <musa_suffix> [wheel_dir]
 # Example:
-#   rename_wheels_musa.sh 43 sgl-kernel/dist
+#   rename_wheels_musa.sh 43 python/sglang/kernels/aot/dist
 set -euxo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then

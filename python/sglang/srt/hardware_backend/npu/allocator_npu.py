@@ -48,7 +48,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             num_new_pages_item = num_new_pages_tensor.item()
         else:
             num_new_pages_item = num_new_pages
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
+        if num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
@@ -116,7 +116,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
-
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -126,6 +125,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages == 0:
             out_indices = last_loc + 1
         else:
+            start_new_pages = start_new_pages.clamp(max=num_new_pages - 1)
             out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
                 start_new_pages
             ] * self.page_size * need_new_pages
@@ -140,16 +140,12 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             device = free_index.device
             free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._release_page_ids(free_page_indices.to(device))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
