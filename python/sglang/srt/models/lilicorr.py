@@ -96,6 +96,7 @@ class LiLiCorrHead(nn.Module):
         hidden_size = config.resolve_hidden_size(model_hidden_size=model_hidden_size)
         self.block_size = int(block_size)
         self.num_candidate_slots = self.block_size - 1
+        self.num_active_slots = self.num_candidate_slots
         self.candidate_topk = int(config.candidate_topk)
         self.hidden_size = hidden_size
         self.num_heads = int(config.num_heads)
@@ -195,7 +196,7 @@ class LiLiCorrHead(nn.Module):
     ) -> torch.Tensor:
         topk = self.candidate_topk
         slot_ids = torch.arange(
-            self.num_candidate_slots, device=device, dtype=torch.long
+            self.num_active_slots, device=device, dtype=torch.long
         ).repeat_interleave(topk)
         rel = slot_ids.view(-1, 1) - slot_ids.view(1, -1)
         rel = rel.clamp(min=-(self.block_size - 1), max=self.block_size - 1)
@@ -205,6 +206,19 @@ class LiLiCorrHead(nn.Module):
             self.same_slot_bias.view(-1, 1, 1)
         )
         return bias.to(device=device, dtype=dtype).contiguous()
+
+    def set_active_block_size(self, block_size: int) -> None:
+        # A prefix of the trained slots; every relative offset it needs was trained.
+        if not 2 <= int(block_size) <= self.block_size:
+            raise ValueError(
+                f"block_size={int(block_size)} is outside [2, {self.block_size}], "
+                "the trained LiLiCorr block."
+            )
+        self.num_active_slots = int(block_size) - 1
+        if self._attn_bias is not None:
+            self._attn_bias = self._build_attention_bias(
+                device=self._attn_bias.device, dtype=self._attn_bias.dtype
+            )
 
     def _require_materialized(self) -> None:
         if self._attn_bias is None:
@@ -264,7 +278,7 @@ class LiLiCorrHead(nn.Module):
         hidden_states = hidden_states + self.feature_mlp(
             features.to(dtype=token_states.dtype)
         )
-        hidden_states = hidden_states + self.slot_embedding
+        hidden_states = hidden_states + self.slot_embedding[:, :, :n_slots]
         hidden_states = hidden_states + self.rank_embedding
         hidden_states = hidden_states.reshape(
             bsz * n_blocks, n_slots * topk, self.hidden_size
@@ -389,13 +403,7 @@ class LiLiCorrDraftModel(DFlashDraftModel):
 
     def set_block_size(self, block_size: int) -> None:
         super().set_block_size(block_size)
-        if int(block_size) != int(self.lilicorr.block_size):
-            raise ValueError(
-                f"The worker resolved block_size={int(block_size)} but the head's "
-                f"relative-slot bias and slot embedding are sized for "
-                f"{int(self.lilicorr.block_size)}. Drop "
-                "--speculative-num-draft-tokens, or serve a head trained at that size."
-            )
+        self.lilicorr.set_active_block_size(block_size)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         seen: set[str] = set()
