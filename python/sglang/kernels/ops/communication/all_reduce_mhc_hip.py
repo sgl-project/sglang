@@ -1,50 +1,23 @@
 """TP4 tiny-row all-reduce/post using AITER's registered peer buffers."""
 
-import hashlib
-from functools import lru_cache
-from pathlib import Path
-
 import torch
 from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
-from aiter.jit.core import AITER_CSRC_DIR, compile_ops, get_args_of_build
+from aiter.jit.core import AITER_CSRC_DIR
+
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 
-@lru_cache(maxsize=1)
-def _build_args():
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "jit/csrc/distributed/all_reduce_mhc_hip.cu"
-    )
-    header = Path(AITER_CSRC_DIR) / "include/custom_all_reduce.cuh"
-    revision = hashlib.sha256(source.read_bytes() + header.read_bytes()).hexdigest()[
-        :16
-    ]
-    args = get_args_of_build("module_fused_ar_mhc")
-    args.update(
-        md_name=f"module_sglang_dsv41_ar_mhc_{revision}",
-        srcs=[str(source)],
+@cache_once
+def _all_reduce_mhc_module():
+    return load_jit(
+        "all_reduce_mhc_hip",
+        cuda_files=["distributed/all_reduce_mhc_hip.cuh"],
+        cuda_wrappers=[("run", "all_reduce_mhc_hip::AllReduceMhcPostKernel::run")],
+        # AITER's CustomAllreduce, whose peer buffers and signals the kernel runs on
+        extra_include_paths=[f"{AITER_CSRC_DIR}/include"],
         # no FMA contraction: the unfused all-reduce + hc_post rounds every multiply and add
-        flags_extra_hip=[*args["flags_extra_hip"], "-ffp-contract=off"],
+        extra_cuda_cflags=["-ffp-contract=off"],
     )
-    return args
-
-
-@compile_ops(
-    "module_fused_ar_mhc",
-    fc_name="run",
-    gen_func=lambda *args, **kwargs: _build_args(),
-    develop=True,
-)
-def _dsv41_all_reduce_mhc_post(
-    ptr: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    registered_ptr: int,
-    registered_bytes: int,
-) -> None: ...
 
 
 def all_reduce_mhc_post(
@@ -64,7 +37,7 @@ def all_reduce_mhc_post(
     )
     pool = communicator._pool["input"]
     output = torch.empty_like(residual)
-    _dsv41_all_reduce_mhc_post(
+    _all_reduce_mhc_module().run(
         communicator._ptr,
         input,
         output,
