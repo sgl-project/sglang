@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.linear.utils import use_flashinfer_kda_prefill
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -522,9 +523,12 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
+            if (
+                not forward_batch.forward_mode.is_target_verify()
+                and not use_flashinfer_kda_prefill()
+            ):
+                # Triton extend takes probabilities; FlashInfer prefill and the
+                # verify/decode kernels take logits.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

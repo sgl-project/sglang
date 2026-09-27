@@ -1,7 +1,7 @@
 """FlashInfer KDA decode/verify wrapper.
 
-Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100 / Blackwell). FlashInfer has
-no KDA prefill kernel, so ``extend`` stays on Triton / CuTe DSL.
+Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100 / Blackwell). KDA prefill
+uses a separate adapter in ``kda_flashinfer_prefill``.
 
 Contract with the Triton KDA reference:
   - raw per-K gate ``a`` is activated in-kernel as
@@ -87,8 +87,7 @@ def build_fused_accept_indices(
 class FlashInferKDAKernel(LinearAttnKernelBase):
     """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1.
 
-    Prefill (``extend``) is intentionally not implemented -- FlashInfer ships no
-    KDA chunk kernel; the dispatcher keeps prefill on Triton / CuTe DSL.
+    Prefill (``extend``) is implemented by ``FlashInferKDAPrefillKernel``.
     """
 
     def __init__(self):
@@ -381,5 +380,6 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
 
     def extend(self, *args, **kwargs):
         raise NotImplementedError(
-            "FlashInferKDAKernel has no prefill kernel; keep prefill on Triton / CuTe DSL."
+            "FlashInferKDAKernel is decode/verify-only; use "
+            "FlashInferKDAPrefillKernel for prefill."
         )
