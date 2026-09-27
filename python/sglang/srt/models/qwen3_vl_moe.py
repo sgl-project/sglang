@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import complete_deferred_allreduce
+from sglang.srt.layers.communicator import reduce_output
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
@@ -107,7 +107,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         ):
             layer_idx += self.start_layer
             if layer_idx in self.layers_to_capture:
-                hidden_states = complete_deferred_allreduce(hidden_states)
+                hidden_states = reduce_output(hidden_states)
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
@@ -140,7 +140,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     hidden_states.add_(
                         input_deepstack_embeds[:, sep : sep + self.hidden_size]
                     )

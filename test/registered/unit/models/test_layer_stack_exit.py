@@ -16,9 +16,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MODELS_DIR = Path(sglang.__file__).resolve().parent / "srt" / "models"
-MARKER = "_sglang_needs_allreduce_fusion"
+UNREDUCED = "UnreducedOutput"
 EXIT = "finish_layer_stack"
-COMPLETE = "complete_deferred_allreduce"
+COMPLETE = "reduce_output"
 FINAL_NORMS = {"norm", "norm_f", "final_layernorm"}
 IN_PLACE = {"add_", "sub_", "mul_", "copy_"}
 
@@ -58,22 +58,27 @@ def delegates_to_super(forward):
     )
 
 
+def declares_no_deferral(node):
+    """Builds its communicator with allow_deferred_ffn_reduction=False: its FFN
+    completes its own reduction."""
+    return any(
+        keyword.arg == "allow_deferred_ffn_reduction"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is False
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        for keyword in call.keywords
+    )
+
+
 def defers(node):
     """Asks whether to leave the reduction to the next layer (directly or
-    through ffn_exit), or sets the marker itself."""
-    if any(calls(node, "ffn_exit")) or any(
-        calls(node, "should_fuse_mlp_allreduce_with_next_layer")
-    ):
-        return True
+    through ffn_exit), or wraps its output as unreduced itself."""
+    if declares_no_deferral(node):
+        return False
     return any(
-        isinstance(sub, ast.Assign)
-        and isinstance(sub.value, ast.Constant)
-        and sub.value.value is True
-        and any(
-            isinstance(target, ast.Attribute) and target.attr == MARKER
-            for target in sub.targets
-        )
-        for sub in ast.walk(node)
+        any(calls(node, name))
+        for name in ("ffn_exit", "should_fuse_mlp_allreduce_with_next_layer", UNREDUCED)
     )
 
 
@@ -116,6 +121,7 @@ class Census:
                 if name not in deferring
                 for _, node in defs
                 if set(base_names(node)) & deferring
+                and not declares_no_deferral(node)
                 and (
                     method(node, "forward") is None
                     or delegates_to_super(method(node, "forward"))

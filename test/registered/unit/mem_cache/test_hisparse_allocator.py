@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -242,7 +243,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
+        )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)

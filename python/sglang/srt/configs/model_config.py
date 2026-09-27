@@ -1283,9 +1283,12 @@ class ModelConfig:
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
-        elif (
-            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
-            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
+            # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
+            # the MLA ones (V2.5 and V3) carry kv_lora_rank, V2 keeps its GQA
+            # shapes.
+            "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+            and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
         ):
             self.head_dim = self.hf_text_config.head_dim
             self.attention_arch = AttentionArch.MLA
