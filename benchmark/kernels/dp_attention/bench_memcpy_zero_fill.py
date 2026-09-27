@@ -61,10 +61,10 @@ def run_shape(
 
     speedup_pct = (t_unfused - t_fused) / t_unfused * 100
     print(
-        f"[{label}] dst={dst_rows}x{hidden} sz={sz} ({sz/dst_rows*100:.1f}% coverage) | "
-        f"unfused={t_unfused*1000:7.2f}us  fused={t_fused*1000:7.2f}us  "
+        f"[{label}] dst={dst_rows}x{hidden} sz={sz} ({sz / dst_rows * 100:.1f}% coverage) | "
+        f"unfused={t_unfused * 1000:7.2f}us  fused={t_fused * 1000:7.2f}us  "
         f"delta={speedup_pct:+5.1f}% | "
-        f"BW unfused={unfused_traffic/1e9/(t_unfused/1000):6.1f}GB/s fused={fused_traffic/1e9/(t_fused/1000):6.1f}GB/s"
+        f"BW unfused={unfused_traffic / 1e9 / (t_unfused / 1000):6.1f}GB/s fused={fused_traffic / 1e9 / (t_fused / 1000):6.1f}GB/s"
     )
 
 
