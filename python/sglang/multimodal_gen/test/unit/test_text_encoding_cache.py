@@ -61,6 +61,11 @@ class FullHiddenStateEncoder(TextEncoder):
         )
 
 
+class LibraryEncoder(torch.nn.Module):
+    __init__ = FullHiddenStateEncoder.__init__
+    forward = FullHiddenStateEncoder.forward
+
+
 def make_text_config(output_type="tensor"):
     def postprocess(output, text_inputs, return_attention_mask=False):
         embedding = output.hidden_states[9]
@@ -212,8 +217,10 @@ def make_server_args(**kwargs):
     return SimpleNamespace(**defaults)
 
 
-def make_group_executor(stage_type, device, capacity):
-    encoder = FullHiddenStateEncoder().to(device).eval()
+def make_group_executor(stage_type, device, capacity, *, fsdp=False, native=True):
+    encoder = (
+        (FullHiddenStateEncoder() if native else LibraryEncoder()).to(device).eval()
+    )
     config = make_text_config()
     config.supports_auto_residency = False
     config.vae_config = SimpleNamespace(use_temporal_scaling_frames=False)
@@ -225,7 +232,7 @@ def make_group_executor(stage_type, device, capacity):
         component_precisions={},
         comfyui_mode=True,
         enable_layerwise_nvtx_marker=False,
-        use_fsdp_inference=False,
+        use_fsdp_inference=fsdp,
         disable_conditioning_cache=capacity == 0,
         conditioning_cache_max_size_mb=capacity / 1024**2,
         should_cpu_offload_component=lambda _: False,
@@ -249,6 +256,8 @@ def make_group_executor(stage_type, device, capacity):
 
 
 @pytest.mark.parametrize("capacity", [0, 1, 4096])
+@pytest.mark.parametrize("fsdp", [False, True])
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize(
     "device",
     [
@@ -263,10 +272,10 @@ def make_group_executor(stage_type, device, capacity):
 )
 @torch.no_grad()
 def test_grouped_conditioning_reuses_positive_and_negative_independently(
-    capacity, device
+    capacity, device, fsdp, native
 ):
     executor, stage, encoder, args = make_group_executor(
-        TextEncodingStage, device, capacity
+        TextEncodingStage, device, capacity, fsdp=fsdp, native=native
     )
 
     def requests():
@@ -293,10 +302,13 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
     assert executor.conditioning_cache._group_entries.get() is None
 
     second = executor.execute_group([stage], requests(), args)
-    assert encoder.calls == (3 if capacity == 4096 else 6)
+    persistent = capacity == 4096 and not fsdp and native
+    assert encoder.calls == (3 if persistent else 6)
     torch.testing.assert_close(second[0].prompt_embeds[0], expected, rtol=0, atol=0)
     assert second[0].prompt_seq_lens == [[2]]
     assert executor.conditioning_cache.bytes <= capacity
+    if fsdp or not native:
+        assert executor.conditioning_cache.bytes == 0
 
 
 @torch.no_grad()
