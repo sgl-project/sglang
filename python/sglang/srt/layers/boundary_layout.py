@@ -87,8 +87,9 @@ class StageOutput(msgspec.Struct, frozen=True):
 
 
 class DecoderLayerSides(msgspec.Struct, frozen=True):
-    """The declarations both sides of a decoder layer's boundaries are chosen
-    from."""
+    """What a decoder layer declares about its attention, its FFN and the rows
+    between them; ``decoder_layer_edges`` turns it into the layer's
+    boundaries."""
 
     # The rows the layer's input and residual arrive on.
     input_rows: Layout
@@ -105,6 +106,68 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     # Whether the residual is added into one rank's share of the attention
     # output's sum before that sum completes, instead of after it.
     residual_joins_attention_sum: bool = False
+
+
+class EdgeDecl(msgspec.Struct, frozen=True):
+    """One boundary between two stages, as the layer that runs one side of it
+    sees it: what arrives from the producer, what the consumer needs, and the
+    rows the residual is on before and after the boundary."""
+
+    produced: StageOutput
+    need: StageInput
+    residual: Layout
+    residual_to: Layout
+    # Whether the residual is added into one rank's share of the produced sum
+    # before that sum completes, instead of after it.
+    residual_joins_sum: bool = False
+
+
+class DecoderLayerEdges(msgspec.Struct, frozen=True):
+    """A decoder layer's three boundaries: from the rows the previous layer
+    handed on into the attention, from the attention into the FFN, and from
+    the FFN onto the rows the layer hands on. The next layer runs the rest of
+    the last one."""
+
+    into_attention: EdgeDecl
+    into_ffn: EdgeDecl
+    out_of_ffn: EdgeDecl
+
+
+def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
+    """The boundaries of a decoder layer, each with the declarations of its two
+    sides. What arrives at the layer is complete unless it owes a sum by
+    construction (``input_owes``); a sum the previous layer leaves for a batch
+    comes with the value."""
+    owes = sides.input_owes is not None
+    arrived = StageOutput(sides.input_rows, group=sides.input_owes, always_leaves=owes)
+    # Completing what the input owes leaves it and the residual on each
+    # attention-TP rank's slice.
+    attention_rows = (
+        Layout(sides.input_rows.sharded | {TokenAxis.ATTN_TP_SCATTER})
+        if owes
+        else sides.input_rows
+    )
+    return DecoderLayerEdges(
+        into_attention=EdgeDecl(
+            produced=arrived,
+            need=sides.attention,
+            residual=sides.input_rows,
+            residual_to=attention_rows,
+        ),
+        into_ffn=EdgeDecl(
+            produced=sides.attention_output,
+            need=sides.ffn,
+            residual=attention_rows,
+            residual_to=sides.ffn_residual_rows,
+            residual_joins_sum=sides.residual_joins_attention_sum,
+        ),
+        out_of_ffn=EdgeDecl(
+            produced=sides.ffn_output,
+            need=StageInput(sides.output_rows),
+            residual=sides.ffn_residual_rows,
+            residual_to=sides.output_rows,
+        ),
+    )
 
 
 def sequence_parallel_layer_sides(

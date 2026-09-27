@@ -1,3 +1,4 @@
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,9 +7,11 @@ import torch
 
 from sglang.srt.layers.boundary_layout import SumGroup
 from sglang.srt.layers.communicator import (
+    ADD_AND_NORM,
     LayerCommunicator,
     ScatterMode,
     UnreducedOutput,
+    _attention_input_step,
 )
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
@@ -40,6 +43,18 @@ def _communicator():
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
     comm.enable_fused_ar_quant = False
     comm._attn_input_fusions = comm._select_attn_input_fusions()
+    # Only the ordinary batches' attention input half, with these entries.
+    comm._context = SimpleNamespace()
+    comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
+    comm._steps = SimpleNamespace(
+        attention_prepare=partial(
+            _attention_input_step,
+            layer_input=None,
+            fusions=comm._attn_input_fusions,
+            enters_stack=False,
+            residual_ops=ADD_AND_NORM,
+        )
+    )
     return comm
 
 
