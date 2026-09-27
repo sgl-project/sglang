@@ -191,21 +191,13 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
-def _maybe_localize_npu_dcp_out_cache_loc(
-    out_cache_loc: Optional[torch.Tensor],
+def _localize_npu_dcp_out_cache_loc(
+    out_cache_loc: torch.Tensor,
     *,
-    is_draft_worker: bool = False,
-    interleave_size: int = 1,
-) -> Optional[torch.Tensor]:
-    """Return rank-local NPU DCP slots while preserving allocator identities."""
+    interleave_size: int,
+) -> torch.Tensor:
+    """Map allocator-global NPU DCP slots to this target rank."""
     parallel = get_parallel()
-    if (
-        not _is_npu
-        or not parallel.dcp_enabled
-        or is_draft_worker
-        or out_cache_loc is None
-    ):
-        return out_cache_loc
     return localize_dcp_indices(
         out_cache_loc,
         parallel.dcp_size,
@@ -1029,11 +1021,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Preserve that view before exposing rank-local NPU DCP write slots.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
-        ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(
-            ret.out_cache_loc,
-            is_draft_worker=model_runner.is_draft_worker,
-            interleave_size=model_runner.page_size,
-        )
+            if ret.out_cache_loc is not None:
+                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
+                    ret.out_cache_loc,
+                    interleave_size=model_runner.page_size,
+                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
