@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     register_vae_fast_path_gate,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -228,7 +229,24 @@ class FusedUpsample2xConv(nn.Sequential):
     def __init__(self, resample: nn.Sequential, gate: VaeFastPathGate) -> None:
         super().__init__(*resample.children())
         self._sgl_gate = gate
-        self._sgl_folded = None
+        # Non-persistent buffer: it moves with the module under CPU offload and
+        # stays out of the state_dict; rebuilt whenever the conv weight changes.
+        self.register_buffer("_sgl_folded", None, persistent=False)
+        self._sgl_folded_key = None
+
+    def _folded_weight(self, conv: nn.Conv2d) -> torch.Tensor:
+        weight = conv.weight
+        key = (
+            weight.data_ptr(),
+            weight._version,
+            weight.dtype,
+            weight.device,
+            weight.is_contiguous(memory_format=torch.channels_last),
+        )
+        if self._sgl_folded is None or self._sgl_folded_key != key:
+            self._sgl_folded = fold_upsample2x_conv2d_weight(conv)
+            self._sgl_folded_key = key
+        return self._sgl_folded
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._run(x, with_bias=True)
@@ -252,14 +270,7 @@ class FusedUpsample2xConv(nn.Sequential):
                 conv.dilation,
                 conv.groups,
             )
-        folded = self._sgl_folded
-        if (
-            folded is None
-            or folded.dtype is not conv.weight.dtype
-            or folded.device != conv.weight.device
-        ):
-            folded = fold_upsample2x_conv2d_weight(conv)
-            self._sgl_folded = folded
+        folded = self._folded_weight(conv)
         return F.conv_transpose2d(x, folded, bias, stride=2, padding=1)
 
 
@@ -453,7 +464,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLQwenImage21):
         return vae
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not current_platform.is_cuda() or current_platform.is_rocm():
         return vae
     decoder = vae.decoder if vae.config.load_decoder else None
     if type(decoder) is not QwenImage21Decoder3d or vae.spatial_parallel:

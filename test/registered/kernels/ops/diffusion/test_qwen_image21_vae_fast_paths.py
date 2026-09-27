@@ -208,6 +208,45 @@ def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
     # gate off: layout and kernels revert, output is bit-identical again
     assert torch.equal(optimized.decode(z), expected)
     assert not optimized.decoder._sgl_channels_last
+    # the folded upsampler kernel follows the conv weight: a new weight value
+    # must not reuse the stale fold
+    for model in (reference, optimized):
+        for m in model.modules():
+            if type(m).__name__ == "QwenImage21Resample" and m.mode.startswith(
+                "upsample"
+            ):
+                m.resample[1].weight.zero_()
+                m.resample[1].bias.zero_()
+    expected_zero = reference.decode(z)
+    with use_vae_fast_path(optimized, True):
+        fast_zero = optimized.decode(z)
+    assert not torch.equal(expected_zero, expected)
+    torch.testing.assert_close(
+        fast_zero.float(), expected_zero.float(), atol=0.05, rtol=0
+    )
+    # CPU offload must not leave the folded kernels (or anything else) on the GPU
+    optimized.to("cpu")
+    for m in optimized.modules():
+        for value in list(vars(m).values()) + list(m._buffers.values()):
+            assert not (isinstance(value, torch.Tensor) and value.is_cuda), type(m)
+    optimized.to("cuda")
+
+
+def test_fold_rejects_convs_it_cannot_express():
+    from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
+        fold_upsample2x_conv2d_weight,
+    )
+
+    good = torch.nn.Conv2d(4, 6, 3, padding=1)
+    assert fold_upsample2x_conv2d_weight(good).shape == (4, 6, 4, 4)
+    for bad in (
+        torch.nn.Conv2d(4, 6, 1),
+        torch.nn.Conv2d(4, 6, 3, padding=1, stride=2),
+        torch.nn.Conv2d(4, 4, 3, padding=1, groups=2),
+        torch.nn.Conv2d(4, 6, 3, padding=1, padding_mode="reflect"),
+    ):
+        with pytest.raises(ValueError):
+            fold_upsample2x_conv2d_weight(bad)
 
 
 @torch.no_grad()

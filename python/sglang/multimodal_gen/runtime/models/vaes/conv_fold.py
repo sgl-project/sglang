@@ -18,6 +18,22 @@ def fold_upsample2x_conv2d_weight(conv: nn.Conv2d) -> torch.Tensor:
     differs from the eager chain at rounding level. Keeps the weight's
     channels_last layout when it has one.
     """
+    if not (
+        type(conv) is nn.Conv2d
+        and conv.kernel_size == (3, 3)
+        and conv.stride == (1, 1)
+        and conv.padding == (1, 1)
+        and conv.dilation == (1, 1)
+        and conv.groups == 1
+        and conv.padding_mode == "zeros"
+    ):
+        raise ValueError(
+            "fold_upsample2x_conv2d_weight needs a plain Conv2d(k3, s1, p1, zeros), got "
+            f"{type(conv).__name__} kernel={getattr(conv, 'kernel_size', None)} "
+            f"stride={getattr(conv, 'stride', None)} padding={getattr(conv, 'padding', None)} "
+            f"dilation={getattr(conv, 'dilation', None)} groups={getattr(conv, 'groups', None)} "
+            f"padding_mode={getattr(conv, 'padding_mode', None)}"
+        )
     w = conv.weight.detach().float()  # [Cout, Cin, 3, 3]
     cout, cin = w.shape[:2]
     wt = w.new_zeros(cin, cout, 4, 4)  # ConvTranspose2d layout
