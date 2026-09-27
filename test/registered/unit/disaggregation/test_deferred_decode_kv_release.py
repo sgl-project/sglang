@@ -181,6 +181,16 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         self.assertEqual(armed_at_send, [False])
         self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
+    def test_force_arm_arms_unpublished_receiver_before_send(self):
+        # Bug regression: a send_metadata that failed partway leaves init_time
+        # None while earlier ranks already hold destinations, so the transfer
+        # queue's notify-and-defer must still arm (before the send) -- else
+        # every drain ack is dropped and the hold runs out the full timeout.
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
+        recv.ensure_abort_notified(force_arm=True)
+        self.assertEqual(armed_at_send, [True])
+
     def test_ensure_abort_notified_sends_once_and_keeps_failure_records(self):
         # For failures decode did not initiate the true root cause is already
         # recorded; notifying must not overwrite it the way abort() does.
@@ -383,12 +393,14 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         clear=lambda: None,
     )
 
-    def ensure():
+    def ensure(force_arm=False):
         # A receiver that never published metadata has nobody to notify and
         # leaves abort_notified False, like the real ensure_abort_notified.
+        receiver.force_arm_calls.append(force_arm)
         if notifiable:
             receiver.abort_notified = True
 
+    receiver.force_arm_calls = []
     receiver.ensure_abort_notified = ensure
     return SimpleNamespace(
         req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}", return_logprob=False),
@@ -423,6 +435,9 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         released = self._pop(q)
 
         self.assertTrue(entry.kv_receiver.abort_notified)  # prefill was told
+        # force_arm: the receiver may have failed mid-publish (init_time None),
+        # and this deferral only drains via acks if the tracker armed.
+        self.assertEqual(entry.kv_receiver.force_arm_calls, [True])
         self.assertEqual(released, [])
         self.assertEqual(len(q._deferred_releases), 1)
         # Metadata slot stays owned by the hold until resolve time.
