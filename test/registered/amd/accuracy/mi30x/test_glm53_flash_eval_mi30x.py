@@ -22,7 +22,7 @@ path, since AITER mHC is gfx95-only, and nothing else gives that path nightly
 coverage for this model. That path reaches gfx942 only with the HIP guard in
 #41136: without it, TileLang's HIP codegen cannot lower the tl.get_lane_idx in
 the fused mHC post/pre kernel and decode graph capture dies with "Unresolved
-call Op(tl.get_lane_idx)" (run 36092686822).
+call Op(tl.get_lane_idx)" (run 36079282524).
 
 Measured on main plus both HIP fixes in #41136, which this test requires:
 0.9750 (1286/1319) on the rocm10 image, with a 2769 s weight load, a 1391 s
