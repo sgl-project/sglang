@@ -239,11 +239,11 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             gamma=_fused_norm_gamma(self.input_layernorm),
         )
 
-    def _select_mlp_input_fusions(self, residual_input_mode):
-        fusions = super()._select_mlp_input_fusions(residual_input_mode)
+    def _select_mlp_input_fusions(self):
+        fusions = super()._select_mlp_input_fusions()
         parallel = get_parallel()
         if (
-            residual_input_mode is ScatterMode.TP_ATTN_FULL
+            self.layer_scatter_modes.layer_input_mode is ScatterMode.TP_ATTN_FULL
             and parallel.attn_tp_size == parallel.tp_size
             and _fused_norm_gamma(self.post_attention_layernorm) is not None
         ):
