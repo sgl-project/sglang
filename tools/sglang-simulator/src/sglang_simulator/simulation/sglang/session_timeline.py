@@ -41,11 +41,8 @@ class SessionTimeline:
     def drain(self) -> list[object]:
         """Release every held close regardless of settlement.
 
-        A turn that never finishes -- aborted, retired, or failed mid-decode --
-        leaves its session permanently unsettled, because the completion
-        predicate counts generated tokens against `max_new_tokens`. Without a
-        drain those closes are never delivered and the session's KV stays
-        referenced for the life of the process.
+        A turn that never finishes, such as one aborted before it ran, leaves its
+        session unsettled for good; undelivered, its close pins the session's KV.
         """
         released = [req for _, req in self._pending_closes]
         self._pending_closes = []
@@ -83,11 +80,7 @@ class SessionTimeline:
             return False
         rids = self._session_rids.get(session_id)
         if not rids:
-            # No turn of this session has been dispatched yet. `all()` over an
-            # empty set is vacuously true, which would release the close on the
-            # spot -- the exact reordering this class exists to prevent. A
-            # client that pipelines its close alongside the final turn hits this
-            # race. Stay unsettled until a turn is seen; `drain()` covers the
-            # session that legitimately never sends one.
+            # No turn dispatched yet; `all()` over nothing would release the close
+            # early. `drain()` covers a session that never sends one.
             return False
         return all(self._is_request_finished(rid) for rid in rids)

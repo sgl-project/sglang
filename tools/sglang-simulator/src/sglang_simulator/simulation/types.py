@@ -102,6 +102,11 @@ class RequestStats:
     queue_start: float = -1
     queue_end: float = -1
     created_time: float = -1
+    # False when the request carried no simulation metadata (the server's warm-up);
+    # its timing fields keep the -1 defaults above.
+    simulated: bool = False
+    # Set from the scheduler's own finish state, which honours max_new_tokens clamps.
+    finished: bool = False
     gen_token_latencies: list[float] = field(default_factory=list)
 
     def is_complete(self) -> bool:

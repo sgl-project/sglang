@@ -34,9 +34,8 @@ class C_UnifiedRadixCacheHook(BaseHook):
 
         target.check_hicache_events = wrapped_check_hicache_events
 
-        # KV eviction is the mechanism session references reorder, but the count
-        # is only returned to the allocator and never reported. Accumulate it so
-        # a run can show whether eviction fired at all.
+        # The evicted count is only returned to the allocator; accumulate it so the
+        # report shows whether eviction fired at all.
         def count_evicted(method):
             def wrapped(self, *args, **kwargs):
                 result = method(self, *args, **kwargs)

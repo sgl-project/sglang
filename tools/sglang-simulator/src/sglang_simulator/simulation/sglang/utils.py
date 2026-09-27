@@ -139,11 +139,18 @@ def resolve_filler_token_id(server_args: "ServerArgs") -> int:
     doubled quote is also in the vocab, so a T-token answer came back as ~T/2
     history tokens. A leading-space word never merges with itself.
     """
+    # Without a tokenizer, outputs return as ids and are never re-tokenized, so any
+    # id is stable; 1 is the constant the sampler emitted before.
+    if server_args.skip_tokenizer_init:
+        return 1
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
         server_args.tokenizer_path, trust_remote_code=server_args.trust_remote_code
     )
+    # Arbitrary length and words: long enough to expose a pairwise merge, and any
+    # single token that survives the round trip works.
     probe_length = 64
     for text in (" the", " and", " data", " token"):
         token_ids = tokenizer.encode(text, add_special_tokens=False)

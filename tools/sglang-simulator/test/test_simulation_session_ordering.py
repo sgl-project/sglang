@@ -6,22 +6,25 @@ decision downstream is made against the wrong tree.
 """
 
 import os
-import pytest
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
 
-from sglang.srt.managers.io_struct import (
-    CloseSessionReqInput,
-    OpenSessionReqInput,
-    SessionParams,
-    TokenizedGenerateReqInput,
-)
 from sglang_simulator.simulation.manager import StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.scheduler import ReqDispatcher
 from sglang_simulator.simulation.sglang.session_timeline import SessionTimeline
 from sglang_simulator.simulation.types import SimulationMode
+
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    CloseSessionReqInput,
+    OpenSessionReqInput,
+    SessionParams,
+    TokenizedGenerateReqInput,
+)
 
 # ===== SessionTimeline: no SGLang types, no globals, injected predicate =====
 
@@ -72,21 +75,6 @@ def test_drain_releases_closes_whose_turns_never_finished():
     assert timeline.has_pending() is False
 
 
-def test_has_pending_is_false_with_nothing_held():
-    assert _timeline(finished=set()).has_pending() is False
-
-
-def test_close_is_held_while_a_dispatched_turn_is_unfinished():
-    finished = set()
-    timeline = _timeline(finished)
-    timeline.hold_close(session_id="s1", req="close-s1")
-    timeline.note_dispatched(session_id="s1", rid="r1")
-
-    assert timeline.take_settled_closes(set()) == []
-    finished.add("r1")
-    assert timeline.take_settled_closes(set()) == ["close-s1"]
-
-
 # ===== ReqDispatcher integration, against real io_struct types =====
 
 
@@ -118,8 +106,11 @@ def _generate_req(rid, session_id, created_time_ms, total_request, output_len=2)
 
 
 def _finish(rid):
-    req_stats = request_stats_manager.get_req_stats(rid)
-    req_stats.gen_token_latencies = [0.01] * req_stats.output_length
+    request_stats_manager.get_req_stats(rid).finished = True
+
+
+def _batch(*reqs):
+    return BatchTokenizedGenerateReqInput(batch=list(reqs))
 
 
 def _types(reqs):
@@ -199,3 +190,80 @@ def test_timeline_independent_control_requests_still_release_immediately():
 
     StateManager.set_global_clock(0.0)
     assert _types(dispatcher.dispatch()) == ["SimpleNamespace"]
+
+
+@pytest.mark.parametrize("max_new_tokens", [100, None])
+def test_close_follows_the_scheduler_finish_not_max_new_tokens(max_new_tokens):
+    """A turn can stop short of `max_new_tokens` (clamped or unset). Counting tokens
+    against it held the close for the whole run, or raised on None."""
+    dispatcher = _fresh_dispatcher()
+    dispatcher.add(
+        [
+            _generate_req(
+                "r1",
+                "s1",
+                created_time_ms=0,
+                total_request=1,
+                output_len=max_new_tokens,
+            )
+        ]
+    )
+    dispatcher.add([CloseSessionReqInput(rid="c1", session_id="s1")])
+
+    StateManager.set_global_clock(0.0)
+    assert _types(dispatcher.dispatch()) == ["TokenizedGenerateReqInput"]
+    request_stats_manager.get_req_stats("r1").gen_token_latencies = [0.01, 0.01]
+    _finish("r1")
+    assert _types(dispatcher.dispatch()) == ["CloseSessionReqInput"]
+
+
+def test_batched_turns_are_queued_individually_at_ingest():
+    """A batch container has no `sampling_params` of its own; ingest read it and
+    raised. Each turn it carries keeps its own arrival time."""
+    dispatcher = _fresh_dispatcher()
+    dispatcher.add(
+        [
+            _batch(
+                _generate_req("r1", "s1", created_time_ms=0, total_request=2),
+                _generate_req("r2", "s1", created_time_ms=1000, total_request=2),
+            )
+        ]
+    )
+
+    StateManager.set_global_clock(0.0)
+    assert _types(dispatcher.dispatch()) == ["TokenizedGenerateReqInput"]
+    StateManager.set_global_clock(1.0)
+    assert _types(dispatcher.dispatch()) == ["TokenizedGenerateReqInput"]
+
+
+def test_live_batched_turn_arrives_now_and_settles_its_session():
+    """Turns in a live batch were looked up by the container, so they kept their
+    stale trace timestamp and their session's close was never released."""
+    dispatcher = _fresh_dispatcher()
+    dispatcher.add([_generate_req("r1", None, created_time_ms=0, total_request=1)])
+    StateManager.set_global_clock(0.0)
+    dispatcher.dispatch()
+
+    StateManager.set_global_clock(5.0)
+    dispatcher.add(
+        [_batch(_generate_req("r2", "s1", created_time_ms=0, total_request=1))]
+    )
+    dispatcher.add([CloseSessionReqInput(rid="c1", session_id="s1")])
+    assert _types(dispatcher.dispatch()) == ["BatchTokenizedGenerateReqInput"]
+    assert request_stats_manager.get_req_stats("r2").created_time == 5.0
+
+    _finish("r2")
+    assert _types(dispatcher.dispatch()) == ["CloseSessionReqInput"]
+
+
+def test_reset_delivers_closes_whose_turns_never_finished():
+    """A close still held at reset was discarded, pinning its session's KV into the
+    next run on the same server."""
+    dispatcher = _fresh_dispatcher()
+    dispatcher.add([_generate_req("r1", "s1", created_time_ms=0, total_request=1)])
+    dispatcher.add([CloseSessionReqInput(rid="c1", session_id="s1")])
+    StateManager.set_global_clock(0.0)
+    assert _types(dispatcher.dispatch()) == ["TokenizedGenerateReqInput"]
+
+    dispatcher.reset()
+    assert _types(dispatcher.dispatch()) == ["CloseSessionReqInput"]

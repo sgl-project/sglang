@@ -109,10 +109,8 @@ class ReqDispatcher:
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
-        # Constructed on first use, never here: `REQ_DISPATCHER` is a class-body
-        # attribute built at module import, and the classifier imports io_struct.
-        # Importing SGLang before the hooks install leaves its classes unhooked,
-        # and the required-hook check then refuses to start the server.
+        # Built on first use: this runs at module import, and the classifier imports
+        # io_struct, which must not load before the hooks install.
         self._session_requests = None
         self.session_timeline = SessionTimeline(
             is_request_finished=self._request_finished
@@ -120,8 +118,7 @@ class ReqDispatcher:
 
     @staticmethod
     def _request_finished(rid: str) -> bool:
-        req_stats = request_stats_manager.get_req_stats(rid)
-        return len(req_stats.gen_token_latencies) >= req_stats.output_length
+        return request_stats_manager.get_req_stats(rid).finished
 
     @property
     def session_requests(self) -> SessionRequestClassifier:
@@ -147,19 +144,17 @@ class ReqDispatcher:
         self.offline_recv_all_requests = False
         leaked = self.session_timeline.pending_session_ids()
         if leaked:
-            # Reaching here means a turn never reported completion, so the close
-            # never settled. Surface it: silently dropping the close would look
-            # identical to a session that correctly released its KV.
             logger.warning(
-                "Discarding %d held session close(s) at reset; their turns never "
+                "Releasing %d held session close(s) at reset; their turns never "
                 "finished: %s",
                 len(leaked),
                 ", ".join(sorted(set(leaked))),
             )
+        # Deliver them anyway, or the sessions' KV stays pinned into the next run.
+        self.immediate_release_requests.extend(self.session_timeline.drain())
         self.session_timeline.reset()
 
     def _hold_session_requests(self, reqs: list) -> list:
-        """Take session lifecycle requests out of `reqs`, returning the rest."""
         remaining = []
         for req in reqs:
             if self.session_requests.is_close(req):
@@ -188,7 +183,8 @@ class ReqDispatcher:
 
             for req in reqs:
                 if self.session_requests.carries_generate_req(req):
-                    gen_requests.append(req)
+                    # Each turn in a batch carries its own arrival time.
+                    gen_requests.extend(self.session_requests.iter_generate_reqs(req))
                 else:
                     # Such as: /profile_start, /flush_cache, etc.
                     self.immediate_release_requests.append(req)
@@ -228,10 +224,8 @@ class ReqDispatcher:
                 if len(self.future_queue) == total_request:
                     self.offline_recv_all_requests = True
                     heapq.heapify(self.future_queue)
-                    # Ingest is the client streaming requests in while this loop
-                    # polls; charging that idle wall-clock as cpu_overhead adds
-                    # the whole send window to the simulated clock at t=0, when
-                    # every request is still queued, inflating their TTFT alike.
+                    # Re-baseline so the client's send window is not charged as
+                    # cpu_overhead at t=0, when every request is still queued.
                     StateManager.set_last_real_time_ts(time.time())
                     logger.info("All requests received. Starting simulation now.")
                 else:
@@ -243,12 +237,14 @@ class ReqDispatcher:
         recv_reqs = []
 
         recv_reqs.extend(self.immediate_release_requests)
-        # A request admitted after the simulation started arrives now, whatever
-        # timestamp it carries. Multi-turn replay reuses one row's metadata for
-        # every round, so later turns would otherwise report the preceding turns'
-        # execution as their own queueing delay.
+        # Admitted after the simulation started, so it arrives now: multi-turn replay
+        # reuses the first turn's metadata, whose timestamp is stale for later turns.
         live_arrivals = (
-            {id(req) for req in self.immediate_release_requests}
+            {
+                id(req)
+                for outer_req in self.immediate_release_requests
+                for req in self.session_requests.iter_generate_reqs(outer_req)
+            }
             if self.offline_recv_all_requests
             else set()
         )
@@ -264,17 +260,16 @@ class ReqDispatcher:
                 recv_reqs.append(req)
                 heapq.heappop(self.future_queue)
 
-        for req in recv_reqs:
-            session_id = self.session_requests.session_id_of(req)
-            if session_id is not None:
-                self.session_timeline.note_dispatched(
-                    session_id=session_id, rid=req.rid
-                )
+        for outer_req in recv_reqs:
+            for req in self.session_requests.iter_generate_reqs(outer_req):
+                session_id = self.session_requests.session_id_of(req)
+                if session_id is not None:
+                    self.session_timeline.note_dispatched(
+                        session_id=session_id, rid=req.rid
+                    )
 
         if self.mode == SimulationMode.OFFLINE and self.session_timeline.has_pending():
-            # Guarded: `_sessions_with_pending_turns` walks the whole future
-            # queue, and wall time spent here is charged to the simulated clock
-            # as CPU overhead. Sessionless runs must not pay for it.
+            # Walks the whole future queue, and that wall time is charged to the clock.
             recv_reqs.extend(
                 self.session_timeline.take_settled_closes(
                     self._sessions_with_pending_turns()
@@ -296,6 +291,7 @@ class ReqDispatcher:
                     simulation_args = {}
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
+                req_stats.simulated = True
                 req_stats.session_id = self.session_requests.session_id_of(req)
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
@@ -316,10 +312,8 @@ class ReqDispatcher:
                         )
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
-                    # Skipped for live arrivals: a later turn reuses the first
-                    # turn's metadata, so its stale `queue_start` would wind the
-                    # global clock backwards and make every in-flight request's
-                    # latency negative.
+                    # Not for live arrivals: their stale `queue_start` would
+                    # wind the clock back.
                     queue_start = simulation_args.get("queue_start")
                     if queue_start is not None and not is_live_arrival:
                         StateManager.set_global_clock(queue_start)
@@ -553,7 +547,13 @@ class C_SchedulerHook(BaseHook):
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                         time.sleep(abs(predicted_latency))
                         now = time.time()
-                        forward_latency = now - StateManager.get_last_real_time_ts()
+                        # The predictor ran inside this interval, not inside the
+                        # one process_batch_result charges, so subtract it here.
+                        forward_latency = (
+                            now
+                            - StateManager.get_last_real_time_ts()
+                            - StateManager.pop_predictor_wall_dur()
+                        )
                         StateManager.set_last_real_time_ts(now)
                     else:
                         forward_latency = predicted_latency
@@ -596,13 +596,10 @@ class C_SchedulerHook(BaseHook):
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
                 last_real_time_ts = StateManager.get_last_real_time_ts()
-                # Running the predictor is the cost of simulating, not work a
-                # real server does; charging it would put the simulation's own
-                # runtime into the result it reports.
+                # The predictor is the simulator's cost, not work a real server does.
                 predictor_wall_dur = StateManager.pop_predictor_wall_dur()
-                # 0 means no batch has run since the last reset, so there is no
-                # elapsed host time to charge yet. Differencing against it would
-                # step the simulated clock by a whole Unix epoch.
+                # 0 means no batch has run since reset; differencing against it
+                # would add a whole Unix epoch.
                 cpu_overhead = (
                     max(
                         now
@@ -627,6 +624,7 @@ class C_SchedulerHook(BaseHook):
                             - req_stats.last_event_time  # queue duration
                         )
                         req_stats.last_event_time = request_response_time
+                        req_stats.finished = req.finished()
                     else:
                         # Chunked request: nothing to do
                         pass
@@ -658,7 +656,9 @@ class C_SchedulerHook(BaseHook):
             is_start_profile = req.req_type.name == "START_PROFILE"
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
-                if item.rid is not None and item.input_length > 0:
+                # An unstamped request keeps created_time -1, which would anchor the
+                # normalisation below and shift every stamped request by 1 s.
+                if item.rid is not None and item.input_length > 0 and item.simulated:
                     stats.append(item)
 
             stats = sorted(stats, key=lambda req: req.created_time)

@@ -12,7 +12,6 @@ User datasets must not contain simulator metadata.
 """
 
 import argparse
-import asyncio
 import contextlib
 import json
 import os
@@ -31,6 +30,7 @@ register_autobench_dataset()
 
 from sglang.benchmark import serving
 from sglang.benchmark.datasets.common import DatasetRow
+from sglang.srt.utils.network import resolve_base_url
 
 _ORIGINAL_AIOHTTP_REQUEST = None
 _ORIGINAL_CALCULATE_METRICS = serving.calculate_metrics
@@ -41,7 +41,6 @@ _SIMULATOR_MODE = "offline"
 _USE_TRACE_TIMESTAMPS = False
 _SESSION_PER_CONVERSATION = False
 _BASE_URL = ""
-_CLOSE_SESSION_TIMEOUT_S = 30.0
 
 
 def _metrics_path() -> Path:
@@ -85,25 +84,12 @@ def _set_session_id(request: DatasetRow, session_id: str) -> None:
 
 
 async def _close_session(session_id: str) -> None:
-    """Release a session's KV once its last round has returned.
-
-    Bounded by a timeout on purpose. The simulator orders a close behind every
-    turn of its session, so a turn that never reports completion would other-
-    wise hang the whole benchmark here rather than in the scheduler, where the
-    cause is visible. Losing a close costs KV that the run is about to discard;
-    hanging costs the run.
-    """
-    if not _BASE_URL:
-        return
-    timeout = aiohttp.ClientTimeout(total=_CLOSE_SESSION_TIMEOUT_S)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{_BASE_URL}/close_session", json={"session_id": session_id}
-            ) as response:
-                response.raise_for_status()
-    except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
-        print(f"WARNING: close_session failed for {session_id}: {exc}")
+    """Release a session's KV once its last round has returned."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{_BASE_URL}/close_session", json={"session_id": session_id}
+        ) as response:
+            response.raise_for_status()
 
 
 def simulator_wrap_multi_turn_request_func(request_func, backend: str):
@@ -148,6 +134,9 @@ async def simulator_get_request(
     # The benchmark may not forward --use-trace-timestamps to get_request(),
     # so preserve the parsed value in this adapter.
     use_trace_timestamps = use_trace_timestamps or _USE_TRACE_TIMESTAMPS
+    if _SESSION_PER_CONVERSATION:
+        for index, request in enumerate(input_requests):
+            _set_session_id(request, f"sim-conv-{index}")
     if _SIMULATOR_MODE == "blocking":
         async for request in _ORIGINAL_GET_REQUEST(
             input_requests,
@@ -159,9 +148,6 @@ async def simulator_get_request(
         return
 
     total_request = len(input_requests)
-    if _SESSION_PER_CONVERSATION:
-        for index, request in enumerate(input_requests):
-            _set_session_id(request, f"sim-conv-{index}")
     if use_trace_timestamps:
         if any(request.timestamp is None for request in input_requests):
             raise ValueError(
@@ -267,7 +253,7 @@ def _replace_output_file_duration(
 
 def simulator_run_benchmark(args: argparse.Namespace):
     global _USE_TRACE_TIMESTAMPS, _BASE_URL
-    _BASE_URL = (getattr(args, "base_url", "") or "").rstrip("/")
+    _BASE_URL = resolve_base_url(args.base_url, args.host, args.port).rstrip("/")
     if args.backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
             "benchmark/simulator/bench_serving.py requires --backend one of "
@@ -335,8 +321,10 @@ def cli_main() -> None:
     validate_benchmark_runtime()
     if any(argument in ("-h", "--help") for argument in sys.argv[1:]):
         print(
-            "SGLang Simulator option: "
-            "--simulator-mode {offline,blocking} (default: offline)\n"
+            "SGLang Simulator options:\n"
+            "  --simulator-mode {offline,blocking} (default: offline)\n"
+            "  --simulator-session-per-conversation  one radix-native session per "
+            "multi-turn conversation, closed after its last round\n"
         )
     _SIMULATOR_MODE, remaining = _extract_simulator_args(sys.argv[1:])
     sys.argv = [sys.argv[0], *remaining]
