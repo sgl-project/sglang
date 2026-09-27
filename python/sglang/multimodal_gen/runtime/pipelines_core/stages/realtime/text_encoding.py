@@ -110,6 +110,8 @@ class RealtimeTextState(BaseRealtimeState):
 class RealtimeTextEncodingStage(TextEncodingStage):
     """Cache text encoder outputs across realtime chunks by prompt identity."""
 
+    deduplicated_output_fields = ()
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:

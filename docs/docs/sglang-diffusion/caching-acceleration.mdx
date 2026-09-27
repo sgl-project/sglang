@@ -53,7 +53,7 @@ Joint vision-language embeddings depend on both the prompt and image. The cache 
 
 Dynamic batching still decides which requests can execute together. Conditioning reuse does not change encoder batch shapes, padding, or output order: a batched encoder call is matched as a whole, rather than split into individually cached rows. Model-specific grouped execution that also prepares materials, broadcasts results, or manages state retains its own execution rules.
 
-The common text stage also keeps group-local stage deduplication: equivalent requests execute the stage once and receive their own output containers. This avoids repeating tokenization and stage bookkeeping. The conditioning cache shares encodings between otherwise different requests, including a common negative prompt. Custom stages that prepare request-specific metadata use encoder-result reuse while still preparing each request.
+The common text stage also keeps group-local stage deduplication: equivalent requests execute the stage once and receive their own output containers. This avoids repeating tokenization and stage bookkeeping. When stage deduplication leaves only one computation, it also skips the temporary group cache and its hit synchronization; cross-request caching remains available. The conditioning cache shares encodings between otherwise different requests, including a common negative prompt. Custom stages that prepare request-specific metadata or realtime session state use encoder-result reuse while still preparing each request.
 
 ## Overview
 
