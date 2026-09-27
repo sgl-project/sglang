@@ -373,13 +373,14 @@ class ConditioningCache:
             hit = bool(flag.item())
         if hit:
             self.hits += 1
+            if entry is not None:
+                entry.preferred |= _prefer_cache.get()
+                self._entries.move_to_end(key)
             if group_entry is not None:
                 self.group_hits += 1
                 group_entry.wait()
                 return _copy_output(group_entry.output, share_tensors=share_in_group)
             entry.wait()
-            entry.preferred |= _prefer_cache.get()
-            self._entries.move_to_end(key)
             logger.debug("Conditioning cache hit: %s.%s", type(model).__name__, method)
             restored = {}
 

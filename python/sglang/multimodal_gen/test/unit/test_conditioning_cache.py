@@ -427,6 +427,25 @@ def test_group_cache_preserves_mutable_outputs_and_posterior_rng(capacity):
 
 
 @torch.no_grad()
+def test_group_hit_preserves_negative_host_entry_under_capacity_pressure():
+    model = Encoder().eval()
+    cache = ConditioningCache(24)
+    negative = torch.zeros(4)
+    with cache.scope(), cache.group_scope():
+        model(negative)
+        with prefer_conditioning_cache():
+            model(negative)
+        model(torch.ones(4))
+    with cache.scope():
+        actual = model(negative)
+    assert model.calls == 2
+    assert cache.hits == 2
+    assert cache.group_hits == 1
+    assert cache.evictions == 0
+    torch.testing.assert_close(actual.last_hidden_state, negative, rtol=0, atol=0)
+
+
+@torch.no_grad()
 def test_group_cache_invalidates_and_releases_after_failure():
     cache = ConditioningCache(0)
     model = Encoder().eval()
