@@ -5,15 +5,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.layers.boundary_layout import Layout, SumGroup, TokenAxis
 from sglang.srt.layers.communicator import (
     ADD_AND_NORM,
     FfnExitFusion,
     LayerCommunicator,
+    Layout,
+    SumGroup,
+    TokenAxis,
     UnreducedOutput,
-    _attention_input_step,
     reduce_output,
 )
+from sglang.srt.layers.communicator.boundary import _attention_input_step
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -31,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -116,8 +119,8 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
                 residual,
             ),
         ),
-        patch(
-            "sglang.srt.layers.communicator.reduce_output",
+        patch_communicator(
+            "reduce_output",
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):

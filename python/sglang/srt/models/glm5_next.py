@@ -28,12 +28,12 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
     reduce_output,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,

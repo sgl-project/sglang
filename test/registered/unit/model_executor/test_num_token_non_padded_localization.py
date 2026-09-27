@@ -28,7 +28,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -37,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded_cpu,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -50,11 +50,11 @@ def sparse_moe_input(rows):
         patch.object(
             moe_utils, "is_moe_input_scattered_across_dp_ranks", return_value=local
         ),
-        patch.object(
-            comm, "is_moe_input_scattered_across_dp_ranks", return_value=local
+        patch_communicator(
+            "is_moe_input_scattered_across_dp_ranks", return_value=local
         ),
-        patch.object(comm, "is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
-        patch.object(comm, "_gathers_over_attention_cp", return_value=False),
+        patch_communicator("is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
+        patch_communicator("_gathers_over_attention_cp", return_value=False),
     ):
         yield
 
@@ -196,7 +196,7 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                 self.subTest(case=label),
                 get_parallel().override(attn_dp_size=1, attn_cp_size=2),
                 sparse_moe_input("moe_cp"),
-                patch.object(comm, "get_moe_cp_size", return_value=2),
+                patch_communicator("get_moe_cp_size", return_value=2),
                 patch(
                     "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
                     return_value=False,

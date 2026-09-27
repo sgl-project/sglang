@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -272,10 +273,10 @@ class TestLayerScatterModesLastLayer(CustomTestCase):
         from sglang.srt.layers import communicator as comm
 
         with (
-            patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
-            patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=False),
-            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_cp_enabled", return_value=False),
+            patch_communicator("enable_moe_dense_fully_dp", return_value=False),
+            patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
+            patch_communicator("is_dsa_enable_prefill_cp", return_value=False),
+            patch_communicator("is_mla_cp_enabled", return_value=False),
         ):
             for num_layers, layer_id in (
                 (NUM_LAYERS, 0),
