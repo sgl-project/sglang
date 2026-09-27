@@ -9,12 +9,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.boundary_layout import Layout, TokenAxis
 from sglang.srt.layers.communicator import (
     ADD_AND_NORM,
     LayerCommunicator,
-    _attention_input_step,
+    Layout,
+    TokenAxis,
 )
+from sglang.srt.layers.communicator.boundary import _attention_input_step
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -33,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import COMMUNICATOR_MODULES
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -209,10 +211,13 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
 def test_communicator_publishes_layout_at_each_transition(
     monkeypatch, gathered_over_dp, num_tokens, publish_lora_layout
 ):
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_parallel",
-        lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
-    )
+    for module in COMMUNICATOR_MODULES:
+        if hasattr(module, "get_parallel"):
+            monkeypatch.setattr(
+                module,
+                "get_parallel",
+                lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
+            )
     # Start from TP_GLOBAL so an unpublished transition is distinguishable.
     initial = LoRABatchLayout.TP_GLOBAL
     expected_mlp = (

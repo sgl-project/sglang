@@ -9,8 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers.boundary_layout import Layout
-from sglang.srt.layers.communicator import UnreducedOutput
+from sglang.srt.layers.communicator import Layout, UnreducedOutput
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 from torch import nn
@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.layers import communicator as comm
 from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -51,18 +52,15 @@ class TestLongcatShortcut(CustomTestCase):
             )
         )
         with (
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_local_dp_buffer",
                 side_effect=lambda group, hidden_size=None: torch.empty(rows, 3),
             ),
-            patch.object(
-                comm,
+            patch_communicator(
                 "attn_tp_all_gather_into_tensor",
                 side_effect=lambda out, x: out.copy_(x.repeat(tp, 1)),
             ),
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_parallel",
                 return_value=SimpleNamespace(attn_tp_group=object()),
             ),

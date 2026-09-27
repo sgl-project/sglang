@@ -7,14 +7,19 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.boundary_layout import (
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
     Layout,
+    ScatterMode,
     StageOutput,
     SumGroup,
     TokenAxis,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import (
     sequence_parallel_layer_sides,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
@@ -23,6 +28,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -30,7 +36,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def sp_region_steps():
     """The steps a layer runs while a LayerNorm SP region is active."""
-    return comm._select_boundary_steps(
+    return comm_boundary._select_boundary_steps(
         sequence_parallel_layer_sides(
             axis_sizes={
                 TokenAxis.ATTN_DP: 1,
@@ -44,14 +50,14 @@ def sp_region_steps():
 def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
     return comm.BoundarySteps(
         attention_prepare=partial(
-            comm._attention_input_step,
+            comm_boundary._attention_input_step,
             layer_input=None,
             fusions=(),
             enters_stack=False,
             residual_ops=comm.ADD_AND_NORM,
         ),
         attention_input=comm.CommunicateSimpleFn._trivial,
-        ffn_input=comm._mlp_input_norm,
+        ffn_input=comm_ops._mlp_input_norm,
         ffn_input_rows=Layout(frozenset()),
         ffn_output=ffn_output or StageOutput(Layout(frozenset()), group=SumGroup.TP),
         ffn_output_move=(
@@ -304,10 +310,9 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             input_ids=types.SimpleNamespace(shape=(8,))
         )
         with (
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=True),
-            patch.object(
-                comm,
+            patch_communicator("is_enable_moe_cp_allgather", return_value=False),
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=True),
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
             ),
@@ -392,21 +397,19 @@ class TestDeferFfnReduction(CustomTestCase):
             global_dp_buffer_len=global_tokens,
         )
         with (
-            patch.object(
-                comm, "_reduce_and_redistribute_output_step", return_value=step
+            patch_communicator(
+                "_reduce_and_redistribute_output_step", return_value=step
             ),
             get_forward().scoped(sp_active=sp_active),
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fused),
-            patch.object(comm, "_use_aiter", False),
-            patch.object(
-                comm,
+            patch_communicator("is_enable_moe_cp_allgather", return_value=False),
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=fused),
+            patch_communicator("_use_aiter", False),
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=types.SimpleNamespace(input_scattered=False),
             ),
-            patch.object(comm, "is_dp_attention_enabled", return_value=dp_attention),
-            patch.object(
-                comm,
+            patch_communicator("is_dp_attention_enabled", return_value=dp_attention),
+            patch_communicator(
                 "get_moe_a2a_backend",
                 return_value=types.SimpleNamespace(is_none=lambda: a2a_none),
             ),
@@ -497,10 +500,13 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
 
     def test_keeps_what_the_next_layer_input_cannot_run(self):
         for name, condition in (
-            ("reduce-scatter", dict(step=comm._reduce_and_redistribute_output_varlen)),
+            (
+                "reduce-scatter",
+                dict(step=comm_ops._reduce_and_redistribute_output_varlen),
+            ),
             (
                 "MAX_LEN reduce-scatter",
-                dict(step=comm._reduce_and_redistribute_output_max_len),
+                dict(step=comm_ops._reduce_and_redistribute_output_max_len),
             ),
             ("other postprocess", dict(scatters_to_local_tokens=False)),
             ("LayerNorm SP", dict(sp_active=True)),

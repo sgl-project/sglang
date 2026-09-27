@@ -7,6 +7,8 @@ import torch
 from torch import nn
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
@@ -49,14 +51,14 @@ class DeferringLayer(nn.Module):
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         self.layer_communicator._steps = comm.BoundarySteps(
             attention_prepare=partial(
-                comm._attention_input_step,
+                comm_boundary._attention_input_step,
                 layer_input=None,
                 fusions=(),
                 enters_stack=False,
                 residual_ops=comm.ADD_AND_NORM,
             ),
             attention_input=comm.CommunicateSimpleFn._trivial,
-            ffn_input=comm._mlp_input_norm,
+            ffn_input=comm_ops._mlp_input_norm,
             ffn_input_rows=comm.Layout(frozenset()),
             ffn_output=comm.StageOutput(
                 comm.Layout(frozenset()),
