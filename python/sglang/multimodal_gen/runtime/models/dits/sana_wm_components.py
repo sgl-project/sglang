@@ -13,10 +13,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
+from sglang.kernels.ops import diffusion as diffusion_ops
+from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_SANA_WM_CONV_POST = BitExactFusionGate(
+    "SANA-WM conv post-processing", per_signature=True
+)
+
+_SANA_WM_GDN_REVERSE = BitExactFusionGate(
+    "SANA-WM reverse GDN scan", per_signature=True
+)
 
 _SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
 _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
@@ -1032,11 +1042,67 @@ class GLUMBConvTemp(nn.Module):
         )
         nn.init.zeros_(self.t_conv.weight)
 
-    def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
+    def _spatial_glu_reference(self, x: torch.Tensor) -> torch.Tensor:
         x = self.inverted_conv(x)
         x = self.depth_conv(x)
         a, g = x.chunk(2, dim=1)
-        return self.point_conv(a * self.glu_act(g))
+        return a * self.glu_act(g)
+
+    def _spatial_glu(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not _SANA_WM_CONV_POST.disabled
+            and x.is_cuda
+            and x.dtype is torch.bfloat16
+            and x.is_contiguous()
+            and x.numel() > 0
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            conv = self.inverted_conv.conv
+            sig = (
+                x.shape,
+                x.stride(),
+                x.device,
+                x.dtype,
+                conv.weight.shape,
+                conv.weight.stride(),
+                self.depth_conv.conv.weight.stride(),
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+            verified = _SANA_WM_CONV_POST.is_verified(sig)
+            if verified or not torch.cuda.is_current_stream_capturing():
+                try:
+                    raw = F.conv2d(
+                        x,
+                        conv.weight,
+                        None,
+                        conv.stride,
+                        conv.padding,
+                        conv.dilation,
+                        conv.groups,
+                    )
+                    hidden = diffusion_ops.fused_bias_silu(raw, conv.bias)
+                    # Native depthwise conv accumulates bias before rounding;
+                    # preserve it and fuse only its following SiLU/multiply.
+                    out = diffusion_ops.fused_bias_glu(self.depth_conv(hidden), None)
+                except Exception as exc:
+                    _SANA_WM_CONV_POST.on_exception(exc, logger=logger)
+                else:
+                    if verified:
+                        return out
+                    return _SANA_WM_CONV_POST.accept_or_fallback(
+                        out,
+                        self._spatial_glu_reference(x),
+                        sig=sig,
+                        logger=logger,
+                    )
+        return self._spatial_glu_reference(x)
+
+    def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
+        return self.point_conv(self._spatial_glu(x))
 
     def _apply_spatial_autochunked(self, x: torch.Tensor) -> torch.Tensor:
         """Avoid oversized Conv2d calls on long videos while keeping short path fused."""
@@ -1698,40 +1764,7 @@ def _single_path_delta_scan_bidirectional(
 # ---------------------------------------------------------------------------
 
 
-def _gdn_scan_cached(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_rot: torch.Tensor,
-    k_rot: torch.Tensor,
-    beta: torch.Tensor,
-    decay: torch.Tensor,
-    *,
-    init_state_kv: Optional[torch.Tensor] = None,
-    init_state_z: Optional[torch.Tensor] = None,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Chunk-causal main-branch GDN scan for streaming `forward_long`.
-
-    The forward pass seeds/returns ``(state_kv, state_z)`` so chunks stay
-    continuous; the backward pass is intra-chunk and stateless. Returns
-    ``(out, (state_kv, state_z))``.
-    """
-    (num_fwd, den_fwd), (state_kv, state_z) = _gdn_scan_forward_stateful(
-        q,
-        k,
-        v,
-        q_rot,
-        k_rot,
-        beta,
-        decay,
-        init_state_kv=init_state_kv,
-        init_state_z=init_state_z,
-        eps=eps,
-        return_components=True,
-        return_state=True,
-    )
-
+def _gdn_scan_backward_reference(q, k, v, q_rot, k_rot, beta, decay, eps):
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -1767,6 +1800,167 @@ def _gdn_scan_cached(
 
     num_bwd = flip_back(num_bwd_flipped, D)
     den_bwd = flip_back(den_bwd_flipped, 1)
+    return num_bwd, den_bwd
+
+
+def _single_path_delta_scan_backward_reference(q_rot, k_rot, v, beta, decay):
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def to_time(x):
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    def from_time(x):
+        return x.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+
+    q_rot_bwd = from_time(torch.flip(to_time(q_rot), dims=[2]))
+    k_rot_bwd = from_time(_flip_and_shift(to_time(k_rot), dim=2, shift_val=0.0))
+    v_bwd = from_time(_flip_and_shift(to_time(v), dim=2, shift_val=0.0))
+    beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
+    decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
+
+    out_bwd_flipped = _single_path_delta_scan_forward(
+        q_rot_bwd,
+        k_rot_bwd,
+        v_bwd,
+        beta_bwd,
+        decay_bwd,
+    )
+    out_bwd = torch.flip(out_bwd_flipped.view(B, H, D, T, S), dims=[3]).reshape(
+        B, H, D, N
+    )
+    return out_bwd
+
+
+def _sana_wm_reverse_scan_impl(q_rot, k_rot, v, beta, decay, q=None, k=None):
+    """Traverse the exclusive backward recurrence without flipped full videos.
+
+    The old flip/shift cat followed by reshape materializes contiguous K/V.
+    Keep that layout so cuBLAS sees the same leading dimensions. Queries can
+    be selected directly from their original layout. The synthetic first
+    update has zero K/V/beta and unit decay, leaving the zero state unchanged.
+    Its query matmuls are retained, including their nonfinite-input behavior.
+    """
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+    k_rot = k_rot.contiguous().view(B, H, D, T, S)
+    v = v.contiguous().view(B, H, D, T, S)
+    q_rot = q_rot.view(B, H, D, T, S)
+    main_branch = q is not None
+    if main_branch:
+        q = q.view(B, H, D, T, S)
+        k = k.contiguous().view(B, H, D, T, S)
+    beta = beta.unsqueeze(3) if beta.ndim == 4 else beta.view(B, H, T, 1, 1)
+    decay = decay.view(B, H, T, 1, 1)
+    state_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
+    state_z = (
+        torch.zeros(B, H, D, 1, device=q_rot.device, dtype=q_rot.dtype)
+        if main_branch
+        else None
+    )
+    nums, dens = [None] * T, [None] * T
+    for i in range(T - 1, -1, -1):
+        if i + 1 < T:
+            j = i + 1
+            kt, vt = k_rot[:, :, :, j], v[:, :, :, j]
+            bt, gt = beta[:, :, j], decay[:, :, j]
+            state_kv = state_kv * gt
+            if main_branch:
+                state_z = state_z * gt
+            delta_v = (vt - torch.matmul(state_kv, kt)) * bt
+            state_kv = state_kv + torch.matmul(delta_v, kt.transpose(-1, -2))
+            if main_branch:
+                key = k[:, :, :, j]
+                delta_z = (1.0 - torch.matmul(state_z.transpose(-1, -2), key)) * bt
+                state_z = state_z + torch.matmul(key, delta_z.transpose(-1, -2))
+        nums[i] = torch.matmul(state_kv, q_rot[:, :, :, i])
+        if main_branch:
+            dens[i] = torch.matmul(state_z.transpose(-1, -2), q[:, :, :, i])
+    num = torch.stack(nums, dim=2).permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+    if not main_branch:
+        return num
+    den = torch.stack(dens, dim=2).permute(0, 1, 3, 2, 4).reshape(B, H, 1, N)
+    return num, den
+
+
+def _sana_wm_reverse_scan(q_rot, k_rot, v, beta, decay, *, reference, q=None, k=None):
+    inputs = (q_rot, k_rot, v, beta, decay) + (() if q is None else (q, k))
+    if (
+        not _SANA_WM_GDN_REVERSE.disabled
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and all(
+            x.is_cuda and x.dtype is torch.float32 and x.numel() > 0 for x in inputs
+        )
+    ):
+        sig = (
+            q is not None,
+            tuple((x.shape, x.stride(), x.device, x.dtype) for x in inputs),
+            torch.get_float32_matmul_precision(),
+        )
+        verified = _SANA_WM_GDN_REVERSE.is_verified(sig)
+        if verified or not torch.cuda.is_current_stream_capturing():
+            try:
+                out = _sana_wm_reverse_scan_impl(q_rot, k_rot, v, beta, decay, q, k)
+            except Exception as exc:
+                _SANA_WM_GDN_REVERSE.on_exception(exc, logger=logger)
+            else:
+                if verified:
+                    return out
+                return _SANA_WM_GDN_REVERSE.accept_or_fallback(
+                    out, reference(), sig=sig, equal=tensors_equal, logger=logger
+                )
+    return reference()
+
+
+def _gdn_scan_cached(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    init_state_kv: Optional[torch.Tensor] = None,
+    init_state_z: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Chunk-causal main-branch GDN scan for streaming `forward_long`.
+
+    The forward pass seeds/returns ``(state_kv, state_z)`` so chunks stay
+    continuous; the backward pass is intra-chunk and stateless. Returns
+    ``(out, (state_kv, state_z))``.
+    """
+    (num_fwd, den_fwd), (state_kv, state_z) = _gdn_scan_forward_stateful(
+        q,
+        k,
+        v,
+        q_rot,
+        k_rot,
+        beta,
+        decay,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        eps=eps,
+        return_components=True,
+        return_state=True,
+    )
+
+    num_bwd, den_bwd = _sana_wm_reverse_scan(
+        q_rot,
+        k_rot,
+        v,
+        beta,
+        decay,
+        q=q,
+        k=k,
+        reference=lambda: _gdn_scan_backward_reference(
+            q, k, v, q_rot, k_rot, beta, decay, eps
+        ),
+    )
     out = (num_fwd + num_bwd) / (den_fwd + den_bwd + eps)
     return out, (state_kv, state_z)
 
@@ -1795,31 +1989,15 @@ def _single_path_delta_scan_cached(
         return_state=True,
     )
 
-    B, H, D, N = q_rot.shape
-    T = beta.shape[2]
-    S = N // T
-
-    def to_time(x):
-        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
-
-    def from_time(x):
-        return x.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
-
-    q_rot_bwd = from_time(torch.flip(to_time(q_rot), dims=[2]))
-    k_rot_bwd = from_time(_flip_and_shift(to_time(k_rot), dim=2, shift_val=0.0))
-    v_bwd = from_time(_flip_and_shift(to_time(v), dim=2, shift_val=0.0))
-    beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
-    decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
-
-    out_bwd_flipped = _single_path_delta_scan_forward(
-        q_rot_bwd,
-        k_rot_bwd,
-        v_bwd,
-        beta_bwd,
-        decay_bwd,
-    )
-    out_bwd = torch.flip(out_bwd_flipped.view(B, H, D, T, S), dims=[3]).reshape(
-        B, H, D, N
+    out_bwd = _sana_wm_reverse_scan(
+        q_rot,
+        k_rot,
+        v,
+        beta,
+        decay,
+        reference=lambda: _single_path_delta_scan_backward_reference(
+            q_rot, k_rot, v, beta, decay
+        ),
     )
     return out_fwd + out_bwd, state_kv
 
@@ -1871,9 +2049,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
-        assert (
-            out_dim == in_dim
-        ), f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        assert out_dim == in_dim, (
+            f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        )
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.heads = heads
@@ -2219,9 +2397,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if beta.ndim == 3 and beta.shape != (B, heads, T):
             return f"requires beta shape {(B, heads, T)}, got {tuple(beta.shape)}"
         if beta.ndim == 4 and beta.shape != (B, heads, T, S):
-            return (
-                f"requires beta shape {(B, heads, T, S)}, " f"got {tuple(beta.shape)}"
-            )
+            return f"requires beta shape {(B, heads, T, S)}, got {tuple(beta.shape)}"
         if decay.shape != (B, heads, T):
             return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
         if head_dim > 128:
@@ -2252,8 +2428,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if precheck_reason is not None:
             if self.gdn_backend == "triton":
                 raise RuntimeError(
-                    "SANA-WM Triton camera GDN backend unavailable: "
-                    f"{precheck_reason}"
+                    f"SANA-WM Triton camera GDN backend unavailable: {precheck_reason}"
                 )
             return None
 
@@ -2837,14 +3012,19 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         k_dn = k_proj.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
-        # No RMS downscale here: full post-UCPE q/k/v feed the scan; inflation
-        # is computed from full post-UCPE K vs pre-UCPE K and absorbed only into
-        # beta.
+        # Same per-token RMS downscale as _cam_branch, so a single chunk with
+        # no carried state reduces exactly to the dense scan.
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
+
         pre_ucpe_k_norm = torch.linalg.vector_norm(
             k_pre_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
@@ -2910,10 +3090,17 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        # No RMS downscale here: full post-UCPE q/k/v feed SDPA directly.
-        q_dn = q_proj.permute(0, 1, 3, 2)
-        k_dn = k_proj.permute(0, 1, 3, 2)
-        v_dn = v_proj.permute(0, 1, 3, 2)
+        # Same per-token RMS downscale as _cam_branch_softmax, so cached
+        # chunks stay on the dense path's numerics.
+        q_dn = _downscale_to_reference_rms(
+            q_bhnd.permute(0, 1, 3, 2), q_proj.permute(0, 1, 3, 2)
+        )
+        k_dn = _downscale_to_reference_rms(
+            k_bhnd.permute(0, 1, 3, 2), k_proj.permute(0, 1, 3, 2)
+        )
+        v_dn = _downscale_to_reference_rms(
+            v_bhnd.permute(0, 1, 3, 2), v_proj.permute(0, 1, 3, 2)
+        )
 
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()  # (B, N_cur, H, D)
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()

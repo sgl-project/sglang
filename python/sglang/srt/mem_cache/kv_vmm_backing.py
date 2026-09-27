@@ -212,9 +212,9 @@ class KvVmmBufferOwner:
             self.ensure_prefix(self.page_size)
 
         for t in self.tensors:
-            assert (
-                t.is_cuda and t.device.index == self.device_id
-            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            assert t.is_cuda and t.device.index == self.device_id, (
+                f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            )
 
     # -- backing --------------------------------------------------------------
 

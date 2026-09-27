@@ -50,9 +50,9 @@ def test_chat_non_streaming_returns_assistant_message(
                 body = resp.json()
                 choice = body["choices"][0]
                 assert choice["message"]["role"] == "assistant"
-                assert choice["message"][
-                    "content"
-                ], f"empty assistant content: {choice!r}"
+                assert choice["message"]["content"], (
+                    f"empty assistant content: {choice!r}"
+                )
                 assert choice.get("finish_reason"), choice
     finally:
         gpu_allocator.release(gpu)
@@ -91,8 +91,8 @@ def test_chat_streaming_emits_sse_chunks_with_done(
                         if line.startswith("data:"):
                             chunks.append(line.strip())
                 assert len(chunks) >= 2, f"expected >=2 SSE chunks, got: {chunks}"
-                assert any(
-                    "[DONE]" in c for c in chunks
-                ), f"no [DONE] terminator in stream: {chunks}"
+                assert any("[DONE]" in c for c in chunks), (
+                    f"no [DONE] terminator in stream: {chunks}"
+                )
     finally:
         gpu_allocator.release(gpu)

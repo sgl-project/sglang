@@ -42,6 +42,7 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor] = None,
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -71,6 +72,11 @@ class TargetHiddenKvInjector:
 
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            if target_hidden_is_projected:
+                raise RuntimeError(
+                    "Pre-gather target-hidden projection is not supported by the "
+                    "DSpark MLA KV injection path."
+                )
             self._inject_mla(
                 pool=pool,
                 target_hidden=target_hidden,
@@ -91,6 +97,7 @@ class TargetHiddenKvInjector:
                 cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                target_hidden_is_projected=target_hidden_is_projected,
             )
 
     def _inject_mla(
@@ -113,6 +120,24 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+            )
+        elif (
+            cache_loc.is_cuda
+            and cache_loc.is_contiguous()
+            and commit_lens is not None
+            and cache_loc_2d is not None
+            and commit_lens.is_contiguous()
+            and cache_loc.numel() == cache_loc_2d.numel()
+        ):
+            from sglang.kernels.ops.speculative.dspark.commit_swa import (
+                committed_swa_locations,
+            )
+
+            swa_loc = committed_swa_locations(
+                cache_loc,
+                pool.full_to_swa_index_mapping,
+                commit_lens,
+                cache_loc_2d.shape[1],
             )
         else:
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)

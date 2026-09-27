@@ -11,7 +11,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
-register_cuda_ci(est_time=130, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=130, stage="weekly", runner_config="4-gpu-h100")
 
 
 class TestPCGWithEAGLE3(PCGSpecBase, unittest.TestCase):

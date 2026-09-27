@@ -6,7 +6,7 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
@@ -16,6 +16,9 @@ _TRITON_KERNELS = [
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),
     ("virtual_slot", "alloc_bind_inplace"),
+    ("virtual_slot", "free_unbind_inplace"),
+    ("virtual_slot", "bind_inplace"),
+    ("virtual_slot", "write_loc_to_kernel_ids"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -43,5 +46,40 @@ register_kernel(
         op="memory.memcpy_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",
+    )
+)
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="memory.adler32_checksum",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.adler32:adler32_checksum",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.adler32_regions_checksum",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.adler32:adler32_regions_checksum",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.adler32_strided_checksum",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.adler32:adler32_strided_checksum",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.row_compact_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )

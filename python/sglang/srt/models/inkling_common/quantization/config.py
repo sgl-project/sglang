@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -226,7 +227,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
     def maybe_from_model_config(
         cls, model_config: ModelConfig
     ) -> InklingModelOptNvfp4Config | None:
-        from sglang.srt.runtime_context import get_parallel
 
         raw_quant_config = _get_raw_quant_config(model_config)
 

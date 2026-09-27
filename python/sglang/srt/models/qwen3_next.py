@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -49,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -473,19 +472,7 @@ def _apply_qwen3_next_mlp(
     hidden_states, residual = layer.layer_communicator.prepare_mlp(
         hidden_states, residual, forward_batch
     )
-    mlp_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
-        forward_batch
-    )
-    fuse_mlp_allreduce = (
-        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-            forward_batch
-        )
-    )
-
-    with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
-    ):
+    with layer.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
         if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = layer.mlp(
                 hidden_states,
@@ -493,19 +480,12 @@ def _apply_qwen3_next_mlp(
             )
         else:
             hidden_states = layer.mlp(hidden_states)
-
-    if fuse_mlp_allreduce:
-        hidden_states._sglang_needs_allreduce_fusion = True
-    else:
-        hidden_states, residual = layer.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+    hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
     return hidden_states, residual
 
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -596,7 +576,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -968,6 +947,10 @@ class Qwen3NextModel(nn.Module):
                     ),
                 )
 
+        last_layer = self.layers[-1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1007,7 +990,7 @@ class Qwen3NextForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         # The quant config's packed_modules_mapping may be None if it wasn't
@@ -1145,9 +1128,7 @@ class Qwen3NextForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if is_mtp:
-
                 if "mtp" not in name:
                     continue
 
@@ -1240,9 +1221,9 @@ class Qwen3NextForCausalLM(nn.Module):
                     #     continue
 
                     if name.endswith("_scale") and name not in params_dict:
-                        assert (
-                            abs(loaded_weight.item() - 1.0) < 1e-6
-                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        assert abs(loaded_weight.item() - 1.0) < 1e-6, (
+                            f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        )
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
