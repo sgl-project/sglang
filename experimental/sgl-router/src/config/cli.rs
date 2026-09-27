@@ -13,8 +13,8 @@ use crate::config::{
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
     DEFAULT_FUSE,
 };
@@ -176,6 +176,12 @@ pub struct DiscoveryArgs {
     /// Decode equality selector terms (key=value or key==value). Requires --prefill-selector.
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
+
+    /// EndpointSlice label key whose value is a worker's PD version group; a
+    /// prefill worker is paired only with decode workers of the same group.
+    /// Requires --prefill-selector and --decode-selector.
+    #[arg(long)]
+    pub pd_version_group_label: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -364,6 +370,10 @@ impl Cli {
                 "reorg sessions do not support --affinity-mode soft"
             );
             ensure!(
+                self.discovery.pd_version_group_label.is_none(),
+                "reorg routing does not support --pd-version-group-label"
+            );
+            ensure!(
                 self.routing.policy != PolicyKind::SessionAware
                     || (self.affinity.pressure_abs_threshold_tokens.is_none()
                         && self.affinity.pressure_abs_threshold_ms.is_none()
@@ -479,9 +489,10 @@ impl DiscoveryArgs {
                     self.service_discovery_namespace.is_none()
                         && self.selector.is_empty()
                         && self.prefill_selector.is_empty()
-                        && self.decode_selector.is_empty(),
+                        && self.decode_selector.is_empty()
+                        && self.pd_version_group_label.is_none(),
                     "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --pd-version-group-label require --service-discovery"
                 );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
@@ -493,9 +504,23 @@ impl DiscoveryArgs {
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
+                let version_group_label = self
+                    .pd_version_group_label
+                    .map(|label| label.trim().to_owned());
+                if let Some(label) = &version_group_label {
+                    ensure!(
+                        matches!(mode, K8sDiscoveryMode::PdDisaggregation { .. }),
+                        "--pd-version-group-label requires --prefill-selector and --decode-selector"
+                    );
+                    ensure!(
+                        !label.is_empty(),
+                        "--pd-version-group-label must not be empty"
+                    );
+                }
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
+                    version_group_label,
                 })
             }
         };
@@ -876,7 +901,7 @@ fn join_selector(terms: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+    use crate::config::{DiscoveryBackend, ScoreTermKind};
 
     #[test]
     fn chat_routing_selects_policy_implementation_without_another_config() {
@@ -1295,6 +1320,79 @@ mod tests {
                 }
             ),
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    const PD_K8S: [&str; 5] = [
+        "--service-discovery",
+        "--prefill-selector",
+        "app=sglang,role=prefill",
+        "--decode-selector",
+        "app=sglang,role=decode",
+    ];
+
+    #[test]
+    fn k8s_pd_version_group_label() {
+        let mut args = PD_K8S.to_vec();
+        args.extend(["--pd-version-group-label", " sglang.ai/version-group "]);
+        let c = into_config_owned(with_model(&args)).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert_eq!(
+                k.version_group_label.as_deref(),
+                Some("sglang.ai/version-group")
+            ),
+            _ => panic!("expected k8s backend"),
+        }
+        let c = into_config_owned(with_model(&PD_K8S)).unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert_eq!(k.version_group_label, None),
+            _ => panic!("expected k8s backend"),
+        }
+    }
+
+    #[test]
+    fn rejects_pd_version_group_label_outside_k8s_pd() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--worker-urls",
+                    "http://x:30000",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "require --service-discovery",
+            ),
+            (
+                vec![
+                    "--service-discovery",
+                    "--selector",
+                    "app=sglang",
+                    "--pd-version-group-label",
+                    "v",
+                ],
+                "requires --prefill-selector and --decode-selector",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--pd-version-group-label", " "])
+                    .collect(),
+                "must not be empty",
+            ),
+            (
+                PD_K8S
+                    .iter()
+                    .copied()
+                    .chain(["--chat-routing", "reorg", "--pd-version-group-label", "v"])
+                    .collect(),
+                "reorg routing does not support --pd-version-group-label",
+            ),
+        ] {
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "args={args:?} got: {err}");
         }
     }
 

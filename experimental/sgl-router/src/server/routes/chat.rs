@@ -233,8 +233,9 @@ fn pick_decode_worker(
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
     }
+    // Only a decode worker in the prefill's version group can receive its KV.
     let candidates = resolver
-        .decode_candidates(&request.model)
+        .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
