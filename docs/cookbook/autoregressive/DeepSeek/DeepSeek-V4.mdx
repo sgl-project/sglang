@@ -923,7 +923,7 @@ Concurrency 32–48 keeps the same TP-only command and adds HiCache DRAM offload
   --hicache-mem-layout page_first_direct
 ```
 
-**DP8 (DP Attention), concurrency 128–256:**
+**DP8 (DP Attention), concurrency 128:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
@@ -950,6 +950,7 @@ python3 -m sglang.launch_server \
   --stream-interval 20 \
   --prefill-decode-interval 20 \
   --prefill-delayer-token-usage-low-watermark 0.7 \
+  --load-balance-method total_requests \
   --attention-backend dsv4 \
   --enable-deepseek-v4-fp4-indexer \
   --page-size 256 \
