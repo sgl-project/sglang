@@ -667,6 +667,16 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
      tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
      rm go1.22.2.linux-amd64.tar.gz && \
+     # Mooncake's etcd wrapper rule runs `go mod tidy` inside `make`, which
+     # fetches the go.mod toolchain and modules with no retry. Run the same tidy
+     # first so make finds them cached; `go mod download` alone misses the test
+     # imports tidy resolves.
+     (cd mooncake-common/etcd && \
+      for i in 1 2 3 4 5; do \
+        go mod tidy && exit 0; \
+        [ "$i" -lt 5 ] && echo "Mooncake etcd go mod tidy failed (attempt $i/5), retrying in 30s..." && sleep 30; \
+      done; \
+      exit 1) && \
      mkdir -p build && \
      cd build && \
      cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
