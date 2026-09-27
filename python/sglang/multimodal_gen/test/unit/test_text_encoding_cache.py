@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -511,6 +512,8 @@ class TextEncodingDPGroup:
 
 
 def run_text_encoding_dp(rank, rendezvous, grouped):
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.cuda.set_device(rank)
     init_distributed_environment(
         backend="gloo",
         rank=rank,
@@ -575,6 +578,7 @@ class ShardedTextEncoder(FullHiddenStateEncoder):
 
 
 def run_fsdp_conditioning(rank, rendezvous):
+    os.environ["LOCAL_RANK"] = str(rank)
     torch.cuda.set_device(rank)
     init_distributed_environment(
         world_size=2,
