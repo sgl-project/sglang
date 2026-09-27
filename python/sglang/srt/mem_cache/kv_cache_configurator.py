@@ -34,7 +34,10 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_page_size,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -418,6 +421,9 @@ class KVCacheConfigurator:
     @property
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
+
+    def _replicated_dsa_indexer_size(self, size: int) -> int:
+        return size * get_parallel().attn_dcp_size
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
@@ -1622,6 +1628,7 @@ class KVCacheConfigurator:
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
+        index_buf_size = self._replicated_dsa_indexer_size(max_total_num_tokens)
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1645,6 +1652,10 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        if not get_memory().enable_hisparse:
+            pool_kwargs["index_buf_size"] = index_buf_size
+            pool_kwargs["index_page_size"] = get_alloc_page_size()
+            pool_kwargs["index_kernel_page_size"] = get_schedule().page_size
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1883,6 +1894,11 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    index_buf_size=self._replicated_dsa_indexer_size(
+                        max_total_num_tokens
+                    ),
+                    index_page_size=get_alloc_page_size(),
+                    index_kernel_page_size=get_schedule().page_size,
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
