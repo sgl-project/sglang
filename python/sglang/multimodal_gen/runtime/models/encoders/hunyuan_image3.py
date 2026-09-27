@@ -31,8 +31,11 @@ class HunyuanImage3VisionModel(Siglip2Model):
     """Adapt padded HunyuanImage-3 conditioning inputs to SRT's packed SigLIP2."""
 
     def __init__(self, config: dict):
+        config = dict(config, hidden_act="gelu")
+        # The checkpoint stores a legacy read-only Transformers property.
+        config.pop("use_return_dict", None)
         super().__init__(
-            Siglip2VisionConfig(**{**config, "hidden_act": "gelu"}),
+            Siglip2VisionConfig(**config),
             qkv_backend="sdpa",
             use_data_parallel=True,
         )

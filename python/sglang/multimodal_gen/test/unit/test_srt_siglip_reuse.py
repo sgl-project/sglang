@@ -171,6 +171,7 @@ def test_hunyuan_siglip2_loads_unfused_checkpoint_weights():
             num_hidden_layers=1,
             num_patches=16,
             patch_size=2,
+            use_return_dict=True,
         )
     )
     checkpoint = {}
