@@ -12,14 +12,13 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -36,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -60,8 +59,14 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -77,10 +82,11 @@ _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
     try:
-        from sgl_kernel import bmm_fp8, merge_state_v2
+        from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
-        from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+        from sglang.kernels.ops.gemm import bmm_fp8
+        from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
         _has_concat_mla_k = True
@@ -107,7 +113,7 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
     # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
@@ -150,12 +156,13 @@ for backend in CONCAT_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_concat_rope_backend)
 
 
-def get_attn_forward_method(server_args, forward_batch) -> AttnForwardMethod:
+def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
+    prefill_backend, decode_backend = attention_backends()
     is_decode = forward_batch.forward_mode.is_decode_or_idle()
     if is_decode:
-        backend = server_args.decode_attention_backend or server_args.attention_backend
+        backend = decode_backend
     else:
-        backend = server_args.prefill_attention_backend or server_args.attention_backend
+        backend = prefill_backend
         if (
             forward_batch.forward_mode.is_extend_without_speculative()
             and backend == "fa3"
@@ -206,16 +213,12 @@ class SarvamMoEMLP(nn.Module):
         self,
         x,
         forward_batch: ForwardBatch = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         if x.shape[0] == 0:
             return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -272,8 +275,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -317,8 +319,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
     ) -> torch.Tensor:
         del gemm_output_zero_allocator
@@ -329,13 +329,9 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
-            return self.forward_normal_dual_stream(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal_dual_stream(hidden_states)
         else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
 
     def get_moe_weights(self):
         return [
@@ -361,8 +357,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         current_stream = torch.cuda.current_stream()
@@ -374,19 +368,12 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -416,12 +403,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -464,9 +446,8 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
-        self._server_args = None
         self.current_attention_backend = None
 
         if self.q_lora_rank is None:
@@ -621,18 +602,12 @@ class SarvamMoEMLAAttention(nn.Module):
         return k
 
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
-        if self._server_args is None:
-            self._server_args = get_global_server_args()
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.current_attention_backend = (
-                self._server_args.decode_attention_backend
-                or self._server_args.attention_backend
-            )
-        else:
-            self.current_attention_backend = (
-                self._server_args.prefill_attention_backend
-                or self._server_args.attention_backend
-            )
+        prefill_backend, decode_backend = attention_backends()
+        self.current_attention_backend = (
+            decode_backend
+            if forward_batch.forward_mode.is_decode_or_idle()
+            else prefill_backend
+        )
 
     def _maybe_fp8_bmm(
         self,
@@ -696,7 +671,7 @@ class SarvamMoEMLAAttention(nn.Module):
         )
 
         self._set_current_attention_backend(forward_batch)
-        can_use_prefix_cache = not self._server_args.disable_radix_cache
+        can_use_prefix_cache = not get_memory().disable_radix_cache
         do_prefix_merge = has_extend_prefix and can_use_prefix_cache
 
         if do_prefix_merge and forward_batch.num_prefix_chunks is None:
@@ -777,11 +752,9 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_global_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             return self._run_mha_prefill(
@@ -891,10 +864,8 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_global_server_args()
         self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             output = self._run_mha_prefill(
@@ -949,11 +920,9 @@ class SarvamMoEMLAAttention(nn.Module):
 
         q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
 
-        if self._server_args is None:
-            self._server_args = get_global_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
             attn_output = self.attn_mqa(
@@ -1091,7 +1060,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -1113,30 +1081,16 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not use_reduce_scatter
-            and not should_allreduce_fusion
+            and not ffn_exit.mlp_reduce_scatter
+            and not ffn_exit.fuse_mlp_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1151,8 +1105,8 @@ class SarvamMLAModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.pp_group = get_parallel().pp_group
+        self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1209,6 +1163,10 @@ class SarvamMLAModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -1232,7 +1190,7 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self._remap_config(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))
@@ -1241,7 +1199,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

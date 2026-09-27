@@ -1,6 +1,6 @@
 import torch
 
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
@@ -37,7 +37,7 @@ class MulAdd(CustomOp):
     def forward_xpu(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ):
-        return self.forward_native(a, b, c, k=k)
+        return self.forward_cuda(a, b, c, k=k)
 
     @torch.compile
     def forward_musa(

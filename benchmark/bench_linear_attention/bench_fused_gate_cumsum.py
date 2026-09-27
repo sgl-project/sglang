@@ -22,9 +22,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 import torch
 import triton
 
-from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.kda import kda_gate_chunk_cumsum
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.kda import kda_gate_chunk_cumsum
 
 CHUNK_SIZE = 64
 

@@ -3,7 +3,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DistilledDiTConfig,
+    Ideogram4DiTConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
@@ -300,3 +303,44 @@ class Ideogram4PipelineConfig(ImagePipelineConfig):
         grid_h = batch.height // patch
         grid_w = batch.width // patch
         return (batch_size, grid_h * grid_w, self.dit_config.arch_config.in_channels)
+
+
+@dataclass
+class Ideogram4DistilledPipelineConfig(Ideogram4PipelineConfig):
+    dit_config: DiTConfig = field(default_factory=Ideogram4DistilledDiTConfig)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ideogram import (
+        Ideogram4FastSamplingParams,
+        Ideogram4InstantSamplingParams,
+        Ideogram4SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Ideogram4FastSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-fast"],
+    )
+    register_configs(
+        sampling_param_cls=Ideogram4InstantSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-instant"],
+    )
+    register_configs(
+        sampling_param_cls=Ideogram4SamplingParams,
+        pipeline_config_cls=Ideogram4PipelineConfig,
+        hf_model_paths=[
+            "ideogram-ai/ideogram-4-fp8",
+            "ideogram-ai/ideogram-4-nf4",
+            "Comfy-Org/Ideogram-4",
+        ],
+        model_detectors=[
+            lambda hf_id: "ideogram4pipeline" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-fp8" in hf_id.lower(),
+            lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
+            lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
+            lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
+        ],
+    )

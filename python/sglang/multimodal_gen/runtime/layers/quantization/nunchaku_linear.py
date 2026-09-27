@@ -6,8 +6,8 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 

@@ -177,19 +177,19 @@ There is one B200 node with 4 (for FP4) GPUs or 8 (for FP4 or FP8) GPUs.  Both F
 If using 4 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 If using 8 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 #### FP8
 
 ```bash
-SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
+SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
 ```
 
 ### Example: Serving with two H200\*8 nodes and docker
@@ -271,7 +271,9 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
+sgl-eval run gsm8k \
+  --base-url http://10.0.0.1:30000/v1 \
+  --num-examples 1319 --num-threads 64
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
@@ -322,13 +324,15 @@ Then on the **master node**, supposing the ShareGPT data is located at `/path/to
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 --num-threads 64
 
 # bench serving
 python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
 ```
 
-> **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
+> **Note: using `--num-threads 200` can accelerate accuracy benchmarking**.
 
 ### Example: Serving with 32 L40S with int8 Quantization
 

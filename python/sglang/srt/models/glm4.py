@@ -23,9 +23,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -94,14 +91,10 @@ class Glm4MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -302,7 +295,7 @@ class Glm4Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -424,7 +417,7 @@ class Glm4ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Glm4Model(

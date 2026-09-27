@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=500, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=275, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -37,12 +37,14 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             "8",
             "--dp",
             "2",
-            "--enable-prefill-context-parallel",
+            "--enable-prefill-cp",
+            "--cp-strategy",
+            "zigzag",
             "--attention-backend",
             "fa3",
             "--mem-frac",
-            "0.7",
-            "--cuda-graph-max-bs",
+            "0.75",
+            "--cuda-graph-max-bs-decode",
             "32",
             "--max-running-requests",
             "32",
@@ -68,18 +70,16 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=32,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (deepseek-v3-mla-cp-in-seq-split)\n"
+                f"### test_a_gsm8k (deepseek-v3-mla-cp-zigzag)\n"
                 f'{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)

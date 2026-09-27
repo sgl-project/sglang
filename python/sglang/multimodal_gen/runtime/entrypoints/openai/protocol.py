@@ -13,6 +13,20 @@ class ImageResponseData(BaseModel):
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
+    resize: Optional[str] = None
+
+
+class ImagePromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ImageUsage(BaseModel):
+    prompt_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    image_count: Optional[int] = None
 
 
 class ImageResponse(BaseModel):
@@ -21,12 +35,18 @@ class ImageResponse(BaseModel):
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    usage: Optional[ImageUsage] = None
 
 
+# Keep request schemas limited to OpenAI fields and stable cross-model SGLang
+# extensions. Model-owned controls travel as allowed extras and are interpreted
+# only after the active SamplingParams subclass is resolved; do not add them to
+# these shared protocol models.
 class ImageGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
+    enhance_prompt: bool = False
     model: Optional[str] = None
     n: Optional[int] = 1
     quality: Optional[str] = "auto"
@@ -59,6 +79,10 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Progressive resolution generation
+    progressive_mode: Optional[str] = None
+    progressive_levels: Optional[int] = None
+    progressive_delta: Optional[float] = None
 
 
 # Video API protocol models
@@ -82,14 +106,19 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    revised_prompt: Optional[str] = None
+    action: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
+    enhance_prompt: bool = False
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
+    video_path: Optional[str] = None
+    video_url: Optional[str] = None
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None
@@ -127,6 +156,9 @@ class VideoGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
 
 
 class VideoListResponse(BaseModel):
@@ -139,6 +171,7 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    enhance_prompt: Literal[False] = False
     type: Literal["init"]
     # WebSocket does not support multipart/form-data image uploads
     first_frame: Optional[bytes | str] = None

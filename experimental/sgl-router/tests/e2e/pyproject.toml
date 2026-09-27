@@ -4,7 +4,7 @@
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-# Default discovery: smoke tests (top-level test_*.py) and the
+# Default discovery: top-level test_*.py files and the
 # multi-worker chat_completions suite. k8s_integration is intentionally
 # not in the default set — it requires a kind/k8s cluster and is
 # invoked explicitly.

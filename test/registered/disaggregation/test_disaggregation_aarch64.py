@@ -8,13 +8,17 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
 QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=125, stage="base-c", runner_config="4-gpu-gb300")
+
+# Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
+NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 120
 
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
@@ -51,8 +55,10 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--nccl-port",
+            str(NCCL_PORT_BASE),
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -72,8 +78,10 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "2",
+            "--nccl-port",
+            str(NCCL_PORT_BASE + 1),
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 4))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

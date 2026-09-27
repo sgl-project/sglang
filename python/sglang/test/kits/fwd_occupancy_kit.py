@@ -51,9 +51,7 @@ class FwdOccupancyMixin:
     # Measurement: one long single-batch request -- max_new_tokens must
     # span several decode_log_interval windows for enough samples.
     fwd_occupancy_max_new_tokens: int = 2048
-    fwd_occupancy_prompt: str = (
-        "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
-    )
+    fwd_occupancy_prompt: str = "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
 
     def _scrape_fwd_occupancy(self):
         """Max non-NaN gauge value across exposed labels (e.g. dp ranks);
@@ -212,15 +210,18 @@ class FwdOccupancyMixin:
         ]
         if avg_accept is not None:
             perf_rows.append(["avg spec accept", f"{avg_accept:.3f}"])
+        # Lead each table with a text title line so the two tables stay
+        # visually separated even when CI prefixes every line with a timestamp
+        # (which turns blank separator lines into non-empty lines).
         print(
-            "\n"
+            "\n[perf metrics]\n"
             + tabulate.tabulate(
                 perf_rows, headers=["perf metric", "value"], tablefmt="github"
             )
         )
 
         print(
-            "\n\n"
+            "\n[fwd_occupancy stats]\n"
             + tabulate.tabulate(
                 [
                     ["samples (n)", len(samples)],

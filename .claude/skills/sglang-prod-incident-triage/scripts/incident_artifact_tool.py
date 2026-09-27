@@ -101,8 +101,7 @@ def format_summary_line(filename: str, result: Dict[str, Any]) -> str:
     if result.get("ok"):
         return f"{filename}: ok"
     return (
-        f"{filename}: failed status={result.get('status')} "
-        f"error={result.get('error')}"
+        f"{filename}: failed status={result.get('status')} error={result.get('error')}"
     )
 
 
@@ -617,7 +616,9 @@ def summarize_dump_file(path: Path, max_requests: int, preview_chars: int) -> st
     time_span = (
         max(timestamps) - min(timestamps)
         if len(timestamps) >= 2
-        else 0.0 if len(timestamps) == 1 else None
+        else 0.0
+        if len(timestamps) == 1
+        else None
     )
 
     lines = [

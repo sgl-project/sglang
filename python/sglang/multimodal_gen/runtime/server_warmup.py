@@ -7,16 +7,24 @@ from typing import Any, Awaitable, Callable
 
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    has_realtime_model_adapter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    auto_residency_args_skip_reason,
+)
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
+    lighten_warmup_req,
     should_include_warmup_image,
+    supports_synthetic_warmup,
 )
 
 logger = init_logger(__name__)
@@ -24,6 +32,13 @@ logger = init_logger(__name__)
 # a 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
 # diffusers image processor requires both dimensions >= 64px)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
+
+
+def _is_ci_log_env() -> bool:
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        or os.environ.get("CI", "").lower() == "true"
+    )
 
 
 def get_first_generation_req(req_or_group: Any) -> Req | None:
@@ -61,43 +76,102 @@ def should_return_warmup_result(req_or_group: Any) -> bool:
 
 
 def should_run_server_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.server_warmup
+    return server_args.warmup_mode == "server"
 
 
 def is_realtime_serving(server_args: ServerArgs) -> bool:
     """Synthetic warmup has no realtime session state."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
-            get_realtime_model_adapter,
-        )
-
-        get_realtime_model_adapter(server_args)
-        return True
-    except Exception:
-        return False
+    return has_realtime_model_adapter(server_args)
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return should_run_server_warmup(server_args) and not is_realtime_serving(
-        server_args
+    return (
+        should_run_server_warmup(server_args)
+        and supports_synthetic_warmup(server_args)
+        and not is_realtime_serving(server_args)
     )
 
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.warmup_resolutions is not None
+    return (
+        server_args.warmup_mode != "off"
+        and server_args.warmup_resolutions is not None
+        and supports_synthetic_warmup(server_args)
+    )
+
+
+def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
+    """Final gate for warmup-calibrated residency placement.
+
+    Only rules out paths the planner was not designed for; the workers
+    re-check per component (explicit placement, FSDP modules, custom
+    strategies, missing sizes) and per measurement.
+    """
+    args_reason = auto_residency_args_skip_reason(server_args)
+    if args_reason is not None:
+        return args_reason
+    if not should_run_synthetic_server_warmup(server_args):
+        return "no synthetic server warmup to calibrate from"
+    return None
+
+
+# Enough to clear a probe that overshot the card, few enough that a failure
+# which is not about probe size gives up quickly instead of walking the
+# workload down to nothing.
+MAX_WARMUP_DEGRADE_ATTEMPTS = 3
+
+
+_OUT_OF_MEMORY_MARKERS = (
+    "out of memory",
+    "outofmemory",
+    "cudaerrormemoryallocation",
+    "cublas_status_alloc_failed",
+    "cannot allocate memory",
+    "unable to allocate",
+)
+
+
+def _is_out_of_memory(error: Any) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in _OUT_OF_MEMORY_MARKERS)
+
+
+def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
+    """Next warmup probe to try after `req` ran the card out of memory.
+
+    Only memory failures are worth retrying smaller; anything else fails the
+    same way at every size and should surface instead of being shrunk away.
+    """
+    lighter = lighten_warmup_req(server_args, req)
+    if lighter is None:
+        return None
+    logger.warning(
+        "%s ran out of memory; retrying warmup at %s",
+        format_warmup_req(req),
+        format_warmup_req(lighter),
+    )
+    return lighter
 
 
 def format_warmup_req(req_or_group: Any) -> str:
     req = get_first_generation_req(req_or_group)
-    prefix = (
-        "server warmup req" if is_server_based_warmup(req_or_group) else "warmup req"
-    )
+    if req is not None and req.extra.get("auto_residency_full_shape_probe"):
+        prefix = "auto residency probe"
+    else:
+        prefix = (
+            "server warmup req"
+            if is_server_based_warmup(req_or_group)
+            else "warmup req"
+        )
     if req is None:
         return prefix
 
-    shape = f"{req.width}x{req.height}"
-    if req.num_frames is not None and req.num_frames > 1:
-        shape += f"x{req.num_frames}f"
+    width = getattr(req, "width", None)
+    height = getattr(req, "height", None)
+    shape = "action" if width is None or height is None else f"{width}x{height}"
+    num_frames = getattr(req, "num_frames", None)
+    if num_frames is not None and num_frames > 1:
+        shape += f"x{num_frames}f"
 
     default_steps = req.extra.get("cache_dit_num_inference_steps")
     if default_steps is not None and default_steps != req.num_inference_steps:
@@ -114,6 +188,8 @@ def build_client_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_input_path: str | None = None,
+    rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> list[Req]:
     warmup_reqs = build_warmup_reqs(
         server_args,
@@ -122,9 +198,16 @@ def build_client_warmup_reqs(
         return_warmup_result=True,
         server_based_warmup=True,
     )
-    warmup_total = len(warmup_reqs)
+    warmup_total = sum(1 for req in warmup_reqs if req.is_warmup)
     for req in warmup_reqs:
-        req.extra["warmup_total"] = warmup_total
+        if req.is_warmup:
+            req.extra["warmup_total"] = warmup_total
+            if step_limit is not None:
+                req.num_inference_steps = min(req.num_inference_steps, step_limit)
+        if rewarm:
+            # a repeat pass after an auto-residency change: keep it out of
+            # the scheduler's warmup progress accounting (already at N/N)
+            req.extra["server_warmup_rewarm"] = True
     return warmup_reqs
 
 
@@ -133,6 +216,8 @@ async def run_async_client_warmup(
     forward: Callable[[Req], Awaitable[OutputBatch]],
     *,
     fail_open: bool = False,
+    rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> None:
     try:
         warmup_input_path = None
@@ -140,14 +225,27 @@ async def run_async_client_warmup(
             warmup_input_path = prepare_warmup_image_path(server_args)
 
         for req in build_client_warmup_reqs(
-            server_args, warmup_input_path=warmup_input_path
+            server_args,
+            warmup_input_path=warmup_input_path,
+            rewarm=rewarm,
+            step_limit=step_limit,
         ):
             response = await forward(req)
+            for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+                if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                lighter = _degrade_after_oom(server_args, req)
+                if lighter is None:
+                    break
+                req = lighter
+                response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
-    except Exception as e:
+    except Exception:
         if fail_open:
-            logger.warning("Synthetic server warmup failed; continuing startup: %s", e)
+            logger.warning(
+                "Synthetic server warmup failed; continuing startup", exc_info=True
+            )
             return
         raise
 
@@ -164,6 +262,14 @@ def run_sync_client_warmup(
         server_args, warmup_input_path=warmup_input_path
     ):
         response = forward(req)
+        for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+            if response.error is None or not _is_out_of_memory(response.error):
+                break
+            lighter = _degrade_after_oom(server_args, req)
+            if lighter is None:
+                break
+            req = lighter
+            response = forward(req)
         if response.error is not None:
             raise RuntimeError(response.error)
 
@@ -199,12 +305,20 @@ class SchedulerWarmupMixin:
         if not self._show_warmup_progress:
             return
 
+        ci_log_env = _is_ci_log_env()
         if self._warmup_progress_bar is None:
             self._warmup_progress_bar = tqdm(
                 total=self._warmup_progress_total(req_or_group),
                 desc="Warmup requests",
                 unit="req",
+                disable=ci_log_env,
             )
+            if ci_log_env:
+                logger.info(
+                    "Warmup requests: 0/%s %s",
+                    self._warmup_progress_bar.total,
+                    self._format_warmup_req(req_or_group),
+                )
         self._warmup_progress_bar.set_postfix_str(
             self._format_warmup_req(req_or_group), refresh=False
         )
@@ -225,8 +339,16 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        progress_n = self._warmup_processed
+        if _is_ci_log_env():
+            logger.info(
+                "Warmup requests: %s/%s %s",
+                progress_n,
+                self._warmup_progress_bar.total,
+                self._format_warmup_req(req_or_group),
+            )
 
-        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
+        if progress_n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()
             self._warmup_progress_bar = None
 
@@ -237,6 +359,18 @@ class SchedulerWarmupMixin:
         is_warmup: bool,
     ) -> None:
         if not is_warmup:
+            return
+
+        req = get_first_generation_req(req_or_group)
+        if req is not None and req.extra.get("server_warmup_rewarm"):
+            # auto-residency re-warm passes repeat already-counted requests;
+            # advancing the bar again would log N+1/N in CI
+            if output_batch.error is not None:
+                logger.warning(
+                    "%s processing failed: %s",
+                    self._format_warmup_req(req_or_group),
+                    output_batch.error,
+                )
             return
 
         server_based_warmup = is_server_based_warmup(req_or_group)
@@ -256,17 +390,16 @@ class SchedulerWarmupMixin:
                 self._logged_server_ready_after_warmup = True
         else:
             warmup_desc = self._format_warmup_req(req_or_group)
-            logger.info(f"{warmup_desc} processing failed")
+            logger.warning("%s processing failed: %s", warmup_desc, output_batch.error)
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: list[tuple[bytes, Any]]
     ) -> list[tuple[bytes, Any]]:
         if (
             self.req_based_warmup_scheduled
-            or not self.server_args.warmup
+            or self.server_args.warmup_mode != "request"
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
-            or self.server_args.server_warmup
         ):
             return recv_reqs
 

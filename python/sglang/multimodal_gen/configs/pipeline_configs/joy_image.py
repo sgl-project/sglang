@@ -93,7 +93,6 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
 
         while height >= step_height:
             if max(height, width) / min(height, width) <= max_ratio:
-                ratio = height / width
                 buckets.append((1, 1, 1, height, width))
             # Try to increase width or decrease height
             if height * (width + step_width) <= target_pixels:
@@ -429,3 +428,21 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
         cond_norm = torch.norm(noise_pred_cond, dim=2, keepdim=True)
         noise_norm = torch.norm(noise_pred, dim=2, keepdim=True).clamp_min(1e-12)
         return noise_pred * (cond_norm / noise_norm)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.joy_image import (
+        JoyImageEditSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=JoyImageEditSamplingParams,
+        pipeline_config_cls=JoyImageEditPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )

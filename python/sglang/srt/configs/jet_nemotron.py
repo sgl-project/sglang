@@ -8,6 +8,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
     mamba2_state_dtype,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass
@@ -56,7 +57,6 @@ class JetNemotronConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         jet_block_config = JetBlockConfig(**self.efficient_attention_config["jet"])
 
@@ -66,7 +66,7 @@ class JetNemotronConfig(PretrainedConfig):
         total_v_dim = num_heads * head_v_dim
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=total_v_dim,
             n_groups=num_heads,
             num_heads=num_heads,

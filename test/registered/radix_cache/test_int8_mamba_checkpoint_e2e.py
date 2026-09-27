@@ -12,7 +12,7 @@ path is exercised:
   * test_gsm8k — end-to-end task accuracy holds.
 
 NOTE: the int8 checkpoint is only engaged when a cached prefix is reused FROM the
-int8 pool, which requires ``--mamba-scheduler-strategy extra_buffer`` — the default
+int8 pool, which requires ``--mamba-radix-cache-strategy extra_buffer`` — the default
 ``no_buffer`` only snapshots the recurrent state at the full-sequence leaf, so a
 fixed-prefix / divergent-question workload reuses ~0 mamba state and the int8 path
 would never fire.
@@ -27,16 +27,21 @@ from urllib.parse import urlparse
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.test_utils import DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+from sglang.test.server_fixtures.default_fixture import (
+    DefaultServerBase,
+)
+from sglang.test.test_utils import (
+    DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
+)
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=172, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
     """int8 mamba checkpoint pool on Qwen3-Next-80B-A3B (GDN-hybrid)."""
 
     model = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
 
     # Cache-hit KL: int8 is a lossy codec, so its cache-hit divergence is
     # inherently larger than the bf16/fp8 reuse the other KL tests bound (~0.005),
@@ -64,7 +69,7 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
         "--mem-fraction-static",
         "0.7",
         "--enable-int8-mamba-checkpoint",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
     ]
 
@@ -78,7 +83,7 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=512,
             parallel=self.parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)
