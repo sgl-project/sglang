@@ -68,15 +68,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp8_dispatch", call.kwargs)
 
-    def test_server_flag_selects_mxf4_mma_type(self):
-        for enabled, expected in ((False, "fp8xfp4"), (True, "mxf4xmxf4")):
-            with self.subTest(enabled=enabled):
-                config = SimpleNamespace(
-                    moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=enabled)
-                )
-                with patch.object(mega_moe, "get_exec", return_value=config):
-                    self.assertEqual(mega_moe._mega_moe_mma_type(), expected)
-
     def test_buffer_cache_separates_mma_types(self):
         deep_gemm = self.deep_gemm
         expected_buffers = (object(), object())

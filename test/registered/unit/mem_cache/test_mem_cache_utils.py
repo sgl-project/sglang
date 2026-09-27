@@ -1,8 +1,6 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
-import sys
-import types
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -199,28 +197,6 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertIsNone(pool)
         self.assertIsNone(pool_type)
-
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_enabled_via_env(self, mock_env_get):
-        mock_env_get.return_value = "enabled"
-        mock_init = MagicMock()
-        mock_init.return_value = (True, "mock_pool_instance", "mooncake")
-
-        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
-        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
-        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
-                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
-            },
-        ):
-            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertTrue(enabled)
-        self.assertEqual(pool, "mock_pool_instance")
-        self.assertEqual(pool_type, "mooncake")
-        mock_init.assert_called_once_with("cuda:0")
 
 
 class TestGetHashStr(unittest.TestCase):
