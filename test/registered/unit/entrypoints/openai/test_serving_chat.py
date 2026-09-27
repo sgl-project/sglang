@@ -30,7 +30,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -39,10 +41,15 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
+)
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -57,6 +64,26 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
 _ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
+
+_RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{content}",
+                },
+            },
+        },
+    },
+}
 
 
 def _spec_result(index):
@@ -619,6 +646,80 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_response_template_prefix_uses_prompt_token_ids(self):
+        class ResponseTemplateAlias(ResponseTemplateToolDetector):
+            pass
+
+        processed_messages = MessageProcessingResult(
+            "prompt decoded with default spacing",
+            [1, 2, 3],
+            None,
+            None,
+            [],
+            [],
+            None,
+        )
+        self.chat.tool_call_parser = "response-template-alias"
+        self.basic_req.input_ids = [1, 2, 3]
+        self.basic_req.tools = [
+            Tool(function=Function(name="get_weather", parameters={}))
+        ]
+        self.basic_req.tool_choice = "auto"
+        self.tm.tokenizer.decode.return_value = "<first><second>"
+
+        with (
+            patch.dict(
+                FunctionCallParser.ToolCallParserEnum,
+                {"response-template-alias": ResponseTemplateAlias},
+            ),
+            patch.object(
+                self.chat,
+                "_process_messages",
+                return_value=processed_messages,
+            ),
+        ):
+            _, request = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(request._response_parser_prefix, "<first><second>")
+        self.tm.tokenizer.decode.assert_called_once_with(
+            [1, 2, 3],
+            skip_special_tokens=False,
+            spaces_between_special_tokens=False,
+        )
+
+    def test_response_template_prefix_uses_engine_prompt_text(self):
+        processed_messages = MessageProcessingResult(
+            "exact engine prompt",
+            [],
+            None,
+            None,
+            [],
+            [],
+            None,
+        )
+        self.chat.reasoning_parser = "response_template"
+        self.chat._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template=_RESPONSE_TEMPLATE,
+            prefix="",
+        )
+        self.tm.model_config.is_multimodal = True
+
+        def process_messages(request, _):
+            self.assertIsNone(request.chat_template_kwargs)
+            return processed_messages
+
+        with patch.object(
+            self.chat,
+            "_process_messages",
+            side_effect=process_messages,
+        ):
+            adapted, request = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(request._response_parser_prefix, "exact engine prompt")
+        self.assertFalse(request.skip_special_tokens)
+        self.assertFalse(adapted.sampling_params["spaces_between_special_tokens"])
+        self.tm.tokenizer.decode.assert_not_called()
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
@@ -2917,6 +3018,65 @@ class ServingChatTestCase(unittest.TestCase):
             any(c.get("usage") is not None for c in after_error),
             "usage chunk dropped after error abort",
         )
+
+    def test_truncated_response_template_call_keeps_stop_without_arguments(self):
+        self.chat.tool_call_parser = "response_template"
+        self.tm.tokenizer.response_template = _RESPONSE_TEMPLATE
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        request._response_parser_prefix = "<assistant>"
+
+        async def generate():
+            yield {
+                "text": '<call:get_weather>{"city":',
+                "meta_info": {
+                    "id": "chatcmpl-truncated-call",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": "CUSTOM_STOP"},
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request = Mock(return_value=generate())
+        adapted_request = GenerateReqInput(
+            text="<assistant>",
+            sampling_params={},
+            stream=True,
+        )
+
+        chunks = self._run_chat_stream(adapted_request, request)
+        parsed = self._parse_chunks(chunks)
+        arguments = "".join(
+            tool_call["function"]["arguments"]
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+            for tool_call in choice.get("delta", {}).get("tool_calls", [])
+        )
+        finish = next(
+            choice
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+            if choice.get("finish_reason") is not None
+        )
+
+        self.assertEqual(arguments, "")
+        self.assertEqual(finish["finish_reason"], "stop")
+        self.assertEqual(finish["matched_stop"], "CUSTOM_STOP")
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
