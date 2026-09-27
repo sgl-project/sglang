@@ -57,6 +57,10 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.req_time_stats import (
+    set_spec_verify_end_time_batch,
+    set_time_batch,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -1457,6 +1461,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group,
@@ -1467,6 +1472,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(
@@ -1965,7 +1971,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
-        return run_eagle_verify(
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+        result = run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             target_worker=self.target_worker,
@@ -1980,3 +1987,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
         )
+        set_spec_verify_end_time_batch(batch.reqs, result.accept_lens)
+        return result
