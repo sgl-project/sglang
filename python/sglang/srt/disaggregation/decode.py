@@ -2678,13 +2678,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if requires_host_drain:
                     decode_req.kv_receiver.abort()
-                if requires_host_drain or (
+                deferrable = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
+                )
+                if deferrable and not decode_req.kv_receiver.abort_notified:
+                    # A failure decode did not initiate (prefill fault, transport
+                    # error, hicache restore failure) can still have sibling-rank
+                    # writes in flight toward these pages; tell every prefill
+                    # rank to stop and drain-ack, so the hold arms for every
+                    # failure kind, not only decode-initiated aborts.
+                    decode_req.kv_receiver.ensure_abort_notified()
+                if requires_host_drain or (
+                    deferrable and decode_req.kv_receiver.abort_notified
                 ):
-                    # Host pages always await a drain ack. Device pages retain
-                    # the existing opt-in deferred-release behavior.
+                    # Host pages always await a drain ack. A receiver that could
+                    # not notify (metadata never published, so no prefill holds
+                    # its destination info) has nothing in flight and releases
+                    # immediately below.
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)

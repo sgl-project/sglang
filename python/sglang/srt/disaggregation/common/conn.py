@@ -2020,6 +2020,12 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        self.ensure_abort_notified()
+
+    def ensure_abort_notified(self) -> None:
+        """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
+        Unlike abort(), does not overwrite the recorded root cause -- callable
+        for an already-Failed room whose failure decode did not initiate."""
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
