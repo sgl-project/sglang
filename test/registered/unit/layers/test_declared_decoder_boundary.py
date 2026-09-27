@@ -1899,6 +1899,146 @@ class TestPrefillCP(CustomTestCase):
                 self.assertIs(communicator._batch_steps(fb), expected)
 
 
+class TestBranchRows(CustomTestCase):
+    """Two FFNs that branch from one input and merge again (LongCat's MoE and
+    dense branch): each layer's communicator gives the rows of its FFN input,
+    of its residual while the FFN runs and of what it hands on, and a complete
+    value moves between them."""
+
+    local = comm.Layout(frozenset({TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER}))
+    attention = comm.Layout(frozenset({TokenAxis.ATTN_DP}))
+    full = comm.Layout(frozenset())
+
+    def rows(self, communicator, parallel, cp_extend=False):
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: cp_extend)
+        )
+        with (
+            planning(parallel),
+            patch.object(comm, "get_forward", lambda: SimpleNamespace(sp_active=False)),
+            patch.object(
+                comm,
+                "get_attn_tp_context",
+                lambda: SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(comm, "moe_cp_gathered_rows", lambda fb: [2, 1]),
+        ):
+            return communicator._branch_rows(batch)
+
+    def test_each_branch_declares_its_rows(self):
+        parallel = parallel_of(attn_dp=2, attn_tp=2)
+        dense = build(layer_facts(2, 6), parallel)
+        self.assertEqual(
+            self.rows(dense, parallel), (self.full, self.attention, self.attention)
+        )
+        for a2a, expected in (
+            (True, (self.local, self.local, self.local)),
+            (False, (self.full, self.attention, self.attention)),
+        ):
+            with self.subTest(a2a=a2a):
+                moe = build(
+                    layer_facts(1, 3, sparse=True, previous_sparse=True),
+                    parallel,
+                    a2a=a2a,
+                )
+                self.assertEqual(self.rows(moe, parallel), expected)
+
+    def test_a_batch_on_other_steps_has_no_branch_rows(self):
+        parallel = parallel_of(attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=True)
+        communicator = build(layer_facts(1, 3), parallel)
+        with self.assertRaises(NotImplementedError):
+            self.rows(communicator, parallel, cp_extend=True)
+
+    def test_branches_move_between_the_declared_rows(self):
+        # An a2a MoE beside a dense FFN, under attention DP and TP.
+        class Communicator(SimpleNamespace):
+            branch_input = LayerCommunicator.branch_input
+            branch_output = LayerCommunicator.branch_output
+            merge_branch = LayerCommunicator.merge_branch
+
+        moe = Communicator(_branch_rows=lambda fb: (self.local, self.local, self.local))
+        dense = Communicator(
+            _branch_rows=lambda fb: (self.full, self.attention, self.attention)
+        )
+        moves = []
+
+        def recorded(value, rows, to, forward_batch):
+            moves.append((value, rows, to))
+            return value
+
+        with patch.object(comm, "move_rows", recorded):
+            dense.branch_input(moe, "h0", "residual", None)
+            self.assertEqual(
+                moves,
+                [
+                    ("h0", self.local, self.full),
+                    ("residual", self.local, self.attention),
+                ],
+            )
+            moves.clear()
+            moe.branch_output("shortcut", None)
+            self.assertEqual(moves, [("shortcut", self.local, self.local)])
+            moves.clear()
+            merged = moe.merge_branch(1, 2, "residual", dense, None)
+            self.assertEqual(
+                moves,
+                [
+                    (2, self.attention, self.local),
+                    ("residual", self.attention, self.local),
+                ],
+            )
+            # The contribution adds; the residual is the dense branch's.
+            self.assertEqual(merged, (3, "residual"))
+
+    def test_a_value_is_gathered_then_cut_in_order(self):
+        # Stand-ins that change the rows distinctly, so the order of the moves shows.
+        def tp_gather(h):
+            return torch.cat([h, h])
+
+        def dp_gather(h):
+            return torch.cat([h, h + 100])
+
+        def dp_scatter(h):
+            return h[: len(h) // 2]
+
+        def tp_cut(h):
+            return h[len(h) // 2 :]
+
+        value = torch.arange(4.0).view(4, 1)
+        with (
+            patch.object(comm, "_redistribute_from_attn_tp_shards", tp_gather),
+            patch.object(comm, "_redistribute_input_to_dp", lambda h, fb: dp_gather(h)),
+            patch.object(comm, "_to_local_tokens", lambda step, fb, h: dp_scatter(h)),
+            patch.object(
+                comm,
+                "get_parallel",
+                lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=1),
+            ),
+        ):
+            for rows, to, expected in (
+                (self.local, self.full, dp_gather(tp_gather(value))),
+                (self.local, self.attention, tp_gather(value)),
+                (self.attention, self.local, tp_cut(value)),
+                (self.full, self.attention, dp_scatter(value)),
+                (self.full, self.local, tp_cut(dp_scatter(value))),
+                (self.attention, self.attention, value),
+            ):
+                with self.subTest(rows=rows, to=to):
+                    self.assertTrue(
+                        torch.equal(comm.move_rows(value, rows, to, None), expected)
+                    )
+            cp = comm.Layout(frozenset({TokenAxis.ATTN_CP}))
+            for rows, to in (
+                (comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER})), self.attention),
+                (cp, self.full),
+            ):
+                with (
+                    self.subTest(rows=rows, to=to),
+                    self.assertRaises(NotImplementedError),
+                ):
+                    comm.move_rows(value, rows, to, None)
+
+
 # ---------------------------------------------------------------------------
 # Two consecutive layers, rank by rank.
 

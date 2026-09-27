@@ -18,34 +18,29 @@ class TestLongcatShortcut(CustomTestCase):
         """On the last layer with scattered MoE tokens, the shortcut output must
         not add the residual a second time; the dense branch already carries it."""
         tp, rows = 2, 4
-        modes = comm.ScatterMode
-        context = comm.CommunicateContext(
-            process_group_sizes={
-                modes.SCATTERED: 1,
-                modes.TP_ATTN_FULL: tp,
-                modes.FULL: tp,
-            },
-            attn_tp_rank=0,
-            attn_tp_size=tp,
-            attn_dp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            tp_size=tp,
-            tp_rank=0,
-        )
-        postprocess = comm.CommunicateSummableTensorPairFn.get_fn(
-            modes.SCATTERED, modes.SCATTERED, modes.TP_ATTN_FULL, context
-        )
+        # The MoE runs on each attention-TP rank's slice; the last layer hands on
+        # the attention's rows, where the dense branch ends.
+        local = comm.Layout(frozenset({comm.TokenAxis.ATTN_TP_SCATTER}))
+        attention = comm.Layout(frozenset())
+
+        class Communicator(SimpleNamespace):
+            branch_output = comm.LayerCommunicator.branch_output
+            merge_branch = comm.LayerCommunicator.merge_branch
+
         fork_hidden = torch.full((rows // tp, 3), 2.0)
         fork_residual = torch.full_like(fork_hidden, 5.0)
-        preparation = SimpleNamespace(
+        moe_communicator = Communicator(
             prepare_attn=lambda h, r, batch: (h, r),
             prepare_mlp=lambda h, r, batch: (fork_hidden, fork_residual),
-            postprocess_layer=lambda h, r, batch: postprocess(h, r, batch, context),
+            _branch_rows=lambda batch: (local, local, attention),
+        )
+        dense_communicator = Communicator(
+            _branch_rows=lambda batch: (attention, attention, attention)
         )
         layer = LongcatFlashDecoderLayer.__new__(LongcatFlashDecoderLayer)
         nn.Module.__init__(layer)
-        layer.moe_layer_communicator = preparation
+        layer.moe_layer_communicator = moe_communicator
+        layer.mlp_layer_communicator = [None, dense_communicator]
         layer.self_attn = [lambda **kw: kw["hidden_states"]]
         layer.mlp = nn.Identity()
         layer.forward_mlp = Mock(
