@@ -428,7 +428,9 @@ def test_custom_text_stages_preserve_group_reuse_and_request_metadata(fsdp, stag
     def requests():
         return [
             Req(
-                sampling_params=SamplingParams(prompt=prompt, height=64, width=64),
+                sampling_params=SamplingParams(
+                    prompt=prompt, negative_prompt="", height=64, width=64
+                ),
                 do_classifier_free_guidance=False,
             )
             for prompt in ("hello", "different", "hello")
