@@ -24,7 +24,6 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.communicator.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.communicator.boundary import (
@@ -47,7 +46,6 @@ from sglang.srt.layers.communicator.boundary import (
 from sglang.srt.layers.communicator.layout import (
     CommunicateContext,
     Layout,
-    ScatterMode,
     SumGroup,
     TokenAxis,
     _batch_shards_over_cp,
@@ -56,7 +54,6 @@ from sglang.srt.layers.communicator.layout import (
     _gathers_over_attention_cp,
     _generic_prefill_cp_shards_tokens,
     _sum_group,
-    enable_dwdp,
     enable_moe_dense_fully_dp,
     sparse_moe_gathers_over_moe_cp,
     token_axis_sizes,
@@ -83,7 +80,6 @@ from sglang.srt.layers.communicator.residual.add_norm import (
     apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.communicator.residual.mhc import MHCState
-from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
@@ -94,7 +90,6 @@ from sglang.srt.layers.moe import (
     is_moe_input_scattered_across_dp_ranks,
     post_experts_reduction_group,
     post_experts_sum_is_one_all_reduce,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -113,130 +108,38 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
 @dataclass
-class _LayerModeComputationContext:
-    num_layers: int
-    layer_id: int
-    is_layer_sparse: bool
-    is_previous_layer_sparse: Optional[bool]
-    is_next_layer_sparse: Optional[bool]
+class LayerFacts:
+    """Where a layer sits in the model and whether it and its neighbours have a
+    sparse MLP: the facts its boundaries are declared from."""
 
-    def previous_layer(self):
-        assert self.is_previous_layer_sparse is not None
-        return _LayerModeComputationContext(
-            num_layers=self.num_layers,
-            layer_id=self.layer_id - 1,
-            is_layer_sparse=self.is_previous_layer_sparse,
-            is_previous_layer_sparse=None,
-            is_next_layer_sparse=self.is_layer_sparse,
-        )
-
-
-def sparse_mlp_scatter_mode() -> ScatterMode:
-    """SCATTERED hands a sparse MLP this rank's own token shard; FULL and
-    MOE_FULL hand it a buffer gathered over the attn-TP or MoE-CP group."""
-    if (
-        # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-        not get_moe_a2a_backend().is_none()
-        or should_use_flashinfer_cutlass_moe_fp4_allgather()
-        or enable_dwdp()
-    ):
-        return ScatterMode.SCATTERED
-    # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
-    if is_enable_moe_cp_allgather() and not (
-        is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
-    ):
-        return ScatterMode.MOE_FULL
-    return ScatterMode.FULL
-
-
-@dataclass
-class LayerScatterModes:
-    layer_input_mode: ScatterMode
-    attn_mode: ScatterMode
-    # Can be further split into e.g. mlp_input_mode and mlp_output_mode if needed
-    mlp_mode: ScatterMode
-    middle_residual_mode: ScatterMode
-    layer_output_mode: ScatterMode
     is_layer_sparse: bool = False
     # The model's first layer: its input is the embedding, not a layer output.
     is_first_layer: bool = False
     # The model's last layer: its output goes to the final norm, not a next layer.
     is_last_layer: bool = False
-    # Whether the layer before this one has a sparse MLP; None when the modes
+    # Whether the layer before this one has a sparse MLP; None when the facts
     # were given directly, not planned from the layer sequence.
     is_previous_layer_sparse: Optional[bool] = None
     # Whether the layer after this one has a sparse MLP; None likewise.
     is_next_layer_sparse: Optional[bool] = None
 
     @classmethod
-    def init_new(cls, **kwargs):
-        context = _LayerModeComputationContext(**kwargs)
+    def init_new(
+        cls,
+        *,
+        layer_id: int,
+        num_layers: int,
+        is_layer_sparse: bool,
+        is_previous_layer_sparse: Optional[bool],
+        is_next_layer_sparse: Optional[bool],
+    ) -> "LayerFacts":
         return cls(
-            layer_input_mode=cls._compute_layer_input_mode(context),
-            attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=cls._compute_mlp_mode(context),
-            middle_residual_mode=cls._compute_middle_residual_mode(context),
-            layer_output_mode=cls._compute_layer_output_mode(context),
-            is_layer_sparse=context.is_layer_sparse,
-            is_first_layer=context.layer_id == 0,
-            is_last_layer=context.layer_id == context.num_layers - 1,
-            is_previous_layer_sparse=context.is_previous_layer_sparse,
-            is_next_layer_sparse=context.is_next_layer_sparse,
+            is_layer_sparse=is_layer_sparse,
+            is_first_layer=layer_id == 0,
+            is_last_layer=layer_id == num_layers - 1,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
-
-    @classmethod
-    def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
-        if context.layer_id == 0:
-            return ScatterMode.model_input_output()
-        return cls._compute_layer_output_mode(context.previous_layer())
-
-    @classmethod
-    def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
-        if context.is_layer_sparse:
-            return sparse_mlp_scatter_mode()
-        else:
-            if enable_moe_dense_fully_dp():
-                return ScatterMode.SCATTERED
-            # A TP-sharded dense MLP reduces over the whole TP group, which spans
-            # every CP rank; a CP-sharded prefill must gather tokens across CP
-            # first or the all-reduce sums different tokens' partial outputs.
-            # MLA/DSA CP models gather over the attention-CP group instead.
-            if _generic_prefill_cp_shards_tokens() and not (
-                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
-            ):
-                return ScatterMode.MOE_FULL
-            return ScatterMode.FULL
-
-    @classmethod
-    def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
-        return (
-            not context.is_layer_sparse
-            and context.is_next_layer_sparse
-            and enable_moe_dense_fully_dp()
-            and get_exec().overlap.enable_two_batch_overlap
-        )
-
-    @classmethod
-    def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
-        if mlp_mode == ScatterMode.SCATTERED:
-            return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
-            return ScatterMode.TP_ATTN_FULL
-        raise NotImplementedError
-
-    @classmethod
-    def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
-        if context.layer_id == context.num_layers - 1:
-            return ScatterMode.model_input_output()
-        if mlp_mode == ScatterMode.SCATTERED:
-            if cls._should_gather_for_tbo(context):
-                return ScatterMode.TP_ATTN_FULL
-            return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
-            return ScatterMode.TP_ATTN_FULL
-        raise NotImplementedError
 
 
 def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
@@ -329,7 +232,7 @@ class LayerCommunicator:
 
     def __init__(
         self,
-        layer_scatter_modes: LayerScatterModes,
+        layer_facts: LayerFacts,
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
@@ -349,11 +252,11 @@ class LayerCommunicator:
         # The fused kernels a backend gives the layer, tried before its own.
         fusions: Optional[LayerFusions] = None,
     ):
-        self.layer_scatter_modes = layer_scatter_modes
+        self.layer_facts = layer_facts
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
-        self.is_last_layer = layer_scatter_modes.is_last_layer
+        self.is_last_layer = layer_facts.is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
@@ -425,7 +328,7 @@ class LayerCommunicator:
                     residual,
                 ),
                 attention_fusions=self._attn_input_fusions,
-                enters_stack=self.layer_scatter_modes.is_first_layer,
+                enters_stack=self.layer_facts.is_first_layer,
             )
             if layernorm_sp.layernorm_sp_enabled()
             else None
@@ -514,7 +417,7 @@ class LayerCommunicator:
         hold every token on each CP rank. An active LayerNorm SP region and
         input-scattered attention have their own. Raises NotImplementedError
         for the combinations the steps do not cover."""
-        modes = self.layer_scatter_modes
+        modes = self.layer_facts
         parallel = get_parallel()
         if not (modes.is_first_layer or modes.is_previous_layer_sparse is not None):
             raise NotImplementedError(
@@ -639,7 +542,7 @@ class LayerCommunicator:
             scattered = scattered_residual_layer_sides(
                 axis_sizes=token_axis_sizes(),
                 ffn_group=sides.ffn_output.group,
-                is_first_layer=self.layer_scatter_modes.is_first_layer,
+                is_first_layer=self.layer_facts.is_first_layer,
                 is_last_layer=self.is_last_layer,
                 leaves_for_reduce_scatter=self.allow_reduce_scatter,
             )
@@ -649,7 +552,7 @@ class LayerCommunicator:
             with_residual(scattered, self._residual),
             attention_handoff=handoff,
             attention_fusions=self._attn_input_fusions,
-            enters_stack=self.layer_scatter_modes.is_first_layer,
+            enters_stack=self.layer_facts.is_first_layer,
         )
 
     def _steps_from_declarations(
@@ -659,7 +562,7 @@ class LayerCommunicator:
         return _select_boundary_steps(
             sides,
             attention_fusions=self._attn_input_fusions,
-            enters_stack=self.layer_scatter_modes.is_first_layer,
+            enters_stack=self.layer_facts.is_first_layer,
             **kwargs,
         )
 
@@ -748,7 +651,7 @@ class LayerCommunicator:
         # The SP region opens at the first layer, re-evaluated per forward so a
         # crash mid-loop cannot leak into the next one. It sets what the batch's
         # steps are chosen from, and the first layer's input owes nothing.
-        if self._sp_steps is not None and self.layer_scatter_modes.is_first_layer:
+        if self._sp_steps is not None and self.layer_facts.is_first_layer:
             get_forward().set(
                 "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
             )
@@ -1041,7 +944,7 @@ class LayerCommunicator:
                 forward_batch=forward_batch,
                 context=self._context,
                 allow_reduce_scatter=self.allow_reduce_scatter,
-                is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+                is_layer_sparse=self.layer_facts.is_layer_sparse,
             )
         update = steps.ffn_output.update
         if residual is not None and update.at_producer:
@@ -1135,13 +1038,6 @@ class LayerCommunicator:
         if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
             return hidden_states, residual
         return reduce_output(hidden_states), residual
-
-    def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
-        """Whether the FFN leaves its sum to a reduce-scatter, for layers that run
-        their FFN outside ffn_exit."""
-        return self._ffn_leaves_sum_to_reduce_scatter(
-            forward_batch, self._postprocess_dp_step(forward_batch)
-        )
 
     def _select_ffn_exit_fusions(
         self,
@@ -1359,7 +1255,7 @@ class MHCLayerCommunicator(LayerCommunicator):
 
     def __init__(
         self,
-        layer_scatter_modes: LayerScatterModes,
+        layer_facts: LayerFacts,
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
@@ -1377,9 +1273,9 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
             hc_ffn_post_pre=hc_ffn_post_pre,
-            is_last_layer=layer_scatter_modes.is_last_layer,
+            is_last_layer=layer_facts.is_last_layer,
         )
-        if layer_scatter_modes.is_layer_sparse and sparse_moe_gathers_over_moe_cp():
+        if layer_facts.is_layer_sparse and sparse_moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "MHCLayerCommunicator does not support a MoE gathered over the "
                 "MoE-CP group (moe_dp_size < attention_context_parallel_size). "
@@ -1388,7 +1284,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         # The postprocess writes the FFN output into the streams, so the FFN's
         # sum never waits for the next layer.
         super().__init__(
-            layer_scatter_modes,
+            layer_facts,
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,

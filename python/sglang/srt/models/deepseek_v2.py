@@ -69,7 +69,7 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
@@ -2576,7 +2576,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -2643,7 +2643,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
             fusions = CuteDSLFusion()
         return LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=input_layernorm,
             post_attention_layernorm=post_attention_layernorm,
             allow_reduce_scatter=True,

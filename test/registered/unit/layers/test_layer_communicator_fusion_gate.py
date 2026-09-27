@@ -10,7 +10,6 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     Layout,
-    ScatterMode,
     StageOutput,
     SumGroup,
     TokenAxis,
@@ -83,18 +82,11 @@ def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
     )
 
 
-def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
+def _fake_communicator(ffn_sum_is_movable=True):
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._speculative_algo = None
-    communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=mlp_mode)
-    # Fixed at construction by the scatter-mode path from the MLP's mode.
-    communicator._steps = _steps(
-        ffn_sum_is_movable=mlp_mode
-        not in (
-            ScatterMode.MOE_FULL,
-            ScatterMode.SCATTERED,
-        )
-    )
+    # An FFN gathered over MoE-CP or on each rank's own rows has no movable sum.
+    communicator._steps = _steps(ffn_sum_is_movable=ffn_sum_is_movable)
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
     communicator._cp_steps = None
@@ -320,7 +312,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         moe_ep_size,
         moe_tp_size,
         moe_dp_size=1,
-        mlp_mode=ScatterMode.TP_ATTN_FULL,
+        ffn_sum_is_movable=True,
     ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
@@ -340,7 +332,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                _fake_communicator(mlp_mode), forward_batch
+                _fake_communicator(ffn_sum_is_movable), forward_batch
             )
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
@@ -358,14 +350,12 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
-    def test_moe_full_layer_does_not_fuse(self):
+    def test_a_layer_gathered_over_moe_cp_does_not_fuse(self):
         # Fusion skips postprocess_layer, which holds the CP scatter; a dense
-        # MOE_FULL layer (moe_dp_size == attn_cp_size) is not caught by the
-        # is_enable_moe_cp_allgather gate.
+        # layer gathered over the MoE-CP group (moe_dp_size == attn_cp_size) is
+        # not caught by the is_enable_moe_cp_allgather gate.
         self.assertFalse(
-            self._should_fuse(
-                moe_ep_size=1, moe_tp_size=4, mlp_mode=ScatterMode.MOE_FULL
-            )
+            self._should_fuse(moe_ep_size=1, moe_tp_size=4, ffn_sum_is_movable=False)
         )
 
 

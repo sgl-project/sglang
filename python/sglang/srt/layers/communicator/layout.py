@@ -71,30 +71,6 @@ class SumGroup(Enum):
     MOE_OUTPUT = auto()
 
 
-class ScatterMode(Enum):
-    """
-    Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
-    Model input/output: [ab, ab, cd, cd] for four ranks respectively
-    SCATTERED: [a, b, c, d]
-    TP_ATTN_FULL: [ab, ab, cd, cd], i.e. all ranks inside a TP attn group have full data of the group
-    FULL: [abcd, abcd, abcd, abcd]
-    MOE_FULL: full within the MoE group (cp_per_moe CP chunks), used when moe_dp_size < attn_cp_size
-    """
-
-    SCATTERED = auto()
-    TP_ATTN_FULL = auto()
-    FULL = auto()
-    MOE_FULL = auto()
-
-    @staticmethod
-    def model_input_output():
-        """The scatter mode for model forward pass input and output data"""
-        if is_dsa_enable_prefill_cp() or is_mla_cp_enabled():
-            return ScatterMode.SCATTERED
-
-        return ScatterMode.TP_ATTN_FULL
-
-
 def enable_moe_dense_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
 
@@ -103,10 +79,6 @@ def _generic_prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()
     return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
-
-
-def enable_dwdp():
-    return get_parallel().dwdp_size > 1
 
 
 def _batch_size(forward_batch: ForwardBatch) -> int:
@@ -124,7 +96,6 @@ def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
 
 @dataclass
 class CommunicateContext:
-    process_group_sizes: Dict[ScatterMode, int]
     attn_tp_rank: int
     attn_tp_size: int
     attn_dp_size: int
@@ -144,18 +115,7 @@ class CommunicateContext:
         attn_cp_rank = get_parallel().attn_cp_rank
         tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        moe_cp_size = get_moe_cp_size()
-        process_group_sizes = {
-            ScatterMode.SCATTERED: 1,
-            ScatterMode.TP_ATTN_FULL: attn_tp_size,
-            # TODO: support --moe-dense-tp-size > 1
-            # With context parallel enabled, we should exclude
-            # the attn_cp_size from the total tp_size
-            ScatterMode.FULL: tp_size // attn_cp_size,
-            ScatterMode.MOE_FULL: tp_size // (attn_cp_size // moe_cp_size),
-        }
         return cls(
-            process_group_sizes=process_group_sizes,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,

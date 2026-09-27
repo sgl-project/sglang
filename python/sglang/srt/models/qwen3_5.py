@@ -45,7 +45,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1104,7 +1104,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_layer_sparse,
@@ -1124,7 +1124,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
@@ -1306,7 +1306,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_layer_sparse,
@@ -1328,7 +1328,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,

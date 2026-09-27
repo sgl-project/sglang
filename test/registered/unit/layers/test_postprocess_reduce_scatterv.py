@@ -15,8 +15,7 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
+    LayerFacts,
 )
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.moe import utils as moe_utils
@@ -155,26 +154,17 @@ class TestPostprocessReduceScatterv(CustomTestCase):
             postprocess_sums(allow_reduce_scatter=False, is_layer_sparse=False)
         )
 
-    def test_layer_modes_record_whether_the_layer_is_sparse(self):
+    def test_layer_facts_record_whether_the_layer_is_sparse(self):
         for sparse in (False, True):
-            with (
-                self.subTest(sparse=sparse),
-                patch_communicator(
-                    "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
-                ),
-                patch_communicator("enable_moe_dense_fully_dp", return_value=False),
-                patch_communicator(
-                    "_generic_prefill_cp_shards_tokens", return_value=False
-                ),
-            ):
-                modes = LayerScatterModes.init_new(
+            with self.subTest(sparse=sparse):
+                facts = LayerFacts.init_new(
                     layer_id=1,
                     num_layers=4,
                     is_layer_sparse=sparse,
                     is_previous_layer_sparse=sparse,
                     is_next_layer_sparse=sparse,
                 )
-            self.assertEqual(modes.is_layer_sparse, sparse)
+            self.assertEqual(facts.is_layer_sparse, sparse)
 
     def test_postprocess_passes_the_layer_sparsity(self):
         seen = {}
@@ -184,7 +174,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         communicator._cp_steps = None
         communicator._context = None
         communicator.allow_reduce_scatter = False
-        communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
+        communicator.layer_facts = types.SimpleNamespace(is_layer_sparse=True)
         communicator._steps = steps(
             ffn_output_move=lambda **kwargs: seen.update(kwargs) or (None, None)
         )
@@ -282,7 +272,7 @@ class TestLongcatNextnReducesItsMlp(CustomTestCase):
             ),
             patch.object(nextn, "RMSNorm"),
             patch.object(nextn, "get_parallel"),
-            patch.object(nextn, "LayerScatterModes"),
+            patch.object(nextn, "LayerFacts"),
             patch.object(nextn, "LayerCommunicator"),
         ):
             nextn.LongcatFlashDenseDecoderLayer(config, layer_id=0)
