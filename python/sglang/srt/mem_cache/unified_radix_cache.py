@@ -975,18 +975,15 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
 
-    @rank_consensus(same_params=["req.rid", "owned_kv_len"])
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
+    @rank_consensus(same_params=["req.rid", "up_to"])
+    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
         if self.disable:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :owned_kv_len
-        ]
+        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
 
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
@@ -1060,8 +1057,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # Everything past the inserted key goes back, the protected prefix
-        # never does. After a rotation decline nothing was inserted.
+        # Everything past the inserted key goes back to the caller, the
+        # protected prefix never does. After a rotation decline nothing was
+        # inserted.
         free_from = (
             min(req.kv.cache_protected_len, len(kv_indices))
             if result.rotation_tail_declined
@@ -1074,12 +1072,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"{free_from=} {len(kv_indices)=} {req.kv.cache_protected_len=}"
             )
             free_from = tail_free_start
-        self.free_kv_row(req.kv, [(free_from, len(kv_indices_full))])
-
-        self.unpin(req)
-
-        if result is not None and result.last_device_node is not None:
-            req.last_node = result.last_device_node
+        req.kv.cache_protected_len = free_from
 
         # cleanup
         for comp in self._components_tuple:
@@ -1093,7 +1086,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if req.finished_reason is not None and not isinstance(
                 req.finished_reason, FINISH_ABORT
             ):
-                self.session_refs.register_session_ref(req)
+                self.session_refs.register_session_ref(
+                    req, leaf=result.last_device_node
+                )
 
     @rank_consensus(same_params=["req.rid", "chunked"])
     def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
@@ -1217,7 +1212,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # gather contract forbids -- keep the request entirely on its own
             # pages: no dedup free, no rebind, no protection change. The insert
             # declined before its walk, so nothing was freed underneath us. The
-            # final cache_finished_req releases everything past the protected
+            # release_kv_cache releases everything past the protected
             # prefix.
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
