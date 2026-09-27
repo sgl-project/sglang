@@ -16,7 +16,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Protocol, Tuple, Union
 
 import msgspec
 import torch
@@ -301,6 +301,22 @@ class StageCommunicator:
         return hidden_states, residual
 
 
+class LayerFusions(Protocol):
+    """The fused kernels a fusion backend gives a layer, bound to it and tried
+    before the layer's own: at its attention input (each takes what the previous
+    layer left, the residual, the batch and a post-residual addition), at its
+    FFN input, and at its FFN exit (each says what the exit does when its kernel
+    takes the batch)."""
+
+    def attention_input(self, layer: "LayerCommunicator") -> Tuple[Callable, ...]: ...
+
+    def ffn_input(self, layer: "LayerCommunicator") -> Tuple["FusedMlpInput", ...]: ...
+
+    def ffn_exit(
+        self, layer: "LayerCommunicator"
+    ) -> Tuple[Callable[[ForwardBatch], Optional["FfnExitFusion"]], ...]: ...
+
+
 class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
@@ -308,6 +324,8 @@ class LayerCommunicator:
     _ffn_exit_fusions: Tuple[Callable, ...] = ()
     # A plain residual unless the layer is built with its own.
     _residual: LayerResidual = PLAIN_RESIDUAL
+    # The fused kernels a backend gives the layer, if any.
+    fusions: Optional[LayerFusions] = None
 
     def __init__(
         self,
@@ -328,6 +346,8 @@ class LayerCommunicator:
         # A layer that is one stage of a sequence of stages, instead of an
         # attention followed by an FFN.
         stage: Optional["LayerStage"] = None,
+        # The fused kernels a backend gives the layer, tried before its own.
+        fusions: Optional[LayerFusions] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -340,6 +360,7 @@ class LayerCommunicator:
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
         self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
         self._residual = residual
+        self.fusions = fusions
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -765,9 +786,10 @@ class LayerCommunicator:
         Each takes (owed, residual, forward_batch, post_residual_addition) and
         returns None when it does not take the batch. They add the residual
         plainly; the boundary tries them only when the update it writes in is a
-        plain add."""
+        plain add. A backend's come first."""
+        given = self.fusions.attention_input(self) if self.fusions else ()
         if not hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-            return ()
+            return given
         self._attn_input_fuses_quant = (
             self.enable_fused_ar_quant
             and _use_aiter
@@ -775,7 +797,7 @@ class LayerCommunicator:
                 self.input_layernorm, "forward_with_allreduce_fusion_quant_per_group"
             )
         )
-        return (self._reduce_output_and_update_and_read_residual,)
+        return (*given, self._reduce_output_and_update_and_read_residual)
 
     def _reduce_output_and_update_and_read_residual(
         self,
@@ -822,10 +844,13 @@ class LayerCommunicator:
     def _select_mlp_input_fusions(self) -> Tuple["FusedMlpInput", ...]:
         """The fused kernels that can take the attention -> FFN steps, in the
         order they are tried. They add the residual plainly; the boundary tries
-        them only when the update it writes in is a plain add."""
+        them only when the update it writes in is a plain add. A backend's come
+        first."""
+        given = self.fusions.ffn_input(self) if self.fusions else ()
         if not hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion"):
-            return ()
+            return given
         return (
+            *given,
             FusedMlpInput(
                 completes=SumGroup.ATTN_TP,
                 run=self._mlp_input_reduce_output_and_update_and_read_residual,
@@ -1123,8 +1148,9 @@ class LayerCommunicator:
     ) -> Tuple[Callable[[ForwardBatch], Optional["FfnExitFusion"]], ...]:
         """The fused kernels of the next layer's input that may take this layer's
         FFN sum, in the order they are tried. Each returns what the exit does
-        when its kernel takes this batch, or None."""
-        return (self._next_input_norm_takes_ffn_sum,)
+        when its kernel takes this batch, or None. A backend's come first."""
+        given = self.fusions.ffn_exit(self) if self.fusions else ()
+        return (*given, self._next_input_norm_takes_ffn_sum)
 
     def _next_input_norm_takes_ffn_sum(
         self, forward_batch: ForwardBatch

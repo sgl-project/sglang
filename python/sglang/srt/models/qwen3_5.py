@@ -214,14 +214,13 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
     )
 
 
-def _layer_communicator_class(config: Qwen3_5TextConfig, is_nextn: bool):
+def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
+    """The CuTe DSL kernels a layer tries before its own, when they are on."""
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-            CuteDSLFusionLayerCommunicator,
-        )
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
 
-        return CuteDSLFusionLayerCommunicator
-    return LayerCommunicator
+        return CuteDSLFusion()
+    return None
 
 
 if _is_cuda:
@@ -1124,13 +1123,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant()
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
+        self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            fusions=_layer_fusions(config, is_nextn),
         )
 
     def forward(
@@ -1327,13 +1327,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
-        self.layer_communicator = _layer_communicator_class(config, is_nextn)(
+        self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            fusions=_layer_fusions(config, is_nextn),
         )
 
         self.alt_stream = alt_stream
