@@ -788,13 +788,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         host_indices = self._shared_backing.translate_indices(
             self.pool_label, host_indices
         )
-        # The L2 engine resolves device IDs using the per-layer HiCache contract.
-        # This pool copies whole envelopes, so discard the kernel-view page stride.
-        kernel_page_size = self.page_size * self.device_pool.kernel_page_blocks
-        device_indices = (
-            device_indices // kernel_page_size * self.page_size
-            + device_indices % self.page_size
-        )
         if io_backend == "kernel":
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(
