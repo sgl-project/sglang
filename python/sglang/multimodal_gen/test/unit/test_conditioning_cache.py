@@ -330,6 +330,9 @@ def _rank_eviction(rank, init_method, disabled_rank, grouped=False):
             for attempt in range(3):
                 if attempt == 1 and rank == 0:
                     cache.clear()
+                if attempt == 2 and rank == 0 and grouped and not disabled_rank:
+                    # One rank restores a host entry while its peer reuses a device entry.
+                    cache._group_entries.get().clear()
                 cache.run(model, "forward", (x,), {}, compute, group)
         assert model.calls == (3 if disabled_rank and not grouped else 2)
         assert cache.hits == (0 if disabled_rank and not grouped else 1)
