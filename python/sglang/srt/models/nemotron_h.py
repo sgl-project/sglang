@@ -78,11 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import (
-    feeds_mlp_layer,
-    is_attn_layer,
-    make_layer_communicator,
-)
+from sglang.srt.models.nemotron_h_utils import make_layer_communicator
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
@@ -376,66 +372,28 @@ class NemotronHMoE(nn.Module):
 
 
 class NemotronHMLPLikeDecoderLayer(nn.Module):
-    """MLP half of a decoder layer. A preceding Mamba / attention layer hands over
-    its unreduced output, as between the two halves of a standard decoder layer."""
+    """An FFN (MLP / MoE) stage. Its input is the previous stage's output: a
+    mixer's attention partial sum, or a value that is complete or carries the
+    sum an FFN before it left."""
 
-    def _init_layer_communicator(
-        self, config: NemotronHConfig, layer_idx: int, *, is_sparse: bool
-    ) -> None:
-        pattern = config.hybrid_override_pattern
-        self.input_is_reduced = layer_idx == 0 or not is_attn_layer(
-            pattern[layer_idx - 1]
-        )
-        self.feeds_mlp_layer = feeds_mlp_layer(pattern, layer_idx)
+    def _init_layer_communicator(self, config: NemotronHConfig, layer_idx: int):
         self.layer_communicator = make_layer_communicator(
-            self.norm,
-            for_attn=False,
-            allow_reduce_scatter=True,
-            is_sparse=is_sparse,
-            is_last_layer=layer_idx == len(pattern) - 1,
+            self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
     def forward(
         self,
         *,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | UnreducedOutput,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.input_is_reduced:
-            # Fold the reduced input into the residual, leaving prepare_mlp a
-            # zero update to reduce.
-            residual = hidden_states if residual is None else hidden_states + residual
-            hidden_states = torch.zeros_like(hidden_states)
+    ) -> tuple[torch.Tensor | UnreducedOutput, torch.Tensor]:
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        # prepare_mlp ignores a deferred reduction, so only defer into a
-        # Mamba / attention layer.
-        fuse_mlp_allreduce = (
-            not self.feeds_mlp_layer
-            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mixer.forward(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states = UnreducedOutput(
-                hidden_states,
-                group=self.layer_communicator.ffn_reduction_group(forward_batch),
-            )
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-        return hidden_states, residual
+        return ffn_exit.finish(hidden_states, residual)
 
 
 class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -469,7 +427,7 @@ class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx, is_sparse=False)
+        self._init_layer_communicator(config, layer_idx)
 
 
 class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -492,52 +450,37 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_layer_communicator(config, layer_idx, is_sparse=True)
+        self._init_layer_communicator(config, layer_idx)
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
-    """Attention half of a decoder layer. Before an MLP layer the mixer leaves its
-    output unreduced for prepare_mlp; otherwise the mixer reduces it itself."""
+    """A mixer (Mamba / attention) stage. Before an FFN stage it leaves its
+    output all-reduce to that stage's input; otherwise it reduces the output
+    itself unless the fused kernel takes the sum into the next input norm."""
 
     def _init_layer_communicator(self, config: NemotronHConfig, layer_idx: int):
-        self.feeds_mlp_layer = feeds_mlp_layer(
-            config.hybrid_override_pattern, layer_idx
-        )
         self.layer_communicator = make_layer_communicator(
-            self.norm,
-            for_attn=True,
-            is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
+            self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
     def forward(
         self,
         *,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | UnreducedOutput,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | UnreducedOutput, torch.Tensor]:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
         if forward_batch.forward_mode.is_idle():
             return hidden_states, residual
 
-        fuse_mlp_allreduce = (
-            not self.feeds_mlp_layer
-            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        skip_reduce = self.feeds_mlp_layer or fuse_mlp_allreduce
-        with get_forward().scoped(fuse_mlp_allreduce=skip_reduce):
+        with self.layer_communicator.mixer_exit(forward_batch) as mixer_exit:
             hidden_states = self._forward_mixer(
-                hidden_states, forward_batch, skip_reduce
+                hidden_states, forward_batch, mixer_exit.skips_reduction
             )
-        if fuse_mlp_allreduce:
-            hidden_states = UnreducedOutput(
-                hidden_states, group=get_parallel().tp_group
-            )
-        return hidden_states, residual
+        return mixer_exit.finish(hidden_states), residual
 
 
 class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
@@ -779,17 +722,22 @@ class NemotronHModel(nn.Module):
         self.layers_to_capture: set[int] = set()
 
     def _capture_hidden_states(self, hidden_states, residual, boundary_idx):
-        pattern = self.config.hybrid_override_pattern
-        if (
-            residual is not None
-            and boundary_idx > 0
-            and is_attn_layer(pattern[boundary_idx - 1])
-            and feeds_mlp_layer(pattern, boundary_idx - 1)
-        ):
-            # Reduce a copy so the MLP layer still receives a TP partial.
+        if residual is not None and self._owes_attention_sum_at(boundary_idx):
+            # Reduce a copy so the FFN stage still receives its partial sum.
             hidden_states = attn_tp_all_reduce(hidden_states.clone())
         # Later norms update the input residual in place.
         return hidden_states.clone() if residual is None else hidden_states + residual
+
+    def _owes_attention_sum_at(self, boundary_idx: int) -> bool:
+        """Whether the value at this boundary is a mixer's partial sum that the
+        FFN stage after it completes: what the layer after the boundary
+        declares it takes, or at this rank's end what the last layer declares
+        it hands on."""
+        if boundary_idx < self.end_layer:
+            edge = self.layers[boundary_idx].layer_communicator.stage_edges[0]
+        else:
+            edge = self.layers[boundary_idx - 1].layer_communicator.stage_edges[1]
+        return edge.produced.always_leaves
 
     def forward(
         self,

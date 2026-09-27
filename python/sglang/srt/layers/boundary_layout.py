@@ -14,7 +14,7 @@
 """Token layouts of the tensors handed across layer communication boundaries."""
 
 from enum import Enum, auto
-from typing import FrozenSet, Mapping, Optional
+from typing import FrozenSet, Mapping, Optional, Tuple
 
 import msgspec
 
@@ -108,6 +108,14 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     residual_joins_attention_sum: bool = False
 
 
+class StageDecl(msgspec.Struct, frozen=True):
+    """A computing stage's two sides: the rows its input must be on, and what
+    its output is."""
+
+    input: StageInput
+    output: StageOutput
+
+
 class EdgeDecl(msgspec.Struct, frozen=True):
     """One boundary between two stages, as the layer that runs one side of it
     sees it: what arrives from the producer, what the consumer needs, and the
@@ -166,6 +174,40 @@ def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
             need=StageInput(sides.output_rows),
             residual=sides.ffn_residual_rows,
             residual_to=sides.output_rows,
+        ),
+    )
+
+
+def stage_edges(
+    *, previous: Optional[StageOutput], stage: StageDecl, rows: Layout
+) -> Tuple[EdgeDecl, EdgeDecl]:
+    """The two boundaries of a layer that is one stage of a sequence of stages:
+    into it from the previous stage's output (None at the start of the layer
+    stack) and out of it onto ``rows``, the rows every layer hands on and the
+    residual is on between stages. The previous output arrives on those rows: a
+    stage whose output is elsewhere (an FFN on the TP group) moves it back there
+    first, and what it may leave of its sum comes with the value; otherwise the
+    value is complete. The residual follows the input onto a finer slice and
+    stays where it is when the input is gathered."""
+    arrived = (
+        StageOutput(
+            rows,
+            group=previous.group,
+            always_leaves=previous.always_leaves,
+            leaves_for_next_layer=previous.leaves_for_next_layer,
+        )
+        if previous is not None
+        and (previous.always_leaves or previous.leaves_for_next_layer)
+        else StageOutput(rows)
+    )
+    during = stage.input.layout if rows.sharded <= stage.input.layout.sharded else rows
+    return (
+        EdgeDecl(produced=arrived, need=stage.input, residual=rows, residual_to=during),
+        EdgeDecl(
+            produced=stage.output,
+            need=StageInput(rows),
+            residual=during,
+            residual_to=rows,
         ),
     )
 

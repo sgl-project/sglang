@@ -1363,6 +1363,32 @@ class TestInputScatteredAttention(CustomTestCase):
                 )
                 self.assertIs(getattr(steps, "func", steps), step)
 
+    def test_a_complete_value_is_sliced_onto_each_rank(self):
+        # An FFN on each rank's slice after an FFN, or at the start of the
+        # layer stack, takes a complete input.
+        sizes = self.SIZES
+        attention = comm.Layout.sharded_over(axis_sizes=sizes)
+        local = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        step, _ = comm._select_ffn_input(
+            comm.StageOutput(attention),
+            residual=attention,
+            residual_to=local,
+            need=comm.StageInput(local),
+            force_layernorm_before_gather=False,
+            fusions=(),
+        )
+        self.assertIs(step.func, comm._mlp_input_slice)
+        hidden = torch.arange(4.0)[:, None].expand(4, HIDDEN).clone()
+        residual = torch.ones(4, HIDDEN)
+        context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=1)
+        out, out_residual = step(hidden, residual, None, Norm(), context)
+        torch.testing.assert_close(out_residual, hidden[2:] + 1)
+        torch.testing.assert_close(out, 2 * (hidden[2:] + 1))
+        # At the start of the layer stack the input is the residual.
+        out, out_residual = step(hidden, None, None, Norm(), context)
+        torch.testing.assert_close(out_residual, hidden[2:])
+        torch.testing.assert_close(out, 2 * hidden[2:])
+
     def test_which_layers_can_scatter_their_input(self):
         configured = dict(enable_attn_tp_input_scattered=True)
         for name, parallel, a2a, expected in (
