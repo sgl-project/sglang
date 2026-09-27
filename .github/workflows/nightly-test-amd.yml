@@ -81,6 +81,8 @@ on:
           - nightly-8-gpu-mi35x-deepseek-v4-pro
           - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp
           - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark
+          # 4-GPU DeepSeek-V4.1-Flash (MI35x only - FP4 experts need gfx95x)
+          - nightly-4-gpu-mi35x-deepseek-v41-flash
           # 8-GPU Kimi-K2.6 (MI30x)
           - nightly-8-gpu-kimi-k26
           # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
@@ -1703,6 +1705,54 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   # ==============================================================================
+  # 4-GPU DeepSeek-V4.1-Flash (MI35x only - FP4 experts need gfx95x)
+  #
+  # The cookbook recipe is TP4 + EP4, so this uses four GPUs of an 8-GPU runner.
+  # ==============================================================================
+
+  nightly-4-gpu-mi35x-deepseek-v41-flash:
+    name: ${{ format('nightly-4-gpu-mi35x-deepseek-v41-flash ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-deepseek-v41-flash,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy Test MI35x ROCm (4-GPU DeepSeek-V4.1-Flash)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-deepseek-v41-flash --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU Kimi-K2.6 (MI30x)
   #
   # Kept on MI30x: Kimi-K3 needs gfx95x for its native MXFP4 weights, so it
@@ -2411,6 +2461,8 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-v4-pro
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp
       - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark
+      # 4-GPU DeepSeek-V4.1-Flash (MI35x only - FP4 experts need gfx95x)
+      - nightly-4-gpu-mi35x-deepseek-v41-flash
       # 8-GPU Kimi-K2.6 (MI30x)
       - nightly-8-gpu-kimi-k26
       # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
