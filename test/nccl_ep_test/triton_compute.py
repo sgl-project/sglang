@@ -4,12 +4,14 @@ import torch
 import torch.nn.functional as F
 
 
-def configure_compute():
+def configure_compute(*, graph_enabled=False):
     from sglang.srt.runtime_context import get_context
 
     get_context().override_server_args(
         enable_fused_moe_sum_all_reduce=False,
         enable_deterministic_inference=False,
+        disable_shared_experts_fusion=True,
+        enable_nccl_ep_cuda_graph=graph_enabled,
     ).install()
 
 
