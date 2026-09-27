@@ -29,6 +29,18 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def steps(*, ffn_output_move):
+    """A layer's steps with the given FFN output move; None sends the output
+    back over attention DP."""
+    return comm.BoundarySteps(
+        attention_input=comm.CommunicateSimpleFn._trivial,
+        ffn_input=comm._mlp_input_norm,
+        ffn_output=comm.StageOutput(comm.Layout(frozenset())),
+        ffn_output_move=ffn_output_move,
+        ffn_sum_is_movable=False,
+    )
+
+
 @contextlib.contextmanager
 def reduce_scatterv_applies():
     with (
@@ -143,11 +155,10 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         communicator._sp_steps = None
         communicator._input_scattered_steps = None
         communicator._context = None
-        communicator._postprocess_scatters_to_local_tokens = False
         communicator.allow_reduce_scatter = False
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
-        communicator._communicate_summable_tensor_pair_fn = lambda **kwargs: (
-            seen.update(kwargs) or (None, None)
+        communicator._steps = steps(
+            ffn_output_move=lambda **kwargs: seen.update(kwargs) or (None, None)
         )
         communicator.postprocess_layer(None, None, None)
         self.assertIs(seen["is_layer_sparse"], True)
@@ -160,7 +171,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
                 communicator = LayerCommunicator.__new__(LayerCommunicator)
                 communicator._sp_steps = None
                 communicator._input_scattered_steps = None
-                communicator._postprocess_scatters_to_local_tokens = True
+                communicator._steps = steps(ffn_output_move=None)
                 communicator._postprocess_dp_step = lambda forward_batch: step
                 with patch.object(
                     comm, "_to_local_tokens", side_effect=lambda s, fb, h: (s, h)

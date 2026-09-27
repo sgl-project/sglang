@@ -48,7 +48,14 @@ def communicator(norm):
     c._context = None
     c.enable_fused_ar_quant = False
     c.fused_ar_quant_keep_bf16 = False
-    c._communicate_simple_fn = lambda hidden_states, **_: hidden_states
+    # A layer whose attention takes its input as it is and owes nothing on it.
+    c._steps = comm.BoundarySteps(
+        attention_input=lambda hidden_states, **_: hidden_states,
+        ffn_input=comm._mlp_input_norm,
+        ffn_output=comm.StageOutput(comm.Layout(frozenset())),
+        ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+        ffn_sum_is_movable=False,
+    )
     # Construction picks the fused entries; call it under the platform patches.
     c._attn_input_fusions = c._select_attn_input_fusions()
     return c

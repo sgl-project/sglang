@@ -93,16 +93,18 @@ class DSACPLayerCommunicator(LayerCommunicator):
             assert self._context.attn_dp_size == 1, (
                 f"dp_size should be 1 when moe_runner_backend is none"
             )
-        self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
-            input_mode=ScatterMode.SCATTERED,
-            output_mode=ScatterMode.SCATTERED,
-            context=self._context,
-        )
-        self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
-            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_input_mode=ScatterMode.SCATTERED,
-            output_mode=ScatterMode.SCATTERED,
-            context=self._context,
+        return (
+            DSACPCommunicateSimpleFn.get_fn(
+                input_mode=ScatterMode.SCATTERED,
+                output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            ),
+            DSACPCommunicateSummableTensorPairFn.get_fn(
+                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+                residual_input_mode=ScatterMode.SCATTERED,
+                output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            ),
         )
 
     def _select_mlp_input(self):
@@ -113,7 +115,7 @@ class DSACPLayerCommunicator(LayerCommunicator):
             residual_output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        return fn, False
+        return fn, ()
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
