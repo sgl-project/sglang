@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -647,6 +648,19 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
         # The chat request's True is a synthesized default (ResponsesRequest has
         # no such field), so leave it unset for --preferred-sampling-params.
         self.assertNotIn("skip_special_tokens", params)
+
+    def test_response_template_parser_keeps_special_tokens_unspaced(self):
+        serving = make_serving()
+        serving.reasoning_parser = "response_template"
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template={
+                "start_anchor": "<assistant>",
+                "fields": {"content": {"content": "text"}},
+            },
+        )
+        params = self._create_responses_sampling_params(serving)
+        self.assertFalse(params["skip_special_tokens"])
+        self.assertFalse(params["spaces_between_special_tokens"])
 
 
 class InputItemNormalizationTestCase(CustomTestCase):

@@ -659,6 +659,7 @@ class ServingChatTestCase(unittest.TestCase):
             [],
             [],
             None,
+            uses_response_template=True,
         )
         self.chat.tool_call_parser = "response-template-alias"
         self.basic_req.input_ids = [1, 2, 3]
@@ -679,6 +680,9 @@ class ServingChatTestCase(unittest.TestCase):
                 return_value=processed_messages,
             ),
         ):
+            self.assertTrue(
+                self.chat._requires_response_template_detokenization(self.basic_req)
+            )
             _, request = self.chat._convert_to_internal_request(self.basic_req)
 
         self.assertEqual(request._response_parser_prefix, "<first><second>")
@@ -705,14 +709,14 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.tm.model_config.is_multimodal = True
 
-        def process_messages(request, _):
+        def render(request, _):
             self.assertIsNone(request.chat_template_kwargs)
             return processed_messages
 
         with patch.object(
             self.chat,
-            "_process_messages",
-            side_effect=process_messages,
+            "_apply_conversation_template",
+            side_effect=render,
         ):
             adapted, request = self.chat._convert_to_internal_request(self.basic_req)
 
@@ -1347,6 +1351,7 @@ class ServingChatTestCase(unittest.TestCase):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as parser_cls:
+            parser_cls.ToolCallParserEnum = FunctionCallParser.ToolCallParserEnum
             parser = parser_cls.return_value
             parser.get_structure_constraint.return_value = ("structural_tag", "tag")
 
@@ -1389,6 +1394,7 @@ class ServingChatTestCase(unittest.TestCase):
                     "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
                 ) as parser_cls,
             ):
+                parser_cls.ToolCallParserEnum = FunctionCallParser.ToolCallParserEnum
                 parser = parser_cls.return_value
                 parser.detector.eot_token = TOOLS_CLOSE
                 parser.detector.parses_required_natively.return_value = False

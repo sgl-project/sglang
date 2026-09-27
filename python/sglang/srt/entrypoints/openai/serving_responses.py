@@ -496,6 +496,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         not processed_messages.skip_special_tokens
                     ):
                         sampling_params["skip_special_tokens"] = False
+                    if (
+                        processed_messages is not None
+                        and processed_messages.uses_response_template
+                    ):
+                        sampling_params["spaces_between_special_tokens"] = False
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -581,7 +586,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
-            self._maybe_set_response_parser_prefix(request, adapted_request)
+            if (
+                processed_messages is not None
+                and processed_messages.uses_response_template
+            ):
+                self._set_response_parser_prefix(request, adapted_request)
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)

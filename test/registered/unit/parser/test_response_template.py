@@ -531,6 +531,79 @@ class TestResponseTemplateAdapters(unittest.TestCase):
 
         self.assertEqual(detector.reasoning_default, "explicit_enable_thinking")
 
+    def test_reasoning_detector_supports_think_end_token_lookups(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens: [len(text), add_special_tokens]
+        )
+
+        self.assertIsNone(detector.think_excluded_tokens)
+        self.assertEqual(detector.get_think_end_token_ids(tokenizer), [10, False])
+
+    def test_force_nonempty_content_returns_reasoning_only_output_as_content(self):
+        request = ChatCompletionRequest(
+            messages=[],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        reasoning = ReasoningParser(
+            model_type="response_template",
+            tokenizer=SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE),
+            request=request,
+            prefix=PREFIX,
+        )
+
+        self.assertEqual(
+            reasoning.parse_non_stream(THINKING + "<turn|>"),
+            ("", "I should check the weather."),
+        )
+        self.assertEqual(
+            reasoning.parse_non_stream(THINKING + "Sunny<turn|>"),
+            ("I should check the weather.", "Sunny"),
+        )
+
+    def test_force_nonempty_content_streams_unclosed_reasoning_as_content(self):
+        for stream_reasoning in (True, False):
+            with self.subTest(stream_reasoning=stream_reasoning):
+                detector = ResponseTemplateReasoningDetector(
+                    stream_reasoning=stream_reasoning,
+                    response_template=GEMMA4_RESPONSE_TEMPLATE,
+                    prefix=PREFIX + "<|channel>thought\n",
+                    force_nonempty_content=True,
+                )
+
+                parsed = [
+                    detector.parse_streaming_increment(chunk)
+                    for chunk in _chunks("Still thinking", 4)
+                ]
+                finished = detector.finish()
+
+                self.assertEqual("".join(result.normal_text for result in parsed), "")
+                self.assertEqual(finished.normal_text, "Still thinking")
+                self.assertEqual(finished.reasoning_text, "")
+
+    def test_force_nonempty_content_keeps_closed_streamed_reasoning(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+            force_nonempty_content=True,
+        )
+
+        parsed = [
+            detector.parse_streaming_increment(chunk)
+            for chunk in _chunks(THINKING + "<turn|>", 5)
+        ]
+        finished = detector.finish()
+
+        self.assertEqual(
+            "".join(result.reasoning_text for result in parsed + [finished]),
+            "I should check the weather.",
+        )
+        self.assertEqual(
+            "".join(result.normal_text for result in parsed + [finished]), ""
+        )
+
     def test_reasoning_subclass_can_define_regex_delimiters_and_policy(self):
         class PatternReasoningDetector(ResponseTemplateReasoningDetector):
             response_template = {

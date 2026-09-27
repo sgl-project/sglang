@@ -315,6 +315,7 @@ class ResponseTemplateReasoningDetector:
         tokenizer=None,
         response_template: dict | None = None,
         prefix: str = "",
+        force_nonempty_content: bool = False,
         **_kwargs,
     ):
         template, loaded = _load_serving_template(
@@ -322,6 +323,9 @@ class ResponseTemplateReasoningDetector:
         )
         self.response_template = template
         self.stream_reasoning = stream_reasoning
+        self.think_excluded_tokens = None
+        self._force_nonempty_content = force_nonempty_content
+        self._open_reasoning = ""
         thinking = loaded.fields.get(_THINKING_FIELD)
         self.think_start_token = (
             thinking.open_literals[0]
@@ -338,21 +342,51 @@ class ResponseTemplateReasoningDetector:
         self._prefix = prefix
         self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
 
+    def get_think_end_token_ids(self, tokenizer) -> list[int]:
+        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
     def detect_and_parse(self, text: str) -> _ReasoningResult:
         adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
-        return adapter.route_reasoning_events(
+        result = adapter.route_reasoning_events(
             adapter.parse(text), stream_reasoning=True
         )
+        if self._force_nonempty_content and not result.normal_text:
+            result.normal_text, result.reasoning_text = result.reasoning_text, ""
+        return result
 
     def parse_streaming_increment(self, new_text: str) -> _ReasoningResult:
+        events = self._adapter.feed(new_text)
+        if self._force_nonempty_content:
+            self._track_open_reasoning(events)
         return self._adapter.route_reasoning_events(
-            self._adapter.feed(new_text), stream_reasoning=self.stream_reasoning
+            events, stream_reasoning=self.stream_reasoning
         )
 
     def finish(self) -> _ReasoningResult:
-        return self._adapter.route_reasoning_events(
-            self._adapter.finalize(), stream_reasoning=self.stream_reasoning
+        events = self._adapter.finalize()
+        result = self._adapter.route_reasoning_events(
+            events, stream_reasoning=self.stream_reasoning
         )
+        # Under force_nonempty_content, reasoning left open at the end of the
+        # stream is also returned as content.
+        if self._force_nonempty_content:
+            unclosed_reasoning = self._track_open_reasoning(events)
+            if unclosed_reasoning is not None:
+                result.normal_text += unclosed_reasoning
+                result.reasoning_text = ""
+        return result
+
+    def _track_open_reasoning(self, events: list[dict]) -> str | None:
+        """Accumulate open thinking text; return the text of a region `events` close."""
+        closed = None
+        for event in events:
+            if event.get("field") != _THINKING_FIELD:
+                continue
+            if event["type"] == "region_chunk":
+                self._open_reasoning += event["text"]
+            elif event["type"] in ("region_close", "region_malformed"):
+                closed, self._open_reasoning = self._open_reasoning, ""
+        return closed
 
 
 class ResponseTemplateToolDetector(BaseFormatDetector):

@@ -1216,8 +1216,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
-        if self._requires_response_template_detokenization(request):
-            configure_response_template_request(request)
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1301,17 +1299,16 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
-        self._maybe_set_response_parser_prefix(request, adapted_request)
+        if processed_messages.uses_response_template:
+            self._set_response_parser_prefix(request, adapted_request)
         return adapted_request, request
 
-    def _maybe_set_response_parser_prefix(
+    def _set_response_parser_prefix(
         self,
         request,
         adapted_request: GenerateReqInput,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill."""
-        if not self._requires_response_template_detokenization(request):
-            return
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1321,7 +1318,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         request._response_parser_prefix = prefix or ""
 
-    def _requires_response_template_detokenization(self, request) -> bool:
+    def _requires_response_template_detokenization(
+        self, request: ChatCompletionRequest
+    ) -> bool:
         if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
             return True
 
@@ -1468,6 +1467,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
 
+        # Configured after rendering so the detokenization options never reach
+        # the chat template.
+        if self._requires_response_template_detokenization(request):
+            configure_response_template_request(request)
+            result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         result.skip_special_tokens = request.skip_special_tokens
