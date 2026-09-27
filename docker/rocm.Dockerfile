@@ -822,20 +822,38 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
+  # Locate ROCm llvm-config. The pytorch bases ship /opt/rocm/llvm/bin/clang
+  # but not llvm-config (that binary is in rocm-llvm-dev, which these images
+  # do not install). amd-docker-scale cannot reliably reach apt.llvm.org
+  # (curl: (7) Couldn't connect to server), so install the distro toolchain
+  # instead: jammy ships llvm-15, noble ships llvm-18. TVM requires LLVM >= 6
+  # when USE_LLVM is on. Do not install unversioned llvm-dev; it would
+  # shadow the llvm-config-16 shim below.
   LLVM_CONFIG_PATH=""; \
-  for p in /opt/rocm/llvm/bin/llvm-config /opt/rocm/llvm-*/bin/llvm-config /opt/rocm-*/llvm*/bin/llvm-config; do \
+  for p in \
+      /opt/rocm/llvm/bin/llvm-config \
+      /opt/rocm/lib/llvm/bin/llvm-config \
+      /opt/rocm/llvm-*/bin/llvm-config \
+      /opt/rocm-*/llvm/bin/llvm-config \
+      /opt/rocm-*/lib/llvm/bin/llvm-config \
+      /opt/rocm-*/llvm*/bin/llvm-config; do \
     if [ -x "$p" ]; then LLVM_CONFIG_PATH="$p"; break; fi; \
   done; \
   if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
+    LLVM_CONFIG_PATH="$(find /opt/rocm /opt/rocm-* -maxdepth 6 -path "*/bin/llvm-config" \( -type f -o -type l \) -executable -print -quit 2>/dev/null || true)"; \
+  fi; \
+  if [ -z "$LLVM_CONFIG_PATH" ]; then \
+    . /etc/os-release; \
+    case "${VERSION_ID}" in \
+      22.04*) distro_llvm_pkg="llvm-15"; distro_llvm_bin="llvm-config-15" ;; \
+      *) distro_llvm_pkg="llvm-18"; distro_llvm_bin="llvm-config-18" ;; \
+    esac; \
+    echo "[TileLang] ROCm llvm-config not found; installing Ubuntu ${distro_llvm_pkg}"; \
     apt-get update; \
-    apt-get install -y --no-install-recommends llvm-18; \
+    apt-get install -y --no-install-recommends "${distro_llvm_pkg}"; \
     rm -rf /var/lib/apt/lists/*; \
-    LLVM_CONFIG_PATH="$(command -v llvm-config-18)"; \
-    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: llvm-config-18 not found after install"; exit 1; fi; \
+    LLVM_CONFIG_PATH="$(command -v "${distro_llvm_bin}" || true)"; \
+    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: ${distro_llvm_bin} not found after install"; exit 1; fi; \
   fi; \
   echo "[TileLang] Using LLVM_CONFIG at: $LLVM_CONFIG_PATH"; \
   export PATH="$(dirname "$LLVM_CONFIG_PATH"):/usr/local/bin:${PATH}"; \
