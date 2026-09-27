@@ -9,10 +9,12 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils import is_xpu
 from sglang.srt.utils.custom_op import register_custom_op
 
-_fused_qk_norm_rope_xpu = None
+_fused_inplace_qknorm_rope_xpu = None
 if is_xpu():
     try:
-        from sgl_kernel import fused_qk_norm_rope as _fused_qk_norm_rope_xpu
+        from sgl_kernel import (
+            fused_inplace_qknorm_rope as _fused_inplace_qknorm_rope_xpu,
+        )
     except ImportError:
         pass
 
@@ -117,7 +119,7 @@ def can_use_fused_qk_norm_rope(
         yarn: whether YaRN scaling is active (factor != 1.0); prebuilds the
               correct CUDA kernel variant so no extra JIT compile occurs on the
               first real call. Unused on XPU, where the kernel is AOT and
-              branches on the scaling factor at runtime.
+              reads RoPE scaling from the cos/sin cache.
     """
     logger = logging.getLogger(__name__)
     if head_dim not in (64, 128, 256):
@@ -128,7 +130,7 @@ def can_use_fused_qk_norm_rope(
     if dtype != torch.bfloat16:
         logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
         return False
-    if _fused_qk_norm_rope_xpu is not None:
+    if _fused_inplace_qknorm_rope_xpu is not None:
         return True
     try:
         _jit_fused_qknorm_rope_module(head_dim, is_neox, yarn)
@@ -181,26 +183,6 @@ def fused_qk_norm_rope(
     """
     if rotary_dim is None:
         rotary_dim = head_dim
-
-    if _fused_qk_norm_rope_xpu is not None:
-        return _fused_qk_norm_rope_xpu(
-            qkv=qkv,
-            num_heads_q=num_heads_q,
-            num_heads_k=num_heads_k,
-            num_heads_v=num_heads_v,
-            head_dim=head_dim,
-            eps=eps,
-            q_weight=q_weight,
-            k_weight=k_weight,
-            base=base,
-            is_neox=is_neox,
-            position_ids=position_ids,
-            factor=factor,
-            low=low,
-            high=high,
-            attention_factor=attention_factor,
-            rotary_dim=rotary_dim,
-        )
 
     fused_qk_norm_rope_out(
         qkv,

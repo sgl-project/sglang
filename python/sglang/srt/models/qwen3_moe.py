@@ -85,6 +85,8 @@ if _is_cuda or _is_xpu:
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
+if _is_xpu:
+    from sgl_kernel import fused_inplace_qknorm_rope
 
 
 @lru_cache(maxsize=1)
@@ -660,7 +662,7 @@ class Qwen3MoeAttention(nn.Module):
             and qkv.dtype in (torch.bfloat16, torch.float16)
         )
         if use_fused:
-            if _is_cuda or _is_xpu:
+            if _is_cuda:
                 theta = self.rope_theta
                 positions = (
                     positions.view(-1)
@@ -688,6 +690,20 @@ class Qwen3MoeAttention(nn.Module):
                     attention_factor,
                 )
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            elif _is_xpu:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                fused_inplace_qknorm_rope(
+                    q=q.view(-1, self.num_heads, self.head_dim),
+                    k=k.view(-1, self.num_kv_heads, self.head_dim),
+                    q_weight=self.q_norm.weight,
+                    k_weight=self.k_norm.weight,
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    positions=positions.view(-1),
+                    is_neox=self.rotary_emb.is_neox_style,
+                    eps=self.q_norm.variance_epsilon,
+                    head_dim=self.head_dim,
+                    rope_dim=self.rotary_emb.rotary_dim,
+                )
             elif _is_cpu:
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 self.rotary_emb._match_cos_sin_cache_dtype(q)
