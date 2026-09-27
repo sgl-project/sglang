@@ -38,7 +38,7 @@ import triton.language as tl
 
 @triton.jit
 def kda_replayssm_exact_fold_kernel(
-    h0,  # [num_slots, HV, V, K] fp32 checkpoint (folded in place)
+    h0,  # [num_slots, HV, V, K] fp32/bf16 checkpoint (folded in place)
     rawv_cache,  # [num_slots, HV, L, V]  raw v
     rawk_cache,  # [num_slots, H,  L, K]  raw pre-norm k
     gk_cache,  # [num_slots, HV, L, K]  fp32 per-K log-decay gate
@@ -177,7 +177,7 @@ def kda_replayssm_exact_fold_kernel(
 
 
 def commit_kda_replayssm_spec(
-    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K] fp32, folded in place
+    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K] fp32/bf16, folded in place
     rawv_cache: torch.Tensor,  # [num_slots, HV, L, V]
     rawk_cache: torch.Tensor,  # [num_slots, H,  L, K]
     gk_cache: torch.Tensor,  # [num_slots, HV, L, K] fp32
@@ -191,13 +191,14 @@ def commit_kda_replayssm_spec(
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
 ) -> None:
-    """Replay each request's accepted window into its fp32 checkpoint in place.
+    """Replay each request's accepted window into its checkpoint in place.
 
     Tiling clones the recurrent kernel (full-K rows, BV = min(np2(V), 32) cols,
-    num_warps=1) so the folded checkpoint is bit-identical to the recurrent
-    baseline's committed state. With extra_buffer (mamba_track_indices given) the
-    same replay snapshots the interval-crossing state into the track slot in one
-    pass, so no separate track scatter / force-flush is needed.
+    num_warps=1) so an FP32 checkpoint is bit-identical to the recurrent
+    baseline's committed state; a BF16 checkpoint keeps FP32 register math and
+    rounds only the committed store. With extra_buffer (mamba_track_indices
+    given) the same replay snapshots the interval-crossing state into the track
+    slot in one pass, so no separate track scatter / force-flush is needed.
     """
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
@@ -255,7 +256,7 @@ def commit_kda_replayssm_spec(
 
 
 def commit_kda_replayssm_spec_all_layers(
-    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
+    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32/bf16, in place
     rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
     rawk_cache: torch.Tensor,  # [num_layers, num_slots, H,  L, K]
     gk_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, K] fp32

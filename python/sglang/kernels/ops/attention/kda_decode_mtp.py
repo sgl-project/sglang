@@ -5,6 +5,10 @@ L2 norm, beta sigmoid, ILP=2, W=4. Recurrent-state tiles are cp.async'd into
 NUM_STATE_STAGES smem stages. Phase 2 walks the V // TILE_V state tiles in
 passes of TILES_PER_PASS: a multi-token verify keeps them all register-resident
 across the token chain, a single-token step streams one at a time.
+
+Persistent recurrent state and speculative snapshots may use FP32 or BF16
+storage. State is converted to FP32 as it enters registers and the complete
+token recurrence remains FP32.
 """
 
 import cuda.bindings.driver as cuda
@@ -170,6 +174,7 @@ def kda_decode_mtp_kernel(
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
+    STATE_IS_BF16: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
@@ -222,7 +227,7 @@ def kda_decode_mtp_kernel(
         cute.make_layout((CONV_WEIGHT_ELEMS,)),
         16,
     )
-    sState = smem.allocate_tensor(cutlass.Float32, smem_state_layout, 16)
+    sState = smem.allocate_tensor(h0.element_type, smem_state_layout, 16)
     if cutlass.const_expr(APPLY_ONORM):
         sOall = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
@@ -700,13 +705,22 @@ def kda_decode_mtp_kernel(
                         _st = (i_l * P2_BATCHES + b) * P2_VEC
                         v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
                         for j in range(P2_VEC):
-                            ht[
-                                scratch_row,
-                                i_t,
-                                i_hv,
-                                v_base + v_row,
-                                j * P2_LANES_K + k_grp,
-                            ] = r_state[_st + j]
+                            if cutlass.const_expr(STATE_IS_BF16):
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = cutlass.BFloat16(r_state[_st + j])
+                            else:
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = r_state[_st + j]
 
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
@@ -774,6 +788,7 @@ def _run_kda_decode_mtp_dspark(
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
+    STATE_IS_BF16: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
@@ -785,9 +800,13 @@ def _run_kda_decode_mtp_dspark(
     smem_qk_layout = cute.make_layout(
         (1 + NUM_SPEC, p2_lanes, p2_vec // 4, 4), stride=qk_stride
     )
-    # Padding by the subgroup width shifts concurrent v-rows onto disjoint bank
-    # groups: +8 tiles four eight-bank windows; +16 tiles two half-warps.
-    smem_state_stride = TILE_K + p2_lanes
+    state_item_bits = h0.element_type.width
+    state_item_bytes = state_item_bits // 8
+    state_copy_elems = 128 // state_item_bits
+    # Pad each row by one subgroup of 4-byte banks so concurrent v-rows land on
+    # disjoint bank groups: +8 banks tiles four eight-bank windows, +16 tiles two
+    # half-warps. Counted in bytes so a BF16 row shifts like an FP32 one.
+    smem_state_stride = TILE_K + (p2_lanes * 4) // state_item_bytes
     TILE_V = _state_tile_v(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
     state_stages = min(NUM_STATE_STAGES, TILE_K // TILE_V)
     state_stage_elems = TILE_V * smem_state_stride
@@ -803,7 +822,7 @@ def _run_kda_decode_mtp_dspark(
     )
     state_copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=state_cache_mode),
-        cutlass.Float32,
+        h0.element_type,
         num_bits_per_copy=128,
     )
     state_g2s_copy = cute.make_tiled_copy_tv(
@@ -812,14 +831,14 @@ def _run_kda_decode_mtp_dspark(
             (TILE_V, BLOCK_THREADS // TILE_V),
             stride=(BLOCK_THREADS // TILE_V, 1),
         ),
-        val_layout=cute.make_layout((1, 4)),
+        val_layout=cute.make_layout((1, state_copy_elems)),
     )
     t_loop = 1 + NUM_SPEC
     smem_bytes = (
         # sQ, sK, sG, sBeta, sVall, and sConvW.
         (3 * t_loop * qk_elems + t_loop + t_loop * TILE_K + 8 * TILE_K) * 4
         # State stages and the raw output tile for normalization.
-        + state_smem_elems * 4
+        + state_smem_elems * state_item_bytes
         + (t_loop * TILE_K * 4 if cutlass.const_expr(APPLY_ONORM) else 0)
         + 256
     )
@@ -862,6 +881,7 @@ def _run_kda_decode_mtp_dspark(
         lower_bound,
         CACHE_RING,
         APPLY_ONORM,
+        STATE_IS_BF16,
         onorm_eps,
     ).launch(
         grid=(H, N, 1),
@@ -1015,16 +1035,19 @@ def fused_kda_decode_mtp_dspark(
     num_spec = T // N - 1
     if recurrent_state.shape[1:] != (H, TILE_K, TILE_K):
         raise ValueError("expected recurrent state layout [pool, H, V=128, K=128]")
+    supported_state_dtypes = (torch.float32, torch.bfloat16)
+    state_item_bytes = recurrent_state.element_size()
     if (
-        recurrent_state.dtype != torch.float32
+        recurrent_state.dtype not in supported_state_dtypes
         or tuple(recurrent_state.stride()[-3:]) != (TILE_K * TILE_K, TILE_K, 1)
-        or recurrent_state.stride(0) % 4 != 0
-        or recurrent_state.storage_offset() % 4 != 0
+        or recurrent_state.stride(0) * state_item_bytes % 16 != 0
+        or recurrent_state.data_ptr() % 16 != 0
     ):
         raise ValueError(
-            "cp.async recurrent state requires fp32 contiguous [H, V, K] "
+            "cp.async recurrent state requires fp32/bf16 contiguous [H, V, K] "
             "inner layout and 16-byte-aligned slot offsets"
         )
+    state_is_bf16 = recurrent_state.dtype == torch.bfloat16
     rings = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
     cache_ring = all(ring is not None for ring in rings)
     if any(ring is not None for ring in rings) and not cache_ring:
@@ -1056,12 +1079,14 @@ def fused_kda_decode_mtp_dspark(
             # write, but CuTe still type-checks the rank-5 indexing.
             intermediate_ssm = recurrent_state.unsqueeze(1)
     if not cache_ring and (
-        intermediate_ssm.shape[1] < 1 + num_spec
+        intermediate_ssm is None
+        or intermediate_ssm.dtype != recurrent_state.dtype
+        or intermediate_ssm.shape[1] < 1 + num_spec
         or intermediate_ssm.shape[2:5] != (H, TILE_K, TILE_K)
     ):
         raise ValueError(
             f"expected intermediate SSM layout [scratch, >={1 + num_spec}, H, "
-            f"V=128, K=128]"
+            f"V=128, K=128] with dtype {recurrent_state.dtype}"
         )
     if scale is None:
         scale = TILE_K**-0.5
@@ -1120,6 +1145,7 @@ def fused_kda_decode_mtp_dspark(
         block_threads,
         cache_ring,
         apply_onorm,
+        state_is_bf16,
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
         float(lower_bound),
@@ -1143,6 +1169,7 @@ def fused_kda_decode_mtp_dspark(
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
             APPLY_ONORM=apply_onorm,
+            STATE_IS_BF16=state_is_bf16,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             stream=stream,
         )
