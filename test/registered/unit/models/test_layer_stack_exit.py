@@ -323,6 +323,20 @@ class TestLayerStackExit(CustomTestCase):
                     )
         self.assertEqual(problems, [])
 
+    def test_pipeline_residual_is_received_through_the_boundary(self):
+        problems = []
+        for name, (forward, _) in self.complete_census.subjects().items():
+            for node in ast.walk(forward):
+                if (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "pp_proxy_tensors"
+                    and isinstance(node.slice, ast.Constant)
+                    and node.slice.value == "residual"
+                ):
+                    problems.append(f"{name}:{node.lineno}")
+        self.assertEqual(problems, [])
+
     def test_split_prefill_completes_only_at_the_final_segment(self):
         census = self.complete_census
         containers = {name for _, name in census.stacks}

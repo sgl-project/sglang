@@ -704,8 +704,9 @@ class GptOssModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.

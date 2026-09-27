@@ -22,7 +22,7 @@ from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
 def buffer(
@@ -70,3 +70,21 @@ def finish_layer_stack(
     if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
         return hidden_states, residual
     return reduce_output(hidden_states), residual
+
+
+def from_pp(
+    tensors: PPProxyTensors,
+    *,
+    residual_in_hidden: bool = False,
+    allow_missing_residual: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Receive the layer-stack state without reducing a declared partial sum.
+    MHC carries its written streams in hidden_states; ordinary layers receive
+    a separate residual tensor."""
+    if residual_in_hidden:
+        residual = None
+    elif allow_missing_residual:
+        residual = tensors.tensors.get("residual")
+    else:
+        residual = tensors["residual"]
+    return tensors["hidden_states"], residual

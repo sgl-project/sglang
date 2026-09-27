@@ -1178,8 +1178,9 @@ class Qwen2MoeModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

@@ -3031,8 +3031,9 @@ class DeepseekV2Model(nn.Module):
             initial_topk_indices = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
             initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
         index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
         if not self.pp_group.is_first_rank:

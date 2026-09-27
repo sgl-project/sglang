@@ -12,7 +12,7 @@ from sglang.srt.layers import communicator
 from sglang.srt.layers.communicator import boundary, layer, layout, ops, output
 from sglang.srt.layers.communicator import residual as residual_contract
 from sglang.srt.layers.communicator.adapters import attention
-from sglang.srt.layers.communicator.residual import add_norm, mhc
+from sglang.srt.layers.communicator.residual import access, add_norm, mhc
 
 COMMUNICATOR_MODULES = (
     communicator,
@@ -20,6 +20,7 @@ COMMUNICATOR_MODULES = (
     output,
     attention,
     residual_contract,
+    access,
     add_norm,
     mhc,
     ops,

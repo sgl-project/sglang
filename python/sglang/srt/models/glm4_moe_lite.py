@@ -780,8 +780,9 @@ class Glm4MoeLiteModel(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = self.layers[
+                self.start_layer
+            ].layer_communicator.from_pp(pp_proxy_tensors)
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),

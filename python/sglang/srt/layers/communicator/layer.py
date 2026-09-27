@@ -76,6 +76,7 @@ from sglang.srt.layers.communicator.residual.access import (
     buffer,
     finish_layer_stack,
     fold,
+    from_pp,
 )
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
@@ -573,6 +574,13 @@ class LayerCommunicator:
             attention_fusions=self._attn_input_fusions,
             enters_stack=self.layer_facts.is_first_layer,
             **kwargs,
+        )
+
+    def from_pp(self, tensors, *, allow_missing_residual: bool = False):
+        return from_pp(
+            tensors,
+            residual_in_hidden=self._residual.ffn_update.at_producer,
+            allow_missing_residual=allow_missing_residual,
         )
 
     def prepare_attn_and_capture_last_layer_outputs(

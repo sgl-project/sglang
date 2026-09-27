@@ -26,7 +26,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack
+from sglang.srt.layers.communicator.residual.access import finish_layer_stack, from_pp
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -409,8 +409,7 @@ class Qwen2Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states, residual = from_pp(pp_proxy_tensors)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
