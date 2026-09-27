@@ -6,7 +6,9 @@ import torch
 from sglang.kernels.ops.speculative.lilicorr import (
     _lattice_scores,
     _selector_walk_torch,
+    _topk_lse_torch,
     lilicorr_sample_path,
+    lilicorr_topk_lse,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -15,6 +17,32 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="LiLiCorr Triton kernels require CUDA"
 )
+
+
+# 1025 and 2047 straddle the tile boundary; 3072 has fewer tiles than k.
+@pytest.mark.parametrize("vocab", [1025, 2047, 3072, 151936])
+def test_tiled_topk_lse_is_exact_against_the_reference(vocab):
+    torch.manual_seed(0)
+    logits = torch.randn(6, vocab, device="cuda", dtype=torch.float32)
+
+    vals, tokens, lse = lilicorr_topk_lse(logits, 8)
+    ref_vals, ref_tokens, ref_lse = _topk_lse_torch(logits.cpu(), 8)
+
+    torch.testing.assert_close(vals.cpu(), ref_vals)
+    torch.testing.assert_close(tokens.cpu(), ref_tokens)
+    torch.testing.assert_close(lse.cpu(), ref_lse)
+
+
+def test_tied_bf16_logits_return_a_valid_selection():
+    torch.manual_seed(6)
+    logits = torch.randint(0, 64, (4, 8192), device="cuda").to(torch.bfloat16)
+
+    vals, tokens, _ = lilicorr_topk_lse(logits, 8)
+    ref_vals, _, _ = _topk_lse_torch(logits.cpu(), 8)
+
+    torch.testing.assert_close(vals.cpu(), ref_vals)
+    gathered = torch.gather(logits, 1, tokens).float()
+    torch.testing.assert_close(gathered.cpu(), vals.cpu())
 
 
 def _walk_reference(

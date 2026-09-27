@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -101,23 +102,6 @@ def _project_candidate_logits(
     return logits
 
 
-def _log_partition(logits: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
-    """Full-vocabulary logsumexp over logits [N, V], returned fp32.
-
-    The row max is vals[:, :1], free because the top-k comes back sorted descending, so
-    this does not pay for its own amax. Only the REDUCTION is fp32: measured on an H100
-    at [480, 151936] bf16, logsumexp(logits.float()) costs 895 us because the upcast
-    materializes a second [N, V] tensor, against 359 us here, while logsumexp on the
-    native dtype is 426 us and carries 6e-2 of error -- unusable for a log-prob. This
-    form lands at 2.6e-4, well under the bf16 logits' own ~4e-3.
-    """
-    m = vals[:, :1]
-    return (
-        m.float().squeeze(-1)
-        + (logits - m).exp().sum(dim=-1, dtype=torch.float32).log()
-    )
-
-
 def candidate_topk(
     hidden: torch.Tensor,
     lm_head: nn.Module,
@@ -129,13 +113,7 @@ def candidate_topk(
 
     Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
     the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
-    O(vocab) gather bandwidth.
-
-    with_partition also returns the full-vocabulary log-partition [N] fp32, which a head
-    consuming normalized log-probs needs (val - lse). It is a reduction over the same
-    projection, combined across shards by a second logsumexp, so it spans the whole
-    vocabulary and not this rank's slice. The padded tail is already -inf, and logsumexp
-    ignores -inf, so it needs no separate mask.
+    O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -156,8 +134,11 @@ def candidate_topk(
     logits = _project_candidate_logits(
         hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
     )
-    vals, ids = _radix_topk(logits, k)
-    lse = _log_partition(logits, vals) if with_partition else None
+    lse = None
+    if with_partition:
+        vals, ids, lse = lilicorr_topk_lse(logits, k)
+    else:
+        vals, ids = _radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
