@@ -26,8 +26,8 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
-    get_nccl_ep_mode,
     get_nccl_ep_layout,
+    get_nccl_ep_mode,
     get_nccl_ep_num_max_dispatch_tokens_per_rank,
 )
 
@@ -261,6 +261,7 @@ class NcclEpBuffer:
         if state is None:
             state = SimpleNamespace(
                 group=None,
+                dispatchers=set(),
                 num_experts=None,
                 num_local_experts=None,
                 nccl_num_local_experts=None,
@@ -292,14 +293,14 @@ class NcclEpBuffer:
     @classmethod
     def get_buffer(
         cls,
-        ep_group: "GroupCoordinator",
+        ep_group: GroupCoordinator,
         hidden_size: int,
         num_experts: int,
         num_local_experts: int,
         max_dispatch_tokens_per_rank: int,
         router_topk: int,
         layout,
-    ) -> "NcclEpBuffer":
+    ) -> NcclEpBuffer:
         state = cls._state()
         if state.group is None:
             state.num_experts = num_experts
@@ -336,7 +337,7 @@ class NcclEpBuffer:
         return state
 
     @classmethod
-    def _create_group(cls, state, ep_group: "GroupCoordinator"):
+    def _create_group(cls, state, ep_group: GroupCoordinator):
         nccl_core, nccl_ep = _load_nccl_ep()
 
         pynccl = ep_group.pynccl_comm
@@ -492,13 +493,12 @@ class NcclEpBuffer:
     @classmethod
     def destroy(cls):
         state = cls._state()
-        g = state.group
-        if g is not None:
-            try:
-                g.destroy()
-            except Exception:
-                pass
+        for dispatcher in tuple(state.dispatchers):
+            dispatcher.close()
+        if state.group is not None:
+            state.group.destroy()
             state.group = None
+        state.dispatchers.clear()
 
 
 # ----------------------------- Dispatcher (LL path) -----------------------------
@@ -520,9 +520,7 @@ class NcclEpDispatcher(BaseDispatcher):
     after dispatch to feed ``apply_deepep_ll``.
     """
 
-    def __init__(
-        self, moe_runner_config: "MoeRunnerConfig", ep_group: "GroupCoordinator"
-    ):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, ep_group: GroupCoordinator):
         super().__init__()
         nccl_core, nccl_ep = _load_nccl_ep()
         self._nccl_ep = nccl_ep
@@ -633,7 +631,19 @@ class NcclEpDispatcher(BaseDispatcher):
                 self.router_topk,
                 self.layout,
             )
+            self.buffer.dispatchers.add(self)
             self._comm_initialized = True
+
+    def close(self):
+        """Release native handles before their shared EP group is destroyed."""
+        if self._stage != _Stage.INITIAL:
+            raise RuntimeError("Cannot close NCCL EP during an active transaction")
+        if self.handle is not None:
+            self.handle.destroy()
+            self.handle = None
+        self._handle_persistent = False
+        self._comm_initialized = False
+        self.buffer = None
 
     def init_comm_resources(self):
         if self._comm_initialized:

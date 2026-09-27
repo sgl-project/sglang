@@ -970,26 +970,15 @@ class ModelRunner:
         if not get_moe_a2a_backend().is_nccl_ep():
             return
 
-        layer_model = self.model
-        if not hasattr(layer_model, "layers"):
-            return
-        for layer in layer_model.layers:
-            moe_block = None
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                moe_block = layer.mlp.experts
-            elif hasattr(layer, "block_sparse_moe") and hasattr(
-                layer.block_sparse_moe, "experts"
-            ):
-                moe_block = layer.block_sparse_moe.experts
-            elif hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-                moe_block = layer.moe.experts
-            elif hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
-                moe_block = layer.mixer.experts
-            if moe_block is not None and hasattr(moe_block, "dispatcher"):
-                dispatcher = moe_block.dispatcher
-                if isinstance(dispatcher, NcclEpDispatcher):
-                    dispatcher.init_comm_resources()
-                    dispatcher.init_handle_for_graph()
+        seen = set()
+        for module in self.model.modules():
+            dispatcher = getattr(module, "dispatcher", None)
+            if not isinstance(dispatcher, NcclEpDispatcher) or id(dispatcher) in seen:
+                continue
+            seen.add(id(dispatcher))
+            dispatcher.init_comm_resources()
+            if not dispatcher.layout.is_rank_major():
+                dispatcher.init_handle_for_graph()
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):
         resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
