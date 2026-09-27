@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.communicator import (
+    ADD,
+    NORM_QUANT_READ,
+    NORM_READ,
     Layout,
     MixerExit,
     StageDecl,
@@ -111,6 +114,17 @@ class TestStageEdges(CustomTestCase):
             (into.group, into.always_leaves, into.leaves_for_next_layer),
             (SumGroup.TP, False, True),
         )
+
+    def test_each_stage_reads_and_writes_as_a_layer_s_attention_or_ffn(self):
+        for pattern, tp in itertools.product(self.PATTERNS, (1, 2)):
+            with self.subTest(pattern=pattern, tp=tp):
+                for kind, layer in zip(pattern, stages(pattern, tp=tp)):
+                    into, out_of = layer.edges
+                    self.assertIs(
+                        into.need.read,
+                        NORM_QUANT_READ if utils.is_attn_layer(kind) else NORM_READ,
+                    )
+                    self.assertIs(out_of.produced.update, ADD)
 
     def test_the_residual_follows_the_input_onto_a_finer_slice(self):
         axis_sizes = sizes(dp=2, tp=2)

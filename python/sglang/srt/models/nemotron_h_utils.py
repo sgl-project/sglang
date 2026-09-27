@@ -4,6 +4,7 @@ from typing import Optional
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.communicator import (
+    NORM_QUANT_READ,
     InputRead,
     LayerCommunicator,
     LayerScatterModes,
@@ -37,11 +38,12 @@ def _stage_kind(pattern: str, layer_idx: int) -> Optional[InputRead]:
 
 
 def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
-    """What the stage at ``layer_idx`` declares. A mixer computes on the
-    attention's rows and leaves its attention-TP sum to an FFN stage after it,
-    or, when a fused kernel takes it, to a mixer after it. An FFN computes on
-    the TP group's rows, a MoE dispatched by an a2a backend on this rank's own,
-    and may leave its sum to a mixer after it."""
+    """What the stage at ``layer_idx`` declares. A mixer reads its input as
+    an attention does, computes on the attention's rows and leaves its
+    attention-TP sum to an FFN stage after it, or, when a fused kernel takes
+    it, to a mixer after it. An FFN computes on the TP group's rows, a MoE
+    dispatched by an a2a backend on this rank's own, and may leave its sum to a
+    mixer after it."""
     axis_sizes = token_axis_sizes()
     attention = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
@@ -50,7 +52,7 @@ def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
     if is_attn_layer(pattern[layer_idx]):
         owes = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
         return StageDecl(
-            StageInput(attention),
+            StageInput(attention, read=NORM_QUANT_READ),
             StageOutput(
                 attention,
                 group=SumGroup.ATTN_TP if owes else None,

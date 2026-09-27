@@ -37,16 +37,22 @@ def steps(*, ffn_output_move):
     """A layer's steps with the given FFN output move; None sends the output
     back over attention DP."""
     return comm.BoundarySteps(
-        attention_prepare=partial(
-            comm_boundary._attention_input_step,
-            layer_input=None,
-            fusions=(),
-            enters_stack=False,
-            residual_ops=comm.ADD_AND_NORM,
+        attention=comm.StageEntry(
+            prepare=partial(
+                comm_boundary._attention_input_step,
+                layer_input=None,
+                fusions=(),
+                enters_stack=False,
+                read=comm.NORM_QUANT_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
+            input_move=comm.CommunicateSimpleFn._trivial,
+            handoff=comm_ops._hand_qkv_hook_its_input,
         ),
-        attention_input=comm.CommunicateSimpleFn._trivial,
-        ffn_input=comm_ops._mlp_input_norm,
-        ffn_input_rows=comm.Layout(frozenset()),
+        ffn=comm.StageEntry(
+            prepare=comm_ops._mlp_input_norm, input_rows=comm.Layout(frozenset())
+        ),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=ffn_output_move,
         ffn_sum_is_movable=False,

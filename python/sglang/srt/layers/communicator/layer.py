@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import cached_property, partial
 from typing import Callable, Optional, Tuple, Union
 
 import msgspec
@@ -33,7 +33,7 @@ from sglang.srt.layers.communicator.boundary import (
     FusedMlpInput,
     InputRead,
     LayerStage,
-    _another_stage,
+    StageEntry,
     _cp_moves,
     _select_boundary_steps,
     decoder_layer_sides,
@@ -41,6 +41,7 @@ from sglang.srt.layers.communicator.boundary import (
     make_boundary,
     scattered_residual_layer_sides,
     sequence_parallel_layer_sides,
+    with_residual,
 )
 from sglang.srt.layers.communicator.layout import (
     CommunicateContext,
@@ -73,9 +74,9 @@ from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.residual import ResidualOps
+from sglang.srt.layers.communicator.residual import LayerResidual
 from sglang.srt.layers.communicator.residual.add_norm import (
-    ADD_AND_NORM,
+    PLAIN_RESIDUAL,
     aiter_all_reduce_fusion_enabled_for,
     apply_aiter_all_reduce_fusion,
     apply_flashinfer_allreduce_fusion,
@@ -244,13 +245,68 @@ def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
     return _ffn_has_tokens(forward_batch) and post_experts_sum_is_one_all_reduce()
 
 
+class StageCommunicator:
+    """One stage of a layer, its attention or its FFN: the boundary into it,
+    run with the stage's norm on the steps the layer chose for the batch."""
+
+    def __init__(self, layer: "LayerCommunicator", name: str, norm_name: str):
+        self._layer = layer
+        self._name = name
+        self._norm_name = norm_name
+
+    @property
+    def norm(self) -> torch.nn.Module:
+        """The norm the stage reads its input with, one of the layer's."""
+        return getattr(self._layer, self._norm_name)
+
+    def entry(
+        self, forward_batch: ForwardBatch, steps: Optional[BoundarySteps] = None
+    ) -> StageEntry:
+        if steps is None:
+            steps = self._layer._batch_steps(forward_batch)
+        entry = getattr(steps, self._name)
+        if entry is None:
+            raise NotImplementedError(
+                f"a layer that is one stage has no {self._name} stage"
+            )
+        return entry
+
+    def prepare(
+        self,
+        hidden_states,
+        residual,
+        forward_batch: ForwardBatch,
+        steps: Optional[BoundarySteps] = None,
+        **call,
+    ):
+        """The stage's input and the residual, from the previous stage's output
+        (``call``: what the stage's read takes, e.g. the attention's
+        ``quant_format``)."""
+        entry = self.entry(forward_batch, steps)
+        context = self._layer._context
+        hidden_states, residual = entry.prepare(
+            hidden_states, residual, forward_batch, self.norm, context, **call
+        )
+        if entry.input_move is not None:
+            hidden_states = entry.input_move(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                context=context,
+            )
+        if entry.handoff is not None:
+            hidden_states = entry.handoff(
+                hidden_states, forward_batch, self._layer.qkv_latent_func
+            )
+        return hidden_states, residual
+
+
 class LayerCommunicator:
     # Communicators built without __init__ (e.g. test doubles) publish no LoRA
     # layout and try no fused kernel at the FFN exit.
     _publish_lora_layout: bool = False
     _ffn_exit_fusions: Tuple[Callable, ...] = ()
     # A plain residual unless the layer is built with its own.
-    _residual_ops: ResidualOps = ADD_AND_NORM
+    _residual: LayerResidual = PLAIN_RESIDUAL
 
     def __init__(
         self,
@@ -265,8 +321,9 @@ class LayerCommunicator:
         fused_ar_quant_keep_bf16: bool = False,
         # False for a layer whose FFN always completes its own reduction.
         allow_deferred_ffn_reduction: bool = True,
-        # How the layer writes its residual and reads its stages' inputs.
-        residual_ops: ResidualOps = ADD_AND_NORM,
+        # How the layer's attention and FFN read their inputs from the residual
+        # and write their outputs into it.
+        residual: LayerResidual = PLAIN_RESIDUAL,
         # A layer that is one stage of a sequence of stages, instead of an
         # attention followed by an FFN.
         stage: Optional["LayerStage"] = None,
@@ -281,7 +338,7 @@ class LayerCommunicator:
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
         self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
-        self._residual_ops = residual_ops
+        self._residual = residual
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -299,6 +356,11 @@ class LayerCommunicator:
             get_lora().enable_lora
         )
         if stage is not None:
+            if residual != PLAIN_RESIDUAL:
+                raise ValueError(
+                    "a layer that is one stage takes its reads and updates from "
+                    "the stage's declarations"
+                )
             self._init_stage(stage)
             return
         # Its two boundaries, for a layer that is one stage.
@@ -336,8 +398,10 @@ class LayerCommunicator:
         # q_lora, which input-scattered attention needs.
         self._sp_steps = (
             _select_boundary_steps(
-                sequence_parallel_layer_sides(axis_sizes=token_axis_sizes()),
-                residual_ops=residual_ops,
+                with_residual(
+                    sequence_parallel_layer_sides(axis_sizes=token_axis_sizes()),
+                    residual,
+                ),
                 attention_fusions=self._attn_input_fusions,
                 enters_stack=self.layer_scatter_modes.is_first_layer,
             )
@@ -354,9 +418,9 @@ class LayerCommunicator:
             )
         self._declared = None
         self._cp_steps = self._input_scattered_steps = self._sp_steps = None
-        self.stage_edges = stage.edges
         into_edge, out_edge = stage.edges
         reads_ffn = stage.reads is InputRead.FFN
+        self.stage_edges = stage.edges
         into = make_boundary(
             into_edge,
             reads=stage.reads,
@@ -366,21 +430,34 @@ class LayerCommunicator:
                 else self._attn_input_fusions
             ),
             force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
-            residual_ops=self._residual_ops,
             enters_stack=stage.enters_stack,
         )
-        out = make_boundary(out_edge, reads=None, residual_ops=self._residual_ops)
+        out = make_boundary(out_edge, reads=None)
+        entry = StageEntry(
+            prepare=into.prepare,
+            input_rows=into.input_rows,
+            input_move=None if reads_ffn else into.input_move,
+            handoff=None if reads_ffn else _hand_qkv_hook_its_input,
+            fused=into.fused,
+        )
         self._steps = BoundarySteps(
-            attention_prepare=_another_stage if reads_ffn else into.prepare,
-            attention_input=_another_stage if reads_ffn else into.input_move,
-            ffn_input=into.prepare if reads_ffn else _another_stage,
-            ffn_input_rows=into.input_rows,
+            attention=None if reads_ffn else entry,
+            ffn=entry if reads_ffn else None,
             ffn_output=out_edge.produced,
             ffn_output_move=out.output_move,
             ffn_output_move_completes_sum=out.output_move_completes_sum,
             ffn_sum_is_movable=out_edge.produced.group is not None,
-            fused=into.fused,
         )
+
+    @cached_property
+    def attn(self) -> StageCommunicator:
+        """The layer's attention stage."""
+        return StageCommunicator(self, "attention", "input_layernorm")
+
+    @cached_property
+    def ffn(self) -> StageCommunicator:
+        """The layer's FFN stage."""
+        return StageCommunicator(self, "ffn", "post_attention_layernorm")
 
     @property
     def input_rows(self) -> Layout:
@@ -472,7 +549,7 @@ class LayerCommunicator:
             # No batch shards its tokens and there is no attention DP: as
             # without CP.
             may_leave = may_leave_to_reduce_scatter = True
-        return decoder_layer_sides(
+        sides = decoder_layer_sides(
             axis_sizes=token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=on_local_rows(modes.is_layer_sparse),
             ffn_shards_over_cp=ffn_on_cp_shards,
@@ -499,6 +576,7 @@ class LayerCommunicator:
             )
             and may_leave,
         )
+        return with_residual(sides, self._residual)
 
     @staticmethod
     def _refuse_uncovered_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
@@ -532,7 +610,7 @@ class LayerCommunicator:
         for the layer's ordinary declarations ``sides``. A plain residual comes
         back to the full rows inside the attention output's sum; one whose
         write-back is not a plain add stays on each rank's slice."""
-        if self._residual_ops.adds_plainly:
+        if self._residual.attention_update.adds_plainly:
             scattered = input_scattered_layer_sides(
                 axis_sizes=token_axis_sizes(),
                 ffn_group=sides.ffn_output.group,
@@ -550,8 +628,7 @@ class LayerCommunicator:
             # DSA and hook-less attention take the slice gathered.
             handoff = _hand_scattered_input_to_attention
         return _select_boundary_steps(
-            scattered,
-            residual_ops=self._residual_ops,
+            with_residual(scattered, self._residual),
             attention_handoff=handoff,
             attention_fusions=self._attn_input_fusions,
             enters_stack=self.layer_scatter_modes.is_first_layer,
@@ -563,7 +640,6 @@ class LayerCommunicator:
         """The steps this layer runs for a set of declarations."""
         return _select_boundary_steps(
             sides,
-            residual_ops=self._residual_ops,
             attention_fusions=self._attn_input_fusions,
             enters_stack=self.layer_scatter_modes.is_first_layer,
             **kwargs,
@@ -586,9 +662,7 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._batch_steps(
-                forward_batch
-            ).attention_input(
+            gathered_last_layer_output = self.attn.entry(forward_batch).input_move(
                 hidden_states=residual,
                 forward_batch=forward_batch,
                 context=self._context,
@@ -616,10 +690,7 @@ class LayerCommunicator:
         the batch is not input-scattered.
         """
         return (
-            any(
-                f.may_return_new_residual
-                for f in self._batch_steps(forward_batch).fused
-            )
+            any(f.may_return_new_residual for f in self.ffn.entry(forward_batch).fused)
             and not get_attn_tp_context().input_scattered
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
@@ -637,7 +708,7 @@ class LayerCommunicator:
                 "lora_batch_layout",
                 (
                     LoRABatchLayout.DP_LOCAL
-                    if TokenAxis.ATTN_DP in steps.ffn_input_rows.sharded
+                    if TokenAxis.ATTN_DP in steps.ffn.input_rows.sharded
                     else LoRABatchLayout.TP_GLOBAL
                 ),
             )
@@ -660,19 +731,12 @@ class LayerCommunicator:
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        hidden_states, residual = self._batch_steps(forward_batch).attention_prepare(
+        return self.attn.prepare(
             hidden_states,
             residual,
             forward_batch,
-            self.input_layernorm,
-            self._context,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
-        )
-        return self._finish_prepare_attn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
         )
 
     def _in_sp_region(self) -> bool:
@@ -693,27 +757,14 @@ class LayerCommunicator:
             return self._cp_steps
         return self._steps
 
-    def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        steps = self._batch_steps(forward_batch)
-        hidden_states = steps.attention_input(
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            context=self._context,
-        )
-        hidden_states = steps.attention_handoff(
-            hidden_states, forward_batch, self.qkv_latent_func
-        )
-        return hidden_states, residual
-
     def _select_attn_input_fusions(self) -> Tuple[Callable, ...]:
         """The fused kernels that complete what the previous layer left together
         with the residual update and the input norm, in the order they are tried.
         Each takes (owed, residual, forward_batch, post_residual_addition) and
         returns None when it does not take the batch. They add the residual
-        plainly."""
+        plainly: what arrives is written in as this layer's FFN writes its own."""
         if not (
-            self._residual_ops.adds_plainly
+            self._residual.ffn_update.adds_plainly
             and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
         ):
             return ()
@@ -772,7 +823,7 @@ class LayerCommunicator:
         """The fused kernels that can take the attention -> FFN steps, in the
         order they are tried. They add the residual plainly."""
         if not (
-            self._residual_ops.adds_plainly
+            self._residual.attention_update.adds_plainly
             and hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion")
         ):
             return ()
@@ -813,13 +864,7 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return steps.ffn_input(
-            hidden_states,
-            residual,
-            forward_batch,
-            self.post_attention_layernorm,
-            self._context,
-        )
+        return self.ffn.prepare(hidden_states, residual, forward_batch, steps)
 
     def maybe_prefetch_next_full_attention_kv(
         self,
@@ -847,10 +892,8 @@ class LayerCommunicator:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter, when
         the next layer's input also writes the output into the residual."""
-        return (
-            self._batch_steps(forward_batch).returns_over_dp
-            and not self._residual_ops.updates_residual_after_ffn
-        )
+        steps = self._batch_steps(forward_batch)
+        return steps.returns_over_dp and not steps.ffn_output.update.at_producer
 
     def _postprocess_dp_step(
         self, forward_batch: ForwardBatch
@@ -977,8 +1020,9 @@ class LayerCommunicator:
                 allow_reduce_scatter=self.allow_reduce_scatter,
                 is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
             )
-        if residual is not None and self._residual_ops.updates_residual_after_ffn:
-            hidden_states = self._residual_ops.update_residual(hidden_states, residual)
+        update = steps.ffn_output.update
+        if residual is not None and update.at_producer:
+            hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual
 
@@ -1326,7 +1370,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             allow_reduce_scatter,
             qkv_latent_func,
             allow_deferred_ffn_reduction=False,
-            residual_ops=self.mhc,
+            residual=self.mhc.layer_residual(),
         )
         # MHC has not been run with input-scattered attention under attention CP.
         if self._context.attn_cp_size > 1 and self._input_can_be_scattered():

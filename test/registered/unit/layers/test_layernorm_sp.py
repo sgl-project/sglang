@@ -22,6 +22,7 @@ from sglang.srt.layers.communicator import (
     TokenAxis,
 )
 from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.communicator import (
     sequence_parallel_layer_sides,
 )
@@ -191,16 +192,23 @@ class TestSpRegionSteps(CustomTestCase):
     def ordinary_steps(self, attention_input):
         """The layer's steps outside the region, which must not run inside it."""
         return comm.BoundarySteps(
-            attention_prepare=partial(
-                comm_boundary._attention_input_step,
-                layer_input=None,
-                fusions=(),
-                enters_stack=False,
-                residual_ops=comm.ADD_AND_NORM,
+            attention=comm.StageEntry(
+                prepare=partial(
+                    comm_boundary._attention_input_step,
+                    layer_input=None,
+                    fusions=(),
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                input_rows=comm.Layout(frozenset()),
+                input_move=attention_input,
+                handoff=comm_ops._hand_qkv_hook_its_input,
             ),
-            attention_input=attention_input,
-            ffn_input=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
-            ffn_input_rows=Layout(frozenset()),
+            ffn=comm.StageEntry(
+                prepare=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
+                input_rows=Layout(frozenset()),
+            ),
             ffn_output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
             ffn_output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
             ffn_sum_is_movable=True,

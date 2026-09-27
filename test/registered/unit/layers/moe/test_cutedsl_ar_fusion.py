@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.communicator import (
-    ADD_AND_NORM,
+    ADD,
+    NORM_QUANT_READ,
     FfnExitFusion,
     LayerCommunicator,
     Layout,
@@ -51,12 +52,17 @@ def _communicator():
     comm._context = SimpleNamespace()
     comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
     comm._steps = SimpleNamespace(
-        attention_prepare=partial(
-            _attention_input_step,
-            layer_input=None,
-            fusions=comm._attn_input_fusions,
-            enters_stack=False,
-            residual_ops=ADD_AND_NORM,
+        attention=SimpleNamespace(
+            prepare=partial(
+                _attention_input_step,
+                layer_input=None,
+                fusions=comm._attn_input_fusions,
+                enters_stack=False,
+                read=NORM_QUANT_READ,
+                update=ADD,
+            ),
+            input_move=None,
+            handoff=None,
         )
     )
     return comm
@@ -111,14 +117,6 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
     with (
-        patch.object(
-            CuteDSLFusionLayerCommunicator,
-            "_finish_prepare_attn",
-            lambda self, *, hidden_states, residual, forward_batch: (
-                hidden_states,
-                residual,
-            ),
-        ),
         patch_communicator(
             "reduce_output",
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
@@ -184,7 +182,7 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
             (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
         ):
             comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
-                ffn_input_rows=rows
+                ffn=SimpleNamespace(input_rows=rows)
             )
             assert comm._common_eligible(_DECODE, 8) is eligible
 
@@ -383,14 +381,6 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
         ),
         patch.object(
             CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=False
-        ),
-        patch.object(
-            CuteDSLFusionLayerCommunicator,
-            "_finish_prepare_attn",
-            lambda self, *, hidden_states, residual, forward_batch: (
-                hidden_states,
-                residual,
-            ),
         ),
     ):
         hidden, residual = comm.prepare_attn(

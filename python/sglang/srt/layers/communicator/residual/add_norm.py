@@ -23,6 +23,7 @@ from sglang.srt.layers.communicator.adapters.attention import (
     _redistribute_to_attn_tp_shards,
     get_attn_tp_context,
 )
+from sglang.srt.layers.communicator.residual import LayerResidual
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
@@ -261,43 +262,13 @@ def _attn_input_update_and_read_residual(quant_format: str):
     return _update_and_read_residual_plain
 
 
-class AddAndNorm:
-    """A plain residual: a stage's output is added into it, and the next
-    stage's input is its norm. An empty batch skips the norms."""
+class Add:
+    """A plain residual: the output is added into it."""
 
     adds_plainly = True
-    updates_residual_after_ffn = False
+    at_producer = False
 
-    def enter(self, hidden_states):
-        return hidden_states
-
-    def read_attention_input(self, residual, norm, quant_format):
-        if residual.shape[0] == 0:
-            return residual, residual
-        return _attn_input_update_and_read_residual(quant_format)(
-            norm, residual, None, None
-        )
-
-    def update_and_read_attention_input(
-        self, hidden_states, residual, norm, quant_format, post_residual_addition
-    ):
-        if hidden_states.shape[0] == 0:
-            return hidden_states, hidden_states
-        return _attn_input_update_and_read_residual(quant_format)(
-            norm, hidden_states, residual, post_residual_addition
-        )
-
-    def update_and_read_ffn_input(self, hidden_states, residual, norm):
-        if residual is None:
-            # The layer stack starts at this FFN: its input is the residual.
-            if hidden_states.shape[0] == 0:
-                return hidden_states, hidden_states
-            return norm(hidden_states), hidden_states
-        if hidden_states.shape[0] == 0:
-            return hidden_states, residual
-        return norm(hidden_states, residual)
-
-    def update_residual(self, hidden_states, residual):
+    def update(self, hidden_states, residual):
         hidden_states += residual
         return hidden_states
 
@@ -308,4 +279,91 @@ class AddAndNorm:
         return _redistribute_from_attn_tp_shards(residual)
 
 
-ADD_AND_NORM = AddAndNorm()
+class NormQuantRead:
+    """The input is the residual's norm, fused with the quantization the
+    consumer asks for (``quant_format``) and a post-residual addition; a plain
+    add of the previous output runs in the same kernel. An empty batch skips
+    the norm."""
+
+    norms_plainly = True
+
+    def enter(self, hidden_states):
+        return hidden_states
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if residual.shape[0] == 0:
+            return residual, residual
+        return _attn_input_update_and_read_residual(quant_format)(
+            norm, residual, None, None
+        )
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if not update.adds_plainly:
+            return self.read(update.update(hidden_states, residual), norm, quant_format)
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
+        return _attn_input_update_and_read_residual(quant_format)(
+            norm, hidden_states, residual, post_residual_addition
+        )
+
+
+class NormRead:
+    """The input is the residual's norm; a plain add of the previous output
+    runs in the same kernel. An empty batch skips the norm."""
+
+    norms_plainly = True
+
+    def enter(self, hidden_states):
+        return hidden_states
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if quant_format or post_residual_addition is not None:
+            raise NotImplementedError(
+                f"a norm read with {quant_format=} or a post-residual addition"
+            )
+        if residual.shape[0] == 0:
+            return residual, residual
+        return norm(residual), residual
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if residual is None:
+            # The layer stack starts at this stage: its input is the residual.
+            return self.read(hidden_states, norm, quant_format, post_residual_addition)
+        if not update.adds_plainly:
+            return self.read(update.update(hidden_states, residual), norm, quant_format)
+        if quant_format or post_residual_addition is not None:
+            raise NotImplementedError(
+                f"a norm read with {quant_format=} or a post-residual addition"
+            )
+        if hidden_states.shape[0] == 0:
+            return hidden_states, residual
+        return norm(hidden_states, residual)
+
+
+ADD = Add()
+NORM_QUANT_READ = NormQuantRead()
+NORM_READ = NormRead()
+# A plain residual: the attention reads with its input norm and the quantization
+# it wants, the FFN with its norm, and each stage's output is added.
+PLAIN_RESIDUAL = LayerResidual(
+    attention_read=NORM_QUANT_READ,
+    attention_update=ADD,
+    ffn_read=NORM_READ,
+    ffn_update=ADD,
+)

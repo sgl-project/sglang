@@ -10,7 +10,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.communicator import (
-    ADD_AND_NORM,
+    ADD,
+    NORM_QUANT_READ,
     LayerCommunicator,
     Layout,
     TokenAxis,
@@ -238,20 +239,27 @@ def test_communicator_publishes_layout_at_each_transition(
     gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
     # The rows of the steps the batch runs decide, not the ordinary steps'.
     communicator._steps = SimpleNamespace(
-        ffn_input_rows=local if gathered_over_dp else gathered
+        ffn=SimpleNamespace(input_rows=local if gathered_over_dp else gathered)
     )
     selected = SimpleNamespace(
-        attention_prepare=partial(
-            _attention_input_step,
-            layer_input=None,
-            fusions=(),
-            enters_stack=False,
-            residual_ops=ADD_AND_NORM,
+        attention=SimpleNamespace(
+            prepare=partial(
+                _attention_input_step,
+                layer_input=None,
+                fusions=(),
+                enters_stack=False,
+                read=NORM_QUANT_READ,
+                update=ADD,
+            ),
+            input_move=lambda hidden_states, **kwargs: hidden_states,
+            handoff=lambda hidden_states, *args: hidden_states,
         ),
-        attention_input=lambda hidden_states, **kwargs: hidden_states,
-        attention_handoff=lambda hidden_states, *args: hidden_states,
-        ffn_input=lambda hidden_states, residual, *args: (hidden_states, residual),
-        ffn_input_rows=gathered if gathered_over_dp else local,
+        ffn=SimpleNamespace(
+            prepare=lambda hidden_states, residual, *args: (hidden_states, residual),
+            input_rows=gathered if gathered_over_dp else local,
+            input_move=None,
+            handoff=None,
+        ),
     )
     communicator._batch_steps = lambda forward_batch: selected
     hidden = torch.zeros(num_tokens, 4)

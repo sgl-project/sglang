@@ -1,13 +1,15 @@
 import itertools
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
+    ADD,
     EdgeDecl,
+    FusedMlpInput,
     InputRead,
     Layout,
     StageInput,
@@ -258,6 +260,145 @@ class TestNonAlternatingEdges(CustomTestCase):
         )
         with self.assertRaises(NotImplementedError):
             make_boundary(edge, reads=None)
+
+
+class ProbeRead:
+    """A read that marks what it reads: the input is the residual plus 100.
+    ``norms_plainly`` says whether it may stand in for a norm."""
+
+    def __init__(self, norms_plainly):
+        self.norms_plainly = norms_plainly
+        self.reads = 0
+
+    def enter(self, hidden_states):
+        return hidden_states
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        self.reads += 1
+        return residual + 100, residual
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        return self.read(update.update(hidden_states, residual), norm)
+
+
+class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
+    """Every input step reads the FFN input with the read the consumer
+    declares. A step that completes the sum onto the rows it reads from, or a
+    fused add + norm kernel, runs only for a read that leaves the residual as
+    it is."""
+
+    def _ffn_input(self, read, *, dp=1, residual_joins_sum=False, fusions=()):
+        axis_sizes = sizes(dp=dp, tp=2)
+        attention = rows(axis_sizes, TokenAxis.ATTN_DP)
+        residual = (
+            rows(axis_sizes, TokenAxis.ATTN_DP, TokenAxis.ATTN_TP_SCATTER)
+            if residual_joins_sum
+            else attention
+        )
+        need = rows(axis_sizes) if dp > 1 else attention
+        return comm_boundary._select_ffn_input(
+            StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True),
+            residual=residual,
+            residual_to=attention,
+            need=StageInput(need, read=read),
+            force_layernorm_before_gather=False,
+            fusions=fusions,
+            residual_joins_sum=residual_joins_sum,
+            read=read,
+            update=ADD,
+        )
+
+    def test_the_dp_partial_reads_the_gathered_sum_with_the_declared_read(self):
+        read = ProbeRead(norms_plainly=True)
+        step, _ = self._ffn_input(read, dp=2)
+        self.assertIs(step.func, comm_ops._mlp_input_dp_partial)
+        hidden, residual = torch.ones(2, 4), torch.full((2, 4), 3.0)
+        with (
+            patch.object(
+                comm_ops,
+                "_reduce_and_redistribute_output_to_dp",
+                lambda h, forward_batch, cp_shard_counts: h * 2,
+            ),
+            patch.object(comm_ops, "dp_scatter", lambda *args: None),
+        ):
+            out, out_residual = step(
+                hidden, residual, None, MagicMock(), SimpleNamespace(attn_tp_rank=0)
+            )
+        self.assertEqual(read.reads, 1)
+        torch.testing.assert_close(out, torch.full((2, 4), 108.0))
+        self.assertIs(out_residual, residual)
+
+    def test_a_read_that_changes_the_residual_replicates_instead(self):
+        step, _ = self._ffn_input(ProbeRead(norms_plainly=False), dp=2)
+        self.assertIs(step.func, comm_ops._mlp_input_dp_replicate)
+
+    def test_the_residual_joined_sum_is_read_with_the_declared_read(self):
+        read = ProbeRead(norms_plainly=True)
+        step, _ = self._ffn_input(read, residual_joins_sum=True)
+        self.assertIs(step.func, comm_ops._mlp_input_residual_into_sum)
+        hidden, residual = torch.ones(4, 4), torch.full((2, 4), 3.0)
+        with patch.object(
+            comm_ops, "tensor_model_parallel_all_reduce", lambda h: h * 2
+        ):
+            out, out_residual = step(
+                hidden,
+                residual,
+                None,
+                MagicMock(),
+                SimpleNamespace(tp_size=2, tp_rank=0),
+            )
+        self.assertEqual(read.reads, 1)
+        expected = torch.tensor([8.0, 8.0, 2.0, 2.0])[:, None].expand(4, 4)
+        torch.testing.assert_close(out_residual, expected)
+        torch.testing.assert_close(out, expected + 100)
+
+    def test_a_fused_kernel_runs_only_for_a_read_that_leaves_the_residual(self):
+        fused = FusedMlpInput(
+            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=True
+        )
+        for norms_plainly in (True, False):
+            with self.subTest(norms_plainly=norms_plainly):
+                step, tried = self._ffn_input(
+                    ProbeRead(norms_plainly), fusions=(fused,)
+                )
+                self.assertIs(step.func, comm_ops._mlp_input_without_dp)
+                expected = (fused,) if norms_plainly else ()
+                self.assertEqual(tried, expected)
+                self.assertEqual(
+                    step.keywords["fusions"], tuple(f.run for f in expected)
+                )
+
+    def test_the_attention_input_tries_its_kernels_only_for_such_a_read(self):
+        axis_sizes = sizes(tp=2)
+        attention = rows(axis_sizes)
+        kernel = MagicMock()
+        for norms_plainly in (True, False):
+            with self.subTest(norms_plainly=norms_plainly):
+                read = ProbeRead(norms_plainly)
+                edge = EdgeDecl(
+                    produced=StageOutput(
+                        attention, group=SumGroup.TP, leaves_for_next_layer=True
+                    ),
+                    need=StageInput(attention, read=read),
+                    residual=attention,
+                    residual_to=attention,
+                )
+                boundary = make_boundary(
+                    edge, reads=InputRead.ATTENTION, fusions=(kernel,)
+                )
+                self.assertIs(boundary.prepare.keywords["read"], read)
+                self.assertEqual(
+                    boundary.prepare.keywords["fusions"],
+                    (kernel,) if norms_plainly else (),
+                )
 
 
 if __name__ == "__main__":

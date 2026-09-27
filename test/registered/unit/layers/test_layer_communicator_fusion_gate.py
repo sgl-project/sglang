@@ -49,20 +49,26 @@ def sp_region_steps():
 
 def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
     return comm.BoundarySteps(
-        attention_prepare=partial(
-            comm_boundary._attention_input_step,
-            layer_input=None,
-            fusions=(),
-            enters_stack=False,
-            residual_ops=comm.ADD_AND_NORM,
+        attention=comm.StageEntry(
+            prepare=partial(
+                comm_boundary._attention_input_step,
+                layer_input=None,
+                fusions=(),
+                enters_stack=False,
+                read=comm.NORM_QUANT_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
+            input_move=comm.CommunicateSimpleFn._trivial,
+            handoff=comm_ops._hand_qkv_hook_its_input,
         ),
-        attention_input=comm.CommunicateSimpleFn._trivial,
-        ffn_input=comm_ops._mlp_input_norm,
-        ffn_input_rows=Layout(frozenset()),
+        ffn=comm.StageEntry(
+            prepare=comm_ops._mlp_input_norm, input_rows=Layout(frozenset())
+        ),
         ffn_output=ffn_output or StageOutput(Layout(frozenset()), group=SumGroup.TP),
-        ffn_output_move=(
-            None if returns_over_dp else comm.CommunicateSummableTensorPairFn._trivial
-        ),
+        ffn_output_move=None
+        if returns_over_dp
+        else comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=ffn_sum_is_movable,
     )
 

@@ -10,7 +10,7 @@ from unittest import mock
 
 from sglang.srt.layers import communicator
 from sglang.srt.layers.communicator import boundary, layer, layout, ops, output
-from sglang.srt.layers.communicator import residual as residual_ops
+from sglang.srt.layers.communicator import residual as residual_contract
 from sglang.srt.layers.communicator.adapters import attention
 from sglang.srt.layers.communicator.residual import add_norm, mhc
 
@@ -19,7 +19,7 @@ COMMUNICATOR_MODULES = (
     layout,
     output,
     attention,
-    residual_ops,
+    residual_contract,
     add_norm,
     mhc,
     ops,

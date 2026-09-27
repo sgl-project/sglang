@@ -25,6 +25,7 @@ from sglang.srt.layers.communicator.boundary import (
     InputRead,
     LayerStage,
     StageDecl,
+    StageEntry,
     StageInput,
     StageOutput,
     decoder_layer_edges,
@@ -67,16 +68,20 @@ from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
     reduce_output,
 )
+from sglang.srt.layers.communicator.residual import LayerResidual
 from sglang.srt.layers.communicator.residual.add_norm import (
-    ADD_AND_NORM,
+    ADD,
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+    NORM_QUANT_READ,
+    NORM_READ,
+    PLAIN_RESIDUAL,
 )
 from sglang.srt.layers.communicator.residual.mhc import (
     MHCState,
 )
 
 __all__ = [
-    "ADD_AND_NORM",
+    "ADD",
     "AttentionInputs",
     "BoundarySteps",
     "CommunicateContext",
@@ -92,14 +97,19 @@ __all__ = [
     "HandoffOutput",
     "InputRead",
     "LayerCommunicator",
+    "LayerResidual",
     "LayerScatterModes",
     "LayerStage",
     "Layout",
     "MHCLayerCommunicator",
     "MHCState",
     "MixerExit",
+    "NORM_QUANT_READ",
+    "NORM_READ",
+    "PLAIN_RESIDUAL",
     "ScatterMode",
     "StageDecl",
+    "StageEntry",
     "StageInput",
     "StageOutput",
     "SumGroup",

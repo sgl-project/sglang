@@ -276,7 +276,7 @@ class TestDpCpGather(CustomTestCase):
                 self.assertIsNotNone(r.communicator._cp_steps, "declared under CP")
                 if ffn_input is not None:
                     steps = r.communicator._batch_steps(r.forward_batch)
-                    self.assertIs(steps.ffn_input.func, ffn_input)
+                    self.assertIs(steps.ffn.prepare.func, ffn_input)
                 hidden_states, residual = rank_inputs(*rank)
                 return r.communicator.prepare_mlp(
                     hidden_states, residual, r.forward_batch

@@ -50,16 +50,22 @@ class DeferringLayer(nn.Module):
         self.return_topk = return_topk
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         self.layer_communicator._steps = comm.BoundarySteps(
-            attention_prepare=partial(
-                comm_boundary._attention_input_step,
-                layer_input=None,
-                fusions=(),
-                enters_stack=False,
-                residual_ops=comm.ADD_AND_NORM,
+            attention=comm.StageEntry(
+                prepare=partial(
+                    comm_boundary._attention_input_step,
+                    layer_input=None,
+                    fusions=(),
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                input_rows=comm.Layout(frozenset()),
+                input_move=comm.CommunicateSimpleFn._trivial,
+                handoff=comm_ops._hand_qkv_hook_its_input,
             ),
-            attention_input=comm.CommunicateSimpleFn._trivial,
-            ffn_input=comm_ops._mlp_input_norm,
-            ffn_input_rows=comm.Layout(frozenset()),
+            ffn=comm.StageEntry(
+                prepare=comm_ops._mlp_input_norm, input_rows=comm.Layout(frozenset())
+            ),
             ffn_output=comm.StageOutput(
                 comm.Layout(frozenset()),
                 group=comm.SumGroup.TP,

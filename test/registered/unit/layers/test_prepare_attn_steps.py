@@ -60,16 +60,22 @@ def communicator(norm):
     c._attn_input_fusions = c._select_attn_input_fusions()
     # A layer whose attention takes its input as it is and owes nothing on it.
     c._steps = comm.BoundarySteps(
-        attention_prepare=partial(
-            comm_boundary._attention_input_step,
-            layer_input=None,
-            fusions=c._attn_input_fusions,
-            enters_stack=False,
-            residual_ops=comm.ADD_AND_NORM,
+        attention=comm.StageEntry(
+            prepare=partial(
+                comm_boundary._attention_input_step,
+                layer_input=None,
+                fusions=c._attn_input_fusions,
+                enters_stack=False,
+                read=comm.NORM_QUANT_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
+            input_move=lambda hidden_states, **_: hidden_states,
+            handoff=comm_ops._hand_qkv_hook_its_input,
         ),
-        attention_input=lambda hidden_states, **_: hidden_states,
-        ffn_input=comm_ops._mlp_input_norm,
-        ffn_input_rows=comm.Layout(frozenset()),
+        ffn=comm.StageEntry(
+            prepare=comm_ops._mlp_input_norm, input_rows=comm.Layout(frozenset())
+        ),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
         ffn_sum_is_movable=False,
@@ -240,12 +246,16 @@ class TestPrepareAttnSteps(CustomTestCase):
             takes_anything = MagicMock(return_value=("fused", "fused"))
             c._steps = msgspec.structs.replace(
                 c._steps,
-                attention_prepare=partial(
-                    comm_boundary._attention_input_step,
-                    layer_input=None,
-                    fusions=(takes_anything,),
-                    enters_stack=False,
-                    residual_ops=comm.ADD_AND_NORM,
+                attention=msgspec.structs.replace(
+                    c._steps.attention,
+                    prepare=partial(
+                        comm_boundary._attention_input_step,
+                        layer_input=None,
+                        fusions=(takes_anything,),
+                        enters_stack=False,
+                        read=comm.NORM_QUANT_READ,
+                        update=comm.ADD,
+                    ),
                 ),
             )
             partial_sum = torch.ones(3, 4)
