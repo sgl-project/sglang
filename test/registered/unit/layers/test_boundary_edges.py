@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
@@ -10,7 +11,6 @@ from sglang.srt.layers.communicator import (
     ADD,
     EdgeDecl,
     FusedMlpInput,
-    InputRead,
     Layout,
     StageInput,
     StageOutput,
@@ -23,9 +23,11 @@ from sglang.srt.layers.communicator import (
     decoder_layer_sides,
     input_scattered_layer_sides,
     make_boundary,
+    make_output_boundary,
 )
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -88,8 +90,32 @@ class TestDecoderLayerEdges(CustomTestCase):
         self.assertIs(edge.produced.group, SumGroup.TP)
         self.assertTrue(edge.produced.always_leaves)
         self.assertEqual(edge.residual_to, rows(axis_sizes, TokenAxis.ATTN_TP_SCATTER))
-        boundary = make_boundary(edge, reads=InputRead.ATTENTION)
-        self.assertIs(boundary.prepare.keywords["layer_input"], comm.tp_reduce_scatter)
+        step = make_boundary(edge).prepare.keywords["step"]
+        self.assertIs(step.keywords["layer_input"], comm.tp_reduce_scatter)
+
+    def test_each_entry_keeps_the_move_after_its_read(self):
+        sides = decoder_layer_sides(
+            axis_sizes=sizes(dp=2, tp=2),
+            ffn_on_local_rows=False,
+            previous_on_local_rows=False,
+            is_last_layer=False,
+            attention_gathers_local_rows=False,
+            ffn_group=SumGroup.TP,
+            leaves_for_next_layer=True,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        )
+        edges = decoder_layer_edges(sides)
+        moves = {edges.into_attention: MagicMock(), edges.into_ffn: MagicMock()}
+        real = comm_boundary.make_boundary
+
+        def with_move(edge, **kwargs):
+            return msgspec.structs.replace(real(edge, **kwargs), input_move=moves[edge])
+
+        with patch.object(comm_boundary, "make_boundary", with_move):
+            steps = comm_boundary._select_boundary_steps(sides)
+        self.assertIs(steps.attention.input_move, moves[edges.into_attention])
+        self.assertIs(steps.ffn.input_move, moves[edges.into_ffn])
 
 
 class TestAMoeOnEachCpShard(CustomTestCase):
@@ -147,19 +173,22 @@ class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
                 residual=attention,
                 residual_to=attention,
             )
-            boundary = make_boundary(edge, reads=InputRead.ATTENTION)
+            boundary = make_boundary(edge)
+            step = boundary.prepare.keywords["step"]
             halves.add(
                 (
                     boundary.prepare.func,
-                    tuple(sorted(boundary.prepare.keywords.items())),
+                    step.func,
+                    tuple(sorted(step.keywords.items())),
                     boundary.input_move,
                 )
             )
         self.assertEqual(len(halves), 1)
-        ((func, keywords, move),) = halves
-        self.assertIs(func, comm_boundary._attention_input_step)
+        ((func, step, keywords, move),) = halves
+        self.assertIs(func, comm_ops._consumer_step)
+        self.assertIs(step, comm_ops._read_input)
         self.assertIsNone(dict(keywords)["layer_input"])
-        self.assertIs(move, comm.CommunicateSimpleFn._trivial)
+        self.assertIsNone(move)
 
 
 class TestNonAlternatingEdges(CustomTestCase):
@@ -178,11 +207,12 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=attention,
             residual_to=attention,
         )
-        producer = make_boundary(edge, reads=None)
+        producer = make_output_boundary(edge)
         self.assertIs(producer.output_move, Pair._trivial)
-        consumer = make_boundary(edge, reads=InputRead.ATTENTION)
-        self.assertIsNone(consumer.prepare.keywords["layer_input"])
-        self.assertIs(consumer.input_move, comm.CommunicateSimpleFn._trivial)
+        consumer = make_boundary(edge)
+        self.assertIs(consumer.prepare.func, comm_ops._consumer_step)
+        self.assertIsNone(consumer.prepare.keywords["step"].keywords["layer_input"])
+        self.assertIsNone(consumer.input_move)
 
     def test_an_ffn_into_an_ffn(self):
         axis_sizes = sizes(dp=2, tp=2)
@@ -194,7 +224,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=attention,
             residual_to=attention,
         )
-        step = make_boundary(complete, reads=InputRead.FFN).prepare
+        step = make_boundary(complete).prepare.keywords["step"]
         self.assertIs(step.func, comm_ops._mlp_input_dp_replicate)
         self.assertFalse(step.keywords["reduces_attention_tp"])
         # A sum the value carries is completed first, then the same steps run.
@@ -206,11 +236,12 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=attention,
             residual_to=attention,
         )
-        step = make_boundary(leaves, reads=InputRead.FFN).prepare
-        self.assertIs(step.func, comm_ops._mlp_input_completing_owed)
-        self.assertIs(step.keywords["step"].func, comm_ops._mlp_input_dp_replicate)
-        # A producer that always leaves a sum other than the attention TP's is
-        # not supported.
+        prepare = make_boundary(leaves).prepare
+        self.assertIs(prepare.func, comm_ops._consumer_step)
+        self.assertIs(prepare.keywords["step"].func, comm_ops._mlp_input_dp_replicate)
+        # A TP sum left on the rows of one attention-DP shard: the TP group spans
+        # the other shards, whose ranks hold other rows, so no all-reduce over it
+        # completes these.
         always = EdgeDecl(
             produced=StageOutput(attention, group=SumGroup.TP, always_leaves=True),
             need=StageInput(full),
@@ -218,7 +249,119 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual_to=attention,
         )
         with self.assertRaises(NotImplementedError):
-            make_boundary(always, reads=InputRead.FFN)
+            make_boundary(always)
+
+    def test_an_ffn_that_always_leaves_its_tp_sum(self):
+        # Without attention DP every TP rank holds the rows, so TP completes the sum.
+        full = rows(sizes(tp=2))
+        edge = EdgeDecl(
+            produced=StageOutput(full, group=SumGroup.TP, always_leaves=True),
+            need=StageInput(full),
+            residual=full,
+            residual_to=full,
+        )
+        over_tp = comm.FusedMlpInput(
+            completes=SumGroup.TP, run=MagicMock(), may_return_new_residual=False
+        )
+        over_attention_tp = comm.FusedMlpInput(
+            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=False
+        )
+        boundary = make_boundary(edge, fusions=(over_tp, over_attention_tp))
+        self.assertEqual(boundary.fused, (over_tp,))
+        step = make_boundary(edge).prepare
+        self.assertIs(step.keywords["step"].func, comm_ops._mlp_input_without_dp)
+        all_reduce = MagicMock(side_effect=lambda h: h * 2)
+        with patch_communicator("tensor_model_parallel_all_reduce", all_reduce):
+            hidden, residual = step(
+                torch.ones(3, 4),
+                torch.full((3, 4), 5.0),
+                None,
+                lambda hidden, residual: (hidden + residual, hidden + residual),
+                None,
+            )
+        all_reduce.assert_called_once()
+        torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
+
+
+class _WrittenIn:
+    """An update that is not a plain add: the output is written into the
+    residual only once its sum is complete."""
+
+    adds_plainly = False
+    at_producer = False
+
+    def update(self, hidden_states, residual):
+        return 2 * hidden_states + residual
+
+    def residual_to_attn_tp_shard(self, residual, context):
+        return residual
+
+    def residual_from_attn_tp_shards(self, residual):
+        return residual
+
+
+class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
+    """On the same rows, the steps into a stage follow the update the producer
+    declares: a plain add may join a sum before it completes and run inside a
+    fused add + norm, another update runs after the sum completes."""
+
+    def edge(self, update):
+        axis_sizes = sizes(dp=2, tp=2)
+        attention = rows(axis_sizes, TokenAxis.ATTN_DP)
+        return EdgeDecl(
+            produced=StageOutput(
+                attention, group=SumGroup.ATTN_TP, always_leaves=True, update=update
+            ),
+            need=StageInput(rows(axis_sizes)),
+            residual=attention,
+            residual_to=attention,
+        )
+
+    def test_the_dp_gather_order(self):
+        plain = make_boundary(self.edge(comm.ADD)).prepare.keywords["step"]
+        self.assertIs(plain.func, comm_ops._mlp_input_dp_partial)
+        written = _WrittenIn()
+        other = make_boundary(self.edge(written)).prepare.keywords["step"]
+        self.assertIs(other.func, comm_ops._mlp_input_dp_replicate)
+        self.assertTrue(other.keywords["reduces_attention_tp"])
+        self.assertIs(other.keywords["update"], written)
+
+    def test_fused_kernels_take_only_a_plain_add(self):
+        full = rows(sizes(tp=2))
+        fused = comm.FusedMlpInput(
+            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=False
+        )
+        carried = MagicMock()
+        for update, offered in ((comm.ADD, True), (_WrittenIn(), False)):
+            with self.subTest(adds_plainly=offered):
+                edge = EdgeDecl(
+                    produced=StageOutput(
+                        full, group=SumGroup.ATTN_TP, always_leaves=True, update=update
+                    ),
+                    need=StageInput(full),
+                    residual=full,
+                    residual_to=full,
+                )
+                boundary = make_boundary(
+                    edge, fusions=(fused,), carried_fusions=(carried,)
+                )
+                self.assertEqual(boundary.fused, (fused,) if offered else ())
+                self.assertEqual(
+                    boundary.prepare.keywords["carried_fusions"],
+                    (carried,) if offered else (),
+                )
+
+    def test_the_consumer_reads_as_it_declares(self):
+        full = rows(sizes(tp=2))
+        read = MagicMock()
+        edge = EdgeDecl(
+            produced=StageOutput(full),
+            need=StageInput(full, read=read),
+            residual=full,
+            residual_to=full,
+        )
+        step = make_boundary(edge).prepare.keywords["step"]
+        self.assertIs(step.keywords["read"], read)
 
     def test_the_next_ffn_completes_a_sum_left_for_it_once(self):
         full = rows(sizes(tp=2))
@@ -228,7 +371,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=full,
             residual_to=full,
         )
-        step = make_boundary(edge, reads=InputRead.FFN).prepare
+        step = make_boundary(edge).prepare
         group = SimpleNamespace(all_reduce=MagicMock(side_effect=lambda h: h * 2))
 
         def norm(hidden, residual):
@@ -259,7 +402,7 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual_to=attention,
         )
         with self.assertRaises(NotImplementedError):
-            make_boundary(edge, reads=None)
+            make_output_boundary(edge)
 
 
 class ProbeRead:
@@ -304,17 +447,19 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
             else attention
         )
         need = rows(axis_sizes) if dp > 1 else attention
-        return comm_boundary._select_ffn_input(
-            StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True),
-            residual=residual,
-            residual_to=attention,
-            need=StageInput(need, read=read),
-            force_layernorm_before_gather=False,
+        boundary = make_boundary(
+            EdgeDecl(
+                produced=StageOutput(
+                    attention, group=SumGroup.ATTN_TP, always_leaves=True, update=ADD
+                ),
+                need=StageInput(need, read=read),
+                residual=residual,
+                residual_to=attention,
+                residual_joins_sum=residual_joins_sum,
+            ),
             fusions=fusions,
-            residual_joins_sum=residual_joins_sum,
-            read=read,
-            update=ADD,
         )
+        return boundary.prepare.keywords["step"], boundary.fused
 
     def test_the_dp_partial_reads_the_gathered_sum_with_the_declared_read(self):
         read = ProbeRead(norms_plainly=True)
@@ -391,12 +536,10 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
                     residual=attention,
                     residual_to=attention,
                 )
-                boundary = make_boundary(
-                    edge, reads=InputRead.ATTENTION, fusions=(kernel,)
-                )
-                self.assertIs(boundary.prepare.keywords["read"], read)
+                boundary = make_boundary(edge, carried_fusions=(kernel,))
+                self.assertIs(boundary.prepare.keywords["step"].keywords["read"], read)
                 self.assertEqual(
-                    boundary.prepare.keywords["fusions"],
+                    boundary.prepare.keywords["carried_fusions"],
                     (kernel,) if norms_plainly else (),
                 )
 

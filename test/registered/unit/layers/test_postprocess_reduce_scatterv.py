@@ -18,7 +18,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.communicator import boundary as comm_boundary
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
@@ -39,19 +38,29 @@ def steps(*, ffn_output_move):
     return comm.BoundarySteps(
         attention=comm.StageEntry(
             prepare=partial(
-                comm_boundary._attention_input_step,
-                layer_input=None,
-                fusions=(),
-                enters_stack=False,
-                read=comm.NORM_QUANT_READ,
-                update=comm.ADD,
+                comm_ops._consumer_step,
+                step=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                carried_fusions=(),
             ),
             input_rows=comm.Layout(frozenset()),
             input_move=comm.CommunicateSimpleFn._trivial,
             handoff=comm_ops._hand_qkv_hook_its_input,
         ),
         ffn=comm.StageEntry(
-            prepare=comm_ops._mlp_input_norm, input_rows=comm.Layout(frozenset())
+            prepare=partial(
+                comm_ops._read_input,
+                layer_input=None,
+                enters_stack=False,
+                read=comm.NORM_READ,
+                update=comm.ADD,
+            ),
+            input_rows=comm.Layout(frozenset()),
         ),
         ffn_output=comm.StageOutput(comm.Layout(frozenset())),
         ffn_output_move=ffn_output_move,

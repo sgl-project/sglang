@@ -16,14 +16,13 @@ declarations."""
 
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, FrozenSet, Mapping, Optional, Tuple, Union
+from typing import Callable, FrozenSet, Mapping, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.communicator.layout import (
-    CommunicateContext,
     Layout,
     SumGroup,
     TokenAxis,
@@ -35,24 +34,19 @@ from sglang.srt.layers.communicator.layout import (
 from sglang.srt.layers.communicator.ops import (
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
+    _consumer_step,
     _hand_qkv_hook_its_input,
-    _mlp_input_completing_owed,
     _mlp_input_dp_partial,
     _mlp_input_dp_replicate,
     _mlp_input_gather_attention_cp,
     _mlp_input_gather_moe_cp,
-    _mlp_input_norm,
     _mlp_input_on_residual_shard,
     _mlp_input_residual_into_sum,
     _mlp_input_scatter,
     _mlp_input_slice,
     _mlp_input_without_dp,
+    _read_input,
     tp_reduce_scatter,
-)
-from sglang.srt.layers.communicator.output import (
-    HandoffOutput,
-    UnreducedOutput,
-    reduce_output,
 )
 from sglang.srt.layers.communicator.residual import (
     LayerResidual,
@@ -64,7 +58,6 @@ from sglang.srt.layers.communicator.residual.add_norm import (
     NORM_QUANT_READ,
     NORM_READ,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -560,63 +553,10 @@ class BoundarySteps(msgspec.Struct, frozen=True):
         return self.ffn_output_move is None
 
 
-def _attention_input_step(
-    hidden_states: Union[torch.Tensor, "UnreducedOutput"],
-    residual: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-    norm: torch.nn.Module,
-    context: "CommunicateContext",
-    *,
-    quant_format: str,
-    post_residual_addition: Optional[torch.Tensor],
-    layer_input: Optional[Callable],
-    fusions: Tuple[Callable, ...],
-    enters_stack: bool,
-    read: StageRead,
-    update: StageUpdate,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """A boundary's half into an attention: complete what the previous layer
-    left (a value that owes a sum, or a producer's handoff one of ``fusions``
-    consumes with the add and norm), what the input owes by construction
-    (``layer_input``), then write the previous output into the residual and read
-    the attention input with ``norm``. The layer stack's first layer
-    (``enters_stack``) starts its residual from its input."""
-    enters = residual is None and enters_stack
-    owed = None if isinstance(hidden_states, torch.Tensor) else hidden_states
-    if owed is not None and residual is None:
-        raise RuntimeError(f"{type(owed).__name__} requires residual input")
-    if isinstance(owed, UnreducedOutput) and owed.reduce_and_redistribute is not None:
-        # No fused kernel runs under attention DP: the reduce-scatter back to
-        # this rank's tokens comes first.
-        hidden_states, owed = reduce_output(owed), None
-    if owed is not None:
-        for fused in fusions:
-            result = fused(owed, residual, forward_batch, post_residual_addition)
-            if result is not None:
-                return result
-        if isinstance(owed, HandoffOutput):
-            # No fused kernel took the handoff: its producer completes it.
-            hidden_states, owed = reduce_output(owed), None
-        else:
-            hidden_states = owed.partial
-    if layer_input is not None:
-        hidden_states, residual = layer_input(hidden_states, residual, context)
-    if enters:
-        hidden_states, residual = read.enter(hidden_states), None
-    if owed is not None and hidden_states.shape[0] != 0:
-        hidden_states = reduce_output(owed)
-    if residual is None:
-        # The previous layer already wrote its output into the residual.
-        return read.read(hidden_states, norm, quant_format)
-    return read.update_and_read(
-        update, hidden_states, residual, norm, quant_format, post_residual_addition
-    )
-
-
-class InputRead(Enum):
-    """How a boundary's consumer reads its input from the residual: with the
-    attention input norm (prepare_attn) or with the FFN input norm and its
-    fused kernels (prepare_mlp)."""
+class StageKind(Enum):
+    """Which of a decoder layer's two stages a layer that is one stage takes
+    the place of: its norm, its read and update, its fused kernels and its
+    entry in the layer's steps."""
 
     ATTENTION = auto()
     FFN = auto()
@@ -624,12 +564,12 @@ class InputRead(Enum):
 
 class LayerStage(msgspec.Struct, frozen=True):
     """A layer that is one stage of a sequence of stages, each an
-    attention-like mixer or an FFN: how it reads its input, its two boundaries
+    attention-like mixer or an FFN: which of the two it is, its two boundaries
     (into it, and out of it onto the rows every layer hands on, as
     ``stage_edges`` gives them), and whether the layer stack
     starts at it."""
 
-    reads: InputRead
+    kind: StageKind
     edges: Tuple[EdgeDecl, EdgeDecl]
     enters_stack: bool = False
 
@@ -642,11 +582,11 @@ class Boundary(msgspec.Struct, frozen=True):
 
     edge: EdgeDecl
     # The consumer's half: completing what the input owes, the add and the
-    # norm; into the FFN also the move onto the rows it needs.
+    # norm, and the moves onto the rows it needs that come before the read.
     prepare: Optional[Callable] = None
-    # Into an attention, the move onto its rows after prepare.
+    # The move onto the consumer's rows after prepare; None when there is none.
     input_move: Optional[Callable] = None
-    # The fused kernels an FFN's prepare tries first.
+    # The fused kernels prepare tries first on a sum the input always owes.
     fused: Tuple["FusedMlpInput", ...] = ()
     # The producer's half: the postprocess that moves the output onto the rows
     # the layer hands on; None when it goes back over attention DP, whose step
@@ -668,79 +608,70 @@ class Boundary(msgspec.Struct, frozen=True):
 def make_boundary(
     edge: EdgeDecl,
     *,
-    reads: Optional[InputRead],
-    fusions: Tuple = (),
+    fusions: Tuple["FusedMlpInput", ...] = (),
+    carried_fusions: Tuple[Callable, ...] = (),
     force_layernorm_before_gather: bool = False,
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
 ) -> Boundary:
-    """The steps a layer runs at ``edge``, around the residual operations;
-    ``cp_moves`` for an edge that gathers over or returns across attention CP.
-    ``reads`` is how the consumer reads its input, or None when the consumer
-    runs in the next layer and ``edge.need`` is the rows this layer hands on:
-    then only the producer's half runs here. ``fusions`` are the fused kernels
-    the consumer tries first (FusedMlpInput into an FFN, the attention input's
-    entries into an attention); ``enters_stack`` for the edge into the layer
-    stack's first attention. The consumer's half reads only this edge's
-    declarations, never what the producer chose for a batch; a sum left for a
-    batch arrives with the value."""
-    if reads is None:
-        if edge.need.layout != edge.residual_to:
-            raise NotImplementedError(f"{edge=}")
-        returns_over_dp, output_move, completes_sum = _select_ffn_output_move(
-            edge.produced,
-            residual=edge.residual,
-            to=edge.residual_to,
-            cp_moves=cp_moves,
-            update=edge.produced.update,
-        )
-        return Boundary(
-            edge,
-            output_move=None if returns_over_dp else output_move,
-            output_move_completes_sum=completes_sum,
-        )
-    if reads is InputRead.FFN:
-        input_step, fused = _select_ffn_input(
-            edge.produced,
-            residual=edge.residual,
-            residual_to=edge.residual_to,
-            need=edge.need,
-            force_layernorm_before_gather=force_layernorm_before_gather,
-            fusions=fusions,
-            residual_joins_sum=edge.residual_joins_sum,
-            cp_moves=cp_moves,
-            read=edge.need.read,
-            update=edge.produced.update,
-        )
-        return Boundary(edge, prepare=input_step, fused=fused)
-    layer_input = None
-    if edge.produced.always_leaves:
-        # A reduce-scatter completes the TP sum onto each rank's slice, which the
-        # attention takes: its group is the TP group without attention DP or CP.
-        if (
-            edge.produced.group is not SumGroup.TP
-            or edge.residual.sharded
-            or TokenAxis.ATTN_TP_SCATTER not in edge.need.gathers_itself
-            or edge.residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
-        ):
-            raise NotImplementedError(f"{edge=}")
-        layer_input = tp_reduce_scatter
+    """The consumer's half of ``edge``, chosen from the edge's declarations and
+    the producer's update: what a value carries for a batch (a sum or a handoff
+    its producer left) is completed first, trying ``carried_fusions``; a sum
+    the producer always leaves as the layouts say, trying ``fusions``. Fused
+    kernels run only for a plain add and a read that is the residual's norm
+    and leaves the residual as it is; orders that add the residual before the
+    sum completes only for a plain add. ``cp_moves`` for an edge that gathers
+    over attention CP; ``enters_stack`` for the edge into the layer stack's
+    first stage. The steps read only this edge's declarations, never what the
+    producer chose for a batch."""
+    update = edge.produced.update
+    # A fused kernel runs the add and the norm itself.
+    plain = update.adds_plainly and edge.need.read.norms_plainly
+    step, fused, input_move = _select_input_steps(
+        edge.produced,
+        residual=edge.residual,
+        residual_to=edge.residual_to,
+        need=edge.need,
+        update=update,
+        fusions=fusions if plain else (),
+        force_layernorm_before_gather=force_layernorm_before_gather,
+        residual_joins_sum=edge.residual_joins_sum,
+        cp_moves=cp_moves,
+        enters_stack=enters_stack,
+    )
     return Boundary(
         edge,
         prepare=partial(
-            _attention_input_step,
-            layer_input=layer_input,
-            # A fused kernel runs the add and the norm itself.
-            fusions=(
-                fusions
-                if edge.produced.update.adds_plainly and edge.need.read.norms_plainly
-                else ()
-            ),
-            enters_stack=enters_stack,
-            read=edge.need.read,
-            update=edge.produced.update,
+            _consumer_step,
+            step=step,
+            carried_fusions=carried_fusions if plain else (),
+            owes_by_construction=edge.produced.always_leaves,
         ),
-        input_move=_select_attention_input_move(edge.residual_to, edge.need),
+        input_move=input_move,
+        fused=fused,
+    )
+
+
+def make_output_boundary(
+    edge: EdgeDecl, *, cp_moves: Optional[CpMoves] = None
+) -> Boundary:
+    """The producer's half of ``edge``, out of a layer's last stage onto the
+    rows the layer hands on (``edge.need``), whose consumer runs in the next
+    layer: the postprocess that moves the output there. ``cp_moves`` for an
+    edge that returns across attention CP."""
+    if edge.need.layout != edge.residual_to:
+        raise NotImplementedError(f"{edge=}")
+    returns_over_dp, output_move, completes_sum = _select_ffn_output_move(
+        edge.produced,
+        residual=edge.residual,
+        to=edge.residual_to,
+        cp_moves=cp_moves,
+        update=edge.produced.update,
+    )
+    return Boundary(
+        edge,
+        output_move=None if returns_over_dp else output_move,
+        output_move_completes_sum=completes_sum,
     )
 
 
@@ -760,18 +691,18 @@ def _select_boundary_steps(
     input tries ``attention_fusions``, and the layer stack's first layer
     (``enters_stack``) starts its residual there."""
     edges = decoder_layer_edges(sides)
-    out_of_ffn = make_boundary(edges.out_of_ffn, reads=None, cp_moves=cp_moves)
+    out_of_ffn = make_output_boundary(edges.out_of_ffn, cp_moves=cp_moves)
     into_ffn = make_boundary(
         edges.into_ffn,
-        reads=InputRead.FFN,
         fusions=fusions,
         force_layernorm_before_gather=force_layernorm_before_gather,
         cp_moves=cp_moves,
     )
     into_attention = make_boundary(
         edges.into_attention,
-        reads=InputRead.ATTENTION,
-        fusions=attention_fusions,
+        carried_fusions=attention_fusions,
+        force_layernorm_before_gather=force_layernorm_before_gather,
+        cp_moves=cp_moves,
         enters_stack=enters_stack,
     )
     return BoundarySteps(
@@ -784,6 +715,7 @@ def _select_boundary_steps(
         ffn=StageEntry(
             prepare=into_ffn.prepare,
             input_rows=into_ffn.input_rows,
+            input_move=into_ffn.input_move,
             fused=into_ffn.fused,
         ),
         ffn_output=edges.out_of_ffn.produced,
@@ -793,69 +725,33 @@ def _select_boundary_steps(
     )
 
 
-def _select_attention_input_move(rows: Layout, need: StageInput) -> Callable:
-    """How the rows a layer takes become its attention's input: as they are,
-    or gathered over attention TP from each rank's slice, unless the attention
-    gathers them itself."""
-    gathered = rows.sharded - need.layout.sharded - need.gathers_itself
-    if not need.layout.sharded <= rows.sharded or gathered not in (
-        frozenset(),
-        {TokenAxis.ATTN_TP_SCATTER},
-    ):
-        raise NotImplementedError(f"{rows=} {need=}")
-    if gathered:
-        return CommunicateSimpleFn._scattered_to_tp_attn_full
-    return CommunicateSimpleFn._trivial
-
-
-def _select_ffn_input(
+def _select_input_steps(
     produced: StageOutput,
     *,
     residual: Layout,
     residual_to: Layout,
     need: StageInput,
-    force_layernorm_before_gather: bool,
+    update: StageUpdate,
     fusions: Tuple[FusedMlpInput, ...],
-    residual_joins_sum: bool = False,
-    cp_moves: Optional[CpMoves] = None,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
-) -> Tuple[Callable, Tuple[FusedMlpInput, ...]]:
-    """The steps from the attention output to the FFN input, and the fused
-    kernels they try first: complete the attention-TP sum, move the residual to
-    the rows it has while the FFN runs, write the output into it and read the
-    FFN input, and bring the rows to what the FFN's group needs: a gather over
-    attention DP, or each rank's own slice. A kernel in ``fusions`` is tried
-    only when nothing is gathered or sliced, and only if it completes the sum
-    the attention output owes. A write-back that is not a plain add runs only
-    after the sum completes."""
-    if produced.leaves_for_next_layer and produced.group not in (
-        None,
-        SumGroup.ATTN_TP,
-    ):
-        # A producer that leaves its sum only for some batches (an FFN before
-        # this one) hands that sum on with the value: complete it, then the
-        # input is a complete output.
-        step, fused = _select_ffn_input(
-            StageOutput(produced.layout),
-            residual=residual,
-            residual_to=residual_to,
-            need=need,
-            force_layernorm_before_gather=force_layernorm_before_gather,
-            fusions=fusions,
-            residual_joins_sum=residual_joins_sum,
-            cp_moves=cp_moves,
-            read=read,
-            update=update,
-        )
-        return partial(_mlp_input_completing_owed, step=step), fused
-    # What the attention output owes decides the steps: the attention-TP sum,
-    # always left by the output projection, or nothing.
-    owes_attention_tp = produced.group is SumGroup.ATTN_TP
-    if owes_attention_tp != produced.always_leaves or produced.group not in (
-        None,
-        SumGroup.ATTN_TP,
-    ):
+    force_layernorm_before_gather: bool,
+    residual_joins_sum: bool,
+    cp_moves: Optional[CpMoves],
+    enters_stack: bool,
+) -> Tuple[Callable, Tuple[FusedMlpInput, ...], Optional[Callable]]:
+    """The steps into a stage for a value that is complete or owes the sum its
+    producer always leaves, the fused kernels they try first, and the move
+    after them: complete that sum, move the residual to the rows it has while
+    the stage runs, write the output into it with ``update`` and read the input,
+    and bring the input onto the rows the stage needs: a gather over attention
+    DP or CP, each rank's own slice, or after the read a gather over attention
+    TP. A kernel in ``fusions`` is tried only when nothing is gathered or
+    sliced, and only if it completes the sum the input owes. An update that is
+    not a plain add runs only after the sum completes."""
+    read = need.read
+    # What the input owes by construction; a sum the producer leaves only for
+    # some batches comes with the value and is completed before these steps.
+    owes = produced.group if produced.always_leaves else None
+    if produced.always_leaves and owes is None:
         raise NotImplementedError(f"{produced=}")
     gathered = produced.layout.sharded - need.layout.sharded - need.gathers_itself
     sliced = need.layout.sharded - produced.layout.sharded
@@ -866,44 +762,89 @@ def _select_ffn_input(
         if (
             sliced != {TokenAxis.ATTN_TP_SCATTER}
             or gathered
+            or owes not in (None, SumGroup.ATTN_TP)
             or residual_to != need.layout
             or residual not in (produced.layout, need.layout)
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
             partial(
-                _mlp_input_scatter if owes_attention_tp else _mlp_input_slice,
+                _mlp_input_scatter if owes is SumGroup.ATTN_TP else _mlp_input_slice,
                 scatters_residual=residual != residual_to,
                 read=read,
                 update=update,
             ),
             (),
+            None,
         )
     if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP_SCATTER}:
-        # The residual stays on each rank's slice while the FFN takes the
-        # attention's rows (MHC on an input-scattered batch).
-        if gathered or not owes_attention_tp or residual != residual_to:
+        if residual == residual_to:
+            # The residual stays on each rank's slice while the stage takes the
+            # rows around it (MHC on an input-scattered batch).
+            if gathered or owes is not SumGroup.ATTN_TP:
+                raise NotImplementedError(f"{produced=} {residual=} {need=}")
+            return (
+                partial(_mlp_input_on_residual_shard, read=read, update=update),
+                (),
+                None,
+            )
+        # A reduce-scatter completes the TP sum onto each rank's slice, which
+        # the stage takes: its group is the TP group without attention DP or CP.
+        if (
+            owes is not SumGroup.TP
+            or residual.sharded
+            or TokenAxis.ATTN_TP_SCATTER not in need.gathers_itself
+            or residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
+        ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
         return (
-            partial(_mlp_input_on_residual_shard, read=read, update=update),
+            partial(
+                _read_input,
+                layer_input=tp_reduce_scatter,
+                enters_stack=enters_stack,
+                read=read,
+                update=update,
+            ),
             (),
+            None,
         )
     if gathered == {TokenAxis.ATTN_CP}:
         # Each CP rank completes its own chunk, then the CP moves gather them.
         if cp_moves is None:
             raise NotImplementedError(f"{produced=} {need=}")
-        on_chunk, fused = _select_ffn_input(
+        on_chunk, fused, _ = _select_input_steps(
             produced,
             residual=residual,
             residual_to=residual_to,
-            need=StageInput(produced.layout),
-            force_layernorm_before_gather=force_layernorm_before_gather,
-            fusions=fusions,
-            residual_joins_sum=residual_joins_sum,
-            read=read,
+            need=StageInput(produced.layout, read=read),
             update=update,
+            fusions=fusions,
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            residual_joins_sum=residual_joins_sum,
+            cp_moves=cp_moves,
+            enters_stack=enters_stack,
         )
-        return partial(cp_moves.gather, gather=on_chunk), fused
+        return partial(cp_moves.gather, gather=on_chunk), fused, None
+    if gathered == {TokenAxis.ATTN_TP_SCATTER}:
+        # A complete input on each rank's slice, gathered over attention TP
+        # once it is read.
+        if (
+            owes is not None
+            or residual != residual_to
+            or residual_to != produced.layout
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        return (
+            partial(
+                _read_input,
+                layer_input=None,
+                enters_stack=enters_stack,
+                read=read,
+                update=update,
+            ),
+            (),
+            CommunicateSimpleFn._scattered_to_tp_attn_full,
+        )
     if (
         residual_to != produced.layout
         or gathered
@@ -919,30 +860,48 @@ def _select_ffn_input(
     # A residual arriving on each rank's slice is gathered back first.
     gathers_residual = residual != residual_to
     if not gathered:
-        if not owes_attention_tp:
-            return partial(_mlp_input_norm, read=read, update=update), ()
+        if owes is None:
+            if gathers_residual:
+                raise NotImplementedError(f"{produced=} {residual=} {need=}")
+            return (
+                partial(
+                    _read_input,
+                    layer_input=None,
+                    enters_stack=enters_stack,
+                    read=read,
+                    update=update,
+                ),
+                (),
+                None,
+            )
         if gathers_residual and residual_joins_sum:
             # Each rank adds its slice of the residual into its share of the
             # sum, so the all-reduce also brings the residual back to every row.
-            if not update.adds_plainly:
+            if owes is not SumGroup.ATTN_TP or not update.adds_plainly:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
-            return partial(_mlp_input_residual_into_sum, read=read), ()
-        # A fused kernel runs the add and the norm itself.
-        fused = (
-            tuple(f for f in fusions if f.completes is produced.group)
-            if update.adds_plainly and read.norms_plainly
-            else ()
-        )
+            return partial(_mlp_input_residual_into_sum, read=read), (), None
+        # A sum over TP completes only on rows every TP rank holds: the TP group
+        # spans attention DP and CP.
+        if owes is not SumGroup.ATTN_TP and (
+            owes is not SumGroup.TP or produced.layout.sharded
+        ):
+            raise NotImplementedError(f"{produced=} {need=}")
+        fused = tuple(f for f in fusions if f.completes is owes)
         return (
             partial(
                 _mlp_input_without_dp,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
+                group=owes,
                 read=read,
                 update=update,
             ),
             fused,
+            None,
         )
+    if owes not in (None, SumGroup.ATTN_TP):
+        raise NotImplementedError(f"{produced=} {need=}")
+    owes_attention_tp = owes is SumGroup.ATTN_TP
     # The partial order adds the residual on attention-TP rank 0 before the DP
     # gather's collective completes that sum, which only a plain residual add
     # allows.
@@ -963,6 +922,7 @@ def _select_ffn_input(
                 read=read,
             ),
             (),
+            None,
         )
     return (
         partial(
@@ -974,6 +934,7 @@ def _select_ffn_input(
             update=update,
         ),
         (),
+        None,
     )
 
 

@@ -36,11 +36,16 @@ from sglang.srt.layers.communicator.adapters.attention import (
 from sglang.srt.layers.communicator.layout import (
     CommunicateContext,
     Layout,
+    SumGroup,
     TokenAxis,
     _cp_shard_token_rows,
     moe_cp_gathered_rows,
 )
-from sglang.srt.layers.communicator.output import UnreducedOutput, reduce_output
+from sglang.srt.layers.communicator.output import (
+    HandoffOutput,
+    UnreducedOutput,
+    reduce_output,
+)
 from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
 from sglang.srt.layers.communicator.residual.add_norm import ADD, NORM_READ
 from sglang.srt.layers.communicator_dsa_cp import (
@@ -249,19 +254,26 @@ def _mlp_input_without_dp(
     *,
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
+    group: SumGroup = SumGroup.ATTN_TP,
     read: StageRead = NORM_READ,
     update: StageUpdate = ADD,
 ):
+    """Complete the sum the input owes over ``group`` on the rows it is on,
+    unless one of ``fusions`` does it with the residual add and the norm, then
+    write it into the residual and read the input."""
     if gathers_residual:
         residual = update.residual_from_attn_tp_shards(residual)
     for fused in fusions:
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
             return result
-    # MHC sums its streams in full precision.
-    hidden_states = _mlp_input_reduce_output(
-        hidden_states, forward_batch, may_quantize=update.adds_plainly
-    )
+    if group is SumGroup.ATTN_TP:
+        # MHC sums its streams in full precision.
+        hidden_states = _mlp_input_reduce_output(
+            hidden_states, forward_batch, may_quantize=update.adds_plainly
+        )
+    else:
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     if _is_npu and context.cache is not None:
         _ = prepare_weight_cache(hidden_states, context.cache)
     return read.update_and_read(update, hidden_states, residual, layernorm)
@@ -381,33 +393,88 @@ def _tp_all_gather_scattered_rows(
     return output
 
 
-def _mlp_input_completing_owed(
-    hidden_states: Union[torch.Tensor, "UnreducedOutput"],
-    residual: torch.Tensor,
+def _consumer_step(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, HandoffOutput],
+    residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     context: CommunicateContext,
     *,
     step: Callable,
+    carried_fusions: Tuple[Callable, ...],
+    owes_by_construction: bool = False,
+    **call,
 ):
-    """An FFN input whose producer may have left its sum: complete what the
-    value owes, then run ``step`` on the complete output."""
-    return step(
-        reduce_output(hidden_states), residual, forward_batch, layernorm, context
-    )
+    """A boundary's half into a stage: complete what the value carries, a sum
+    or a handoff its producer left for this batch, then run ``step`` on the
+    complete value. Under attention DP the reduction back to this rank's tokens
+    comes first; otherwise one of ``carried_fusions`` may complete it with the
+    residual add and the read, and an empty batch has nothing to sum. An input
+    that owes its sum by construction (``owes_by_construction``) is that sum's
+    only carrier. ``call`` is what the stage's read takes (the attention's
+    ``quant_format`` and ``post_residual_addition``)."""
+    if not isinstance(hidden_states, torch.Tensor):
+        owed = hidden_states
+        if residual is None:
+            raise RuntimeError(f"{type(owed).__name__} requires residual input")
+        if owes_by_construction:
+            raise RuntimeError(
+                f"an input that owes its sum by construction arrived as "
+                f"{type(owed).__name__}"
+            )
+        if (
+            isinstance(owed, UnreducedOutput)
+            and owed.reduce_and_redistribute is not None
+        ):
+            hidden_states = reduce_output(owed)
+        else:
+            for fused in carried_fusions:
+                result = fused(
+                    owed, residual, forward_batch, call.get("post_residual_addition")
+                )
+                if result is not None:
+                    return result
+            if isinstance(owed, HandoffOutput) or owed.partial.shape[0] != 0:
+                hidden_states = reduce_output(owed)
+            else:
+                hidden_states = owed.partial
+    return step(hidden_states, residual, forward_batch, norm, context, **call)
 
 
-def _mlp_input_norm(
+def _read_input(
     hidden_states: torch.Tensor,
-    residual: torch.Tensor,
+    residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
-    layernorm: torch.nn.Module,
+    norm: torch.nn.Module,
     context: CommunicateContext,
     *,
-    read: StageRead = NORM_READ,
-    update: StageUpdate = ADD,
+    layer_input: Optional[Callable],
+    enters_stack: bool,
+    read: StageRead,
+    update: StageUpdate,
+    quant_format: str = "",
+    post_residual_addition: Optional[torch.Tensor] = None,
 ):
-    return read.update_and_read(update, hidden_states, residual, layernorm)
+    """Complete what the input owes by construction (``layer_input``), then
+    write the previous stage's output into the residual and read the stage's
+    input with ``norm``. The layer stack's first stage (``enters_stack``)
+    starts its residual from its input."""
+    enters = residual is None and enters_stack
+    if layer_input is not None:
+        hidden_states, residual = layer_input(hidden_states, residual, context)
+    if enters:
+        hidden_states, residual = read.enter(hidden_states), None
+    if residual is None:
+        # The previous layer already wrote its output into the residual.
+        return read.read(hidden_states, norm, quant_format)
+    return read.update_and_read(
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format=quant_format,
+        post_residual_addition=post_residual_addition,
+    )
 
 
 def _mlp_input_scatter(

@@ -51,19 +51,29 @@ def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
     return comm.BoundarySteps(
         attention=comm.StageEntry(
             prepare=partial(
-                comm_boundary._attention_input_step,
-                layer_input=None,
-                fusions=(),
-                enters_stack=False,
-                read=comm.NORM_QUANT_READ,
-                update=comm.ADD,
+                comm_ops._consumer_step,
+                step=partial(
+                    comm_ops._read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=comm.NORM_QUANT_READ,
+                    update=comm.ADD,
+                ),
+                carried_fusions=(),
             ),
             input_rows=comm.Layout(frozenset()),
             input_move=comm.CommunicateSimpleFn._trivial,
             handoff=comm_ops._hand_qkv_hook_its_input,
         ),
         ffn=comm.StageEntry(
-            prepare=comm_ops._mlp_input_norm, input_rows=Layout(frozenset())
+            prepare=partial(
+                comm_ops._read_input,
+                layer_input=None,
+                enters_stack=False,
+                read=comm.NORM_READ,
+                update=comm.ADD,
+            ),
+            input_rows=Layout(frozenset()),
         ),
         ffn_output=ffn_output or StageOutput(Layout(frozenset()), group=SumGroup.TP),
         ffn_output_move=None

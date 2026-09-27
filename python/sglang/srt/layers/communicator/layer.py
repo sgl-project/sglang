@@ -31,14 +31,15 @@ from sglang.srt.layers.communicator.boundary import (
     BoundarySteps,
     DecoderLayerSides,
     FusedMlpInput,
-    InputRead,
     LayerStage,
     StageEntry,
+    StageKind,
     _cp_moves,
     _select_boundary_steps,
     decoder_layer_sides,
     input_scattered_layer_sides,
     make_boundary,
+    make_output_boundary,
     scattered_residual_layer_sides,
     sequence_parallel_layer_sides,
     with_residual,
@@ -419,30 +420,26 @@ class LayerCommunicator:
         self._declared = None
         self._cp_steps = self._input_scattered_steps = self._sp_steps = None
         into_edge, out_edge = stage.edges
-        reads_ffn = stage.reads is InputRead.FFN
+        is_ffn = stage.kind is StageKind.FFN
         self.stage_edges = stage.edges
         into = make_boundary(
             into_edge,
-            reads=stage.reads,
-            fusions=(
-                self._select_mlp_input_fusions()
-                if reads_ffn
-                else self._attn_input_fusions
-            ),
+            fusions=self._select_mlp_input_fusions() if is_ffn else (),
+            carried_fusions=() if is_ffn else self._attn_input_fusions,
             force_layernorm_before_gather=self.force_layernorm_before_dp_gather,
             enters_stack=stage.enters_stack,
         )
-        out = make_boundary(out_edge, reads=None)
+        out = make_output_boundary(out_edge)
         entry = StageEntry(
             prepare=into.prepare,
             input_rows=into.input_rows,
-            input_move=None if reads_ffn else into.input_move,
-            handoff=None if reads_ffn else _hand_qkv_hook_its_input,
+            input_move=into.input_move,
+            handoff=None if is_ffn else _hand_qkv_hook_its_input,
             fused=into.fused,
         )
         self._steps = BoundarySteps(
-            attention=None if reads_ffn else entry,
-            ffn=entry if reads_ffn else None,
+            attention=None if is_ffn else entry,
+            ffn=entry if is_ffn else None,
             ffn_output=out_edge.produced,
             ffn_output_move=out.output_move,
             ffn_output_move_completes_sum=out.output_move_completes_sum,
@@ -662,10 +659,15 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self.attn.entry(forward_batch).input_move(
-                hidden_states=residual,
-                forward_batch=forward_batch,
-                context=self._context,
+            move = self.attn.entry(forward_batch).input_move
+            gathered_last_layer_output = (
+                residual
+                if move is None
+                else move(
+                    hidden_states=residual,
+                    forward_batch=forward_batch,
+                    context=self._context,
+                )
             )
             if (
                 gathered_last_layer_output is residual
@@ -762,11 +764,9 @@ class LayerCommunicator:
         with the residual update and the input norm, in the order they are tried.
         Each takes (owed, residual, forward_batch, post_residual_addition) and
         returns None when it does not take the batch. They add the residual
-        plainly: what arrives is written in as this layer's FFN writes its own."""
-        if not (
-            self._residual.ffn_update.adds_plainly
-            and hasattr(self.input_layernorm, "forward_with_allreduce_fusion")
-        ):
+        plainly; the boundary tries them only when the update it writes in is a
+        plain add."""
+        if not hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
             return ()
         self._attn_input_fuses_quant = (
             self.enable_fused_ar_quant
@@ -821,11 +821,9 @@ class LayerCommunicator:
 
     def _select_mlp_input_fusions(self) -> Tuple["FusedMlpInput", ...]:
         """The fused kernels that can take the attention -> FFN steps, in the
-        order they are tried. They add the residual plainly."""
-        if not (
-            self._residual.attention_update.adds_plainly
-            and hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion")
-        ):
+        order they are tried. They add the residual plainly; the boundary tries
+        them only when the update it writes in is a plain add."""
+        if not hasattr(self.post_attention_layernorm, "forward_with_allreduce_fusion"):
             return ()
         return (
             FusedMlpInput(
