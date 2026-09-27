@@ -51,11 +51,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260914`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260914
+docker pull lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +65,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260914 \
+    lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926 \
     sglang serve <use args below>
 ```
 
@@ -877,11 +877,17 @@ Concurrency 256 uses 2P1D — two prefill workers, one node each, added with a s
 
 ### 3.7 Agentic Long-Context with HiCache DRAM Offload (MI355X FP4, DSpark)
 
-DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7).
+DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every arm.
+
+- **BCG**: conc 1–4 — `--cuda-graph-backend-prefill breakable`
+- **Grouped ASM**: TP-only, conc ≥ 16 — `SGLANG_DSV4_GROUPED_ASM=1`
+- **EP**: MegaMoE; at concurrency 384 lower `--prefill-decode-interval` to `15`
 
 **TP8, concurrency 1–16:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
@@ -920,6 +926,8 @@ Concurrency 32–48 keeps the same TP-only command and adds HiCache DRAM offload
 **DP8 (DP Attention), concurrency 128–256:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
@@ -963,6 +971,65 @@ python3 -m sglang.launch_server \
 ```
 
 `--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware` so multi-turn sessions land on the rank holding the longest radix/HiCache prefix; above concurrency 160 add `--balance-abs-threshold 32`.
+
+**DP8 EP8 MegaMoE, concurrency 128–384:**
+```bash Command
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_USE_ROCM700A=0 \
+TORCH_BLAS_PREFER_HIPBLASLT=1 \
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+AITER_BF16_FP8_MOE_BOUND=0 \
+SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
+SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
+MORI_SHMEM_HEAP_SIZE=17179869184 \
+SGLANG_AITER_MEGA_RANK_SYNC=1 \
+SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1 \
+SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD=1 \
+SGLANG_DP_USE_REDUCE_SCATTER=0 \
+GPU_MAX_HW_QUEUES=5 \
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --trust-remote-code \
+  --tp 8 \
+  --dp 8 \
+  --ep 8 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --enable-prefill-delayer \
+  --enable-dp-attention-local-control-broadcast \
+  --tokenizer-worker-num 8 \
+  --stream-interval 20 \
+  --prefill-decode-interval 20 \
+  --prefill-delayer-token-usage-low-watermark 0.7 \
+  --load-balance-method total_requests \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --page-size 256 \
+  --swa-full-tokens-ratio 0.1 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-a2a-backend megamoe \
+  --moe-dense-tp-size 1 \
+  --disable-shared-experts-fusion \
+  --enable-eplb \
+  --eplb-rebalance-num-iterations 200 \
+  --expert-distribution-recorder-mode stat \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 65536 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 6 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 1.5 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --watchdog-timeout 3600
+```
 
 ### 3.8 PD Disaggregation on MI355X (MORI-IO)
 
