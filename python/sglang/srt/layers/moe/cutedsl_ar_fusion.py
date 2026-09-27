@@ -8,6 +8,7 @@ shared-expert add folded in when the runner hands back a MoeFinalizeHandoff.
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Callable, Optional, Sequence
 
 import torch
@@ -195,11 +196,20 @@ class CuteDSLFusionService:
         )
 
 
-class CuteDSLFusionLayerCommunicator(LayerCommunicator):
-    fusion_service: CuteDSLFusionService | None = None
-    # The FFN exit's CuteDSL kernels, which install() gives from what it knows
-    # of this layer and the one after it.
-    _cutedsl_exit_fusions: tuple = ()
+class CuteDSLFusion:
+    """One layer's CuTe DSL kernels, given to its LayerCommunicator at
+    construction. At the attention input: the MoE finalize + AR + add + norm of
+    a handoff the previous layer left, and the AR + add + norm of a sum it left.
+    At the FFN input: the attention output's AR + add + norm. At the FFN exit:
+    handing the MoE finalize, or the all-reduce, to the next layer's kernel.
+    install_cutedsl_fusion gives it the model's service and chooses the exit
+    from the layer after this one; until then no kernel takes a batch."""
+
+    def __init__(self) -> None:
+        self.service: CuteDSLFusionService | None = None
+        # The FFN exit's choices, from what install() knows of the next layer.
+        self.hands_off_finalize = False
+        self.next_input_absorbs = False
 
     def install(
         self,
@@ -209,160 +219,161 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         next_input_absorbs: bool,
         output_is_replicated: bool,
     ) -> None:
-        """Take the model's fusion service and choose the FFN exit's CuteDSL
-        kernels: the MoE may hand off its finalize when it can and something
-        after it takes the handoff (``hands_off_finalize``); the FFN may leave
-        its all-reduce to the next layer's AR + norm when that layer has one,
-        unless a replicated output follows the reduction (moving it would scale
-        that by tp)."""
-        self.fusion_service = service
-        self._cutedsl_exit_fusions = (
-            (self._defer_moe_finalize_cutedsl,) if hands_off_finalize else ()
-        ) + (
-            (self._absorb_all_reduce_cutedsl,)
-            if next_input_absorbs and not output_is_replicated
-            else ()
-        )
-        self._ffn_exit_fusions = self._select_ffn_exit_fusions()
+        """Take the model's fusion service and choose the FFN exit's kernels:
+        the MoE may hand off its finalize when it can and something after it
+        takes the handoff (``hands_off_finalize``); the FFN may leave its
+        all-reduce to the next layer's AR + norm when that layer has one, unless
+        a replicated output follows the reduction (moving it would scale that
+        by tp)."""
+        self.service = service
+        self.hands_off_finalize = hands_off_finalize
+        self.next_input_absorbs = next_input_absorbs and not output_is_replicated
 
-    def _select_attn_input_fusions(self):
+    def attention_input(self, layer: LayerCommunicator) -> tuple:
         return (
-            self._finalize_output_and_update_and_read_residual_cutedsl,
-            self._reduce_output_and_update_and_read_residual_cutedsl,
-            *super()._select_attn_input_fusions(),
+            partial(self._finalize_output_and_update_and_read_residual, layer),
+            partial(self._reduce_output_and_update_and_read_residual, layer),
         )
 
-    def _finalize_output_and_update_and_read_residual_cutedsl(
-        self, owed, residual, forward_batch, post_residual_addition
+    def ffn_input(self, layer: LayerCommunicator) -> tuple:
+        parallel = get_parallel()
+        if (
+            TokenAxis.ATTN_TP_SCATTER not in layer.input_rows.sharded
+            # The workspace sums over TP, which is then the attention-TP group.
+            and parallel.attn_tp_size == parallel.tp_size
+            and _fused_norm_gamma(layer.post_attention_layernorm) is not None
+        ):
+            return (
+                FusedMlpInput(
+                    completes=SumGroup.ATTN_TP,
+                    run=partial(
+                        self._mlp_input_reduce_output_and_update_and_read_residual,
+                        layer,
+                    ),
+                    may_return_new_residual=True,
+                ),
+            )
+        return ()
+
+    def ffn_exit(self, layer: LayerCommunicator) -> tuple:
+        return (
+            partial(self._defer_moe_finalize, layer),
+            partial(self._absorb_all_reduce, layer),
+        )
+
+    def _finalize_output_and_update_and_read_residual(
+        self, layer, owed, residual, forward_batch, post_residual_addition
     ):
         """Finish a deferred MoE finalize with the all-reduce, residual add and
         input norm, when this layer's kernel takes the batch; otherwise the
         handoff is completed by its producer's own tail."""
         if not isinstance(owed, MoeFinalizeHandoff):
             return None
-        gamma = _fused_norm_gamma(self.input_layernorm)
-        if gamma is None or not self._should_use_finalize(forward_batch, owed.m):
+        gamma = _fused_norm_gamma(layer.input_layernorm)
+        if gamma is None or not self._should_use_finalize(layer, forward_batch, owed.m):
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
-        assert self.fusion_service is not None
-        return self.fusion_service.finalize(
-            handoff=owed, residual=residual, gamma=gamma
-        )
+        assert self.service is not None
+        return self.service.finalize(handoff=owed, residual=residual, gamma=gamma)
 
-    def _reduce_output_and_update_and_read_residual_cutedsl(
-        self, owed, residual, forward_batch, post_residual_addition
+    def _reduce_output_and_update_and_read_residual(
+        self, layer, owed, residual, forward_batch, post_residual_addition
     ):
         """Complete the all-reduce the previous layer left with the residual add
         and input norm."""
         if not isinstance(owed, UnreducedOutput) or not (
             self._can_consume_post_moe_all_reduce(
-                forward_batch, int(owed.partial.shape[0])
+                layer, forward_batch, int(owed.partial.shape[0])
             )
         ):
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
-        assert self.fusion_service is not None
-        return self.fusion_service.all_reduce_residual_rms_norm(
+        assert self.service is not None
+        return self.service.all_reduce_residual_rms_norm(
             local_contribution=owed.partial,
             residual=residual,
-            gamma=_fused_norm_gamma(self.input_layernorm),
+            gamma=_fused_norm_gamma(layer.input_layernorm),
         )
 
-    def _select_mlp_input_fusions(self):
-        fusions = super()._select_mlp_input_fusions()
-        parallel = get_parallel()
-        if (
-            TokenAxis.ATTN_TP_SCATTER not in self.input_rows.sharded
-            # The workspace sums over TP, which is then the attention-TP group.
-            and parallel.attn_tp_size == parallel.tp_size
-            and _fused_norm_gamma(self.post_attention_layernorm) is not None
-        ):
-            return (
-                FusedMlpInput(
-                    completes=SumGroup.ATTN_TP,
-                    run=self._mlp_input_reduce_output_and_update_and_read_residual_cutedsl,
-                    may_return_new_residual=True,
-                ),
-                *fusions,
-            )
-        return fusions
-
-    def _mlp_input_reduce_output_and_update_and_read_residual_cutedsl(
-        self, hidden_states, residual, forward_batch
+    def _mlp_input_reduce_output_and_update_and_read_residual(
+        self, layer, hidden_states, residual, forward_batch
     ):
         """The attention output's all-reduce with the residual add and the
         post-attention norm."""
         if not (
-            self._common_eligible(forward_batch, int(hidden_states.shape[0]))
+            self._common_eligible(layer, forward_batch, int(hidden_states.shape[0]))
             and residual is not None
             and not get_exec().comm.enable_quant_communications
         ):
             return None
-        assert self.fusion_service is not None
-        return self.fusion_service.all_reduce_residual_rms_norm(
+        assert self.service is not None
+        return self.service.all_reduce_residual_rms_norm(
             local_contribution=hidden_states,
             residual=residual,
-            gamma=_fused_norm_gamma(self.post_attention_layernorm),
+            gamma=_fused_norm_gamma(layer.post_attention_layernorm),
         )
 
-    def _should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
+    def _should_use_finalize(self, layer, forward_batch: ForwardBatch, m: int) -> bool:
         return (
-            self._common_eligible(forward_batch, m) and get_parallel().moe_ep_size == 1
+            self._common_eligible(layer, forward_batch, m)
+            and get_parallel().moe_ep_size == 1
         )
 
     def _can_consume_post_moe_all_reduce(
-        self, forward_batch: ForwardBatch, m: int
+        self, layer, forward_batch: ForwardBatch, m: int
     ) -> bool:
         """Incoming, and independent of this layer's own successor."""
         return (
-            self._common_eligible(forward_batch, m)
-            and _fused_norm_gamma(self.input_layernorm) is not None
+            self._common_eligible(layer, forward_batch, m)
+            and _fused_norm_gamma(layer.input_layernorm) is not None
             and not get_exec().comm.enable_quant_communications
         )
 
-    def _select_ffn_exit_fusions(self):
-        return (*self._cutedsl_exit_fusions, *super()._select_ffn_exit_fusions())
-
-    def _defer_moe_finalize_cutedsl(
-        self, forward_batch: ForwardBatch
+    def _defer_moe_finalize(
+        self, layer, forward_batch: ForwardBatch
     ) -> Optional[FfnExitFusion]:
         """The MoE hands its unfinalized output to the next layer's finalize +
         all-reduce + norm."""
-        if self._should_use_finalize(
-            forward_batch, int(forward_batch.input_ids.shape[0])
+        if self.hands_off_finalize and self._should_use_finalize(
+            layer, forward_batch, int(forward_batch.input_ids.shape[0])
         ):
             return FfnExitFusion.DEFER_MOE_FINALIZE
         return None
 
-    def _absorb_all_reduce_cutedsl(
-        self, forward_batch: ForwardBatch
+    def _absorb_all_reduce(
+        self, layer, forward_batch: ForwardBatch
     ) -> Optional[FfnExitFusion]:
         """The next layer's AR + norm takes the post-experts all-reduce."""
-        if self._can_consume_post_moe_all_reduce(
-            forward_batch, int(forward_batch.input_ids.shape[0])
+        if self.next_input_absorbs and self._can_consume_post_moe_all_reduce(
+            layer, forward_batch, int(forward_batch.input_ids.shape[0])
         ):
             return FfnExitFusion.NEXT_INPUT
         return None
 
-    def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
+    def _common_eligible(self, layer, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
         return bool(
-            self.fusion_service is not None
+            self.service is not None
             and _is_supported_forward_mode(forward_batch.forward_mode)
-            and self.fusion_service.supports(m)
+            and self.service.supports(m)
             and not is_dp_attention_enabled()
             # Also forces moe_dp_size == 1, so a hybrid EP x MoE-TP reduction
             # always merges into the one TP reduction the workspace performs.
             and parallel.attn_cp_size == 1
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
-            and self._context.tp_size > 1
+            and parallel.tp_size > 1
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP_SCATTER
-            not in self._batch_steps(forward_batch).ffn.input_rows.sharded
+            not in layer.ffn.entry(forward_batch).input_rows.sharded
         )
+
+
+def _fusion_of(layer: torch.nn.Module) -> CuteDSLFusion | None:
+    fusions = getattr(layer.layer_communicator, "fusions", None)
+    return fusions if isinstance(fusions, CuteDSLFusion) else None
 
 
 def install_cutedsl_fusion(
@@ -384,11 +395,7 @@ def install_cutedsl_fusion(
         # A draft shares the target's process, which holds one workspace.
         return None
 
-    fusion_layers = [
-        layer
-        for layer in layers
-        if isinstance(layer.layer_communicator, CuteDSLFusionLayerCommunicator)
-    ]
+    fusion_layers = [layer for layer in layers if _fusion_of(layer) is not None]
     if not fusion_layers:
         return None
 
@@ -414,26 +421,22 @@ def install_cutedsl_fusion(
     )
     hands_off = 0
     for index, layer in enumerate(layers):
-        communicator = layer.layer_communicator
-        if not isinstance(communicator, CuteDSLFusionLayerCommunicator):
+        fusion = _fusion_of(layer)
+        if fusion is None:
             continue
         successor = layers[index + 1] if index + 1 < len(layers) else None
         if successor is None:
             has_consumer = final_norm_consumes_handoff
         else:
-            has_consumer = isinstance(
-                successor.layer_communicator, CuteDSLFusionLayerCommunicator
-            )
+            has_consumer = _fusion_of(successor) is not None
         hands_off_finalize = bool(can_defer_finalize(layer)) and has_consumer
         hands_off += hands_off_finalize
-        communicator.install(
+        fusion.install(
             service,
             hands_off_finalize=hands_off_finalize,
             # False on the last layer: the final norm does not all-reduce.
             next_input_absorbs=successor is not None
-            and isinstance(
-                successor.layer_communicator, CuteDSLFusionLayerCommunicator
-            ),
+            and _fusion_of(successor) is not None,
             output_is_replicated=requires_local_reduction is not None
             and bool(requires_local_reduction(layer)),
         )
@@ -456,16 +459,18 @@ def prepare_cutedsl_fusion(
     Scans the module tree, so a wrapper holding the model as a submodule (a VLM's
     language_model) needs no hook of its own.
     """
-    communicators = [
-        communicator
+    fusions = [
+        fusion
         for module in model.modules()
         # Most modules carry no layer_communicator.
         if isinstance(
-            communicator := module.__dict__.get("layer_communicator"),
-            CuteDSLFusionLayerCommunicator,
+            fusion := getattr(
+                module.__dict__.get("layer_communicator"), "fusions", None
+            ),
+            CuteDSLFusion,
         )
     ]
-    if not communicators or any(c.fusion_service is None for c in communicators):
+    if not fusions or any(f.service is None for f in fusions):
         raise ValueError(
             "--flashinfer-allreduce-fusion-backend cutedsl is set, but "
             f"{type(model).__name__} installed no CuTe DSL fusion service, so no "
@@ -477,7 +482,7 @@ def prepare_cutedsl_fusion(
             "FlashInfer MNNVL CuTe DSL fusion does not support concurrent PDMux "
             "streams sharing one mutable workspace"
         )
-    services = {id(c.fusion_service): c.fusion_service for c in communicators}
+    services = {id(f.service): f.service for f in fusions}
     max_m = _resolve_max_m(max_running_requests=max_running_requests)
     for service in services.values():
         service.prepare(max_m=max_m)
@@ -485,5 +490,5 @@ def prepare_cutedsl_fusion(
         "Prepared the FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d "
         "(%d fused layers)",
         max_m,
-        len(communicators),
+        len(fusions),
     )

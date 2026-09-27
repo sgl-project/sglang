@@ -2632,26 +2632,24 @@ class DeepseekV2DecoderLayer(nn.Module):
     ):
         """The communicator for this layer's norms; it chooses its boundary
         steps from them at construction."""
+        fusions = None
         if (
             not get_parallel().enable_prefill_cp
             and not self.is_nextn
             and _use_mnnvl_cutedsl_fusion()
         ):
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-                CuteDSLFusionLayerCommunicator,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
 
-            communicator_cls = CuteDSLFusionLayerCommunicator
-        else:
-            communicator_cls = LayerCommunicator
-        return communicator_cls(
+            fusions = CuteDSLFusion()
+        return LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=input_layernorm,
             post_attention_layernorm=post_attention_layernorm,
             allow_reduce_scatter=True,
             qkv_latent_func=qkv_latent_func,
             allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
+            fusions=fusions,
         )
 
     def _detect_gfx95_quant_format(self) -> str:

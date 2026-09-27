@@ -24,7 +24,7 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-    CuteDSLFusionLayerCommunicator,
+    CuteDSLFusion,
     MoeFinalizeHandoff,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
@@ -43,11 +43,13 @@ _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros
 
 
 def _communicator():
-    comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+    comm = LayerCommunicator.__new__(LayerCommunicator)
+    comm.fusions = CuteDSLFusion()
     comm.input_layernorm = RMSNorm(8, eps=1e-6)
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
     comm.enable_fused_ar_quant = False
     comm._attn_input_fusions = comm._select_attn_input_fusions()
+    comm._ffn_exit_fusions = comm._select_ffn_exit_fusions()
     # Only the ordinary batches' attention input half, with these entries.
     comm._context = SimpleNamespace()
     comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
@@ -71,6 +73,11 @@ def _communicator():
     return comm
 
 
+def _bound(entry):
+    """What an entry runs and the layer it is bound to."""
+    return entry.func, entry.args
+
+
 def _install(layers, **kwargs):
     reset_context()
     publish(ServerArgs(model_path="dummy"), role="test")
@@ -89,9 +96,7 @@ def _install(layers, **kwargs):
 def eligible():
     """Every shared gate open, so a case varies only the predicate it names."""
     with (
-        patch.object(
-            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
-        ),
+        patch.object(CuteDSLFusion, "_common_eligible", return_value=True),
         patch(
             f"{_MODULE}.get_exec",
             return_value=SimpleNamespace(
@@ -106,7 +111,7 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
     unreduced output reaches the final norm; it must not skip its own."""
     last = _communicator()
-    last.install(
+    last.fusions.install(
         SimpleNamespace(
             all_reduce_residual_rms_norm=lambda *, local_contribution, residual, gamma: (
                 local_contribution + 1,
@@ -128,25 +133,33 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
         out_hidden, _ = last.prepare_attn(hidden_states, torch.zeros(8, 8), _DECODE)
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
-    assert last._ffn_exit_fusions == (last._next_input_norm_takes_ffn_sum,)
+    defer, absorb, _ = last._ffn_exit_fusions
+    assert defer(_DECODE) is None and absorb(_DECODE) is None
 
 
 def test_cutedsl_entries_come_before_the_base_fused_kernel():
     comm = _communicator()
-    assert comm._attn_input_fusions == (
-        comm._finalize_output_and_update_and_read_residual_cutedsl,
-        comm._reduce_output_and_update_and_read_residual_cutedsl,
-        comm._reduce_output_and_update_and_read_residual,
+    fusion = comm.fusions
+    finalize, reduce, base_input = comm._attn_input_fusions
+    assert _bound(finalize) == (
+        fusion._finalize_output_and_update_and_read_residual,
+        (comm,),
     )
+    assert _bound(reduce) == (
+        fusion._reduce_output_and_update_and_read_residual,
+        (comm,),
+    )
+    assert base_input == comm._reduce_output_and_update_and_read_residual
     base = comm._mlp_input_reduce_output_and_update_and_read_residual
-    cutedsl = comm._mlp_input_reduce_output_and_update_and_read_residual_cutedsl
+    cutedsl = (fusion._mlp_input_reduce_output_and_update_and_read_residual, (comm,))
     with patch(
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
         comm._declared = SimpleNamespace(input_rows=Layout(frozenset()))
         fusions = comm._select_mlp_input_fusions()
-        assert [f.run for f in fusions] == [cutedsl, base]
+        assert _bound(fusions[0].run) == cutedsl
+        assert fusions[1].run == base
         # The workspace reduces over the TP group, which is the attention-TP group here.
         assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
         assert all(f.may_return_new_residual for f in fusions)
@@ -163,12 +176,12 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
     the batch's FFN input on the full rows, not each rank's own slice (a2a, the
     fp4 all-gather, DWDP or a dense MLP on every rank)."""
     comm = _communicator()
-    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
-    comm._context = SimpleNamespace(tp_size=2)
+    fusion = comm.fusions
+    fusion.service = SimpleNamespace(supports=lambda m: True)
     with (
         patch(
             f"{_MODULE}.get_parallel",
-            return_value=SimpleNamespace(attn_cp_size=1),
+            return_value=SimpleNamespace(attn_cp_size=1, tp_size=2),
         ),
         patch(f"{_MODULE}.is_dp_attention_enabled", return_value=False),
         patch(
@@ -187,22 +200,27 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
             comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
                 ffn=SimpleNamespace(input_rows=rows)
             )
-            assert comm._common_eligible(_DECODE, 8) is eligible
+            assert fusion._common_eligible(comm, _DECODE, 8) is eligible
 
 
-def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel():
+def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel(eligible):
     comm = _communicator()
-    comm.install(
+    fusion = comm.fusions
+    defer, absorb, base = comm._ffn_exit_fusions
+    assert _bound(defer) == (fusion._defer_moe_finalize, (comm,))
+    assert _bound(absorb) == (fusion._absorb_all_reduce, (comm,))
+    assert base == comm._next_input_norm_takes_ffn_sum
+    # Before install() chooses them, neither CuTe DSL kernel takes the sum.
+    assert defer(_DECODE) is None and absorb(_DECODE) is None
+    fusion.install(
         SimpleNamespace(),
         hands_off_finalize=True,
         next_input_absorbs=True,
         output_is_replicated=False,
     )
-    assert comm._ffn_exit_fusions == (
-        comm._defer_moe_finalize_cutedsl,
-        comm._absorb_all_reduce_cutedsl,
-        comm._next_input_norm_takes_ffn_sum,
-    )
+    with patch.object(CuteDSLFusion, "_should_use_finalize", return_value=True):
+        assert defer(_DECODE) is FfnExitFusion.DEFER_MOE_FINALIZE
+    assert absorb(_DECODE) is FfnExitFusion.NEXT_INPUT
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
@@ -229,7 +247,10 @@ def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
         assert exit_fusion(replicated) is None
         assert exit_fusion(plain) is FfnExitFusion.NEXT_INPUT
     # Consuming what a predecessor skipped stays independently eligible.
-    assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
+    assert (
+        replicated.fusions._can_consume_post_moe_all_reduce(replicated, _DECODE, 8)
+        is True
+    )
 
 
 def test_a_service_nested_under_a_wrapper_is_prepared():
@@ -241,7 +262,7 @@ def test_a_service_nested_under_a_wrapper_is_prepared():
     wrapper = torch.nn.Module()
     wrapper.language_model = torch.nn.Sequential(layer)
     _install([layer])
-    layer.layer_communicator.fusion_service.prepare = lambda *, max_m: prepared.append(
+    layer.layer_communicator.fusions.service.prepare = lambda *, max_m: prepared.append(
         max_m
     )
 
@@ -372,19 +393,15 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
 
     comm = _communicator()
     comm.input_layernorm = AddNorm()
-    comm.fusion_service = SimpleNamespace(
+    comm.fusions.service = SimpleNamespace(
         finalize=lambda **kw: pytest.fail("the kernel does not take this batch")
     )
     finish = MagicMock(return_value=torch.ones(2, 8))
     with (
         # A norm the kernel could fold in, on a batch it does not take.
         patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
-        patch.object(
-            CuteDSLFusionLayerCommunicator, "_should_use_finalize", return_value=False
-        ),
-        patch.object(
-            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=False
-        ),
+        patch.object(CuteDSLFusion, "_should_use_finalize", return_value=False),
+        patch.object(CuteDSLFusion, "_common_eligible", return_value=False),
     ):
         hidden, residual = comm.prepare_attn(
             _handoff(finish), torch.full((2, 8), 2.0), _DECODE
