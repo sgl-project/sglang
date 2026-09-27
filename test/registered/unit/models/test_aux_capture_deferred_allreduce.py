@@ -49,6 +49,7 @@ class DeferringLayer(nn.Module):
         self.layer_communicator._steps = comm.BoundarySteps(
             attention_input=comm.CommunicateSimpleFn._trivial,
             ffn_input=comm._mlp_input_norm,
+            ffn_input_rows=comm.Layout(frozenset()),
             ffn_output=comm.StageOutput(
                 comm.Layout(frozenset()),
                 group=comm.SumGroup.TP,
