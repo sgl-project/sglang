@@ -22,7 +22,6 @@ from sglang.srt.layers.communicator import (
     BoundarySteps,
     LayerCommunicator,
     LayerScatterModes,
-    ScatterMode,
     sparse_moe_gathers_over_moe_cp,
 )
 
@@ -200,12 +199,3 @@ class MHCLayerCommunicator(LayerCommunicator):
                 f"MHCLayerCommunicator with a gather over attention CP: {sides=}"
             )
         return super()._steps_from_declarations(sides, **kwargs)
-
-    def _post_init_communicate(self):
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL:
-            raise NotImplementedError(
-                "MHCLayerCommunicator does not support MOE_FULL "
-                "(moe_dp_size < attention_context_parallel_size). Increase "
-                "moe_dp_size to match attention_context_parallel_size."
-            )
-        return super()._post_init_communicate()

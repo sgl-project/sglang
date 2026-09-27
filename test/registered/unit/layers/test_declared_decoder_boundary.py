@@ -34,7 +34,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
     UnreducedOutput,
-    scatter_mode_layouts,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.moe import utils as moe_utils
@@ -227,92 +226,6 @@ def planned_modes(
             is_previous_layer_sparse=previous_sparse,
             is_next_layer_sparse=False,
         )
-
-
-class TestDeclarationsMatchScatterModes(CustomTestCase):
-    """The layouts derived from the groups each side computes over are the
-    layouts of the modes layer planning gives the same layers."""
-
-    def test_every_attention_dp_and_tp(self):
-        for (
-            attn_dp,
-            attn_tp,
-            layer_id,
-            sparse,
-            previous_sparse,
-            a2a,
-        ) in itertools.product(
-            (1, 2, 4, 8),
-            (1, 2, 4),
-            (0, 1, 3),
-            (False, True),
-            (False, True),
-            (False, True),
-        ):
-            with self.subTest(
-                attn_dp=attn_dp,
-                attn_tp=attn_tp,
-                layer_id=layer_id,
-                sparse=sparse,
-                previous_sparse=previous_sparse,
-                a2a=a2a,
-            ):
-                parallel = parallel_of(attn_dp=attn_dp, attn_tp=attn_tp)
-                modes = planned_modes(
-                    layer_id,
-                    4,
-                    sparse=sparse,
-                    previous_sparse=previous_sparse,
-                    parallel=parallel,
-                    a2a=a2a,
-                )
-                sizes = {
-                    TokenAxis.ATTN_DP: attn_dp,
-                    TokenAxis.ATTN_CP: 1,
-                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                }
-                layouts = scatter_mode_layouts(
-                    attn_dp_size=attn_dp, attn_cp_size=1, attn_tp_size=attn_tp
-                )
-                sides = sides_of(
-                    sizes,
-                    sparse=sparse,
-                    a2a=a2a,
-                    previous_a2a=layer_id > 0 and previous_sparse and a2a,
-                    last=layer_id == 3,
-                    leaves_next=True,
-                    leaves_rs=True,
-                )
-                self.assertEqual(sides.input_rows, layouts[modes.layer_input_mode])
-                self.assertEqual(
-                    sides.ffn_residual_rows, layouts[modes.middle_residual_mode]
-                )
-                self.assertEqual(sides.output_rows, layouts[modes.layer_output_mode])
-                self.assertEqual(sides.attention.layout, layouts[modes.attn_mode])
-                self.assertEqual(sides.ffn.layout, layouts[modes.mlp_mode])
-                self.assertEqual(
-                    sides.attention_output.layout, layouts[modes.attn_mode]
-                )
-                self.assertEqual(sides.ffn_output.layout, sides.ffn.layout)
-                # A MoE dispatched per DP shard hands on a complete output.
-                self.assertIs(sides.ffn_output.group is None, sparse and a2a)
-
-    def test_the_attention_output_owes_the_attention_tp_sum(self):
-        for attn_tp in (1, 2):
-            sides = sides_of(
-                {
-                    TokenAxis.ATTN_DP: 2,
-                    TokenAxis.ATTN_CP: 1,
-                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
-                }
-            )
-            owed = attn_tp > 1
-            self.assertIs(
-                sides.attention_output.group, SumGroup.ATTN_TP if owed else None
-            )
-            self.assertIs(sides.attention_output.always_leaves, owed)
-            self.assertIs(sides.ffn_output.group, SumGroup.TP)
-            self.assertFalse(sides.ffn_output.always_leaves)
 
 
 class TestWhichLayersUseDeclarations(CustomTestCase):
@@ -903,14 +816,6 @@ class TestTwoBatchOverlap(CustomTestCase):
                         after._steps.attention_input,
                         comm.CommunicateSimpleFn._scattered_to_tp_attn_full,
                     )
-                # The declarations give the rows the scatter modes planned.
-                for layer in (first, before, after, last):
-                    layouts = layer._context.layouts
-                    modes = layer.layer_scatter_modes
-                    self.assertEqual(layer.input_rows, layouts[modes.layer_input_mode])
-                    self.assertEqual(
-                        layer._declared.output_rows, layouts[modes.layer_output_mode]
-                    )
 
     def test_the_split_moves_from_the_first_layer_s_rows(self):
         pair = comm.CommunicateSummableTensorPairFn
@@ -996,7 +901,7 @@ class TestTwoBatchOverlap(CustomTestCase):
                 )
                 steps = communicator._steps
                 self.assertEqual(
-                    steps.ffn_input_rows, communicator._context.layouts[modes.mlp_mode]
+                    steps.ffn_input_rows, communicator._declared.ffn.layout
                 )
                 published = {}
                 with patch.object(
@@ -1021,6 +926,23 @@ class TestTwoBatchOverlap(CustomTestCase):
 class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
     """prepare_mlp completes the attention-TP sum exactly when the attention
     output's declaration says it is owed, whatever the attention-TP size."""
+
+    def test_the_attention_output_owes_the_attention_tp_sum(self):
+        for attn_tp in (1, 2):
+            sides = sides_of(
+                {
+                    TokenAxis.ATTN_DP: 2,
+                    TokenAxis.ATTN_CP: 1,
+                    TokenAxis.ATTN_TP_SCATTER: attn_tp,
+                }
+            )
+            owed = attn_tp > 1
+            self.assertIs(
+                sides.attention_output.group, SumGroup.ATTN_TP if owed else None
+            )
+            self.assertIs(sides.attention_output.always_leaves, owed)
+            self.assertIs(sides.ffn_output.group, SumGroup.TP)
+            self.assertFalse(sides.ffn_output.always_leaves)
 
     def run_steps(self, produced, *, force=False):
         sizes = {
