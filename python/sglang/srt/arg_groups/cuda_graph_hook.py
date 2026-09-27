@@ -151,8 +151,8 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and not model_config_of(
             server_args
         ).is_multimodal_breakable_cuda_graph_supported
-        # Keep trtllm_mla on the preferred breakable path, which now serves
-        # MLA by falling back to the flashinfer MLA impl for extend.
+        # Keep trtllm_mla on the preferred breakable path, which serves extend
+        # through an eager TRT-LLM ragged MHA region.
         and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
     ):
         logger.info(

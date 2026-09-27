@@ -718,10 +718,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
-            (self.disable_chunked_prefix_cache and has_prefix)
-            or is_in_tc_piecewise_cuda_graph()
-            or is_in_breakable_cuda_graph()
-        )
+            self.disable_chunked_prefix_cache
+            and (has_prefix or is_in_breakable_cuda_graph())
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
@@ -831,10 +830,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Also fallback to flashinfer MLA backend under a captured prefill graph
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
-                (self.disable_chunked_prefix_cache and has_prefix)
-                or is_in_tc_piecewise_cuda_graph()
-                or is_in_breakable_cuda_graph()
-            )
+                self.disable_chunked_prefix_cache
+                and (has_prefix or is_in_breakable_cuda_graph())
+            ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 

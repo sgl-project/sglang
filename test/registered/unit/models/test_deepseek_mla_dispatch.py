@@ -142,5 +142,40 @@ class TestCPMLADispatch(CustomTestCase):
                             )
 
 
+class TestTRTLLMMLABreakableDispatch(CustomTestCase):
+    """A breakable prefill graph fixes the method at capture for every replay."""
+
+    def _dispatch(self, *, disable_chunked_prefix_cache: bool, prefix: int):
+        attn = SimpleNamespace(
+            disable_chunked_prefix_cache=disable_chunked_prefix_cache
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, extend_prefix_lens_cpu=[prefix]
+        )
+        with (
+            mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
+        ):
+            return abh.handle_attention_trtllm_mla(attn, batch)
+
+    def test_extend_uses_chunked_kv_regardless_of_prefix(self):
+        for prefix in (0, 32):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    self._dispatch(disable_chunked_prefix_cache=False, prefix=prefix),
+                    AttnForwardMethod.MHA_CHUNKED_KV,
+                )
+
+    def test_disabled_chunked_prefix_cache_keeps_mla(self):
+        # Chunked KV would reach FlashInfer's chunk-KV wrapper on a prefixed
+        # replay, which does not exist without chunked prefix cache.
+        for prefix in (0, 32):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    self._dispatch(disable_chunked_prefix_cache=True, prefix=prefix),
+                    AttnForwardMethod.MLA,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

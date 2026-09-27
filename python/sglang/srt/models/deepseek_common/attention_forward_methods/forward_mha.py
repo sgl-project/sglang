@@ -14,10 +14,18 @@ from sglang.srt.layers.dcp import (
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -165,6 +173,51 @@ def forward_dsa_indexer_for_mha(
 #       v_i: [chunk_size, num_local_heads, v_head_dim],
 #       acc_o_i, acc_lse_i = merge_state(acc_o_{i-1}, acc_lse_{i-1}, o_i, lse_i)
 #       The final output is the accumulated output acc_o_n
+
+
+def _bcg_mha_chunked_kv_attention(
+    attn: DeepseekV2AttentionMLA,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    capture_forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Use live prefix metadata inside the graph break, then restore bucket shape."""
+    # eager_on_graph retains capture-time arguments; replay needs the live batch.
+    context = get_tc_piecewise_forward_context()
+    forward_batch = (
+        context.forward_batch
+        if context is not None and context.forward_batch is not None
+        else capture_forward_batch
+    )
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens is None:
+        real_num_tokens = q.shape[0]
+    assert real_num_tokens <= q.shape[0]
+    if real_num_tokens == 0:
+        return q.new_zeros((q.shape[0], attn.num_local_heads, attn.v_head_dim))
+
+    # RadixAttention normally inserts its own eager attention break under BCG.
+    # This function is already running after that segment was ended, so route
+    # all suffix/prefix calls directly to the backend to avoid nested breaks.
+    with force_eager_attention():
+        attn_output = attn._forward_normal_chunked_kv_attention(
+            q[:real_num_tokens],
+            k[:real_num_tokens],
+            v[:real_num_tokens],
+            forward_batch,
+        )
+
+    if real_num_tokens == q.shape[0]:
+        return attn_output
+    padded_output = attn_output.new_zeros(
+        (q.shape[0], *attn_output.shape[1:]),
+    )
+    padded_output[:real_num_tokens].copy_(attn_output)
+    return padded_output
+
+
+bcg_mha_chunked_kv_attention = eager_on_graph(True)(_bcg_mha_chunked_kv_attention)
 
 
 class DeepseekMHAForwardMixin:
@@ -339,6 +392,28 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if is_in_breakable_cuda_graph():
+            attn_output = bcg_mha_chunked_kv_attention(self, q, k, v, forward_batch)
+        else:
+            attn_output = self._forward_normal_chunked_kv_attention(
+                q, k, v, forward_batch
+            )
+
+        # Keep the output projection in the CUDA graph segment after the
+        # dynamic attention break.
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_normal_chunked_kv_attention(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
@@ -363,12 +438,7 @@ class DeepseekMHAForwardMixin:
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         if fused_prefix:
-            attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
-            attn_output = attn_output.reshape(
-                -1, self.num_local_heads * self.v_head_dim
-            )
-            output, _ = self.o_proj(attn_output)
-            return output
+            return self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -386,11 +456,7 @@ class DeepseekMHAForwardMixin:
                 forward_batch=forward_batch,
             )
 
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        if gate is not None:
-            attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,
