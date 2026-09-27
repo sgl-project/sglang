@@ -41,6 +41,8 @@ VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 class LingBotVideoTextEncodingStage(TextEncodingStage):
     """Qwen3-VL prompt/negative encoding for LingBot-Video MoE (T2V, base)."""
 
+    deduplicated_output_fields = ()
+
     def __init__(self, text_encoders, tokenizers, transformer):
         super().__init__(text_encoders, tokenizers)
         self.transformer = transformer

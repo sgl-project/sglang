@@ -51,6 +51,8 @@ def _causal_block_count(batch: Req, server_args: ServerArgs) -> int:
 
 
 class LongLive2TextEncodingStage(TextEncodingStage):
+    deduplicated_output_fields = ()
+
     def _block_prompts(self, batch: Req, server_args: ServerArgs) -> list[str] | None:
         shot_prompts = getattr(batch, "shot_prompts", None)
         if shot_prompts is None:

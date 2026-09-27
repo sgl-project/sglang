@@ -124,6 +124,42 @@ class TextEncodingStage(ConditionEncodingStage):
     expected by the diffusion model.
     """
 
+    deduplicated_output_fields = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+        "prompt_seq_lens",
+        "negative_prompt_seq_lens",
+        "pooled_embeds",
+        "neg_pooled_embeds",
+        "clip_embedding_pos",
+        "clip_embedding_neg",
+        "is_prompt_processed",
+    )
+
+    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
+        return (
+            self.freeze_for_dedup(batch.prompt),
+            self.freeze_for_dedup(batch.negative_prompt),
+            bool(batch.do_classifier_free_guidance),
+            self.freeze_for_dedup(batch.prompt_template),
+            batch.max_sequence_length,
+        )
+
+    @classmethod
+    def copy_stage_output(cls, value):
+        # embeddings stay shared; nested metadata containers belong to each request
+        if isinstance(value, list):
+            return [cls.copy_stage_output(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls.copy_stage_output(item) for item in value)
+        if isinstance(value, dict):
+            return {key: cls.copy_stage_output(item) for key, item in value.items()}
+        return value
+
     def __init__(self, text_encoders, tokenizers) -> None:
         """
         Initialize the prompt encoding stage.

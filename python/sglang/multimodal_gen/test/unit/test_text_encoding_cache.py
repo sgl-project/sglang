@@ -297,6 +297,7 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
     executor, stage, encoder, args = make_group_executor(
         TextEncodingStage, device, capacity, fsdp=fsdp, native=native
     )
+    stage.forward = Mock(wraps=stage.forward)
 
     def requests():
         return [
@@ -311,8 +312,9 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
         ]
 
     first = executor.execute_group([stage], requests(), args)
+    assert stage.forward.call_count == 2
     assert encoder.calls == 3  # two positives, one shared negative
-    assert executor.conditioning_cache.group_hits == 3
+    assert executor.conditioning_cache.group_hits == 1
     assert first[0].prompt_embeds[0] is first[2].prompt_embeds[0]
     assert first[0].negative_prompt_embeds[0] is first[1].negative_prompt_embeds[0]
     assert first[0].prompt_seq_lens is not first[2].prompt_seq_lens
@@ -323,6 +325,7 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
     assert executor.conditioning_cache._group_entries.get() is None
 
     second = executor.execute_group([stage], requests(), args)
+    assert stage.forward.call_count == 4
     persistent = capacity == 4096 and not fsdp and native and not warmup
     assert encoder.calls == (3 if persistent else 6)
     torch.testing.assert_close(second[0].prompt_embeds[0], expected, rtol=0, atol=0)

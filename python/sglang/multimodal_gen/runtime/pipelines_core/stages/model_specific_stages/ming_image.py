@@ -36,6 +36,8 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 
 class MingImageEncodingStage(TextEncodingStage):
+    deduplicated_output_fields = ()
+
     def __init__(self, text_encoders, tokenizers):
         super().__init__(text_encoders, tokenizers)
         self.image_processor = Qwen2VLImageProcessorPil.from_pretrained(
