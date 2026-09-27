@@ -288,6 +288,14 @@ class DSV4AttnMetadata:
             return self.c4_sparse_page_indices
         raise ValueError(f"invalid {compress_ratio=}")
 
+    def drop_folded_sparse_indices(self, compress_ratio: Literal[1, 2, 4]) -> None:
+        """An index source rewrites sparse_page_indices(compress_ratio) in place, so the
+        length-folded copies keyed on that buffer stop describing it."""
+        cache = self._aiter_sparse_masked_indices
+        if cache:
+            for key in [k for k in cache if k[0] == compress_ratio]:
+                del cache[key]
+
     def sparse_raw_indices(
         self, compress_ratio: Literal[1, 2, 4]
     ) -> Optional[torch.Tensor]:
@@ -2301,6 +2309,10 @@ class DeepseekV4HipRadixBackend(
 
         Target-verify takes the decode body: the torch body syncs with the host per
         request and cannot be recorded into the verify graph."""
+        # every body below rewrites the ratio's page indices in place
+        self.forward_metadata.core_metadata.drop_folded_sparse_indices(
+            layer.compress_ratio
+        )
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
