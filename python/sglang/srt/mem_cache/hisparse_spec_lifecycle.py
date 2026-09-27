@@ -113,6 +113,11 @@ class SpeculativeKVLifecycle:
         self._active = {}
         self._latest = {}
 
+    def is_active(self, key):
+        """Whether this exact generation/iteration still owns a transaction."""
+        txn = self._active.get(key.request_slot)
+        return txn is not None and txn.arena.key == key
+
     def _get(self, key):
         txn = self._active.get(key.request_slot)
         if txn is None or txn.arena.key != key:

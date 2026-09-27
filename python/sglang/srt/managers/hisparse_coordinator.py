@@ -373,6 +373,67 @@ class HiSparseCoordinator:
             layer_num,
         )
 
+    def speculative_verifier(self):
+        """Opt-in eager API; scheduler must prepare, fence, commit and retire."""
+        adapter = getattr(self, "_speculative_verifier", None)
+        if adapter is None:
+            from sglang.srt.mem_cache.hisparse_spec_coordinator import (
+                HiSparseSpecCoordinator,
+            )
+
+            adapter = HiSparseSpecCoordinator(self, device_module)
+            self._speculative_verifier = adapter
+        return adapter
+
+    def _prepare_speculative_stream(self):
+        """Eager-only boundary: drain previous writers before CPU snapshots."""
+        stream = device_module.current_stream()
+        stream.wait_stream(self.write_staging_stream)
+        stream.wait_stream(self.decode_backup_stream)
+        if self.decode_producer_stream is not None:
+            stream.wait_stream(self.decode_producer_stream)
+        if self.enable_prefetch:
+            stream.wait_stream(self.prefetch_stream)
+        stream.synchronize()
+        self.wait_for_pending_backup()
+
+    def _copy_speculative_union(self, layer_id, src, dst, count, real):
+        """Copy explicit token rows; page64 ownership is independent of IO."""
+        copy_cache_planned_mla(
+            miss_src=src,
+            miss_dst=dst,
+            miss_count=count,
+            num_real_reqs=real,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.item_size_bytes,
+            num_blocks=4,
+            is_dsv4_layout=False,
+            skip_io=False,
+        )
+
+    def _speculative_check_idle(self, req_pool_indices):
+        adapter = getattr(self, "_speculative_verifier", None)
+        if adapter is not None and any(
+            owner.key is not None for owner in adapter.owners.values()
+        ):
+            for slot in req_pool_indices.tolist():
+                owner = adapter.owners.get(slot)
+                if owner is not None and owner.key is not None:
+                    raise ValueError(
+                        "ordinary decode cannot overwrite live verifier residency"
+                    )
+
+    def _speculative_admit(self, req):
+        adapter = getattr(self, "_speculative_verifier", None)
+        if adapter is not None:
+            adapter.admit(req)
+
+    def _speculative_teardown(self, req):
+        adapter = getattr(self, "_speculative_verifier", None)
+        if adapter is not None and req.kv.req_pool_idx in adapter.owners:
+            adapter.teardown(req)
+
     def create_speculative_host_backend(self, resolve_owner):
         """Opt-in eager adapter, inactive until scheduler lifecycle hooks land.
 
@@ -390,6 +451,9 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def destroy(self) -> None:
+        adapter = getattr(self, "_speculative_verifier", None)
+        if adapter is not None:
+            adapter.destroy()
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
@@ -417,6 +481,7 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        self._speculative_admit(req)
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -469,6 +534,7 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
+        self._speculative_admit(req)
         self.alloc_device_buffer(req)
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
@@ -674,6 +740,7 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        self._speculative_check_idle(req_pool_indices_cpu)
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -926,6 +993,7 @@ class HiSparseCoordinator:
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
+        self._speculative_teardown(req)
         # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
@@ -959,6 +1027,7 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        self._speculative_teardown(req)
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -1126,6 +1195,7 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        self._speculative_check_idle(req_pool_indices)
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
