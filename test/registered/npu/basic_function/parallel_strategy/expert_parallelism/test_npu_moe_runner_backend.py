@@ -58,6 +58,7 @@ class TestMoreRunnerBackendTriton(CustomTestCase):
             ],
             env={
                 "HCCL_BUFFSIZE": "1024",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
             },
         )
 

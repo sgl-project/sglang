@@ -6,7 +6,12 @@ import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_resources,
+    get_schedule,
+)
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -42,15 +47,19 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
 
 def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().indexer_capturer
 
 
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().indexer_capturer = capturer
+
+
+def destroy_global_indexer_capturer():
+    if (capturer := get_resources().indexer_capturer) is not None:
+        capturer.destroy()
+    get_resources().indexer_capturer = None
 
 
 def maybe_capture_indexer_topk(

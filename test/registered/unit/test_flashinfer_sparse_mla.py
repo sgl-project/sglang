@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestFlashInferSparseMLAAdapter(unittest.TestCase):

@@ -209,7 +209,7 @@ def build_image_encoder(config):
     elif config["type"] == "DinoImageEncoderMV":
         return DinoImageEncoderMV(**config["kwargs"])
     else:
-        raise ValueError(f'Unknown image encoder type: {config["type"]}')
+        raise ValueError(f"Unknown image encoder type: {config['type']}")
 
 
 class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):

@@ -11,7 +11,10 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup, ReduceOp
 
-from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+)
 
 
 def _ipc_all_to_all_4d(group, input_, scatter_dim):
@@ -131,9 +134,7 @@ class DistributedAutograd:
             grad_input = torch.empty(
                 ctx.input_shape, dtype=grad_output.dtype, device=grad_output.device
             )
-            dist.reduce_scatter_tensor(
-                grad_input, grad_chunks.contiguous(), group=ctx.group
-            )
+            reduce_scatter_single(grad_input, grad_chunks.contiguous(), group=ctx.group)
 
             return None, grad_input, None, None
 
@@ -165,9 +166,9 @@ class DistributedAutograd:
             if world_size == 1:
                 return input_
 
-            assert (
-                input_.dim() == 4
-            ), f"input must be 4D tensor, got {input_.dim()} and shape {input_.shape}"
+            assert input_.dim() == 4, (
+                f"input must be 4D tensor, got {input_.dim()} and shape {input_.shape}"
+            )
 
             if world_size == 2 and scatter_dim in (1, 2):
                 fast = _ipc_all_to_all_4d(group, input_, scatter_dim)
@@ -303,9 +304,9 @@ class DeviceCommunicatorBase:
         NOTE: `dst` is the local rank of the destination rank.
         """
         world_size = self.world_size
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()

@@ -40,6 +40,25 @@ assert _KernelType is not None
             msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
         )
 
+    def test_torch_compile_works_after_sglang_installs_stub(self):
+        script = """
+import sglang
+import torch
+torch.compile(lambda x: x * 2 + 1)(torch.randn(8))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

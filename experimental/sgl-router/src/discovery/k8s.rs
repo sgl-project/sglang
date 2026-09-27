@@ -118,7 +118,12 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
         for addr in &ep.addresses {
-            let url = format!("http://{addr}:{port}");
+            let host = if es.address_type == "IPv6" {
+                format!("[{addr}]")
+            } else {
+                addr.clone()
+            };
+            let url = format!("http://{host}:{port}");
             let id = match pod_uid {
                 Some(uid) => WorkerId(format!("{ns}/{uid}")),
                 None => WorkerId(format!("{ns}/{slice_name}/{addr}:{port}")),
@@ -539,6 +544,15 @@ mod tests {
         assert_eq!(ws[0].mode, WorkerMode::Prefill);
         let ws = extract_workers(&s, WorkerMode::Decode);
         assert_eq!(ws[0].mode, WorkerMode::Decode);
+    }
+
+    #[test]
+    fn brackets_ipv6_worker_addresses() {
+        let mut slice = make_slice(&["2001:db8::1"], 30000, true);
+        slice.address_type = "IPv6".into();
+        let workers = extract_workers(&slice, WorkerMode::Plain);
+        assert_eq!(workers[0].url, "http://[2001:db8::1]:30000");
+        assert!(url::Url::parse(&workers[0].url).is_ok());
     }
 
     #[test]
@@ -1022,7 +1036,7 @@ mod tests {
     }
 
     /// Pod is replaced (same IP, different UID) — router must see this as
-    /// a Removed+Added cycle so the new pod gets fresh CB/active_load
+    /// a Removed+Added cycle so the new pod gets fresh CB/router_inflight_load
     /// state. Without UID-keyed WorkerIds, two consecutive
     /// `process_events` snapshots would dedup by `addr:port` and the
     /// new pod would inherit the dead pod's state.

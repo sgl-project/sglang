@@ -61,21 +61,21 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
       gsm8k_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking`,
       gpqa_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking --n-repeats 4 --max-tokens 40960`,
       mmmu_pro_pct:
-`pip install git+https://github.com/sgl-project/sgl-eval
+`pip install sgl-eval
 sgl-eval run mmmu_pro \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
@@ -93,9 +93,10 @@ sgl-eval run mmmu_pro \\
 
   dockerImages: {
     // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
-    // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
-    // dev-minimax-m3 is the rolling default. M3 model support is not yet in a
-    // tagged release, so :latest cannot serve it.
+    // (B300/GB300) + Grace arm64 builds; cu12 is the final Hopper/CUDA-12 build
+    // (that lane is retired, so it no longer rebuilds); dev-minimax-m3 is the
+    // rolling default. M3 model support is not yet in a tagged release, so
+    // :latest cannot serve it.
     b200: "lmsysorg/sglang:dev-minimax-m3",
     b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
     gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",

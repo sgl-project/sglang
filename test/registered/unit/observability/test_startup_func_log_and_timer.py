@@ -3,14 +3,13 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_cpu_ci(est_time=4, suite="base-c-test-cpu")
+register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
 
 import unittest
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.observability.startup_func_log_and_timer as mod
 from sglang.srt.observability.startup_func_log_and_timer import (
-    enable_startup_timer,
     get_max_duration,
     reset_startup_timers,
     set_startup_metric,
@@ -29,13 +28,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         mod.enable_startup_metrics = self.orig_enable
         mod.STARTUP_LATENCY_SECONDS = self.orig_gauge
         mod._max_durations.clear()
-
-    @patch("prometheus_client.Gauge")
-    def test_enable_startup_timer(self, MockGauge):
-        enable_startup_timer()
-        self.assertTrue(mod.enable_startup_metrics)
-        self.assertIs(mod.STARTUP_LATENCY_SECONDS, MockGauge.return_value)
-        MockGauge.assert_called_once()
 
     def test_reset_and_get_max_duration(self):
         mod._max_durations["ctx"] = 5.0

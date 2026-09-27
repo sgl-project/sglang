@@ -3,11 +3,9 @@
 import asyncio
 import base64
 import copy
-import json
 import math
 import os
 import re
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -231,39 +229,6 @@ def _decode_frames_and_timestamps(vdw, ele):
     return video_tensor, timestamps
 
 
-def _ffprobe_has_audio(src, stdin=None, label=None) -> bool:
-    # Header-only audio-stream probe for HTTP URLs; avoids full download.
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-select_streams",
-                "a",
-                src,
-            ],
-            input=stdin,
-            capture_output=True,
-            timeout=30,
-        )
-        if r.returncode != 0:
-            stderr = r.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"ffprobe failed for {label}: {stderr}")
-        return bool(json.loads(r.stdout).get("streams"))
-    except subprocess.TimeoutExpired:
-        logger.error("ffprobe timed out for %s", label)
-        raise
-    except FileNotFoundError as e:
-        raise RuntimeError("ffprobe not found; install ffmpeg") from e
-    except json.JSONDecodeError:
-        logger.error("ffprobe returned invalid JSON for %s", label)
-        raise
-
-
 class MiMoProcessor:
     def __init__(
         self,
@@ -330,14 +295,14 @@ class MiMoProcessor:
 
         self.use_video_timestamps = use_video_timestamps
         assert self.use_video_timestamps
-        assert (
-            not self.use_video_timestamps or self.rope_type == "rope"
-        ), "use_video_timestamps only supports 1d rope"
+        assert not self.use_video_timestamps or self.rope_type == "rope", (
+            "use_video_timestamps only supports 1d rope"
+        )
         self.video_audio_interleave_length = video_audio_interleave_length
         self.use_per_grid_t_timestamps = False
-        assert (
-            self.video_audio_interleave_length == -1 or self.rope_type == "rope"
-        ), "video_audio_interleave_length != -1 only supports 1d rope"
+        assert self.video_audio_interleave_length == -1 or self.rope_type == "rope", (
+            "video_audio_interleave_length != -1 only supports 1d rope"
+        )
         assert (
             self.video_audio_interleave_length == -1
             or self.video_audio_interleave_length >= 0
@@ -690,7 +655,6 @@ class MiMoProcessor:
     def process_video(
         self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None
     ):
-
         def smart_resize_video(
             num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs
         ):
@@ -723,9 +687,9 @@ class MiMoProcessor:
             else:
                 selected_frame_indices = candidate_indices
 
-            assert (
-                len(selected_frame_indices) > 0
-            ), f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
+            assert len(selected_frame_indices) > 0, (
+                f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
+            )
             return selected_frame_indices
 
         kwargs = self.prepare_video_kwargs(video_input)
@@ -791,9 +755,9 @@ class MiMoProcessor:
 
         min_pixels, max_pixels = smart_resize_video(num_frames_sampled, **kwargs)
 
-        assert (
-            num_frames_seg > 0
-        ), f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
+        assert num_frames_seg > 0, (
+            f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
+        )
 
         temporal_padding_factor = (
             self.temporal_patch_size * self.temporal_compression_ratio
@@ -911,9 +875,9 @@ class MiMoProcessor:
             // self.temporal_compression_ratio
         )
 
-        assert (
-            len(timestamps) == grid_t * self.temporal_patch_size
-        ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+        assert len(timestamps) == grid_t * self.temporal_patch_size, (
+            f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+        )
 
         if not self.use_video_timestamps:
             raise NotImplementedError
@@ -945,7 +909,7 @@ class MiMoProcessor:
         if verbose:
             verbose_str = f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
             for i, ts in enumerate(text_timestamps):
-                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i*self.temporal_patch_size*self.temporal_compression_ratio : (i+1)*self.temporal_patch_size*self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
+                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i * self.temporal_patch_size * self.temporal_compression_ratio : (i + 1) * self.temporal_patch_size * self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
             verbose_str += "<video_end>]\n"
 
         return {
@@ -983,9 +947,9 @@ class MiMoProcessor:
         # Compute per-grid_t audio-segment boundaries. Tokenizer-free so it
         # runs identically on the single-node path and the EPD encoder side.
         grid_t, grid_h, grid_w = thw_grid
-        assert (
-            len(timestamps) == grid_t * self.temporal_patch_size
-        ), f"Expected {grid_t} * {self.temporal_patch_size} timestamps, got {len(timestamps)}"
+        assert len(timestamps) == grid_t * self.temporal_patch_size, (
+            f"Expected {grid_t} * {self.temporal_patch_size} timestamps, got {len(timestamps)}"
+        )
         if not self.use_video_timestamps:
             raise NotImplementedError
 
@@ -1239,9 +1203,9 @@ class MiMoProcessor:
         labels = torch.tensor(labels)
 
         if len(is_audio_tokenized) > 0:
-            assert all(is_audio_tokenized) or not any(
-                is_audio_tokenized
-            ), "All audio inputs must be tokenized or not tokenized"
+            assert all(is_audio_tokenized) or not any(is_audio_tokenized), (
+                "All audio inputs must be tokenized or not tokenized"
+            )
             extra["is_audio_tokenized"] = is_audio_tokenized[0]
 
         if self.rope_type == "rope":

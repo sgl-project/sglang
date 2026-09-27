@@ -198,7 +198,7 @@ def print_suite_summary(
         )
         for standalone_file in suite_info.missing_standalone_estimates:
             print(f"    - {standalone_file}")
-    print(f"  Total estimated time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"  Total estimated time: {total_time:.1f}s ({total_time / 60:.1f} min)")
     print(f"  Selected partitions: {len(partitions)}")
     print()
 
@@ -207,7 +207,7 @@ def print_suite_summary(
         partition_time = sum(item.est_time for item in partition)
         print(f"    Partition {idx}:")
         print(
-            f"      Estimated time: {partition_time:.1f}s ({partition_time/60:.1f} min)"
+            f"      Estimated time: {partition_time:.1f}s ({partition_time / 60:.1f} min)"
         )
         for item in partition:
             fallback_suffix = (
@@ -304,9 +304,11 @@ def main():
             sys.exit(1)
 
     print("=== Diffusion Partition Computation ===")
-    print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")
-    print(f"Target partition time: {args.target_time}s ({args.target_time/60:.1f} min)")
-    print(f"Max partition time: {args.max_time}s ({args.max_time/60:.1f} min)")
+    print(f"Min partition time: {args.min_time}s ({args.min_time / 60:.1f} min)")
+    print(
+        f"Target partition time: {args.target_time}s ({args.target_time / 60:.1f} min)"
+    )
+    print(f"Max partition time: {args.max_time}s ({args.max_time / 60:.1f} min)")
     print()
 
     for suite_name, suite_info in suites.items():

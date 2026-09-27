@@ -8,7 +8,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
-register_cuda_ci(est_time=450, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=450, stage="weekly", runner_config="4-gpu-h100")
 
 
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
@@ -21,7 +21,7 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "--trust-remote-code",
         "--quantization",
         "fp8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--speculative-algorithm",
         "NEXTN",

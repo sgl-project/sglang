@@ -4,36 +4,44 @@
 //! Shared router config for the cache-aware proxy tests.
 //!
 //! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches the
-//! built-in V4 chat encoder — the engine-equivalent path — with no template fixture.
+//! built-in V4 chat formatter — the engine-equivalent path — with no template fixture.
 
 use sgl_router::config::{
-    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    CacheAwareConfig, Config, DiscoveryBackend, InflightLoadConfig, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 
 pub const MODEL: &str = "deepseek-v4-tiny";
 
-/// A single-model `cache_aware_zmq` router. Discovery is a placeholder because
+/// A single-model native `cache_aware` router. Discovery is a placeholder because
 /// every caller installs its own `WorkerRegistry`.
 pub fn config() -> Config {
     Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: PolicyKind::CacheAwareZmq,
+            disable_input_ids_forwarding: false,
+            policy: PolicyKind::CacheAware,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            affinity: None,
             sticky: None,
+            fused: None,
+            eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }

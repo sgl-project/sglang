@@ -38,8 +38,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+    set_mixed_precision_policy,
+)
 
 logger = init_logger(__name__)
 

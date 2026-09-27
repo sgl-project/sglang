@@ -10,13 +10,13 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
     replace_parameter,
     swizzle_blockscale,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -31,9 +31,8 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
-
     def __init__(self):
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
@@ -277,6 +276,17 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
+            # All-None unless the runner config carries a clamp limit.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                self.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -337,10 +347,11 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert (
-                not self.moe_runner_config.apply_router_weight_on_input
-            ), "apply_router_weight_on_input is not supported for Flashinfer"
+            assert not self.moe_runner_config.apply_router_weight_on_input, (
+                "apply_router_weight_on_input is not supported for Flashinfer"
+            )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
@@ -354,6 +365,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                     layer.w2_weight_scale,
                     layer.g2_alphas,
                 ],
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,

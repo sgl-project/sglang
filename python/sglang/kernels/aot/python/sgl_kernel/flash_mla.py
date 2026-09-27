@@ -159,9 +159,9 @@ def flash_mla_with_kvcache(
     assert extra_topk_length is None
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
-    assert (descale_q is None) == (
-        descale_k is None
-    ), "descale_q and descale_k should be both None or both not None"
+    assert (descale_q is None) == (descale_k is None), (
+        "descale_q and descale_k should be both None or both not None"
+    )
 
     if indices is None and q.element_size() == 1:
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
@@ -257,9 +257,9 @@ def _flash_mla_with_kvcache_sched_meta(
         assert sched_meta.config.causal == causal, helper_msg
         assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, helper_msg
         assert sched_meta.config.topk == topk, helper_msg
-        assert (
-            sched_meta.config.extra_page_block_size == extra_page_block_size
-        ), helper_msg
+        assert sched_meta.config.extra_page_block_size == extra_page_block_size, (
+            helper_msg
+        )
         assert sched_meta.config.extra_topk == extra_topk, helper_msg
 
     if topk is not None:
