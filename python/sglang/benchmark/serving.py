@@ -1325,7 +1325,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
     return None
 
 
-def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+def wrap_multi_turn_request_func(
+    request_func: Callable, backend: str, close_session_url: Optional[str] = None
+) -> Callable:
     assert backend in MULTI_TURN_BACKENDS, (
         f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
     )
@@ -1334,6 +1336,17 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
+        # With close_session_url, the conversation gets its own session, closed
+        # after its last round.
+        session_id = uuid.uuid4().hex if close_session_url else None
+        if session_id is not None:
+            request_func_input = replace(
+                request_func_input,
+                extra_request_body={
+                    **request_func_input.extra_request_body,
+                    "session_id": session_id,
+                },
+            )
         prompts = request_func_input.prompt
         prev_messages: List[Dict[str, str]] = []
         outputs = []
@@ -1369,6 +1382,12 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
                 {"role": "assistant", "content": output.generated_text}
             )
 
+        if session_id is not None:
+            async with _create_bench_client_session() as session:
+                async with session.post(
+                    close_session_url, json={"session_id": session_id}
+                ) as response:
+                    response.raise_for_status()
         return outputs
 
     return f
@@ -1418,8 +1437,17 @@ async def benchmark(
             and bool(first_prompt)
             and _normalize_round_messages(first_prompt[0]) is not None
         )
+    session_per_conversation = getattr(args, "session_per_conversation", False)
+    if session_per_conversation and not is_multi_turn:
+        raise ValueError("--session-per-conversation requires a multi-turn dataset")
     if is_multi_turn:
-        request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+        request_func = wrap_multi_turn_request_func(
+            request_func,
+            backend=backend,
+            close_session_url=(
+                f"{base_url}/close_session" if session_per_conversation else None
+            ),
+        )
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2660,6 +2688,12 @@ def cli_main():
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+    parser.add_argument(
+        "--session-per-conversation",
+        action="store_true",
+        help="Multi-turn datasets only: give each conversation its own session, "
+        "closed after its last round. Exercises --enable-session-radix-cache.",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
