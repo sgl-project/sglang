@@ -408,23 +408,9 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
-        req = None
-        has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            [last_node] = session.req_nodes.values()
-            req = last_node.req
-            if not req.finished():
-                has_unfinished_request = True
-
-        if has_unfinished_request:
-            # An in-flight request is still decoding on this session's KV
-            # memory. Freeing now would corrupt the scheduler. Mark the
-            # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
-            # and we schedule release_session for after it completes.
+        if not self._all_requests_finished(session):
+            # Both ordinary and streaming requests retain session-owned MM
+            # inputs and cache state until completion or a confirmed abort.
             session.close_on_finish = True
             logger.info(
                 "Deferring session close for %s (unfinished request)",
@@ -483,9 +469,14 @@ class SessionController:
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:
-        if not session.req_nodes:
-            return True
-        return all(node.req.finished() for node in session.req_nodes.values())
+        if session.streaming and session._inflight:
+            return False
+        # A chunked abort can become terminal before its last forward result
+        # drains. That result must stop using the inputs before we release them.
+        return all(
+            node.req.finished() and node.req.inflight_middle_chunks <= 0
+            for node in session.req_nodes.values()
+        )
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

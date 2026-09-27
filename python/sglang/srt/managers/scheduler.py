@@ -5858,13 +5858,13 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.enable_session_radix_cache:
-            self.tree_cache.release_radix_session(recv_req.session_id)
         if (
             recv_req.session_id in self.session_controller
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+        else:
+            self.tree_cache.release_radix_session(recv_req.session_id)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -6100,6 +6100,15 @@ def run_scheduler_process(
 def _make_abort_req(
     req: Req, finished_reason: Optional[FinishReasonDict] = None
 ) -> AbortReq:
+    # These terminal notifications bypass batch-result processing. Confirm the
+    # abort locally so an ordinary session waiting to close can be reaped.
+    if req.session is not None and not req.session.streaming and not req.finished():
+        if req.to_finish is None:
+            reason = finished_reason or {}
+            req.to_finish = FINISH_ABORT(
+                reason.get("message"), reason.get("status_code"), reason.get("err_type")
+            )
+        req.update_finish_state()
     return AbortReq(
         rid=req.rid,
         finished_reason=finished_reason,

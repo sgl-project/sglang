@@ -33,6 +33,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
+        self.session = None
         self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
