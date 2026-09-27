@@ -540,27 +540,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        if (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and not forward_batch.forward_mode.is_cuda_graph()
-        ):
-            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
-                FlashInferKDAPrefillKernel,
-            )
-
-            if isinstance(
-                self.kernel_dispatcher.extend_kernel, FlashInferKDAPrefillKernel
-            ) and (
-                torch.cuda.get_device_capability(self.device) in ((10, 0), (10, 3))
-                and not torch.cuda.is_current_stream_capturing()
-                and self.forward_metadata.query_start_loc.is_cuda
-                and self.forward_metadata.query_start_loc.is_contiguous()
-            ):
-                self.forward_metadata.flashinfer_kda_prefill_wrapper = (
-                    self.kernel_dispatcher.extend_kernel.plan(
-                        self.forward_metadata.query_start_loc
-                    )
-                )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -571,17 +550,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
-            if self.kernel_dispatcher.extend_kernel.uses_state_checkpoints:
-                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
-                    build_flashinfer_kda_checkpoint_plan,
-                )
-
-                build_flashinfer_kda_checkpoint_plan(
-                    forward_batch,
-                    self.forward_metadata,
-                    self.device,
-                    self.mamba_chunk_size,
-                )
 
     def forward_decode(
         self,
@@ -982,12 +950,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             state_checkpoint_every_n_tokens=(
                 self.forward_metadata.state_checkpoint_every_n_tokens
             ),
-            state_checkpoint_track_src=(
-                self.forward_metadata.state_checkpoint_track_src
-            ),
             state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
             track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-            prefill_wrapper=self.forward_metadata.flashinfer_kda_prefill_wrapper,
+            prefill_metadata=self.forward_metadata,
+            prefill_forward_batch=forward_batch,
+            prefill_chunk_size=self.mamba_chunk_size,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
