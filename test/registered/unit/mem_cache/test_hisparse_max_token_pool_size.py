@@ -7,16 +7,25 @@ Covers the HiSparse host-backed capacity fix:
 - `DecodePreallocQueue._check_if_req_exceed_kv_capacity` uses that ratio-expanded
   capacity for admission when HiSparse is enabled, so long-context inputs are
   not truncated at the device-only `max_total_num_tokens`.
+- `ModelRunner.request_token_capacity` is that logical capacity only on a PD
+  decode, and the worker's `max_req_len`/`max_req_input_len` and the
+  scheduler's `max_new_tokens` clip follow it, so a PD HiSparse decode neither
+  rejects a prompt longer than its device pool nor cuts its output short.
 """
 
+import logging
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     separate_buffer_allocator_double,
@@ -201,6 +210,182 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
             finished_reason=None,
         )
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
+
+
+def _hisparse_runner(*, enable_hisparse: bool, device: int, ratio: int):
+    runner = _make_model_runner(
+        enable_hisparse=enable_hisparse,
+        token_to_kv_pool_allocator=SimpleNamespace(size_full=device * ratio),
+        is_hybrid_swa=False,
+        max_total_num_tokens=device,
+        full_max_total_num_tokens=None,
+        swa_max_total_num_tokens=None,
+        req_to_token_pool=SimpleNamespace(schedulable_token_capacity=lambda c: c),
+    )
+    runner.kv_cache_configurator.is_hybrid_swa = False
+    runner.kv_cache_configurator.is_draft_worker = False
+    return runner
+
+
+class TestRequestTokenCapacity(CustomTestCase):
+    def test_pd_hisparse_decode_uses_logical_pool(self):
+        runner = _hisparse_runner(enable_hisparse=True, device=104960, ratio=48)
+        with get_context().override_server_args(disaggregation_mode="decode"):
+            self.assertEqual(runner.request_token_capacity, 104960 * 48)
+
+    def test_aggregated_and_prefill_hisparse_keep_device_pool(self):
+        """Outside a PD decode, extends take a device slot per token."""
+        runner = _hisparse_runner(enable_hisparse=True, device=104960, ratio=48)
+        for mode in ("null", "prefill"):
+            with get_context().override_server_args(disaggregation_mode=mode):
+                self.assertEqual(runner.request_token_capacity, 104960)
+
+    def test_non_hisparse_decode_keeps_device_pool(self):
+        runner = _hisparse_runner(enable_hisparse=False, device=104960, ratio=48)
+        with get_context().override_server_args(disaggregation_mode="decode"):
+            self.assertEqual(runner.request_token_capacity, 104960)
+
+
+def _worker(runner, *, context_len: int):
+    worker = TpModelWorker.__new__(TpModelWorker)
+    worker._model_runner = runner
+    worker.model_config = SimpleNamespace(context_len=context_len)
+    worker.random_seed = 0
+    worker.dllm_algorithm = None
+    worker.device = "cpu"
+    runner.req_to_token_pool = SimpleNamespace(
+        schedulable_token_capacity=lambda capacity: capacity,
+        size=1,
+        max_context_len=context_len,
+    )
+    runner.max_running_requests = 22
+    runner.forward_stream = None
+    runner.token_to_kv_pool = SimpleNamespace(size=runner.max_total_num_tokens)
+    return worker
+
+
+class TestWorkerRequestLengthLimit(CustomTestCase):
+    """max_req_len = min(context_len - 1, request-token capacity - 1); the input
+    limit is five tokens below it. A 105,000-token HiSparse device pool floors to
+    104,960 at page 64, which is where a PD decode's 104,954-token limit came
+    from before it used the logical pool."""
+
+    def setUp(self):
+        super().setUp()
+        dcp = get_parallel().override(attn_dcp_size=1)
+        dcp.__enter__()
+        self.addCleanup(dcp.__exit__, None, None, None)
+
+    def _limits(self, mode, *, enable_hisparse=True, context_len=1048576):
+        runner = _hisparse_runner(
+            enable_hisparse=enable_hisparse, device=104960, ratio=48
+        )
+        worker = _worker(runner, context_len=context_len)
+        with get_context().override_server_args(disaggregation_mode=mode):
+            info = worker.get_worker_info()
+        return info[0], info[4], info[5]
+
+    def test_pd_hisparse_decode_limit_is_logical_or_context(self):
+        max_total, max_req_len, max_req_input_len = self._limits("decode")
+        self.assertEqual(max_total, 104960)  # scheduler pool stays the device
+        self.assertEqual(max_req_len, 1048575)  # context_len binds, not device
+        self.assertEqual(max_req_input_len, 1048570)
+        _, max_req_len, _ = self._limits("decode", context_len=8 << 20)
+        self.assertEqual(max_req_len, 104960 * 48 - 1)
+
+    def test_other_roles_keep_device_limit(self):
+        self.assertEqual(self._limits("null"), (104960, 104959, 104954))
+        self.assertEqual(
+            self._limits("decode", enable_hisparse=False), (104960, 104959, 104954)
+        )
+
+
+class TestSchedulerRequestTokenCapacity(CustomTestCase):
+    """The max_new_tokens clip uses scheduler.request_token_capacity."""
+
+    def setUp(self):
+        super().setUp()
+        dcp = get_parallel().override(attn_dcp_size=1)
+        dcp.__enter__()
+        self.addCleanup(dcp.__exit__, None, None, None)
+        logger = logging.getLogger("sglang.srt.managers.scheduler")
+        level = logger.level
+        logger.setLevel(logging.ERROR)
+        self.addCleanup(logger.setLevel, level)
+
+    def _clip(self, *, request_token_capacity, max_req_len, input_len=117624):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_req_len = max_req_len
+        scheduler.max_total_num_tokens = 104960
+        scheduler.request_token_capacity = request_token_capacity
+        scheduler.page_size = 64
+        scheduler.kv_shard_widening = 1
+        scheduler.max_new_tokens_limit = None
+        scheduler.sliding_window_size = None
+        scheduler.chunked_prefill_size = None
+        allocator = SimpleNamespace(page_size=64)
+        allocator.max_new_tokens_for_memory = partial(
+            BaseTokenToKVPoolAllocator.max_new_tokens_for_memory, allocator
+        )
+        scheduler.token_to_kv_pool_allocator = allocator
+        req = SimpleNamespace(
+            rid="long",
+            origin_input_ids=[0] * input_len,
+            sampling_params=SimpleNamespace(max_new_tokens=1024, min_new_tokens=0),
+        )
+        scheduler.init_req_max_new_tokens(req)
+        return req.sampling_params.max_new_tokens
+
+    def test_pd_hisparse_decode_keeps_output_beyond_device_pool(self):
+        self.assertEqual(
+            self._clip(request_token_capacity=104960 * 48, max_req_len=1048575),
+            1024,
+        )
+
+    def test_device_bound_scheduler_still_clips(self):
+        self.assertEqual(
+            self._clip(request_token_capacity=104960, max_req_len=104959), 0
+        )
+
+
+class TestRoleSwitchRefreshesRequestLimits(CustomTestCase):
+    """A PD role switch recomputes the request limits cached at startup."""
+
+    def setUp(self):
+        super().setUp()
+        dcp = get_parallel().override(attn_dcp_size=1)
+        dcp.__enter__()
+        self.addCleanup(dcp.__exit__, None, None, None)
+
+    def _scheduler(self):
+        runner = _hisparse_runner(enable_hisparse=True, device=104960, ratio=48)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hisparse = True
+        scheduler.tp_worker = _worker(runner, context_len=8 << 20)
+        scheduler.max_total_num_tokens = 104960
+        scheduler.disaggregation_mode = None
+        scheduler.beam_coordinator = SimpleNamespace(max_req_len=0)
+        return scheduler
+
+    def _limits(self, scheduler):
+        return (
+            scheduler.max_req_len,
+            scheduler.max_req_input_len,
+            scheduler.request_token_capacity,
+            scheduler.beam_coordinator.max_req_len,
+        )
+
+    def test_both_directions(self):
+        scheduler = self._scheduler()
+        logical = 104960 * 48
+        with get_context().override_server_args(disaggregation_mode="decode"):
+            scheduler._sync_disaggregation_mode_to_subcomponents()
+        self.assertEqual(
+            self._limits(scheduler), (logical - 1, logical - 6, logical, logical - 1)
+        )
+        with get_context().override_server_args(disaggregation_mode="prefill"):
+            scheduler._sync_disaggregation_mode_to_subcomponents()
+        self.assertEqual(self._limits(scheduler), (104959, 104954, 104960, 104959))
 
 
 if __name__ == "__main__":
