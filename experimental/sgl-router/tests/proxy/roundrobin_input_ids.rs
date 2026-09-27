@@ -295,6 +295,42 @@ async fn round_robin_tool_request_omits_input_ids() {
     );
 }
 
+/// One forwarding outcome books per dispatched chat request.
+#[tokio::test]
+async fn input_ids_forwarding_metric_books_outcome_per_request() {
+    let chat = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let mut tools = chat.clone();
+    tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+    let mut image = chat.clone();
+    image["messages"][0]["content"] =
+        json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]);
+    for (cfg, request, outcome) in [
+        (config(), &chat, "forwarded"),
+        (config(), &tools, "ineligible"),
+        (config(), &image, "ineligible_multimodal"),
+        (
+            without_forwarding(config(), PolicyKind::RoundRobin),
+            &chat,
+            "disabled",
+        ),
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let expected = format!(
+            r#"sgl_router_input_ids_forwarding_total{{model_id="{MODEL}",outcome="{outcome}"}} 1"#
+        );
+        let rendered = ctx.metrics.render();
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected}; got:\n{rendered}"
+        );
+    }
+}
+
 /// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
 /// offload was expected but the encoder failed. A tool request on the same model

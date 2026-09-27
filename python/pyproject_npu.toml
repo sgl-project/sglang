@@ -33,8 +33,6 @@ dependencies = [
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
-  "memfabric-hybrid==1.1.4",
-  "memfabric-zbal==1.1.2",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",

@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,12 +37,13 @@ class _FakeAllocator:
 
 def _make_req():
     return SimpleNamespace(
+        last_node=None,
         kv=ReqKvInfo(
             req_pool_idx=0,
             cache_protected_len=2,
             swa_evict_floor=3,
-            swa_evicted_seqlen=6,
-        )
+            component_evicted_seqlens={ComponentType.SWA: 6},
+        ),
     )
 
 

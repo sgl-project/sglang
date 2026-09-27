@@ -494,7 +494,6 @@ class TestRadixCache(CustomTestCase):
 
         cache.cache_finished_req(
             req,
-            is_insert=True,
             owned_kv_len=len(prompt_ids) + len(output_ids),
         )
 
