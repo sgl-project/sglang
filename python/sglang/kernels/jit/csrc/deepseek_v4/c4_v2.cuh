@@ -206,7 +206,7 @@ SGL_DEVICE void c4_forward(
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
       const auto fp32_score = score[j];
-      const auto exp_score = expf(fp32_score - max_value);
+      const auto exp_score = __expf(fp32_score - max_value);
       sum_product += cast<float>(kv[j][i]) * exp_score;
       sum_exp_value += exp_score;
     }

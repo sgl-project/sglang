@@ -40,8 +40,9 @@ def _store_sf_interleaved_kernel(
     tok_offsets = tok_start + tl.arange(0, BLOCK_T)
     mask = tok_offsets < num_tokens
 
-    # Load slot indices
+    # Slot 0 is the reserved CUDA-graph padding sink; skip writes to it.
     slots = tl.load(loc_ptr + tok_offsets, mask=mask, other=0)
+    mask = mask & (slots != 0)
     page_offsets = slots % page_size
     page_idxs = slots // page_size
 
@@ -69,9 +70,9 @@ def store_sf_interleaved(
     page_size: int = 128,
 ):
     """Scatter-write per-token scale factors into interleaved page layout."""
-    assert (
-        page_size == 128
-    ), f"Interleaved SF layout requires page_size=128, got {page_size}"
+    assert page_size == 128, (
+        f"Interleaved SF layout requires page_size=128, got {page_size}"
+    )
     num_tokens, nheads, sf_dim = sf_in.shape
     assert sf_dim == 4, f"Expected sf_dim=4 (hdim=128, sf_vec_size=32), got {sf_dim}"
 

@@ -81,9 +81,9 @@ def adapt_config_dict(
             else:
                 config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
 
-            assert (
-                "llama_4_scaling" in config_dict
-            ), "MistralLarge3 expect llama4 scaling config."
+            assert "llama_4_scaling" in config_dict, (
+                "MistralLarge3 expect llama4 scaling config."
+            )
             llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
             assert all(
                 [

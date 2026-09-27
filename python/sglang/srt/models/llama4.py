@@ -25,9 +25,6 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -38,7 +35,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -52,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
@@ -70,7 +67,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4MoE(nn.Module):
-
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
@@ -146,10 +142,7 @@ class Llama4MoE(nn.Module):
 
         out_aD = routed_out + shared_out
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            out_aD = tensor_model_parallel_all_reduce(out_aD)
+        out_aD = reduce_moe_output(out_aD)
 
         return out_aD
 
@@ -195,7 +188,6 @@ def _get_or_create_alt_stream(device_module):
 
 
 class Llama4Attention(nn.Module):
-
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -441,6 +433,7 @@ class Llama4DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            allow_deferred_ffn_reduction=False,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
@@ -476,17 +469,10 @@ class Llama4DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
         # Fully Connected
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.feed_forward(hidden_states, forward_batch)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

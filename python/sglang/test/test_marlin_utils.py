@@ -21,18 +21,39 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.utils import (
     get_pack_factor,
     gptq_quantize_weights,
+    pack_cols,
     quantize_weights,
     sort_weights,
 )
 
 
-class MarlinWorkspace:
+def awq_pack(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
 
+    if num_bits == 4:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    elif num_bits == 8:
+        interleave = np.array([0, 2, 1, 3])
+    else:
+        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    q_w = q_w.reshape((-1, len(interleave)))[:, interleave].ravel()
+    q_w = q_w.reshape((-1, size_n)).contiguous()
+
+    return pack_cols(q_w, num_bits, size_k, size_n)
+
+
+class MarlinWorkspace:
     def __init__(self, out_features, min_thread_n, max_parallel):
-        assert (
-            out_features % min_thread_n == 0
-        ), "out_features = {} is undivisible by min_thread_n = {}".format(
-            out_features, min_thread_n
+        assert out_features % min_thread_n == 0, (
+            "out_features = {} is undivisible by min_thread_n = {}".format(
+                out_features, min_thread_n
+            )
         )
 
         max_workspace_size = (out_features // min_thread_n) * max_parallel

@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -15,8 +14,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_lora,
     get_serving,
 )
@@ -82,6 +83,9 @@ class RuntimeHandle:
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
+
+    def set_engine_state_changed_callback(self, callback) -> None:
+        self.tokenizer_manager.set_engine_state_changed_callback(callback)
 
     @property
     def _tm_loop(self):
@@ -410,6 +414,9 @@ class RuntimeHandle:
             "load_format": self.tokenizer_manager.config_value("load_format"),
             "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
             "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -417,16 +424,21 @@ class RuntimeHandle:
         if embedding_model_spec is not None:
             result["embedding"] = resolved_embedding_plan(
                 embedding_model_spec,
-                server_args=self.server_args,
+                config=resolving_view(self.server_args),
                 model_config=model_config,
             )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
+        # `resolved_dict` answers with what resolution decided; the launch
+        # command answers with what was asked for, and the two are not
+        # derivable from each other. The HTTP and in-process readbacks both
+        # carry it, so this one does too.
+        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
         result.update(self.scheduler_info)
-        result["kv_events"] = (
-            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        result["kv_events"] = describe_kv_events_publisher(
+            self.tokenizer_manager.server_args
         )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
@@ -439,6 +451,10 @@ class RuntimeHandle:
             ServerStatus.Starting,
             ServerStatus.UnHealthy,
         )
+
+    def is_pause(self) -> bool:
+        """Return the tokenizer manager's authoritative generation pause state."""
+        return self.tokenizer_manager.is_pause
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
@@ -544,9 +560,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

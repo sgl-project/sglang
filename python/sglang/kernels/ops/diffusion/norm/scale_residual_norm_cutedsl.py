@@ -263,7 +263,7 @@ def fused_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
-    from sglang.kernels.ops.diffusion.norm.norm_scale_shift_jit import (
+    from sglang.kernels.kda_kernels.norm_scale_shift_jit import (
         try_fused_norm_scale_shift as _try_qwen_native_norm_scale_shift,
     )
 
@@ -349,7 +349,7 @@ def fused_scale_residual_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
-    from sglang.kernels.ops.diffusion.norm.norm_scale_shift_jit import (
+    from sglang.kernels.kda_kernels.norm_scale_shift_jit import (
         try_fused_scale_residual_norm_scale_shift as _try_qwen_native_residual_path,
     )
 
