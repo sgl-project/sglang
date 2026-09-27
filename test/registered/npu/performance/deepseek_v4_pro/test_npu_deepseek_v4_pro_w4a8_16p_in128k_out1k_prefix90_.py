@@ -93,7 +93,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     16,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
-    "--disable-radix-cache",
+    # "--disable-radix-cache",
     # # DSPARK speculative decoding with the bundled draft weights.
     # "--speculative-algorithm",
     # "DSPARK",
