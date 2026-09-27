@@ -274,6 +274,31 @@ def make_group_executor(
     return executor, stage, encoder, args
 
 
+@pytest.mark.parametrize("native", [False, True])
+@torch.no_grad()
+def test_one_unique_stage_skips_group_only_cache_lookup(native, monkeypatch):
+    executor, stage, encoder, args = make_group_executor(
+        TextEncodingStage, "cpu", 4096, fsdp=True, native=native
+    )
+    fingerprint = Mock(wraps=conditioning._fingerprint)
+    monkeypatch.setattr(conditioning, "_fingerprint", fingerprint)
+    stage.forward = Mock(wraps=stage.forward)
+    requests = [
+        Req(
+            sampling_params=SamplingParams(prompt="hello", num_inference_steps=4),
+            do_classifier_free_guidance=False,
+        )
+        for _ in range(3)
+    ]
+
+    outputs = executor.execute_group([stage], requests, args)
+
+    assert stage.forward.call_count == 1
+    assert encoder.calls == 1
+    assert outputs[0].prompt_embeds[0] is outputs[2].prompt_embeds[0]
+    fingerprint.assert_not_called()
+
+
 @pytest.mark.parametrize("capacity", [0, 1, 4096])
 @pytest.mark.parametrize("fsdp", [False, True])
 @pytest.mark.parametrize("native", [False, True])
