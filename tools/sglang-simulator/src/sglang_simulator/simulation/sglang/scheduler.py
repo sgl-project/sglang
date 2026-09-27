@@ -183,7 +183,8 @@ class ReqDispatcher:
 
             for req in reqs:
                 if self.session_requests.carries_generate_req(req):
-                    # Each turn in a batch carries its own arrival time.
+                    # OFFLINE mode queues each request at its own arrival time,
+                    # which a batch does not have, so unpack it into its requests.
                     gen_requests.extend(self.session_requests.iter_generate_reqs(req))
                 else:
                     # Such as: /profile_start, /flush_cache, etc.

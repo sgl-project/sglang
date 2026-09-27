@@ -80,6 +80,8 @@ class C_ModelRunnerHook(BaseHook):
 
         def wrapped_sample(self, *args, **kwargs):
             logits = args[0]
+            # Multi-turn replay feeds these tokens back as history text, so the id
+            # must re-tokenize to one token each; see resolve_filler_token_id.
             return torch.full(
                 size=(logits.next_token_logits.shape[0],),
                 fill_value=self.filler_token_id,
