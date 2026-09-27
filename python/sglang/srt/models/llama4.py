@@ -522,7 +522,11 @@ class Llama4Model(nn.Module):
         aux_hidden_states = []
         for i in range(len(self.layers)):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+                aux_hidden_states.append(
+                    self.layers[i].layer_communicator.snapshot(
+                        hidden_states, residual, at_input=True
+                    )
+                )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,

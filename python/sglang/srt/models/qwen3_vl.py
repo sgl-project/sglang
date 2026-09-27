@@ -1218,7 +1218,9 @@ class Qwen3LLMModel(Qwen3Model):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                    layer.layer_communicator.snapshot(
+                        hidden_states, residual, at_input=True
+                    )
                 )
 
             if self.use_hf_deepstack_order:

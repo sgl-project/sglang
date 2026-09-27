@@ -736,8 +736,8 @@ class Step3p5Model(nn.Module):
             else:
                 if hidden_states.shape[0] > 0:
                     # if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = last_layer.layer_communicator.snapshot(
+                        hidden_states, residual
                     )
                     if residual is None:
                         hidden_states = self.norm(hidden_states)

@@ -337,6 +337,30 @@ class TestLayerStackExit(CustomTestCase):
                     problems.append(f"{name}:{node.lineno}")
         self.assertEqual(problems, [])
 
+    def test_models_use_boundary_access_for_output_values(self):
+        problems = []
+        forbidden = {
+            "UnreducedOutput",
+            "HandoffOutput",
+            "reduce_output",
+            "layer_input_buffer",
+        }
+        for path, tree in self.complete_census.trees.items():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id in forbidden:
+                    problems.append(f"{path.name}:{node.lineno}: {node.id}")
+        for name, (forward, _) in self.complete_census.subjects().items():
+            for node in ast.walk(forward):
+                if (
+                    isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Add)
+                    and isinstance(node.left, ast.Name)
+                    and isinstance(node.right, ast.Name)
+                    and {node.left.id, node.right.id} == {"hidden_states", "residual"}
+                ):
+                    problems.append(f"{name}:{node.lineno}: residual add")
+        self.assertEqual(problems, [])
+
     def test_split_prefill_completes_only_at_the_final_segment(self):
         census = self.complete_census
         containers = {name for _, name in census.stacks}

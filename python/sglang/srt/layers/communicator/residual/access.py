@@ -17,6 +17,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.communicator.output import (
     HandoffOutput,
     UnreducedOutput,
@@ -88,3 +89,16 @@ def from_pp(
     else:
         residual = tensors["residual"]
     return tensors["hidden_states"], residual
+
+
+def snapshot(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    *,
+    group: Optional[GroupCoordinator] = None,
+) -> torch.Tensor:
+    """Copy a complete output with its plain residual. A statically declared
+    sum is reduced on a copy; the main output and residual remain unchanged."""
+    if group is not None:
+        hidden_states = group.all_reduce(hidden_states.clone())
+    return hidden_states.clone() if residual is None else hidden_states + residual

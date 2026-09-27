@@ -156,6 +156,23 @@ def build_model(model_cls, *, defer, capture):
 
 
 class TestAuxCaptureDeferredAllreduce(CustomTestCase):
+    def test_skipping_an_empty_capture_does_not_complete_its_output(self):
+        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        partial = torch.empty(0, 4)
+        owed = comm.UnreducedOutput(partial, group=GROUP)
+        with patch.object(GROUP, "all_reduce") as reduce:
+            hidden, captured = boundary.capture_output(owed, partial, skip_empty=True)
+        self.assertIs(hidden, owed)
+        self.assertIsNone(captured)
+        reduce.assert_not_called()
+
+    def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
+        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        hidden = torch.ones(2, 4)
+        captured = boundary.snapshot(hidden, None)
+        hidden.zero_()
+        torch.testing.assert_close(captured, torch.ones_like(hidden))
+
     def test_capture_matches_eager_reduction(self):
         inputs = torch.tensor([[0.25, -0.5, 0.75, 1.0], [1.5, 2.0, -1.0, 0.0]])
         batch = SimpleNamespace(

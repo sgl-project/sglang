@@ -69,6 +69,7 @@ from sglang.srt.layers.communicator.ops import (
 )
 from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
+    reduce_output,
 )
 from sglang.srt.layers.communicator.residual import LayerResidual
 from sglang.srt.layers.communicator.residual.access import (
@@ -77,6 +78,7 @@ from sglang.srt.layers.communicator.residual.access import (
     finish_layer_stack,
     fold,
     from_pp,
+    snapshot,
 )
 from sglang.srt.layers.communicator.residual.add_norm import (
     PLAIN_RESIDUAL,
@@ -239,6 +241,7 @@ class LayerCommunicator:
     _residual: LayerResidual = PLAIN_RESIDUAL
     # The fused kernels a backend gives the layer, if any.
     fusions: Optional[LayerFusions] = None
+    stage_edges = None
 
     def __init__(
         self,
@@ -575,6 +578,32 @@ class LayerCommunicator:
             enters_stack=self.layer_facts.is_first_layer,
             **kwargs,
         )
+
+    def snapshot(self, hidden_states, residual, *, at_input: bool = False):
+        group = None
+        if residual is not None and self.stage_edges is not None:
+            edge = self.stage_edges[0 if at_input else 1]
+            if edge.produced.always_leaves:
+                group = _sum_group(edge.produced.group)
+        return snapshot(hidden_states, residual, group=group)
+
+    def capture_output(
+        self,
+        hidden_states,
+        residual,
+        *,
+        at_input: bool = False,
+        skip_empty: bool = False,
+    ):
+        """Complete the carried output on the main path, then snapshot it.
+        Keep this explicit completion distinct from a read-only snapshot: the
+        next prepare must not select a fusion for a sum already completed here."""
+        if skip_empty:
+            storage = buffer(hidden_states)
+            if storage is not None and storage.shape[0] == 0:
+                return hidden_states, None
+        hidden_states = reduce_output(hidden_states)
+        return hidden_states, self.snapshot(hidden_states, residual, at_input=at_input)
 
     def from_pp(self, tensors, *, allow_missing_residual: bool = False):
         return from_pp(

@@ -26,7 +26,11 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack, from_pp
+from sglang.srt.layers.communicator.residual.access import (
+    finish_layer_stack,
+    from_pp,
+    snapshot,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -414,9 +418,7 @@ class Qwen2Model(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+                aux_hidden_states.append(snapshot(hidden_states, residual))
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,

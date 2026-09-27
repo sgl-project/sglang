@@ -121,8 +121,8 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             # if forward_batch.return_hidden_states_before_norm:
-            hidden_states_before_norm = (
-                hidden_states if residual is None else hidden_states + residual
+            hidden_states_before_norm = self.mtp_block.layer_communicator.snapshot(
+                hidden_states, residual
             )
             if residual is not None:
                 hidden_states, _ = self.shared_head.norm(hidden_states, residual)

@@ -102,15 +102,6 @@ def tp_reduce_scatter(
     return output, residual
 
 
-def layer_input_buffer(
-    hidden_states: Union[torch.Tensor, UnreducedOutput],
-) -> torch.Tensor:
-    """The tensor holding a layer's input, for reusing its memory without reading it."""
-    if isinstance(hidden_states, UnreducedOutput):
-        return hidden_states.partial
-    return hidden_states
-
-
 class CommunicateSimpleFn:
     @staticmethod
     def _trivial(

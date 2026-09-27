@@ -37,7 +37,6 @@ from sglang.srt.layers.communicator import (
     LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -804,8 +803,12 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_states.append(hidden_states + residual)
+                    hidden_states, snapshot = self.layers[
+                        i
+                    ].layer_communicator.capture_output(
+                        hidden_states, residual, at_input=True
+                    )
+                    aux_hidden_states.append(snapshot)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,

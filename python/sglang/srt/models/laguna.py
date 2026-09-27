@@ -22,7 +22,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
-    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -592,10 +591,12 @@ class LagunaModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                hidden_states = reduce_output(hidden_states)
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                hidden_states, snapshot = self.layers[
+                    i
+                ].layer_communicator.capture_output(
+                    hidden_states, residual, at_input=True
                 )
+                aux_hidden_states.append(snapshot)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -613,7 +614,7 @@ class LagunaModel(nn.Module):
         if hidden_states.shape[0] != 0:
             if self.end_layer in self.layers_to_capture:
                 aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
+                    last_layer.layer_communicator.snapshot(hidden_states, residual)
                 )
             if residual is None:
                 hidden_states = self.norm(hidden_states)

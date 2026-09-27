@@ -31,7 +31,6 @@ from sglang.srt.layers.communicator import (
     MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    reduce_output,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1082,14 +1081,7 @@ class Glm5NextModel(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
-    def _prepare_aux_hidden_state(
-        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        # mHC folds the residual into widened hidden state, so residual remains None
-        # until hc_contract merges it; only plain residual streams are added here.
-        aux_hidden_state = (
-            hidden_states if residual is None else hidden_states + residual
-        )
+    def _prepare_aux_hidden_state(self, aux_hidden_state: torch.Tensor) -> torch.Tensor:
         if self.dflash_capture and self.config.mhc:
             aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
         return aux_hidden_state
@@ -1157,10 +1149,16 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
-                    hidden_states = reduce_output(hidden_states)
-                    aux_hidden_state = self._prepare_aux_hidden_state(
-                        hidden_states, residual
-                    )
+                    if self.dflash_capture and self.config.mhc:
+                        # hc_post has completed the streams; contracting them
+                        # creates the retained value without copying the wide input.
+                        aux_hidden_state = self._prepare_aux_hidden_state(hidden_states)
+                    else:
+                        hidden_states, aux_hidden_state = self.layers[
+                            i
+                        ].layer_communicator.capture_output(
+                            hidden_states, residual, at_input=True
+                        )
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
                             aux_hidden_state, dim=0

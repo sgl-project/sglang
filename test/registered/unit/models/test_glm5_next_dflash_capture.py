@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.layers.communicator import LayerCommunicator
 from sglang.srt.models.glm5_next import Glm5NextModel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,7 +30,9 @@ class TestGlm5NextDflashCapture(CustomTestCase):
 
         hidden_states = torch.arange(24, dtype=torch.float32).reshape(2, 12)
 
-        actual = model._prepare_aux_hidden_state(hidden_states, None)
+        boundary = LayerCommunicator.__new__(LayerCommunicator)
+        _, captured = boundary.capture_output(hidden_states, None)
+        actual = model._prepare_aux_hidden_state(captured)
         expected = hidden_states.unflatten(-1, (4, -1)).mean(dim=-2)
 
         torch.testing.assert_close(actual, expected)
