@@ -844,6 +844,30 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    def _hold_back_final_chunk(self, chunk_len: int, remaining: int) -> int:
+        """Shorten a non-final chunk so the final chunk is at least one SWA
+        window long. Returns the shortened length, or `chunk_len` when no
+        shortening is needed or fewer rows than a window remain.
+
+        The chunk boundary this creates is not page aligned. Rounding it down
+        to a page leaves no valid length once fewer than a window plus a page
+        remain, and the only alternatives there are a short final chunk or
+        admitting nothing this batch, which can starve the request. A chunk
+        may end at any position, since the allocator continues a partial page.
+        """
+        window = (
+            self.tree_cache.swa_reprefill_tail_tokens()
+            if self.tree_cache is not None
+            else 0
+        )
+        if not window:
+            return chunk_len
+        rest = remaining - chunk_len
+        if rest <= 0 or rest >= window:
+            return chunk_len
+        held = remaining - window
+        return held if held > 0 else chunk_len
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -1156,6 +1180,8 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated:
+            new_len = self._hold_back_final_chunk(new_len, cand_extend_input_len)
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=len(req.prefix_indices), extend_len=new_len
@@ -1318,7 +1344,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._hold_back_final_chunk(
+                self.rem_chunk_tokens, cand_extend_input_len
+            )
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1534,6 +1562,9 @@ class PrefillAdder:
                     )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
+            extend_len = self._hold_back_final_chunk(
+                extend_len, len(req.full_untruncated_fill_ids) - prefix_len
+            )
             if extend_len <= 0:
                 return AddReqResult.OTHER
             is_chunked = True

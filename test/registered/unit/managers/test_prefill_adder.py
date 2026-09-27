@@ -70,6 +70,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         tree_cache.buffer_pipeline = None
+        tree_cache.swa_reprefill_tail_tokens.return_value = 0
         return tree_cache
 
     def create_token_allocator(
@@ -281,6 +282,40 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_range.length, 4096)
+
+    def test_hold_back_final_chunk_shortens_to_leave_a_window(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=16384)  # page 256
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        # 16384 of 16385 would leave 1 row, cut to 16385 - 128
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16385), 16257)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16511), 16383)
+        # rest >= window, or nothing left: unchanged
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16512), 16384)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 40000), 16384)
+        self.assertEqual(adder._hold_back_final_chunk(16384, 16384), 16384)
+        # no page-aligned length leaves a window, cut to 300 - 128
+        self.assertEqual(adder._hold_back_final_chunk(256, 300), 172)
+        # fewer rows than a window remain: unchanged
+        self.assertEqual(adder._hold_back_final_chunk(100, 120), 100)
+
+    def test_first_chunk_leaves_at_least_a_window_for_the_final_chunk(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        req = self.create_shared_req("short-tail")
+        req.full_untruncated_fill_ids = list(range(512 + 50))
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, req)
+        # 562 - 128, the final chunk gets 128 rows
+        self.assertEqual(req.extend_range.length, 434)
+
+    def test_continuation_leaves_at_least_a_window_for_the_final_chunk(self):
+        adder = self.create_shortest_prefill_adder()  # chunk 4096, page 256
+        self.mock_tree_cache.swa_reprefill_tail_tokens.return_value = 128
+        req = self.create_shared_req("continuation-short-tail")
+        req.full_untruncated_fill_ids = list(range(4096 + 50))
+        self.assertIs(adder.add_chunked_req(req), req)
+        # 4146 - 128
+        self.assertEqual(req.extend_range.length, 4018)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
