@@ -19,10 +19,10 @@ from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     qr_rocm_arch_available,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 torch.manual_seed(42)
@@ -119,7 +119,7 @@ class TestQuickAllReduce(CustomTestCase):
         )
         publish_build_topology(tp_size=world_size, world_rank=rank)
         initialize_model_parallel()
-        group = get_tensor_model_parallel_group().device_group
+        group = get_parallel().tp_group.device_group
 
         # A small all_reduce for warmup.
         # this is needed because device communicators might be created lazily
@@ -189,7 +189,7 @@ class TestQuickAllReduce(CustomTestCase):
         )
         publish_build_topology(tp_size=world_size, world_rank=rank)
         initialize_model_parallel()
-        group = get_tensor_model_parallel_group().device_group
+        group = get_parallel().tp_group.device_group
 
         for sz in self.TEST_SIZES:
             for dtype in [torch.float16, torch.bfloat16]:

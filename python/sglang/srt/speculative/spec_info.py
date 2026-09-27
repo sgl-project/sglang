@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -300,20 +299,6 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
-
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
@@ -446,6 +431,13 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
             SpecInputType.UNO_VERIFY,
         }
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        return None
 
 
 def spec_scale_global_num_tokens(

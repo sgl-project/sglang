@@ -81,6 +81,10 @@ class _StubMambaComponent(_StubFullComponent):
     component_type = ComponentType.MAMBA
 
 
+class _StubAuxiliarySWAComponent(_StubFullComponent):
+    component_type = ComponentType.AUXILIARY_SWA
+
+
 class TreeCoreRegistryTest(CustomTestCase):
     def setUp(self):
         self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
@@ -195,6 +199,51 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self.assertIs(cache.tree_core, core)
         component = cache.components[ComponentType.FULL]
         self.assertIs(component.tree_core, core)
+
+    def test_backend_override_is_instance_local(self):
+        for backend, default_backend, expected_backend in (
+            ("python", "unregistered-test-core", "python"),
+            (None, "python", "python"),
+            (None, "unregistered-test-core", None),
+            ("", "python", None),
+            ("unregistered-test-core", "python", None),
+        ):
+            with (
+                self.subTest(backend=backend, default_backend=default_backend),
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(default_backend),
+            ):
+                params = self._cache_params(tree_core_backend=backend)
+                if expected_backend is None:
+                    with self.assertRaisesRegex(ValueError, "is not registered"):
+                        UnifiedRadixCache(params)
+                else:
+                    cache = UnifiedRadixCache(params)
+                    self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
+                    self.assertEqual(cache._tree_core_backend, expected_backend)
+                self.assertEqual(
+                    envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), default_backend
+                )
+
+    def test_auxiliary_component_uses_its_own_node_storage(self):
+        cache = UnifiedRadixCache(
+            self._cache_params(
+                tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
+                component_registry_override={
+                    ComponentType.FULL: _StubFullComponent,
+                    ComponentType.AUXILIARY_SWA: _StubAuxiliarySWAComponent,
+                },
+                tree_core_backend="python",
+            )
+        )
+        node = cache.tree_core.root_node
+        auxiliary = node.component_data[ComponentType.AUXILIARY_SWA]
+        full = node.component_data[ComponentType.FULL]
+        self.assertIsNot(auxiliary, full)
+        auxiliary.metadata["boundary"] = 7
+        self.assertNotIn("boundary", full.metadata)
+        self.assertIs(
+            cache.components[ComponentType.AUXILIARY_SWA].tree_core, cache.tree_core
+        )
 
 
 if __name__ == "__main__":

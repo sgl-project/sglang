@@ -36,6 +36,7 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 

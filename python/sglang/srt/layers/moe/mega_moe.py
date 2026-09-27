@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -43,6 +44,13 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_is_hip = is_hip()
+
+
+def _use_amd_flydsl_mega_moe() -> bool:
+    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
+    # diverting a CUDA run into a path whose kernels it does not have.
+    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
 
 
 def _mega_moe_mma_type(experts=None) -> str:
@@ -152,6 +160,13 @@ def is_mega_moe_experts_ready(experts) -> bool:
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_flydsl import (
+            should_use_mega_moe as should_use_flydsl_mega_moe,
+        )
+
+        return should_use_flydsl_mega_moe(moe, hidden_states)
+
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not is_mega_moe_experts_ready(moe.experts):
@@ -174,6 +189,15 @@ def forward_mega_moe(
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_flydsl import (
+            forward_mega_moe as forward_flydsl_mega_moe,
+        )
+
+        return forward_flydsl_mega_moe(
+            moe, hidden_states, forward_batch, input_ids_global
+        )
+
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
@@ -221,7 +245,7 @@ def _run_mega_routed(
             hidden_states,
             router_logits,
             num_token_non_padded=(
-                forward_batch.num_token_non_padded
+                forward_batch.moe_num_token_non_padded()
                 if forward_batch is not None
                 else None
             ),
@@ -432,6 +456,14 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe.mega_moe_flydsl import (
+            build_mega_moe_experts_weights as build_flydsl_mega_moe_weights,
+        )
+
+        build_flydsl_mega_moe_weights(experts)
+        return
+
     from deep_gemm import (
         transform_sf_into_required_layout,
     )

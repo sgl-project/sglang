@@ -1,4 +1,4 @@
-"""Test for ComfyUIFluxPipeline with pass-through scheduler."""
+"""Test for FluxPipeline with pass-through scheduler."""
 
 import os
 import sys
@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def test_comfyui_flux_pipeline_direct() -> None:
-    """Test ComfyUIFluxPipeline with custom inputs."""
+    """Test FluxPipeline with custom inputs."""
     device = current_platform.device_type
     model_path = os.environ.get(
         "SGLANG_TEST_FLUX_MODEL_PATH",
@@ -22,7 +22,8 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIFluxPipeline",
+        model_id="FLUX.1-dev",
+        pipeline_class_name="FluxPipeline",
         num_gpus=2,
         comfyui_mode=True,
     )
@@ -70,6 +71,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
         width=width,
         num_frames=1,
         num_inference_steps=1,
+        guidance_scale=1.0,
         save_output=True,
         return_trajectory_latents=True,
     )
@@ -85,6 +87,10 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     clip_dim = 768
     req.prompt_embeds = [pooled_projections, encoder_hidden_states]
+    req.prompt_seq_lens = [
+        [int(pooled_projections.shape[0])],
+        [encoder_seq_len],
+    ]
 
     if req.guidance_scale > 1.0:
         dummy_neg_clip_embedding = torch.zeros(
@@ -105,17 +111,15 @@ def test_comfyui_flux_pipeline_direct() -> None:
             dummy_neg_clip_embedding,
             negative_encoder_hidden_states,
         ]
+        req.negative_prompt_seq_lens = [
+            [int(dummy_neg_clip_embedding.shape[0])],
+            [encoder_seq_len],
+        ]
     else:
         req.negative_prompt_embeds = None
 
     req.pooled_embeds = [pooled_projections]
-    # Flux time_text_embed needs a pooled projection on every CFG branch. Zeros are
-    # not real negative conditioning, so only dtype and device are asserted below.
-    req.neg_pooled_embeds = (
-        [torch.zeros_like(pooled_projections)]
-        if req.negative_prompt_embeds is not None
-        else []
-    )
+    req.neg_pooled_embeds = [torch.zeros_like(pooled_projections)]
 
     if (
         req.guidance_scale > 1.0
