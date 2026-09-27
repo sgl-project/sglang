@@ -240,8 +240,9 @@ class Session:
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
+                for req_node in list(self.req_nodes.values()):
+                    if req_node.parent is None:
+                        req_node.clear(self.req_nodes)
             else:
                 if session_params.rid not in self.req_nodes:
                     abort = True
