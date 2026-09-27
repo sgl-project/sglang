@@ -182,6 +182,8 @@ Do not put `Req`, scheduler instances, sampled latents, or session state into a 
 
 Test cache-on versus cache-off with identical seeds, changed prompts/masks/reference pixels (including alpha), downstream in-place mutations, changed weights, and rank-local eviction under supported parallel groups. Also exercise grouped requests through the executor with a zero or undersized CPU budget: check encoder call counts, per-request metadata, output ownership, and group cleanup on failure. Include the new model in the [conditioning cache coverage](/docs/sglang-diffusion/caching-acceleration#coverage-and-limits).
 
+Preserve existing grouped-request encoding reuse when cross-request caching is unavailable. Use `cross_request=False` for boundaries that support only group-local reuse, such as library fallback encoders and gathered batch-DP outputs. FSDP scopes allow consumed-output group reuse while bypassing nested encoder caches. A boundary containing collectives needs hit consensus across every participating rank, including FSDP shards and encoder DP copies; an encoder TP group alone may be insufficient. Test these bypass paths and single-rank invalidation before removing stage deduplication.
+
 ## Choose a Pipeline Shape
 
 SGLang-Diffusion uses `ComposedPipelineBase` to wire stages together. Most

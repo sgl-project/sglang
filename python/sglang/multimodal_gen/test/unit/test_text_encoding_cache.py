@@ -1,4 +1,3 @@
-from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -7,6 +6,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -15,6 +16,12 @@ from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingPara
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.cache import conditioning
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
 )
@@ -504,12 +511,16 @@ class TextEncodingDPGroup:
 
 
 def run_text_encoding_dp(rank, rendezvous, grouped):
-    dist.init_process_group(
-        "gloo",
+    init_distributed_environment(
+        backend="gloo",
         rank=rank,
         world_size=2,
-        init_method=rendezvous,
-        timeout=timedelta(seconds=30),
+        local_rank=rank,
+        distributed_init_method=rendezvous,
+        timeout=30,
+    )
+    initialize_model_parallel(
+        sequence_parallel_degree=2, ulysses_degree=2, backend="gloo"
     )
     try:
         encoder = FullHiddenStateEncoder().eval()
@@ -527,21 +538,90 @@ def run_text_encoding_dp(rank, rendezvous, grouped):
                 outputs = stage.encode_text(
                     ["a", "bb", "ccc"], args, device="cpu", return_attention_mask=True
                 )
-                assert group.gathers > before
+                if grouped and attempt == 2:
+                    assert group.gathers == before
+                else:
+                    assert group.gathers > before
                 assert outputs[0][0][:, 0, 0].tolist() == [10, 11, 12]
                 assert outputs[4] == [[2, 2, 2]]
-                outputs[0][0].zero_()
         assert encoder.calls == (2 if rank == 0 else 1)
         assert cache.hits == (1 if rank == 0 else 2)
     finally:
-        dist.destroy_process_group()
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 @pytest.mark.parametrize("grouped", [False, True])
-def test_batch_dp_keeps_gathering_on_rank_local_encoder_hits(tmp_path, grouped):
+def test_batch_dp_requires_consensus_to_skip_gather(tmp_path, grouped):
     mp.spawn(
         run_text_encoding_dp,
         args=(f"file://{tmp_path / 'dp-rendezvous'}", grouped),
+        nprocs=2,
+        join=True,
+    )
+
+
+class ShardedTextEncoder(FullHiddenStateEncoder):
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.projection = torch.nn.Linear(1, 8, bias=False)
+        torch.nn.init.ones_(self.projection.weight)
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        self.calls += 1
+        hidden = self.projection(input_ids[..., None].float())
+        return BaseEncoderOutput(last_hidden_state=hidden, hidden_states=(hidden,) * 32)
+
+
+def run_fsdp_conditioning(rank, rendezvous):
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=rendezvous,
+        backend="nccl",
+        timeout=60,
+    )
+    initialize_model_parallel(sequence_parallel_degree=2, ulysses_degree=2)
+    try:
+        encoder = ShardedTextEncoder().cuda().eval()
+        fully_shard(encoder, mesh=init_device_mesh("cuda", (2,)))
+        assert encoder.projection.weight.to_local().numel() == 4
+        args = make_server_args(pipeline_config=make_text_config())
+        with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+            stage = TextEncodingStage([encoder], [object()])
+        stage._text_encode_dp_group = Mock(return_value=None)
+        cache = ConditioningCache(4096)
+        with torch.no_grad(), cache.scope(cross_request=False):
+            for _ in range(2):
+                with cache.group_scope():
+                    for attempt in range(3):
+                        if rank == 0 and attempt == 1:
+                            cache.clear()
+                        output = stage.encode_text("hello", args, device=f"cuda:{rank}")
+                        torch.testing.assert_close(
+                            output[0][0][0, :, 0],
+                            torch.tensor([5.0, 2.0], device=f"cuda:{rank}"),
+                            rtol=0,
+                            atol=0,
+                        )
+                assert cache._group_entries.get() is None
+        assert encoder.calls == 4
+        assert cache.group_hits == 2
+        assert cache.bytes == 0
+        assert encoder.projection.weight.to_local().numel() == 4
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+def test_fsdp_group_reuse_agrees_across_shards_and_expires(tmp_path):
+    mp.spawn(
+        run_fsdp_conditioning,
+        args=(f"file://{tmp_path / 'fsdp-rendezvous'}",),
         nprocs=2,
         join=True,
     )

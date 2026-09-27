@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
     get_tp_group,
+    get_world_group,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -704,31 +705,32 @@ class TextEncodingStage(ConditionEncodingStage):
                     seq_lens,
                 )
 
-            if dp_group is None and isinstance(text_encoder, TextEncoder):
-                cache_group = text_encoder._encoder_tp_group
-                if cache_group is None and model_parallel_is_initialized():
+            native_encoder = isinstance(text_encoder, TextEncoder)
+            cache_group = text_encoder._encoder_tp_group if native_encoder else None
+            if model_parallel_is_initialized():
+                if dp_group is not None:
+                    # agree across encoder copies before skipping their gather
+                    cache_group = get_world_group()
+                elif cache_group is None:
                     cache_group = get_tp_group()
-                # Cache the consumed conditioning, not every intermediate layer.
-                # The stage namespace separates pipeline postprocessing contracts.
-                conditioning = cached_encoder_call(
-                    text_encoder,
-                    (cache_inputs,),
-                    {
-                        "encoder_index": i,
-                        "return_attention_mask": return_attention_mask,
-                        "device": str(target_device),
-                        "dtype": dtype,
-                    },
-                    encode_conditioning,
-                    cache_group,
-                    namespace=self,
-                    nested=False,
-                    share_in_group=True,
-                )
-            else:
-                # Batch-DP keeps caching inside each encoder copy so every rank
-                # still enters the output gather, including on a cache hit.
-                conditioning = encode_conditioning()
+            # consumed embeddings have no intermediate-state size limit; library
+            # and batch-DP encoders retain them only for the current group
+            conditioning = cached_encoder_call(
+                text_encoder,
+                (cache_inputs,),
+                {
+                    "encoder_index": i,
+                    "return_attention_mask": return_attention_mask,
+                    "device": str(target_device),
+                    "dtype": dtype,
+                },
+                encode_conditioning,
+                cache_group,
+                namespace=self,
+                nested=dp_group is not None,
+                share_in_group=True,
+                cross_request=native_encoder and dp_group is None,
+            )
             # a hit can leave weights retained by warmup or the previous request
             self.finish_unused_declared_component(
                 component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",

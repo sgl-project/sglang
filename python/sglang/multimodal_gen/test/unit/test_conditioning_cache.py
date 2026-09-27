@@ -446,6 +446,41 @@ def test_group_hit_preserves_negative_host_entry_under_capacity_pressure():
 
 
 @torch.no_grad()
+def test_group_only_scope_ignores_host_entries_and_nested_encoder_caches():
+    model = VisionLanguageEncoder().eval()
+    cache = ConditioningCache(4096)
+    namespace = Encoder()
+    x = torch.ones(4)
+
+    def stage():
+        return cached_encoder_call(
+            model,
+            (x, x),
+            {},
+            lambda: model(x, x),
+            namespace=namespace,
+            share_in_group=True,
+        )
+
+    with cache.scope():
+        expected = stage()
+        entries = cache.stats()["entries"]
+        with cache.scope(cross_request=False):
+            for _ in range(2):
+                with cache.group_scope():
+                    torch.testing.assert_close(stage(), expected, rtol=0, atol=0)
+                    stage()
+                    assert cache.stats()["entries"] == entries
+            assert model.calls == model.vision_calls == 3
+            stage()
+            stage()
+            assert model.calls == model.vision_calls == 5
+        stage()
+        assert model.calls == 5
+    assert cache.group_hits == 2
+
+
+@torch.no_grad()
 def test_group_cache_invalidates_and_releases_after_failure():
     cache = ConditioningCache(0)
     model = Encoder().eval()

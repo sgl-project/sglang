@@ -20,6 +20,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
+    get_world_group,
     get_world_size,
     model_parallel_is_initialized,
 )
@@ -31,6 +32,9 @@ _active_cache: ContextVar["ConditioningCache | None"] = ContextVar(
 )
 _refresh_cache: ContextVar[bool] = ContextVar(
     "refresh_conditioning_cache", default=False
+)
+_cross_request_cache: ContextVar[bool] = ContextVar(
+    "cross_request_conditioning_cache", default=True
 )
 _prefer_cache: ContextVar[bool] = ContextVar("prefer_conditioning_cache", default=False)
 _stage_encoder: ContextVar[object | None] = ContextVar("stage_encoder", default=None)
@@ -313,13 +317,17 @@ class ConditioningCache:
         entries[key] = _GroupEntry(stored, owner, size, tuple(ready))
 
     @contextmanager
-    def scope(self, enabled=True, *, refresh=False):
+    def scope(self, enabled=True, *, refresh=False, cross_request=True):
         # Zero-capacity ranks still participate in encoder hit consensus.
         token = _active_cache.set(self if enabled else None)
         refresh_token = _refresh_cache.set(refresh or _refresh_cache.get())
+        cross_request_token = _cross_request_cache.set(
+            cross_request and _cross_request_cache.get()
+        )
         try:
             yield
         finally:
+            _cross_request_cache.reset(cross_request_token)
             _refresh_cache.reset(refresh_token)
             _active_cache.reset(token)
 
@@ -335,10 +343,14 @@ class ConditioningCache:
         nested=False,
         namespace=None,
         share_in_group=False,
+        cross_request=True,
     ):
         group_entries = self._group_entries.get()
+        cross_request = cross_request and _cross_request_cache.get()
+        if not cross_request and group_entries is None:
+            return compute()
         try:
-            if not self.max_bytes and group_entries is None:
+            if (not cross_request or not self.max_bytes) and group_entries is None:
                 raise Uncacheable("cache disabled")
             if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
                 raise Uncacheable("stateful autoregressive encoding")
@@ -360,7 +372,7 @@ class ConditioningCache:
             key = hashlib.sha256(pickle.dumps(key)).digest()
         except Uncacheable:
             key = None
-        entry = self._entries.get(key)
+        entry = self._entries.get(key) if cross_request else None
         group_entry = group_entries.get(key) if group_entries is not None else None
         hit = (
             group_entry is not None or entry is not None
@@ -415,7 +427,7 @@ class ConditioningCache:
 
             _map_output(output, count)
             self._remember_group(key, output, self._identity(model), share_in_group)
-            if not size or size > self.max_bytes:
+            if not cross_request or not size or size > self.max_bytes:
                 self.bypasses += 1
                 return output
         except Uncacheable:
@@ -481,11 +493,14 @@ class ConditioningCache:
         return output
 
 
-def _inference_cache(model):
+def _inference_cache(model, *, share_in_group=False):
     if torch.compiler.is_compiling():
         return None
     cache = _active_cache.get()
     if cache is None or model.training or torch.is_grad_enabled():
+        return None
+    # FSDP reuses only consumed stage outputs, never sharded intermediate states
+    if not _cross_request_cache.get() and not share_in_group:
         return None
     # graph capture cannot hash or copy CUDA values through host memory
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -503,8 +518,9 @@ def cached_encoder_call(
     namespace=None,
     nested=True,
     share_in_group=False,
+    cross_request=True,
 ):
-    cache = _inference_cache(model)
+    cache = _inference_cache(model, share_in_group=share_in_group)
     if (
         cache is None
         or model is _stage_encoder.get()
@@ -512,6 +528,10 @@ def cached_encoder_call(
         or kwargs.get("past_key_values") is not None
     ):
         return compute()
+
+    if not _cross_request_cache.get() and model_parallel_is_initialized():
+        # the encoder's TP group may not cover its FSDP shard group
+        group = get_world_group()
 
     def compute_conditioning():
         # a stage owns the consumed output; preserve nested vision-method caches
@@ -526,11 +546,12 @@ def cached_encoder_call(
         "forward",
         args,
         kwargs,
-        compute_conditioning if namespace is not None else compute,
+        compute_conditioning if namespace is not None and cross_request else compute,
         group,
         nested=nested,
         namespace=namespace,
         share_in_group=share_in_group,
+        cross_request=cross_request,
     )
 
 
