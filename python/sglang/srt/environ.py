@@ -937,6 +937,10 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # 12-head zero-pad topology (Kimi-K3 TP8) with fp8 KV: run MLA decode/verify
+    # on aiter's fp8-Q persistent asm kernels (mla_a8w8_*_ps) instead of the
+    # Gluon kernel. Off by default.
+    SGLANG_AITER_MLA_A8W8_ASM = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
