@@ -732,6 +732,18 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
     ):
         """Run the exported prepared BF16 prefill; returns (output, checkpoints, schedule)."""
         _, prepare_bf16_kda_prefill = _get_flashinfer_prepared_bf16_prefill()
+        # Upstream forward_extend runs one fused causal conv over the packed qkv
+        # row and hands us ``split(dim=-1)`` views, i.e. [1, T, H, D] tensors whose
+        # token stride is the full qkv width.  The prepared export's TMA
+        # descriptors read dense operands (``q must be contiguous``), so repack
+        # strided inputs here; this is a no-op for already-dense tensors.  Cost
+        # when it fires: one T*H*D BF16 copy per strided operand.
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
         num_v_heads, head_v_dim, head_k_dim = v.shape[2], v.shape[3], q.shape[3]
         self._check_cake_fp32_state_contract(
             ssm_states,
