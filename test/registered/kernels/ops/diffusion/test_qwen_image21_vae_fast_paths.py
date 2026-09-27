@@ -37,10 +37,13 @@ pytestmark = pytest.mark.skipif(
 
 
 def make_vae():
+    # The real latent channel count and 1/9 of the decoder width: every fold
+    # site has K >= 576 like the real decoder, and at a 64x64 latent all of them
+    # produce >= 2**18 output elements, so the first-sight comparisons decide.
     ac = QwenImage21VAEArchConfig(
-        base_dim=8,
-        decoder_base_dim=8,
-        z_dim=4,
+        base_dim=16,
+        decoder_base_dim=16,
+        z_dim=64,
         dim_mult=(1, 2, 4, 4, 4),
         num_res_blocks=1,
         temperal_downsample=(False, False, False, False),
@@ -60,22 +63,23 @@ def make_vae():
     return vae
 
 
-def latent():
-    return torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
+def latent(size=4):
+    return torch.randn(1, 64, 1, size, size, device="cuda", dtype=torch.bfloat16)
 
 
 def modules_of(vae, cls):
     return [m for m in vae.modules() if isinstance(m, cls)]
 
 
-def first_divergence(reference, optimized, z):
-    """Where the optimized decoder first departs from the eager one, and which fast path is responsible.
+def first_divergence(reference, optimized, first_z, z):
+    """Where the optimized decoder first departs from the eager one on ``z``, and which fast path is responsible.
 
     Both models keep the original module names, so hooks on the residual /
     up blocks and the output conv line up one to one (the wrapped norms are
-    skipped: the optimized one includes the SiLU). Then the decode is repeated
-    with one fast-path family disabled at a time on a fresh optimized copy,
-    so a mismatch names its family without an interactive session.
+    skipped: the optimized one includes the SiLU). Then fresh optimized copies
+    take their first sight on ``first_z`` with one fast-path family disabled
+    at a time and decode ``z``, so a mismatch names its family without an
+    interactive session.
     """
     watched = (
         "QwenImage21ResidualBlock",
@@ -132,7 +136,7 @@ def first_divergence(reference, optimized, z):
                     m, vae_opt.FusedChannelRMSNormSiLU
                 ):
                     m._exact_gate.disable()
-            model.decode(z)  # first sight for the remaining families
+            model.decode(first_z)  # first sight for the remaining families
             return torch.equal(model.decode(z), ref_out)
         finally:
             for name, gate in saved.items():
@@ -151,7 +155,8 @@ def first_divergence(reference, optimized, z):
     return (
         "decode "
         + ("equal" if torch.equal(ref_out, opt_out) else "differs")
-        + f"; eager reproducible on this latent: {torch.equal(reference.decode(z), ref_out)}"
+        + f"; eager repeats on this latent: {torch.equal(reference.decode(z), ref_out)}"
+        + f"; optimized repeats on this latent: {torch.equal(optimized.decode(z), opt_out)}"
         + "; first divergent blocks: "
         + ("; ".join(blocks) if blocks else "none")
         + "; "
@@ -193,7 +198,8 @@ def test_lossless_decode_is_bit_identical(module_gates):
     for key, value in optimized.state_dict().items():
         assert torch.equal(value, reference.state_dict()[key])
 
-    z = latent()
+    # 64x64 latent (1024x1024 output): every fold site is above the size floor.
+    z = latent(64)
     expected = reference.decode(z)
     assert torch.equal(reference.decode(z), expected), (
         "the eager decode itself is not reproducible on this platform"
@@ -216,9 +222,9 @@ def test_lossless_decode_is_bit_identical(module_gates):
     assert len(fold_gates) >= 8
     assert all(gate.verified or gate.disabled for gate in fold_gates)
 
-    z.normal_()
-    assert torch.equal(optimized.decode(z), reference.decode(z)), first_divergence(
-        reference, optimized, z
+    z2 = latent(64)
+    assert torch.equal(optimized.decode(z2), reference.decode(z2)), first_divergence(
+        reference, optimized, z, z2
     )
 
 

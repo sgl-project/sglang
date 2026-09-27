@@ -306,7 +306,10 @@ framework-specific optimization workflow.
   `norm(dim=1)` reduction and fuses only the pointwise finish
   (`max(norm, 1e-12)`, divide, scale, gamma, `+0.0`) with SiLU; the causal
   convs fold their symmetric `F.pad` into the conv padding, verified per
-  (dtype, shape, stride) signature because cuDNN may pick another algorithm;
+  (dtype, shape, stride) signature because cuDNN may pick another algorithm
+  (only attempted above 2^18 output elements, where a bit-exact match is
+  decisive; two engines with different accumulation orders agree on all but
+  ~1e-4 of the elements, so small convs keep the padded path);
   aten's separate conv-bias pass disappears for each residual block's second
   conv (`bias_residual_add` applies bias and residual in one pass) and for the
   upsampler conv (`dup_up3d_add` takes the bias on the shortcut add).

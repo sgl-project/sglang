@@ -10,7 +10,10 @@ first sight and disabled on a mismatch:
 - ``FoldedPadConv2d`` folds the symmetric ``F.pad`` that precedes every causal
   conv into the convolution's own padding. cuDNN may pick another algorithm for
   the new descriptor, so the folded conv is compared per input signature and
-  kept only where the result is identical.
+  kept only where the result is identical. The comparison is decisive only on
+  large outputs (two engines with different accumulation orders round to the
+  same bf16 in all but ~1e-4 of the elements), so convs below
+  ``_FOLD_MIN_OUTPUT_ELEMENTS`` keep the padded path, where it costs nothing.
 - Each residual block's second conv runs without its bias and ``bias_residual_add``
   applies bias and residual in one pass with aten's per-op bf16 rounding, so the
   separate bias pass over the conv output disappears. The upsampler conv does the
@@ -72,6 +75,12 @@ _BIAS_RESIDUAL_FUSION = BitExactFusionGate(
 _UPSAMPLE_BIAS_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 VAE upsampler bias + DupUp3D shortcut add"
 )
+# Below this many output elements a bit-exact first-sight match does not prove
+# the folded conv uses the same arithmetic (seen on H100 at a 4x4 test latent:
+# folds matched on the first latent and differed on the next), so the fold is
+# only attempted above it. With this decoder's K >= 576, the expected number of
+# differing elements between two engines is then >= 20.
+_FOLD_MIN_OUTPUT_ELEMENTS = 2**18
 
 
 class FusedChannelRMSNormSiLU(nn.Module):
@@ -172,7 +181,11 @@ class FoldedPadConv2d(nn.Module):
             return self._reference(x, cache_x, with_bias)
         sig = (x.dtype, tuple(x.shape), tuple(x.stride()), with_bias)
         verified = gate.is_verified(sig)
-        if not verified and torch.cuda.is_current_stream_capturing():
+        if not verified and (
+            torch.cuda.is_current_stream_capturing()
+            or x.numel() // x.shape[1] * self.weight.shape[0]
+            < _FOLD_MIN_OUTPUT_ELEMENTS
+        ):
             return self._reference(x, cache_x, with_bias)
 
         def folded_conv() -> torch.Tensor:
