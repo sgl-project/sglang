@@ -11,8 +11,7 @@ it exercises engine paths no other AMD nightly covers. The KDA state pool is a
 second memory pool alongside the paged KV pool, and the mHC pre/post ops sit on
 every layer boundary. A single-arch gate would not be enough: gfx950 takes the
 AITER mHC pre/post kernels, while gfx942 falls back to the generic mHC path.
-This file gates the gfx950 half; the gfx942 half is
-test_glm53_flash_eval_mi30x.py.
+This file gates the gfx950 half.
 
 Measured on current main: 0.9750 (1286/1319) on the rocm10 image, HF snapshot
 eb9eb208eb0d988989d07a6a12d0fdeb5f52574a, with a 312 s weight load, a 473 s
