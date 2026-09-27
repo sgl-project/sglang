@@ -524,19 +524,30 @@ def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(
     # pack_qkv_weights must keep parameter names/values and alias the packed buffer,
     # so a merge-mode LoRA delta written into to_q.weight is what the packed GEMM sees.
     attn = bf16_model_hd128.transformer_blocks[0].attn
-    assert attn.qkv_weight is not None
+    packed = attn.packed_qkv_weight()
+    assert packed is not None
     rows = attn.to_q.weight.shape[0]
-    assert torch.equal(attn.qkv_weight[:rows], attn.to_q.weight)
-    assert torch.equal(attn.qkv_weight[rows : 2 * rows], attn.to_k.weight)
-    assert torch.equal(attn.qkv_weight[2 * rows :], attn.to_v.weight)
+    assert torch.equal(packed[:rows], attn.to_q.weight)
+    assert torch.equal(packed[rows : 2 * rows], attn.to_k.weight)
+    assert torch.equal(packed[2 * rows :], attn.to_v.weight)
     keys = set(bf16_model_hd128.state_dict().keys())
     assert "transformer_blocks.0.attn.to_q.weight" in keys
     assert not any("qkv_weight" in key for key in keys)
-    before = attn.qkv_weight[:rows].clone()
+    before = packed[:rows].clone()
     attn.to_q.weight.add_(1.0)
-    assert torch.equal(attn.qkv_weight[:rows], before + 1.0)
+    assert torch.equal(attn.packed_qkv_weight()[:rows], before + 1.0)
     attn.to_q.weight.sub_(1.0)
-    assert (
-        tuple(layer.weight.data_ptr() for layer in (attn.to_q, attn.to_k, attn.to_v))
-        == attn.qkv_weight_ptrs
+    # An offload round trip must not pin the shared CUDA storage: nothing on the
+    # module keeps a device tensor once the parameters moved, and the shared
+    # views come back with the weights.
+    attn.to("cpu")
+    assert attn.packed_qkv_weight() is None
+    assert not any(
+        isinstance(value, torch.Tensor) and value.is_cuda
+        for value in vars(attn).values()
     )
+    attn.to("cuda")
+    packed = attn.packed_qkv_weight()
+    assert packed is not None
+    assert torch.equal(packed[:rows], attn.to_q.weight)
+    assert torch.equal(packed[2 * rows :], attn.to_v.weight)

@@ -354,20 +354,20 @@ class QwenImage21Attention(nn.Module):
         self.target_attn = USPAttention(
             self.heads, self.head_dim, supported_attention_backends=backends
         )
-        # Set by pack_qkv_weights: one [3C, C] buffer whose row slices are the
-        # to_q/to_k/to_v weights, and the pointers those slices must keep.
-        self.qkv_weight = None
-        self.qkv_weight_ptrs = ()
 
     def pack_qkv_weights(self):
-        """Share one [3C, C] buffer between to_q/to_k/to_v so one GEMM projects all three.
+        """Share one [3C, C] storage between to_q/to_k/to_v so one GEMM projects all three.
 
         The parameters keep their names and shapes (state_dict, LoRA merge and
         weight updates that copy in place all stay valid); only their storage
-        moves. Layers that are not plain bf16 unquantized projections are left
-        alone and the packed path stays off.
+        moves. No reference to the shared storage is kept: ``packed_qkv_weight``
+        re-derives the [3C, C] view from the parameters, so offloading them
+        frees the whole buffer. Layers that are not plain bf16 unquantized
+        projections are left alone and the packed path stays off.
         """
         layers = (self.to_q, self.to_k, self.to_v)
+        if self.packed_qkv_weight() is not None:
+            return
         if not all(
             type(layer) is ColumnParallelLinear
             and isinstance(layer.quant_method, UnquantizedLinearMethod)
@@ -379,15 +379,49 @@ class QwenImage21Attention(nn.Module):
             and layer.weight.shape == self.to_q.weight.shape
             for layer in layers
         ):
-            self.qkv_weight = None
-            self.qkv_weight_ptrs = ()
             return
         packed = torch.cat([layer.weight.data for layer in layers], dim=0)
         rows = self.to_q.weight.shape[0]
         for index, layer in enumerate(layers):
             layer.weight.data = packed[index * rows : (index + 1) * rows]
-        self.qkv_weight = packed
-        self.qkv_weight_ptrs = tuple(layer.weight.data_ptr() for layer in layers)
+
+    def packed_qkv_weight(self):
+        """The [3C, C] view over to_q/to_k/to_v when they are consecutive slices of one storage, else None."""
+        q, k, v = self.to_q.weight, self.to_k.weight, self.to_v.weight
+        rows, cols = q.shape
+        if not (
+            q.is_cuda
+            and q.dtype is torch.bfloat16
+            and k.dtype is q.dtype
+            and v.dtype is q.dtype
+            and k.shape == q.shape
+            and v.shape == q.shape
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+        ):
+            return None
+        base = q.untyped_storage().data_ptr()
+        if not (
+            k.untyped_storage().data_ptr() == base
+            and v.untyped_storage().data_ptr() == base
+        ):
+            return None
+        stride = rows * cols
+        if not (
+            k.storage_offset() == q.storage_offset() + stride
+            and v.storage_offset() == k.storage_offset() + stride
+        ):
+            return None
+        return q.as_strided((3 * rows, cols), (cols, 1))
+
+    def _apply(self, fn, recurse=True):
+        # .to() and CPU offload rebuild every parameter in its own storage;
+        # re-share them once the weights are back on the GPU so the packed
+        # projection survives the round trip (a no-op anywhere else).
+        module = super()._apply(fn, recurse)
+        self.pack_qkv_weights()
+        return module
 
     def project_qkv(self, x):
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
@@ -469,23 +503,22 @@ class QwenImage21Attention(nn.Module):
         call compares every slice against the module forwards.
         """
         layers = (self.to_q, self.to_k, self.to_v)
+        packed = self.packed_qkv_weight()
         if not (
-            self.qkv_weight is not None
+            packed is not None
             and x.shape[0] == 1
             and len(layouts) == 1
             and get_sp_world_size() == 1
             and _QKV_PACK_FUSION.can_attempt_once()
             and all(can_project_into(layer, x) for layer in layers)
-            and tuple(layer.weight.data_ptr() for layer in layers)
-            == self.qkv_weight_ptrs
         ):
             return None
         cache = caches[0]
         prefix = cache["key"].shape[1] if cache else layouts[0]["prefix_rope"].shape[0]
         seq = x.shape[1]
-        rows = self.qkv_weight.shape[0] // 3
+        rows = packed.shape[0] // 3
         buffer = x.new_empty(1, prefix + seq, 3 * rows)
-        torch.mm(x.view(seq, x.shape[-1]), self.qkv_weight.t(), out=buffer[0, prefix:])
+        torch.mm(x.view(seq, x.shape[-1]), packed.t(), out=buffer[0, prefix:])
         q = buffer[:, prefix:, :rows].view(1, seq, self.heads, self.head_dim)
         k_out = buffer[:, :, rows : 2 * rows].view(
             1, prefix + seq, self.heads, self.head_dim
