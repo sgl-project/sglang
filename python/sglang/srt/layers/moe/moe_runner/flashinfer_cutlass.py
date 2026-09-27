@@ -8,7 +8,7 @@ a small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
@@ -30,10 +30,6 @@ from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPLLCombineInput,
-        DeepEPNormalCombineInput,
-    )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -419,119 +415,6 @@ def fused_experts_none_to_flashinfer_cutlass(
         runner_config=runner_config,
     )
     return StandardCombineInput(hidden_states=output)
-
-
-def _run_flashinfer_w4afp8_deepep_ll(
-    dispatch_output: DispatchOutput,
-    quant_info: FlashInferCutlassMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-    x = dispatch_output.hidden_states
-    if x.dtype != torch.bfloat16 or dispatch_output.hidden_states_scale is not None:
-        raise ValueError("FlashInfer W4AFP8 DeepEP low_latency requires BF16 dispatch.")
-    experts = quant_info.w13_weight.shape[0]
-    if quant_info.moe_ep_size <= 1:
-        raise ValueError("FlashInfer W4AFP8 DeepEP requires expert parallel size > 1.")
-    if (
-        x.ndim != 3
-        or x.shape[0] != experts
-        or dispatch_output.masked_m.shape != (experts,)
-    ):
-        raise ValueError(
-            "FlashInfer W4AFP8 requires [local experts, capacity, hidden] DeepEP buffers and one count per expert."
-        )
-    _, capacity, hidden = x.shape
-    # Keep capacity fixed and counts on device so changed routes/counts work
-    # during graph replay. Padding is assigned to a remote expert and skipped.
-    live = (
-        torch.arange(capacity, device=x.device)[None, :]
-        < dispatch_output.masked_m[:, None]
-    )
-    offset = quant_info.moe_ep_rank * experts
-    ids = torch.arange(experts, device=x.device, dtype=torch.int32)[:, None] + offset
-    ids = torch.where(live, ids, 0 if offset else experts).reshape(-1, 1)
-    tokens = torch.where(live[:, :, None], x, 0).reshape(-1, hidden)
-    # Each received row belongs to one expert. Router weights must be applied
-    # only by low_latency_combine, which consumes the original top-k metadata.
-    weights = live.reshape(-1, 1).float()
-    standard = StandardDispatchOutput(
-        tokens, None, StandardTopKOutput(weights, ids, None)
-    )
-    output = _run_flashinfer_w4afp8(
-        standard,
-        quant_info,
-        replace(runner_config, routed_scaling_factor=None),
-        symmetric_output=False,
-    ).reshape_as(x)
-    output.masked_fill_(~live[:, :, None], 0)
-    return DeepEPLLCombineInput(
-        output, dispatch_output.topk_ids, dispatch_output.topk_weights
-    )
-
-
-@register_fused_func("deepep", "flashinfer_cutlass")
-def fused_experts_deepep_to_flashinfer_cutlass(
-    dispatch_output: DispatchOutput,
-    quant_info: MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> DeepEPNormalCombineInput | DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-    if not (
-        isinstance(quant_info, FlashInferCutlassMoeQuantInfo)
-        and quant_info.quant_type == "w4afp8"
-    ):
-        raise ValueError("FlashInfer CUTLASS DeepEP requires native W4AFP8 weights.")
-    if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-        return _run_flashinfer_w4afp8_deepep_ll(
-            dispatch_output, quant_info, runner_config
-        )
-    if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-        raise ValueError("FlashInfer W4AFP8 requires a DeepEP dispatch output.")
-    if quant_info.moe_ep_size <= 1:
-        raise ValueError("FlashInfer W4AFP8 DeepEP requires expert parallel size > 1.")
-    if dispatch_output.hidden_states_scale is not None:
-        raise ValueError("FlashInfer W4AFP8 DeepEP normal requires BF16 dispatch.")
-
-    # DeepEP returns rank-local IDs and -1 for unused slots. Use a valid
-    # remote expert for those slots: FlashInfer skips it on this rank, without
-    # passing negative IDs to its routing kernels or duplicating a local ID.
-    local_experts = quant_info.w13_weight.shape[0]
-    local_ids = dispatch_output.topk_ids
-    valid = (local_ids >= 0) & (local_ids < local_experts)
-    offset = quant_info.moe_ep_rank * local_experts
-    remote_expert = 0 if offset else local_experts
-    global_ids = torch.where(valid, local_ids + offset, remote_expert).to(torch.int32)
-    weights = torch.where(valid, dispatch_output.topk_weights, 0).float()
-    live_rows = valid.any(dim=-1, keepdim=True)
-    hidden_states = dispatch_output.hidden_states
-    if hidden_states.dtype != torch.bfloat16:
-        raise ValueError("FlashInfer W4AFP8 DeepEP normal requires BF16 dispatch.")
-    # Padding rows need not contain initialized activation data.
-    hidden_states = torch.where(live_rows, hidden_states, 0)
-    standard = StandardDispatchOutput(
-        hidden_states, None, StandardTopKOutput(weights, global_ids, None)
-    )
-    # As in native W4AFP8 DeepEP, the model applies routed_scaling_factor
-    # after combine (or fuses it into top-k weights). Only router weights
-    # are applied here; DeepEP normal combine sums the rank contributions.
-    output = _run_flashinfer_w4afp8(
-        standard,
-        quant_info,
-        replace(runner_config, routed_scaling_factor=None),
-        symmetric_output=False,
-    )
-    output.masked_fill_(~live_rows, 0)
-    return DeepEPNormalCombineInput(
-        output, dispatch_output.topk_ids, dispatch_output.topk_weights
-    )
 
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")

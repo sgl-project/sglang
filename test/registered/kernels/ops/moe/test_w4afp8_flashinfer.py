@@ -1,8 +1,9 @@
-"""H200 W4AFP8 adapter checks; no distributed process group is needed here."""
+"""SM90 W4AFP8 adapter and kernel checks without a distributed process group."""
 
 # ruff: noqa: E402
 
 import importlib.util
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,11 +14,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
-
-pytest.importorskip("flashinfer.fused_moe")
-if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
-    pytest.skip("Requires SM90", allow_module_level=True)
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass as runner
@@ -35,6 +32,13 @@ _spec = importlib.util.spec_from_file_location(
 _reference = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_reference)
 pack_int4_values_to_int8 = _reference.pack_int4_values_to_int8
+
+
+@pytest.fixture(autouse=True)
+def require_sm90_flashinfer():
+    pytest.importorskip("flashinfer.fused_moe")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires SM90")
 
 
 def make_layer(ep_size=1, ep_rank=0, hidden=6144, intermediate=None, experts=256):
@@ -284,115 +288,5 @@ def test_empty_input_does_not_launch_kernel():
     assert output.dtype == x.dtype
 
 
-@pytest.mark.parametrize("ep_rank", [0, 3, 7])
-@pytest.mark.parametrize("finalize", [False, True])
-def test_deepep_normal_matches_standard_local_contribution(ep_rank, finalize):
-    from dataclasses import replace
-
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
-
-    methods, _, config = make_layer(8, ep_rank)
-    method, _ = methods[1]
-    x = torch.randn(8, 6144, device="cuda", dtype=torch.bfloat16)
-    local_ids = torch.arange(8, device="cuda").expand(8, 8).clone()
-    local_ids[:, 4:] = -1
-    local_ids[-1] = -1
-    scores = torch.full((8, 8), 0.125, device="cuda")
-    global_ids = torch.where(
-        local_ids >= 0, local_ids + ep_rank * 32, 0 if ep_rank else 32
-    ).int()
-    expected_dispatch = StandardDispatchOutput(
-        x, None, StandardTopKOutput(scores, global_ids, None)
-    )
-    dispatch = DeepEPNormalDispatchOutput(
-        x, None, local_ids, scores, [8] * 4 + [0] * 28
-    )
-    with patch.object(
-        runner.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE, "get", return_value=finalize
-    ):
-        expected = invoke(
-            method, expected_dispatch, replace(config, routed_scaling_factor=None)
-        )
-        with (
-            patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
-            patch.object(runner, "is_allocation_symmetric", return_value=False),
-            patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
-        ):
-            actual = runner.fused_experts_deepep_to_flashinfer_cutlass(
-                dispatch, method.flashinfer_quant_info, config
-            )
-        torch.testing.assert_close(actual.hidden_states, expected, rtol=0, atol=0)
-        assert actual.hidden_states[-1].count_nonzero().item() == 0
-
-
-@pytest.mark.parametrize("ep_rank", [0, 3])
-@pytest.mark.parametrize("finalize", [False, True])
-def test_deepep_low_latency_graph_replay(ep_rank, finalize):
-    from dataclasses import replace
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLDispatchOutput
-
-    methods, _, config = make_layer(8, ep_rank)
-    method, _ = methods[1]
-    x = torch.randn(32, 3, 6144, device="cuda", dtype=torch.bfloat16)
-    counts = torch.zeros(32, device="cuda", dtype=torch.int32)
-    ids = torch.tensor([[ep_rank * 32, ep_rank * 32 + 1]], device="cuda")
-    scores = torch.tensor([[0.25, 0.75]], device="cuda")
-    dispatch = DeepEPLLDispatchOutput(x, None, ids, scores, counts, 1)
-    with (
-        patch.object(
-            runner.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
-            "get",
-            return_value=finalize,
-        ),
-        patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
-        patch.object(runner, "is_allocation_symmetric", return_value=False),
-        patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
-    ):
-
-        def run():
-            return runner.fused_experts_deepep_to_flashinfer_cutlass(
-                dispatch, method.flashinfer_quant_info, config
-            ).hidden_states
-
-        for _ in range(3):
-            run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = run()
-        for first, second in ((3, 1), (0, 0), (1, 2)):
-            counts.zero_()
-            counts[:2].copy_(
-                torch.tensor([first, second], device="cuda", dtype=torch.int32)
-            )
-            x.normal_()
-            live = torch.arange(3, device="cuda")[None, :] < counts[:, None]
-            x.masked_fill_(~live[:, :, None], float("nan"))
-            output.fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            # Independently run only live rows, one expert at a time. DeepEP
-            # combines these unweighted outputs using its original scores.
-            for expert, count in enumerate((first, second)):
-                if count:
-                    standard = StandardDispatchOutput(
-                        x[expert, :count],
-                        None,
-                        StandardTopKOutput(
-                            torch.ones(count, 1, device="cuda"),
-                            torch.full(
-                                (count, 1),
-                                ep_rank * 32 + expert,
-                                device="cuda",
-                                dtype=torch.int32,
-                            ),
-                            None,
-                        ),
-                    )
-                    expected = invoke(
-                        method, standard, replace(config, routed_scaling_factor=None)
-                    )
-                    torch.testing.assert_close(
-                        output[expert, :count], expected, rtol=1e-2, atol=0.1
-                    )
-            assert torch.isfinite(output).all()
-            assert output[~live].count_nonzero().item() == 0
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-x"]))

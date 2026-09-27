@@ -149,12 +149,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self.load_up_proj_weight_first = self.use_flashinfer
         if self.use_flashinfer:
             self._validate_flashinfer_config()
-            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-            if get_moe_a2a_backend().is_deepep() and layer.moe_ep_size <= 1:
-                raise ValueError(
-                    "FlashInfer W4AFP8 DeepEP requires expert parallel size > 1."
-                )
             if params_dtype != torch.bfloat16:
                 raise ValueError("FlashInfer W4AFP8 requires BF16 model activations.")
             if hidden_size % 128 or intermediate_size_per_partition % 128:
@@ -280,13 +274,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.use_flashinfer:
             self._process_flashinfer_weights(layer)
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config(
-                    {
-                        "normal_dispatcher_output_dtype": "bf16",
-                        "low_latency_dispatcher_output_dtype": "bf16",
-                    }
-                )
             return
 
         dtype = torch.bfloat16
@@ -366,16 +353,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         from packaging.version import Version
 
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-        from sglang.srt.runtime_context import get_exec
         from sglang.srt.utils import is_flashinfer_available
 
         a2a = get_moe_a2a_backend()
-        if a2a.is_deepep():
-            if get_exec().moe.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
-                raise ValueError("FlashInfer W4AFP8 DeepEP requires BF16 dispatch.")
-        elif not a2a.is_none():
+        if not a2a.is_none():
             raise ValueError(
-                "FlashInfer W4AFP8 supports A2A backends none or deepep only."
+                "FlashInfer W4AFP8 supports only --moe-a2a-backend none. "
+                "For DeepEP, use --moe-runner-backend cutlass."
             )
         if (
             self.quant_config.group_size != 128
