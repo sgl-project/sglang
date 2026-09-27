@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
+    init_dcp_pack_buffers,
 )
 from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
@@ -218,7 +219,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             return SimpleNamespace(get_ptr=lambda: 0x1000, get_size=lambda: size)
 
         with (
-            get_context().override_server_args(chunked_prefill_size=250),
+            get_context().override_server_args(chunked_prefill_size=250, device="cuda"),
             patch(
                 "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
                 return_value=(None, None),
@@ -314,6 +315,46 @@ class TestDcpPackBufferBytes(CustomTestCase):
             dcp_pack_buffer_bytes([100], page_size=64, max_tokens=8)
 
 
+class TestInitDcpPackBuffers(CustomTestCase):
+    """The pack kernel is Triton-only: a non-CUDA device must get no buffers
+    (per-token fallback) rather than crash, and an indexed "cuda:N" device must
+    still get them, not silently fall back."""
+
+    _KV_ARGS = SimpleNamespace(
+        kv_item_lens=[64 * 16], page_size=64, num_draft_entries=0, gpu_id=3
+    )
+
+    def test_non_triton_device_gets_no_buffers(self):
+        register_fn = Mock()
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+        ) as staging_buffer:
+            buffers = init_dcp_pack_buffers(
+                register_fn, self._KV_ARGS, 2, 4, 64, device_type="xpu"
+            )
+
+        self.assertEqual(buffers, [])
+        staging_buffer.assert_not_called()
+        register_fn.assert_not_called()
+
+    def test_cuda_buffers_use_the_bare_device_type_and_gpu_id(self):
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+            ) as staging_buffer,
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
+                return_value=(None, None),
+            ),
+        ):
+            buffers = init_dcp_pack_buffers(
+                Mock(), self._KV_ARGS, 2, 4, 64, device_type="cuda:0"
+            )
+
+        self.assertEqual(len(buffers), 2)
+        self.assertEqual(staging_buffer.call_args.args[1], "cuda:3")
+
+
 class TestTryDcpPack(CustomTestCase):
     def test_try_pack_uses_requested_region_and_dense_indices(self):
         """A gather must fit its rank region even when the total buffer has space."""
@@ -331,6 +372,7 @@ class TestTryDcpPack(CustomTestCase):
                 "get_ptr": lambda self: 0x1000,
                 "get_size": lambda self: pack.numel(),
                 "get_gather_stream": lambda self: gather_stream,
+                "producer_stream": lambda self: Mock(),
             },
         )()
         src = np.array([1, 5, 9, 13], dtype=np.int64)
@@ -342,10 +384,7 @@ class TestTryDcpPack(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"
-            ),
-            patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.stream",
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
                 return_value=nullcontext(),
             ),
             patch(

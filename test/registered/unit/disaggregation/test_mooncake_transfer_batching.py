@@ -516,5 +516,57 @@ class TestMooncakeEarlySendWaitEvent(unittest.TestCase):
         self.assertIs(queue.put.call_args.args[0].wait_event, event)
 
 
+class TestMooncakeStagingDeviceType(unittest.TestCase):
+    """Staging init must receive the runtime's device, not a hardcoded "cuda".
+
+    device_type is keyword-only with no default, so dropping it raises. The
+    silent failure mode is a literal: it works on a CUDA host and allocates
+    staging on the wrong device for every other accelerator.
+    """
+
+    @staticmethod
+    def _manager():
+        return SimpleNamespace(
+            kv_args=SimpleNamespace(gpu_id=3),
+            _staging_ctx=SimpleNamespace(buffers=None, allocator=None),
+            kv_buffer_tensors=MagicMock(),
+            _register_staging_memory=MagicMock(),
+        )
+
+    def test_prefill_staging_buffers_get_the_runtime_device(self):
+        manager = self._manager()
+        with (
+            patch(
+                "sglang.srt.disaggregation.mooncake.conn.get_device",
+                return_value=SimpleNamespace(device="xpu"),
+            ),
+            patch(
+                "sglang.srt.disaggregation.mooncake.conn.get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=2048),
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler.init_staging_buffers"
+            ) as init_buffers,
+        ):
+            MooncakeKVManager._init_staging_buffers(manager, 2)
+
+        self.assertEqual(init_buffers.call_args.kwargs["device_type"], "xpu")
+
+    def test_decode_staging_allocator_gets_the_runtime_device(self):
+        manager = self._manager()
+        with (
+            patch(
+                "sglang.srt.disaggregation.mooncake.conn.get_device",
+                return_value=SimpleNamespace(device="xpu"),
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler.init_staging_allocator"
+            ) as init_allocator,
+        ):
+            MooncakeKVManager._init_staging_allocator(manager)
+
+        self.assertEqual(init_allocator.call_args.kwargs["device_type"], "xpu")
+
+
 if __name__ == "__main__":
     unittest.main()

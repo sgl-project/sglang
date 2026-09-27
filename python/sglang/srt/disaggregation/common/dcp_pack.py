@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+from sglang.srt.utils import device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,8 @@ def try_pack_dcp_src(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
     gather_stream = pack_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(pack.device))
-    with torch.cuda.stream(gather_stream):
+    gather_stream.wait_stream(pack_buffer.producer_stream())
+    with device_stream_context(gather_stream):
         copy_mla_rows_into_pack(
             kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
         )
@@ -97,11 +98,23 @@ def init_dcp_pack_buffers(
     dcp_size: int,
     max_tokens: int,
     *,
+    device_type: str,
     include_draft: bool = False,
 ) -> List[StagingBuffer]:
+    from sglang.srt.disaggregation.common.staging_buffer import (
+        _TRITON_STAGING_DEVICE_TYPES,
+    )
     from sglang.srt.disaggregation.common.staging_handler import (
+        _bare_device_type,
         _get_custom_mem_pool,
     )
+
+    device_type = _bare_device_type(device_type)
+    # copy_mla_rows_into_pack is Triton-only, for the reason recorded on
+    # _TRITON_STAGING_DEVICE_TYPES; no buffers routes callers to per-token RDMA.
+    if device_type not in _TRITON_STAGING_DEVICE_TYPES:
+        logger.info("PD DCP pack disabled on %s; using per-token transfer", device_type)
+        return []
 
     kv_item_lens = kv_args.kv_item_lens
     if not include_draft and kv_args.num_draft_entries:
@@ -113,7 +126,7 @@ def init_dcp_pack_buffers(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{device_type}:{gpu_id}"
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []

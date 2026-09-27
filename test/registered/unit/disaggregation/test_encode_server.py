@@ -1510,8 +1510,7 @@ class TestEncoderDelivery(CustomTestCase):
             shape = (2, 4)
             dtype = torch.float16
             nbytes = 16
-            is_cuda = True
-            device = "cuda:0"
+            device = torch.device("cuda:0")
 
             def __getitem__(self, key):
                 return self
@@ -1535,7 +1534,10 @@ class TestEncoderDelivery(CustomTestCase):
         )
         stream = SimpleNamespace(synchronize=lambda: events.append("sync"))
 
-        with patch.object(torch.cuda, "current_stream", return_value=stream):
+        with patch(
+            "sglang.srt.disaggregation.encoder.server.current_device_stream",
+            return_value=stream,
+        ):
             encoder._stage_embeddings(
                 ctx,
                 [{"req_id": "req", "num_parts": 1, "part_idx": 0}],

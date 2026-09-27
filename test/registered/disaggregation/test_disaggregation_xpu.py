@@ -1,18 +1,28 @@
 """
-Disaggregation integration test for the NIXL transfer backend on Intel XPU.
+Disaggregation integration tests for the NIXL and Mooncake transfer backends on
+Intel XPU.
 
-Launches a prefill server, a decode server, and a load-balancer using the
-NIXL KV-transfer backend, then verifies that basic text completion works
-end-to-end.  This exercises the np.uint64 pointer-arithmetic fix in
-python/sglang/srt/disaggregation/nixl/conn.py, which is required on
-Intel XPU where device addresses have bit 63 set (e.g. 0xffff81ab54e01000)
-and would overflow np.int64.
+Launches a prefill server, a decode server, and a load-balancer, then verifies
+that basic text completion works end-to-end.
+
+NIXL: exercises the np.uint64 pointer-arithmetic fix in
+python/sglang/srt/disaggregation/nixl/conn.py, which is required on Intel XPU
+where device addresses have bit 63 set (e.g. 0xffff81ab54e01000) and would
+overflow np.int64.
+
+Mooncake: runs on the TENT engine (MC_USE_TENT=1), whose XPU platform stages
+device memory through host DRAM, over the TCP transport so no RDMA NIC is
+needed.
+
+Requirements:
+    The ``sglang-router`` package and a mooncake-transfer-engine built with
+    -DUSE_XPU=ON -DUSE_TENT=ON (both installed by docker/xpu.Dockerfile). The
+    NIXL classes are skipped until NIXL and UCX support XPU memory.
 
 Usage:
     python3 -m pytest test/registered/disaggregation/test_disaggregation_xpu.py -v
 """
 
-import subprocess
 import unittest
 
 import requests
@@ -24,35 +34,65 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_xpu_ci(
-    est_time=300,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="XPU CI image does not include an XPU-compatible NIXL/UCX build",
-)
+register_xpu_ci(est_time=300, suite="nightly-xpu-2-gpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
-
-
-@unittest.skipUnless(
-    _XPU_AVAILABLE, "Intel XPU not available (torch.xpu.is_available() returned False)"
+# PD disaggregation needs two devices: the fixture puts decode on
+# decode_base_gpu_id=1 while prefill holds device 0.
+_XPU_DEVICE_COUNT = torch.xpu.device_count() if _XPU_AVAILABLE else 0
+_SKIP_REASON = (
+    "Intel XPU not available (torch.xpu.is_available() returned False)"
+    if not _XPU_AVAILABLE
+    else f"PD disaggregation needs 2 XPUs, found {_XPU_DEVICE_COUNT}"
 )
-class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
-    """Smoke-test the NIXL disaggregation backend with a small completion."""
+
+# UCX treats SYCL device allocations as host memory, so NIXL cannot register
+# XPU KV buffers. Drop once both upstream PRs are in the XPU CI image.
+_NIXL_XPU_SKIP = (
+    "NIXL on XPU needs https://github.com/ai-dynamo/nixl/pull/1536 and "
+    "https://github.com/openucx/ucx/pull/11218"
+)
+
+# The XPU CI image gets Mooncake from docker/xpu.Dockerfile; skip, not fail,
+# on an image built before that step landed.
+try:
+    import mooncake.engine  # noqa: F401
+
+    _MOONCAKE_AVAILABLE = True
+except ImportError:
+    _MOONCAKE_AVAILABLE = False
+_MOONCAKE_SKIP = "mooncake transfer engine not installed"
+
+# XPU support lives in Mooncake's TENT engine. With no RDMA NIC, TCP carries
+# the host-staged bytes between prefill and decode.
+_MOONCAKE_XPU_ENV = {
+    "MC_USE_TENT": "1",
+    "MOONCAKE_PROTOCOL": "tcp",
+}
+
+
+class _DisaggregationXpuTestMixin:
+    """Backend-agnostic completion checks; subclasses pick the backend."""
+
+    transfer_backend_name: str
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
-        # Force the NIXL backend and XPU device.
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+        cls.transfer_backend = [
+            "--disaggregation-transfer-backend",
+            cls.transfer_backend_name,
+        ]
         cls.rdma_devices = []
         cls.extra_prefill_args = ["--device", "xpu"]
-        cls.extra_decode_args = ["--device", "xpu"]
-        subprocess.check_call(
-            ["pip", "install", "sglang-router"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # host_pool retraction backup calls cudaHostRegister, which is CUDA-only.
+        cls.extra_decode_args = [
+            "--device",
+            "xpu",
+            "--disaggregation-decode-retraction-backup",
+            "cpu_tensor",
+        ]
         cls.launch_all()
 
     def test_completion_returns_text(self):
@@ -74,7 +114,7 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
         )
 
     def test_completion_correct_output(self):
-        """Disaggregated NIXL output must produce the expected token for a deterministic prompt."""
+        """Disaggregated output must produce the expected token for a deterministic prompt."""
         response = requests.post(
             self.lb_url + "/generate",
             json={
@@ -84,8 +124,29 @@ class TestDisaggregationNixlBasic(PDDisaggregationServerBase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         generated = response.json()["text"]
-        # The model should produce "2" somewhere in the first few tokens.
         self.assertIn("2", generated, f"Expected '2' in output, got: {generated!r}")
+
+
+@unittest.skip(_NIXL_XPU_SKIP)
+@unittest.skipUnless(_XPU_DEVICE_COUNT >= 2, _SKIP_REASON)
+class TestDisaggregationNixlBasic(
+    _DisaggregationXpuTestMixin, PDDisaggregationServerBase
+):
+    """Smoke-test the NIXL disaggregation backend with a small completion."""
+
+    transfer_backend_name = "nixl"
+
+
+@unittest.skipUnless(_MOONCAKE_AVAILABLE, _MOONCAKE_SKIP)
+@unittest.skipUnless(_XPU_DEVICE_COUNT >= 2, _SKIP_REASON)
+class TestDisaggregationMooncakeBasic(
+    _DisaggregationXpuTestMixin, PDDisaggregationServerBase
+):
+    """Smoke-test the Mooncake disaggregation backend with a small completion."""
+
+    transfer_backend_name = "mooncake"
+    extra_prefill_env = _MOONCAKE_XPU_ENV
+    extra_decode_env = _MOONCAKE_XPU_ENV
 
 
 if __name__ == "__main__":
