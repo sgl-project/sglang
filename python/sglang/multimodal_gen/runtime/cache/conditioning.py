@@ -71,6 +71,16 @@ class Uncacheable(TypeError):
 
 
 @contextmanager
+def conditioning_cache_group(*, enabled):
+    cache = _active_cache.get()
+    if cache is None:
+        yield
+    else:
+        with cache.group_scope(enabled=enabled):
+            yield
+
+
+@contextmanager
 def prefer_conditioning_cache():
     # retain reusable negative conditioning ahead of changing positive prompts
     token = _prefer_cache.set(True)

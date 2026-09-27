@@ -12,7 +12,10 @@ from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
-from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    ConditioningCache,
+    conditioning_cache_group,
+)
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -127,7 +130,7 @@ class PipelineExecutor(ABC):
         self.before_stage(stage, stage_index, payload, server_args)
         with maybe_record_function(f"STAGE {stage_name}"):
             with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-                with self.conditioning_cache.group_scope(
+                with conditioning_cache_group(
                     enabled=(isinstance(payload, list) and len(payload) > 1)
                     or (isinstance(payload, Req) and payload.batch_size > 1)
                 ):
