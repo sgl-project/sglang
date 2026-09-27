@@ -128,8 +128,108 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
+    def ensure_provisional_mapping(self, key, old_kv_len, logical_ids, reserved_rows):
+        """Own separate whole page64 arena; re-arm retained logical reservations.
+
+        The caller retains logical page ownership, including rejected tail rows.
+        No continuation from last_loc is used: its mapping may legitimately be 0.
+        """
+        from sglang.srt.mem_cache.hisparse_spec_state import (
+            ProvisionalArena,
+            rounded_rows,
+        )
+
+        if self.page_size != 64:
+            raise ValueError("speculative HiSparse requires page64")
+        logical_ids = tuple(logical_ids)
+        count = rounded_rows(reserved_rows)
+        mapping = self.full_to_hisparse_device_index_mapping
+        if (
+            not logical_ids
+            or len(logical_ids) > reserved_rows
+            or len(set(logical_ids)) != len(logical_ids)
+            or any(
+                type(i) is not int or not 64 <= i < len(mapping) - 1
+                for i in logical_ids
+            )
+        ):
+            raise ValueError("invalid speculative logical write IDs")
+        owned = getattr(self, "_provisional_arenas", {})
+        if key in owned:
+            raise ValueError("transaction already owns an arena")
+        logical = torch.tensor(logical_ids, dtype=torch.int64, device=self.device)
+        if torch.any(mapping[logical] != 0).item():
+            raise ValueError("provisional writes overlap existing residency")
+        rows = self.hisparse_attn_allocator.alloc(count)
+        if rows is None:
+            raise MemoryError("provisional physical page allocation failed")
+        pages = torch.unique(rows // 64)
+        try:
+            arena = ProvisionalArena(
+                key,
+                reserved_rows,
+                tuple(pages.tolist()),
+                tuple(
+                    zip(
+                        range(old_kv_len, old_kv_len + len(logical_ids)),
+                        rows[: len(logical_ids)].tolist(),
+                    )
+                ),
+            )
+            mapping[logical] = rows[: len(logical_ids)]
+        except Exception:
+            mapping[logical] = 0
+            self.hisparse_attn_allocator.free_page_ids(pages)
+            raise
+        owned[key] = (arena, logical_ids)
+        self._provisional_arenas = owned
+        return arena
+
+    def validate_provisional_mapping(self, arena, logical_ids):
+        owned = getattr(self, "_provisional_arenas", {}).get(arena.key)
+        if owned is None or owned[0] is not arena or owned[1] != tuple(logical_ids):
+            raise ValueError("stale or unowned provisional arena")
+        logical = torch.tensor(logical_ids, dtype=torch.int64, device=self.device)
+        expected = torch.tensor(
+            [slot for _, slot in arena.position_slots],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if not torch.equal(
+            self.full_to_hisparse_device_index_mapping[logical], expected
+        ):
+            raise ValueError("provisional logical mapping changed while live")
+
+    def retire_provisional_mapping(self, arena, logical_ids):
+        """Called only after every copy/reader fence; never frees logical pages."""
+        self.validate_provisional_mapping(arena, logical_ids)
+        mapping = self.full_to_hisparse_device_index_mapping
+        pages = torch.tensor(arena.page_ids, dtype=torch.int64, device=self.device)
+        logical = torch.tensor(logical_ids, dtype=torch.int64, device=self.device)
+        # This eager audit detects unauthorized aliases, including arena padding.
+        # Preserve ownership on corruption instead of freeing someone else's map.
+        aliases = torch.nonzero(torch.isin(mapping // 64, pages)).flatten()
+        if not torch.equal(torch.sort(aliases).values, torch.sort(logical).values):
+            raise ValueError("unexpected mapping aliases into provisional arena")
+        mapping[logical] = 0
+        self.hisparse_attn_allocator.free_page_ids(pages)
+        del self._provisional_arenas[arena.key]
+
+    def _guard_provisional_pages(self, physical_ids):
+        pages = {
+            page
+            for arena, _ in getattr(self, "_provisional_arenas", {}).values()
+            for page in arena.page_ids
+        }
+        if pages and any(page in pages for page in (physical_ids // 64).tolist()):
+            raise ValueError("live provisional pages require fenced retirement")
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
+        if getattr(self, "_provisional_arenas", None):
+            self._guard_provisional_pages(
+                self.full_to_hisparse_device_index_mapping[allocated_indices]
+            )
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
@@ -165,6 +265,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
+        self._guard_provisional_pages(buffer_indices)
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
@@ -239,6 +340,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
 
     def clear(self):
+        if getattr(self, "_provisional_arenas", {}):
+            raise ValueError("drain speculative transactions before allocator clear")
+        self._provisional_arenas = {}
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
         # Keep the trailing -1: it is what a last_loc of -1 translates to.
@@ -255,6 +359,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        live_logical_pages = {
+            logical_id // self.page_size
+            for _, logical_ids in getattr(self, "_provisional_arenas", {}).values()
+            for logical_id in logical_ids
+        }
+        if live_logical_pages and any(
+            page in live_logical_pages
+            for page in (free_index // self.page_size).tolist()
+        ):
+            raise ValueError("live speculative logical pages remain scheduler-owned")
+        if getattr(self, "_provisional_arenas", None):
+            self._guard_provisional_pages(
+                self.full_to_hisparse_device_index_mapping[free_index]
+            )
         self.logical_attn_allocator.free(free_index)
         self.free_hisparse(free_index)
         assert (
