@@ -58,8 +58,7 @@ class PureSWARadixCache(RadixCache):
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def insert_req(self, req: Req, *, up_to: int):
-        """Insert only the prefill portion [0, evict_floor); the span
-        _evict_swa already freed during decode is skipped by free_kv_row."""
+        """Insert only the prefill portion [0, swa_evict_floor)."""
         if self.disable:
             return
         token_ids = (req.origin_input_ids + req.output_ids)[:up_to]

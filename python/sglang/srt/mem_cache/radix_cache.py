@@ -523,10 +523,9 @@ class RadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        # The cache_protected_len is not always equal to len(req.prefix_indices)
-        # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
-        # It should be freed in the next cache_unfinished_req or by release_kv_cache to avoid memory leak.
-        # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
+        # With page_size > 1 the partial page sits in req.prefix_indices but not
+        # in the tree; cache_protected_len marks the tree-owned part so the next
+        # cache_unfinished_req or release_kv_cache frees the rest.
         req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)

@@ -593,8 +593,7 @@ def bench_lock_unlock(
 
 
 def _finish_req(cache, req, up_to):
-    """What release_kv_cache does after the row is known to be the request's:
-    insert, free the rest of the owned span, drop the lock."""
+    """insert_req, then what release_kv_cache does after it: free the rest, drop the lock."""
     cache.insert_req(req, up_to=up_to)
     cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
     cache.unpin(req)
