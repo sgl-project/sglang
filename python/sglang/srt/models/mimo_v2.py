@@ -80,7 +80,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
