@@ -8,7 +8,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.deep_select import is_deepselect_supported, topk
+from sglang.kernels.ops.attention.deep_select import is_deepselect_supported, topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")

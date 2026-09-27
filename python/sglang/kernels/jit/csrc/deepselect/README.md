@@ -5,7 +5,7 @@
 to the kernel implementation. MIT licensed; see `vendor/LICENSE`.
 
 `entry.cuh` is the SGLang side: tensor validation, the `TopkSelectArgs` block,
-and the two host entry points the JIT exports. `python/sglang/kernels/ops/deep_select.py`
+and the two host entry points the JIT exports. `python/sglang/kernels/ops/attention/deep_select.py`
 is the wrapper that compiles and calls them.
 
 ## What is vendored
