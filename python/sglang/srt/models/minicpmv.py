@@ -24,7 +24,7 @@
 import re
 import types
 from array import array
-from functools import partial
+from functools import partial, wraps
 from itertools import chain, groupby
 from typing import (
     Any,
@@ -1348,6 +1348,13 @@ class MiniCPMV4_5(MiniCPMBaseModel):
             data_start_token_ids=[im_start_id],
         )
 
+        return pad_mm_token_pairs(
+            input_ids,
+            image_inputs,
+            data_token_pairs=media_token_pairs,
+            data_start_token_ids=[im_start_id],
+        )
+
     def eval(self):
         super().eval()
         return self
@@ -1769,8 +1776,25 @@ class MiniCPMV:
 
     def __getattr__(self, name):
         if name == "minicpmv":
-            return None
-        return getattr(self.minicpmv, name)
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+        attr = getattr(self.minicpmv, name)
+        # nn.Module instances are callable (via __call__) but must pass
+        # through unwrapped so attribute access like model.llm stays a module.
+        if callable(attr) and not isinstance(attr, nn.Module):
+
+            @wraps(attr)
+            def wrapper(*args, **kwargs):
+                result = attr(*args, **kwargs)
+                # Methods like eval()/train()/to() return ``self.minicpmv``;
+                # rewrite the result so chaining stays on the wrapper.
+                if result is self.minicpmv:
+                    return self
+                return result
+
+            return wrapper
+        return attr
 
     def __call__(self, *args, **kwargs):
         return self.minicpmv(*args, **kwargs)
