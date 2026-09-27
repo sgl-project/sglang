@@ -2474,7 +2474,7 @@ def _complete_backup(core, node, full_offset=1000, aux_offset=1000):
     return full + full_offset, aux
 
 
-def _swa_mamba_cache(backend, window):
+def _swa_mamba_cache(backend, window, enable_session=False):
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -2494,6 +2494,7 @@ def _swa_mamba_cache(backend, window):
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
                 sliding_window_size=window,
+                enable_session_radix_cache=enable_session,
                 tree_components=(
                     ComponentType.FULL,
                     ComponentType.SWA,
@@ -2505,10 +2506,15 @@ def _swa_mamba_cache(backend, window):
 
 
 def _internal_swa_write_back_case(
-    backend, page_size=1, window=8, with_mamba=False, prefix_nodes=1
+    backend,
+    page_size=1,
+    window=8,
+    with_mamba=False,
+    prefix_nodes=1,
+    enable_session=False,
 ):
     cache, allocator = (
-        _swa_mamba_cache(backend, window)
+        _swa_mamba_cache(backend, window, enable_session)
         if with_mamba
         else _swa_cache(window=window, page_size=page_size, backend=backend)
     )
@@ -2671,6 +2677,15 @@ def test_internal_swa_write_back_preserves_window_until_ack(
             core.get_component_device_value(parent, ComponentType.SWA),
             case.swa[parent],
         )
+        if backup == "ack_raised":
+            cache._finish_write_through_ack(parent)
+        # The driver's finally block must discard the paused walk even when
+        # submission or completion fails, so a new eviction can make progress.
+        _mock_swa_write_back_io(case)
+        assert cache.evict(params).swa_num_tokens_evicted == case.segment
+        assert core.get_component_device_value(parent, ComponentType.SWA) is None
+        cache.dec_lock_ref(leaf, case.leaf_lock)
+        core.sanity_check([], [])
         return
 
     result = cache.evict(params)
@@ -2812,6 +2827,322 @@ def test_internal_swa_write_back_follows_runtime_policy_update(backend):
     assert core.component_has_host_value_only(case.nodes[0], ComponentType.SWA)
     cache.write_backup_storage.assert_called_once_with(case.nodes[0])
     cache.dec_lock_ref(case.nodes[-1], case.leaf_lock)
+    core.sanity_check([], [])
+
+
+def _internal_eviction_phase_case(backend, component, enable_session=False):
+    case = _internal_swa_write_back_case(
+        backend, with_mamba=True, enable_session=enable_session
+    )
+    _mock_swa_write_back_io(case)
+    case.cache.components[ComponentType.MAMBA]._mamba_pool_host = Mock()
+    case.request = case.segment if component == ComponentType.SWA else 1
+    case.finish = (
+        case.core.finish_swa_state_eviction
+        if component == ComponentType.SWA
+        else case.core.finish_mamba_state_eviction
+    )
+    return case
+
+
+def _assert_internal_eviction_pending(step, component, node, swa_tokens=0):
+    assert step.node_id is None and step.made_progress
+    assert step.mamba_backup_node_id == (
+        node if component == ComponentType.MAMBA else None
+    )
+    assert step.swa_backup_node_id == (node if component == ComponentType.SWA else None)
+    assert step.swa_backup_num_tokens == swa_tokens
+    assert not step.tracker and not step.device_frees and not step.host_frees
+    assert step.unbacked_tokens == 0
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_internal_eviction_returns_backup_before_mutating_state(backend, component):
+    case = _internal_eviction_phase_case(backend, component)
+    cache, core = case.cache, case.core
+    parent, leaf = case.nodes
+    original = {
+        ct: core.get_component_device_value(parent, ct).clone()
+        for ct in cache.tree_components
+    }
+    before = {ct: core.component_evictable_size(ct) for ct in cache.tree_components}
+    tracker, freed, host_freed = {}, {}, {}
+    core.evict_device_start(component, case.request)
+    try:
+        step = core.evict_device_next_node(component, {})
+        _assert_internal_eviction_pending(
+            step,
+            component,
+            parent,
+            case.segment if component == ComponentType.SWA else 0,
+        )
+        assert not case.events
+        for ct, value in original.items():
+            assert torch.equal(core.get_component_device_value(parent, ct), value)
+            assert core.component_evictable_size(ct) == before[ct]
+
+        # Publish a completed backup through the same planner and ACK methods
+        # used by the controller, then consume exactly one mutation's deltas.
+        _complete_backup(core, parent)
+        result = case.finish(parent)
+        assert result.node_id is None and result.made_progress
+        assert result.mamba_backup_node_id is None
+        assert result.swa_backup_node_id is None and result.swa_backup_num_tokens == 0
+        assert result.unbacked_tokens == 0
+        _accumulate_step(result, tracker, freed, host_freed)
+        expected = {ComponentType.MAMBA: 1}
+        if component == ComponentType.SWA:
+            expected[ComponentType.SWA] = case.segment
+        assert tracker == expected and not host_freed
+        for ct, count in expected.items():
+            assert torch.equal(torch.cat(freed[ct]), original[ct])
+            assert core.get_component_device_value(parent, ct) is None
+            assert core.component_evictable_size(ct) == before[ct] - count
+            assert core.component_has_host_value_only(parent, ct)
+        assert torch.equal(
+            core.get_component_device_value(parent, ComponentType.FULL),
+            original[ComponentType.FULL],
+        )
+        exhausted = core.evict_device_next_node(component, tracker)
+        assert not exhausted.made_progress and exhausted.node_id is None
+        assert not exhausted.tracker and not exhausted.device_frees
+    finally:
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+@pytest.mark.parametrize("violation", ["advance", "wrong_node"])
+def test_internal_eviction_rejects_unfinished_or_mismatched_steps(
+    backend, component, violation
+):
+    case = _internal_eviction_phase_case(backend, component)
+    parent, leaf = case.nodes
+    case.core.evict_device_start(component, case.request)
+    step = case.core.evict_device_next_node(component, {})
+    _assert_internal_eviction_pending(
+        step,
+        component,
+        parent,
+        case.segment if component == ComponentType.SWA else 0,
+    )
+    # A native protocol violation poisons this fresh core. Both implementations
+    # must expose an ordinary exception before attempting another mutation.
+    with pytest.raises((AssertionError, RuntimeError), match="pending internal"):
+        if violation == "advance":
+            case.core.evict_device_next_node(component, {})
+        else:
+            case.finish(leaf)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_internal_eviction_finish_rechecks_a_new_request_lock(backend, component):
+    case = _internal_eviction_phase_case(backend, component)
+    cache, core = case.cache, case.core
+    parent, leaf = case.nodes
+    original = core.get_component_device_value(parent, component).clone()
+    core.evict_device_start(component, case.request)
+    step = core.evict_device_next_node(component, {})
+    _assert_internal_eviction_pending(
+        step,
+        component,
+        parent,
+        case.segment if component == ComponentType.SWA else 0,
+    )
+    parent_lock = cache.inc_lock_ref(parent).to_dec_params()
+    result = case.finish(parent)
+    assert result.made_progress and result.node_id is None
+    assert not result.tracker and not result.device_frees and not result.host_frees
+    assert torch.equal(core.get_component_device_value(parent, component), original)
+    cache.dec_lock_ref(parent, parent_lock)
+    core.evict_device_end(component)
+
+    core.evict_device_start(component, case.request)
+    try:
+        step = core.evict_device_next_node(component, {})
+        _assert_internal_eviction_pending(
+            step,
+            component,
+            parent,
+            case.segment if component == ComponentType.SWA else 0,
+        )
+        tracker, freed = {}, {}
+        _accumulate_step(case.finish(parent), tracker, freed, {})
+        assert tracker[component] == case.request
+        assert torch.equal(torch.cat(freed[component]), original)
+    finally:
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+@pytest.mark.parametrize("cleanup", ["end", "reset"])
+def test_internal_eviction_cleanup_discards_the_pending_request(
+    backend, component, cleanup
+):
+    case = _internal_eviction_phase_case(backend, component)
+    cache, core = case.cache, case.core
+    parent, leaf = case.nodes
+    core.evict_device_start(component, case.request)
+    step = core.evict_device_next_node(component, {})
+    _assert_internal_eviction_pending(
+        step,
+        component,
+        parent,
+        case.segment if component == ComponentType.SWA else 0,
+    )
+    if cleanup == "reset":
+        core.reset()
+    else:
+        core.evict_device_end(component)
+        assert torch.equal(
+            core.get_component_device_value(parent, ComponentType.SWA),
+            case.swa[parent],
+        )
+    core.evict_device_start(component, case.request)
+    try:
+        step = core.evict_device_next_node(component, {})
+        if cleanup == "reset":
+            assert not step.made_progress and step.node_id is None
+            assert step.mamba_backup_node_id is None and step.swa_backup_node_id is None
+            assert all(
+                core.component_evictable_size(ct) == 0 for ct in cache.tree_components
+            )
+        else:
+            _assert_internal_eviction_pending(
+                step,
+                component,
+                parent,
+                case.segment if component == ComponentType.SWA else 0,
+            )
+            tracker = {}
+            _accumulate_step(case.finish(parent), tracker, {}, {})
+            assert tracker[component] == case.request
+    finally:
+        core.evict_device_end(component)
+    if cleanup != "reset":
+        cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_python_session_internal_eviction_resumes_in_partition_order(component):
+    case = _internal_swa_write_back_case(
+        "python", with_mamba=True, prefix_nodes=3, enable_session=True
+    )
+    cache, core = case.cache, case.core
+    assert cache._tree_core_backend == "python" and core.enable_session_radix_cache
+    first, second, third, leaf = case.nodes
+    comp = cache.components[component]
+    comp.register_session_leaf("retained", core.node_by_id(first))
+    assert comp.session_ref(core.node_by_id(first)) == 1
+    finish = (
+        core.finish_mamba_state_eviction
+        if component == ComponentType.MAMBA
+        else core.finish_swa_state_eviction
+    )
+    tracker = {}
+    request = 3 if component == ComponentType.MAMBA else 3 * case.segment
+    core.evict_device_start(component, request)
+    try:
+        # The referenced oldest prefix comes after both unreferenced prefixes.
+        # Each finish removes the current node before the sentinel moves on.
+        for victim, window_tokens in ((second, 4), (third, 2), (first, 2)):
+            step = core.evict_device_next_node(component, tracker)
+            _assert_internal_eviction_pending(
+                step,
+                component,
+                victim,
+                window_tokens if component == ComponentType.SWA else 0,
+            )
+            _accumulate_step(finish(victim), tracker, {}, {})
+        assert tracker[component] == request
+        assert not core.evict_device_next_node(component, tracker).made_progress
+    finally:
+        core.evict_device_end(component)
+    # The Full node still exists, so its session frontier remains registered
+    # across an auxiliary tombstone until the session itself is released.
+    assert comp.session_ref(core.node_by_id(first)) == 1
+    assert comp.release_session("retained") == 1
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+def test_custom_swa_component_keeps_its_inline_backup_contract():
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    class AuxiliarySWAComponent(SWAComponent):
+        component_type = ComponentType.AUXILIARY_SWA
+
+        def _publish_window(self, node, cache_actions):
+            cache_actions.append(
+                SWARebuild(
+                    node.id,
+                    node.component_data[ComponentType.FULL].value,
+                    component_type=self.component_type,
+                )
+            )
+
+    reference, allocator = _swa_cache(window=4, backend="python")
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=reference.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            sliding_window_size=4,
+            tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
+            component_registry_override={
+                ComponentType.AUXILIARY_SWA: AuxiliarySWAComponent
+            },
+            tree_core_backend="python",
+        )
+    )
+    core = cache.tree_core
+    values = allocator.alloc(6)
+    parent = cache.insert(
+        InsertParams(key=_key([0, 1]), value=values[:2])
+    ).last_device_node
+    leaf = cache.insert(
+        InsertParams(key=_key(list(range(6))), value=values, prev_prefix_len=2)
+    ).last_device_node
+    lock = cache.inc_lock_ref(leaf).to_dec_params()
+    component = ComponentType.AUXILIARY_SWA
+    original = core.get_component_device_value(parent, component).clone()
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    cache.is_write_back = True
+    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    events = []
+
+    def backup(node):
+        assert node == parent
+        assert torch.equal(core.get_component_device_value(node, component), original)
+        events.append(node)
+        return False  # Best-effort allocation failure must still make progress.
+
+    cache.backup_node_for_write_back = backup
+    core.evict_device_start(component, 2)
+    try:
+        result = core.evict_device_next_node(component, {})
+        assert result.node_id is None and result.made_progress
+        assert result.swa_backup_node_id is None and result.mamba_backup_node_id is None
+        tracker, freed = {}, {}
+        _accumulate_step(result, tracker, freed, {})
+        assert events == [parent] and tracker[component] == 2
+        assert torch.equal(torch.cat(freed[component]), original)
+        assert core.get_component_device_value(parent, component) is None
+        assert not core.evict_device_next_node(component, tracker).made_progress
+    finally:
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, lock)
     core.sanity_check([], [])
 
 
@@ -3869,7 +4200,8 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize(
-    "backup", ["success", "host_pressure", "failed", "raised", "ack_raised"]
+    "backup",
+    ["success", "host_pressure", "missing_pool", "failed", "raised", "ack_raised"],
 )
 def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
     from collections import defaultdict
@@ -3917,9 +4249,13 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
     cache._build_backup_sidecar = Mock(return_value=[])
     host_pool = Mock()
     host_pool.available_size.return_value = 0 if backup == "host_pressure" else 1
-    cache.components[ComponentType.MAMBA]._mamba_pool_host = host_pool
+    cache.components[ComponentType.MAMBA]._mamba_pool_host = (
+        None if backup == "missing_pool" else host_pool
+    )
     cache.host_pool_group = Mock()
-    cache.host_pool_group.get_pool.return_value = host_pool
+    cache.host_pool_group.get_pool.return_value = (
+        None if backup == "missing_pool" else host_pool
+    )
     _mamba_insert(core, [1], [10], 7)
     node = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
     _mamba_insert(core, [1, 2], [10, 11], 8)
@@ -3982,13 +4318,30 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
             assert events == (["write"] if backup == "raised" else ["write", "ack"])
             assert not tracker[ComponentType.MAMBA]
             assert_state_resident()
-            return
-        assert cache._evict_device_next_node(ComponentType.MAMBA, tracker) == (
-            None,
-            True,
-        )
+        else:
+            assert cache._evict_device_next_node(ComponentType.MAMBA, tracker) == (
+                None,
+                True,
+            )
     finally:
         core.evict_device_end(ComponentType.MAMBA)
+    if backup in ("raised", "ack_raised"):
+        if backup == "ack_raised":
+            core.finish_write_through([node], ack_id=node)
+            cache.ongoing_write_through.clear()
+        core.evict_device_start(ComponentType.MAMBA, 1)
+        try:
+            step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
+            if step.mamba_backup_node_id is not None:
+                step = core.finish_mamba_state_eviction(node)
+            freed = {}
+            _accumulate_step(step, tracker, freed, {})
+            assert tracker[ComponentType.MAMBA] == 1
+            assert torch.cat(freed[ComponentType.MAMBA]).tolist() == [7]
+        finally:
+            core.evict_device_end(ComponentType.MAMBA)
+        core.sanity_check([], [])
+        return
     assert tracker[ComponentType.MAMBA] == 1 and tracker[ComponentType.FULL] == 0
     assert core.get_component_device_value(node, ComponentType.FULL).tolist() == [10]
     assert core.get_component_device_value(node, ComponentType.MAMBA) is None

@@ -760,12 +760,12 @@ class UnifiedRadixCache(BasePrefixCache):
             assert (
                 not result.device_frees and not result.host_frees and not result.tracker
             )
-            # Rust yields before freeing internal state (#40680). Make room
-            # in the state pool, then drain the D->H ack before its tombstone.
+            # Both cores yield before freeing internal state (#40680). Make
+            # room in the state pool, then drain the D->H ack before tombstoning.
             # Allocation failure still permits the legacy drop to make progress.
             node_id = result.mamba_backup_node_id
             mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
-            if mamba_host_pool.available_size() < 1:
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
                 self.evict_host(1, ComponentType.MAMBA)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_mamba_state_eviction(node_id)

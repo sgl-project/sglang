@@ -124,6 +124,9 @@ class TreeComponent(ABC):
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
+        # An internal-state victim awaiting the controller's host backup.
+        self._evict_device_pending_node: Optional[NodeId] = None
+        self._evict_device_pending_num_tokens = 0
         # Per-session frontier nodes (the deepest registered node per cached
         # path), not physical tree leaves: a frontier node may have children.
         self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
@@ -514,6 +517,8 @@ class TreeComponent(ABC):
         assert not self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction already in progress"
         )
+        self._evict_device_pending_node = None
+        self._evict_device_pending_num_tokens = 0
         self._evict_device_start(request_cnt)
         self.is_evict_device_ongoing = True
 
@@ -531,6 +536,10 @@ class TreeComponent(ABC):
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
         )
+        assert self._evict_device_pending_node is None, (
+            f"finish the pending internal {self.component_type.name} eviction "
+            "before advancing"
+        )
         return self._evict_device_next_node(tracker, device_frees, host_frees)
 
     def evict_device_end(self) -> None:
@@ -540,6 +549,8 @@ class TreeComponent(ABC):
         )
         self._evict_device_end()
         self.is_evict_device_ongoing = False
+        self._evict_device_pending_node = None
+        self._evict_device_pending_num_tokens = 0
 
     @abstractmethod
     def _evict_device_start(self, request_cnt: int) -> None:

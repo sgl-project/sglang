@@ -22,16 +22,10 @@ The Rust bindings report unexpected native panics as `RuntimeError` so Python's
 crash handlers can report them and coordinate shutdown. A panic during a core
 operation poisons its mutex, and subsequent calls refuse to reuse that state.
 
-T-LRU supports integer and floating-point `threshold` and `next_prompt_estimate`
-parameters. Integer configurations retain exact arithmetic; floating-point
-configurations preserve Python's operation order, rounding, and comparison with
-integer cache lengths, including NaN and infinity. In mixed integer/float
-configurations, the integer estimate must fit in i128; larger values raise
-`OverflowError` at initialization. The native integer addition is checked and
-panics if the actual history plus estimate overflows. Priority evaluation uses
-only native integer/float arithmetic and does not allocate. Per-node path depth
-and branch history preserve the tail budget across splits, host refills, and
-repeated eviction. The ancestor history walk runs only when T-LRU is selected.
+T-LRU accepts integer and floating-point `threshold` and `next_prompt_estimate`
+parameters. In mixed integer/float configurations, the integer estimate must fit
+in i128; larger values raise `OverflowError` at initialization. Native integer
+addition is checked, and overflow is reported as `RuntimeError`.
 
 Select a backend explicitly with:
 
@@ -53,13 +47,13 @@ Python. Trusted bundled extensions do not require a Rust compiler.
 
 ## Development
 
-External backends registered through `register_tree_core_backend` must implement
-the new `UnifiedTreeCoreInterface.swa_tombstone_ranges` and `attach_swa_window`
-methods for SWA buffer-mode repair. These methods are abstract, so existing
-subclasses need to add them before they can be instantiated. The new
-`finish_mamba_state_eviction` and `finish_swa_state_eviction` hooks are optional
-for backends that complete these backups inline and never return a deferred
-`mamba_backup_node_id` or `swa_backup_node_id`.
+Alternative backends implement `UnifiedTreeCoreInterface` and register through
+`register_tree_core_backend`. For built-in Mamba and SWA internal-state write-back,
+the core returns a backup request and the controller performs transfers and waits
+for acknowledgment.
+The controller then calls `finish_mamba_state_eviction` or
+`finish_swa_state_eviction` to resume eviction. This keeps I/O outside the Rust
+tree's mutex; both tree cores implement the same contract.
 
 ```bash
 # Build (libtorch from the installed torch package):
@@ -83,19 +77,3 @@ cache suite. Production wheels do not enable it.
 Unit tests live in `src/tests/`, mirroring the source layout one file per module (wired via `#[cfg(test)] #[path = ...]`), so implementation files stay free of inline test blocks.
 
 Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Full, SWA, Mamba]`.
-
-One insertion-ordered `NodeSet` tracks device leaves, host leaves, and Full host
-duplicates. Leaf eviction ranks candidates in the policy heap; duplicate
-reclamation consumes insertion order directly, matching Python's dictionary.
-
-SWA buffer-mode load-back can repair tombstoned windows in Rust. The core finds
-missing SWA spans and attaches loaded slots across node boundaries, preserving
-Full-KV ownership, lock accounting, and pending write-through split actions.
-The shared Python pipeline handles transfers and redundant-slot cleanup.
-
-HiCache write-back preserves eligible internal SWA windows before device eviction
-(#40712). Rust pauses the walk while the Python controller makes room for the
-whole unbacked window and completes its host backup. The walk then resumes,
-retaining reusable host state when the backup succeeds and still freeing device
-slots when allocation fails. The same transfer and ACK handling serves internal
-Mamba state backups (#40680).

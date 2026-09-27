@@ -325,19 +325,23 @@ class UnifiedTreeCoreInterface(ABC):
         D->H backup must run (write_back) before the node can be demoted."""
         ...
 
+    @abstractmethod
     def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
-        """Resume a requested internal-state eviction after backup completion.
+        """Resume the pending internal Mamba eviction after its backup attempt.
 
-        Cores that back up inline never return ``mamba_backup_node_id``.
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
         """
-        raise NotImplementedError("this tree core does not defer Mamba state eviction")
+        ...
 
+    @abstractmethod
     def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
-        """Resume an internal SWA eviction after its host backup attempt.
+        """Resume the pending internal SWA eviction after its backup attempt.
 
-        Cores that back up inline never return ``swa_backup_node_id``.
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
         """
-        raise NotImplementedError("this tree core does not defer SWA state eviction")
+        ...
 
     @abstractmethod
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:

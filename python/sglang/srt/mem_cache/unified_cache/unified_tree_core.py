@@ -474,6 +474,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        # End suspended walks while their session-cursor sentinels still
+        # belong to the old LRUs, clearing any pending internal victim.
+        for component in self.components:
+            if component.is_evict_device_ongoing:
+                component.evict_device_end()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -1586,12 +1591,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
+        component = self.components_by_type[component_type]
         updated_tracker = defaultdict(int, tracker)
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            result.node_id = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
@@ -1600,7 +1604,89 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
-        result.made_progress = result.node_id is not None or bool(result.tracker)
+        if component_type == ComponentType.MAMBA:
+            result.mamba_backup_node_id = component._evict_device_pending_node
+        elif component_type == ComponentType.SWA:
+            result.swa_backup_node_id = component._evict_device_pending_node
+            result.swa_backup_num_tokens = component._evict_device_pending_num_tokens
+        result.made_progress = (
+            result.node_id is not None
+            or result.mamba_backup_node_id is not None
+            or result.swa_backup_node_id is not None
+            or bool(result.tracker)
+        )
+        return result
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.MAMBA, node_id)
+
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.SWA, node_id)
+
+    def _finish_internal_component_eviction(
+        self, component_type: ComponentType, node_id: NodeId
+    ) -> EvictDeviceNextNodeResult:
+        """Resume an internal tombstone after the controller's backup attempt."""
+        component = self.components_by_type[component_type]
+        assert component.is_evict_device_ongoing, (
+            f"{component_type.name} device eviction not started"
+        )
+        assert component._evict_device_pending_node == node_id, (
+            f"no matching pending internal {component_type.name} eviction"
+        )
+        component._evict_device_pending_node = None
+        component._evict_device_pending_num_tokens = 0
+        # Consuming the pending request advances the walk even if I/O changed
+        # this victim's eligibility. No frees occur before backup completion.
+        result = EvictDeviceNextNodeResult(made_progress=True)
+        node = self._node_arena.get(node_id)
+        lru = self.lru_lists[component_type]
+        enabled = self.enable_session_radix_cache
+        if (
+            node is None
+            or node.component_data[component_type].value is None
+            or node.component_data[component_type].lock_ref > 0
+            or (
+                component_type == ComponentType.MAMBA
+                and node.load_back_pending_id is not None
+            )
+            or not lru.in_list(node)
+        ):
+            if enabled:
+                component._evict_device_cursor = lru.cursor_next()
+            return result
+        if (
+            node in self.evictable_device_leaves
+            and (not enabled or component._can_evict_leaf_atomically(node))
+        ) or (
+            component_type == ComponentType.MAMBA
+            and node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            # Re-select changed leaves through the normal walk; internal
+            # finish must not accidentally perform an atomic Full eviction.
+            component._evict_device_cursor = node
+            return result
+        self._begin_tracking_unbacked_tokens()
+        try:
+            self._evict_component_and_detach_lru(
+                node,
+                component,
+                target=EvictLayer.DEVICE,
+                tracker=result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+            self._cascade_evict(
+                node,
+                component,
+                result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        if enabled:
+            component._evict_device_cursor = lru.cursor_next()
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
