@@ -2767,6 +2767,60 @@ class UnifiedRadixCacheSuite:
                 )
                 cache.sanity_check()
 
+    def test_swa_lock_pins_one_window_when_match_ends_inside_capped_leaf(self):
+        """A match that ends one page before the end of a capped window leaf leaves
+        a matched node shorter than the window, so the lock walk reaches the long
+        live-SWA parent (e.g. a finished request's untrimmed last chunk). With
+        SGLANG_SWA_LOCK_WINDOW_ONLY=0 the whole parent is pinned; with the default
+        the walk splits it and pins one page-aligned window."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+
+        for window_only in (False, True):
+            with (
+                self.subTest(window_only=window_only),
+                envs.SGLANG_SWA_LOCK_WINDOW_ONLY.override(window_only),
+            ):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                # A live parent of 4 pages, then the one-window leaf the insert caps.
+                seq = self._make_seq(1, tail_pages + 4)
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                cache.sanity_check()
+
+                # Diverge on the last page, as a follow-up request diverges after
+                # one that stopped at its first output token.
+                key = seq[:-ps] + self._make_seq(100_000, 1)
+                m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", key))))
+                matched = len(seq) - ps
+                self.assertEqual(len(m.device_indices), matched)
+                node = m.last_device_node
+
+                lock_result = cache.inc_lock_ref(node)
+                cache.sanity_check()
+                want = tail_size if window_only else matched
+                self.assertEqual(cache.swa_protected_size(), want)
+                self.assertEqual(cache.full_protected_size(), matched)
+
+                cache.dec_lock_ref(node, lock_result.to_dec_params())
+                cache.sanity_check()
+                self.assertEqual(cache.swa_protected_size(), 0)
+                self.assertEqual(cache.full_protected_size(), 0)
+
+                # The split is topology only: the whole sequence still matches and
+                # a second lock round trip pins the same amount.
+                m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+                self.assertEqual(len(m.device_indices), len(seq))
+                m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", key))))
+                lock_result = cache.inc_lock_ref(m.last_device_node)
+                self.assertEqual(cache.swa_protected_size(), want)
+                cache.dec_lock_ref(m.last_device_node, lock_result.to_dec_params())
+                cache.sanity_check()
+
     def _swa_lru_order(self, cache):
         return cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)
 

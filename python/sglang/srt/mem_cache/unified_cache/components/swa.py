@@ -585,6 +585,36 @@ class SWAComponent(TreeComponent):
         assert action is None, "fresh SWA leaf cannot be write-through-pending"
         return new_parent
 
+    def _maybe_split_for_window_lock(
+        self, node: UnifiedTreeNode, uncovered: int
+    ) -> None:
+        """Cap the part of a live, unlocked SWA node that a lock walk pins at what
+        the window still needs. The leaf cap above bounds only a fresh leaf: a match
+        that ends inside that leaf leaves a node shorter than the window, and the
+        walk then reaches a long live ancestor (e.g. a finished request's untrimmed
+        last chunk) and would pin all of it. `node` keeps its id and becomes the
+        in-window tail, so a lock receipt anchored on it stays valid. A node with
+        a buffer-mode write pending is left whole: the write reads all of it, and
+        its pin is itself a lock walk."""
+        cd = node.component_data[self.component_type]
+        if (
+            cd.lock_ref > 0
+            or cd.value is None
+            or node.write_through_pending_id is not None
+            or self.cache.buffer_backup_pending(node.id)
+        ):
+            return
+        page_size = self.tree_core.page_size
+        tail_size = (uncovered + page_size - 1) // page_size * page_size
+        node_len = len(node.key)
+        if node_len <= tail_size:
+            return
+        split_at = node_len - tail_size
+        if page_size > 1 and (split_at % page_size != 0 or node_len % page_size != 0):
+            return
+        _, action = self.tree_core._split_node(node.key, node, split_at)
+        assert action is None, "a node without write-through cannot return an action"
+
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
@@ -828,8 +858,11 @@ class SWAComponent(TreeComponent):
             else self.tree_core.lru_lists[ct]
         )
 
+        window_only = not lock_host and envs.SGLANG_SWA_LOCK_WINDOW_ONLY.get()
         cur = node
         while cur != root and covered < sliding_window_size:
+            if window_only:
+                self._maybe_split_for_window_lock(cur, sliding_window_size - covered)
             comp = cur.component_data[ct]
             value = comp.host_value if lock_host else comp.value
             ref = comp.host_lock_ref if lock_host else comp.lock_ref
