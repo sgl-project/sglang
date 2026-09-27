@@ -84,7 +84,7 @@ def parse_response(
     stream = ResponseParser(response_template, prefix=prefix, tools=tools)
     events = stream.feed(text)
     message, final_events = stream.finalize()
-    for event in events + final_events:
+    for event in stream.initial_events + events + final_events:
         if event["type"] == "region_malformed":
             raise event["error"]
     return message

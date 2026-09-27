@@ -1254,13 +1254,15 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "region_malformed")
         self.assertEqual(events[-1]["start"], len(parser.input_text))
 
-    def test_parse_response_raises_for_truncated_malformed_region(self):
+    def test_parse_response_raises_for_malformed_region(self):
         spec = {
             "start_anchor": "<|assistant|>",
             "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json"}},
         }
         with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
             parse_response('<x>{"name":', spec, prefix="")
+        with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+            parse_response("", spec, prefix='<|assistant|><x>{"name":</x>')
 
 
 class PrefixAndTruncationTest(unittest.TestCase):
