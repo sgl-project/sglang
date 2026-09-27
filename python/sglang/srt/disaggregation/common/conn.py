@@ -262,6 +262,10 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            # Fan-out peers snapshotted at registration: the sender's clear()
+            # can pop transfer_infos before the worker drains, and the drain
+            # ack would otherwise reach the registered target alone.
+            self._deferred_ack_fanout_snapshots: Dict[int, List[Tuple[str, int]]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
@@ -709,10 +713,14 @@ class CommonKVManager(BaseKVManager):
         # With prefill TP < decode TP several decode ranks share one room, but
         # the registry keeps only the last ABORT sender -- the earlier ranks
         # would hold their pages for the full release timeout. Fan the ack out
-        # to every known peer; the registered sender is the guaranteed floor
-        # (transfer_infos is gone after teardown and may be incomplete when the
-        # abort lands during bootstrap).
+        # to every known peer: the live transfer_infos (catches peers that
+        # registered after the ABORT), the snapshot taken at registration
+        # (survives a teardown that popped transfer_infos mid-flight), and the
+        # registered sender as the guaranteed floor.
         targets = self._abort_ack_fanout_targets(room)
+        for peer in self._deferred_ack_fanout_snapshots.pop(room, ()):
+            if peer not in targets:
+                targets.append(peer)
         if target not in targets:
             targets.append(target)
         for decode_ip, decode_port in targets:
@@ -725,6 +733,7 @@ class CommonKVManager(BaseKVManager):
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        self._deferred_ack_fanout_snapshots[room] = self._abort_ack_fanout_targets(room)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1692,6 +1701,9 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
             else:
                 self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+                self.kv_mgr._deferred_ack_fanout_snapshots.pop(
+                    self.bootstrap_room, None
+                )
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -2014,6 +2026,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        # Once metadata is published (init_time set) prefill may already be
+        # writing; arm the drain-ack tracker BEFORE the ABORT goes out, so an
+        # ack racing back -- or fanned out by a peer rank's earlier abort of
+        # the same room -- is counted instead of dropped. Prealloc-queue
+        # receivers (init_time None) never enter the deferred-release flow
+        # that would clean the tracker up, so they stay unarmed.
+        if self.kv_mgr.enable_deferred_decode_kv_release and self.init_time is not None:
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

@@ -25,6 +25,7 @@ def _prefill_mgr(cls=CommonKVManager, enabled=True):
     mgr = cls.__new__(cls)
     mgr.enable_deferred_decode_kv_release = enabled
     mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_fanout_snapshots = {}
     mgr._staging_outstanding = {}
     mgr.request_status = {}
     mgr.transfer_infos = {}
@@ -87,6 +88,30 @@ class TestDeferredAckTargets(CustomTestCase):
         # pop() semantics survive the fan-out: a second drain acks nobody.
         mgr._maybe_ack_drained_abort(7)
         self.assertEqual(len(mgr._sent), 3)
+
+    def test_drain_ack_fanout_survives_mid_flight_teardown(self):
+        """The sender's clear() can pop transfer_infos while a chunk is still in
+        flight; the peers snapshotted when the ABORT registered must still be
+        acked when the worker finally drains, or they hold until the timeout."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[7] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.1", dst_port=5000),
+            "sess1": SimpleNamespace(endpoint="10.0.0.2", dst_port=5001),
+        }
+        mgr._staging_outstanding[7] = 1
+        mgr.register_deferred_ack_target(7, "10.0.0.2", 5001)
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [])  # still writing -> held
+
+        # Scheduler clears the sender mid-flight; the worker drains after.
+        mgr.transfer_infos.clear()
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            sorted(mgr._sent),
+            [("10.0.0.1", 5000, 7), ("10.0.0.2", 5001, 7)],
+        )
+        self.assertNotIn(7, mgr._deferred_ack_fanout_snapshots)
 
     def test_drain_ack_after_teardown_falls_back_to_registered_target(self):
         mgr = _prefill_mgr()
