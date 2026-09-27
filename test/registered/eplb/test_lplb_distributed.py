@@ -38,8 +38,9 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import publish_build_topology
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="2-gpu-large")
 
 NUM_GPUS = 2
 TOPK = 2
@@ -173,16 +174,16 @@ def test_solve_ipm_matches_torch_reference():
     max_diff = (cuda_x - torch_x).abs().max().item()
     print(
         f"\n[ipm-compare] converged={converged}  max|cuda-torch|={max_diff:.3e}  "
-        f"cuda={[round(v,4) for v in cuda_x.tolist()]}  "
-        f"torch={[round(v,4) for v in torch_x.tolist()]}"
+        f"cuda={[round(v, 4) for v in cuda_x.tolist()]}  "
+        f"torch={[round(v, 4) for v in torch_x.tolist()]}"
     )
     assert converged, (
         "IPM returned the 0.5 non-convergence sentinel — the comparison would "
         "be trivial. Adjust the LP instance so it converges."
     )
-    assert torch.allclose(
-        cuda_x, torch_x, atol=1e-2, rtol=1e-2
-    ), f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+    assert torch.allclose(cuda_x, torch_x, atol=1e-2, rtol=1e-2), (
+        f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+    )
 
 
 @pytest.mark.skipif(
@@ -212,6 +213,13 @@ def _worker_main(local_rank: int, world_size: int):
     set_global_server_args_for_scheduler(
         ServerArgs(
             model_path="dummy",
+            # Match the tp/ep width initialize_model_parallel is about to
+            # build below -- get_parallel()'s derived widths (attn_tp_size,
+            # moe_ep_size, ...) are projected from this at publish time, and
+            # nothing here should leave that projection reflecting a width
+            # this process never actually runs at.
+            tp_size=world_size,
+            ep_size=world_size,
         )
     )
 
@@ -231,10 +239,10 @@ def _worker_main(local_rank: int, world_size: int):
     init_distributed_environment(
         world_size=world_size, rank=local_rank, local_rank=local_rank
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world_size,
-        expert_model_parallel_size=world_size,
+    publish_build_topology(
+        tp_size=world_size, ep_size=world_size, world_rank=local_rank
     )
+    initialize_model_parallel()
 
     from sglang.srt.eplb.lplb_solver import clear_global_lplb_solvers
 
@@ -363,9 +371,9 @@ def _check_all_ranks_empty(rank: int, world_size: int, device: torch.device):
 
     assert torch.isfinite(actual).all(), f"rank {rank}: non-finite for empty-batch"
     assert (actual >= 0).all(), f"rank {rank}: negative for empty-batch"
-    assert torch.allclose(
-        actual, expected, atol=1e-4, rtol=1e-3
-    ), f"rank {rank}: empty-batch output disagrees with all-zero oracle"
+    assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-3), (
+        f"rank {rank}: empty-batch output disagrees with all-zero oracle"
+    )
 
 
 def _check_solver_determinism(rank: int, world_size: int, device: torch.device):

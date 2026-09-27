@@ -1,3 +1,4 @@
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -154,7 +155,7 @@ class InternS1ForConditionalGeneration(nn.Module):
 
         return hs
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
@@ -186,7 +187,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             name = "vision_model." + name[len("model.vision_tower.") :]
 
         if name.startswith("vision_model.encoder.layer"):
-
             name = name.replace(r".layer.", r".layers.")
             name = name.replace(r".attention.", r".attn.attn.")
             name = name.replace(r".projection_layer.", r".proj.")

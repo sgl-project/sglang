@@ -10,7 +10,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     _sanitize_filename,
 )
-from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
+from sglang.multimodal_gen.configs.utils import expand_path_fields
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs

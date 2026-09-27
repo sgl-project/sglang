@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.warmup_request_builder import lighten_warmup_req
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
     globally_suppress_loggers,
 )
@@ -45,15 +47,29 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    map_request_outputs,
     materialize_output_sample,
     post_process_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    WarmupMemoryRecord,
+    estimate_default_workload_peak_bytes,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
+    peek_global_component_residency_manager,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
+)
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    DiffusionMetrics,
+    init_metrics,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -62,11 +78,18 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+    initialize_current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+from sglang.multimodal_gen.runtime.realtime.video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -77,28 +100,35 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
-)
+from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     DiffStage,
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
-OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
-    "vae",
-    "image_encoder",
-    "text_encoder",
-    "text_encoder_2",
-    "transformer",
-)
+
+def _device_has_allocator_cache() -> bool:
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    )
+
+
+def _device_module():
+    return torch.get_device_module(current_platform.device_type)
+
+
+def _device_initialized() -> bool:
+    if not _device_has_allocator_cache():
+        return False
+    return _device_module().is_initialized()
 
 
 @dataclass
@@ -128,10 +158,70 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
+    "vae",
+    "image_encoder",
+    "text_encoder",
+    "text_encoder_2",
+    "transformer",
+)
+
+
+PROBE_FIT_MIN_MARGIN_BYTES = 1 << 30
+
+
+def _shape_label(req: Req) -> str:
+    return f"{req.width}x{req.height}x{req.num_frames or 1}f"
+
+
+def fit_auto_residency_probe(
+    req: Req,
+    *,
+    records: list[WarmupMemoryRecord],
+    free_bytes: int,
+    total_bytes: int,
+    server_args: ServerArgs,
+) -> tuple[Req, int | None, int]:
+    """Shrink a full-shape probe until its extrapolated peak fits the memory left.
+
+    The probe measures the default workload under the load-safe placement, so
+    a probe the card cannot hold would only be found out by running out of
+    memory. The bounded warmup that runs before it gives one measurement to
+    extrapolate from; while that extrapolation exceeds free memory minus the
+    reserve, frames go first and then area, the ladder the OOM retry walks.
+    Returns the fitted request, its estimate and the number of shrink steps.
+    """
+    # Only the probe has to fit, so the margin is allocator slack, not the
+    # planner's placement reserve (which held back 4 GiB of a 32 GiB card and
+    # shrank a probe that had 10 GiB to spare).
+    budget = free_bytes - max(PROBE_FIT_MIN_MARGIN_BYTES, total_bytes // 50)
+    # The bounded warmup already ran at the smallest measured shape; a probe
+    # below it measures nothing new and degenerate shapes fail inside models.
+    floor_units = min((record.workload_units() for record in records), default=0)
+    fitted, steps = req, 0
+    while True:
+        units = (
+            max(1, int(fitted.width or 1))
+            * max(1, int(fitted.height or 1))
+            * max(1, int(fitted.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=units
+        )
+        if estimate is None or estimate <= budget or units <= floor_units:
+            return fitted, estimate, steps
+        lighter = lighten_warmup_req(server_args, fitted)
+        if lighter is None:
+            return fitted, estimate, steps
+        fitted, steps = lighter, steps + 1
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
+
+    metrics: DiffusionMetrics | None = None
 
     def __init__(
         self,
@@ -149,15 +239,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
+        self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
+        load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
         self._load_peak_reserved_mb = (
-            0.0
-            if current_platform.is_cpu()
-            else capture_memory_snapshot().peak_reserved_mb
+            load_snapshot.peak_reserved_mb if load_snapshot is not None else 0.0
+        )
+        # Allocated peaks are the guarded figure: reserved peaks also track the
+        # allocator's pool history and move a few percent for identical work.
+        self._load_peak_allocated_mb = (
+            load_snapshot.peak_allocated_mb if load_snapshot is not None else 0.0
         )
         self._runtime_peak_reserved_mb = 0.0
+        # Warmup probes run the default workload's full shape and may exceed any
+        # serving request; keep their peak out of the runtime figure.
+        self._warmup_peak_reserved_mb = 0.0
+        self._release_warmup_pool_before_serving = False
+        self._runtime_peak_allocated_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -167,6 +267,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
+        # per-rank memory measurements of server warmup forwards; consumed by
+        # the auto-residency placement decision before the server turns ready
+        self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        self._update_lora_metrics()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -181,8 +285,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         released = self._realtime_sessions.release(session_id)
         if released:
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if _device_initialized():
+                _device_module().empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
@@ -325,6 +429,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
+                pin_budget=get_global_component_residency_manager(
+                    self.pipeline, self.server_args
+                ).host_pin_budget,
                 component_names=(
                     None
                     if self.server_args.component_residency is not None
@@ -358,24 +465,37 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         remaining_gpu_mem_gb = (
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
-        can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
+        try:
+            can_stay_resident = self.get_can_stay_resident_components(
+                remaining_gpu_mem_gb
+            )
+        except Exception:
+            # a debug-only hint must never fail a completed request
+            logger.debug("Residency hint unavailable", exc_info=True)
+            can_stay_resident = []
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
         pool_overhead_pct = (
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
         )
 
+        residency_hint = (
+            f" Components that can remain on GPU: {can_stay_resident}. "
+            "Make it explicit with --component-residency <name>=resident; "
+            "--performance-mode auto with server warmup applies safe "
+            "adjustments automatically."
+            if can_stay_resident
+            else ""
+        )
         logger.debug(
             "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
-            "headroom=%.2f GB. Components that can remain on GPU: %s. "
-            "Adjust --cpu-offload-components or --layerwise-offload-components "
-            "to change residency.",
+            "headroom=%.2f GB.%s",
             peak_reserved_gb,
             peak_allocated_gb,
             pool_overhead_gb,
             pool_overhead_pct,
             remaining_gpu_mem_gb,
-            can_stay_resident,
+            residency_hint,
         )
 
     def execute_forward(
@@ -403,6 +523,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return self._execute_forward_batch(batch)
 
         req = batch[0]
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+            self._fit_auto_residency_probe(req)
         return self._execute_forward_common(
             req,
             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
@@ -434,8 +556,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -496,9 +618,57 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        # Prewarm reqs (is_warmup=False) run a different offload layout and
+        # must not contaminate the calibration records. Pipelines that cannot
+        # apply a residency plan also skip the temporary per-layer hooks.
+        measure_server_warmup = (
+            req.is_warmup
+            and bool(req.extra.get("server_based_warmup"))
+            and self.server_args.pipeline_config.supports_auto_residency
+            and current_platform.is_cuda()
+        )
+        warmup_workload = (
+            (
+                int(req.width or 0),
+                int(req.height or 0),
+                int(req.num_frames or 1),
+                max(1, int(req.num_inference_steps or 1)),
+            )
+            if measure_server_warmup
+            else None
+        )
+        warmup_baseline_allocated_bytes = 0
+        layerwise_usage_tracker: LayerwiseUsageTracker | None = None
+        layerwise_layer_uses_by_stage: dict[
+            str, dict[str, dict[str, tuple[int, ...]]]
+        ] = {}
         try:
+            if measure_server_warmup:
+                # Drop the previous request's allocator pool so each probe
+                # starts from the same placement and can return released
+                # component storage before its allocated peak is measured.
+                torch.get_device_module().empty_cache()
+            self._release_warmup_pool(req)
             if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
+            if measure_server_warmup:
+                warmup_baseline_allocated_bytes = (
+                    torch.get_device_module().memory_allocated()
+                )
+                if (
+                    self.server_args.performance_mode == "auto"
+                    and self.pipeline is not None
+                ):
+                    layerwise_usage_tracker = LayerwiseUsageTracker(
+                        self.pipeline.modules,
+                        stage_name_provider=(
+                            lambda: (
+                                req.metrics.active_stage_name
+                                if req.metrics is not None
+                                else None
+                            )
+                        ),
+                    )
 
             start_time = (
                 execution_start_time
@@ -550,8 +720,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-            self._record_output_peak_memory(output_batch)
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
 
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -572,7 +744,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -606,11 +779,114 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
-            self._record_output_peak_memory(output_batch)
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
             # clean cache if OOM
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
+        finally:
+            # also runs on the propagate_forward_errors re-raise: a warmup
+            # forward that never completed must still leave a failed record,
+            # or the estimator would plan from the remaining partial data
+            if measure_server_warmup:
+                assert warmup_workload is not None
+                if layerwise_usage_tracker is not None:
+                    (
+                        layerwise_layer_uses,
+                        layerwise_layer_uses_by_stage,
+                    ) = layerwise_usage_tracker.finish_with_stages()
+                else:
+                    layerwise_layer_uses = {}
+                self._record_server_warmup_memory(
+                    req=req,
+                    workload=warmup_workload,
+                    baseline_allocated_bytes=warmup_baseline_allocated_bytes,
+                    succeeded=output_batch is not None and output_batch.error is None,
+                    layerwise_layer_uses=layerwise_layer_uses,
+                    layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
+                )
         return output_batch
+
+    def _record_server_warmup_memory(
+        self,
+        *,
+        req: Req,
+        workload: tuple[int, int, int, int],
+        baseline_allocated_bytes: int,
+        succeeded: bool,
+        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
+        layerwise_layer_uses_by_stage: (
+            dict[str, dict[str, dict[str, tuple[int, ...]]]] | None
+        ) = None,
+    ) -> None:
+        phase_allocated_peaks: dict[str, int] = {}
+        phase_components: dict[str, tuple[str, ...]] = {}
+        phase_used_components: dict[str, tuple[str, ...]] = {}
+        phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
+        untracked_active_components: tuple[str, ...] = ()
+        residency_manager = peek_global_component_residency_manager()
+        if residency_manager is not None:
+            for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
+                phase_allocated_peaks[phase_name] = peak.allocated_bytes
+                phase_components[phase_name] = peak.active_components
+                phase_used_components[phase_name] = peak.used_components
+                phase_full_weight_transition_components[phase_name] = (
+                    peak.full_weight_transition_components
+                )
+            untracked_active_components = residency_manager.current_device_components()
+        request_allocated_peak = max(
+            int(torch.get_device_module().max_memory_allocated()),
+            max(phase_allocated_peaks.values(), default=0),
+        )
+        if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
+            # Work after the residency-managed stage timeline (for example,
+            # output materialization) must remain a placement constraint.
+            # A reserved-only increase is not a second live placement. Record
+            # it separately so post-placement validation can still require
+            # allocator headroom without charging cache to candidate deltas.
+            phase_allocated_peaks["request:untracked"] = request_allocated_peak
+            phase_components["request:untracked"] = untracked_active_components
+            phase_used_components["request:untracked"] = ()
+            phase_full_weight_transition_components["request:untracked"] = ()
+        metrics = req.metrics
+        width, height, num_frames, num_inference_steps = workload
+        self._auto_residency_warmup_records.append(
+            WarmupMemoryRecord(
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                baseline_allocated_bytes=int(baseline_allocated_bytes),
+                peak_allocated_bytes=request_allocated_peak,
+                succeeded=succeeded,
+                peak_reserved_bytes=int(
+                    torch.get_device_module().max_memory_reserved()
+                ),
+                phase_peak_allocated_bytes=phase_allocated_peaks,
+                phase_active_components=phase_components,
+                phase_used_components=phase_used_components,
+                phase_full_weight_transition_components=(
+                    phase_full_weight_transition_components
+                ),
+                layerwise_layer_uses=layerwise_layer_uses or {},
+                layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
+                num_inference_steps=num_inference_steps,
+                total_duration_ms=(
+                    float(metrics.total_duration_ms) if metrics is not None else 0.0
+                ),
+                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
+                step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
+                step_duration_ms_by_stage=(
+                    {
+                        stage_name: tuple(durations)
+                        for stage_name, durations in metrics.steps_by_stage.items()
+                    }
+                    if metrics is not None
+                    else {}
+                ),
+                stage_iterations=(
+                    dict(metrics.stage_iterations) if metrics is not None else {}
+                ),
+            )
+        )
 
     def _materialize_output_transport(
         self,
@@ -669,9 +945,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and torch.cuda.is_initialized()
+            and _device_initialized()
         ):
-            torch.cuda.synchronize()
+            _device_module().synchronize()
         start_time = time.perf_counter()
         output_batch.output = [
             self._materialize_frame_output(output, output_batch, req)
@@ -680,9 +956,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics is not None:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and torch.cuda.is_initialized()
+                and _device_initialized()
             ):
-                torch.cuda.synchronize()
+                _device_module().synchronize()
             output_batch.metrics.record_stage(
                 "GPUWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
@@ -724,15 +1000,102 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return np.asarray(materialized.frames)
 
-    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
+    def _fit_auto_residency_probe(self, req: Req) -> None:
+        """Size the full-shape probe to what the card has left, on every rank alike."""
+        records = [r for r in self._auto_residency_warmup_records if r.succeeded]
+        if not records or not current_platform.is_cuda():
+            return
+        device = current_platform.get_device(self.local_rank)
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(empty_cache=True) * (1 << 30)
+        )
+        total_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+        _, _, steps = fit_auto_residency_probe(
+            req,
+            records=records,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            server_args=self.server_args,
+        )
+        requested_units = (
+            max(1, int(req.width or 1))
+            * max(1, int(req.height or 1))
+            * max(1, int(req.num_frames or 1))
+        )
+        estimate = estimate_default_workload_peak_bytes(
+            records=records, target_units=requested_units
+        )
+        # Ranks see different free memory and hold different records; the
+        # forward must run one shape everywhere, so the most cautious rank wins.
+        agreed = torch.tensor([steps], dtype=torch.int64, device=device)
+        agreed = get_replica_group().all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MAX
+        )
+        steps = int(agreed.item())
+        if steps == 0:
+            return
+        fitted = req
+        for _ in range(steps):
+            lighter = lighten_warmup_req(self.server_args, fitted)
+            if lighter is None:
+                break
+            fitted = lighter
+        if self.is_output_rank:
+            logger.warning(
+                "Auto residency probe %s would not fit: extrapolated peak %.1f GiB "
+                "against %.1f GiB free; probing at %s instead",
+                _shape_label(req),
+                (estimate or 0) / (1 << 30),
+                free_bytes / (1 << 30),
+                _shape_label(fitted),
+            )
+        req.sampling_params = fitted.sampling_params
+
+    def _release_warmup_pool(self, req: Req) -> None:
+        """Drop what the full-shape probe left behind before the next request.
+
+        The probe runs a shape serving may never see. Its cached allocator
+        blocks would become the floor of every runtime peak measurement, and
+        the all-to-all staging buffers it created (IPC and Ulysses) stay
+        allocated at its message size. The request after the probe (the
+        bounded re-warm) regrows all of them at a serving-sized shape.
+        """
+        if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+            self._release_warmup_pool_before_serving = True
+            return
+        if not self._release_warmup_pool_before_serving:
+            return
+        self._release_warmup_pool_before_serving = False
+        if current_platform.is_cpu() or current_platform.is_mps():
+            return
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+            IPC_A2A,
+        )
+        from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
+
+        IPC_A2A.drop_staging()
+        drop_a2a_staging_buffers()
+        torch.get_device_module().empty_cache()
+
+    def _record_output_peak_memory(
+        self, output_batch: OutputBatch, *, is_warmup: bool = False
+    ) -> None:
         if current_platform.is_cpu():
             return
-        peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
-        self._runtime_peak_reserved_mb = max(
-            self._runtime_peak_reserved_mb, peak_reserved_mb
-        )
+        snapshot = capture_memory_snapshot()
+        if is_warmup:
+            self._warmup_peak_reserved_mb = max(
+                self._warmup_peak_reserved_mb, snapshot.peak_reserved_mb
+            )
+        else:
+            self._runtime_peak_reserved_mb = max(
+                self._runtime_peak_reserved_mb, snapshot.peak_reserved_mb
+            )
+            self._runtime_peak_allocated_mb = max(
+                self._runtime_peak_allocated_mb, snapshot.peak_allocated_mb
+            )
         if self.is_output_rank:
-            output_batch.peak_memory_mb = peak_reserved_mb
+            output_batch.peak_memory_mb = snapshot.peak_reserved_mb
 
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
@@ -740,7 +1103,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         peaks = torch.tensor(
-            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
+            [
+                self._load_peak_reserved_mb,
+                self._runtime_peak_reserved_mb,
+                self._warmup_peak_reserved_mb,
+                self._load_peak_allocated_mb,
+                self._runtime_peak_allocated_mb,
+            ],
             dtype=torch.float64,
             device=current_platform.get_device(self.local_rank),
         )
@@ -749,13 +1118,32 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return
 
         snapshot = capture_memory_snapshot()
-        load_peak_mb, runtime_peak_mb = peaks.tolist()
+        (
+            load_peak_mb,
+            runtime_peak_mb,
+            warmup_peak_mb,
+            load_peak_allocated_mb,
+            runtime_peak_allocated_mb,
+        ) = peaks.tolist()
         for metrics in output_metrics:
             metrics.record_memory_snapshot(
-                "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
+                "load_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=load_peak_mb,
+                    peak_allocated_mb=load_peak_allocated_mb,
+                ),
             )
             metrics.record_memory_snapshot(
-                "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+                "runtime_peak",
+                replace(
+                    snapshot,
+                    peak_reserved_mb=runtime_peak_mb,
+                    peak_allocated_mb=runtime_peak_allocated_mb,
+                ),
+            )
+            metrics.record_memory_snapshot(
+                "warmup_peak", replace(snapshot, peak_reserved_mb=warmup_peak_mb)
             )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
@@ -819,9 +1207,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if not self.is_output_rank or output_batch.output is None:
             return
-        if len(output_batch.output) != len(reqs):
+        output_requests = map_request_outputs(reqs)
+        if len(output_batch.output) != len(output_requests):
             raise RuntimeError(
-                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+                f"Expected {len(output_requests)} grouped outputs, got {len(output_batch.output)}"
             )
 
         first_req = reqs[0]
@@ -830,7 +1219,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
@@ -994,13 +1383,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         merge batched output
         """
-        if parts.output_file_paths:
-            merged.output_file_paths = parts.output_file_paths
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(
                 metrics for metrics in parts.metrics_list if metrics is not None
             )
+        if merged.error is not None:
+            return
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
         if parts.tensor_outputs:
             merged.output = torch.cat(parts.tensor_outputs, dim=0)
         elif parts.list_outputs:
@@ -1078,14 +1469,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(
-            lora_nickname,
-            lora_path,
-            target,
-            strength,
-            merge_mode=merge_mode,
-            lora_alpha=lora_alpha,
-        )
+        try:
+            self.pipeline.set_lora(
+                lora_nickname,
+                lora_path,
+                target,
+                strength,
+                merge_mode=merge_mode,
+                lora_alpha=lora_alpha,
+            )
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1100,7 +1494,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.merge_lora_weights(target, strength)
+        try:
+            self.pipeline.merge_lora_weights(target, strength)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1112,8 +1509,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.unmerge_lora_weights(target)
+        try:
+            self.pipeline.unmerge_lora_weights(target)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
+
+    def _update_lora_metrics(self) -> None:
+        if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
+            self.metrics.update_lora(self.pipeline.get_lora_status())
 
     def list_loras(self) -> OutputBatch:
         """
@@ -1162,36 +1566,24 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    # torch.OutOfMemoryError exists only in some PyTorch builds
-    types = [torch.cuda.OutOfMemoryError]
-    if hasattr(torch, "OutOfMemoryError"):
-        types.append(torch.OutOfMemoryError)
-    return tuple(types)
+    return (torch.OutOfMemoryError,)
 
 
 def run_scheduler_process(
     local_rank: int,
     rank: int,
-    master_port: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
 ) -> None:
-    """
-    The entry point for the worker process.
-    Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
-    Ranks > 0 act as slaves, waiting for tasks from the master.
-    """
+    """Run a rank's scheduler and report readiness to the launching process."""
+    # Idempotent safeguard for direct callers; process bootstraps already
+    # initialized the platform before this module was imported.
+    initialize_current_platform()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():
@@ -1202,8 +1594,6 @@ def run_scheduler_process(
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     try:
@@ -1211,8 +1601,6 @@ def run_scheduler_process(
             server_args,
             gpu_id=rank,
             port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
@@ -1230,8 +1618,8 @@ def run_scheduler_process(
         if "scheduler" in locals():
             del scheduler
         gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if _device_initialized():
+            _device_module().empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

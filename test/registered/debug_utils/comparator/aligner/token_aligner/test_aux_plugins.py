@@ -16,8 +16,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
 from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 _sglang_plugin = _SGLangPlugin()
 _megatron_plugin = _MegatronPlugin()

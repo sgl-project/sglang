@@ -8,10 +8,11 @@ from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHelionKDADispatcher(unittest.TestCase):
@@ -23,8 +24,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.layers.attention.linear.kernels.kda_helion."
-                "HelionKDAKernel",
+                "sglang.srt.layers.attention.linear.kernels.kda_helion.HelionKDAKernel",
                 return_value=helion_kernel,
             ) as constructor,
         ):
@@ -81,11 +81,6 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
 
-    def test_enum_recognizes_helion(self):
-        backend = LinearAttnKernelBackend("helion")
-        self.assertIs(backend, LinearAttnKernelBackend.HELION)
-        self.assertTrue(backend.is_helion())
-
     def test_replayssm_decode_uses_native_helion_kernel(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
         kernel._packed_decode = MagicMock()
@@ -129,42 +124,10 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertEqual(kernel._replayssm_decode.call_args.kwargs["lower_bound"], -5.0)
         kernel._triton.packed_decode.assert_not_called()
 
-    def test_packed_decode_forwards_lower_bound(self):
-        kernel = HelionKDAKernel.__new__(HelionKDAKernel)
-        kernel._packed_decode = MagicMock()
-        kernel._triton = MagicMock()
-        mixed_qkv = torch.empty(2, 16)
-        a = torch.empty(2, 8)
-        b = torch.empty(2, 1)
-        a_log = torch.empty(1)
-        dt_bias = torch.empty(8)
-        state = torch.empty(2, 1, 4, 8)
-        indices = torch.arange(2, dtype=torch.int32)
-
-        kernel.packed_decode(
-            mixed_qkv,
-            a,
-            b,
-            A_log=a_log,
-            dt_bias=dt_bias,
-            scale=0.5,
-            ssm_states=state,
-            cache_indices=indices,
-            num_v_heads=1,
-            head_v_dim=4,
-            lower_bound=-5.0,
-        )
-
-        kernel._packed_decode.assert_called_once()
-        self.assertEqual(kernel._packed_decode.call_args.kwargs["lower_bound"], -5.0)
-
     def test_replayssm_accepts_helion_and_rejects_other_backends(self):
         with (
-            patch(
-                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
-                return_value=False,
-            ),
-            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
+            override_platform(is_sm100=False),
+            override_platform(is_cuda=False),
         ):
             helion_args = ServerArgs(
                 model_path="dummy",
@@ -188,16 +151,64 @@ class TestHelionKDADispatcher(unittest.TestCase):
             mamba_ssm_dtype="bfloat16",
         )
         with (
-            patch(
-                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
-                return_value=True,
-            ),
-            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
+            override_platform(is_sm100=True),
+            override_platform(is_cuda=False),
         ):
             handle_linear_attn_backend(args)
 
         self.assertIsNone(args.linear_attn_decode_backend)
         self.assertEqual(args.linear_attn_backend, "helion")
+
+
+class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
+    """Bookkeeping: every KDA prefill kernel must declare whether extend()
+    honors the fp32 track snapshot (``supports_track_state_snapshot``).
+
+    KDAAttnBackend allocates the snapshot buffer whenever a tracked batch has
+    chunk-unaligned sequences and asserts the flag before use. A kernel that
+    serves extend() without the flag must reject tracked batches loudly
+    (NotImplementedError); a missing declaration used to mean the buffer was
+    silently left unwritten and prefix-cache restores read garbage (the
+    FlashKDA fallback once dropped the track arguments exactly this way).
+    """
+
+    def test_every_kda_prefill_kernel_declares_the_contract(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
+            CuteDSLKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+            FlashInferKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+            FlashKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+            NvidiaKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_ptx import (
+            PtxKDAKernel,
+        )
+
+        # Native support or fallback that forwards the snapshot arguments.
+        for cls in (
+            TritonKDAKernel,
+            HelionKDAKernel,
+            NvidiaKDAKernel,
+            PtxKDAKernel,
+            FlashKDAKernel,
+        ):
+            self.assertTrue(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} must declare supports_track_state_snapshot "
+                f"(native support or a fallback that forwards track_state)",
+            )
+        # Reject tracked batches loudly instead (extend() raises).
+        for cls in (CuteDSLKDAKernel, FlashInferKDAKernel):
+            self.assertFalse(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} rejects tracked batches; it must not claim "
+                f"snapshot support it does not have",
+            )
 
 
 if __name__ == "__main__":

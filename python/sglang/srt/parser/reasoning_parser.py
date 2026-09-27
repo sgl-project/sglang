@@ -2,6 +2,8 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
@@ -43,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -75,11 +78,15 @@ class BaseReasoningFormatDetector:
         thinks_internally: bool = False,
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
+        tool_start_at_line_start: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self.think_excluded_tokens = think_excluded_tokens
         self.tool_start_token = tool_start_token
+        # Only a tool_start_token that begins a line interrupts reasoning, so
+        # the model mentioning the tag mid-sentence does not end the block.
+        self.tool_start_at_line_start = tool_start_at_line_start
         self.force_reasoning = force_reasoning
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
@@ -87,6 +94,7 @@ class BaseReasoningFormatDetector:
         self.reasoning_default = reasoning_default
 
         self._buffer = ""
+        self._streamed_reasoning_tail = ""
         self.stripped_think_start = False
         self.think_start_self_label = ""
 
@@ -106,12 +114,32 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
     ) -> StreamingParseResult:
         if self._force_nonempty_content and not ret.normal_text:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
+
+    def _find_tool_start(self, text: str, preceded_by: str = "") -> int:
+        """Index of the first tool_start_token that interrupts reasoning, or -1.
+
+        `preceded_by` is the character just before `text`, for a streaming
+        buffer whose leading newline was already emitted as reasoning."""
+        if not self.tool_start_token:
+            return -1
+        idx = text.find(self.tool_start_token)
+        while idx != -1:
+            prev = text[idx - 1] if idx > 0 else preceded_by
+            # Nothing precedes the token at the absolute start of generation;
+            # that counts as line start too.
+            if not self.tool_start_at_line_start or prev in ("", "\n"):
+                return idx
+            idx = text.find(self.tool_start_token, idx + 1)
+        return -1
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -139,13 +167,8 @@ class BaseReasoningFormatDetector:
             and self.think_end_token not in self.previous_content
         ):
             # Check for tool_start_token interruption
-            if (
-                in_reasoning
-                and self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
-                # Find the first occurrence of tool_start_token and split there
-                tool_idx = processed_text.find(self.tool_start_token)
+            tool_idx = self._find_tool_start(processed_text) if in_reasoning else -1
+            if tool_idx != -1:
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
@@ -153,7 +176,9 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             # Assume reasoning was truncated before end token
-            return StreamingParseResult(reasoning_text=processed_text)
+            return StreamingParseResult(
+                reasoning_text=self._strip_partial_tool_start(processed_text)
+            )
 
         # Extract reasoning content
         if self.think_end_token in processed_text:
@@ -228,8 +253,10 @@ class BaseReasoningFormatDetector:
         if self._in_reasoning:
             # Check for tool_start_token interruption. Streaming cannot see a
             # think_end_token that has not arrived yet; see the chunk_dependent test.
-            if self.tool_start_token and self.tool_start_token in current_text:
-                tool_idx = current_text.find(self.tool_start_token)
+            tool_idx = self._find_tool_start(
+                current_text, self._streamed_reasoning_tail
+            )
+            if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
@@ -251,9 +278,10 @@ class BaseReasoningFormatDetector:
                     for token in holdback_tokens
                 )
                 self._buffer = current_text[len(current_text) - holdback :]
-                return StreamingParseResult(
-                    reasoning_text=current_text[: len(current_text) - holdback]
-                )
+                reasoning_text = current_text[: len(current_text) - holdback]
+                if reasoning_text:
+                    self._streamed_reasoning_tail = reasoning_text[-1]
+                return StreamingParseResult(reasoning_text=reasoning_text)
             else:
                 return StreamingParseResult()
 
@@ -280,6 +308,21 @@ class BaseReasoningFormatDetector:
                 return i
         return 0
 
+    def _strip_partial_tool_start(self, text: str, preceded_by: str = "") -> str:
+        """Drop a trailing partial tool-start token that begins a line: generation
+        ended mid-tag, and flushing the fragment as reasoning would surface raw
+        markup to the client. `preceded_by` is as in `_find_tool_start`."""
+        if not self.tool_start_at_line_start or not text:
+            return text
+        n = self._ends_with_partial_token(text, self.tool_start_token or "")
+        if n == 0:
+            return text
+        start = len(text) - n
+        prev = text[start - 1] if start > 0 else preceded_by
+        if prev in ("", "\n"):
+            return text[:start]
+        return text
+
     def finish(self) -> StreamingParseResult:
         """Flush reasoning still buffered when the stream ends before the end token
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
@@ -295,6 +338,7 @@ class BaseReasoningFormatDetector:
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
         buffer = self._strip_leading_think_start(self._buffer)
+        buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
         if self._force_nonempty_content:
@@ -471,6 +515,63 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+class K2V3Detector(BaseReasoningFormatDetector):
+    """Reasoning detector for canonical K2 Horizon IFM tokens.
+
+    K2 Horizon's template prefills the opening token, so generated text starts
+    inside reasoning and this parser is always forced on. ``reasoning_effort``
+    selects the matching IFM token pair.
+    """
+
+    _EFFORT_TOKENS = {
+        "high": ("<ifm|think>", "</ifm|think>"),
+        "medium": ("<ifm|think_fast>", "</ifm|think_fast>"),
+        "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
+    }
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+        reasoning_effort: object = "high",
+    ):
+        if not force_reasoning:
+            raise ValueError("K2-v3 reasoning parser requires force_reasoning=True")
+
+        # Five release templates reject unsupported levels. The 0.9B template's
+        # fallback emits the medium token, so medium is the only possible wire
+        # format for an unsupported value that reaches generation.
+        effort = (
+            reasoning_effort
+            if isinstance(reasoning_effort, str)
+            and reasoning_effort in self._EFFORT_TOKENS
+            else "medium"
+        )
+        start_token, end_token = self._EFFORT_TOKENS[effort]
+        super().__init__(
+            start_token,
+            end_token,
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            # Common prefix of the singular and plural tool-call open tags.
+            # This also closes reasoning for a malformed turn that omits its
+            # explicit </ifm|think...> token.
+            tool_start_token="<ifm|tool_call",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="always",
+            force_nonempty_content=force_nonempty_content,
+        )
+        # Catalog only: scheduler-side request validation encodes these, but
+        # the active matcher must use just the delimiter selected above.
+        self.request_selectable_think_end_tokens = tuple(
+            tokens[1] for tokens in self._EFFORT_TOKENS.values()
+        )
+
+
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -484,6 +585,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     Post-reasoning content is unwrapped from the XTML ``response`` /
     ``message`` markers; a ``tools`` channel is passed through raw for the
     kimi_k3 tool-call detector.
+
+    The model does not always honour the pre-filled think channel: on very long
+    prompts (~1M tokens) it sometimes emits a zero-length think section and
+    writes the reply directly, closing with
+    ``<|close|>response<|sep|><|close|>message<|sep|>`` and never producing
+    ``<|close|>think<|sep|>`` or ``<|open|>response<|sep|>``. A bare
+    ``<|close|>response<|sep|>`` therefore proves the preceding text was the
+    response channel, and it is reported as content rather than reasoning
+    (see :meth:`_skipped_think_channel`).
     """
 
     def __init__(
@@ -492,6 +602,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -517,8 +628,14 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             reasoning_default="thinking",
         )
+        # Unlike the base class, K3 cannot use `normal_text == ""` alone:
+        # skipped-think and truncated marker-free reasoning end up identical.
+        self._force_nonempty_content = force_nonempty_content
         self._reasoning_done = False
         self._tools_passthrough = False
+        self._stream_text = ""
+        self._streamed_reasoning: list[str] = []
+        self._discard_delayed_think_close = False
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -534,22 +651,44 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         ]
         return min(found) if found else -1
 
+    @staticmethod
+    def _skipped_think_channel(
+        text: str,
+        start: int = 0,
+        think_close_idx: int = -1,
+        next_channel_idx: int = -1,
+    ) -> bool:
+        response_close_idx = text.find(RESPONSE_CLOSE, start)
+        return response_close_idx != -1 and all(
+            boundary_idx == -1 or response_close_idx < boundary_idx
+            for boundary_idx in (think_close_idx, next_channel_idx)
+        )
+
+    def _clean_skipped_think_content(self, text: str) -> str:
+        return self._clean_content(text.replace(self.think_end_token, ""))
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self.think_end_token not in text:
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._force_nonempty_content and self._is_skipped_think_answer(text):
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
         close_idx = text.find(self.think_end_token, start)
         tools_idx = text.find(self.tool_start_token, start)
+        channel_idx = self._next_channel_idx(text, start)
+        if self._skipped_think_channel(text, start, close_idx, channel_idx):
+            return StreamingParseResult(
+                normal_text=self._clean_skipped_think_content(text[start:])
+            )
         if close_idx != -1 and tools_idx != -1 and tools_idx < close_idx:
             return StreamingParseResult(
                 reasoning_text=strip_partial_marker_suffix(text[start:tools_idx]),
                 normal_text=self._clean_content(text[tools_idx:]),
             )
         if close_idx == -1:
-            channel_idx = self._next_channel_idx(text, start)
             if channel_idx != -1:
                 return StreamingParseResult(
                     reasoning_text=strip_partial_marker_suffix(text[start:channel_idx]),
@@ -565,8 +704,19 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             reasoning_text=reasoning_text, normal_text=self._clean_content(rest)
         )
 
+    def _is_skipped_think_answer(self, text: str) -> bool:
+        return (
+            self.think_start_token not in text
+            and self.think_end_token not in text
+            and self.think_start_token.removesuffix("<|sep|>") not in text
+            and self.think_end_token.removesuffix("<|sep|>") not in text
+            and (RESPONSE_CLOSE in text or MESSAGE_CLOSE in text)
+        )
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
+        if self._force_nonempty_content:
+            self._stream_text += new_text
 
         if not self._in_reasoning and not self._reasoning_done:
             open_idx = self._buffer.find(self.think_start_token)
@@ -590,22 +740,38 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             close_idx = buf.find(self.think_end_token)
             tools_idx = buf.find(self.tool_start_token)
+            channel_idx = self._next_channel_idx(buf)
+            if self._skipped_think_channel(
+                buf,
+                think_close_idx=close_idx,
+                next_channel_idx=channel_idx,
+            ):
+                replay = "".join(self._streamed_reasoning)
+                self._streamed_reasoning.clear()
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._discard_delayed_think_close = True
+                return StreamingParseResult(
+                    normal_text=(replay + self._drain_content()) or None
+                )
+
             if close_idx != -1 and not (tools_idx != -1 and tools_idx < close_idx):
                 reasoning_text = buf[:close_idx]
                 self._buffer = buf[close_idx + len(self.think_end_token) :]
                 self._in_reasoning = False
                 self._reasoning_done = True
+                self._streamed_reasoning.clear()
                 return StreamingParseResult(
                     reasoning_text=reasoning_text or None,
                     normal_text=self._drain_content() or None,
                 )
 
-            channel_idx = self._next_channel_idx(buf)
             if channel_idx != -1:
                 reasoning_text = strip_partial_marker_suffix(buf[:channel_idx])
                 self._buffer = buf[channel_idx:]
                 self._in_reasoning = False
                 self._reasoning_done = True
+                self._streamed_reasoning.clear()
                 self._tools_passthrough = buf.startswith(
                     self.tool_start_token, channel_idx
                 )
@@ -616,41 +782,87 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
+            markers = [
+                self.think_end_token,
+                self.tool_start_token,
+                RESPONSE_OPEN,
+                RESPONSE_CLOSE,
+                MESSAGE_CLOSE,
+            ]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = partial_suffix_len(buf, markers)
             emit = buf[: len(buf) - holdback] if holdback else buf
             emit = strip_partial_marker_suffix(emit)
             self._buffer = buf[len(emit) :]
+            self._streamed_reasoning.append(emit)
             return StreamingParseResult(reasoning_text=emit)
 
         return StreamingParseResult(normal_text=self._drain_content())
+
+    def finish(self) -> StreamingParseResult:
+        self._streamed_reasoning.clear()
+        if not self._force_nonempty_content:
+            return super().finish()
+        text, self._stream_text = self._stream_text, ""
+        if self._in_reasoning and self._is_skipped_think_answer(text):
+            # _in_reasoning means no channel decision happened mid-stream, so the
+            # answer went out as reasoning; without this gate the re-emit duplicates
+            # answers already streamed as content (RESPONSE_OPEN / force_reasoning=False).
+            self._buffer = ""
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._in_reasoning and not self.stream_reasoning and self._buffer:
+            # super().finish() would emit this buffer as content under
+            # force_nonempty_content — the leak the flag exists to prevent.
+            buffer, self._buffer = self._buffer, ""
+            return StreamingParseResult(reasoning_text=buffer)
+        return StreamingParseResult()
 
     def _drain_content(self) -> str:
         buf = self._buffer
         if not buf:
             return ""
         if self._tools_passthrough:
-            self._buffer = ""
-            return buf
+            holdback = (
+                partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            if self._discard_delayed_think_close:
+                emit = emit.replace(self.think_end_token, "")
+            return emit
 
         tools_idx = buf.find(TOOLS_OPEN)
         if tools_idx != -1:
-            head = buf[:tools_idx]
+            holdback = (
+                partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            head = emit[:tools_idx]
+            tail = emit[tools_idx:]
             for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
                 head = head.replace(marker, "")
+            if self._discard_delayed_think_close:
+                head = head.replace(self.think_end_token, "")
+                tail = tail.replace(self.think_end_token, "")
             self._tools_passthrough = True
-            self._buffer = ""
-            return head + buf[tools_idx:]
+            return head + tail
 
-        holdback = partial_suffix_len(
-            buf, [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
-        )
+        markers = [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
+        if self._discard_delayed_think_close:
+            markers.append(self.think_end_token)
+        holdback = partial_suffix_len(buf, markers)
         emit = buf[: len(buf) - holdback] if holdback else buf
         self._buffer = buf[len(emit) :]
         for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
             emit = emit.replace(marker, "")
+        if self._discard_delayed_think_close:
+            emit = emit.replace(self.think_end_token, "")
         return emit
 
 
@@ -875,6 +1087,71 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         )
 
 
+class GraniteThinkingDetector(BaseReasoningFormatDetector):
+    """Detector for Granite 4.2 thinking models (ibm-granite/granite-4.2-*).
+
+    Strips leading newlines from content after </think> — the Granite chat
+    template writes ``\\n</think>\\n``, so content starts with ``\\n``.
+    Matches the behavior of the HF plugin ``granite_thinking_parser.py``.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+        self._content_started = False
+        self._reasoning_seen = False
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = self._detect_and_parse_impl(text)
+        think_end_present = self.think_end_token in text
+        # HF plugin swaps when parsed content is absent (text ends at </think>);
+        # newline-only content the plugin strips itself, without swapping.
+        content_absent = think_end_present and not ret.normal_text
+        if think_end_present and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+        if (
+            self._force_nonempty_content
+            and not ret.normal_text
+            and (content_absent or not think_end_present)
+        ):
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        was_in_reasoning = self._in_reasoning
+        ret = super().parse_streaming_increment(new_text)
+        # Sampling only the pre-call state misses a whole think block arriving
+        # in one chunk; post-call evidence keeps stripping chunk-independent.
+        if (
+            was_in_reasoning
+            or self._in_reasoning
+            or self.stripped_think_start
+            or ret.reasoning_text
+        ):
+            self._reasoning_seen = True
+        if self._reasoning_seen and not self._content_started and ret.normal_text:
+            ret.normal_text = ret.normal_text.lstrip("\n")
+            if ret.normal_text:
+                self._content_started = True
+        return ret
+
+
 class MiniMaxM3Detector(BaseReasoningFormatDetector):
     """MiniMax-M3 detector. Format: (<mm:think>)*(.*)</mm:think>.
 
@@ -1062,6 +1339,11 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._pending_header = ""
         self._pending_reasoning = ""
 
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        del tokenizer
+        # Native framing IDs differ from encoding their printed names as plain text.
+        return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
         self._kind = None
@@ -1213,8 +1495,11 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # Leading "<" included: has_tool_call() matches on it.
-            tool_start_token=f"<{dsv4_dsml_token}",
+            # The reference parser splits reasoning at `\n\n<｜DSML｜tool_calls`;
+            # anchoring on the full tag at a line start keeps a mid-sentence
+            # mention of the tag inside reasoning from ending the block.
+            tool_start_token=f"<{dsv4_dsml_token}tool_calls>",
+            tool_start_at_line_start=True,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1223,6 +1508,15 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+
+class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
+    """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
+    so the unspaced V4 tool-start anchor never interrupts its reasoning."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
 
 
 class _MimoDetector(Qwen3Detector):
@@ -1933,11 +2227,13 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV41ReasoningDetector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
+        "k2_horizon": K2V3Detector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
@@ -1949,12 +2245,15 @@ class ReasoningParser:
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,
+        "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
+        "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }
@@ -2006,6 +2305,26 @@ class ReasoningParser:
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        if model_type.lower() == "granite_thinking_parser":
+            if chat_template_kwargs.get("enable_thinking") is False:
+                kwargs["force_nonempty_content"] = True
+
+        if model_type.lower() == "k2_horizon":
+            # Template kwargs are the final values passed to Jinja and therefore
+            # take precedence over the convenience fields on API requests.
+            effort = chat_template_kwargs.get("reasoning_effort")
+            if effort is None:
+                effort = getattr(request, "reasoning_effort", None)
+            if effort is None:
+                # The Responses API carries the same value in its standard
+                # nested shape (``reasoning.effort``). Prompt rendering already
+                # mirrors it into a ChatCompletionRequest; parsing must select
+                # the matching IFM delimiter as well.
+                reasoning = getattr(request, "reasoning", None)
+                effort = getattr(reasoning, "effort", None)
+            if effort is not None:
+                kwargs["reasoning_effort"] = effort
 
         if tokenizer is not None:
             sig = inspect.signature(detector_class)

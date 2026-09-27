@@ -404,9 +404,9 @@ class CustomAllReduceV2:
             yield
         finally:
             self._graph_mode_allowed = False
-        assert (
-            not torch.cuda.is_current_stream_capturing()
-        ), "Cannot register graph inputs while capturing CUDA graph"
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "Cannot register graph inputs while capturing CUDA graph"
+        )
         self._register_graph_inputs()
 
     def _register_graph_inputs(self) -> None:

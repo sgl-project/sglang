@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -23,6 +24,9 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.runtime_context import get_mm
+
+_FORCE_CPU_IMAGE_PREPROCESSING = envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -388,7 +392,7 @@ class KimiGPUProcessorWrapper:
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
-        if images and torch.cuda.is_available():
+        if images and not _FORCE_CPU_IMAGE_PREPROCESSING and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
@@ -509,7 +513,7 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    gpu_image_decode = not _FORCE_CPU_IMAGE_PREPROCESSING
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     # The GPU wrapper expands placeholders from the request's own token IDs.
@@ -595,7 +599,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # its GPU transport proxy lazy until that assignment is known, avoiding a full
         # image copy to every rank. The scheduler only honors this marker once
         # the processor has already set the item's hash and pad value.
-        if self.keep_mm_features_on_device and self.server_args.mm_enable_dp_encoder:
+        if self.keep_mm_features_on_device and get_mm().mm_enable_dp_encoder:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True

@@ -35,9 +35,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
     set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
     Hunyuan3DPaintUNet,
 )
@@ -62,7 +64,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 

@@ -50,23 +50,6 @@ def _causal_block_count(batch: Req, server_args: ServerArgs) -> int:
     return latent_frames // block_size
 
 
-def expand_longlive2_shot_prompts(
-    shot_prompts: list[str],
-    *,
-    num_blocks: int,
-    shot_durations: list[int] | None = None,
-    chunks_per_shot: int = 0,
-    scene_cut_prefix: str = LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX,
-) -> list[str]:
-    return expand_causal_block_prompts(
-        shot_prompts,
-        num_blocks=num_blocks,
-        shot_durations=shot_durations,
-        chunks_per_shot=chunks_per_shot,
-        scene_cut_prefix=scene_cut_prefix,
-    )[0]
-
-
 class LongLive2TextEncodingStage(TextEncodingStage):
     def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
         base = super().build_dedup_fingerprint(batch, server_args)
@@ -420,6 +403,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 )
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
+
+        total_iterations = len(block_sizes) * len(timesteps)
+        batch.record_stage_iterations(total_iterations, total_iterations)
 
         start_index = 0
         self._validate_block_prompt_count(batch, block_sizes)

@@ -44,7 +44,7 @@ def rerank_text_only():
 
     print("Results (sorted by relevance):")
     for i, result in enumerate(results):
-        print(f"  {i+1}. Score: {result['score']:.4f} - {result['document'][:60]}...")
+        print(f"  {i + 1}. Score: {result['score']:.4f} - {result['document'][:60]}...")
     print()
 
 
@@ -99,7 +99,7 @@ def rerank_with_images():
 
     print("Results (sorted by relevance):")
     for i, result in enumerate(results):
-        print(f"  {i+1}. Index: {result['index']}, Score: {result['score']:.4f}")
+        print(f"  {i + 1}. Index: {result['index']}, Score: {result['score']:.4f}")
     print()
 
 
@@ -149,7 +149,7 @@ def rerank_multimodal_query():
 
     print("Results (sorted by relevance):")
     for i, result in enumerate(results):
-        print(f"  {i+1}. Index: {result['index']}, Score: {result['score']:.4f}")
+        print(f"  {i + 1}. Index: {result['index']}, Score: {result['score']:.4f}")
     print()
 
 

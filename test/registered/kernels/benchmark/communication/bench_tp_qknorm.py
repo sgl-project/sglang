@@ -36,6 +36,7 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -88,7 +89,7 @@ def _precompile_kernels(num_gpus: List[int]) -> None:
         p.join()
         if p.exitcode != 0:
             raise RuntimeError(
-                f"TP QKNorm precompile failed for {world_size=} " f"(exit {p.exitcode})"
+                f"TP QKNorm precompile failed for {world_size=} (exit {p.exitcode})"
             )
 
 
@@ -108,6 +109,7 @@ def _init_cpu_group() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
+    get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
     torch.cuda.set_stream(torch.cuda.Stream())

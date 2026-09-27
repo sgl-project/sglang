@@ -365,10 +365,22 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                     k_tensor = qkv_tensor[hidden_size : 2 * hidden_size, :]
                     v_tensor = qkv_tensor[2 * hidden_size : 3 * hidden_size, :]
 
-                yield f"single_transformer_blocks.{block_idx}.attn.to_q.{param_type}", q_tensor
-                yield f"single_transformer_blocks.{block_idx}.attn.to_k.{param_type}", k_tensor
-                yield f"single_transformer_blocks.{block_idx}.attn.to_v.{param_type}", v_tensor
-                yield f"single_transformer_blocks.{block_idx}.proj_mlp.{param_type}", mlp_tensor
+                yield (
+                    f"single_transformer_blocks.{block_idx}.attn.to_q.{param_type}",
+                    q_tensor,
+                )
+                yield (
+                    f"single_transformer_blocks.{block_idx}.attn.to_k.{param_type}",
+                    k_tensor,
+                )
+                yield (
+                    f"single_transformer_blocks.{block_idx}.attn.to_v.{param_type}",
+                    v_tensor,
+                )
+                yield (
+                    f"single_transformer_blocks.{block_idx}.proj_mlp.{param_type}",
+                    mlp_tensor,
+                )
             elif name == "final_layer.adaLN_modulation.1.weight":
                 # ComfyUI: output order is [shift, scale]
                 # AdaLayerNormContinuous: expects [scale, shift]

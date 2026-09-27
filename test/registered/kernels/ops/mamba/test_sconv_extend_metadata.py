@@ -16,6 +16,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_SEQ_MINUS_EXT,
     HIS_ZEROS,
     PAD_SLOT_ID,
+    SconvMetadataOut,
     fused_extend_sconv_metadata,
     precompute_helion_extend_metadata,
 )
@@ -27,8 +28,8 @@ register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
-# cross si tiles (BLOCK_T=256) and the single-tile B bound
-BATCH_SIZES = [1, 2, 7, 64, 257, 1023]
+# Cross si tiles (BLOCK_T=128/256) and the single-tile B bound.
+BATCH_SIZES = [1, 2, 7, 64, 257, 1023, 1024, 1264, 2047]
 EXTEND_CASES = get_ci_test_range(
     [
         (b, his_mode, lens_dtype)
@@ -43,10 +44,17 @@ EXTEND_CASES = get_ci_test_range(
         (64, HIS_ZEROS, torch.int64),
         (257, HIS_PREFIX, torch.int32),
         (1023, HIS_SEQ_MINUS_EXT, torch.int64),
+        (1024, HIS_ZEROS, torch.int32),
+        (1264, HIS_PREFIX, torch.int64),
+        (2047, HIS_SEQ_MINUS_EXT, torch.int64),
     ],
 )
 VERIFY_CASES = get_ci_test_range(
-    [(b, draft_token_num) for draft_token_num in (1, 9) for b in BATCH_SIZES],
+    [
+        (b, draft_token_num)
+        for draft_token_num in (1, 3, 9)
+        for b in BATCH_SIZES + [2048]
+    ],
     [
         (1, 1),
         (2, 9),
@@ -54,6 +62,23 @@ VERIFY_CASES = get_ci_test_range(
         (64, 9),
         (257, 1),
         (1023, 9),
+        (1024, 3),
+        (1264, 3),
+        (2047, 9),
+        (2048, 3),
+    ],
+)
+GRAPH_REPLAY_CASES = get_ci_test_range(
+    [
+        (b, his_mode)
+        for b in (1024, 1264, 2047)
+        for his_mode in (HIS_ZEROS, HIS_PREFIX, HIS_SEQ_MINUS_EXT, HIS_ONES)
+    ],
+    [
+        (1024, HIS_ZEROS),
+        (1264, HIS_PREFIX),
+        (2047, HIS_SEQ_MINUS_EXT),
+        (1264, HIS_ONES),
     ],
 )
 
@@ -163,6 +188,68 @@ def test_verify_matches_unfused(b, draft_token_num):
 
 
 @requires_cuda
+@pytest.mark.parametrize("b,his_mode", GRAPH_REPLAY_CASES)
+def test_large_extend_cuda_graph_replay(b, his_mode):
+    """Large MTP batches refresh static metadata after lengths/PAD slots change."""
+    draft_token_num = 3
+    cache_indices = _cache_indices(b, torch.int64)
+    lens = torch.full((b,), draft_token_num, dtype=torch.int64, device="cuda")
+    his_src = lens + 1
+
+    def reference():
+        if his_mode == HIS_ONES:
+            return _ref_verify(b, draft_token_num, cache_indices)
+        return _ref_extend(
+            b, lens, his_mode, his_src, cache_indices, b * draft_token_num
+        )
+
+    ref = reference()
+    out = SconvMetadataOut(
+        query_start_loc=torch.empty_like(ref[0]),
+        has_initial_state=torch.empty_like(ref[1]),
+        **{key: torch.empty_like(value) for key, value in ref[2].items()},
+    )
+
+    def refresh():
+        return fused_extend_sconv_metadata(
+            B=b,
+            T=b * draft_token_num,
+            cache_indices=cache_indices,
+            his_mode=his_mode,
+            draft_token_num=draft_token_num,
+            extend_seq_lens=lens,
+            his_src=his_src,
+            out=out,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        assert refresh() is not None  # Compile before graph capture.
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        got = refresh()
+    assert got is not None
+    assert got[0].data_ptr() == out["query_start_loc"].data_ptr()
+    assert got[1].data_ptr() == out["has_initial_state"].data_ptr()
+    for key, value in got[2].items():
+        assert value.data_ptr() == out[key].data_ptr()
+
+    for offset in (0, 1):
+        cache_indices.copy_(torch.arange(b, dtype=torch.int64, device="cuda"))
+        cache_indices[offset::2] = PAD_SLOT_ID
+        lens.fill_(draft_token_num)
+        lens[offset::3] = 0
+        his_src.copy_(lens + 1)
+        his_src[offset::2] = 0
+        ref = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_equal(got, ref)
+
+
+@requires_cuda
 def test_cu_not_spanning_T():
     """Dummy capture sequences: cu stops short of T; trailing si rows clamp to
     B-1 exactly like the reference's searchsorted + clamp."""
@@ -186,7 +273,7 @@ def test_cu_not_spanning_T():
 
 @requires_cuda
 def test_fallback_past_batch_bound():
-    b = 1024  # > _FUSED_EXTEND_MAX_B
+    b = 2048  # > _FUSED_EXTEND_MAX_B
     lens = torch.ones(b, dtype=torch.int64, device="cuda")
     got = fused_extend_sconv_metadata(
         B=b,

@@ -13,21 +13,16 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
-    get_device_sm,
-    is_cuda,
-    is_hip,
+    is_gfx95_supported,
     is_mnnvl_fabric_device,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
 )
 from sglang.utils import is_in_ci
 
@@ -79,7 +74,7 @@ def handle_ssl_validation(server_args: Any):
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
             raise ValueError(
-                "--http2-max-concurrent-streams must be between 1 and " "4294967295."
+                "--http2-max-concurrent-streams must be between 1 and 4294967295."
             )
         if not 1024 <= cfg.http2_initial_connection_window_size < 2**31:
             raise ValueError(
@@ -339,6 +334,9 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=cfg.port + 10000,
         )
 
+    if cfg.grpc_response_timeout_secs <= 0:
+        raise ValueError("--grpc-response-timeout-secs must be positive")
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(
@@ -347,8 +345,7 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
             raise ValueError(
-                "SGLANG_GRPC_WORKER_THREADS "
-                f"({cfg.grpc_worker_threads}) must be >= 1"
+                f"SGLANG_GRPC_WORKER_THREADS ({cfg.grpc_worker_threads}) must be >= 1"
             )
 
     # Native gRPC is incompatible with launch paths it doesn't wire into.
@@ -409,7 +406,7 @@ def handle_environment_variables(server_args: Any):
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
     if cfg.debug_cuda_graph:
-        if not (is_cuda() or is_hip()):
+        if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(
                 "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                 "Disabling breakable CUDA graph."
@@ -424,28 +421,30 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        is_sm100_supported() or is_sm120_supported()
+        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-            "DeepGEMM FP4 indexer support."
+            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "with FP4 indexer support."
         )
-    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-    # it, mirroring the forward scale split: the ue8m0 path
-    # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-    # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-    if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
+    # run it, mirroring the forward scale split: the default sm100 UE8M0
+    # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
+    # SM120 API compatibility is centralized in deep_gemm_wrapper.configurer.
+    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
-        sm = get_device_sm()
+        sm = get_platform().device_sm
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
         supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm90_supported() and explicit
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_platform().is_sm90
+            and explicit
         )
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and a compatible sm100/sm120 build, or explicit opt-in on sm90; "
                 "detected sm%d.",
                 sm,
             )
@@ -469,23 +468,20 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and (
-            cfg.hicache_storage_backend is not None
-            or cfg.hicache_write_policy != "write_back"
+        elif cfg.enable_hierarchical_cache and not (
+            (
+                cfg.hicache_storage_backend is None
+                and cfg.hicache_write_policy in ("write_back", "write_through")
+            )
+            or (
+                cfg.hicache_storage_backend is not None
+                and cfg.hicache_host_memory_mode == "buffer_only"
+                and cfg.hicache_write_policy == "write_through"
+            )
         ):
             logger.warning(
-                "Optimistic prefill only supports L2 hierarchical cache "
-                "with write-back policy"
-            )
-            declare_resolution(
-                server_args,
-                "_handle_other_validations",
-                optimistic_prefill_attempts=0,
-            )
-        elif resolved_view(server_args).uses_mamba_radix_cache:
-            logger.warning(
-                "Optimistic prefill does not support models that use "
-                "mamba radix cache."
+                "Optimistic prefill supports L2 write-back/write-through or "
+                "L3 buffer-only write-through hierarchical cache"
             )
             declare_resolution(
                 server_args,
@@ -749,27 +745,14 @@ def handle_multimodal_feature_transport(server_args: Any):
 
     CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
     memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
-    variable remain supported so existing deployments map to this policy.
+    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
+    remains supported so existing deployments map to this policy.
     """
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
     legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
-
-    if cfg.keep_mm_feature_on_device:
-        if requested_transport not in (None, "cuda_ipc"):
-            raise ValueError(
-                "--keep-mm-feature-on-device conflicts with "
-                f"--mm-feature-transport={requested_transport}. Use only "
-                "--mm-feature-transport=cuda_ipc."
-            )
-        requested_transport = "cuda_ipc"
-        logger.warning(
-            "--keep-mm-feature-on-device is deprecated; using "
-            "--mm-feature-transport=cuda_ipc instead."
-        )
 
     if requested_transport is None:
         if legacy_ipc_is_set:
@@ -788,7 +771,7 @@ def handle_multimodal_feature_transport(server_args: Any):
             )
         elif (
             model_config_of(server_args).is_multimodal
-            and is_cuda()
+            and get_platform().is_cuda
             and cfg.disaggregation_mode == "null"
         ):
             # A full GPU pool always degrades to CPU transport per tensor.
@@ -849,17 +832,11 @@ def handle_multimodal_feature_transport(server_args: Any):
         requested_transport = "cpu"
 
     if requested_transport == "cuda_vmm":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")
         if cfg.pp_size != 1:
             raise ValueError(
-                "--mm-feature-transport=cuda_vmm does not support pipeline "
-                "parallelism."
-            )
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--mm-feature-transport=cuda_vmm is not supported with "
-                "SGLANG_RUST_SERVER."
+                "--mm-feature-transport=cuda_vmm does not support pipeline parallelism."
             )
         pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
         handle_kind = "CUDA FABRIC" if cfg.nnodes > 1 else "POSIX FD"
@@ -875,7 +852,7 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
 
     if requested_transport == "cuda_ipc":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_ipc requires NVIDIA CUDA.")
         if cfg.nnodes != 1:
             raise ValueError(
@@ -903,13 +880,35 @@ def handle_multimodal_feature_transport(server_args: Any):
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
     )
-    # The bounded IPC pool owns device residency. Do not retain unpooled
-    # tensors after a pool miss, which would make HBM use request-dependent.
-    declare_resolution(
-        server_args,
-        "_handle_multimodal_feature_transport",
-        keep_mm_feature_on_device=False,
-    )
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"
     )
+
+
+_ssl_verify_warned = False
+
+
+def ssl_verify_of(cfg: Any):
+    """What to pass as the requests library's ``verify=``.
+
+    A CA file means validate against it. SSL configured without one means
+    verification off -- self-signed certificates in development -- and that is
+    worth saying out loud, once. No SSL means the system CA bundle.
+
+    The warning is once per process: the message is about how this process was
+    configured, and a second engine repeating it says nothing new.
+    """
+    global _ssl_verify_warned
+    if cfg.ssl_ca_certs:
+        return cfg.ssl_ca_certs
+    if cfg.ssl_certfile:
+        if not _ssl_verify_warned:
+            logger.warning(
+                "SSL is enabled but --ssl-ca-certs was not provided. Certificate "
+                "verification is DISABLED for internal health checks. For "
+                "production deployments, provide --ssl-ca-certs or use CA-signed "
+                "certificates."
+            )
+            _ssl_verify_warned = True
+        return False
+    return True
