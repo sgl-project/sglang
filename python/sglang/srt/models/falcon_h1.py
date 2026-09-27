@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -457,7 +456,7 @@ class FalconH1ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
         self.quant_config = quant_config
         self.model = FalconH1Model(

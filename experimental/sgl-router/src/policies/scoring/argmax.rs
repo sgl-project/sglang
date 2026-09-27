@@ -52,10 +52,13 @@ impl Selector for Argmax {
             );
             band = (0..workers.len()).collect();
         }
-        let min_load = band.iter().map(|&i| workers[i].active_load()).min()?;
+        let min_load = band
+            .iter()
+            .map(|&i| workers[i].router_inflight_load())
+            .min()?;
         let tied: Vec<usize> = band
             .into_iter()
-            .filter(|&i| workers[i].active_load() == min_load)
+            .filter(|&i| workers[i].router_inflight_load() == min_load)
             .collect();
         let k = self.rotor.fetch_add(1, Ordering::Relaxed) % tied.len();
         Some(tied[k])

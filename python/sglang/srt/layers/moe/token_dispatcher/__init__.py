@@ -12,6 +12,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputChecker,
     DispatchOutputFormat,
+    RoutewiseCombineInput,
+    RoutewiseLayout,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
@@ -67,6 +69,8 @@ __all__ = [
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
+    "RoutewiseCombineInput",
+    "RoutewiseLayout",
     "FlashinferDispatchOutput",
     "FlashinferDispatcher",
     "MooncakeCombineInput",

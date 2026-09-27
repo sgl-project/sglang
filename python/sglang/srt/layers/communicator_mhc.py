@@ -18,7 +18,6 @@ from typing import Callable, Optional
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.communication_op import (
     attention_tensor_model_parallel_all_reduce,
 )
@@ -30,11 +29,13 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    CommunicateWithAllReduceAndLayerNormFn,
+    FfnCompletion,
     LayerCommunicator,
     LayerScatterModes,
+    MlpInputKind,
     ScatterMode,
     get_attn_tp_context,
+    mlp_input_kind,
     tp_reduce_scatter,
 )
 from sglang.srt.layers.dp_attention import (
@@ -50,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
@@ -58,7 +60,7 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
     )
     total_tokens = forward_batch.input_ids.shape[0]
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-    get_tp_group().all_gather_into_tensor(output, hidden_states)
+    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
 
     return output
 
@@ -72,6 +74,7 @@ class MHCState:
     hc_attn_pre: Callable
     hc_ffn_pre: Callable
     hc_post: Callable
+    hc_ffn_post_pre: Optional[Callable] = None
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
@@ -94,9 +97,26 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
+            # Returns None when it declines -- no fused kernel for this platform
+            # or shape, or a shape the fusion is slower at -- and the chain runs.
+            fused = self.hc_ffn_post_pre(
+                hidden_states=hidden_states,
+                residual=residual,
+                h_res=self.h_res,
+                h_post=self.h_post,
+                out_norm_weight=out_norm_weight,
+                out_norm_eps=out_norm_eps,
+            )
+            if fused is not None:
+                hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
+                if out_norm is not None and not norm_fused:
+                    hidden_states = out_norm(hidden_states)
+                return hidden_states, residual
+
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -112,35 +132,7 @@ class MHCState:
         self.h_post = None
 
 
-class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayerNormFn):
-    @staticmethod
-    def get_fn(
-        hidden_states_input_mode: ScatterMode,
-        residual_input_mode: ScatterMode,
-        hidden_states_output_mode: ScatterMode,
-        residual_output_mode: ScatterMode,
-        context: CommunicateContext,
-    ):
-        fn = CommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode,
-            residual_input_mode,
-            hidden_states_output_mode,
-            residual_output_mode,
-            context,
-        )
-        replacements = {
-            CommunicateWithAllReduceAndLayerNormFn._simple: MHCCommunicateWithAllReduceAndLayerNormFn._simple,
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual: MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-            CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual: MHCCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
-        }
-        if isinstance(fn, partial):
-            return partial(
-                replacements.get(fn.func, fn.func),
-                *fn.args,
-                **(fn.keywords or {}),
-            )
-        return replacements.get(fn, fn)
-
+class MHCCommunicateWithAllReduceAndLayerNormFn:
     @staticmethod
     def _scatter_hidden_states_and_residual(
         hidden_states: torch.Tensor,
@@ -199,7 +191,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
             return hidden_states, hidden_states
 
         scatter_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
-        get_tp_group().reduce_scatter_tensor(scatter_states, hidden_states)
+        get_parallel().tp_group.reduce_scatter_tensor(scatter_states, hidden_states)
 
         scatter_states, residual = mhc.attn_to_mlp(
             scatter_states, residual, out_norm=layernorm
@@ -238,7 +230,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
         if context.attn_dp_size != 1:
             if hidden_states.shape[0] != 0:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = mhc.attn_to_mlp(
@@ -248,7 +240,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                 hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -305,7 +297,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             hidden_states = local_states.new_empty(
                 local_states.shape[0] * context.tp_size, *local_states.shape[1:]
             )
-            get_tp_group().all_gather_into_tensor(hidden_states, local_states)
+            get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
 
         return hidden_states, None
 
@@ -322,13 +314,13 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         **kwargs,
     ):
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer_mhc(get_tp_group(), 1),
+            get_local_dp_buffer_mhc(get_parallel().tp_group, 1),
             hidden_states,
         )
         # MoE skips its post-expert all-reduce with reduce_scatterv, so this
         # scatter must reduce while combining local-expert partial sums.
         if should_use_dp_reduce_scatterv():
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
@@ -362,7 +354,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
         hidden_states, local_hidden_states = (
             get_local_dp_buffer_mhc(
-                get_tp_group(), 1 if is_last_layer else mhc.hc_mult
+                get_parallel().tp_group, 1 if is_last_layer else mhc.hc_mult
             ),
             hidden_states,
         )
@@ -392,13 +384,15 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
 
 class MHCLayerCommunicator(LayerCommunicator):
+    # Chooses its own boundary steps, not from the declarations.
+    _takes_declared_boundaries = False
+
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         *,
         is_first_layer: bool,
@@ -406,6 +400,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        hc_ffn_post_pre: Optional[Callable] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -413,6 +408,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            hc_ffn_post_pre=hc_ffn_post_pre,
         )
 
         super().__init__(
@@ -420,7 +416,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 
@@ -438,15 +433,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = (
-            MHCCommunicateWithAllReduceAndLayerNormFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
-                residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
-                residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
-                context=self._context,
-            )
-        )
         self._communicate_summable_tensor_pair_fn = (
             MHCCommunicateSummableTensorPairFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
@@ -462,6 +448,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        self.publish_attn_lora_layout()
         if self.is_first_layer:
             if get_attn_tp_context().input_scattered:
                 hidden_states, _ = tp_reduce_scatter(
@@ -500,26 +487,21 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         return hidden_states, residual
 
-    def prepare_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cache=None,
-    ):
-        if cache is not None:
-            self._context.cache = cache
-
-        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
-            context=self._context,
-            mhc=self.mhc,
-        )
-
-        return hidden_states, residual
+    def _select_mlp_input(self):
+        """MHC's own implementation of each boundary kind, applied to this
+        layer's MHC state."""
+        kind = mlp_input_kind(self.layer_scatter_modes, self._context)
+        residual_input_mode = self.layer_scatter_modes.layer_input_mode
+        fns = MHCCommunicateWithAllReduceAndLayerNormFn
+        if kind is MlpInputKind.NORM:
+            return partial(fns._simple, mhc=self.mhc), False
+        if kind is MlpInputKind.GATHER:
+            fn = fns._gather_hidden_states_and_residual
+        elif kind is MlpInputKind.SCATTER:
+            fn = fns._scatter_hidden_states_and_residual
+        else:
+            raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
+        return partial(fn, residual_input_mode=residual_input_mode, mhc=self.mhc), False
 
     def postprocess_layer(self, hidden_states, residual, forward_batch):
         hidden_states, residual = self._communicate_summable_tensor_pair_fn(
@@ -535,8 +517,19 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         return hidden_states, residual
 
-    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-        return False
+    def _select_ffn_completion(self, forward_batch: ForwardBatch) -> FfnCompletion:
+        """An MHC layer's own postprocess completes its FFN output, combining the
+        hyper-connection streams; nothing is left to the next layer."""
+        return FfnCompletion(
+            defer_moe_finalize=False,
+            fuse_mlp_allreduce=False,
+            mlp_reduce_scatter=self.should_use_reduce_scatter(forward_batch),
+            complete=partial(
+                self._complete_ffn_output_now,
+                forward_batch=forward_batch,
+                dp_step=None,
+            ),
+        )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:

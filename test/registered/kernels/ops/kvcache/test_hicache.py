@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -11,10 +12,15 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -32,6 +38,83 @@ MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
 STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
+
+
+@pytest.mark.parametrize("direction", ["d2h", "h2d"])
+@pytest.mark.parametrize("backend", ["direct", "kernel"])
+@pytest.mark.skipif(not is_cuda(), reason="Uses a delayed CUDA producer stream")
+def test_unified_l2_waits_for_index_producer(direction, backend):
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    bundle = init_unified_swa_pools(
+        device=DEVICE,
+        kv_cache_dtype=torch.float16,
+        head_num=1,
+        head_dim=4,
+        v_head_dim=4,
+        swa_head_num=1,
+        swa_head_dim=4,
+        swa_v_head_dim=4,
+        page_size=1,
+        start_layer=0,
+        end_layer=2,
+        swa_attention_layer_ids=[1],
+        full_attention_layer_ids=[0],
+        total_bytes=4096,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+    )
+    device_pool = bundle.token_to_kv_pool.full_kv_pool
+    host_pool = UnifiedPageEnvelopeHostPool(
+        device_pool,
+        1.0,
+        0,
+        1,
+        "layer_first",
+        pin_memory=True,
+        allocator_type="default",
+    )
+    engine = L2TransferEngine(backend)
+    producer = torch.cuda.Stream()
+    allocator = bundle.token_to_kv_pool_allocator
+    virtual_indices = allocator.alloc(5)
+    device_indices = virtual_indices[:1].clone()
+    host_indices = host_pool.alloc(1)
+    transfer = L2Transfer(host_pool, device_pool, host_indices, device_indices)
+    device_pages = device_pool.get_page_envelope_buffer()
+    try:
+        # Warm both copy paths before creating the delayed producer dependency.
+        engine.submit_device_to_host([transfer]).finish_event.synchronize()
+        engine.submit_host_to_device(
+            [transfer], transfer_layer_id_max=1
+        ).finish_event.synchronize()
+        device_pages.zero_()
+        physical_pages = allocator.translate_kv_indices_for_transfer(virtual_indices)
+        first_page, last_page = int(physical_pages[0]), int(physical_pages[-1])
+        device_pages[last_page].fill_(77)
+        host_pool.get_data_page(int(host_indices[0])).fill_(33)
+        producer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(400_000_000)
+            device_indices.copy_(virtual_indices[-1:])
+            if direction == "d2h":
+                completion = engine.submit_device_to_host([transfer])
+            else:
+                ready = torch.cuda.Event()
+                ready.record()
+                completion = engine.submit_host_to_device(
+                    [transfer], transfer_layer_id_max=1, start_event=ready
+                )
+        completion.finish_event.synchronize()
+        if direction == "d2h":
+            assert torch.all(host_pool.get_data_page(int(host_indices[0])) == 77)
+        else:
+            assert torch.all(device_pages[last_page] == 33)
+            assert torch.all(device_pages[first_page] == 0)
+    finally:
+        producer.synchronize()
+        host_pool.destroy()
+        reset_context()
 
 
 def _token_indices_for_pages(

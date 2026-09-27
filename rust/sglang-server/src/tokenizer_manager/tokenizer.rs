@@ -158,7 +158,7 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
 /// The `auto_specials` prefix (probed once at construction, Python's
 /// `encode("")` probe) is stripped from template-rendered prompts —
 /// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
-/// extra BOS/EOS while native text keeps the post-processor specials.
+/// extra BOS/EOS while plain text keeps the post-processor specials.
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
@@ -347,7 +347,7 @@ mod tests {
             };
             g.input_ids.clone().expect("tokenized")
         };
-        assert_eq!(run(false), vec![0, 2], "native prompts keep specials");
+        assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
     }
 }
