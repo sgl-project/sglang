@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
+from sglang.srt.mem_cache.hisparse_spec_runtime import eager_hisparse_worker_boundary
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -1399,6 +1400,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    @eager_hisparse_worker_boundary
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

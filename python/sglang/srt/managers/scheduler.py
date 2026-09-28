@@ -3605,14 +3605,22 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # Stash last token into relay; resolve_forward_inputs will gather.
-        last_tokens = torch.tensor(
-            [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
-        )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        # Native speculation retained full prefill draft state per request.
+        # Replacing it with bonus-only payload would lose hidden states/top-k.
+        if self.spec_algorithm.is_none():
+            last_tokens = torch.tensor(
+                [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
+            )
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
         batch.input_ids = None
+        if not self.spec_algorithm.is_none():
+            from sglang.srt.mem_cache.hisparse_spec_runtime import (
+                restore_staging_drafts,
+            )
+
+            batch.spec_info = restore_staging_drafts(reqs)
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]

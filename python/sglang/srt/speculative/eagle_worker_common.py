@@ -561,17 +561,34 @@ def run_eagle_verify(
         if not _is_npu or can_run_cuda_graph:
             verify_forward_batch.mark_forward_metadata_ready()
 
+    transaction = getattr(batch, "hisparse_spec_transaction", None)
+    if transaction is not None and not batch.forward_mode.is_idle():
+        from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+
+        if can_run_cuda_graph or topk != 1:
+            raise ValueError("HiSparse verifier requires eager topk1")
+        transaction.prepare(
+            batch,
+            verify_forward_batch,
+            num_draft_tokens,
+            get_alloc_reserve_per_decode(),
+        )
+
     # Run target verify batch in the main compute stream (GPU compute).
     # Metadata init is skipped iff cuda-graph already ran load_batch —
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-        pp_proxy_tensors=pp_proxy_tensors,
-    )
+    try:
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+    finally:
+        if transaction is not None:
+            transaction.target_done()
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
@@ -599,6 +616,8 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
     )
+    if transaction is not None and not batch.forward_mode.is_idle():
+        transaction.commit(accept_lens, accept_index)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

@@ -90,6 +90,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     hf_config = model_config_of(server_args).hf_config
+    from sglang.srt.mem_cache.hisparse_spec_runtime import validate_eager_layout
+
+    validate_eager_layout(cfg, hf_config)
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_m3_hisparse = is_minimax_sparse(hf_config)
     is_hip = get_platform().is_hip

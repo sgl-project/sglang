@@ -510,6 +510,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    # Eager-only residency transaction; never passed to captured graph replay.
+    hisparse_spec_transaction: Optional[object] = None
 
     # The write loc before `rebind_write_loc` replaced it with kernel-facing
     # ids; a backend re-derives from it into its capture-stable buffer.

@@ -751,17 +751,41 @@ def alloc_for_spec_decode(
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
             )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
+            from sglang.srt.mem_cache.allocator.hisparse import (
+                HiSparseTokenToKVPoolAllocator,
             )
+            from sglang.srt.environ import envs
+
+            allocator = tree_cache.token_to_kv_pool_allocator
+            if isinstance(allocator, HiSparseTokenToKVPoolAllocator):
+                if not envs.SGLANG_HISPARSE_SPECULATIVE_EAGER.get():
+                    raise ValueError(
+                        "HiSparse speculative allocation requires eager opt-in"
+                    )
+                out_cache_loc = allocator.alloc_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+                if out_cache_loc is None:
+                    raise MemoryError(
+                        "HiSparse speculative logical reservation exhausted"
+                    )
+            else:
+                out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(

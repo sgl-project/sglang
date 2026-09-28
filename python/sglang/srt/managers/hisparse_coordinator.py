@@ -430,6 +430,8 @@ class HiSparseCoordinator:
             adapter.admit(req)
 
     def _speculative_teardown(self, req):
+        if hasattr(req, "hisparse_staging_draft"):
+            del req.hisparse_staging_draft
         adapter = getattr(self, "_speculative_verifier", None)
         if adapter is not None and req.kv.req_pool_idx in adapter.owners:
             adapter.teardown(req)

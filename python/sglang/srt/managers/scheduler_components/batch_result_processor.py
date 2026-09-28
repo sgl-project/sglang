@@ -382,6 +382,12 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
+                            if not batch.spec_algorithm.is_none():
+                                from sglang.srt.mem_cache.hisparse_spec_runtime import (
+                                    save_staging_draft,
+                                )
+
+                                save_staging_draft(req, batch.spec_info, i)
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     if sampling_mask_finish_reason is None:
