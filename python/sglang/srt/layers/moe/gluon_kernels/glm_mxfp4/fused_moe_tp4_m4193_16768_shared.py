@@ -613,7 +613,7 @@ def _project_experts(w13, w13_scale, w2, w2_scale, work, expert_start, local_exp
     up_columns, up_k = (256, 256)
     down_columns, down_k = (256, 512)
     _w13_projection[work.capacity // work.block_m * (2 * intermediate // up_columns),](work.xq, work.xs, w13, w13_scale, work.sorted_routes, work.experts, work.aq, work.aqs, expert_start, 2 * intermediate, h, m, work.block_m, up_columns, up_k, local_experts, enable_fp_fusion=False)
-    _w2_projection[work.down_tiles * (h // down_columns),](work.aq, work.aqs, w2, w2_scale, work.weight_minimum, work.down_experts, work.parts, work.codes, work.headers, expert_start, h, intermediate, m, down_columns, down_k, work.payload_pitch, work.scale_codec, local_experts, enable_fp_fusion=False, waves_per_eu=2, llvm_fn_attrs=[['amdgpu-sched-strategy', 'iterative-ilp']])
+    _w2_projection[work.down_tiles * (h // down_columns),](work.aq, work.aqs, w2, w2_scale, work.weight_minimum, work.down_experts, work.parts, work.codes, work.headers, expert_start, h, intermediate, m, down_columns, down_k, work.payload_pitch, work.scale_codec, local_experts, enable_fp_fusion=False, waves_per_eu=2)
 
 def _finish(w2, w2_scale, work, local_experts):
     m, h = work.output.shape
