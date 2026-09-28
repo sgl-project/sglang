@@ -2373,6 +2373,8 @@ class MQALayer(MqaAttentionBase):
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
                 )
+            # Only heads [tp_slice] may be read: with
+            # SGLANG_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY the other heads of `o` are stale.
             o = o[:, tp_slice, :]
         if (
             self.wo_a_fp8

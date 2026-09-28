@@ -18,6 +18,8 @@ from typing import (
 import msgspec
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
@@ -134,6 +136,36 @@ _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _copy_tp_local_heads_kernel(
+    src_ptr, dst_ptr, src_stride, dst_stride, n_elems, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elems
+    x = tl.load(src_ptr + row.to(tl.int64) * src_stride + offs, mask=mask)
+    tl.store(dst_ptr + row.to(tl.int64) * dst_stride + offs, x, mask=mask)
+
+
+def copy_tp_local_heads(dst: torch.Tensor, src: torch.Tensor, n_real: int) -> None:
+    """dst[:, :n_real] = src[:, :n_real] for [rows, H, DV] tensors whose (H, DV)
+    dims are contiguous: one contiguous n_real*DV run per row (torch's strided
+    copy_ for this pattern runs at ~1/3 of the DtoD memcpy bandwidth)."""
+    rows, H, DV = dst.shape
+    if rows == 0:
+        return
+    assert src.shape == dst.shape
+    assert dst.stride()[1:] == (DV, 1) and src.stride()[1:] == (DV, 1)
+    n = n_real * DV
+    # One program per 32 KB row run (70 us vs 94 us for the full copy at 4096 rows).
+    BLOCK = 16384
+    grid = (rows, triton.cdiv(n, BLOCK))
+    _copy_tp_local_heads_kernel[grid](
+        src, dst, src.stride(0), dst.stride(0), n, BLOCK=BLOCK, num_warps=8
+    )
+
 
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
@@ -3576,7 +3608,20 @@ class DeepseekV4AttnBackend(
                 out = forward_batch.attn_output_buffer
                 if out is None:
                     return torch.cat([o_prefill, o], dim=0)
-                torch.cat([o_prefill, o], dim=0, out=out.view(-1, *o.shape[1:]))
+                out_v = out.view(-1, *o.shape[1:])
+                # Only heads [0, tp_q_head_num) are read (`o[:, tp_slice, :]` in
+                # deepseek_v4.py); the rest are TP padding for FlashMLA's head64
+                # kernels, so the flag leaves them stale.
+                n_real = layer.tp_q_head_num
+                if (
+                    envs.SGLANG_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY.get()
+                    and 0 < n_real < o.shape[1]
+                ):
+                    n_prefill = o_prefill.shape[0]
+                    copy_tp_local_heads(out_v[:n_prefill], o_prefill, n_real)
+                    copy_tp_local_heads(out_v[n_prefill:], o, n_real)
+                else:
+                    torch.cat([o_prefill, o], dim=0, out=out_v)
                 return out
             return o
 
