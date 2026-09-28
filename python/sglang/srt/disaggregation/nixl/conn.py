@@ -371,6 +371,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_aux_item_lens: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -421,6 +422,11 @@ class KVArgsRegisterInfo:
             dst_kv_ptrs=dst_kv_ptrs,
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
+            dst_aux_item_lens=(
+                list(struct.unpack(f"{len(msg[23]) // 8}Q", msg[23]))
+                if len(msg) > 23
+                else None
+            ),
             dst_state_data_ptrs=dst_state_data_ptrs,
             gpu_id=int(msg[8].decode("ascii")),
             decode_tp_size=int(msg[9].decode("ascii")),
@@ -1695,6 +1701,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
+                    self.validate_aux_buffers(
+                        dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
+                    )
                     decode_tp_size = dst_info.decode_tp_size
 
                     # Skip KV RDMA transfer when there are no pages to send
@@ -2730,16 +2739,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
-        if not (
-            len(prefill_aux_ptrs) == len(prefill_aux_item_lens) == len(dst_aux_ptrs)
-        ):
-            raise ValueError(
-                "Disaggregation metadata buffer count mismatch: "
-                f"prefill={len(prefill_aux_ptrs)}, "
-                f"prefill lengths={len(prefill_aux_item_lens)}, "
-                f"decode={len(dst_aux_ptrs)}. "
-                "Prefill and decode must use matching builds and metadata options."
-            )
 
         # Stop at the shorter list; see check_peer_aux_buffer_count.
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):

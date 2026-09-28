@@ -47,11 +47,10 @@ class CustomizedInfoSampler(Sampler):
 
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
-        logits_output.customized_info[CUSTOMIZED_INFO_FIELD] = (
-            batch_next_token_ids.detach().cpu().tolist()
-        )
+        cpu_token_ids = batch_next_token_ids.detach().cpu()
+        logits_output.customized_info[CUSTOMIZED_INFO_FIELD] = cpu_token_ids.tolist()
         logits_output.customized_info[CUSTOMIZED_INFO_ARRAY_FIELD] = (
-            batch_next_token_ids.detach().cpu().unsqueeze(-1).numpy()
+            cpu_token_ids.unsqueeze(-1).numpy()
         )
         return batch_next_token_ids
 

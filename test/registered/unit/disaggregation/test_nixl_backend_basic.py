@@ -349,6 +349,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -371,7 +372,12 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.kv_args = SimpleNamespace(
-            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0, gpu_id=3
+            engine_rank=0,
+            kv_data_ptrs=[0],
+            num_draft_entries=0,
+            gpu_id=3,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -416,6 +422,39 @@ class TestNixlTransferWorker(CustomTestCase):
                 return_value=device_module,
             ),
         )
+
+    def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
+        mgr = self._make_manager(21)
+        mgr.decode_kv_args_table["agent"].dst_aux_item_lens = [32]
+        healthy = self._make_manager(22)
+        healthy_req = healthy.transfer_infos[22]["agent"]
+        healthy_req.agent_name = "healthy"
+        mgr.transfer_infos[22] = {"healthy": healthy_req}
+        mgr.request_status[22] = KVPoll.WaitingForInput
+        mgr.decode_kv_args_table["healthy"] = healthy.decode_kv_args_table["agent"]
+        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.send_kv_status_message = MagicMock()
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.send_aux = MagicMock(return_value="aux_handle")
+        chunks = [self._make_chunk(room, [1], True) for room in (21, 22)]
+        queue = SimpleNamespace(get=MagicMock(side_effect=[*chunks, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(mgr.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", mgr.failure_records[21])
+        self.assertIsInstance(mgr.exceptions[21], ValueError)
+        self.assertEqual(mgr.request_status[22], KVPoll.Success)
+        mgr.send_kvcache.assert_called_once()
+        self.assertEqual(mgr.send_kvcache.call_args.args[0], "healthy")
+        mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[0], "healthy")
+        mgr.send_kv_status_message.assert_called_once()
+        self.assertEqual(
+            mgr.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
+        )
+        self.assertEqual(mgr._staging_outstanding.get(21, 0), 0)
 
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -470,6 +509,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -488,6 +528,8 @@ class TestNixlTransferWorker(CustomTestCase):
             kv_data_ptrs=[0x1000],
             page_size=4,
             num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 
@@ -900,16 +942,6 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
-    def test_send_aux_rejects_metadata_buffer_count_mismatch(self):
-        agent = StagingFakeAgent()
-        mgr = self._make_manager(agent)
-        mgr.kv_args.aux_data_ptrs = [0x1000]
-        mgr.kv_args.aux_item_lens = [64]
-
-        with self.assertRaisesRegex(ValueError, "metadata buffer count mismatch"):
-            mgr.send_aux("peer", 0, [0x2000, 0x3000], 0, "room")
-
-        self.assertEqual(agent.get_xfer_descs_calls, [])
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
         mgr._staging_ctx = PrefillStagingContext()
