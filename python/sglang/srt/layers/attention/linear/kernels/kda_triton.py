@@ -18,6 +18,8 @@ if not is_cpu():
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+else:
+    from sgl_kernel.mamba import chunk_kda_cpu as chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
