@@ -92,6 +92,35 @@ if _is_musa:
         return
 
 
+def per_tensor_quant_fp8_fallback(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool = False,
+) -> None:
+    if not is_static:
+        scale = input.float().abs().amax().clamp_min(1e-12) / fp8_max
+        output_s.reshape(-1).copy_(scale.reshape(-1))
+
+    scale = output_s.reshape(())
+    output_q.copy_((input.float() / scale).clamp(fp8_min, fp8_max).to(output_q.dtype))
+
+
+def per_token_quant_fp8_fallback(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    scale = input.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / fp8_max
+    output_s.copy_(scale)
+    output_q.copy_((input.float() / scale).clamp(fp8_min, fp8_max).to(output_q.dtype))
+
+
+if _is_cpu:
+    sgl_per_tensor_quant_fp8 = per_tensor_quant_fp8_fallback
+    sgl_per_token_quant_fp8 = per_token_quant_fp8_fallback
+
+
 logger = logging.getLogger(__name__)
 
 

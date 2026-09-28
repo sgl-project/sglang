@@ -254,6 +254,224 @@ INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, uint8_t, uint8_t, true);
 INSTANTIATE_MOE_FP_TEMPLATE(at::Half, uint8_t, uint8_t, true);
 
 template <typename scalar_t>
+void fused_experts_fp8_pertensor_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUActMethod act_func) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
+  const int64_t NB = div_up(2 * N, BLOCK_N);
+  const int64_t packed_K = get_row_size<at::Float8_e4m3fn>(K);
+  const int64_t stride_e = 2 * N * packed_K;
+  const int64_t stride_n = packed_K;
+
+  int64_t avg_M = std::max(int64_t(1), M * topk / E);
+  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(avg_M);
+  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
+
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+
+    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
+      int32_t expert_id = expert_ids[mb];
+      const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      if (nb_offset == 0) {
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
+      }
+
+      const int64_t offset = offsets[mb];
+      tinygemm_kernel<scalar_t>(
+          A,
+          B,
+          ic0 + offset * 2 * N + nb * BLOCK_N,
+          B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+          C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
+          nullptr,
+          w1s[expert_id],
+          m_size,
+          n_size,
+          K,
+          K,
+          n_size,
+          2 * N,
+          use_brgemm);
+    });
+
+    if (use_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+
+  if (act_func == CPUActMethod::silu_and_mul) {
+    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
+      }
+    });
+  } else if (act_func == CPUActMethod::gelu_and_mul) {
+    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        gelu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
+      }
+    });
+  } else if (act_func == CPUActMethod::swiglu) {
+    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N / 2, alpha, limit);
+        clamp_sigmoid_and_mul_stub(ic1 + m * N + N / 2, ic0 + m * 2 * N + N, N / 2, alpha, limit);
+      }
+    });
+  }
+
+  const int64_t OC = K;
+  const int64_t IC = N;
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  const int64_t packed_IC = get_row_size<at::Float8_e4m3fn>(IC);
+  const int64_t stride_e2 = OC * packed_IC;
+  const int64_t stride_oc = packed_IC;
+
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
+
+    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+      const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+
+      int32_t expert_id = expert_ids[mb];
+      const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+
+      tinygemm_kernel<scalar_t>(
+          A,
+          B,
+          C,
+          B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
+          C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
+          nullptr,
+          w2s[expert_id],
+          m_size,
+          n_size,
+          IC,
+          IC,
+          n_size,
+          BLOCK_N,
+          use_brgemm);
+
+      for (int64_t m = 0; m < m_size; ++m) {
+        int32_t index = A_ids[m];
+        float weight = topk_weights[index];
+        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+      }
+    });
+
+    if (use_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+    }
+  });
+}
+
+#define INSTANTIATE_MOE_FP8_PERTENSOR_TEMPLATE(TYPE)      \
+  template void fused_experts_fp8_pertensor_kernel_impl<TYPE>( \
+      TYPE* __restrict__ output,                         \
+      TYPE* __restrict__ ic0,                            \
+      TYPE* __restrict__ ic1,                            \
+      TYPE* __restrict__ ic2,                            \
+      TYPE* __restrict__ A_tmp,                          \
+      TYPE* __restrict__ B_tmp,                          \
+      float* __restrict__ C_tmp,                         \
+      const TYPE* __restrict__ input,                    \
+      const at::Float8_e4m3fn* __restrict__ packed_w1,   \
+      const at::Float8_e4m3fn* __restrict__ packed_w2,   \
+      const float* __restrict__ w1s,                     \
+      const float* __restrict__ w2s,                     \
+      const float* __restrict__ topk_weights,            \
+      const int32_t* __restrict__ sorted_ids,            \
+      const int32_t* __restrict__ expert_ids,            \
+      const int32_t* __restrict__ offsets,               \
+      int64_t M,                                         \
+      int64_t N,                                         \
+      int64_t K,                                         \
+      int64_t E,                                         \
+      int64_t topk,                                      \
+      int64_t num_tokens_post_pad,                       \
+      float alpha,                                       \
+      float limit,                                       \
+      CPUActMethod act_func)
+
+INSTANTIATE_MOE_FP8_PERTENSOR_TEMPLATE(at::BFloat16);
+
+template <>
+void fused_experts_fp8_pertensor_kernel_impl<at::Half>(
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    at::Half* __restrict__,
+    float* __restrict__,
+    const at::Half* __restrict__,
+    const at::Float8_e4m3fn* __restrict__,
+    const at::Float8_e4m3fn* __restrict__,
+    const float* __restrict__,
+    const float* __restrict__,
+    const float* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    const int32_t* __restrict__,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    int64_t,
+    float,
+    float,
+    CPUActMethod) {
+  TORCH_CHECK(false, "per-tensor fp8 w8a16 MoE supports bfloat16 hidden states only.");
+}
+
+template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
