@@ -172,7 +172,6 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         assert fusions[1].run == base
         # The workspace reduces over the TP group, which is the attention-TP group here.
         assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
-        assert all(f.may_return_new_residual for f in fusions)
         # A residual on each rank's slice is gathered first, which the
         # workspace does not do.
         comm._declared = SimpleNamespace(

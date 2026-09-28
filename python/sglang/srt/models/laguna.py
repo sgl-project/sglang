@@ -19,6 +19,7 @@ from torch import nn
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -475,9 +476,15 @@ class LagunaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        capture_output=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                capture_output=capture_output,
+            )
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -589,18 +596,17 @@ class LagunaModel(nn.Module):
                 self.start_layer
             ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                hidden_states, snapshot = self.layers[
-                    i
-                ].layer_communicator.capture_output(
-                    hidden_states, residual, at_input=True
-                )
-                aux_hidden_states.append(snapshot)
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
 
         last_layer = self.layers[self.end_layer - 1]
@@ -613,14 +619,16 @@ class LagunaModel(nn.Module):
             )
 
         if hidden_states.shape[0] != 0:
-            if self.end_layer in self.layers_to_capture:
-                aux_hidden_states.append(
-                    last_layer.layer_communicator.snapshot(hidden_states, residual)
-                )
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = last_layer.layer_communicator.norm_output(
+                hidden_states,
+                residual,
+                self.norm,
+                capture_output=(
+                    aux_hidden_states.append
+                    if self.end_layer in self.layers_to_capture
+                    else None
+                ),
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states

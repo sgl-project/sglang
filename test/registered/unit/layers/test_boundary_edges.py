@@ -261,11 +261,9 @@ class TestNonAlternatingEdges(CustomTestCase):
             residual=full,
             residual_to=full,
         )
-        over_tp = comm.FusedMlpInput(
-            completes=SumGroup.TP, run=MagicMock(), may_return_new_residual=False
-        )
+        over_tp = comm.FusedMlpInput(completes=SumGroup.TP, run=MagicMock())
         over_attention_tp = comm.FusedMlpInput(
-            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=False
+            completes=SumGroup.ATTN_TP, run=MagicMock()
         )
         boundary = make_boundary(edge, fusions=(over_tp, over_attention_tp))
         self.assertEqual(boundary.fused, (over_tp,))
@@ -370,9 +368,7 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
     def test_fused_kernels_take_only_a_plain_add(self):
         full = rows(sizes(tp=2))
-        fused = comm.FusedMlpInput(
-            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=False
-        )
+        fused = comm.FusedMlpInput(completes=SumGroup.ATTN_TP, run=MagicMock())
         carried = MagicMock()
         for update, offered in ((comm.ADD, True), (_WrittenIn(), False)):
             with self.subTest(adds_plainly=offered):
@@ -569,9 +565,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         torch.testing.assert_close(out, expected + 100)
 
     def test_a_fused_kernel_runs_only_for_a_read_that_leaves_the_residual(self):
-        fused = FusedMlpInput(
-            completes=SumGroup.ATTN_TP, run=MagicMock(), may_return_new_residual=True
-        )
+        fused = FusedMlpInput(completes=SumGroup.ATTN_TP, run=MagicMock())
         for norms_plainly in (True, False):
             with self.subTest(norms_plainly=norms_plainly):
                 step, tried = self._ffn_input(

@@ -47,6 +47,7 @@ from sglang.srt.layers.communicator.ops import (
     _mlp_input_slice,
     _mlp_input_without_dp,
     _read_input,
+    move_rows,
     tp_reduce_scatter,
 )
 from sglang.srt.layers.communicator.residual import (
@@ -479,8 +480,6 @@ class FusedMlpInput(msgspec.Struct, frozen=True):
     # The group whose sum it completes.
     completes: SumGroup
     run: Callable[..., Optional[Tuple[torch.Tensor, torch.Tensor]]]
-    # It may hand back a new residual and leave the one it took unchanged.
-    may_return_new_residual: bool
 
 
 def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
@@ -548,6 +547,10 @@ class StageEntry(msgspec.Struct, frozen=True):
     handoff: Optional[Callable] = None
     # The fused kernels prepare tries first.
     fused: Tuple["FusedMlpInput", ...] = ()
+    # Return the updated residual to the producer's rows for aux capture.
+    capture_move: Optional[Callable] = None
+    capture_move_allocates: bool = False
+    capture_preserves_residual: Optional[Callable] = None
 
 
 class BoundarySteps(msgspec.Struct, frozen=True):
@@ -622,6 +625,19 @@ class Boundary(msgspec.Struct, frozen=True):
         need = self.edge.need
         return Layout(
             need.layout.sharded | (self.edge.residual_to.sharded & need.gathers_itself)
+        )
+
+    @property
+    def capture_move_allocates(self) -> bool:
+        """Returning through a gather allocates; returning through a cut aliases."""
+        return bool(self.edge.residual_to.sharded - self.edge.produced.layout.sharded)
+
+    @property
+    def capture_move(self) -> Optional[Callable]:
+        if self.edge.residual_to == self.edge.produced.layout:
+            return None
+        return partial(
+            move_rows, rows=self.edge.residual_to, to=self.edge.produced.layout
         )
 
 
@@ -808,6 +824,8 @@ def _select_boundary_steps(
             input_rows=into_attention.input_rows,
             input_move=into_attention.input_move,
             handoff=attention_handoff,
+            capture_move=into_attention.capture_move,
+            capture_move_allocates=into_attention.capture_move_allocates,
         ),
         ffn=StageEntry(
             prepare=into_ffn.prepare,

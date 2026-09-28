@@ -100,6 +100,23 @@ def finish_layer_stack(
     return reduce_output(hidden_states), residual
 
 
+def norm_output(hidden_states, residual, norm, capture_output=None):
+    """The final norm and an optional capture of the same updated residual.
+
+    Keep add and norm together: normalizing a separately rounded residual is
+    not numerically equivalent to the fused kernel's FP32 accumulation. The
+    capture callback owns retention of the borrowed residual storage.
+    """
+    if residual is None:
+        if capture_output is not None:
+            capture_output(hidden_states)
+        return norm(hidden_states)
+    hidden_states, residual = norm(hidden_states, residual)
+    if capture_output is not None:
+        capture_output(residual)
+    return hidden_states
+
+
 def from_pp(
     tensors: PPProxyTensors,
     *,

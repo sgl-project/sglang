@@ -38,6 +38,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -936,13 +937,17 @@ class Glm4MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        capture_output=None,
     ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format=self.attn_quant_format,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format=self.attn_quant_format,
+                capture_output=capture_output,
+            )
         )
 
         hidden_states = self.self_attn(
@@ -1103,22 +1108,18 @@ class Glm4MoeModel(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    hidden_states, snapshot = self.layers[
-                        i
-                    ].layer_communicator.capture_output(
-                        hidden_states, residual, at_input=True
-                    )
-                    aux_hidden_states.append(snapshot)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
                 )
 
         if normal_end_layer != self.end_layer:

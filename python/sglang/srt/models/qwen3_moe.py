@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -882,7 +883,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        capture_output=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -892,6 +894,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                capture_output=capture_output,
                 **kwargs,
             )
         )

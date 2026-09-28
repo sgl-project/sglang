@@ -4,9 +4,11 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
     BoundarySteps,
     EdgeDecl,
+    LayerCommunicator,
     Layout,
     StageEntry,
     StageInput,
@@ -161,6 +163,107 @@ class TestResidualStream(CustomTestCase):
             self.stream.input(self.hidden)
         with self.assertRaises(RuntimeError):
             self.stream.input(hidden.clone())
+
+    def test_capture_and_compute_share_the_fused_read(self):
+        boundary = LayerCommunicator.__new__(LayerCommunicator)
+        events = []
+        outputs = AuxHiddenStateList()
+
+        def prepare(hidden, stream, batch, **kwargs):
+            events.append("add_norm")
+            self.assertIsNone(stream.pending.owed)
+            # A fused read returns both the norm output and its updated residual.
+            updated = hidden + stream.residual
+            stream.write(updated)
+            return updated * 3, stream
+
+        def capture(value, *, owned=False):
+            events.append("capture")
+            outputs.capture(value, owned=owned)
+
+        boundary.prepare_attn = Mock(side_effect=prepare)
+        boundary.attn = SimpleNamespace(
+            entry=lambda batch: SimpleNamespace(
+                capture_move=None,
+                capture_move_allocates=False,
+                capture_preserves_residual=None,
+            )
+        )
+        output, stream = boundary.prepare_attn_and_capture_last_layer_outputs(
+            self.hidden, self.stream, None, capture_output=capture
+        )
+        self.assertEqual(events, ["add_norm", "capture"])
+        self.group.all_reduce.assert_called_once()
+        boundary.prepare_attn.assert_called_once()
+        torch.testing.assert_close(output, torch.full((2, 4), 15.0))
+        torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
+        stream.residual.zero_()
+        torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
+
+    def test_deepstack_capture_precedes_the_extra_addition(self):
+        boundary = LayerCommunicator.__new__(LayerCommunicator)
+        extra = torch.full_like(self.partial, 7.0)
+        outputs = AuxHiddenStateList()
+
+        def prepare(hidden, stream, batch, **kwargs):
+            self.assertEqual(len(outputs), 1)
+            self.assertIs(kwargs["post_residual_addition"], extra)
+            updated = hidden + stream.residual + extra
+            stream.write(updated)
+            return updated * 3, stream
+
+        boundary.prepare_attn = Mock(side_effect=prepare)
+        boundary.attn = SimpleNamespace(
+            entry=lambda batch: SimpleNamespace(
+                capture_move=None,
+                capture_move_allocates=False,
+                capture_preserves_residual=None,
+            )
+        )
+        output, _ = boundary.prepare_attn_and_capture_last_layer_outputs(
+            self.hidden,
+            self.stream,
+            None,
+            post_residual_addition=extra,
+            capture_output=outputs.capture,
+        )
+        torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
+        torch.testing.assert_close(output, torch.full((2, 4), 36.0))
+        self.group.all_reduce.assert_called_once()
+
+    def test_capture_restores_the_producers_rows_after_a_scattered_read(self):
+        from unittest.mock import patch
+
+        from sglang.srt.layers.communicator import TokenAxis
+
+        full = Layout(frozenset())
+        local = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        boundary = make_boundary(
+            EdgeDecl(StageOutput(full), StageInput(local), full, local)
+        )
+        shard = torch.full((2, 4), 3.0)
+        expected = torch.cat([shard, torch.full_like(shard, 7.0)])
+        with patch(
+            "sglang.srt.layers.communicator.ops._redistribute_from_attn_tp_shards",
+            return_value=expected,
+        ) as gather:
+            captured = boundary.capture_move(shard, forward_batch=None)
+        gather.assert_called_once_with(shard)
+        torch.testing.assert_close(captured, expected)
+        torch.testing.assert_close(shard, torch.full((2, 4), 3.0))
+
+    def test_final_capture_uses_the_norms_residual_result(self):
+        from sglang.srt.layers.communicator.residual.access import norm_output
+
+        outputs = AuxHiddenStateList()
+        updated = torch.full_like(self.partial, 5.0)
+        normalized = torch.full_like(self.partial, 13.0)
+        norm = Mock(return_value=(normalized, updated))
+        result = norm_output(self.partial, self.residual, norm, outputs.capture)
+        self.assertIs(result, normalized)
+        norm.assert_called_once_with(self.partial, self.residual)
+        updated.zero_()
+        torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
 
     def test_deepstack_adds_once_after_completing_the_sum(self):
         hidden, stream = add_to_output(

@@ -276,9 +276,7 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                     (entry,) if fuses else (),
                 )
                 self.assertIs(
-                    any(
-                        f.may_return_new_residual for f in communicator._steps.ffn.fused
-                    ),
+                    bool(communicator._steps.ffn.fused),
                     fuses,
                 )
                 self.assertFalse(communicator._steps.returns_over_dp)
@@ -1095,11 +1093,10 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
     norm only where those are the steps, and only if it completes the sum the
     attention output owes."""
 
-    def fused(self, completes, may_return_new_residual):
+    def fused(self, completes):
         return comm.FusedMlpInput(
             completes=completes,
             run=lambda h, r, fb: None,
-            may_return_new_residual=may_return_new_residual,
         )
 
     def select(self, *, attn_dp, fusions):
@@ -1125,44 +1122,17 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
         return steps, fused
 
     def test_a_kernel_over_another_group_is_not_chosen(self):
-        over_tp = self.fused(SumGroup.TP, True)
-        over_attention_tp = self.fused(SumGroup.ATTN_TP, False)
+        over_tp = self.fused(SumGroup.TP)
+        over_attention_tp = self.fused(SumGroup.ATTN_TP)
         steps, chosen = self.select(attn_dp=1, fusions=(over_tp, over_attention_tp))
         self.assertIs(steps.func, comm_ops._mlp_input_without_dp)
         self.assertEqual(steps.keywords["fusions"], (over_attention_tp.run,))
         self.assertEqual(chosen, (over_attention_tp,))
 
     def test_no_kernel_is_chosen_where_rows_are_gathered(self):
-        steps, chosen = self.select(
-            attn_dp=2, fusions=(self.fused(SumGroup.ATTN_TP, True),)
-        )
+        steps, chosen = self.select(attn_dp=2, fusions=(self.fused(SumGroup.ATTN_TP),))
         self.assertIs(steps.func, comm_ops._mlp_input_dp_partial)
         self.assertEqual(chosen, ())
-
-    def test_aux_capture_follows_the_chosen_kernels(self):
-        for kernels, expected in (
-            ((self.fused(SumGroup.ATTN_TP, False),), False),
-            ((self.fused(SumGroup.ATTN_TP, True),), True),
-            ((self.fused(SumGroup.TP, True),), False),
-        ):
-            with self.subTest(kernels=kernels):
-
-                class Declaring(LayerCommunicator):
-                    def _select_mlp_input_fusions(self):
-                        return kernels
-
-                with planning(parallel_of(attn_dp=1, attn_tp=2)):
-                    communicator = Declaring(
-                        layer_facts=layer_facts(1, 3),
-                        input_layernorm=Norm(),
-                        post_attention_layernorm=Norm(),
-                    )
-                self.assertIs(
-                    any(
-                        f.may_return_new_residual for f in communicator._steps.ffn.fused
-                    ),
-                    expected,
-                )
 
 
 class TestTheSequenceParallelRegion(CustomTestCase):
@@ -1492,7 +1462,6 @@ class TestOneRepresentation(CustomTestCase):
         "_ffn_output",
         "_postprocess_scatters_to_local_tokens",
         "_ffn_sum_is_movable",
-        "_mlp_input_may_return_new_residual",
     )
 
     def test_the_layer_holds_steps_only(self):

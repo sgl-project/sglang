@@ -10,6 +10,10 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -644,7 +648,7 @@ class InternS2MobiusAttentionDecoderLayer(
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
         meta_mlp: nn.ModuleList,
-        captured_last_layer_outputs: list[torch.Tensor] | None = None,
+        captured_last_layer_outputs: AuxHiddenStateAccumulator | None = None,
         **kwargs,
     ):
         del kwargs
@@ -764,7 +768,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
         residual = residual_batch.start(forward_batch)
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,

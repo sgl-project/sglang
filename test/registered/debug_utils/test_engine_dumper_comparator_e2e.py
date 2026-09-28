@@ -74,6 +74,7 @@ patches:
                   residual,
                   forward_batch,
                   captured_last_layer_outputs=captured_last_layer_outputs,
+                  capture_output=capture_output,
                   **kwargs,
               )
           )
@@ -131,6 +132,7 @@ patches:
                   residual,
                   forward_batch,
                   captured_last_layer_outputs=captured_last_layer_outputs,
+                  capture_output=capture_output,
                   **kwargs,
               )
           )
