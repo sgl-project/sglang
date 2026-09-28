@@ -21,7 +21,7 @@ PR #25090 vs #14194):
 """
 
 import contextlib
-import warnings
+
 from typing import Optional
 
 import torch
@@ -44,41 +44,11 @@ from sglang.srt.utils.common import is_fi_a2a_supported
 _is_hip = is_hip()
 
 
-def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
-    warnings.warn(
-        f"{name} is deprecated; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
 def draft_forward_guard(is_draft: bool):
     """Run a draft forward with DCP disabled (the draft KV pool is not sharded)."""
     if not is_draft:
         return contextlib.nullcontext()
     return get_parallel().override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0)
-
-
-def dcp_enabled() -> bool:
-    """Deprecated: use ``get_parallel().dcp_enabled``."""
-    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
-    return get_parallel().dcp_enabled
-
-
-def get_attention_dcp_world_size() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
-    return get_parallel().attn_dcp_size
-
-
-def get_attention_dcp_rank() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
-    return get_parallel().attn_dcp_rank
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
