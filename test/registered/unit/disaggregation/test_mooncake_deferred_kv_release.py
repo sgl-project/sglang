@@ -89,7 +89,9 @@ class TestMooncakeAbortNotification(
             manager.transfer_worker(queue, MagicMock())
         manager.check_status = lambda room: manager.request_status[room]
 
-    def test_generationless_abort_warns_and_falls_back_to_timeout(self):
+    def test_generationless_abort_marks_failed_without_ack_or_warning(self):
+        # A decode that did not arm (prealloc abort) sends no generation; that
+        # is normal and must not warn about mixed versions.
         manager = _manager()
         message = AbortNotification(ROOM, DECODE_IP, DECODE_PORT).to_zmq()
 
@@ -102,7 +104,7 @@ class TestMooncakeAbortNotification(
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
         self.assertEqual(manager._deferred_ack_targets, {})
         self.assertEqual(manager._sent, [])
-        warning.assert_called_once()
+        warning.assert_not_called()
 
     def test_abort_without_valid_return_address_still_marks_room_failed(self):
         messages = (

@@ -212,9 +212,11 @@ class AbortNotification(msgspec.Struct, frozen=True):
         if self.decode_ip is None or self.decode_port is None:
             return None
         if self.generation is None:
-            logger.warning_once(
-                "Generation-less ABORT received; deferred ACK is unavailable. "
-                "Mixed SGLang versions may wait for the KV release timeout."
+            # Normal for a decode that did not arm (e.g. a prealloc abort before
+            # metadata was published): it does not wait for an ACK. An older
+            # decode that does wait falls back to its release timeout.
+            logger.debug(
+                "Generation-less ABORT for room %s; no deferred ACK", self.room
             )
             return None
         return AckTarget(self.decode_ip, self.decode_port, self.generation)
