@@ -39,8 +39,8 @@ def _use_fp8_chunk_pipeline(
         and total_q >= 4096 * num_requests
         and kv_dtype == torch.float8_e4m3fn
         and head_dim == 256
-        and group_size in (6, 12)
-        and topk == 2051
+        and 1 <= group_size <= 12
+        and topk >= 1024
         and "H20" in torch.cuda.get_device_name(0)
     )
 

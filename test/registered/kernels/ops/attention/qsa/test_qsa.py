@@ -50,16 +50,18 @@ def test_fp8_chunk_pipeline_guard(monkeypatch):
     valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
     assert sparse_attn_module._use_fp8_chunk_pipeline(*valid)
 
-    tp1_shape = valid.copy()
-    tp1_shape[4] = 12
-    assert sparse_attn_module._use_fp8_chunk_pipeline(*tp1_shape)
+    for group_size in (1, 3, 6, 12):
+        supported = valid.copy()
+        supported[4] = group_size
+        supported[5] = 1024
+        assert sparse_attn_module._use_fp8_chunk_pipeline(*supported)
 
     for index, value in [
         (0, 8191),
         (2, torch.bfloat16),
         (3, 128),
-        (4, 3),
-        (5, 2048),
+        (4, 13),
+        (5, 1023),
     ]:
         invalid = valid.copy()
         invalid[index] = value
@@ -69,14 +71,17 @@ def test_fp8_chunk_pipeline_guard(monkeypatch):
     assert not sparse_attn_module._use_fp8_chunk_pipeline(*valid)
 
 
-def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch):
+@pytest.mark.parametrize(
+    ("group_size", "topk"), [(3, 1025), (6, FINAL_TOPK), (12, 1025)]
+)
+def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
 
     torch.manual_seed(42)
     device = torch.device("cuda")
     q_len, kv_len = 4096, 8192
-    q = torch.randn(q_len, 6, 256, dtype=torch.bfloat16, device=device)
+    q = torch.randn(q_len, group_size, 256, dtype=torch.bfloat16, device=device)
     k, v = [
         torch.randn(kv_len, 1, 256, dtype=torch.bfloat16, device=device).to(
             torch.float8_e4m3fn
@@ -84,7 +89,7 @@ def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch):
         for _ in range(2)
     ]
     indices = torch.randint(
-        0, kv_len - q_len + 1, (q_len, FINAL_TOPK), dtype=torch.int32, device=device
+        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device=device
     )
     cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
     cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
