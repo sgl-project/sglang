@@ -59,13 +59,18 @@ def _aiter_gdn_decode_varlen():
     global _AITER_GDN_DECODE_UNAVAILABLE
     if _AITER_GDN_DECODE_UNAVAILABLE:
         return None
-    if not (get_bool_env_var("SGLANG_USE_AITER") and get_bool_env_var("SGLANG_AITER_GDN_DECODE")):
+    if not (
+        get_bool_env_var("SGLANG_USE_AITER")
+        and get_bool_env_var("SGLANG_AITER_GDN_DECODE")
+    ):
         _AITER_GDN_DECODE_UNAVAILABLE = True
         return None
     try:
         from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdn_decode_varlen
     except ImportError:
-        logger.info("aiter FlyDSL GDN decode unavailable; keeping the Triton recurrence")
+        logger.info(
+            "aiter FlyDSL GDN decode unavailable; keeping the Triton recurrence"
+        )
         _AITER_GDN_DECODE_UNAVAILABLE = True
         return None
     return flydsl_gdn_decode_varlen
