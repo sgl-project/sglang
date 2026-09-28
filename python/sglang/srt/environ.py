@@ -856,6 +856,9 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
     # Use gfx950 BF16 Qwen HC mix when AITER FlyDSL hc_mix is available.
     SGLANG_AITER_HC_MIX = EnvBool(True)
+    # Enable split HC combine for eligible shapes and batches of at most 32 rows.
+    # Set to 0 before server startup to use the unsplit combine kernel instead.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
