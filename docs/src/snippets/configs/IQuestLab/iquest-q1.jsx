@@ -1,5 +1,6 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// Recipes follow the IQuestLab/IQuest-Q1 model card. The checkpoint ships the
+// Recipes follow the IQuestLab/IQuest-Q1 model card, with MTP at the checkpoint's
+// trained depth of 7 draft steps. The checkpoint ships the
 // MTP draft in its mtp/ subdirectory, so both paths point at a local copy.
 // IQuest Q1 requires FA3 attention, which SGLang builds for Hopper (SM90) and
 // earlier only; Blackwell is not listed.
@@ -34,25 +35,6 @@ export const config = {
   dockerImages: { h200: "lmsysorg/sglang:dev" },
   dockerMounts: ["\"{{MODEL_ROOT}}:/model:ro\""],
   github: { cookbookModel: "IQuestLab/IQuest-Q1" },
-  playgroundFeatures: {
-    speculative: {
-      options: [
-        { id: "current", label: "Inherited from base" },
-        { id: "off", label: "Off" },
-        { id: "mtp", label: "MTP",
-          note: "Uses the MTP draft bundled in the checkpoint's mtp/ directory.",
-          flags: [
-            "--speculative-algorithm EAGLE",
-            "--speculative-num-steps 5",
-            "--speculative-eagle-topk 1",
-            "--speculative-num-draft-tokens 6",
-            "--speculative-draft-model-path '{{DRAFT_PATH}}'",
-            "--speculative-draft-attention-backend fa3",
-            "--speculative-use-rejection-sampling",
-          ] },
-      ],
-    },
-  },
   cells: [
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
@@ -68,9 +50,9 @@ export const config = {
         "--reasoning-parser iquest_q1",
         "--tool-call-parser iquest_q1",
         "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 5",
+        "--speculative-num-steps 7",
         "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 6",
+        "--speculative-num-draft-tokens 8",
         "--speculative-draft-model-path '{{DRAFT_PATH}}'",
         "--speculative-draft-attention-backend fa3",
         "--speculative-use-rejection-sampling",

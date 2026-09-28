@@ -33,14 +33,6 @@ import { config }     from "/src/snippets/configs/IQuestLab/iquest-q1.jsx";
 
 <Deployment config={config} />
 
-## Playground
-
-The Playground toggles MTP speculative decoding on top of the selected recipe.
-
-import { Playground } from "/src/snippets/_playground.jsx";
-
-<Playground config={config} />
-
 ## 1. Model Introduction
 
 **IQuest-Q1** is a Mixture-of-Experts language model from IQuestLab with about 320B total parameters and 15B active per token. It has 88 layers that interleave three sliding-window attention layers (4,096-token window) with one full-attention layer, uses learned attention sinks, and routes each token to 8 of 256 experts. It ships with a single-layer MTP draft that SGLang applies recursively for speculative decoding.
@@ -52,4 +44,4 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **Hardware.** IQuest-Q1 requires the FA3 attention backend for both the target and the MTP draft, because the attention sink is applied from the FA3 softmax LSE. SGLang builds FA3 for Hopper, so Blackwell GPUs are not supported. The BF16 weights take about 640 GB, which fits 8× H200 with tensor parallelism 8.
 - **Reasoning.** Thinking is on by default. Pass `"chat_template_kwargs": {"thinking": false}` to turn it off for a request. The `iquest_q1` reasoning parser returns the thinking in `reasoning_content`.
 - **Tool calling.** The `iquest_q1` tool-call parser supports `tool_choice` values `auto`, `required`, and a named function.
-- **MTP depth.** The recipe drafts 5 tokens per step and verifies 6. The draft supports up to 7 steps; keep `--speculative-num-draft-tokens` equal to `--speculative-num-steps` + 1.
+- **MTP depth.** The single draft layer runs 7 sequential steps, one token each, and each round verifies 8 tokens. Seven steps is the depth the draft was trained for and the default when `--speculative-num-steps` is omitted. Keep `--speculative-num-draft-tokens` equal to `--speculative-num-steps` + 1.
