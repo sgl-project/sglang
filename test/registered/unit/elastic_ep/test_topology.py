@@ -32,7 +32,7 @@ def test_attention_topology_mapping_and_complete_boundaries():
 
 
 def test_incomplete_replica_is_rejected_before_scale_request():
-    parallel = SimpleNamespace(max_ep_size=8, attn_tp_size=2, attn_cp_size=1)
+    parallel = SimpleNamespace(max_world_size=8, attn_tp_size=2, attn_cp_size=1)
     with (
         patch("sglang.srt.managers.scheduler.get_parallel", return_value=parallel),
         patch.object(ElasticEPStateManager, "get_effective_ep_size", return_value=4),
