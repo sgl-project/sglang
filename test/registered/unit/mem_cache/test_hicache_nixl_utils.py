@@ -9,6 +9,7 @@ import errno
 import fcntl
 import mmap
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -445,6 +446,60 @@ class TestNixlDirectIOProbe(CustomTestCase):
             self.assertFalse(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
         finally:
             os.close(fd)
+
+
+class TestNixlBufferedIOProbe(CustomTestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_buffered_io_probe_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        self.file_manager = NixlFileManager(self.test_dir, use_direct_io=False)
+
+    def test_writable_directories_pass_and_leave_nothing_behind(self):
+        """A probe that always raised would refuse every storage directory."""
+        self.file_manager.check_buffered_io()
+
+        buckets = {
+            os.path.basename(d) for d in self.file_manager._bucket_dirs(self.test_dir)
+        }
+        self.assertEqual(set(os.listdir(self.test_dir)) - buckets, set())
+
+    def test_unwritable_base_directory_fails_startup(self):
+        """Buffered I/O is the last fallback, so a permission or read-only error
+        must stop startup rather than leave a tier that drops every write."""
+        for code in (errno.EACCES, errno.EPERM, errno.EROFS):
+            with self.subTest(errno=errno.errorcode[code]):
+                with mock.patch.object(
+                    self.file_manager,
+                    "_open_probe_file",
+                    side_effect=OSError(code, os.strerror(code)),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, re.escape(self.test_dir)):
+                        self.file_manager.check_buffered_io()
+
+    def test_transient_write_error_only_warns(self):
+        """A full or flaky disk at startup may clear up, so it must not refuse to
+        start the way a permission error does."""
+        with (
+            mock.patch.object(
+                nixl_utils.os, "pwrite", side_effect=OSError(errno.ENOSPC, "full")
+            ),
+            self.assertLogs(_UTILS_LOGGER, level="WARNING"),
+        ):
+            self.file_manager.check_buffered_io()
+
+    def test_unwritable_bucket_directory_fails_startup(self):
+        """Data files live in bucket dirs, which can be left over from another
+        user's run, so a writable base dir alone does not make the tier usable."""
+        bucket_dir = self.file_manager._bucket_dirs(self.test_dir)[-1]
+        access = os.access
+
+        with mock.patch.object(
+            nixl_utils.os,
+            "access",
+            side_effect=lambda path, mode: path != bucket_dir and access(path, mode),
+        ):
+            with self.assertRaisesRegex(RuntimeError, re.escape(bucket_dir)):
+                self.file_manager.check_buffered_io()
 
 
 if __name__ == "__main__":
