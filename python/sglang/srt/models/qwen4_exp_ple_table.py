@@ -1,27 +1,12 @@
-"""Host-side storage for the offloaded Qwen4-Exp PLE n-gram table.
-
-``--ple-offload-embedding`` keeps the PLE table (47.7 GiB in fp8 for
-Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
-rows straight from a host pointer. Two backends provide that pointer:
+"""Host storage for offloaded PLE tables.
 
 ``pinned`` (default)
     ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
 
 ``file``
-    A file-backed, shared ``mmap`` of a sparse file under
-    ``--ple-offload-dir``. Meant for unified-memory parts (GB10 / DGX Spark and
-    similar), where pinned host memory comes out of the *same* pool as the
-    model weights and ``pinned`` therefore frees nothing: Qwen3.8-Flash-Next is
-    126.0 GiB of weights on a 121.63 GiB box and does not boot with ``pinned``.
-    The kernel dereferences the pageable pointer directly, which only works on
-    devices that report ``cudaDevAttrPageableMemoryAccessUsesHostPageTables``;
-    rows are paged in from storage on demand, the file is sparse, deterministic
-    in name and reused across restarts, and gathers of prefill size hint the
-    page cache (``posix_fadvise(WILLNEED)``) so page faults are served
-    concurrently instead of one at a time. A background trimmer keeps the
-    mapping's resident set under a budget, because faulting rows in maps whole
-    page-cache folios and the table would otherwise creep towards full
-    residency (see ``PleFileRssTrimmer``).
+    A shared mmap of a sparse file under ``--ple-offload-dir``. GPUs with
+    host-page-table access read it directly; other CUDA GPUs stage rows
+    through pinned buffers. ``PleFileRssTrimmer`` bounds mapping residency.
 
 This module has no Triton or CUDA-kernel imports so that its allocator and
 prefetcher can be unit-tested on CPU.
@@ -38,6 +23,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -64,46 +50,63 @@ PLE_FILE_RSS_TRIM_CHUNK_BYTES = 1 << 30
 PLE_FILE_PREFETCH_MIN_ROWS = 2048
 
 
-class PleFilePrefetcher:
-    """Hint the page cache about the rows a prefill-sized gather is about to read.
+class PleFilePageHints:
+    """Issue page-cache hints on the calling thread."""
 
-    With the table on storage, a cold prefill chunk faults tens of thousands of
-    4 KiB pages one at a time from inside the gather kernel. Advising them
-    first (``posix_fadvise(WILLNEED)`` per distinct page, on one background
-    thread) lets the block layer serve them concurrently. Measured on a GB10 /
-    NVMe: cold prefill 650-750 tok/s -> 1,000-2,100 tok/s (warm: ~2,200-2,600).
-    Decode-sized gathers are skipped; nothing runs during CUDA-graph capture.
-    """
-
-    def __init__(
-        self,
-        path: str,
-        row_bytes: int,
-        min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS,
-    ) -> None:
+    def __init__(self, path: str, row_bytes: int):
         self._fd = os.open(path, os.O_RDONLY)
         self._row_bytes = int(row_bytes)
-        self._min_rows = int(min_rows)
-        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._advise_failed = False
 
     @staticmethod
-    def pages_for_rows(row_ids: torch.Tensor, row_bytes: int) -> list[int]:
-        start = row_ids.to(torch.int64) * row_bytes
-        end = start + (row_bytes - 1)
-        return (
-            torch.cat([start >> _PAGE_SHIFT, end >> _PAGE_SHIFT])
-            .unique(sorted=True)
-            .tolist()
-        )
+    def pages_for_rows(row_ids: torch.Tensor | np.ndarray, row_bytes: int) -> list[int]:
+        ids = np.asarray(row_ids, dtype=np.int64)
+        starts = ids * row_bytes
+        page_size = 1 << _PAGE_SHIFT
+        return np.unique(
+            np.concatenate(
+                [
+                    (starts + offset) >> _PAGE_SHIFT
+                    for offset in range(0, row_bytes, page_size)
+                ]
+                + [(starts + row_bytes - 1) >> _PAGE_SHIFT]
+            )
+        ).tolist()
+
+    def advise_rows(self, row_ids) -> None:
+        self._advise(self.pages_for_rows(row_ids, self._row_bytes))
 
     def _advise(self, pages: list[int]) -> None:
+        if self._advise_failed:
+            return
         for p in pages:
             try:
                 os.posix_fadvise(
                     self._fd, p << _PAGE_SHIFT, 1 << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
                 )
-            except OSError:
+            except OSError as exc:
+                self._advise_failed = True
+                logger.warning(
+                    "PLE table: posix_fadvise failed (%s); page hints off", exc
+                )
                 return
+
+    def close(self) -> None:
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+
+class PleFilePrefetcher(PleFilePageHints):
+    """Queue page hints for direct GPU prefill reads; skip decode and capture."""
+
+    def __init__(
+        self, path: str, row_bytes: int, min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS
+    ):
+        super().__init__(path, row_bytes)
+        self._min_rows = int(min_rows)
+        self._pool = ThreadPoolExecutor(max_workers=1)
 
     def enqueue(
         self,
@@ -131,11 +134,8 @@ class PleFilePrefetcher:
         return True
 
     def close(self) -> None:
-        self._pool.shutdown(wait=False)
-        try:
-            os.close(self._fd)
-        except OSError:
-            pass
+        self._pool.shutdown(wait=True)
+        super().close()
 
 
 class PleFileRssTrimmer:
@@ -260,7 +260,7 @@ def allocate_ple_host_table(
     storage = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
     _madvise_random(storage, nbytes)
     table = storage.view(dtype).view(*[int(d) for d in shape])
-    table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
+    table._sglang_ple_file_path = path
     return table
 
 
@@ -318,31 +318,6 @@ def make_ple_file_rss_trimmer(table: torch.Tensor) -> Optional[PleFileRssTrimmer
     return trimmer
 
 
-def check_file_backend_supported(device_index: int = 0) -> None:
-    """Fail fast at load time instead of silently reading garbage in the kernel."""
-    if envs.SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK.get():
-        logger.warning(
-            "PLE table: file backend device check skipped by "
-            "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"
-        )
-        return
-    supported = device_uses_host_page_tables(device_index)
-    if supported is None:
-        raise RuntimeError(
-            "--ple-offload-backend file: could not query "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. Set "
-            "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1 only if you know the "
-            "device reads pageable host memory through the host page tables."
-        )
-    if not supported:
-        raise ValueError(
-            "--ple-offload-backend file needs a device whose pageable host "
-            "memory accesses go through the host page tables (unified-memory "
-            "parts such as GB10). This device reports it does not; use "
-            "--ple-offload-backend pinned."
-        )
-
-
 def default_ple_table_dir(model_path: str) -> str:
     """``$SGLANG_QWEN4_PLE_FILE_DIR/<model path>``, one directory per checkpoint."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(model_path).rstrip("/")).strip("_")
@@ -366,11 +341,16 @@ def ple_table_file_name(
     return f"ple_table_{dims}_{str(dtype).replace('torch.', '')}_{numel * elem}B{suffix}.bin"
 
 
+_HOST_PAGE_TABLES: dict[int, Optional[bool]] = {}
+
+
 def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
     """Whether pageable host memory is directly addressable by the GPU.
 
     Returns None when the CUDA runtime library cannot be queried.
     """
+    if device_index in _HOST_PAGE_TABLES:
+        return _HOST_PAGE_TABLES[device_index]
     candidates = [ctypes.util.find_library("cudart")]
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     if os.path.isdir(torch_lib):
@@ -403,9 +383,12 @@ def device_uses_host_page_tables(device_index: int = 0) -> Optional[bool]:
                 ctypes.c_int(device_index),
             )
             if rc == 0:
-                return bool(value.value)
+                result = bool(value.value)
+                _HOST_PAGE_TABLES[device_index] = result
+                return result
         except OSError:
             continue
+    _HOST_PAGE_TABLES[device_index] = None
     return None
 
 

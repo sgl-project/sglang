@@ -90,13 +90,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_PREFETCH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hint the page cache (`posix_fadvise(WILLNEED)`) with the rows a prefill-sized PLE gather is about to read from the file-backed table. Set to `0` to disable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use `posix_fadvise(WILLNEED)` before prefill-sized direct GPU gathers and all host-staged gathers. Set to `0` to disable.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the load-time check that the device reads pageable host memory through the host page tables (`cudaDevAttrPageableMemoryAccessUsesHostPageTables`) before using the file-backed PLE table; only for devices that cannot be queried</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB</code></td>

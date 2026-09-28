@@ -304,13 +304,9 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
-    # --ple-offload-backend file: where the sparse, file-backed PLE table lives
-    # (deterministic name, reused across restarts), whether prefill-sized
-    # gathers hint the page cache first, and an escape hatch for the device
-    # attribute check (pageable host memory reachable through host page tables).
+    # File-backed PLE tables use deterministic names and are reused across restarts.
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
-    SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
     # Faulting rows in maps whole page-cache folios, so the mapping creeps
     # towards full residency (~45 KB/token) and eats the free memory that
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
