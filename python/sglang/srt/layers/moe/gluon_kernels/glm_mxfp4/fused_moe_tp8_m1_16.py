@@ -8,6 +8,58 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
+def _select_power_of_two_band(
+    value,
+    INDEX: gl.constexpr,
+    BANDS: gl.constexpr,
+    WIDTH: gl.constexpr,
+):
+    """Select one contiguous column band without version-specific AMD ops."""
+    value = gl.reshape(value, (16, BANDS, WIDTH))
+    value = gl.permute(value, (0, 2, 1))
+    if BANDS == 16:
+        value = gl.reshape(value, (16, WIDTH, 2, 2, 2, 2))
+        low, high = gl.split(value)
+        value = low if INDEX % 2 == 0 else high
+        low, high = gl.split(value)
+        value = low if INDEX % 4 < 2 else high
+        low, high = gl.split(value)
+        value = low if INDEX % 8 < 4 else high
+        low, high = gl.split(value)
+        return low if INDEX < 8 else high
+    elif BANDS == 8:
+        value = gl.reshape(value, (16, WIDTH, 2, 2, 2))
+        low, high = gl.split(value)
+        value = low if INDEX % 2 == 0 else high
+        low, high = gl.split(value)
+        value = low if INDEX % 4 < 2 else high
+        low, high = gl.split(value)
+        return low if INDEX < 4 else high
+    else:
+        value = gl.reshape(value, (16, WIDTH, 2, 2))
+        low, high = gl.split(value)
+        value = low if INDEX % 2 == 0 else high
+        low, high = gl.split(value)
+        return low if INDEX < 2 else high
+
+
+@gluon.jit
+def _select_row16(value, INDEX: gl.constexpr, WIDTH: gl.constexpr):
+    """Select one row from a 16-row tensor using portable Gluon primitives."""
+    value = gl.permute(value, (1, 0))
+    value = gl.reshape(value, (WIDTH, 2, 2, 2, 2))
+    low, high = gl.split(value)
+    value = low if INDEX % 2 == 0 else high
+    low, high = gl.split(value)
+    value = low if INDEX % 4 < 2 else high
+    low, high = gl.split(value)
+    value = low if INDEX % 8 < 4 else high
+    low, high = gl.split(value)
+    value = low if INDEX < 8 else high
+    return gl.reshape(value, (1, WIDTH))
+
+
+@gluon.jit
 def _unpack_weight_words(words, N: gl.constexpr, BK: gl.constexpr, layout: gl.constexpr):
     b0, b1 = (words.to(gl.uint8), (words >> 8).to(gl.uint8))
     b2, b3 = ((words >> 16).to(gl.uint8), (words >> 24).to(gl.uint8))
@@ -516,7 +568,8 @@ def _padded_down(X, XS, W, Scales, Ids, Weights, Y, N: gl.constexpr, K: gl.const
     parts = gl.convert_layout(parts, sum_layout)
     result = gl.full((1, BN), 0.0, gl.float32, sum_layout)
     for j in gl.static_range(9):
-        part = gl.amd.slice(parts, [1, BN], [j, 0])
+        part = _select_row16(parts, j, BN)
+        part = gl.convert_layout(part, sum_layout)
         if j == 8:
             part = part.to(gl.bfloat16).to(gl.float32)
         result += part * gl.load(Weights + token * 9 + j)
@@ -535,11 +588,11 @@ def _token_local_down(X, XS, W, Scales, Ids, Weights, Y, N: gl.constexpr, K: gl.
     layout: gl.constexpr = gl.BlockedLayout([4, 1], [4, 16], [1, WARPS], [1, 0])
     result = gl.full((1, BN), 0.0, gl.float32, layout)
     for j in gl.static_range(8):
-        band = gl.amd.slice(acc, [16, BN], [0, j * BN])
+        band = _select_power_of_two_band(acc, j, 16, BN)
         band = gl.convert_layout(band, layout)
         part = gl.gather(band, gl.full((1, BN), j, gl.int32, layout), 0)
         result += part * gl.load(Weights + token * 9 + j)
-    band = gl.amd.slice(acc, [16, BN], [0, 8 * BN])
+    band = _select_power_of_two_band(acc, 8, 16, BN)
     band = gl.convert_layout(band, layout)
     shared = gl.gather(band, gl.full((1, BN), 8, gl.int32, layout), 0)
     shared = shared.to(gl.bfloat16).to(gl.float32)
@@ -607,8 +660,8 @@ def _fused_up_body(X, XS, W, Scales, AQ, AQS, Logits, Bias, token, rank, tile, H
     gate = gl.full((1, BN), 0.0, gl.float32, gather_layout)
     up = gl.full((1, BN), 0.0, gl.float32, gather_layout)
     for part in gl.static_range(4):
-        gband = gl.amd.slice(gacc, [16, BN], [0, part * BN])
-        uband = gl.amd.slice(uacc, [16, BN], [0, part * BN])
+        gband = _select_power_of_two_band(gacc, part, 4, BN)
+        uband = _select_power_of_two_band(uacc, part, 4, BN)
         gband = gl.convert_layout(gband, gather_layout)
         uband = gl.convert_layout(uband, gather_layout)
         idx = gl.full((1, BN), part, gl.int32, gather_layout)
@@ -658,7 +711,7 @@ def _static_single_down(X, XS, W, Scales, Ids, Weights, Y, N: gl.constexpr, K: g
     layout: gl.constexpr = gl.BlockedLayout([4, 1], [4, 16], [1, WARPS], [1, 0])
     result = gl.full((1, BN), 0.0, gl.float32, layout)
     for j in gl.static_range(9):
-        band = gl.amd.slice(acc, [16, BN], [0, j * BN])
+        band = _select_power_of_two_band(acc, j, 16, BN)
         band = gl.convert_layout(band, layout)
         part = gl.gather(band, gl.full((1, BN), j, gl.int32, layout), 0)
         if j == 8:
@@ -722,8 +775,8 @@ def _stream_paired_down(X, XS, W, Scales, Ids, Weights, Y, N: gl.constexpr, K: g
     for panel in gl.static_range(2):
         acc = _paired_panel_accumulator(X, XS, W, Scales, Ids, token, tile, N, K, BN, WARPS, panel * 4)
         for j in gl.static_range(4):
-            band0 = gl.amd.slice(acc, [16, BN], [0, j * BN])
-            band1 = gl.amd.slice(acc, [16, BN], [0, (4 + j) * BN])
+            band0 = _select_power_of_two_band(acc, j, 8, BN)
+            band1 = _select_power_of_two_band(acc, 4 + j, 8, BN)
             band0 = gl.convert_layout(band0, layout)
             band1 = gl.convert_layout(band1, layout)
             part0 = gl.gather(band0, gl.full((1, BN), j, gl.int32, layout), 0)
