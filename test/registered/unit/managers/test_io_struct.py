@@ -1035,13 +1035,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, {"id": "session1", "offset": 10})
 
-        # Test with list of dicts
+        # The public schema accepts one dictionary. A list cannot be passed to
+        # SessionParams(**session_params), even when the prompts are batched.
         req = GenerateReqInput(
             text=["Hello", "World"],
             session_params=[{"id": "session1"}, {"id": "session2"}],
         )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
+        with self.assertRaisesRegex(ValueError, "session_params must be a dictionary"):
+            req.normalize_batch_and_arguments()
 
     def test_session_id_handling(self):
         req = GenerateReqInput(

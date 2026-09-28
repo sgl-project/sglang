@@ -44,15 +44,52 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
         # Dispatch by element rank to avoid a per-element unsqueeze.
         if isinstance(self.embeds, list):
             if not self.embeds:
-                self.embeds = torch.cat(self.embeds, dim=0)  # raises — empty is invalid
-            elif self.embeds[0].dim() == 1:
-                # [hidden_dim] elements → stack adds the leading dim.
-                self.embeds = torch.stack(self.embeds, dim=0)
-            else:
-                # [1, hidden_dim] (already has the leading dim) → plain concat.
-                self.embeds = torch.cat(self.embeds, dim=0)
+                raise ValueError(
+                    "positional_embed_overrides embeds must be a non-empty list of "
+                    "tensors or a pre-stacked [N, hidden_dim] tensor."
+                )
+            if not all(isinstance(embed, torch.Tensor) for embed in self.embeds):
+                raise ValueError(
+                    "positional_embed_overrides embeds must contain only tensors."
+                )
+            try:
+                if self.embeds[0].dim() == 1:
+                    # [hidden_dim] elements → stack adds the leading dim.
+                    self.embeds = torch.stack(self.embeds, dim=0)
+                else:
+                    # [1, hidden_dim] (already has the leading dim) → plain concat.
+                    self.embeds = torch.cat(self.embeds, dim=0)
+            except (RuntimeError, TypeError) as exc:
+                raise ValueError(
+                    "positional_embed_overrides embeds must have compatible tensor shapes."
+                ) from exc
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate the normalized object before it crosses the scheduler boundary."""
+        if not isinstance(self.embeds, torch.Tensor) or self.embeds.dim() != 2:
+            raise ValueError(
+                "positional_embed_overrides embeds must be a 2-D tensor [N, hidden_dim]."
+            )
+        if not isinstance(self.positions, list) or any(
+            type(position) is not int for position in self.positions
+        ):
+            raise ValueError(
+                "positional_embed_overrides positions must be a list of integers."
+            )
         if self.embeds.shape[0] != len(self.positions):
             raise ValueError(
                 f"embeds length ({self.embeds.shape[0]}) != "
                 f"positions length ({len(self.positions)})"
+            )
+
+    def validate_hidden_dim(self, expected_hidden_dim: int) -> None:
+        """Reject incompatible embeddings before the scheduler's scatter operation."""
+        self.validate()
+        actual = self.embeds.shape[-1]
+        if actual != expected_hidden_dim:
+            raise ValueError(
+                f"positional_embed_overrides hidden_dim ({actual}) does not match "
+                f"model hidden_size ({expected_hidden_dim}). Each embed tensor must "
+                "have shape [hidden_size] or [1, hidden_size]."
             )
