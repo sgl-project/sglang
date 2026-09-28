@@ -627,6 +627,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mixed_logits_select_index: Optional[torch.Tensor] = None
     mixed_num_prefill_rows: Optional[int] = None
     mixed_num_prefill_tokens: Optional[int] = None
+    # Attention output slice the DeepSeek-V4 layer publishes for that split.
+    attn_output_buffer: Optional[torch.Tensor] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

@@ -683,6 +683,9 @@ def deepseek_v4_attention_with_output(
 
     original_out_cache_loc = forward_batch.out_cache_loc
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    # The backend's verify-merged mixed split writes into this slice in place.
+    out_view = output[:real_num_tokens]
+    forward_batch.attn_output_buffer = out_view
 
     attn_backend = get_attn_backend()
     try:
@@ -698,6 +701,11 @@ def deepseek_v4_attention_with_output(
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.attn_output_buffer = None
+
+    if ret is out_view:
+        output[real_num_tokens:].zero_()
+        return
 
     assert output[:real_num_tokens].numel() == ret.numel(), (
         f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"

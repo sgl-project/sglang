@@ -3571,7 +3571,13 @@ class DeepseekV4AttnBackend(
 
             o = o.squeeze(1)
             if o_prefill is not None:
-                return torch.cat([o_prefill, o], dim=0)
+                # Write both populations straight into the output slice the
+                # attention layer published; it skips its copy on getting it back.
+                out = forward_batch.attn_output_buffer
+                if out is None:
+                    return torch.cat([o_prefill, o], dim=0)
+                torch.cat([o_prefill, o], dim=0, out=out.view(-1, *o.shape[1:]))
+                return out
             return o
 
         raise NotImplementedError("ragged attention")
