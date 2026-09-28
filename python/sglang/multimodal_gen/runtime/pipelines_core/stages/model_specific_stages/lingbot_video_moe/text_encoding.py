@@ -138,6 +138,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
         )
 
     def _encode_inputs(self, inputs, device, dtype):
+        self._begin_text_encoder_use(0)
         text_encoder = self.text_encoders[0]
         inputs = inputs.to(device)
         outputs = self._forward_text_encoder(
