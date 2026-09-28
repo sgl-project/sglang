@@ -850,10 +850,15 @@ class PrefillAdder:
         return 0
 
     def _new_request_reserve_for_req(self, req: Req) -> int:
-        if self.new_request_token_reserve == 0:
+        # A few focused lifecycle tests construct PrefillAdder with
+        # object.__new__ and stub only the state exercised by that path. Keep
+        # the optional HiSparse reservation backward-compatible for those
+        # callers: an absent field has the same meaning as the default value.
+        reserve = getattr(self, "new_request_token_reserve", 0)
+        if reserve == 0:
             return 0
         if req.kv.req_pool_idx is None:
-            return self.new_request_token_reserve
+            return reserve
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
