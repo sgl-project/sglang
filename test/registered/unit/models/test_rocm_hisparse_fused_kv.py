@@ -93,5 +93,27 @@ class TestRocmHiSparseFusedKV(CustomTestCase):
             torch.testing.assert_close(locations, torch.tensor([17, -1, 19, 0]))
 
 
+class TestRocmHiSparseFusedBmmKV(TestRocmHiSparseFusedKV):
+    """The combined absorb/RoPE writer must honor the same slot contract."""
+
+    def invoke(self, locations):
+        self.attn.w_kc = torch.empty(1, 1, 1)
+        self.attn.w_scale = torch.ones(1)
+        with (
+            patch.object(forward_mla_rocm, "get_token_to_kv_pool", lambda: self.pool),
+            patch.object(
+                forward_mla_rocm,
+                "fused_fp8_bmm_rope_cat_and_cache_mla",
+                lambda *args, **kwargs: args,
+                create=True,
+            ),
+        ):
+            args = forward_mla_rocm._fused_bmm_rope_cat_and_cache(
+                self.attn, torch.empty(0, 1, 1), None, None, None, None, locations
+            )
+        self.assertIs(args[6], self.cache)
+        return args[7]
+
+
 if __name__ == "__main__":
     unittest.main()
