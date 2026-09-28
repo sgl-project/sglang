@@ -1,9 +1,13 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang's jit_kernel module
+description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang.kernels JIT infrastructure and public operator groups
 ---
 
 # Tutorial: Adding a New JIT Kernel to SGLang
+
+Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
+operator namespace, logical grouping, lazy registry metadata, and test placement.
+The implementation tutorial below does not replace that API contract.
 
 This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
 
@@ -497,6 +501,32 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 
 ---
 
+## Register the public entry point (required)
+
+Add metadata in `python/sglang/kernels/ops/elementwise/__init__.py` so the
+operator appears in the registry without importing its implementation:
+
+```python
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+register_kernel(
+    KernelSpec(
+        op="elementwise.scale",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.scale:scale",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+```
+
+Record the devices the implementation actually supports; the CUDA-only scale
+example above does not imply that every JIT kernel is CUDA-only. Runtime and
+correctness tests import `scale` from `sglang.kernels.ops.elementwise.scale`.
+Do not import the implementation eagerly in the group initializer. When an
+existing `BaseFusedOp` owns the operation, add the implementation there instead
+of registering a second conflicting op/backend pair.
+
 ## Step 3 (optional): Tune JIT build flags
 
 If your kernel uses some math functions like `expf` or `sinf`, consider enabling `--use_fast_math` for better performance (with a potential precision tradeoff):
@@ -724,7 +754,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
 - `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`
 - `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
-- `python/sglang/kernels/jit/csrc/add_constant.cuh` — minimal runnable reference
+- `python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh` — minimal runnable reference
 - `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
 - `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`

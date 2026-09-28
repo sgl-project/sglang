@@ -23,12 +23,10 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import replace
 from typing import Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -102,7 +100,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -112,7 +109,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.topk = get_spec().speculative_eagle_topk
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        self.ps = ps
         self.gpu_id = gpu_id
         self.device = get_device().device
         self.target_worker = target_worker
@@ -146,8 +142,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self,
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -166,6 +160,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.draft_owns_attention = False
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
@@ -206,7 +202,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_model_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -217,7 +216,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_model_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -692,7 +694,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -705,7 +706,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.topk = get_spec().speculative_eagle_topk
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        self.ps = ps
         self.gpu_id = gpu_id
         self.device = get_device().device
         self._target_worker = target_worker
@@ -720,7 +720,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,
-            ps,
             nccl_port,
             target_worker,
         )
@@ -768,7 +767,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             # Draft prefill seed (no forward).
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -790,7 +790,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 batch.spec_info = self.draft_worker._idle_seed()
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -805,7 +806,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 on_publish(batch_output.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),

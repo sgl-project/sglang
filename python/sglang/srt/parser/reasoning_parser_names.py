@@ -36,4 +36,5 @@ REASONING_PARSER_NAMES = [
     "gemma4",
     "inkling",
     "cohere_command4",
+    "gigachat35",
 ]

@@ -46,6 +46,7 @@ TOOL_CALL_PARSER_NAMES = [
     "hermes",
     "hunyuan",
     "gigachat3",
+    "gigachat35",
     "gemma4",
     "inkling",
 ]

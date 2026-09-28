@@ -52,6 +52,8 @@ PY
 
 The picker defaults to native BF16/FP32 precision, exact attention, eager
 execution, and full-image VAE decoding.
+Commands omit default values, including one GPU, encoder auto scheduling, and
+batch size one. Explicit placement and attention overrides preserve each recipe.
 
 | GPU | Placement / attention | Generation | Edit | Peak VRAM |
 | --- | --- | --- | --- | --- |
@@ -140,29 +142,24 @@ including partly transparent edges, without thresholding or background removal.
 
 ## 4. Offline requests
 
+Defaults are 1024×1024, 40 steps, CFG 1, and seed 42; output saving is enabled.
+For GPUs that need offload, also pass the placement flags from the picker.
+
 ### Text-to-image
 
 ```bash Command
 sglang generate \
-  --model-path /models/qwen-image-2.1 \
-  --model-id Qwen-Image-2.1 \
-  --prompt "A capybara reading a book by candlelight" \
-  --width 1024 --height 1024 \
-  --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
+  --model-path Qwen/Qwen-Image-2.1 \
+  --prompt "A capybara reading a book by candlelight"
 ```
 
 ### Image-conditioned editing
 
 ```bash Command
 sglang generate \
-  --model-path /models/qwen-image-2.1 \
-  --model-id Qwen-Image-2.1 \
+  --model-path Qwen/Qwen-Image-2.1 \
   --image-path /path/to/input.png \
-  --prompt "Move the scene to a snowy mountain at sunrise" \
-  --width 1024 --height 1024 \
-  --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
+  --prompt "Move the scene to a snowy mountain at sunrise"
 ```
 
 Height and width must be positive multiples of 32. Reference images preserve

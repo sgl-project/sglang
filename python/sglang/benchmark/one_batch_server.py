@@ -149,6 +149,7 @@ class BenchArgs:
     cache_hit_rate: float = 0.0
     backend: str = "sglang"
     fake_prefill: bool = False
+    flush_hicache_storage: bool = False
     server_args_for_metrics: Optional[List[str]] = None
     lora_name: Optional[List[str]] = None
     lora_request_distribution: str = "uniform"
@@ -347,6 +348,13 @@ class BenchArgs:
             help="Enable fake prefill mode for decode-only benchmarking. "
             "Use with a decode server running --disaggregation-transfer-backend fake "
             "to benchmark pure decode performance without a real prefill node.",
+        )
+        parser.add_argument(
+            "--flush-hicache-storage",
+            action="store_true",
+            default=BenchArgs.flush_hicache_storage,
+            help="Also clear the hierarchical cache's storage tier before each case; "
+            "/flush_cache resets the radix tree and the host tier only.",
         )
         parser.add_argument(
             "--server-args-for-metrics",
@@ -624,12 +632,17 @@ def run_one_case(
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
+    flush_hicache_storage: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
         _flush_cache_with_retry(url, "/flush_cache")
+        # /flush_cache resets the radix tree and the host tier; a storage tier
+        # persists across it and would serve the same prompts on the next case.
+        if flush_hicache_storage:
+            _flush_cache_with_retry(url, "/hicache/storage-backend/clear")
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -1360,6 +1373,7 @@ def run_benchmark_internal(
                 backend=bench_args.backend,
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
+                flush_hicache_storage=bench_args.flush_hicache_storage,
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1406,6 +1420,7 @@ def run_benchmark_internal(
                     backend=bench_args.backend,
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
+                    flush_hicache_storage=bench_args.flush_hicache_storage,
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1463,6 +1478,7 @@ def run_benchmark_internal(
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
+                            flush_hicache_storage=bench_args.flush_hicache_storage,
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
