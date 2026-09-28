@@ -35,7 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -567,6 +567,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        use_fp32_lm_head: bool = False,
     ):
         super().__init__(
             num_embeddings,
@@ -584,10 +585,17 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # We only support pack LMHead if it's not quantized.
         if _is_cpu and _is_cpu_amx_available:
-            if hasattr(self, "weight") and self.weight.dtype in [
-                torch.bfloat16,
-                torch.float16,
-            ]:
+            if (
+                not (
+                    get_exec().features.enable_fp32_lm_head
+                    or use_fp32_lm_head
+                )
+                and hasattr(self, "weight")
+                and self.weight.dtype in [
+                    torch.bfloat16,
+                    torch.float16,
+                ]
+            ):
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
 
         if bias:
