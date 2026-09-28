@@ -1,23 +1,8 @@
-/*
- * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2026, The vLLM team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-// Adapted from AITER custom_all_reduce.cuh: a TP4 all-reduce of DeepSeek-V4.1's 1-8 row decode
-// hidden states fused with hc_post, split over H, on the peer buffers and signals of AITER's
-// CustomAllreduce (SGLang's ROCm custom all-reduce). Compiled with -ffp-contract=off: the
-// unfused all-reduce + hc_post rounds every multiply and add.
+// Built on AITER's custom all-reduce (csrc/include/custom_all_reduce.cuh, a ROCm port of vLLM's):
+// a TP4 all-reduce of DeepSeek-V4.1's 1-8 row decode hidden states fused with hc_post, split
+// over H, on the peer buffers and signals of AITER's CustomAllreduce (SGLang's ROCm custom
+// all-reduce). Compiled with -ffp-contract=off: the unfused all-reduce + hc_post rounds every
+// multiply and add.
 #pragma once
 
 #ifndef USE_ROCM
