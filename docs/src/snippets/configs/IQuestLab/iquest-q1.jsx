@@ -1,6 +1,5 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// Recipes follow the IQuestLab/IQuest-Q1 model card, with MTP at the checkpoint's
-// trained depth of 7 draft steps. The checkpoint ships the
+// Recipes follow the IQuestLab/IQuest-Q1 model card. The checkpoint ships the
 // MTP draft in its mtp/ subdirectory, so both paths point at a local copy.
 // IQuest Q1 requires FA3 attention, which SGLang builds for Hopper (SM90) and
 // earlier only; Blackwell is not listed.
@@ -17,7 +16,7 @@ export const config = {
   ],
   nodesOptions: [{ id: "single", label: "Single Node" }],
   modelNames: {
-    "default|bf16": "IQuestLab/IQuest-Q1",
+    "default|bf16": "IQuest-Q1",
   },
   placeholders: {
     MODEL_PATH: { target: "command", label: "IQuest-Q1 checkpoint path", default: "/model/IQuest-Q1" },
@@ -50,9 +49,9 @@ export const config = {
         "--reasoning-parser iquest_q1",
         "--tool-call-parser iquest_q1",
         "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 7",
+        "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 8",
+        "--speculative-num-draft-tokens 6",
         "--speculative-draft-model-path '{{DRAFT_PATH}}'",
         "--speculative-draft-attention-backend fa3",
         "--speculative-use-rejection-sampling",

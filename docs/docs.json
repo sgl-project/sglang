@@ -1218,9 +1218,9 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
-                    "group": "IQuest",
+                    "group": "IQuestLab",
                     "pages": [
-                      "cookbook/autoregressive/IQuest/IQuest-Q1"
+                      "cookbook/autoregressive/IQuestLab/IQuest-Q1"
                     ]
                   },
                   {
