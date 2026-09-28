@@ -41,17 +41,17 @@ on:
         type: boolean
         default: false
       skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        description: "Skip PR test health check fail-fast (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{event}-{branch}-{git_ref}
   # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
   #   (without it, both resolve the branch segment to 'main' and block each other)
-  # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
-  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # - a PR keys on its number: github.head_ref is a bare branch name with no owner,
+  #   so two forks using the same name would share one group and cancel each other
+  group: pr-test-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -88,11 +88,6 @@ jobs:
     secrets: inherit
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
-  # These jobs poll GitHub API to wait for previous stages to complete.
-  # For PR runs: wait jobs run and enforce sequential execution via polling.
-  # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
-  # For PRs with the `bypass-fastfail` label: wait jobs run but return success immediately
-  # (handled inside the wait-for-jobs action), so downstream stages dispatch in parallel.
 
   wait-for-base-a:
     needs: [check-changes, call-gate]
@@ -166,7 +161,8 @@ jobs:
         needs.check-changes.outputs.main_package == 'true' ||
         needs.check-changes.outputs.sgl_kernel == 'true' ||
         needs.check-changes.outputs.jit_kernel == 'true' ||
-        needs.check-changes.outputs.multimodal_gen == 'true'
+        needs.check-changes.outputs.multimodal_gen == 'true' ||
+        needs.check-changes.outputs.renderer == 'true'
       )
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit

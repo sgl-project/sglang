@@ -1030,6 +1030,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     else:
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
+            npu_fia_batch_invariant_get_max_workspace,
             npu_fused_infer_attention_score_batch_invariant,
             npu_log_softmax_batch_invariant,
             npu_matmul_batch_invariant,
@@ -1049,6 +1050,12 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         )
         torch.ops.npu.npu_fused_infer_attention_score = (
             npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu.npu_fused_infer_attention_score = (
+            npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu._npu_fused_infer_attention_score_get_max_workspace = (
+            npu_fia_batch_invariant_get_max_workspace
         )
         torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 
