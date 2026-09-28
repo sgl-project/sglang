@@ -8,6 +8,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_THINK_MODE,
+    RESOLUTION_ALIGNMENT,
+)
 
 
 def _is_runtime_option_requested(value) -> bool:
@@ -81,7 +85,23 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     supports_cfg_parallel: bool = False
 
     def supports_dynamic_batching(self):
-        return False
+        return True
+
+    def supports_dynamic_batching_for_request(self, batch) -> bool:
+        sampling_params = getattr(batch, "sampling_params", None)
+        return not bool(getattr(sampling_params, "think_mode", DEFAULT_THINK_MODE))
+
+    def estimate_request_cost(self, batch) -> float:
+        image_tokens = (int(batch.width) // RESOLUTION_ALIGNMENT) * (
+            int(batch.height) // RESOLUTION_ALIGNMENT
+        )
+        cfg_branches = 2 if float(batch.guidance_scale) > 1 else 1
+        return float(
+            image_tokens
+            * int(batch.num_inference_steps)
+            * cfg_branches
+            * int(batch.num_outputs_per_prompt)
+        )
 
     def supports_disaggregation(self) -> bool:
         return False

@@ -8,6 +8,7 @@ import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
@@ -67,9 +68,20 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 class WeightChecker:
-    def __init__(self, *, get_model: Callable[[], Any], ps: Any):
+    def __init__(self, *, get_model: Callable[[], Any]):
         self._get_model = get_model
-        self._ps = ps
+        # Capture the runner placement before its draft scope exits.
+        parallel = get_parallel()
+        self._placement = ParallelismInfo(
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            dp_rank=parallel.dp_rank if parallel.dp_rank is not None else 0,
+            dp_size=parallel.attn_dp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+            rank=0,
+            size=1,
+        )
         self._snapshot_tensors = None
 
     def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
@@ -161,16 +173,12 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        ps = self._ps
-        return ParallelismInfo(
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            dp_rank=ps.dp_rank if ps.dp_rank is not None else 0,
-            dp_size=ps.attn_dp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
-            rank=dist.get_rank() if dist.is_initialized() else 0,
-            size=dist.get_world_size() if dist.is_initialized() else 1,
+        # Read the current WORLD rank because elastic scale-up can change it.
+        return self._placement.model_copy(
+            update={
+                "rank": dist.get_rank() if dist.is_initialized() else 0,
+                "size": dist.get_world_size() if dist.is_initialized() else 1,
+            }
         )
 
     def _model_state(self):

@@ -384,9 +384,14 @@ class CommitKvProj:
         *,
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
+        allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
         if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
-            return cls.triton(main_x=main_x, wkv_linears=wkv_linears)
+            return cls.triton(
+                main_x=main_x,
+                wkv_linears=wkv_linears,
+                allow_strided_output=allow_strided_output,
+            )
         return cls.torch(main_x=main_x, wkv_linears=wkv_linears)
 
     @classmethod
@@ -404,8 +409,13 @@ class CommitKvProj:
         *,
         main_x: torch.Tensor,
         wkv_linears: list[torch.nn.Module],
+        allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        return commit_kv_proj_fused(main_x=main_x, wkv_linears=wkv_linears)
+        return commit_kv_proj_fused(
+            main_x=main_x,
+            wkv_linears=wkv_linears,
+            allow_strided_output=allow_strided_output,
+        )
 
 
 def commit_kv_proj(
@@ -420,11 +430,20 @@ def commit_kv_proj_fused(
     *,
     main_x: torch.Tensor,
     wkv_linears: list[torch.nn.Module],
+    allow_strided_output: bool = False,
 ) -> list[torch.Tensor]:
     num_stages = len(wkv_linears)
     stacked = _stacked_wkv_weight(wkv_linears=wkv_linears)
 
-    if stacked.fp8_scale is not None:
+    if stacked.mxfp8_scale is not None:
+        kv_all = wkv_linears[0].quant_method.w8a8_mxfp8_linear(
+            input=main_x,
+            weight=stacked.weight,
+            weight_scale=stacked.mxfp8_scale,
+            input_scale=None,
+            bias=None,
+        )
+    elif stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
         kv_all = quant_method.w8a8_block_fp8_linear(
             input=main_x,
@@ -438,15 +457,14 @@ def commit_kv_proj_fused(
         kv_all = torch.nn.functional.linear(main_x, stacked.weight)
 
     head_dim = kv_all.shape[-1] // num_stages
-    return [
-        kv_all[:, i * head_dim : (i + 1) * head_dim].contiguous()
-        for i in range(num_stages)
-    ]
+    slices = list(kv_all.split(head_dim, dim=-1))
+    return slices if allow_strided_output else [kv.contiguous() for kv in slices]
 
 
 class _StackedWkvWeight(msgspec.Struct):
     weight: torch.Tensor
     fp8_scale: Optional[torch.Tensor]
+    mxfp8_scale: Optional[torch.Tensor] = None
 
 
 def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWeight:
@@ -500,6 +518,21 @@ def _build_stacked_wkv_weight(
 ) -> _StackedWkvWeight:
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         weight = torch.cat([linear.weight for linear in wkv_linears], dim=0)
+        backend = getattr(wkv_linears[0].quant_method, "mxfp8_dense_backend", None)
+        if (
+            backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+            and all(
+                getattr(linear, "block_fp8_mxfp8_ready", False)
+                and linear.weight.shape[0] % 128 == 0
+                for linear in wkv_linears
+            )
+        ):
+            # 128-row-aligned scale tiles concatenate without breaking the swizzle.
+            scale = torch.cat(
+                [linear.weight_scale_inv_swizzled.reshape(-1) for linear in wkv_linears]
+            )
+            return _StackedWkvWeight(weight=weight, fp8_scale=None, mxfp8_scale=scale)
         if wkv_linears[0].weight_scale_inv.dtype == torch.int32:
             from sglang.srt.layers.quantization.fp8_utils import (
                 inverse_transform_scale_ue8m0,

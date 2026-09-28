@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -977,7 +978,7 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
             config.hidden_size, eps=config.rms_norm_eps, has_weight=False
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )

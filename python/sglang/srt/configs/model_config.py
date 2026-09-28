@@ -20,12 +20,13 @@ import os
 from enum import Enum, IntEnum, auto
 from functools import cached_property
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Callable, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
@@ -45,11 +46,42 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+_MODEL_CONFIG_FACTORIES: dict[type[ServerArgs], Callable[..., "ModelConfig"]] = {}
+
+
+def register_model_config_factory(
+    server_args_type: type[ServerArgs], factory: Callable[..., "ModelConfig"]
+) -> None:
+    """Register a factory with the same signature as ModelConfig.from_server_args.
+
+    Register before resolution or model construction in each process. The nearest
+    registered type in the argument record's MRO wins, so registrations cover
+    subclasses too. Repeating the same registration is harmless; replacing a
+    different factory for the same type is an error.
+    """
+    if not issubclass(server_args_type, ServerArgs):
+        raise TypeError("model-config factories require a ServerArgs subclass")
+    previous = _MODEL_CONFIG_FACTORIES.get(server_args_type)
+    if previous is not None and previous is not factory:
+        raise ValueError(
+            f"A model-config factory is already registered for {server_args_type.__qualname__}"
+        )
+    _MODEL_CONFIG_FACTORIES[server_args_type] = factory
+
+
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
+
+BAILING_MULTI_GATE_MM_ARCHS = frozenset(
+    {
+        "BailingMMNativeForConditionalGeneration",
+        "BailingMM2NativeForConditionalGeneration",
+        "BailingMoeV3VLForConditionalGeneration",
+    }
+)
 
 SWA_SINK_ARCHS = frozenset(
     {
@@ -64,6 +96,17 @@ def _quant_config_to_dict(quant_config):
     if quant_config is not None and not isinstance(quant_config, dict):
         return quant_config.to_dict()
     return quant_config
+
+
+def requires_mm_token_modalities(
+    model_architectures: Optional[List[str]], hf_text_config: PretrainedConfig
+) -> bool:
+    """Whether a Bailing multimodal wrapper uses modality-specific routers."""
+    return bool(
+        model_architectures
+        and any(arch in BAILING_MULTI_GATE_MM_ARCHS for arch in model_architectures)
+        and is_bailing_multi_gate_enabled(hf_text_config)
+    )
 
 
 def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
@@ -450,6 +493,9 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.requires_mm_token_modalities = requires_mm_token_modalities(
+            self.hf_config.architectures, self.hf_text_config
+        )
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
             self.hf_config.architectures,
@@ -517,6 +563,7 @@ class ModelConfig:
             _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
             or {}
         )
+        self.hf_quant_config: dict = quantization_config
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
@@ -605,12 +652,17 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
+        has_dsv41_vision = (
+            self.hf_config.model_type == "deepseek_v41"
+            and self.hf_config.vision_n_layers > 0
+        )
         self.is_multimodal = (
             enable_multimodal
             and not self.is_lm_only
             and (
                 is_multimodal_model(self.hf_config.architectures)
                 or has_multimodal_subconfig
+                or has_dsv41_vision
             )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
@@ -629,6 +681,8 @@ class ModelConfig:
             self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
+        if self.is_multimodal and has_dsv41_vision:
+            self.is_image_understandable_model = True
 
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
@@ -658,27 +712,11 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
-        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
-        self.is_piecewise_cuda_graph_disabled_model = (
-            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or (
-                self.is_multimodal
-                and not is_multimodal_piecewise_cuda_graph_supported(
-                    self.hf_config.architectures
-                )
-            )
+        self.ngram_embedding_n = (
+            self.hf_config.ngram_embedding_n if self.use_ngram_embedding else 0
         )
-        # Multimodal archs whose language-model prefill is verified safe to capture
-        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
-        # CG for every multimodal model; this opt-in re-enables it for listed archs
-        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
-        # LM forward is captured).
-        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
-            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
-        )
-        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
-            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
-        )
+        self.use_engram = bool(getattr(self.hf_config, "engram_layer_ids", ()))
+        self._derive_multimodal_cuda_graph_support(enable_multimodal)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -729,6 +767,18 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
+        for record_type in type(server_args).__mro__:
+            factory = _MODEL_CONFIG_FACTORIES.get(record_type)
+            if factory is not None:
+                return factory(
+                    server_args,
+                    model_path=model_path,
+                    model_revision=model_revision,
+                    is_draft_model=is_draft_model,
+                    context_length=context_length,
+                    **kwargs,
+                )
+
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -768,6 +818,31 @@ class ModelConfig:
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
+        )
+
+    def _derive_multimodal_cuda_graph_support(self, enable_multimodal: bool) -> None:
+        """Declare graph capabilities before deriving shapes and validating config.
+
+        External ModelConfig subclasses can extend this without modifying global
+        architecture tables or repairing the config after construction.
+        """
+        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or (
+                self.is_multimodal
+                and not is_multimodal_piecewise_cuda_graph_supported(
+                    self.hf_config.architectures
+                )
+            )
+        )
+        # The vision encoder still runs eagerly; this opt-in captures only the
+        # language-model prefill of architectures validated for piecewise graphs.
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
+        )
+        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
 
     def _config_draft_model(self):
@@ -852,6 +927,11 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -1116,6 +1196,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1208,15 +1290,20 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
-        elif "BailingMoeV3ForCausalLM" in self.hf_config.architectures:
+        elif (
+            "BailingMoeV3ForCausalLM" in self.hf_config.architectures
+            or "BailingMoeV3VLForConditionalGeneration" in self.hf_config.architectures
+        ):
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = (
-                0 if self.hf_config.use_mla_nope else self.hf_config.qk_rope_head_dim
+                0
+                if getattr(self.hf_text_config, "use_mla_nope", False)
+                else self.hf_text_config.qk_rope_head_dim
             )
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif (
             "SarvamMLAForCausalLM" in self.hf_config.architectures
@@ -2176,6 +2263,9 @@ multimodal_model_archs = [
     "StepVLForConditionalGeneration",
     "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "BailingMMNativeForConditionalGeneration",
+    "BailingMM2NativeForConditionalGeneration",
+    "BailingMoeV3VLForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [

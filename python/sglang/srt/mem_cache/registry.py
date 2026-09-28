@@ -14,7 +14,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -100,13 +99,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
-
-    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-        # lazy import to avoid JIT overhead
-        from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-        logger.info("Using experimental C++ radix tree implementation.")
-        return RadixCacheCpp(params=params, server_args=server_args)
 
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
@@ -262,6 +254,18 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             f"tree_cache is {type(cache).__name__}. Drop the flag or the "
             "option that selected another tree cache for this model."
         )
+
+    if get_memory().radix_eviction_policy == "tlru":
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # T-LRU's per-node tail bookkeeping only exists on the unified tree;
+        # any other cache would silently fall back to LRU ordering.
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "--radix-eviction-policy tlru requires UnifiedRadixCache, but "
+                f"tree_cache is {type(cache).__name__}. Drop the flag or the "
+                "option that selected another tree cache for this model."
+            )
 
     hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+from array import array
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -13,9 +14,6 @@ from sglang.srt.configs.inkling import (
     InklingMMConfig,
     InklingModelConfig,
     InklingVisionConfig,
-)
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
@@ -308,7 +306,7 @@ class InklingDecoderLayer(nn.Module):
                     hs,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                     norm=self.attn_norm,
                     norm_residual=res,
                 )
@@ -317,7 +315,7 @@ class InklingDecoderLayer(nn.Module):
                 # MoE's unreduced partials; the kernel returns the gathered
                 # post-conv [T, H], and the norm runs unfused below.
                 hs = ar_scattered_sconv_fused(
-                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                    hs, prev_mlp_sconv, forward_batch, get_parallel().tp_group
                 )
                 hs, res = self.attn_norm(hs, res)
         elif prev_mlp_partial:
@@ -331,13 +329,13 @@ class InklingDecoderLayer(nn.Module):
                     prev_mlp_sconv,
                     self.attn_norm,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
             else:
                 # Fused extend {AR + full-width sconv + cache update}
                 # (non-scattered); norm runs unfused on the gathered [T, H].
                 hs = ar_fullwidth_sconv_fused(
-                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                    hs, prev_mlp_sconv, forward_batch, get_parallel().tp_group
                 )
                 hs, res = self.attn_norm(hs, res)
         else:
@@ -618,7 +616,7 @@ class InklingCausalLLM(nn.Module):
         # the prefill graph disabled and --skip-server-warmup there is no eager
         # forward to build them lazily; decode capture would bake the fallback).
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
-            ensure_inkling_ar_resources(get_tensor_model_parallel_group())
+            ensure_inkling_ar_resources(get_parallel().tp_group)
             ensure_inkling_ar_resources(get_parallel().attn_tp_group)
 
         # Warm the fused decode {AR -> mlp_sconv -> norm} JIT module (both
@@ -763,7 +761,7 @@ class InklingCausalLLM(nn.Module):
         fuse_ar_sconv = (
             not forward_batch.forward_mode.is_idle()
             and ar_sconv_norm_fusable(
-                get_tensor_model_parallel_group(),
+                get_parallel().tp_group,
                 forward_batch,
                 hidden_states.shape[0],
                 hidden_states.shape[-1],
@@ -788,7 +786,7 @@ class InklingCausalLLM(nn.Module):
         # kernel. Mutually exclusive with ar_sconv_norm_fusable by mode
         # (extend vs decode/verify) and by the scattered gate inside it.
         if not forward_batch.forward_mode.is_idle() and scattered_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             hidden_states.shape[0],
             hidden_states.shape[-1],
@@ -803,7 +801,7 @@ class InklingCausalLLM(nn.Module):
         # (mode for ar_sconv_norm_fusable, the scattered flag for
         # scattered_ar_sconv_fusable).
         if not forward_batch.forward_mode.is_idle() and fullwidth_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             hidden_states.shape[0],
             hidden_states.shape[-1],
@@ -856,7 +854,7 @@ class InklingCausalLLM(nn.Module):
                         hidden_states,
                         prev_mlp_sconv,
                         forward_batch,
-                        get_tensor_model_parallel_group(),
+                        get_parallel().tp_group,
                         norm=self.norm,
                         norm_residual=residual,
                     )
@@ -871,7 +869,7 @@ class InklingCausalLLM(nn.Module):
                     hidden_states,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
                 return (
@@ -890,7 +888,7 @@ class InklingCausalLLM(nn.Module):
                         prev_mlp_sconv,
                         self.norm,
                         forward_batch,
-                        get_tensor_model_parallel_group(),
+                        get_parallel().tp_group,
                     )
                     return (
                         (hidden_states, aux_hidden_states)
@@ -903,7 +901,7 @@ class InklingCausalLLM(nn.Module):
                     hidden_states,
                     prev_mlp_sconv,
                     forward_batch,
-                    get_tensor_model_parallel_group(),
+                    get_parallel().tp_group,
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
                 return (
@@ -1016,7 +1014,6 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         if get_disagg().disaggregation_mode != "decode":
             assert not get_memory().disable_radix_cache
             assert not get_schedule().disable_hybrid_swa_memory
@@ -1125,7 +1122,7 @@ class InklingForConditionalGeneration(nn.Module):
             return 2
         return 1
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # The processor expands one placeholder per media item into a run of the same
         # token id; the scheduler calls this to replace each run with the item's
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.
@@ -1787,7 +1784,7 @@ class InklingMTPLayer(nn.Module):
             h_inproj.dtype,
         )
         if not fm_idle and scattered_ar_sconv_fusable(
-            get_tensor_model_parallel_group(),
+            get_parallel().tp_group,
             forward_batch,
             h_inproj.shape[0],
             h_inproj.shape[-1],

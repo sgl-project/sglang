@@ -187,19 +187,29 @@ jobs:
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
           fi
 
+      - name: Resolve CI labels
+        id: ci-labels
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { resolveCiLabels } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+            );
+            const axes = await resolveCiLabels(github, context);
+            core.info(`CI labels: [${axes.labels.join(', ')}]`);
+            core.setOutput('bypass_fail_fast', String(axes.bypassFailFast));
+
       - name: Set continue-on-error for schedule/full runs
         id: set-continue-on-error
         env:
-          # `bypass-fastfail` PR label: also disable within-suite fast-fail
-          # here. The shared actions/wait-for-jobs already honors the same
-          # label to skip cross-stage waits.
-          BYPASS_FASTFAIL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bypass-fastfail') }}
+          BYPASS_FAIL_FAST: ${{ steps.ci-labels.outputs.bypass_fail_fast }}
         run: |
           if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" \
              || "${{ inputs.continue_on_error }}" == "true" \
-             || "$BYPASS_FASTFAIL_LABEL" == "true" ]]; then
+             || "$BYPASS_FAIL_FAST" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fastfail=$BYPASS_FASTFAIL_LABEL)"
+            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fail-fast=$BYPASS_FAIL_FAST)"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
             echo "Continue-on-error: DISABLED"
@@ -321,7 +331,7 @@ jobs:
           }
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_align.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
-          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
+          run_pytest docker exec -w /sglang-checkout/test/registered/kernels/ops/speculative ci_sglang python3 -m pytest test_eagle_utils.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_activation.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_topk.py

@@ -63,7 +63,7 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
                 repeat=1,
                 temperature=0.0,
                 top_p=1.0,
-                host="http://127.0.0.1",
+                host="127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
         )

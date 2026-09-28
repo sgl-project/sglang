@@ -750,7 +750,7 @@ SGLang's `Engine` API runs inference in-process, without an HTTP server, letting
 `bench_offline_throughput` uses the `Engine` API internally and measures pure inference throughput without HTTP overhead:
 
 ```shell Command
-python -m sglang.bench_offline_throughput \
+python -m sglang.benchmark.offline_throughput \
   --model-path Qwen/Qwen2.5-7B-Instruct \
   --dataset-name random \
   --random-input-len 1024 \

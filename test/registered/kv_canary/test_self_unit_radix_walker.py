@@ -9,7 +9,6 @@ import torch
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -73,65 +72,6 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         locked_node = next(iter(cache.root_node.children.values()))
         locked_node.lock_ref = 1
         result = walk_radix_cache_for_canary(radix_cache=cache, unlocked_only=True)
-        self.assertEqual(result.slot_indices.tolist(), [3, 4])
-
-    def test_walk_unlocked_only_uses_swa_full_lock_ref(self):
-        """Verify SWA radix walking honors full-pool lock references."""
-        cache = SWARadixCache.__new__(SWARadixCache)
-        cache.device = self.device
-        cache.page_size = 1
-        cache.disable = False
-
-        root = TreeNode()
-        root.value = torch.tensor([], dtype=torch.int32, device=self.device)
-        cache.root_node = root
-
-        locked_child = TreeNode()
-        locked_child.value = torch.tensor([1, 2], dtype=torch.int32, device=self.device)
-        locked_child.parent = root
-        locked_child.full_lock_ref = 1
-        root.children[locked_child.id] = locked_child
-
-        unlocked_child = TreeNode()
-        unlocked_child.value = torch.tensor(
-            [3, 4], dtype=torch.int32, device=self.device
-        )
-        unlocked_child.parent = root
-        root.children[unlocked_child.id] = unlocked_child
-
-        result = walk_radix_cache_for_canary(radix_cache=cache, unlocked_only=True)
-        self.assertEqual(result.slot_indices.tolist(), [3, 4])
-
-    def test_swa_resident_only_skips_tombstoned_nodes(self):
-        """Verify SWA radix walking skips nodes whose SWA storage was evicted."""
-        cache = SWARadixCache.__new__(SWARadixCache)
-        cache.device = self.device
-        cache.page_size = 1
-        cache.disable = False
-
-        root = TreeNode()
-        root.value = torch.tensor([], dtype=torch.int32, device=self.device)
-        cache.root_node = root
-
-        tombstoned_child = TreeNode()
-        tombstoned_child.value = torch.tensor(
-            [1, 2], dtype=torch.int32, device=self.device
-        )
-        tombstoned_child.parent = root
-        tombstoned_child.swa_tombstone = True
-        root.children[tombstoned_child.id] = tombstoned_child
-
-        resident_child = TreeNode()
-        resident_child.value = torch.tensor(
-            [3, 4], dtype=torch.int32, device=self.device
-        )
-        resident_child.parent = root
-        root.children[resident_child.id] = resident_child
-
-        result = walk_radix_cache_for_canary(
-            radix_cache=cache,
-            swa_resident_only=True,
-        )
         self.assertEqual(result.slot_indices.tolist(), [3, 4])
 
     def test_unified_swa_sweep_gates_on_swa_lock_not_full_lock(self):

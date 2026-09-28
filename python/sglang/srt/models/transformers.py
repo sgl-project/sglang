@@ -21,6 +21,7 @@
 import inspect
 import logging
 import re
+from array import array
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple, Union
@@ -34,7 +35,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
     get_pp_indices,
     tensor_model_parallel_all_reduce,
 )
@@ -576,7 +576,7 @@ class TransformersBase(nn.Module):
         self.config = config
         self.text_config = get_hf_text_config(config)
         self.weight_mapper = self.hf_to_sglang_mapper
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Weight loading attrs
         self.skip_prefixes: list[str] = []
@@ -1369,7 +1369,7 @@ class MultiModalMixin:
         rope_type = str(getattr(self.text_config, "rope_type", "")).lower()
         return "mrope" in rope_type
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return input_ids
 
     def _get_modality_encoder(self, modality_name: str):

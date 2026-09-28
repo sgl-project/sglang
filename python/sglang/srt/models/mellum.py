@@ -25,7 +25,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -494,7 +493,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
 
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         cfg = cast(Any, config)
         self.config = cfg
         self.quant_config = quant_config

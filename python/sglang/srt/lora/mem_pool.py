@@ -17,7 +17,6 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.eviction_policy import get_eviction_policy
@@ -1457,7 +1456,7 @@ class LoRAMemoryPool:
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
-                    assert not get_pp_group().is_last_rank, (
+                    assert not get_parallel().pp_group.is_last_rank, (
                         f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     )
                     continue

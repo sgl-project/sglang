@@ -90,6 +90,11 @@ class Serving(msgspec.Struct):
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    grpc_response_timeout_secs: A[
+        int,
+        "Timeout in seconds waiting for each native gRPC response chunk, "
+        "including the first. Must be positive. Defaults to 300.",
+    ] = 300
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
@@ -158,7 +163,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
     served_model_name: A[
         Optional[str],
@@ -281,6 +286,10 @@ class Serving(msgspec.Struct):
         bool,
         "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
+    constrained_json_max_whitespace_cnt: A[
+        Optional[int],
+        "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer

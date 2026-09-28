@@ -37,14 +37,15 @@ import argparse
 import copy
 import dataclasses
 import functools
+import importlib
 import logging
+import sys
 import tempfile
 import uuid
 from typing import Any, NoReturn
 
 import msgspec
 
-from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
@@ -60,13 +61,40 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
+
+
+def _reasoning_parser_choices():
+    # Importing the registry here costs seconds in every process that parses
+    # arguments; a plugin that registered a parser has already imported it.
+    module = sys.modules.get("sglang.srt.parser.reasoning_parser")
+    if module is not None:
+        return list(module.ReasoningParser.DetectorMap)
+    from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+    return list(REASONING_PARSER_NAMES)
+
+
+def _tool_call_parser_choices():
+    module = sys.modules.get("sglang.srt.function_call.function_call_parser")
+    if module is not None:
+        return list(module.FunctionCallParser.ToolCallParserEnum)
+    from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+
+    return list(TOOL_CALL_PARSER_NAMES)
+
+
+def _real_kv_hash_modes():
+    # Lazy: this pulls the whole sglang.kernels package (~2 s) into every
+    # process that imports server_args, most of which never use it.
+    from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
+    return list(RealKvHashMode)
+
 
 # Re-exported. These were importable from this module while the field
 # declarations that used them lived here; the declarations moved to
@@ -171,6 +199,23 @@ from sglang.srt.utils.common import (  # noqa: F401
     json_list_type,
     nullable_str,
 )
+
+# Re-exported like the imports above, but resolved on first use: importing them
+# eagerly is what the choices helpers avoid, and most processes never read them.
+_LAZY_REEXPORTS = {
+    "FunctionCallParser": "sglang.srt.function_call.function_call_parser",
+    "ReasoningParser": "sglang.srt.parser.reasoning_parser",
+    "RealKvHashMode": "sglang.kernels.ops.kv_canary.consts",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _LAZY_REEXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
 
 
 def _plain(value: Any) -> Any:
@@ -341,6 +386,9 @@ class ServerArgs:
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
 
+    def _unified_memory_pd_transfer_backends(self) -> set[str]:
+        return {"mooncake"}
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -359,7 +407,7 @@ class ServerArgs:
             help="Choose the kernels for sampling layers.",
         )
 
-        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
+        reasoning_parser_choices = _reasoning_parser_choices()
         parser.add_argument(
             "--reasoning-parser",
             type=str,
@@ -369,7 +417,7 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
+        tool_call_parser_choices = _tool_call_parser_choices()
         parser.add_argument(
             "--tool-call-parser",
             type=str,
@@ -383,7 +431,7 @@ class ServerArgs:
             "--kv-canary-real-data",
             type=str,
             default=_declared_default("kv_canary_real_data"),
-            choices=[m.name.lower() for m in RealKvHashMode],
+            choices=[m.name.lower() for m in _real_kv_hash_modes()],
             help=(
                 "Check the real KV-cache in the canary. "
                 "'none' (default) disables the feature. "

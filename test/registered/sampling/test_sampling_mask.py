@@ -20,7 +20,10 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
+    SamplingBatchInfo,
+)
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -162,9 +165,10 @@ class TestSamplingMaskCapture(CustomTestCase):
                     has_custom_logit_processor=True,
                     custom_params=[{"token_ids": [2]}, None],
                     custom_logit_processor={
-                        0: (
-                            DisallowedTokensLogitsProcessor(),
-                            torch.tensor([True, False], device="cuda"),
+                        0: ProcessorEntry(
+                            processor=DisallowedTokensLogitsProcessor(),
+                            rows=[0],
+                            indices=torch.tensor([0], device="cuda"),
                         )
                     },
                     return_sampling_masks=[True, True],

@@ -637,6 +637,11 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if not x.is_cuda:
+            # AITER kernels dereference activations as GPU pointers; a CPU
+            # input (e.g. unit tests building modules on CPU) aborts the
+            # process with HSA_STATUS_ERROR_MEMORY_FAULT instead of raising.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.

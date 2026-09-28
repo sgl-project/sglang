@@ -18,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -35,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.attention.autotune import (
+    install as install_attention_backend_autotune,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
@@ -45,7 +49,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     get_request_skip_softmax_params,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_attn_backend_context,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
@@ -413,7 +421,9 @@ class UlyssesAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
-        _maybe_install_backend_autotune(self, attn_backend.get_enum())
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -682,7 +692,9 @@ class LocalAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
-        _maybe_install_backend_autotune(self, attn_backend.get_enum())
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -855,7 +867,9 @@ class USPAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
-        _maybe_install_backend_autotune(self, attn_backend.get_enum())
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -2106,19 +2120,27 @@ for _attn_cls in (
 del _attn_cls
 
 
-def _maybe_install_backend_autotune(layer, backend) -> None:
+def _maybe_install_backend_autotune(
+    layer, backend, required_attention_backend: AttentionBackendEnum | None
+) -> None:
     """Opt-in: let the layer pick its backend by measurement on its first big call."""
-    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
     try:
-        if not get_global_server_args().enable_attention_backend_autotune:
+        server_args = server_args_module.get_global_server_args()
+        if not server_args.enable_attention_backend_autotune:
             return
     except Exception:  # no ServerArgs yet (unit tests, tooling)
         return
-    if getattr(layer, "_required_attention_backend", None) is not None:
+    component_context = get_component_attn_backend_context()
+    if (
+        required_attention_backend is not None
+        or get_global_forced_attn_backend() is not None
+        or (
+            component_context is not None
+            and component_context.require_backend_selection
+        )
+        or server_args.is_arg_explicitly_set("attention_backend")
+    ):
         return
-    from sglang.multimodal_gen.runtime.layers.attention.autotune import install
-
     layer.backend = backend
     layer._default_attn_backend = backend
-    install(layer)
+    install_attention_backend_autotune(layer)

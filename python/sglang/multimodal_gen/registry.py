@@ -99,6 +99,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+    QwenImage21PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
@@ -185,6 +188,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
@@ -1132,6 +1136,12 @@ def _register_configs():
     )
     # Qwen-Image
     register_configs(
+        sampling_param_cls=QwenImage21SamplingParams,
+        pipeline_config_cls=QwenImage21PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
+    )
+    register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
@@ -1141,6 +1151,7 @@ def _register_configs():
                 and "edit" not in hf_id.lower()
                 and "layered" not in hf_id.lower()
                 and "2512" not in hf_id.lower()
+                and "qwen-image-2.1" not in hf_id.lower()
             )
         ],
     )

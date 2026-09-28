@@ -10,6 +10,8 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
+import gc
 import json
 import re
 import tempfile
@@ -54,7 +56,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
-_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+_ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -227,10 +229,10 @@ class TestChatTemplateCache(CustomTestCase):
 
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
         first = self._render()
-        first[1].append(99)
+        first[0].append(99)
         second = self._render()
 
-        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.assertEqual(second, ([11, 12], "decoded"))
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
@@ -277,6 +279,13 @@ class ServingChatTestCase(unittest.TestCase):
         # to publish one rather than hang the values off a mock manager.
         reset_context()
         self.addCleanup(reset_context)
+        # Tests drive coroutines through get_or_create_event_loop(), which
+        # creates a fresh loop per call and leaves the previous one unclosed.
+        # Finalize those loops here, between tests: if the cyclic GC collects
+        # one mid-import, its ResourceWarning imports tracemalloc while the
+        # outer import still holds the module-lock bookkeeping, which raises
+        # KeyError from importlib._bootstrap on Python < 3.12.
+        self.addCleanup(self._close_event_loops)
         publish(
             ServerArgs(
                 model_path="dummy",
@@ -292,6 +301,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.tokenizer.reset_mock()
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(
@@ -312,6 +322,17 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _close_event_loops():
+        try:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
+        gc.collect()
 
     @staticmethod
     def _render_tool_results_in_call_order(messages, **kwargs):
@@ -2677,8 +2698,9 @@ class ServingChatTestCase(unittest.TestCase):
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -2691,6 +2713,8 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
+            logprobs=True,
+            top_logprobs=5,
         )
 
         with patch(

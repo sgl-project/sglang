@@ -6,9 +6,8 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
+    get_activation_cuda_cflags,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -18,19 +17,9 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-def _fast_math_flags() -> list[str]:
-    # Mirrors sgl-kernel's CMake policy: fast-math on SM90, precise on
-    # SM100+ (Blackwell needs bit-exact expf), off on HIP (clang rejects).
-    if is_hip_runtime():
-        return []
-    if get_jit_cuda_arch().major >= 10:
-        return []
-    return ["--use_fast_math"]
-
-
 @cache_once
 def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
-    fast_math_flags = _fast_math_flags()
+    fast_math_flags = get_activation_cuda_cflags()
     if not fast_math and not fast_math_flags:
         return activation_module(dtype)
     args = make_cpp_args(dtype, is_arch_support_pdl())

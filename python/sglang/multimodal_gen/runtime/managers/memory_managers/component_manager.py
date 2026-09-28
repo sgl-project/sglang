@@ -49,6 +49,12 @@ class ComponentUse:
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
     start_at_stage_entry: bool = True
+    # Layerwise components release their resident set when the use ends, which
+    # is right for a DiT (one use spans every denoise step) and buys nothing for
+    # a component used once per forward. Set this when something that knows the
+    # pipeline's per-phase headroom has decided the room is better spent holding
+    # the set until this component runs again.
+    retain_resident_layers: bool = False
 
 
 @dataclass(slots=True)

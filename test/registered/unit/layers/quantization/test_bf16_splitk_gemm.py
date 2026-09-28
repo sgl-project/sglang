@@ -2,7 +2,6 @@ import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import (
-    _BF16_SPLITK_TUNED_TACTICS,
     Bf16GemmBackend,
     should_enable_bf16_splitk_gemm,
     use_bf16_splitk_gemm,
@@ -10,11 +9,6 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-
-
-@pytest.mark.parametrize("m,n,k", _BF16_SPLITK_TUNED_TACTICS)
-def test_splitk_selects_tuned_oakhaven_shape(m: int, n: int, k: int):
-    assert use_bf16_splitk_gemm(m, n, k)
 
 
 @pytest.mark.parametrize("m", [0, 33, 64])

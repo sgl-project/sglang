@@ -190,6 +190,7 @@ def _layernorm_modulate_kernel(
     FP8_MAX: tl.constexpr,
     STORE_BF16: tl.constexpr,
     QUANTIZE_FP8: tl.constexpr,
+    HAS_SHIFT: tl.constexpr = True,
 ):
     pid = tl.program_id(0).to(tl.int64)
     row_offs = pid * ROWS + tl.arange(0, ROWS)
@@ -261,13 +262,15 @@ def _layernorm_modulate_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        sh = tl.load(
-            shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
         one_plus = round_bf16_to_fp32(1.0 + sc)
-        y = round_bf16_to_fp32(y * one_plus) + sh
+        y = round_bf16_to_fp32(y * one_plus)
+        if HAS_SHIFT:
+            sh = tl.load(
+                shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            y = y + sh
         if STORE_BF16:
             tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
         if QUANTIZE_FP8:
@@ -388,7 +391,7 @@ def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
 
 
 def can_use_fused_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None
 ) -> bool:
     if not (
         _is_bf16_cuda(x)
@@ -398,28 +401,33 @@ def can_use_fused_layernorm_modulate(
         and x.shape[-1] % 4 == 0
         and x.shape[-1] <= 8192
         and _is_bf16_cuda(scale)
-        and _is_bf16_cuda(shift)
         and scale.device == x.device
-        and shift.device == x.device
     ):
         return False
     batch, _, hidden = x.shape
     q = _mod_row_stride(scale, batch, hidden)
+    if shift is None:
+        return q is not None
+    if not _is_bf16_cuda(shift) or shift.device != x.device:
+        return False
     v = _mod_row_stride(shift, batch, hidden)
     return q is not None and v is not None and q == v
 
 
 def _fake_ln_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
 
 def fused_layernorm_modulate_raw(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     """``LN(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)``, bit-exact
     vs the eager aten chain (LayerNorm without affine).
+
+    With ``shift=None``, omit the addition, preserving signed zeros in
+    scale-only modulation.
 
     Direct-call variant without the ``torch.ops`` dispatch (which costs tens
     of microseconds per call); use it on CPU-launch-bound eager hot paths
@@ -449,6 +457,7 @@ def fused_layernorm_modulate_raw(
             FP8_MAX=fp8_max,
             STORE_BF16=True,
             QUANTIZE_FP8=False,
+            HAS_SHIFT=shift is not None,
             # H200-tuned: 38.5us at (1, 4096, 4096) vs the 121.8us eager
             # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
             # 4 warps triggers pathological Triton layout conversions in

@@ -310,15 +310,14 @@ class UMBPStore(HiCacheStorage):
         if dp_rank_hint is None:
             try:
                 from sglang.srt.layers.dp_attention import (
-                    get_attention_dp_rank,
-                    get_attention_dp_size,
                     is_dp_attention_enabled,
                 )
+                from sglang.srt.runtime_context import get_parallel
 
                 if is_dp_attention_enabled():
-                    dp_rank_hint = get_attention_dp_rank()
-                    dp_size_hint = get_attention_dp_size()
-            except (ImportError, AssertionError):
+                    dp_rank_hint = get_parallel().attn_dp_rank
+                    dp_size_hint = get_parallel().attn_dp_size
+            except (ImportError, AssertionError, RuntimeError):
                 pass
 
         if local_rank_hint is not None:
@@ -807,14 +806,13 @@ class UMBPStore(HiCacheStorage):
 
         try:
             from sglang.srt.layers.dp_attention import (
-                get_attention_dp_rank,
-                get_attention_dp_size,
                 is_dp_attention_enabled,
             )
+            from sglang.srt.runtime_context import get_parallel
 
             if is_dp_attention_enabled():
-                dp_rank = get_attention_dp_rank()
-                dp_size = get_attention_dp_size()
+                dp_rank = get_parallel().attn_dp_rank
+                dp_size = get_parallel().attn_dp_size
                 dp_rank_hint = dp_rank
                 dp_size_hint = dp_size
                 if cfg.ssd.enabled:
@@ -883,7 +881,7 @@ class UMBPStore(HiCacheStorage):
                             dp_size,
                             cfg.ssd.storage_dir,
                         )
-        except (ImportError, AssertionError):
+        except (ImportError, AssertionError, RuntimeError):
             pass
 
         if (

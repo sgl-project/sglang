@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
     MultiModalStaticCache,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1011,10 +1012,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(torch.tensor([400, 1, 0, 0]))
 
             with (
-                patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1051,10 +1049,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1][2] += 1
 
             with (
-                patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1095,10 +1090,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(local_status)
 
             with (
-                patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,

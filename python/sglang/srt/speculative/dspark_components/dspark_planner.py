@@ -11,7 +11,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
@@ -317,7 +316,7 @@ class DSparkVerifyPlanner:
         if batch.is_extend_in_batch:
             batch.global_spec_verify_tier_num_tokens = None
             return
-        cpu_group = get_tp_group().cpu_group
+        cpu_group = get_parallel().tp_group.cpu_group
         local_tensor = torch.tensor([local_tier_num_tokens], dtype=torch.int64)
         gathered = torch.empty(
             (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64

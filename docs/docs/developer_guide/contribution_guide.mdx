@@ -147,6 +147,21 @@ To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also t
 
 If you don’t have permission and you’re not the PR author, please ask maintainers to trigger CI for you.
 
+### CI control labels
+
+Four labels change how a PR's CI runs. Label before you trigger:
+`max-concurrency` fixes the shard fan-out when the run is created.
+
+| Label | Effect |
+| --- | --- |
+| `bypass-fail-fast` | A job failing no longer aborts its siblings; the run continues instead of stopping at the first root-cause failure. A failing `lint` still stops everything. |
+| `parallel-stages` | Stages stop waiting on each other. `base-a`, `base-b` and `base-c` dispatch together, the way a scheduled run does. |
+| `max-concurrency` | A suite fans out to all of its shards at once rather than a third of them. |
+| `highest-priority` | All three of the above, and the PR is also skipped by the batch-cancel workflow, sorted first in the active-runs report, and never closed as stale. |
+
+Each spends extra runner capacity, so they unblock a specific PR rather than
+serve as a default.
+
 ### CI rate limits
 
 Due to CI scheduling and limited resources, higher-priority PRs may preempt running jobs. In such cases, you may need to rerun the tests.

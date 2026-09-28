@@ -233,9 +233,16 @@ def decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
+    kv_splits: int | None = None,
 ) -> torch.Tensor:
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        kv_splits=kv_splits,
     )
 
 

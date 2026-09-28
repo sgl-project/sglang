@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -224,11 +223,11 @@ def refresh_deep_gemm_layout_memory_budget(
         set_masked_standard_layout_memory_budget,
     )
 
-    world_group = get_world_group()
+    world_group = get_parallel().world_group
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=world_group.world_size > 1,
+        distributed=get_parallel().launch_world_size > 1,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(

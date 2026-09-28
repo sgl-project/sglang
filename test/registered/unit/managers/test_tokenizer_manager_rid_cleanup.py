@@ -217,6 +217,91 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     return BatchStrOutput(**kwargs)
 
 
+class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.incremental_streaming_output = True
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.state = _make_req_state("engine_wait")
+        self.state.obj.stream = True
+        self.state.obj.background = False
+        self.tm.rid_to_state[self.state.obj.rid] = self.state
+
+    async def test_available_and_later_outputs_keep_order(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        first = {"output_ids": [1], "meta_info": {"finish_reason": None}}
+        final = {"output_ids": [2], "meta_info": {"finish_reason": {"type": "length"}}}
+        self.state.out_list.append(first)
+        self.state.event.set()
+        with patch(
+            "asyncio.wait_for",
+            side_effect=AssertionError("Engine installed an HTTP timeout"),
+        ):
+            self.assertEqual((await anext(stream))["output_ids"], [1])
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            self.assertFalse(pending.done())
+            self.state.out_list.append(final)
+            self.state.finished = True
+            self.state.event.set()
+            self.assertEqual((await pending)["output_ids"], [2])
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+    async def test_cancelling_pending_wait_removes_event_waiter(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        self.assertTrue(self.state.event._waiters)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertFalse(self.state.event._waiters)
+        await stream.aclose()
+
+    async def test_abort_and_shutdown_errors_wake_engine_iterator(self):
+        for status in (400, 500, 503):
+            with self.subTest(status=status):
+                state = _make_req_state(f"engine_abort_{status}")
+                state.obj.stream = True
+                self.tm.rid_to_state[state.obj.rid] = state
+                stream = self.tm._wait_one_response(state.obj)
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                self.tm._handle_abort_req(
+                    AbortReq(
+                        rid=state.obj.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": status,
+                            "message": "test",
+                        },
+                    )
+                )
+                result = await pending
+                self.assertEqual(
+                    result["meta_info"]["finish_reason"]["status_code"], status
+                )
+                self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(stream)
+
+    async def test_http_timeout_still_checks_disconnection(self):
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=True)
+        self.tm.abort_request = Mock()
+        stream = self.tm._wait_one_response(self.state.obj, request)
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 0.001
+        ):
+            with self.assertRaisesRegex(ValueError, "disconnected"):
+                await anext(stream)
+        request.is_disconnected.assert_awaited_once()
+        self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
+
+
 class TestRidToStateCleanupOnAbort(CustomTestCase):
     """Test that _handle_abort_req removes rid from rid_to_state."""
 

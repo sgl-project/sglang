@@ -510,6 +510,9 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,

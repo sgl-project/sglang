@@ -26,6 +26,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
+    build_prefill_track_plan,
+)
 from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
@@ -36,6 +39,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -118,6 +122,22 @@ class MambaAttnBackendBase(AttentionBackend):
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
+    @staticmethod
+    def _has_cpu_prefill_track_metadata(forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and all(
+                values is not None and len(values) == forward_batch.batch_size
+                for values in (
+                    forward_batch.mamba_prefill_track_mask_cpu,
+                    forward_batch.mamba_track_seqlens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_prefix_lens_cpu,
+                )
+            )
+        )
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -134,6 +154,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        logical_num_tokens = None
+        track_mask_indices = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -146,10 +168,20 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_indices
             )
         # Resolve the tracked-row selection once per forward
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
+        cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
+        if cpu_track_metadata:
+            rows = [
+                i
+                for i, track in enumerate(forward_batch.mamba_prefill_track_mask_cpu)
+                if track
+            ]
+            has_mamba_track_mask = bool(rows)
+            track_mask_indices = self._track_indices_to_device(rows) if rows else None
+        else:
+            has_mamba_track_mask = bool(
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+            )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -258,9 +290,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                if (
+                    forward_batch.extend_seq_lens_cpu is not None
+                    and len(forward_batch.extend_seq_lens_cpu) == bs
+                    and forward_batch.tbo_parent_token_range is None
+                ):
+                    logical_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+                else:
+                    logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
-                        query_start_loc, forward_batch
+                        query_start_loc, forward_batch, track_mask_indices
                     )
 
                     (
@@ -279,6 +319,8 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
+            logical_num_tokens=logical_num_tokens,
+            mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
@@ -347,7 +389,10 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def _init_track_conv_indices(
-        self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        query_start_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
+        track_mask_indices: Optional[torch.Tensor] = None,
     ):
         """Flattened input positions of conv states to track during extend (up to
         the last complete chunk boundary, mamba_track_mask rows only)."""
@@ -361,7 +406,11 @@ class MambaAttnBackendBase(AttentionBackend):
             "this path should only run when the track mask is set on an extend batch"
         )
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
-        start_indices = start_indices[forward_batch.mamba_track_mask]
+        start_indices = (
+            start_indices.index_select(0, track_mask_indices)
+            if track_mask_indices is not None
+            else start_indices[forward_batch.mamba_track_mask]
+        )
 
         indices = start_indices.unsqueeze(-1) + torch.arange(
             conv_state_len,
@@ -379,6 +428,10 @@ class MambaAttnBackendBase(AttentionBackend):
         chunk boundary. Also returns ``track_ssm_h_batch_src``: the batch rows of
         the unaligned tracked seqs, used to integer-index the fp32 snapshot
         buffer on the KDA path so the copy stays free of GPU syncs."""
+        if self._has_cpu_prefill_track_metadata(forward_batch):
+            return self._init_track_ssm_indices_from_cpu(
+                mamba_cache_indices, forward_batch
+            )
         state_chunk_size = self.mamba_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
@@ -452,6 +505,38 @@ class MambaAttnBackendBase(AttentionBackend):
             to_device(track_ssm_seq_idx),
             to_device(track_ssm_end_locs),
             to_device(track_ssm_recompute_dst),
+        )
+
+    def _track_indices_to_device(self, values, dtype=torch.int64):
+        return torch.tensor(
+            values, dtype=dtype, pin_memory=is_pin_memory_available(self.device)
+        ).to(self.device, non_blocking=True)
+
+    def _init_track_ssm_indices_from_cpu(self, mamba_cache_indices, forward_batch):
+        is_mamba2 = isinstance(self, Mamba2AttnBackend)
+        plan = build_prefill_track_plan(
+            forward_batch.mamba_prefill_track_mask_cpu,
+            forward_batch.mamba_track_seqlens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_prefix_lens_cpu,
+            self.mamba_chunk_size,
+            mamba2=is_mamba2,
+        )
+        to_device = self._track_indices_to_device
+        final_rows = to_device(plan.final_rows)
+        h_rows = to_device(plan.h_rows)
+        recompute_rows = to_device(plan.recompute_rows) if is_mamba2 else None
+        destinations = forward_batch.mamba_track_indices
+        return (
+            to_device(plan.chunk_indices, torch.int32),
+            to_device(plan.h_src),
+            destinations.index_select(0, h_rows),
+            to_device(plan.unaligned_rows),
+            mamba_cache_indices.index_select(0, final_rows),
+            destinations.index_select(0, final_rows),
+            recompute_rows,
+            to_device(plan.recompute_end_locs) if is_mamba2 else None,
+            destinations.index_select(0, recompute_rows) if is_mamba2 else None,
         )
 
     def init_forward_metadata_capture_cpu_graph(

@@ -30,7 +30,6 @@ class CacheInitParams:
     # Keyword arguments for the eviction policy's constructor; see the strategy
     # classes in evict_policy.py for what each policy accepts.
     eviction_policy_config: Optional[dict[str, Any]] = None
-    disable_finished_insert: bool = False
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False

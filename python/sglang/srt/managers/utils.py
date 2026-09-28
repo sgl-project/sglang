@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
@@ -31,17 +32,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _async_d2h(t: torch.Tensor) -> torch.Tensor:
-    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
-    to pageable host memory blocks the caller until done) and record_stream keeps
-    the source alive until the copy stream drains, so the caching allocator can't
-    recycle it early. Non-CUDA falls back to a plain copy."""
-    if not t.is_cuda:
-        return t.to("cpu", non_blocking=True)
-    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-    cpu_t.copy_(t, non_blocking=True)
-    t.record_stream(torch.cuda.current_stream(t.device))
-    return cpu_t
+def allocate_distinct_stream(device_module, avoid_streams):
+    """Draw a stream that aliases none of ``avoid_streams``.
+
+    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
+    may hand back one that is already in use.
+    """
+    avoid = {stream.cuda_stream for stream in avoid_streams}
+    for _ in range(65):
+        stream = device_module.Stream(priority=0)
+        if stream.cuda_stream not in avoid:
+            return stream
+    raise RuntimeError("Unable to allocate a distinct stream")
 
 
 @dataclasses.dataclass
@@ -101,6 +103,25 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
+
+    # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
+    # bonus) for the NEXT verify round, relayed last stage -> all stages,
+    # with the tree topology the tokens were arranged by (parent_list and
+    # top_scores_index have different widths, so they stay separate).
+    next_verify_chain: Optional[torch.Tensor] = None
+    next_verify_parent_list: Optional[torch.Tensor] = None
+    next_verify_top_scores_index: Optional[torch.Tensor] = None
+
+    # PP+spec: the verify forward's KV slots on a non-last stage. That stage
+    # prepares verify inside forward isolation, which restores
+    # batch.out_cache_loc, so the slots have to travel on the result to survive
+    # until the accepted path comes back over the relay.
+    spec_verify_out_cache_loc: Optional[torch.Tensor] = None
+
+    # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
+    # Every stage holds the KV for its own layers, so every stage has to compact
+    # that path into its committed prefix; only the last stage can compute it.
+    accept_index: Optional[torch.Tensor] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -259,6 +280,9 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
     logits_output = result.logits_output
     assert logits_output is not None
+    # Nested pinned CPU tensors are serialized as Python metadata by PP, so
+    # their forward-stream copies must be complete before pickling starts.
+    logits_output.finalize_input_logprobs()
     sampling_mask_output = logits_output.sampling_mask_output
 
     return {

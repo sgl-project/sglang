@@ -214,7 +214,6 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
-                "fp4_e2m1",
             ],
             resolvable=True,
         ),

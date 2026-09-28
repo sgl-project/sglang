@@ -19,6 +19,7 @@
 import concurrent.futures
 import logging
 import math
+from array import array
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -45,8 +46,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -391,7 +390,7 @@ class Dots3MoE(nn.Module):
             )
 
             self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -459,7 +458,7 @@ class Dots3MoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(get_parallel().tp_group) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
 
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
@@ -491,7 +490,7 @@ class Dots3MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            with use_symmetric_memory(get_parallel().tp_group) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
@@ -516,7 +515,7 @@ class Dots3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -578,7 +577,7 @@ class Dots3MoE(nn.Module):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -1731,7 +1730,7 @@ class Dots3Model(nn.Module):
         super().__init__()
         _require_cuda()
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1865,7 +1864,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 "g_proj",
             ]
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -1923,10 +1922,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
         **kwargs,
-    ) -> List[int]:
+    ) -> array:
         token_pairs = []
         if mm_inputs.im_start_id is not None and mm_inputs.im_end_id is not None:
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
@@ -2605,7 +2604,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         )
 
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         model_dir = Path(config._name_or_path)
         self.language_model = Dots3LanguageModelForCausalLM(
             config,
@@ -2639,7 +2638,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
-    def pad_input_ids(self, input_ids, mm_inputs, **kwargs):
+    def pad_input_ids(self, input_ids: array, mm_inputs, **kwargs) -> array:
         return self.language_model.pad_input_ids(input_ids, mm_inputs, **kwargs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

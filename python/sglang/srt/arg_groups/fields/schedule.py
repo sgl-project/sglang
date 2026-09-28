@@ -99,6 +99,7 @@ class Schedule(msgspec.Struct):
                 "priority",
                 "routing-key",
                 "hrrn",
+                "shortest-prefill-first",
             ],
         ),
     ] = "fcfs"
@@ -160,6 +161,23 @@ class Schedule(msgspec.Struct):
             ),
             resolvable=True,
             fallback=0.8,
+        ),
+    ] = None
+    # Recorded by the cache hook; the effective field answers the fallback when unset.
+    _swa_full_tokens_ratio_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
         ),
     ] = None
     disable_hybrid_swa_memory: A[

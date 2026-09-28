@@ -519,6 +519,7 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
     ) -> None:
         if batch.return_logprob:
+            logits_output.finalize_input_logprobs()
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = (
                     logits_output.next_token_logprobs.tolist()

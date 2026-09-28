@@ -49,6 +49,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+    DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -115,6 +116,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
+        perf_warmup_requests=1,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -181,6 +183,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
+            extras=[
+                "--warmup-num-frames 1",
+                "--component-residency transformer=resident",
+            ],
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
@@ -254,6 +260,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="video",
+            # the latency baseline measures the warmed, resident transformer
+            extras=["--component-residency transformer=resident"],
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
@@ -398,6 +406,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "sana_wm_ti2v",
         DiffusionServerArgs(
             model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+            extras=["--warmup-resolutions 384x640"],
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,
@@ -1091,6 +1100,9 @@ TWO_GPU_CASES = [
             # decoder headroom on 80 GB GPUs.
             extras=[
                 "--load-diffusion-decoder",
+                "--warmup-resolutions 768x448",
+                "--warmup-num-frames 49",
+                """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
                 "--component-residency "
                 "transformer=component-offload,text_encoder=component-offload",
             ],
@@ -1102,7 +1114,6 @@ TWO_GPU_CASES = [
             expect_audio_output=True,
             extras={"seed": 42, "use_diffusion_decoder": True},
         ),
-        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -1132,6 +1143,25 @@ TWO_GPU_CASES = [
         ),
     ),
     DiffusionTestCase(
+        "qwen_image21_t2i_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST,
+            tp_size=2,
+            ulysses_degree=1,
+            ring_degree=1,
+        ),
+        replace(
+            T2I_sampling_params,
+            output_size="1024x1024",
+            output_format="png",
+            extras={"num_inference_steps": 40, "guidance_scale": 1, "seed": 42},
+        ),
+        perf_repeat_requests=2,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "qwen_image_t2i_2_gpus_extra_high",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
@@ -1140,7 +1170,6 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
-        run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,

@@ -348,6 +348,8 @@ pub enum PoolName {
     DeepseekV4C2,
     DeepseekV4C2Indexer,
     DeepseekV4C2IndexerScale,
+    DeepseekV4C4Rope,
+    DeepseekV4C128Rope,
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
     DeepseekV4C128State,
@@ -4362,6 +4364,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // states must match the host LRU; never both at once.
                 let mut device_count = 0;
                 let mut host_only_count = 0;
+                // A host lock delists its node, so locked nodes are exempt.
+                let mut host_locked_listed = 0;
                 for &node_id in &all_nodes {
                     if self.arena.node(node_id).is_root() {
                         continue;
@@ -4375,17 +4379,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         ));
                     }
                     let host_only = !has_device && node.has_host_value(ct);
-                    if host_only != host_lru.in_list(Some(node_id)) {
+                    let host_listed = host_lru.in_list(Some(node_id));
+                    let host_locked = node.host_lock_ref(ct) > 0;
+                    if host_locked {
+                        host_locked_listed += host_listed as usize;
+                    } else if host_only != host_listed {
                         errors.push(format!(
-                            "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={}",
-                            host_lru.in_list(Some(node_id))
+                            "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={host_listed}"
                         ));
                     }
                     if lru.in_list(Some(node_id)) && host_lru.in_list(Some(node_id)) {
                         errors.push(format!("{ct:?} node {node_id} in both device and host LRU"));
                     }
                     device_count += has_device as usize;
-                    host_only_count += host_only as usize;
+                    host_only_count += (host_only && !host_locked) as usize;
                 }
                 if device_count != lru.len() {
                     errors.push(format!(
@@ -4393,10 +4400,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         lru.len()
                     ));
                 }
-                if host_only_count != host_lru.len() {
+                let host_listed_count = host_lru.len().saturating_sub(host_locked_listed);
+                if host_only_count != host_listed_count {
                     errors.push(format!(
-                        "{ct:?} host LRU: tree={host_only_count} != lru={}",
-                        host_lru.len()
+                        "{ct:?} host LRU: tree={host_only_count} != lru={host_listed_count}"
                     ));
                 }
                 // Linked-list integrity

@@ -18,7 +18,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -341,7 +340,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.quant_config = quant_config
         self._owns_lm_head = False
         # Required for parent's load_weights
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Override config for MTP pattern (which has no Mamba layers)
         config.num_hidden_layers = len(config.mtp_hybrid_override_pattern)

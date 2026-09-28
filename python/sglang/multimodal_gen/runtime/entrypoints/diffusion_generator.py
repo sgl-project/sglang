@@ -34,9 +34,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -57,15 +57,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 
 logger = init_logger(__name__)
-
-try:
-    # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
-    # This must be done at the top level of the module, before any CUDA context
-    # or other processes are initialized.
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # The start method can only be set once per program execution.
-    pass
 
 
 def _replace_sampling_params_for_prompt(
@@ -137,6 +128,10 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        # Not shared with from_server_args: the ServerArgs built below runs
+        # Platform.apply_server_args_defaults, which hooks must precede.
+        apply_plugin_hooks()
+
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
 
         if (server_args := kwargs.get("server_args", None)) is not None:
@@ -147,7 +142,7 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args, local_mode=local_mode)
+        return cls._create(server_args, local_mode=local_mode)
 
     @classmethod
     def from_server_args(
@@ -161,6 +156,16 @@ class DiffGenerator:
 
         Returns:
             The created DiffGenerator
+        """
+        apply_plugin_hooks()
+        return cls._create(server_args, local_mode=local_mode)
+
+    @classmethod
+    def _create(cls, server_args: ServerArgs, *, local_mode: bool) -> "DiffGenerator":
+        """Build and connect a generator, assuming hooks are already applied.
+
+        Each public constructor owns that step itself, so this shared body must
+        not repeat it.
         """
         globally_suppress_loggers()
         instance = cls(
@@ -184,6 +189,9 @@ class DiffGenerator:
         self,
     ) -> list[mp.Process]:
         """Check if a local server is running; if not, start it and return the process handles."""
+        # Not module scope: launch_server pulls in the whole worker graph.
+        from sglang.multimodal_gen.runtime.launch_server import launch_server
+
         # First, we need a client to test the server. Initialize it temporarily.
         sync_scheduler_client.initialize(self.server_args)
 

@@ -1723,9 +1723,25 @@ export const Playground = ({ config }) => {
         mi355x: AMD_RDMA_DOCKER_FLAGS,
       };
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
-      // Mirrors the vendor branch in _deployment.jsx: ROCm reaches its GPUs
-      // through /dev/kfd + /dev/dri and the video group, not --gpus all.
+      // Mirrors the vendor branches in _deployment.jsx: ROCm reaches its GPUs
+      // through /dev/kfd + /dev/dri and the video group (not --gpus all), and
+      // Ascend NPUs are reached with --device, one per /dev/davinciN core (16
+      // on an A3 Series node, 8 on a 950PR/DT Series node — the catalog's
+      // `npuDevices`).
       const isAmdHw = /^mi\d/.test(sel.hw || "");
+      const HW_NPU_DEVICES = { a3: 16, a5: 8 };
+      const npuDevices = HW_NPU_DEVICES[sel.hw];
+      const davinciLines = (devices) => {
+        const lines = [];
+        for (let i = 0; i < devices; i += 4) {
+          const group = [];
+          for (let k = i; k < Math.min(i + 4, devices); k++) {
+            group.push(`--device=/dev/davinci${k}`);
+          }
+          lines.push("  " + group.join(" "));
+        }
+        return lines;
+      };
       const dockerLines = [
         ...(isAmdHw
           ? [
@@ -1735,6 +1751,21 @@ export const Playground = ({ config }) => {
               "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
               "  --shm-size 32g",
             ]
+          : npuDevices
+          ? [
+              // NPU: --privileged grants the davinci devices; the host CANN
+              // driver/firmware/state must be mounted in.
+              "docker run --privileged --shm-size=16g",
+              ...davinciLines(npuDevices),
+              "  --device=/dev/davinci_manager",
+              "  --device=/dev/hisi_hdc",
+              "  -v /usr/local/sbin:/usr/local/sbin",
+              "  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver",
+              "  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware",
+              "  -v /etc/ascend_install.info:/etc/ascend_install.info",
+              "  -v /var/queue_schedule:/var/queue_schedule",
+              "  -v ~/.cache/:/root/.cache/",
+            ]
           : [
               "docker run --gpus all",
               "  --shm-size 32g",
@@ -1743,7 +1774,8 @@ export const Playground = ({ config }) => {
         // A PD pair is cross-host even when each role is a single-node cell, so
         // the RDMA fabric flags are needed for `pdMode` too, not just multinode.
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
-        "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        // The NPU device block already mounts ~/.cache/.
+        ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),

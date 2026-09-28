@@ -157,8 +157,3 @@ class Mm(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
-    keep_mm_feature_on_device: A[
-        bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
-    ] = False
