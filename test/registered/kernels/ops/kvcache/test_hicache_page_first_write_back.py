@@ -17,6 +17,8 @@ from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
     transfer_hicache_all_layer_mla_staged_lf_page_unified,
     transfer_hicache_all_layer_staged_lf_page_unified,
+    transfer_hicache_one_layer_mla_page_unified_lf,
+    transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -660,6 +662,102 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         torch.cuda.synchronize()
         del graph
         host_pool.destroy()
+
+
+@pytest.mark.parametrize(
+    "is_mla,groups", [(False, 1), (False, 3), (False, 8), (True, 1)]
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_page_unified_write_back_load_back_round_trip(
+    is_mla, groups, dtype, index_dtype
+):
+    layers, page_size, heads_per_group = 3, 3, 2
+    dim = 576 if is_mla else 16
+    token_shape = (dim,) if is_mla else (groups * heads_per_group, dim)
+    page_shape = (
+        (layers, page_size, dim)
+        if is_mla
+        else (groups, layers, 2, page_size, heads_per_group, dim)
+    )
+    generator = torch.Generator().manual_seed(39606)
+    source_cpu = [
+        [
+            torch.randint(
+                0, 128, (6 * page_size, *token_shape), generator=generator
+            ).to(dtype)
+            for _ in range(layers)
+        ]
+        for _ in range(1 if is_mla else 2)
+    ]
+    # Write five pages through a two-page staging buffer. Host page order is
+    # different from device page order, and the source page 4 is copied twice.
+    source_pages = [4, 0, 3, 4, 1]
+    host_pages = [6, 2, 0, 5, 3]
+    host = torch.full((8, *page_shape), 255, dtype=dtype, pin_memory=True)
+    # Load the written pages into device pages 1..5; page 0 must stay untouched.
+    expected = [
+        [torch.full_like(t, 255) for t in component] for component in source_cpu
+    ]
+    for component, refs in zip(expected, source_cpu):
+        for dst, src in zip(component, refs):
+            for i, page in enumerate(source_pages):
+                dst[(i + 1) * page_size : (i + 2) * page_size].copy_(
+                    src[page * page_size : (page + 1) * page_size]
+                )
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        source_gpu = [[t.to(DEVICE) for t in component] for component in source_cpu]
+        ptrs = [
+            torch.tensor(
+                [t.data_ptr() for t in component], dtype=torch.uint64, device=DEVICE
+            )
+            for component in source_gpu
+        ]
+        restored = [
+            [torch.full_like(t, 255) for t in component] for component in source_gpu
+        ]
+        staging = torch.empty((2, *page_shape), dtype=dtype, device=DEVICE)
+        src_pages = torch.tensor(source_pages, dtype=index_dtype, device=DEVICE)
+        dst_pages = torch.tensor(host_pages, dtype=torch.int64)
+        if is_mla:
+            transfer_hicache_all_layer_mla_staged_lf_page_unified(
+                ptrs[0], src_pages, dst_pages, staging, host
+            )
+        else:
+            transfer_hicache_all_layer_staged_lf_page_unified(
+                *ptrs, src_pages, dst_pages, staging, host
+            )
+        # Write-back takes page IDs, while load-back takes token indices.
+        host_tokens = (
+            dst_pages.to(device=DEVICE, dtype=index_dtype)[:, None] * page_size
+            + torch.arange(page_size, dtype=index_dtype, device=DEVICE)
+        ).flatten()
+        device_tokens = torch.arange(
+            page_size, 6 * page_size, dtype=index_dtype, device=DEVICE
+        )
+        for layer in range(layers):
+            if is_mla:
+                transfer_hicache_one_layer_mla_page_unified_lf(
+                    restored[0][layer].unsqueeze(1),
+                    host,
+                    host_tokens,
+                    device_tokens,
+                    layer,
+                )
+            else:
+                transfer_hicache_one_layer_page_unified_lf(
+                    restored[0][layer],
+                    restored[1][layer],
+                    host,
+                    host_tokens,
+                    device_tokens,
+                    layer,
+                )
+    stream.synchronize()
+    for component, refs in zip(restored, expected):
+        for actual, reference in zip(component, refs):
+            assert torch.equal(actual.cpu(), reference)
 
 
 if __name__ == "__main__":

@@ -381,8 +381,9 @@ class QwenImage21Attention(nn.Module):
 
 
 class QwenImage21TransformerBlock(nn.Module):
-    def __init__(self, ac, quant_config, prefix):
+    def __init__(self, ac, quant_config, prefix, layer_id):
         super().__init__()
+        self._layer_id = layer_id
         self.img_norm1 = nn.LayerNorm(
             ac.hidden_size, eps=ac.eps, elementwise_affine=False
         )
@@ -404,6 +405,9 @@ class QwenImage21TransformerBlock(nn.Module):
         ropes,
         caches,
     ):
+        # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
+        # Slice here so prefix KV stays per-layer after that wrap.
+        caches = [cache[self._layer_id] for cache in caches]
         scale1, gate1, scale2, gate2 = modulation
         prefixes = [
             apply_modulation(
@@ -482,9 +486,12 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         self.modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(ac.hidden_size, ac.hidden_size * 4, bias=False)
         )
+        self.num_layers = ac.num_layers
         self.transformer_blocks = nn.ModuleList(
             [
-                QwenImage21TransformerBlock(ac, quant_config, f"transformer_blocks.{i}")
+                QwenImage21TransformerBlock(
+                    ac, quant_config, f"transformer_blocks.{i}", i
+                )
                 for i in range(ac.num_layers)
             ]
         )
@@ -528,7 +535,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
             )
             prefix_modulation = self.prepare_modulation(zero_temb)
         if prefix_caches is None:
-            prefix_caches = [[None] * len(self.transformer_blocks) for _ in layouts]
+            prefix_caches = [[None] * self.num_layers for _ in layouts]
         prefix_states, ropes = [], []
         for sample, layout in enumerate(layouts):
             prefix = None
@@ -544,8 +551,10 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                     )
             prefix_states.append({"hidden_states": prefix})
             ropes.append(layout["target_rope"][start:end])
-        # visit each block once so layerwise offload transfers weights once per batch
-        for i, block in enumerate(self.transformer_blocks):
+        # Same extras for every block so Cache-DiT's UnifiedBlocks wrap is valid.
+        # Each block slices prefix_caches by _layer_id. Visit once per layer for
+        # layerwise offload.
+        for block in self.transformer_blocks:
             images = block(
                 images,
                 modulation,
@@ -553,7 +562,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 prefix_modulation,
                 layouts,
                 ropes,
-                [cache[i] for cache in prefix_caches],
+                prefix_caches,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:

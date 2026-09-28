@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod active_load;
 pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
-pub mod engine_load;
 pub mod factory;
-pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
 pub mod prefix_provider;
@@ -22,9 +19,9 @@ pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
@@ -176,7 +173,7 @@ pub struct SelectionContext<'a> {
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
-    load_snapshot: Option<&'a EngineLoadSnapshot>,
+    load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
@@ -254,7 +251,7 @@ impl<'a> SelectionContext<'a> {
     }
 
     /// Attaches the engine load snapshot captured at request ingress.
-    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineReportedLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
     }
@@ -315,7 +312,7 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
-    pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
+    pub fn load_snapshot(&self) -> Option<&EngineReportedLoadSnapshot> {
         self.load_snapshot
     }
 
@@ -592,10 +589,12 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::state::load_monitor::engine_reported_load::{
+        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+    };
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -1222,15 +1221,15 @@ mod tests {
         assert!(proposal.backup.is_some());
     }
 
-    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
                             num_waiting_uncached_tokens: aggregate
@@ -1616,7 +1615,7 @@ mod tests {
     fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
         let primary = worker("primary");
         let workers = vec![Arc::clone(&primary)];
-        let snapshot = EngineLoadSnapshot::default();
+        let snapshot = EngineReportedLoadSnapshot::default();
 
         let decision = resolve_prefill(
             &CandidateRange::global(&workers),
