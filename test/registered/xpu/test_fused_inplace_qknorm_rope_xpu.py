@@ -232,7 +232,7 @@ def test_qknorm_rope_matches_model_unfused_path(
     num_kv_heads: int,
     num_tokens: int,
 ) -> None:
-    """ Test for the fused call fed from a model's RotaryEmbedding matches its unfused apply_qk_norm + rotary_emb path."""
+    """Test for the fused call fed from a model's RotaryEmbedding matches its unfused apply_qk_norm + rotary_emb path."""
     max_position = 131072
     rotary_emb = get_rope(
         head_dim,
