@@ -8,6 +8,19 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
+def _select_row8(value, INDEX: gl.constexpr, WIDTH: gl.constexpr):
+    """Select one row using Gluon primitives available in ROCm nightlies."""
+    value = gl.permute(value, (1, 0))
+    value = gl.reshape(value, (WIDTH, 2, 2, 2))
+    low, high = gl.split(value)
+    value = low if INDEX % 2 == 0 else high
+    low, high = gl.split(value)
+    value = low if INDEX % 4 < 2 else high
+    low, high = gl.split(value)
+    return low if INDEX < 4 else high
+
+
+@gluon.jit
 def _weight_offset(expert, n, k, N: gl.constexpr, K: gl.constexpr):
     byte = k // 2
     return (((expert * (N // 16) + n // 16) * (K // 64) + byte // 32) * 2 + byte // 16 % 2) * 256 + n % 16 * 16 + byte % 16
@@ -338,9 +351,11 @@ def _down_combine(X, W, Scales, Ids, Weights, Shared, Y, H: gl.constexpr, I: gl.
     parts = _routed_down_batch(X, W, Scales, Ids, token, tile, H, I, BN)
     layout: gl.constexpr = gl.DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0]] + ([[0, 16]] if BN == 32 else []), lane_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 0], [0, 0]], warp_bases=[[0, 0]] * 3, block_bases=[], shape=[8, BN])
     parts = gl.convert_layout(parts, layout)
-    value = gl.full((BN,), 0.0, gl.float32, gl.SliceLayout(0, layout))
+    value_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    value = gl.full((BN,), 0.0, gl.float32, value_layout)
     for rank in gl.static_range(8):
-        part = gl.sum(gl.amd.slice(parts, [1, BN], [rank, 0]), 0)
+        part = _select_row8(parts, rank, BN)
+        part = gl.convert_layout(part, value_layout)
         value += part * gl.load(Weights + token * 9 + rank)
     n = tile * BN + gl.arange(0, BN, gl.SliceLayout(0, layout))
     shared_value = gl.load(Shared + token * H + n)
