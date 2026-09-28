@@ -324,18 +324,56 @@ def test_cuda_cache_hit_does_not_wait_for_unrelated_gpu_work():
     torch.testing.assert_close(restored, value, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
 @torch.no_grad()
-def test_cuda_graph_capture_bypasses_host_cache():
+def test_compiled_consumed_conditioning_bypasses_context_lookup():
+    model = torch.nn.Linear(2, 2).eval()
+    cache = ConditioningCache(1024)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def encode(x):
+        return cached_encoder_call(
+            model,
+            (x,),
+            {},
+            lambda: model(x),
+            namespace=model,
+            share_in_group=True,
+        )
+
+    with cache.scope(), prefer_conditioning_cache():
+        x = torch.ones(1, 2)
+        torch.testing.assert_close(encode(x), model(x), rtol=0, atol=0)
+    assert cache.stats()["entries"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+@pytest.mark.parametrize("consumed", [False, True])
+@torch.no_grad()
+def test_cuda_graph_capture_bypasses_conditioning_cache(consumed):
     cache = ConditioningCache(1024)
     model = Encoder().cuda().eval()
     x = torch.ones(4, device="cuda")
-    with cache.scope():
-        model(x)
+
+    def encode():
+        return (
+            cached_encoder_call(
+                model,
+                (x,),
+                {},
+                lambda: model(x),
+                namespace=model,
+                share_in_group=True,
+            )
+            if consumed
+            else model(x)
+        )
+
+    with cache.scope(), prefer_conditioning_cache():
+        encode()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = model(x)
+            output = encode()
         x.fill_(3)
         graph.replay()
         torch.testing.assert_close(output.last_hidden_state, x, rtol=0, atol=0)

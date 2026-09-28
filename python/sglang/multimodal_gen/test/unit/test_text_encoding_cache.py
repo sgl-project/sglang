@@ -414,10 +414,11 @@ def test_negative_conditioning_keeps_private_device_snapshot(native):
     stage.encode_text = partial(stage.encode_text, device="cuda")
     cache = ConditioningCache(4096)
     producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    expected = torch.tensor([[[20.0], [11.0]]])
 
     with cache.scope(), torch.cuda.stream(producer):
+        torch.cuda._sleep(250_000_000)
         first = stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
-        expected = first[0][0].clone()
         first[0][0].zero_()
         first[1][0].zero_()
         first[4][0][0] = 0
@@ -427,11 +428,10 @@ def test_negative_conditioning_keeps_private_device_snapshot(native):
         assert entry.output[0].data_ptr() != first[0][0].data_ptr()
         assert cache.stats()["device_bytes"] == cache.bytes <= 4096
 
-    consumer.wait_stream(producer)
     with cache.scope(), torch.cuda.stream(consumer):
         for _ in range(2):
             hit = stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
-            torch.testing.assert_close(hit[0][0], expected, rtol=0, atol=0)
+            torch.testing.assert_close(hit[0][0].cpu(), expected, rtol=0, atol=0)
             assert hit[1][0].tolist() == [[1, 1]]
             assert hit[4] == [[2]]
             hit[0][0].zero_()

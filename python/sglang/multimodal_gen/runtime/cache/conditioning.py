@@ -574,6 +574,8 @@ def cached_encoder_call(
     share_in_group=False,
     cross_request=True,
 ):
+    if torch.compiler.is_compiling():
+        return compute()
     # only consumed negative conditioning is device-hot; raw hidden states and
     # other encoder boundaries keep their host-cache policy
     keep_on_device = namespace is not None and share_in_group and _prefer_cache.get()
