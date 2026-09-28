@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -320,7 +321,8 @@ class SchedulerInvariantChecker:
             full_uncached += allocated_len - req.kv.cache_protected_len
             if self.is_hybrid_swa:
                 swa_uncached += allocated_len - max(
-                    req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
+                    req.kv.cache_protected_len,
+                    req.kv.get_evicted_seqlen(ComponentType.SWA),
                 )
 
             if req.beam_group is not None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable, Dict, List, TypeVar
+from typing import Any, Callable, Dict, List, Sequence, TypeVar
 
 import torch
 
@@ -86,3 +86,28 @@ def lazy_register_class(name: str, init_fn: Callable[[], None]) -> Callable[[T],
         return cls
 
     return decorator
+
+
+def aligned_new_empty(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    alignment: int,
+) -> torch.Tensor:
+    """An uninitialized tensor whose row stride is a multiple of `alignment` bytes.
+
+    The last dimension is padded up and then sliced back off, so the result has
+    the requested shape and a non-contiguous stride whenever padding was needed.
+    Callers are kernels that state an alignment contract on a row address, such
+    as a TMA descriptor or a vectorized load.
+    """
+    assert len(shape) > 1
+    assert alignment % dtype.itemsize == 0, (
+        "alignment must be a whole number of elements"
+    )
+    step = alignment // dtype.itemsize
+    last_dim = shape[-1]
+    padded_last_dim = (last_dim + step - 1) // step * step
+    aligned_shape = (*shape[:-1], padded_last_dim)
+    return torch.empty(aligned_shape, dtype=dtype, device=device)[..., :last_dim]

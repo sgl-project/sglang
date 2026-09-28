@@ -76,10 +76,13 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], [9, 10]])
         self.assertEqual(
-            output.next_token_sampling_logprobs,
-            [-0.5, [-0.25, -1.5]],
+            [row.tolist() for row in output.next_token_sampling_mask_idx],
+            [[7, 8], [9, 10]],
+        )
+        self.assertEqual(
+            [row.tolist() for row in output.next_token_sampling_logprobs],
+            [[-0.5], [-0.25, -1.5]],
         )
 
     def test_selected_mode_does_not_require_support_tensor(self):
@@ -102,7 +105,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_logprobs, [-0.5])
+        self.assertEqual(output.next_token_sampling_logprobs[0].tolist(), [-0.5])
 
     def test_packed_ids_are_copied_before_per_request_slicing(self):
         """Non-overlap capture must not perform one device copy per request."""
@@ -130,9 +133,18 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             output=output,
         )
         packed_ids.cpu.assert_called_once_with()
-        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], None, [9]])
         self.assertEqual(
-            output.next_token_sampling_logprobs,
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[7, 8], None, [9]],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
             [[-0.5, -0.75], None, [-0.25]],
         )
         self.assertIsNone(output.sampling_mask_output)
