@@ -56,8 +56,8 @@ class RealKvSource:
     num_bytes_per_token``. Trailing bytes of each row are ignored by the canary; this is exactly how the
     abstraction accommodates pools whose per-row layout interleaves canary-relevant bytes with other metadata
     (layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
-    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case. Dim 0 may be a per-layer
-    view into a larger buffer: the kernel steps rows by ``tensor.stride(0)`` instead of ``shape[1]``.
+    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case. Rows are stepped by
+    ``tensor.stride(0)``, so dim 0 may be a per-layer view into a larger buffer.
 
     A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — the launch wrappers
     iterate the source list and fold each into the running real_kv_hash via splitmix64 (one int64 fingerprint

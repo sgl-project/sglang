@@ -2656,11 +2656,13 @@ class MHATokenToKVPool(KVCache):
 
         if dcp_kv_mask is not None:
             N, H, D = cache_k.shape
+            k_buf = self.k_buffer[layer_id - self.start_layer]
+            v_buf = self.v_buffer[layer_id - self.start_layer]
             masked_set_kv_buffer_kernel[(N,)](
                 cache_k,
                 cache_v,
-                self.k_buffer[layer_id - self.start_layer],
-                self.v_buffer[layer_id - self.start_layer],
+                k_buf,
+                v_buf,
                 loc,
                 dcp_kv_mask,
                 N,
@@ -2671,8 +2673,8 @@ class MHATokenToKVPool(KVCache):
                 cache_k.stride(1),
                 cache_v.stride(0),
                 cache_v.stride(1),
-                self.k_buffer[layer_id - self.start_layer].stride(0),
-                self.v_buffer[layer_id - self.start_layer].stride(0),
+                k_buf.stride(0),
+                v_buf.stride(0),
             )
             return
 

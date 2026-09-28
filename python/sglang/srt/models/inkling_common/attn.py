@@ -149,14 +149,32 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
     )
 
 
-def _is_slot_major_nhd(buf: torch.Tensor, head_dim: int) -> bool:
-    """[slot, head, head_dim] with a contiguous (head, head_dim) row; the slot
-    stride may exceed head * head_dim (strided pool views)."""
-    return (
-        buf.dim() == 3
+# Slot-stride alignment (elements) the fused prologue store needs per dtype:
+# its 8-element vector stores (kVecElems) for bf16, its 32-element scale
+# blocks (kMXFP8Block) for MXFP8.
+_FUSED_KV_STORE_SLOT_ALIGN = {torch.bfloat16: 8, torch.float8_e4m3fn: 32}
+
+
+def _fused_kv_store_eligible(
+    k_buf: torch.Tensor, v_buf: torch.Tensor, head_dim: int, dtype: torch.dtype
+) -> bool:
+    """Whether the fused prologue can store K/V of `dtype` straight into these
+    pool buffers.
+
+    It writes one NHD ``[slot, head, head_dim]`` row per loc, stepping slots by
+    the buffers' shared ``stride(0)``, so a strided per-layer view qualifies as
+    long as each row is contiguous. Other layouts (HND / vectorized_5d) keep the
+    backend store, which owns their quant and layout; conv, windows and qk-norm
+    stay fused either way.
+    """
+    slot_stride = k_buf.stride(0)
+    return slot_stride % _FUSED_KV_STORE_SLOT_ALIGN[dtype] == 0 and all(
+        buf.dtype == dtype
+        and buf.dim() == 3
         and buf.shape[-1] == head_dim
-        and buf.stride(2) == 1
-        and buf.stride(1) == head_dim
+        and buf.stride()[1:] == (head_dim, 1)
+        and buf.stride(0) == slot_stride
+        for buf in (k_buf, v_buf)
     )
 
 
@@ -449,19 +467,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        # The fused store writes raw bf16 into an NHD [slot, head, head_dim]
-        # buffer indexed by loc, stepping slots by the buffer's own stride (so
-        # strided per-layer pool views qualify). Take it only for that layout:
-        # FP8/MXFP8 (non-bf16) and HND/vectorized_5d (4D/5D, paged (page, head)
-        # index) pools keep the backend store, which owns their quant + layout.
-        # conv + windows + qk-norm stay fused regardless.
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and v_buf.dtype == torch.bfloat16
-            and _is_slot_major_nhd(k_buf, self.head_dim)
-            and _is_slot_major_nhd(v_buf, self.head_dim)
-            and k_buf.stride(0) == v_buf.stride(0)
-            and k_buf.stride(0) % 8 == 0
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -470,12 +477,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and _is_slot_major_nhd(k_buf, self.head_dim)
-                and _is_slot_major_nhd(v_buf, self.head_dim)
-                and k_buf.stride(0) == v_buf.stride(0)
-                and k_buf.stride(0) % 32 == 0
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -565,13 +569,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and v_buf.dtype == torch.bfloat16
-            and _is_slot_major_nhd(k_buf, self.head_dim)
-            and _is_slot_major_nhd(v_buf, self.head_dim)
-            and k_buf.stride(0) == v_buf.stride(0)
-            and k_buf.stride(0) % 8 == 0
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -580,12 +579,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and _is_slot_major_nhd(k_buf, self.head_dim)
-                and _is_slot_major_nhd(v_buf, self.head_dim)
-                and k_buf.stride(0) == v_buf.stride(0)
-                and k_buf.stride(0) % 32 == 0
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
@@ -680,13 +676,8 @@ class InklingAttention(nn.Module):
         pool = get_token_to_kv_pool()
         k_buf = pool.get_key_buffer(self.layer_id)
         v_buf = pool.get_value_buffer(self.layer_id)
-        do_bf16_store = (
-            k_buf.dtype == torch.bfloat16
-            and v_buf.dtype == torch.bfloat16
-            and _is_slot_major_nhd(k_buf, self.head_dim)
-            and _is_slot_major_nhd(v_buf, self.head_dim)
-            and k_buf.stride(0) == v_buf.stride(0)
-            and k_buf.stride(0) % 8 == 0
+        do_bf16_store = _fused_kv_store_eligible(
+            k_buf, v_buf, self.head_dim, torch.bfloat16
         )
         sfk = sfv = None
         do_mxfp8_store = False
@@ -695,12 +686,9 @@ class InklingAttention(nn.Module):
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
             do_mxfp8_store = (
-                k_buf.dtype == torch.float8_e4m3fn
-                and v_buf.dtype == torch.float8_e4m3fn
-                and _is_slot_major_nhd(k_buf, self.head_dim)
-                and _is_slot_major_nhd(v_buf, self.head_dim)
-                and k_buf.stride(0) == v_buf.stride(0)
-                and k_buf.stride(0) % 32 == 0
+                _fused_kv_store_eligible(
+                    k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
+                )
                 and sfk.dim() == 5
                 and sfv.dim() == 5
                 and getattr(pool, "page_size", 0) == 128
