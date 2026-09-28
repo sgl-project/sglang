@@ -105,6 +105,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -139,6 +140,18 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Start a decode-radix request that owns its whole KV row at the root."""
+    req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+    req.last_node = tree_cache.root_node_handle(req.extra_key)
+    req.last_host_node = req.last_node
+    req.best_match_node = req.last_node
+    req.lock_receipt = DecLockRefParams()
+    req.kv.cache_protected_len = 0
+    req.num_matched_prefix_tokens = 0
+    req.host_hit_length = 0
 
 
 class DecodeReqToTokenPool:
@@ -1772,15 +1785,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             or None,
         )
         if get_disagg().disaggregation_decode_enable_radix_cache:
-            req = decode_req.req
-            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
-            req.last_node = self.tree_cache.root_node_handle(req.extra_key)
-            req.last_host_node = req.last_node
-            req.best_match_node = req.last_node
-            req.lock_receipt = DecLockRefParams()
-            req.kv.cache_protected_len = 0
-            req.num_matched_prefix_tokens = 0
-            req.host_hit_length = 0
+            _bind_root_prefix(decode_req.req, self.tree_cache)
         self._send_kv_metadata(
             decode_req,
             host_indices,
@@ -2240,7 +2245,7 @@ def alloc_for_decode_prealloc_hisparse(
         )
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.swa_evicted_seqlen = swa_evicted_seqlen
+        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
     else:
         kv_loc = allocator.alloc_logical_only(
             prefix_lens=prefix_lens,
@@ -2312,7 +2317,7 @@ def alloc_for_decode_prealloc(
                 swa_evicted_seqlen >= 0
                 and swa_evicted_seqlen % allocator.page_size == 0
             )
-            req.kv.swa_evicted_seqlen = swa_evicted_seqlen
+            req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
         else:
             kv_loc = allocator.alloc_extend(
                 prefix_lens=torch.tensor(
@@ -3097,11 +3102,12 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
+                # `pop_preallocated` matched and locked new requests; a retracted or
+                # rebootstrapped one owns its row, and a re-match here takes no lock.
                 if get_disagg().disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.last_node is None else None
+                    if req.last_node is None:
+                        _bind_root_prefix(req, self.tree_cache)
+                    tree_cache = None
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)

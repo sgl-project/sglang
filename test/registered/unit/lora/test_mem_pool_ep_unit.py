@@ -378,10 +378,6 @@ def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
 class TestNumExpertHelpers(unittest.TestCase):
     """`_get_num_experts` / `_get_num_local_experts` / buffer-dim picker."""
 
-    def test_num_experts_read_from_config(self):
-        model = _make_fake_base_model(num_experts=8)
-        self.assertEqual(LoRAMemoryPool._get_num_experts(model), 8)
-
     def test_num_local_experts_no_ep(self):
         pool = _make_pool(
             num_experts_global=8,

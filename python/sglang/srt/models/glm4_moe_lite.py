@@ -34,7 +34,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     reduce_output,
@@ -548,7 +548,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -588,7 +588,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
@@ -638,7 +638,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
         )
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -820,9 +822,6 @@ class Glm4MoeLiteModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
