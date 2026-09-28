@@ -599,6 +599,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
                 receiver.schedule_stream = object()
+                receiver.pp_send_done_event = None
+                receiver.pp_proxy_recv_event = None
                 receiver.device_module = SimpleNamespace(
                     Event=Mock, current_stream=Mock()
                 )
