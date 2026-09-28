@@ -8,7 +8,7 @@ MXFP8 (``float8_e4m3fn`` + UE8M0 block scale) at inference time and the matmul
 runs via ``npu_quant_matmul`` with FP4 weights.
 
 The config is device-agnostic and dispatches per device in
-``get_quant_method``; only the Ascend NPU backend (Ascend 950 / A5) is
+``get_quant_method``; only the Ascend NPU backend (Ascend 950 / arch35) is
 implemented today.
 """
 

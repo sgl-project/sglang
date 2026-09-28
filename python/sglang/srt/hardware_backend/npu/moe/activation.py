@@ -148,7 +148,7 @@ class NPUSitu(BaseActivation):
 
 
 class NPUSituMXFP8Quant(BaseActivation):
-    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+    """arch35 AscendC grouped SiTU with valid-row MXFP8 quantization."""
 
     def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
         from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
