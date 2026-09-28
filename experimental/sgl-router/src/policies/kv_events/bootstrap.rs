@@ -193,11 +193,12 @@ pub enum SnapshotOutcome {
     /// router image returns for an endpoint it does not serve).
     Unreachable,
     /// Peer answered but has no graftable state for us: still bootstrapping,
-    /// settled with an empty tree, or holding a real tree that shares no
-    /// carriers with our live workers (`NothingUsable`). The last case is a
-    /// WARM peer — deliberately not what [`PeerSnapshot::is_cold`] means, so
-    /// it cannot count toward the sweep's cold-fleet verdict even though it
-    /// shares this metric label.
+    /// settled with an empty tree, holding a real tree that shares no carriers
+    /// with our live workers (`NothingUsable`), or a vetted tree that covers
+    /// none of the ranks being bootstrapped. The last two are WARM peers —
+    /// deliberately not what [`PeerSnapshot::is_cold`] means, so they cannot
+    /// count toward the sweep's cold-fleet verdict even though they share this
+    /// metric label.
     ColdPeer,
     /// Peer answered with a snapshot we must not trust: unknown format, an
     /// invalid parent reference, or a block size that makes its hashes
@@ -274,7 +275,8 @@ pub enum RankOutcome {
     Uncovered,
     /// No peer supplied a usable snapshot: the bootstrap deadline expired,
     /// discovery confirmed there are no siblings, or every sibling proved it
-    /// has no state to give (settled-empty or permanently incompatible).
+    /// has no state to give — settled-empty, permanently incompatible, or
+    /// naming this rank in [`PeerSnapshot::empty_ranks`].
     Abandoned,
     /// Too many batches piled up waiting for a snapshot; the held prefix was
     /// dropped, so no snapshot can be spliced across it.
@@ -353,6 +355,25 @@ pub struct PeerSnapshot {
     pub cursors: Vec<(u32, i64)>,
     /// Tree nodes in dependency order; see [`SnapshotNode`].
     pub nodes: Vec<SnapshotNode>,
+    /// Ranks the producer is subscribed to but held no tree node for at export
+    /// time: ranks it is still bootstrapping itself (their batches are held,
+    /// not applied), and ranks whose applied stream left nothing standing.
+    ///
+    /// Evidence for the consumer's per-rank cold settle: a rank every sibling
+    /// names here is one no sibling can supply, and the export was taken after
+    /// the consumer subscribed (see [`MAX_AGE_PARAM`]), so nothing a sibling
+    /// learns about it later is anything the consumer's own subscription will
+    /// not also deliver. Without it, "has nothing for this rank" and "has not
+    /// discovered this rank yet" look identical — a rank absent from
+    /// `workers` — and only the second is worth waiting for.
+    ///
+    /// Backward compatible in both directions, so no [`SNAPSHOT_FORMAT`] bump:
+    /// an older consumer ignores the unknown field, and an older producer omits
+    /// it, which reads as empty — no evidence, so the consumer keeps waiting
+    /// exactly as it did before the field existed. Omitted from the body when
+    /// empty for the same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empty_ranks: Vec<WireWorker>,
 }
 
 impl PeerSnapshot {
@@ -377,6 +398,15 @@ impl PeerSnapshot {
     /// only candidate in the fleet.
     pub fn holds_no_state(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Whether this body names the rank in [`Self::empty_ranks`]: the producer
+    /// is subscribed to it and holds nothing for it. Addressed by wire identity,
+    /// like [`Self::wire_cursor_for`], because it is evidence, not tree state.
+    pub fn holds_nothing_for(&self, url: &str, dp_rank: u32) -> bool {
+        self.empty_ranks
+            .iter()
+            .any(|w| w.url == url && w.dp_rank == dp_rank)
     }
 
     /// Last-applied sequence this producer reports for a rank, addressed by wire
@@ -1529,6 +1559,7 @@ mod tests {
             workers,
             cursors: vec![],
             nodes,
+            empty_ranks: vec![],
         }
     }
 
@@ -1615,6 +1646,7 @@ mod tests {
             // Out of table order, and with no entry for index 0.
             cursors: vec![(1, 77)],
             nodes: vec![],
+            empty_ranks: vec![],
         };
         assert_eq!(snap.wire_cursor_for("http://w2", 1), Some(77));
         assert_eq!(
@@ -2124,6 +2156,35 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// `empty_ranks` is additive on the wire. An older producer's body has no
+    /// such key and must decode as "no evidence"; an empty list is omitted, so
+    /// an older consumer sees the body it always has.
+    #[test]
+    fn empty_ranks_is_backward_compatible_on_the_wire() {
+        let old_producer = serde_json::json!({
+            "format": SNAPSHOT_FORMAT,
+            "block_size": 64,
+            "is_bigram": false,
+            "producer_ready": true,
+            "workers": [],
+            "cursors": [],
+            "nodes": [],
+        });
+        let decoded: PeerSnapshot = serde_json::from_value(old_producer).unwrap();
+        assert!(decoded.empty_ranks.is_empty());
+        assert!(!decoded.holds_nothing_for("http://a", 0));
+
+        let encoded = serde_json::to_value(snapshot(vec![], vec![])).unwrap();
+        assert!(encoded.get("empty_ranks").is_none(), "omitted when empty");
+
+        let mut named = snapshot(vec![], vec![]);
+        named.empty_ranks = vec![wire_worker("http://a", 1)];
+        let round: PeerSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&named).unwrap()).unwrap();
+        assert!(round.holds_nothing_for("http://a", 1));
+        assert!(!round.holds_nothing_for("http://a", 0), "dp_rank matters");
+    }
+
     #[test]
     fn snapshot_round_trips_through_json() {
         let snap = PeerSnapshot {
@@ -2137,6 +2198,7 @@ mod tests {
                 node(None, -9_000_000_000, vec![0]),
                 node(Some(0), 2, vec![]),
             ],
+            empty_ranks: vec![],
         };
         let encoded = serde_json::to_vec(&snap).unwrap();
         let decoded: PeerSnapshot = serde_json::from_slice(&encoded).unwrap();

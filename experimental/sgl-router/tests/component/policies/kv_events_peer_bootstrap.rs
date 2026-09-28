@@ -218,6 +218,7 @@ fn snapshot_of(tree: &HashTree, cursors: &[(KvWorkerId, i64)]) -> PeerSnapshot {
             .collect(),
         cursors: cursor_wire,
         nodes,
+        empty_ranks: vec![],
     }
 }
 
@@ -533,6 +534,7 @@ async fn fetch_cursors_reads_a_cursor_without_any_nodes() {
         }],
         cursors: vec![(0, 99)],
         nodes: Vec::new(),
+        empty_ranks: vec![],
     };
     // The full arm shares the cursor but carries a tree. Serving the same body
     // for both shapes would make the empty-nodes assert below blind to which
@@ -581,6 +583,7 @@ async fn fetch_cursors_still_works_against_a_peer_that_ignores_the_parameter() {
             workers: vec![0],
             tiers: vec![],
         }],
+        empty_ranks: vec![],
     };
     // `None` = this peer has no cursors-only behaviour at all.
     let (base, handle) = serve_by_shape(full, None).await;
