@@ -3763,7 +3763,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ):
             handle_kv_cache_sharding(args, 80 * 1024)
 
-        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2176)
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
 
     def test_trtllm_mla_rejects_unsupported_shard_topologies(self):
         cases = (
@@ -3818,6 +3818,37 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "requires the Python"):
                 handle_kv_cache_sharding(self._args())
 
+    def test_unused_rust_tree_core_is_allowed_with_radix_disabled(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.disable_radix_cache = True
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+        ):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+
+    def test_dynamic_chunking_is_rejected_only_when_pipeline_parallelism_uses_it(self):
+        for pp_size in (1, 2):
+            with self.subTest(pp_size=pp_size):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.enable_dynamic_chunking = True
+                args.pp_size = pp_size
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    if pp_size > 1:
+                        with self.assertRaisesRegex(
+                            ValueError, "dynamic chunk sizing with pipeline parallelism"
+                        ):
+                            handle_kv_cache_sharding(args, 80 * 1024)
+                    else:
+                        handle_kv_cache_sharding(args, 80 * 1024)
+                        self.assertEqual(
+                            resolution_result(args, "chunked_prefill_size"), 2112
+                        )
+
     def test_post_capture_kv_sizing_keeps_eager_prefill_headroom(self):
         prefill_graph = SimpleNamespace(backend=Backend.BREAKABLE, bs=[4096])
         args = ServerArgs(
@@ -3871,12 +3902,21 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ):
             handle_kv_cache_sharding(args, gpu_mem)
 
-        rounded = 2176  # ceil(2050 / (tp_size * page_size)) * 128
+        rounded = 2112  # ceil(2050 / page_size) * 64; 33 pages across two shards
         expected_fraction = 0.9 - 1.5 * (rounded - 2050) / gpu_mem
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), rounded)
         self.assertAlmostEqual(
             resolution_result(args, "mem_fraction_static"), expected_fraction
         )
+
+    def test_page_aligned_chunk_need_not_span_the_whole_shard_group(self):
+        args = self._rounding_args(raw_mem_fraction=None, resolved_mem_fraction=0.9)
+        args.chunked_prefill_size = 2112  # 33 pages, not divisible by TP size 2.
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+        self.assertEqual(resolution_result(args, "mem_fraction_static"), 0.9)
 
     def test_chunk_rounding_preserves_explicit_mem_fraction(self):
         args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
@@ -3886,7 +3926,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ):
             handle_kv_cache_sharding(args, 80 * 1024)
 
-        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2176)
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
         self.assertEqual(resolution_result(args, "mem_fraction_static"), 0.8)
 
     def test_final_pass_rejects_late_model_capability_overrides(self):

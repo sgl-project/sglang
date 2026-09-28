@@ -22,19 +22,6 @@ from sglang.srt.utils.common import get_device_memory_capacity
 logger = logging.getLogger(__name__)
 
 
-def kv_shard_group_size(server_args: Any) -> int:
-    """Return the active KV-shard group size, or one when disabled."""
-    cfg = resolving_view(server_args)
-    if not cfg.enable_kv_cache_sharding:
-        return 1
-    if cfg.attn_cp_size > 1:
-        return cfg.attn_cp_size
-    if use_mla_backend(server_args):
-        # Plain-TP MLA is validated below, so attn_tp_size == tp_size here.
-        return cfg.tp_size
-    return 1
-
-
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
@@ -93,7 +80,9 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
         )
     tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-    if tree_core_backend != "python":
+    # With radix caching disabled, chunked prefill uses ChunkCache and keeps
+    # the rotation base on each request; it never constructs a tree core.
+    if not cfg.disable_radix_cache and tree_core_backend != "python":
         raise ValueError(
             "--enable-kv-cache-sharding requires the Python UnifiedTreeCore: "
             f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={tree_core_backend!r} is "
@@ -146,9 +135,13 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "HiSparse selects a non-sharded allocator and assumes each rank "
             "owns complete KV pages."
         )
-    if cfg.enable_dynamic_chunking:
+    # The dynamic sizer only runs with pipeline parallelism. Its profiling
+    # and predicted chunks can exceed the fixed shard-scratch capacity.
+    if cfg.enable_dynamic_chunking and cfg.pp_size > 1:
         raise ValueError(
-            "--enable-kv-cache-sharding requires fixed chunk sizes; disable "
+            "--enable-kv-cache-sharding does not support dynamic chunk sizing "
+            "with pipeline parallelism: profiling and predicted chunks can "
+            "exceed the fixed sharded scratch capacity. Disable "
             "--enable-dynamic-chunking."
         )
     if cfg.enable_two_batch_overlap:
@@ -223,7 +216,6 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "transfer descriptor and gather-copy unit; page_size=1 "
             "degenerates both into per-token operations."
         )
-    granule = kv_shard_group_size(server_args) * page_size
     chunk_size = cfg.chunked_prefill_size
     if chunk_size is None or chunk_size <= 0:
         raise ValueError(
@@ -232,8 +224,10 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     declarations = {}
-    if chunk_size % granule != 0:
-        rounded = (chunk_size + granule - 1) // granule * granule
+    # Chunk boundaries must stay on physical pages. Uneven ownership across
+    # ranks is supported; only the prefix gather pads to a full-group span.
+    if chunk_size % page_size != 0:
+        rounded = (chunk_size + page_size - 1) // page_size * page_size
         declarations["chunked_prefill_size"] = rounded
 
         # The raw input, deliberately not the resolving view: the question is
@@ -248,7 +242,7 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
                 raise ValueError(
                     "Cannot safely auto-round --chunked-prefill-size for KV "
                     "sharding without a known device-memory capacity; pass a "
-                    f"multiple of shard_size * page_size ({granule})."
+                    f"multiple of page_size ({page_size})."
                 )
             corrected_mem_fraction = (
                 float(cfg.mem_fraction_static) - activation_delta_mb / gpu_mem
@@ -257,16 +251,16 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
                 raise ValueError(
                     "Auto-rounding --chunked-prefill-size for KV sharding "
                     "would consume all automatically reserved GPU memory; "
-                    f"pass a smaller multiple of {granule}."
+                    f"pass a smaller multiple of {page_size}."
                 )
             declarations["mem_fraction_static"] = corrected_mem_fraction
 
         logger.warning(
             "Rounding --chunked-prefill-size up from %d to %d "
-            "(a multiple of shard_size * page_size = %d) for KV sharding.",
+            "(a multiple of page_size = %d) for KV sharding.",
             chunk_size,
             rounded,
-            granule,
+            page_size,
         )
 
     if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
