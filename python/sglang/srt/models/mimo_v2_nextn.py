@@ -26,6 +26,7 @@ from sglang.srt.layers.communicator import (
     LayerFacts,
     enable_moe_dense_fully_dp,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -223,7 +224,7 @@ class MiMoV2ModelNextN(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
+            residual=residual_batch.start(forward_batch),
         )
 
         hidden_states, residual = self.mtp_block.layer_communicator.finish_layer_stack(

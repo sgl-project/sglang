@@ -78,7 +78,9 @@ class TestStageEdges(CustomTestCase):
                         into.produced.leaves_for_next_layer,
                         produced.leaves_for_next_layer,
                     )
-                self.assertEqual(layers[0].edges[0].produced, StageOutput(rows))
+                self.assertEqual(
+                    layers[0].edges[0].produced, StageOutput(rows, update=None)
+                )
                 self.assertTrue(layers[0].enters_stack)
                 self.assertFalse(any(layer.enters_stack for layer in layers[1:]))
                 last = layers[-1].edges[1].produced
@@ -104,11 +106,11 @@ class TestStageEdges(CustomTestCase):
                 )
         # Without attention TP a mixer's output is complete.
         into = stages("M-", tp=1)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout))
+        self.assertEqual(into, StageOutput(into.layout, update=None))
         # A MoE on this rank's own rows hands on a complete output; an a2a
         # backend dispatches only the MoE, so an MLP still sums over TP.
         into = stages("EM", tp=2, a2a=True)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout))
+        self.assertEqual(into, StageOutput(into.layout, update=None))
         into = stages("-M", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(
             (into.group, into.always_leaves, into.leaves_for_next_layer),

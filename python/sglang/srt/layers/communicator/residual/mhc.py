@@ -143,6 +143,7 @@ class _AttentionUpdate:
 
     adds_plainly = False
     at_producer = False
+    can_defer_across_layers = False
 
     def __init__(self, state: MHCState):
         self.state = state
@@ -185,6 +186,7 @@ class _FfnUpdate:
 
     adds_plainly = False
     at_producer = True
+    can_defer_across_layers = False
 
     def __init__(self, state: MHCState):
         self.state = state

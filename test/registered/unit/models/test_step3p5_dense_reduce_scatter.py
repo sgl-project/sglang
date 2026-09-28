@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +34,11 @@ def dense_layer(*, reduce_scatter):
     communicator = SimpleNamespace(
         prepare_attn=lambda h, r, fb, **_: (h, h if r is None else r),
         prepare_mlp=lambda h, r, fb: (h, r),
+        _batch_steps=lambda fb: SimpleNamespace(
+            ffn_output=SimpleNamespace(update=comm.ADD)
+        ),
+        _declared_ffn_sum=lambda steps, skipped: None,
+        _leave_ffn_output=lambda h, r, stream, update, declared_sum=None: (h, r),
         # A dense layer never leaves its sum to the next layer.
         _select_ffn_completion=lambda fb: comm.FfnCompletion(
             defer_moe_finalize=False,
@@ -54,11 +60,14 @@ class TestStep3p5DenseReduceScatter(CustomTestCase):
         for reduce_scatter in (False, True):
             with self.subTest(reduce_scatter=reduce_scatter):
                 layer, seen, complete = dense_layer(reduce_scatter=reduce_scatter)
+                batch = SimpleNamespace(residual_stream=None)
+                stream = residual_batch.start(batch)
+                stream.write(torch.ones(2, 4))
                 layer.forward(
                     positions=None,
                     hidden_states=torch.ones(2, 4),
-                    forward_batch=None,
-                    residual=None,
+                    forward_batch=batch,
+                    residual=stream,
                 )
                 self.assertEqual(seen["mlp_reduce_scatter"], reduce_scatter)
                 self.assertFalse(seen["fuse_mlp_allreduce"])

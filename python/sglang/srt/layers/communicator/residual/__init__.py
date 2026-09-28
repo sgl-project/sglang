@@ -31,6 +31,9 @@ class StageUpdate(Protocol):
     # The stage writes its output into the residual itself at its end, instead
     # of leaving that to the next stage's read.
     at_producer: bool
+    # Its parameters and state remain valid after leaving the producer layer.
+    # Stateful or offloaded implementations must not opt in without that guarantee.
+    can_defer_across_layers: bool
 
     def update(self, hidden_states, residual) -> torch.Tensor:
         """The residual with the output written into it."""

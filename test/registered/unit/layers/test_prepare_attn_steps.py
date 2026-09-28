@@ -62,6 +62,7 @@ def communicator(norm):
         attention=comm.StageEntry(
             prepare=partial(
                 comm_ops._consumer_step,
+                adds_plainly=True,
                 step=partial(
                     comm_ops._read_input,
                     layer_input=None,
@@ -131,6 +132,16 @@ def platform(*, use_aiter=False, gfx95=False, fusion=False, kernel_group=True):
         yield kernels, all_reduce, group
 
 
+def prepare_attn(communicator, hidden, residual, forward_batch=None, **kwargs):
+    from sglang.srt.layers.communicator.residual.add_norm import ADD
+    from sglang.srt.layers.communicator.residual.stream import ResidualStream
+
+    batch = forward_batch or SimpleNamespace()
+    batch.residual_stream = ResidualStream(residual)
+    hidden = batch.residual_stream.leave(hidden, ADD)
+    return communicator.prepare_attn(hidden, batch.residual_stream, batch, **kwargs)
+
+
 class TestPrepareAttnSteps(CustomTestCase):
     def test_each_quant_format_uses_its_kernel(self):
         for quant_format, flags, kernel in (
@@ -154,8 +165,12 @@ class TestPrepareAttnSteps(CustomTestCase):
                     platform(**flags) as (kernels, _, _),
                 ):
                     norm = Norm()
-                    communicator(norm).prepare_attn(
-                        torch.ones(2, 4), residual, None, quant_format=quant_format
+                    prepare_attn(
+                        communicator(norm),
+                        torch.ones(2, 4),
+                        residual,
+                        None,
+                        quant_format=quant_format,
                     )
                     for name, mock in kernels.items():
                         self.assertEqual(mock.called, name == kernel, name)
@@ -170,10 +185,14 @@ class TestPrepareAttnSteps(CustomTestCase):
         ):
             with self.subTest(quant_format=quant_format), platform(**flags):
                 hidden_states = torch.ones(2, 4)
-                _, residual = communicator(Norm()).prepare_attn(
-                    hidden_states, None, None, quant_format=quant_format
+                _, residual = prepare_attn(
+                    communicator(Norm()),
+                    hidden_states,
+                    None,
+                    None,
+                    quant_format=quant_format,
                 )
-                self.assertIs(residual, hidden_states)
+                self.assertIs(residual.residual, hidden_states)
 
     def test_a_pending_sum_is_completed_once(self):
         for fusion in (False, True):
@@ -183,7 +202,7 @@ class TestPrepareAttnSteps(CustomTestCase):
             ):
                 norm = Norm()
                 hidden_states = comm.UnreducedOutput(torch.ones(2, 4), group=group)
-                communicator(norm).prepare_attn(hidden_states, torch.zeros(2, 4), None)
+                prepare_attn(communicator(norm), hidden_states, torch.zeros(2, 4), None)
                 self.assertEqual(all_reduce.call_count, 0 if fusion else 1)
                 self.assertEqual(
                     norm.calls, ["fused_all_reduce_norm"] if fusion else ["norm"]
@@ -192,7 +211,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_pending_sum_keeps_the_quant_format_without_fusion(self):
         with platform(use_aiter=True) as (kernels, all_reduce, group):
             norm = Norm()
-            communicator(norm).prepare_attn(
+            prepare_attn(
+                communicator(norm),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -205,7 +225,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_pending_sum_over_another_group_skips_the_fused_kernel(self):
         with platform(fusion=True, kernel_group=False) as (_, all_reduce, group):
             norm = Norm()
-            communicator(norm).prepare_attn(
+            prepare_attn(
+                communicator(norm),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -216,7 +237,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_post_residual_addition_bypasses_the_fused_kernel(self):
         with platform(fusion=True) as (_, all_reduce, group):
             norm = Norm()
-            communicator(norm).prepare_attn(
+            prepare_attn(
+                communicator(norm),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -235,7 +257,8 @@ class TestPrepareAttnSteps(CustomTestCase):
                 partial = torch.ones(3, 4)
                 local = torch.full((local_rows, 4), 7.0)
                 step = MagicMock(return_value=local)
-                hidden_states, residual = communicator(norm).prepare_attn(
+                hidden_states, residual = prepare_attn(
+                    communicator(norm),
                     comm.UnreducedOutput(partial, reduce_and_redistribute=step),
                     torch.zeros(local_rows, 4),
                     None,
@@ -247,7 +270,7 @@ class TestPrepareAttnSteps(CustomTestCase):
                     torch.testing.assert_close(hidden_states, local * 2)
                 else:
                     self.assertEqual(norm.calls, [])
-                    self.assertIs(residual, local)
+                    self.assertIs(residual.residual, local)
 
     def test_an_owed_reduce_scatter_is_not_offered_to_a_fused_kernel(self):
         with platform(fusion=True) as (_, all_reduce, _):
@@ -259,6 +282,7 @@ class TestPrepareAttnSteps(CustomTestCase):
                     c._steps.attention,
                     prepare=partial(
                         comm_ops._consumer_step,
+                        adds_plainly=True,
                         step=partial(
                             comm_ops._read_input,
                             layer_input=None,
@@ -272,7 +296,8 @@ class TestPrepareAttnSteps(CustomTestCase):
             )
             partial_sum = torch.ones(3, 4)
             step = MagicMock(return_value=torch.full((1, 4), 7.0))
-            c.prepare_attn(
+            prepare_attn(
+                c,
                 comm.UnreducedOutput(partial_sum, reduce_and_redistribute=step),
                 torch.zeros(1, 4),
                 None,
@@ -289,7 +314,8 @@ class TestPrepareAttnSteps(CustomTestCase):
             ):
                 norm = Norm()
                 with self.assertRaises(RuntimeError):
-                    communicator(norm).prepare_attn(
+                    prepare_attn(
+                        communicator(norm),
                         comm.UnreducedOutput(
                             torch.ones(2, 4), reduce_and_redistribute=step
                         ),

@@ -22,6 +22,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -100,7 +101,7 @@ class Glm4MoeModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
                 positions, hidden_states, forward_batch, residual

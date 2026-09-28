@@ -19,6 +19,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -980,12 +981,12 @@ class BailingMoELinearModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = inputs_embeds
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
         total_num_layers = self.end_layer - self.start_layer
         device = inputs_embeds.device if inputs_embeds is not None else input_ids.device

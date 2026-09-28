@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1109,7 +1110,7 @@ class MossVLTextModel(nn.Module):
         vision_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        residual = residual_batch.start(forward_batch)
 
         for decoder_layer in self.layers:
             if isinstance(decoder_layer, MossVLCrossAttentionDecoderLayer):
@@ -1125,6 +1126,9 @@ class MossVLTextModel(nn.Module):
                         forward_batch=forward_batch,
                         positions=positions,
                         vision_position_ids=vision_position_ids,
+                    )
+                    hidden_states, residual = LayerCommunicator.written(
+                        hidden_states, forward_batch
                     )
             elif isinstance(decoder_layer, MossVLSelfAttentionDecoderLayer):
                 hidden_states, residual = decoder_layer(

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,7 +114,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
+            residual=residual_batch.start(forward_batch),
         )
         hidden_states, residual = self.mtp_block.layer_communicator.finish_layer_stack(
             hidden_states, residual, forward_batch

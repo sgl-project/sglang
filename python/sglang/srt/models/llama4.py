@@ -26,6 +26,7 @@ from torch import nn
 from transformers import Llama4TextConfig
 
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -518,7 +519,7 @@ class Llama4Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        residual = None
+        residual = residual_batch.start(forward_batch)
         aux_hidden_states = []
         for i in range(len(self.layers)):
             if i in self.layers_to_capture:
@@ -560,6 +561,39 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self, input_ids, positions, forward_batch, split_interval, input_embeds=None
+    ):
+        start, end = split_interval
+        if start == 0:
+            forward_batch.residual = residual_batch.start(forward_batch)
+            forward_batch.hidden_states = (
+                self.model.embed_tokens(input_ids)
+                if input_embeds is None
+                else input_embeds
+            )
+        for layer in self.model.layers[start:end]:
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+        if end != self.model.config.num_hidden_layers:
+            return None
+        hidden, residual = LayerCommunicator.finish_layer_stack(
+            forward_batch.hidden_states, forward_batch.residual, forward_batch
+        )
+        forward_batch.residual = None
+        if residual is None:
+            forward_batch.hidden_states = self.model.norm(hidden)
+        else:
+            forward_batch.hidden_states, _ = self.model.norm(hidden, residual)
+        return self.logits_processor(
+            input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

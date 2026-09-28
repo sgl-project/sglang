@@ -42,6 +42,7 @@ from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -269,7 +270,7 @@ class LongcatFlashModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
                 positions, hidden_states, forward_batch, residual, zero_allocator

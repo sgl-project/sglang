@@ -26,6 +26,7 @@ from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.communicator import (
     sequence_parallel_layer_sides,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -203,6 +204,7 @@ class TestSpRegionSteps(CustomTestCase):
                         update=comm.ADD,
                     ),
                     carried_fusions=(),
+                    adds_plainly=True,
                 ),
                 input_rows=comm.Layout(frozenset()),
                 input_move=attention_input,
@@ -217,8 +219,17 @@ class TestSpRegionSteps(CustomTestCase):
             ffn_sum_is_movable=True,
         )
 
+    def owned_input(self, hidden, residual, mode=ForwardMode.EXTEND, *, record=True):
+        batch = SimpleNamespace(forward_mode=mode, residual_stream=None)
+        stream = residual_batch.start(batch)
+        if residual is not None:
+            stream.write(residual)
+            if record:
+                hidden = stream.leave(hidden, comm.ADD)
+        return hidden, stream, batch
+
     def run_prepare_attn(self, communicator, mode, hidden, residual):
-        batch = SimpleNamespace(forward_mode=mode)
+        hidden, residual, batch = self.owned_input(hidden, residual, mode)
         with (
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=False),
@@ -241,7 +252,7 @@ class TestSpRegionSteps(CustomTestCase):
         self.assertTrue(active)
         scatter.assert_called_once()
         torch.testing.assert_close(h, torch.full((1, 4), 2.0))
-        torch.testing.assert_close(r, torch.ones(1, 4))
+        torch.testing.assert_close(r.residual, torch.ones(1, 4))
 
     def test_decode_leaves_the_region_closed(self):
         communicator = self.communicator(first_layer=True)
@@ -277,17 +288,20 @@ class TestSpRegionSteps(CustomTestCase):
                 return_value=SimpleNamespace(input_scattered=False),
             ):
                 h, r = communicator.prepare_attn(
-                    hidden,
-                    residual.clone(),
-                    SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+                    *self.owned_input(hidden, residual.clone())
                 )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
-            h, r = communicator.prepare_mlp(hidden, residual.clone(), object())
+            h, r = communicator.prepare_mlp(
+                *self.owned_input(hidden, residual.clone(), record=False)
+            )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
-            torch.testing.assert_close(r, torch.full((1, 4), 4.0))
-            out = communicator.postprocess_layer(hidden, residual, object())
+            torch.testing.assert_close(r.residual, torch.full((1, 4), 4.0))
+            batch = SimpleNamespace(residual_stream=None)
+            stream = residual_batch.start(batch)
+            stream.write(residual)
+            out = communicator.postprocess_layer(hidden, stream, batch)
             self.assertIs(out[0], hidden)
-            self.assertIs(out[1], residual)
+            self.assertIs(out[1], stream)
 
 
 if __name__ == "__main__":

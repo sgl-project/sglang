@@ -23,6 +23,7 @@ from sglang.srt.layers.communicator.output import (
     UnreducedOutput,
     reduce_output,
 )
+from sglang.srt.layers.communicator.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
@@ -32,6 +33,8 @@ def buffer(
     """Storage that can be reused after prepare consumes the input. A finalize
     handoff has no reusable layer-output tensor. This does not complete or read
     the value held in the storage."""
+    if isinstance(hidden_states, OwedOutput):
+        return hidden_states.contribution.value
     if isinstance(hidden_states, UnreducedOutput):
         return hidden_states.partial
     if isinstance(hidden_states, HandoffOutput):
@@ -42,18 +45,35 @@ def buffer(
 def add_to_output(hidden_states, residual, extra: torch.Tensor) -> Tuple:
     """Complete the output before adding an extra contribution exactly once.
     Leave its residual update for the next prepare call."""
-    hidden_states = reduce_output(hidden_states)
+    hidden_states = (
+        residual.complete(hidden_states)
+        if isinstance(residual, ResidualStream)
+        else reduce_output(hidden_states)
+    )
     hidden_states.add_(extra)
     return hidden_states, residual
 
 
-def fold(hidden_states, residual) -> Tuple[torch.Tensor, None]:
+def fold(hidden_states, residual):
     """Finish a plain layer output and fold its residual into a complete value.
     The following stage receives it with no outstanding residual addition."""
+    stream = residual if isinstance(residual, ResidualStream) else None
+    if stream is not None:
+        hidden_states, residual = stream.finish(hidden_states)
     hidden_states = reduce_output(hidden_states)
     if residual is not None:
         hidden_states = hidden_states + residual
-    return hidden_states, None
+    return (
+        (stream.write(hidden_states), stream)
+        if stream is not None
+        else (hidden_states, None)
+    )
+
+
+def written(hidden_states, forward_batch):
+    """Re-enter after a computation that already updated the full residual."""
+    forward_batch.residual_stream = ResidualStream(hidden_states)
+    return hidden_states, forward_batch.residual_stream
 
 
 def finish_layer_stack(
@@ -68,6 +88,13 @@ def finish_layer_stack(
     pipeline rank, or any other consumer outside the layers. A final norm
     that does a producer's handoff together with its own work
     (``final_norm_takes_handoff``) receives it as it is."""
+    if isinstance(residual, ResidualStream):
+        stream = forward_batch.residual_stream
+        if residual is not stream:
+            raise RuntimeError("residual alias belongs to a different invocation")
+        output = stream.finish(hidden_states, takes_handoff=final_norm_takes_handoff)
+        forward_batch.residual_stream = None
+        return output
     if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
         return hidden_states, residual
     return reduce_output(hidden_states), residual
@@ -99,6 +126,8 @@ def snapshot(
 ) -> torch.Tensor:
     """Copy a complete output with its plain residual. A statically declared
     sum is reduced on a copy; the main output and residual remain unchanged."""
+    if isinstance(residual, ResidualStream):
+        return residual.snapshot(hidden_states, group=group)
     if group is not None:
         hidden_states = group.all_reduce(hidden_states.clone())
     return hidden_states.clone() if residual is None else hidden_states + residual

@@ -35,6 +35,7 @@ from sglang.srt.layers.communicator.ops import (
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
     _consumer_step,
+    _dispatch_consumer,
     _hand_qkv_hook_its_input,
     _mlp_input_dp_partial,
     _mlp_input_dp_replicate,
@@ -96,8 +97,9 @@ class StageOutput(msgspec.Struct, frozen=True):
     # Whether it leaves the sum to the attention-DP reduce_scatterv whenever that
     # combine applies, as a MoE block does without any flag.
     leaves_for_reduce_scatterv: bool = False
-    # How the producer's output is written into the residual.
-    update: StageUpdate = ADD
+    # How the producer's output is written into the residual. An arrival
+    # description has no producer object; its edge declares capabilities only.
+    update: Optional[StageUpdate] = ADD
 
 
 class StageDecl(msgspec.Struct, frozen=True):
@@ -140,6 +142,8 @@ class EdgeDecl(msgspec.Struct, frozen=True):
     # Whether the residual is added into one rank's share of the produced sum
     # before that sum completes, instead of after it.
     residual_joins_sum: bool = False
+    # Capabilities allowed to arrive from another layer, not its update object.
+    update_capabilities: Tuple[bool, ...] = ()
 
 
 class DecoderLayerEdges(msgspec.Struct, frozen=True):
@@ -159,13 +163,13 @@ def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
     construction (``input_owes``); a sum the previous layer leaves for a batch
     comes with the value."""
     owes = sides.input_owes is not None
-    # The previous layer's FFN output, written in as this layer's FFN writes its
-    # own.
+    # Cross-layer arrival describes rows and owed work. The actual update
+    # arrives in the stream; this model family supplies only its capability.
     arrived = StageOutput(
         sides.input_rows,
         group=sides.input_owes,
         always_leaves=owes,
-        update=sides.ffn.output.update,
+        update=None,
     )
     # Completing what the input owes leaves it and the residual on each
     # attention-TP rank's slice.
@@ -180,6 +184,7 @@ def decoder_layer_edges(sides: DecoderLayerSides) -> DecoderLayerEdges:
             need=sides.attention.input,
             residual=sides.input_rows,
             residual_to=attention_rows,
+            update_capabilities=(sides.ffn.output.update.adds_plainly,),
         ),
         into_ffn=EdgeDecl(
             produced=sides.attention.output,
@@ -227,22 +232,28 @@ def stage_edges(
     first, and what it may leave of its sum comes with the value; otherwise the
     value is complete. The residual follows the input onto a finer slice and
     stays where it is when the input is gathered."""
-    update = previous.update if previous is not None else ADD
+    adds_plainly = previous.update.adds_plainly if previous is not None else True
     arrived = (
         StageOutput(
             rows,
             group=previous.group,
             always_leaves=previous.always_leaves,
             leaves_for_next_layer=previous.leaves_for_next_layer,
-            update=update,
+            update=None,
         )
         if previous is not None
         and (previous.always_leaves or previous.leaves_for_next_layer)
-        else StageOutput(rows, update=update)
+        else StageOutput(rows, update=None)
     )
     during = stage.input.layout if rows.sharded <= stage.input.layout.sharded else rows
     return (
-        EdgeDecl(produced=arrived, need=stage.input, residual=rows, residual_to=during),
+        EdgeDecl(
+            produced=arrived,
+            need=stage.input,
+            residual=rows,
+            residual_to=during,
+            update_capabilities=(adds_plainly,),
+        ),
         EdgeDecl(
             produced=stage.output,
             need=StageInput(rows),
@@ -623,6 +634,56 @@ def make_boundary(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
 ) -> Boundary:
+    """Bind only the update capabilities that can reach this edge.
+
+    Execution receives the producer's actual update from the residual stream.
+    A single capability needs no dispatcher; multiple capabilities select one
+    of the already constructed paths at the consumer.
+    """
+    capabilities = edge.update_capabilities
+    if not capabilities:
+        if edge.produced.update is None:
+            raise ValueError("an arrival must declare its update capabilities")
+        capabilities = (edge.produced.update.adds_plainly,)
+    paths = {
+        capability: _bind_consumer(
+            edge,
+            adds_plainly=capability,
+            fusions=fusions,
+            carried_fusions=carried_fusions,
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            cp_moves=cp_moves,
+            enters_stack=enters_stack,
+        )
+        for capability in capabilities
+    }
+    first = next(iter(paths.values()))
+    if len(paths) == 1:
+        return first
+    if any(path.input_move != first.input_move for path in paths.values()):
+        raise NotImplementedError("update capabilities require different input moves")
+    return msgspec.structs.replace(
+        first,
+        prepare=partial(
+            _dispatch_consumer,
+            paths={capability: path.prepare for capability, path in paths.items()},
+        ),
+        fused=tuple(
+            f for f in fusions if any(f in path.fused for path in paths.values())
+        ),
+    )
+
+
+def _bind_consumer(
+    edge: EdgeDecl,
+    *,
+    adds_plainly: bool,
+    fusions: Tuple["FusedMlpInput", ...] = (),
+    carried_fusions: Tuple[Callable, ...] = (),
+    force_layernorm_before_gather: bool = False,
+    cp_moves: Optional[CpMoves] = None,
+    enters_stack: bool = False,
+) -> Boundary:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
     its producer left) is completed first, trying ``carried_fusions``; a sum
@@ -633,28 +694,45 @@ def make_boundary(
     over attention CP; ``enters_stack`` for the edge into the layer stack's
     first stage. The steps read only this edge's declarations, never what the
     producer chose for a batch."""
-    update = edge.produced.update
     # A fused kernel runs the add and the norm itself.
-    plain = update.adds_plainly and edge.need.read.norms_plainly
+    plain = adds_plainly and edge.need.read.norms_plainly
     step, fused, input_move = _select_input_steps(
         edge.produced,
         residual=edge.residual,
         residual_to=edge.residual_to,
         need=edge.need,
-        update=update,
+        adds_plainly=adds_plainly,
         fusions=fusions if plain else (),
         force_layernorm_before_gather=force_layernorm_before_gather,
         residual_joins_sum=edge.residual_joins_sum,
         cp_moves=cp_moves,
         enters_stack=enters_stack,
     )
+    # A written stream entering the first physical layer must not run enter
+    # again (e.g. MHC expansion). Both alternatives are bound at construction.
+    written_step = None
+    if enters_stack:
+        written_step, _, _ = _select_input_steps(
+            edge.produced,
+            residual=edge.residual,
+            residual_to=edge.residual_to,
+            need=edge.need,
+            adds_plainly=adds_plainly,
+            fusions=fusions if plain else (),
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            residual_joins_sum=edge.residual_joins_sum,
+            cp_moves=cp_moves,
+            enters_stack=False,
+        )
     return Boundary(
         edge,
         prepare=partial(
             _consumer_step,
             step=step,
+            adds_plainly=adds_plainly,
             carried_fusions=carried_fusions if plain else (),
             owes_by_construction=edge.produced.always_leaves,
+            written_step=written_step,
         ),
         input_move=input_move,
         fused=fused,
@@ -668,6 +746,16 @@ def make_output_boundary(
     rows the layer hands on (``edge.need``), whose consumer runs in the next
     layer: the postprocess that moves the output there. ``cp_moves`` for an
     edge that returns across attention CP."""
+    update = edge.produced.update
+    if not getattr(update, "at_producer", False):
+        if not getattr(update, "can_defer_across_layers", False):
+            raise NotImplementedError(
+                "a deferred update must guarantee its lifetime across layers"
+            )
+        if not update.adds_plainly and get_parallel().pp_size > 1:
+            raise NotImplementedError(
+                "pipeline boundaries require a plain add or a producer-written residual"
+            )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")
     returns_over_dp, output_move, completes_sum = _select_ffn_output_move(
@@ -740,7 +828,7 @@ def _select_input_steps(
     residual: Layout,
     residual_to: Layout,
     need: StageInput,
-    update: StageUpdate,
+    adds_plainly: bool,
     fusions: Tuple[FusedMlpInput, ...],
     force_layernorm_before_gather: bool,
     residual_joins_sum: bool,
@@ -781,7 +869,6 @@ def _select_input_steps(
                 _mlp_input_scatter if owes is SumGroup.ATTN_TP else _mlp_input_slice,
                 scatters_residual=residual != residual_to,
                 read=read,
-                update=update,
             ),
             (),
             None,
@@ -793,7 +880,7 @@ def _select_input_steps(
             if gathered or owes is not SumGroup.ATTN_TP:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return (
-                partial(_mlp_input_on_residual_shard, read=read, update=update),
+                partial(_mlp_input_on_residual_shard, read=read),
                 (),
                 None,
             )
@@ -812,7 +899,6 @@ def _select_input_steps(
                 layer_input=tp_reduce_scatter,
                 enters_stack=enters_stack,
                 read=read,
-                update=update,
             ),
             (),
             None,
@@ -826,7 +912,7 @@ def _select_input_steps(
             residual=residual,
             residual_to=residual_to,
             need=StageInput(produced.layout, read=read),
-            update=update,
+            adds_plainly=adds_plainly,
             fusions=fusions,
             force_layernorm_before_gather=force_layernorm_before_gather,
             residual_joins_sum=residual_joins_sum,
@@ -849,7 +935,6 @@ def _select_input_steps(
                 layer_input=None,
                 enters_stack=enters_stack,
                 read=read,
-                update=update,
             ),
             (),
             CommunicateSimpleFn._scattered_to_tp_attn_full,
@@ -878,7 +963,6 @@ def _select_input_steps(
                     layer_input=None,
                     enters_stack=enters_stack,
                     read=read,
-                    update=update,
                 ),
                 (),
                 None,
@@ -886,7 +970,7 @@ def _select_input_steps(
         if gathers_residual and residual_joins_sum:
             # Each rank adds its slice of the residual into its share of the
             # sum, so the all-reduce also brings the residual back to every row.
-            if owes is not SumGroup.ATTN_TP or not update.adds_plainly:
+            if owes is not SumGroup.ATTN_TP or not adds_plainly:
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return partial(_mlp_input_residual_into_sum, read=read), (), None
         # A sum over TP completes only on rows every TP rank holds: the TP group
@@ -903,7 +987,6 @@ def _select_input_steps(
                 fusions=tuple(f.run for f in fused),
                 group=owes,
                 read=read,
-                update=update,
             ),
             fused,
             None,
@@ -920,7 +1003,7 @@ def _select_input_steps(
     if (
         owes_attention_tp
         and not force_layernorm_before_gather
-        and update.adds_plainly
+        and adds_plainly
         and read.norms_plainly
     ):
         return (
@@ -940,7 +1023,6 @@ def _select_input_steps(
             reduces_attention_tp=owes_attention_tp,
             places_cp_shards=places_cp_shards,
             read=read,
-            update=update,
         ),
         (),
         None,

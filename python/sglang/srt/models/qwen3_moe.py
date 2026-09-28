@@ -30,6 +30,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -1084,6 +1085,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            forward_batch.residual = residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -1110,6 +1112,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
             )
+            forward_batch.residual = None
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(

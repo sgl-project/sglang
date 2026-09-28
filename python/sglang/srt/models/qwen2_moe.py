@@ -44,6 +44,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1175,12 +1176,12 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -1306,6 +1307,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            forward_batch.residual = residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -1332,6 +1334,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
             )
+            forward_batch.residual = None
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(

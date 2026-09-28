@@ -11,6 +11,7 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusTextConfig,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -762,7 +763,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        residual = None
+        residual = residual_batch.start(forward_batch)
         aux_hidden_states = []
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(

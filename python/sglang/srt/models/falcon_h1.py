@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -421,7 +422,7 @@ class FalconH1Model(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids) * self.embedding_multiplier
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(

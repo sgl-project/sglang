@@ -24,6 +24,7 @@ from sglang.srt.layers.communicator import (
     LayerFacts,
     enable_moe_dense_fully_dp,
 )
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1151,12 +1152,12 @@ class SarvamMLAModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual = residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
             hidden_states, residual = self.layers[
                 self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors)
+            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1267,7 +1268,7 @@ class SarvamMLAForCausalLM(nn.Module):
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
+            forward_batch.residual = residual_batch.start(forward_batch)
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1291,6 +1292,7 @@ class SarvamMLAForCausalLM(nn.Module):
                 hidden_states, _ = self.model.norm(
                     forward_batch.hidden_states, forward_batch.residual
                 )
+            forward_batch.residual = None
             forward_batch.hidden_states = hidden_states
             return self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -1455,7 +1457,7 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
                 forward_batch.hidden_states = self.model.word_embeddings(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
-            forward_batch.residual = None
+            forward_batch.residual = residual_batch.start(forward_batch)
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -1479,6 +1481,7 @@ class SarvamMoEForCausalLM(BailingMoEForCausalLM):
                 hidden_states, _ = self.model.norm(
                     forward_batch.hidden_states, forward_batch.residual
                 )
+            forward_batch.residual = None
             forward_batch.hidden_states = hidden_states
 
             return self.logits_processor(

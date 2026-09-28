@@ -18,6 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -106,7 +107,7 @@ class GigaChat35ModelNextN(nn.Module):
                 )
             )
 
-        residual = None
+        residual = residual_batch.start(forward_batch)
         hidden_states, residual = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
