@@ -4,13 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
