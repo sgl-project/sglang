@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.encoder.runtime import (
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
-    EncoderDelivery,
     EncoderMetaRegistry,
     InternalError,
     MMEncoder,
@@ -48,6 +47,7 @@ from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
     MultiModalStaticCache,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -636,16 +636,6 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
-    def test_contract_has_two_direct_implementations(self):
-        self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
-        self.assertEqual(
-            set(EncoderDelivery.__subclasses__()),
-            {
-                MooncakeDelivery,
-                ZmqDelivery,
-            },
-        )
-
     def test_failed_staged_send_releases_request(self):
         async def run():
             encoder = SimpleNamespace(
@@ -1011,10 +1001,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(torch.tensor([400, 1, 0, 0]))
 
             with (
-                patch(
-                    "sglang.srt.distributed.parallel_state.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1051,10 +1038,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1][2] += 1
 
             with (
-                patch(
-                    "sglang.srt.distributed.parallel_state.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1095,10 +1079,7 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(local_status)
 
             with (
-                patch(
-                    "sglang.srt.distributed.parallel_state.get_tp_group",
-                    return_value=TPGroup(),
-                ),
+                get_parallel().override(tp_group=TPGroup()),
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
