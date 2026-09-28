@@ -702,10 +702,7 @@ class TestWrapperEntryClassGates(_FusionGateCase):
 
 
 class TestA2ABackendGate(_FusionGateCase):
-    """`can_fuse_shared_expert` must refuse for every DeepEP-class backend it
-    is wired for. MoRI runs the same per-rank EP expert layout as DeepEP, so a
-    fused shared expert would occupy a global slot the layers never allocate —
-    the routed experts then read the wrong rows and accuracy collapses."""
+    """A2A backends with local shared experts must refuse global fusion."""
 
     def _config(self):
         return SimpleNamespace(
@@ -727,17 +724,28 @@ class TestA2ABackendGate(_FusionGateCase):
         from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
 
         self._seed()
-        for backend in ("deepep", "mori"):
+        for backend in ("deepep", "mori", "mscclpp"):
             with self.subTest(backend=backend):
                 self._use_backend(backend)
                 self.assertFalse(can_fuse_shared_expert(self._config(), None))
 
+    def test_mscclpp_replicates_the_separate_shared_expert(self):
+        from sglang.srt.models.qwen2_moe import _shared_expert_uses_tp1
+
+        self._seed()
+        self._use_backend("mscclpp")
+        self.assertTrue(_shared_expert_uses_tp1())
+
     def test_a_plain_tp_deployment_still_fuses(self):
-        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+        from sglang.srt.models.qwen2_moe import (
+            _shared_expert_uses_tp1,
+            can_fuse_shared_expert,
+        )
 
         self._seed()
         self._use_backend("none")
         self.assertTrue(can_fuse_shared_expert(self._config(), None))
+        self.assertFalse(_shared_expert_uses_tp1())
 
 
 class TestFamiliesWithoutAGate(_FusionGateCase):

@@ -227,7 +227,7 @@ def create_moe_dispatcher(
         )
     elif a2a_backend.is_mscclpp():
         return MSCCLPPDispatcher(
-            group=get_tp_group().device_group,
+            group=get_tp_group().cpu_group,
             router_topk=moe_runner_config.top_k,
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,

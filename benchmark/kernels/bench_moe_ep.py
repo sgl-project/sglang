@@ -45,7 +45,7 @@ import torch
 import torch.distributed as dist
 
 DTYPE = torch.bfloat16
-MSCCLPP_LL_HIDDEN_SIZES = (4096, 6656, 7168, 8192, 8704, 9216)
+MSCCLPP_LL_HIDDEN_SIZES = (2048, 4096, 6656, 7168, 8192, 8704, 9216)
 
 
 @dataclass
@@ -516,16 +516,15 @@ class MscclppPipeline:
                 hidden_size=args.hidden_size,
                 topk=args.top_k,
                 max_tokens_per_rank=num_tokens,
-                mode=MoEMode.LOW_LATENCY,
+                mode=MoEMode.LATENCY,
                 output_layout=DispatchLayout.RANK_MAJOR,
                 invalid_token_expert_id=args.num_experts,
-                low_latency_combine_mode=CombineMode.RANK_LOCAL_REDUCE,
+                combine_mode=CombineMode.RANK_LOCAL_REDUCE,
             )
         )
         if not self.communicator.is_available():
             raise RuntimeError("MSCCL++ EP low-latency runtime is unavailable")
 
-        self.expert_output = self.communicator.get_expert_output_buffer()
         self.combine_output = torch.empty(
             (num_tokens, args.hidden_size), dtype=DTYPE, device=device
         )
@@ -549,11 +548,13 @@ class MscclppPipeline:
         dispatch_output, _ = state
         if dispatch_output.topk_ids is None or dispatch_output.weights is None:
             raise RuntimeError("MSCCL++ RANK_MAJOR dispatch metadata is missing")
+        if dispatch_output.combine_input_buffer is None:
+            raise RuntimeError("MSCCL++ RANK_MAJOR combine buffer is missing")
         return self.moe(
             hidden_states=dispatch_output.tokens,
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.weights,
-            output=self.expert_output,
+            output=dispatch_output.combine_input_buffer,
         )
 
     def combine(
