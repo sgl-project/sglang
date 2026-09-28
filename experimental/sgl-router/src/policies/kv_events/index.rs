@@ -76,10 +76,12 @@ const PENDING_BATCH_LIMIT: usize = 1024;
 /// anything the rank lacks, and the rank is resolved on the spot rather than
 /// swept for. See `resolve_from_origin`.
 ///
-/// Only an exact match counts. A first batch at 1 means batch 0 was missed —
-/// ZMQ's slow-joiner window drops whatever is published before the SUB
-/// filter reaches the publisher — and that batch may have stored blocks, so
-/// the rank keeps today's sweep.
+/// Only an exact match on the FIRST held batch counts. A first batch at 1
+/// means batch 0 was missed — ZMQ's slow-joiner window drops whatever is
+/// published before the SUB filter reaches the publisher — and that batch may
+/// have stored blocks, so the rank keeps today's sweep. A batch 0 arriving
+/// later is a publisher restart instead; see the regression arms in
+/// `pump_loop`.
 const STREAM_ORIGIN_SEQ: i64 = 0;
 
 /// Delay between peer-sweep attempts while no usable peer has been found.
@@ -2598,11 +2600,41 @@ async fn pump_loop(
                 // stale `BlockStored` from the peer could resurrect a block this
                 // rank has already evicted.
                 if bootstrap.state_of(&worker) == Some(BootstrapState::Pending) {
-                    let first_of_hold = held.get(&worker).is_none_or(VecDeque::is_empty);
-                    if first_of_hold && seq == STREAM_ORIGIN_SEQ {
+                    let last_held = held.get(&worker).and_then(|q| q.back()).map(|(s, _)| *s);
+                    if last_held.is_none() && seq == STREAM_ORIGIN_SEQ {
                         // Nothing to wait on a peer for: this stream starts at
                         // its publisher's origin.
                         resolve_from_origin(&pump_state, &mut held, &worker);
+                    } else if last_held.is_some_and(|last| seq < last) {
+                        // The held queue is raw arrival order — no cursor has
+                        // been seeded into it — and PUB/SUB neither reorders nor
+                        // replays, so a regression inside it is the publisher
+                        // renumbering: the engine restarted in place without an
+                        // `END_SEQ`. The queued prefix is a dead stream. Holding
+                        // on would graft a snapshot whose old-numbering watermark
+                        // then filters the entire new stream, with no gap ever
+                        // detected — dead state served warm, live updates lost.
+                        warn!(
+                            worker = ?worker,
+                            last_held_seq = last_held,
+                            seq,
+                            "kv-bootstrap: sequence regressed while holding; the publisher \
+                             restarted without END_SEQ, discarding the dead stream's batches",
+                        );
+                        if seq == STREAM_ORIGIN_SEQ {
+                            resolve_from_origin(&pump_state, &mut held, &worker);
+                        } else {
+                            // The new stream's head is gone too, so nothing can
+                            // be spliced: run cold from this batch on.
+                            fail_rank(
+                                &pump_state,
+                                &mut held,
+                                &worker,
+                                true,
+                                RankOutcome::PublisherReset,
+                            );
+                        }
+                        spawn_mode_recheck(&http, &oracle, &live_workers, &bootstrap, &worker);
                     } else {
                         let queue = held.entry(worker.clone()).or_default();
                         if queue.len() < PENDING_BATCH_LIMIT {
@@ -2622,6 +2654,36 @@ async fn pump_loop(
                     }
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
+                } else if seq == STREAM_ORIGIN_SEQ
+                    && cursors
+                        .lock()
+                        .get(&worker)
+                        .is_some_and(|&c| c > STREAM_ORIGIN_SEQ)
+                {
+                    // The resolved-rank counterpart of the regression above,
+                    // narrowed to batch 0. Here the comparison is against the
+                    // CURSOR, which a graft may have seeded ahead of anything
+                    // received, so `seq < cursor` in general means "already
+                    // reflected" and stays filtered by `apply_batch`. Batch 0 is
+                    // the exception: a cursor above it proves the publisher
+                    // already emitted later batches, so a new batch 0 can only
+                    // be a restarted publisher — whose whole stream the old
+                    // cursor would otherwise filter until it overtook it. The
+                    // gap check below cannot see this: it flags forward holes,
+                    // and a regressed seq passes it as proof of continuity.
+                    warn!(
+                        worker = ?worker,
+                        "kv-events pump: batch 0 behind a later cursor; the publisher \
+                         restarted without END_SEQ, replacing this rank's state with the new stream",
+                    );
+                    if awaiting_splice_proof.remove(&worker).is_some() {
+                        // The graft's verdict is final now: its state is gone,
+                        // and what replaces it is the new stream from its origin.
+                        bootstrap.record_rank_outcome(RankOutcome::FromOrigin);
+                    }
+                    tree.clear_worker(&worker);
+                    cursors.lock().remove(&worker);
+                    spawn_mode_recheck(&http, &oracle, &live_workers, &bootstrap, &worker);
                 }
                 // First batch after a graft proves — or disproves — that the
                 // snapshot joins up with this rank's live stream.
@@ -2784,11 +2846,13 @@ fn fail_rank(
 /// covers it, and the sweep burns the whole bootstrap deadline — holding
 /// `/readyz` on a booting replica — to learn nothing.
 ///
-/// Clears the rank's tree state and cursor first. A rank on its first
-/// incarnation has neither; one back in `Pending` for a gap retry does
-/// (`fail_rank` replays its queue), and batch 0 means that engine process has
-/// since restarted without a graceful `END_SEQ`, so the old state describes a
-/// cache that no longer exists and its cursor would filter the new stream.
+/// Clears the rank's held queue, tree state and cursor first. A rank on its
+/// first incarnation has none of them. One back in `Pending` for a gap retry
+/// has tree state and a cursor (`fail_rank` replays its queue), and one whose
+/// batch 0 arrives behind held batches has a queue: either way batch 0 means
+/// that engine process restarted without a graceful `END_SEQ`, so the old
+/// state describes a cache that no longer exists and its cursor would filter
+/// the new stream.
 ///
 /// Leaves the caller to apply the triggering batch, and any in-flight sweep to
 /// notice the rank left `Pending` (see [`sweep_until_deadline`]); a snapshot that
@@ -5100,21 +5164,19 @@ mod tests {
         assert_eq!(rank_count(&tracker, "from_origin"), 1);
     }
 
-    /// The conservative side of the origin rule. A first batch past the origin
-    /// means batch 0 was missed, and a batch landing at the origin behind
-    /// others is a restart mid-hold whose prefix belongs to a dead stream:
-    /// neither proves the history complete, so both keep holding for a sweep.
+    /// The conservative side of the origin rule: a first batch past the origin
+    /// means batch 0 was missed, and that batch may have stored blocks, so the
+    /// history is not provably complete and the rank keeps holding for a sweep.
+    /// Batches that keep rising behind it are ordinary held batches.
     #[tokio::test]
     async fn pump_keeps_holding_unless_the_hold_begins_at_the_origin() {
-        let past = worker_id("http://w1", 0);
-        let restarted = worker_id("http://w2", 0);
-        let ranks = [past.clone(), restarted.clone()];
-        let tracker = pending_tracker(&ranks);
-        let h = spawn_pump_with_bootstrap(&ranks, tracker.clone());
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
 
-        for (worker, seq) in [(&past, 1), (&restarted, 7), (&restarted, 0)] {
+        for seq in [1, 2, 3] {
             h.tx.send(WorkerEvent::Batch {
-                worker: worker.clone(),
+                worker: id.clone(),
                 seq,
                 batch: batch(vec![stored(None, vec![seq + 10])]),
             })
@@ -5125,13 +5187,180 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        for rank in &ranks {
-            assert_eq!(tracker.state_of(rank), Some(BootstrapState::Pending));
-        }
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(h.cursors.lock().is_empty(), "nothing applied");
         assert_eq!(rank_count(&tracker, "from_origin"), 0);
     }
 
+    /// Send `seqs` for `id` (each storing block `seq + 1000`), then wait until
+    /// the pump has applied through `until` — so a control message sent next
+    /// cannot overtake them (the pump polls control first).
+    async fn send_and_await_cursor(h: &PumpHarness, id: &KvWorkerId, seqs: &[i64], until: i64) {
+        for &seq in seqs {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![stored(None, vec![seq + 1000])]),
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.cursors.lock().get(id).copied() != Some(until) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the batches are applied, not held");
+    }
+
+    /// An engine restarted in place (same URL, no `END_SEQ`) while its rank is
+    /// Pending: the new stream's batch 0 lands behind the dead stream's held
+    /// batches. Holding on let a later graft seed an old-numbering watermark
+    /// that filtered the whole new stream — dead state reported warm, live
+    /// updates dropped. The regression must discard the dead prefix and resolve
+    /// from the new stream's origin, so a snapshot arriving afterwards is moot.
+    #[tokio::test]
+    async fn pump_restart_while_holding_resolves_from_the_new_origin() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        send_and_await_cursor(&h, &id, &[40, 41, 0, 1], 1).await;
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 50)),
+            })
+            .await
+            .unwrap();
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 2,
+            batch: batch(vec![stored(None, vec![1002])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
+        for dead in [1040, 1041, 100, 200] {
+            assert_eq!(
+                h.tree.match_prefix(None, &[dead]).matched_blocks,
+                0,
+                "block {dead} is from the dead stream or the moot snapshot",
+            );
+        }
+        for live in [1000, 1001, 1002] {
+            assert!(
+                h.tree.match_prefix(None, &[live]).workers.contains(&id),
+                "new-stream block {live} must be applied, not filtered",
+            );
+        }
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(2));
+        assert_eq!(rank_count(&tracker, "from_origin"), 1);
+    }
+
+    /// A regression that does not land on batch 0 is still a restart, but the
+    /// new stream's head was missed too, so nothing can be spliced: discard the
+    /// dead prefix and run cold from here.
+    #[tokio::test]
+    async fn pump_restart_past_the_origin_while_holding_runs_cold() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        send_and_await_cursor(&h, &id, &[40, 41, 3], 3).await;
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(h.tree.match_prefix(None, &[1040]).matched_blocks, 0);
+        assert_eq!(h.tree.match_prefix(None, &[1041]).matched_blocks, 0);
+        assert!(h.tree.match_prefix(None, &[1003]).workers.contains(&id));
+        assert_eq!(rank_count(&tracker, "publisher_reset"), 1);
+    }
+
+    /// The resolved-rank path: a grafted, proven rank whose engine restarts in
+    /// place sees batch 0 behind a cursor seeded in the old numbering. The gap
+    /// check cannot flag a backwards step, and the cursor would filter the new
+    /// stream until it overtook the old one — so batch 0 replaces the state.
+    #[tokio::test]
+    async fn pump_batch_zero_behind_a_resolved_cursor_replaces_the_rank_state() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 6,
+            batch: batch(vec![stored(Some(200), vec![300])]),
+        })
+        .await
+        .unwrap();
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.cursors.lock().get(&id).copied() != Some(6) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("graft and held batch applied");
+
+        send_and_await_cursor(&h, &id, &[0, 1], 1).await;
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(
+            h.tree.match_prefix(None, &[100]).matched_blocks,
+            0,
+            "the restarted engine's cache no longer holds the grafted state",
+        );
+        for live in [1000, 1001] {
+            assert!(
+                h.tree.match_prefix(None, &[live]).workers.contains(&id),
+                "new-stream block {live} must be applied, not filtered",
+            );
+        }
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
+        assert_eq!(
+            rank_count(&tracker, "warm"),
+            1,
+            "the graft's own verdict stands"
+        );
+        assert_eq!(
+            rank_count(&tracker, "from_origin"),
+            0,
+            "counted once, as warm"
+        );
+    }
+
+    /// Same restart while the graft's splice is still unproven: the verdict is
+    /// final at that batch — the grafted state is gone and the new stream from
+    /// its origin replaces it — so it is tallied exactly once, not warm.
+    #[tokio::test]
+    async fn pump_batch_zero_behind_an_unproven_graft_settles_its_verdict() {
+        let id = worker_id("http://w1", 0);
+        let (tracker, h) = graft_with_deferred_proof(&id, 5).await;
+        send_and_await_cursor(&h, &id, &[0], 0).await;
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(h.tree.match_prefix(None, &[100]).matched_blocks, 0);
+        assert!(h.tree.match_prefix(None, &[1000]).workers.contains(&id));
+        assert_eq!(rank_count(&tracker, "warm"), 0);
+        assert_eq!(rank_count(&tracker, "from_origin"), 1);
+    }
     /// A rank back in `Pending` for a gap retry carries tree state and a cursor
     /// from its previous stream. Batch 0 means that engine restarted, so the old
     /// state describes a cache that is gone — and its cursor would filter every
