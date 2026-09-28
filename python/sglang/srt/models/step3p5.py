@@ -11,7 +11,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -560,7 +560,7 @@ class Step3p5DecoderLayer(nn.Module):
         )
 
         # An MTP draft is a one-layer model; layer_id still indexes its config.
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=0 if is_nextn else layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_moe_layer,
@@ -568,10 +568,13 @@ class Step3p5DecoderLayer(nn.Module):
             is_next_layer_sparse=self.is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            # The dense MLP all-reduces its own output unless postprocess
+            # reduce-scatters it; it never leaves the sum to the next layer.
+            allow_deferred_ffn_reduction=self.use_moe,
         )
 
         self.layer_id = layer_id
@@ -618,18 +621,9 @@ class Step3p5DecoderLayer(nn.Module):
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return ffn_exit.finish(hidden_states, residual)
 
-        # The dense MLP all-reduces its own output unless postprocess
-        # reduce-scatters it; it never leaves the sum to the next layer.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False, mlp_reduce_scatter=mlp_reduce_scatter
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        return self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        return ffn_exit.finish(hidden_states, residual)
 
 
 class Step3p5Model(nn.Module):

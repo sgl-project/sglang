@@ -53,6 +53,7 @@ runtime_base = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
   "sentencepiece",
