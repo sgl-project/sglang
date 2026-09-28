@@ -10,7 +10,7 @@ LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB = 131072
 class VocabState:
     max_values: torch.Tensor
     argmax_ids: torch.Tensor
-    logsumexp: torch.Tensor
+    shifted_exp_sum: torch.Tensor
     max_probs: torch.Tensor
 
     def slice_rows(self, end: int) -> "VocabState":
@@ -18,7 +18,7 @@ class VocabState:
         return VocabState(
             max_values=self.max_values[:end],
             argmax_ids=self.argmax_ids[:end],
-            logsumexp=self.logsumexp[:end],
+            shifted_exp_sum=self.shifted_exp_sum[:end],
             max_probs=self.max_probs[:end],
         )
 
@@ -40,12 +40,12 @@ def local_vocab_state_from_logits(
     local_logits = local_logits[:, :valid_vocab_size]
     local_logits = local_logits.float()
     max_values, local_argmax_ids = torch.max(local_logits, dim=-1)
-    logsumexp = torch.logsumexp(local_logits, dim=-1)
+    shifted_exp_sum = torch.exp(local_logits - max_values.unsqueeze(-1)).sum(dim=-1)
     return VocabState(
         max_values=max_values,
         argmax_ids=local_argmax_ids.long() + int(vocab_start),
-        logsumexp=logsumexp,
-        max_probs=torch.exp(max_values - logsumexp),
+        shifted_exp_sum=shifted_exp_sum,
+        max_probs=shifted_exp_sum.reciprocal(),
     )
 
 
@@ -64,13 +64,13 @@ def can_use_local_vocab_state_triton(valid_vocab_size: int) -> bool:
 def pack_vocab_state_for_tp_gather(state: VocabState) -> torch.Tensor:
     if state.max_values.dtype != torch.float32:
         raise ValueError("VocabState.max_values must be torch.float32")
-    if state.logsumexp.dtype != torch.float32:
-        raise ValueError("VocabState.logsumexp must be torch.float32")
+    if state.shifted_exp_sum.dtype != torch.float32:
+        raise ValueError("VocabState.shifted_exp_sum must be torch.float32")
 
     return torch.stack(
         [
             state.max_values,
-            state.logsumexp,
+            state.shifted_exp_sum,
             state.argmax_ids.to(dtype=torch.float32),
         ],
         dim=-1,
@@ -80,7 +80,7 @@ def pack_vocab_state_for_tp_gather(state: VocabState) -> torch.Tensor:
 def _merge_rank_vocab_state(
     max_values_by_rank: torch.Tensor,
     argmax_ids_by_rank: torch.Tensor,
-    logsumexp_by_rank: torch.Tensor,
+    shifted_exp_sum_by_rank: torch.Tensor,
 ) -> VocabState:
     if max_values_by_rank.ndim != 2:
         raise ValueError("rank vocab state must have shape [tp, rows]")
@@ -95,12 +95,16 @@ def _merge_rank_vocab_state(
         max_id,
     )
     best_ids = torch.min(candidate_ids, dim=0).values
-    merged_logsumexp = torch.logsumexp(logsumexp_by_rank, dim=0)
+    merged_shifted_exp_sum = torch.sum(
+        shifted_exp_sum_by_rank
+        * torch.exp(max_values_by_rank - best_values.unsqueeze(0)),
+        dim=0,
+    )
     return VocabState(
         max_values=best_values,
         argmax_ids=best_ids.long(),
-        logsumexp=merged_logsumexp,
-        max_probs=torch.exp(best_values - merged_logsumexp),
+        shifted_exp_sum=merged_shifted_exp_sum,
+        max_probs=merged_shifted_exp_sum.reciprocal(),
     )
 
 
@@ -110,7 +114,7 @@ def merge_gathered_packed_vocab_state(gathered: torch.Tensor) -> VocabState:
     return _merge_rank_vocab_state(
         max_values_by_rank=gathered[:, :, 0],
         argmax_ids_by_rank=gathered[:, :, 2].long(),
-        logsumexp_by_rank=gathered[:, :, 1],
+        shifted_exp_sum_by_rank=gathered[:, :, 1],
     )
 
 
@@ -120,12 +124,14 @@ def merge_vocab_states(states: list[VocabState]) -> VocabState:
 
     max_values_by_rank = torch.stack([state.max_values for state in states], dim=0)
     argmax_ids_by_rank = torch.stack([state.argmax_ids for state in states], dim=0)
-    logsumexp_by_rank = torch.stack([state.logsumexp for state in states], dim=0)
+    shifted_exp_sum_by_rank = torch.stack(
+        [state.shifted_exp_sum for state in states], dim=0
+    )
 
     return _merge_rank_vocab_state(
         max_values_by_rank=max_values_by_rank,
         argmax_ids_by_rank=argmax_ids_by_rank,
-        logsumexp_by_rank=logsumexp_by_rank,
+        shifted_exp_sum_by_rank=shifted_exp_sum_by_rank,
     )
 
 
@@ -161,7 +167,7 @@ def gather_vocab_state_across_tp(
     return _merge_rank_vocab_state(
         max_values_by_rank=gather(local_state.max_values),
         argmax_ids_by_rank=gather(local_state.argmax_ids),
-        logsumexp_by_rank=gather(local_state.logsumexp),
+        shifted_exp_sum_by_rank=gather(local_state.shifted_exp_sum),
     )
 
 

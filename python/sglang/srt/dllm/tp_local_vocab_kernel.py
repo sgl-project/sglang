@@ -10,7 +10,7 @@ def _local_vocab_state_kernel(
     logits_ptr,
     max_values_ptr,
     argmax_ids_ptr,
-    logsumexp_ptr,
+    shifted_exp_sum_ptr,
     stride_row: tl.constexpr,
     valid_vocab_size: tl.constexpr,
     vocab_start: tl.constexpr,
@@ -26,12 +26,11 @@ def _local_vocab_state_kernel(
     ).to(tl.float32)
     max_value = tl.max(values, axis=0)
     arg_offsets = tl.min(tl.where(values == max_value, offsets, BLOCK_VOCAB), axis=0)
-    exp_sum = tl.sum(tl.exp(values - max_value), axis=0)
-    logsumexp = max_value + tl.log(exp_sum)
+    shifted_exp_sum = tl.sum(tl.exp(values - max_value), axis=0)
 
     tl.store(max_values_ptr + row_id, max_value)
     tl.store(argmax_ids_ptr + row_id, arg_offsets + vocab_start)
-    tl.store(logsumexp_ptr + row_id, logsumexp)
+    tl.store(shifted_exp_sum_ptr + row_id, shifted_exp_sum)
 
 
 def _next_power_of_2(value: int) -> int:
@@ -61,7 +60,7 @@ def local_vocab_state_from_logits_triton(
         (num_rows,), device=local_logits.device, dtype=torch.float32
     )
     argmax_ids = torch.empty((num_rows,), device=local_logits.device, dtype=torch.long)
-    logsumexp = torch.empty(
+    shifted_exp_sum = torch.empty(
         (num_rows,), device=local_logits.device, dtype=torch.float32
     )
 
@@ -70,7 +69,7 @@ def local_vocab_state_from_logits_triton(
         local_logits,
         max_values,
         argmax_ids,
-        logsumexp,
+        shifted_exp_sum,
         local_logits.stride(0),
         valid_vocab_size,
         int(vocab_start),
@@ -80,6 +79,6 @@ def local_vocab_state_from_logits_triton(
     return VocabState(
         max_values=max_values,
         argmax_ids=argmax_ids,
-        logsumexp=logsumexp,
-        max_probs=torch.exp(max_values - logsumexp),
+        shifted_exp_sum=shifted_exp_sum,
+        max_probs=shifted_exp_sum.reciprocal(),
     )

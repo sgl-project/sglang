@@ -38,9 +38,19 @@ def _dense_argmax_and_max_prob(
     logits: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = logits.float()
-    max_values, argmax_ids = torch.max(logits, dim=-1)
-    max_probs = torch.exp(max_values - torch.logsumexp(logits, dim=-1))
+    argmax_ids = torch.argmax(logits, dim=-1)
+    max_probs = torch.gather(
+        torch.softmax(logits, dim=-1),
+        dim=-1,
+        index=argmax_ids.unsqueeze(-1),
+    ).squeeze(-1)
     return argmax_ids.long(), max_probs
+
+
+def _dense_shifted_exp_sum(logits: torch.Tensor) -> torch.Tensor:
+    logits = logits.float()
+    max_values = torch.max(logits, dim=-1).values
+    return torch.exp(logits - max_values.unsqueeze(-1)).sum(dim=-1)
 
 
 def test_low_confidence_tp_state_matches_dense_logits():
@@ -66,7 +76,7 @@ def test_low_confidence_tp_state_matches_dense_logits():
 
     torch.testing.assert_close(merged.max_probs, dense_max_probs)
     torch.testing.assert_close(
-        merged.logsumexp, torch.logsumexp(logits.float(), dim=-1)
+        merged.shifted_exp_sum, _dense_shifted_exp_sum(logits)
     )
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
@@ -101,8 +111,8 @@ def test_local_vocab_state_ignores_padded_vocab_entries():
 
     torch.testing.assert_close(merged.max_probs, dense_max_probs)
     torch.testing.assert_close(
-        merged.logsumexp,
-        torch.logsumexp(dense_logits.float(), dim=-1),
+        merged.shifted_exp_sum,
+        _dense_shifted_exp_sum(dense_logits),
     )
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
@@ -149,8 +159,8 @@ def test_random_low_confidence_tp_state_matches_dense_with_padding(
 
     torch.testing.assert_close(merged.max_probs, dense_max_probs)
     torch.testing.assert_close(
-        merged.logsumexp,
-        torch.logsumexp(logits.float(), dim=-1),
+        merged.shifted_exp_sum,
+        _dense_shifted_exp_sum(logits),
     )
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
@@ -178,7 +188,7 @@ def test_triton_local_vocab_state_matches_reference_cuda():
 
     torch.testing.assert_close(actual.max_values, expected.max_values)
     torch.testing.assert_close(actual.max_probs, expected.max_probs)
-    torch.testing.assert_close(actual.logsumexp, expected.logsumexp)
+    torch.testing.assert_close(actual.shifted_exp_sum, expected.shifted_exp_sum)
     assert torch.equal(actual.argmax_ids, expected.argmax_ids)
 
 
@@ -186,7 +196,7 @@ def test_argmax_max_prob_uses_compact_state_without_full_logits():
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0]),
         argmax_ids=torch.tensor([7, 8, 9]),
-        logsumexp=torch.tensor([1.5, 2.5, 3.5]),
+        shifted_exp_sum=torch.tensor([2.0, 2.0, 2.0]),
         max_probs=torch.tensor([0.5, 0.6, 0.7]),
     )
     logits_output = LogitsProcessorOutput(
@@ -252,11 +262,85 @@ def test_low_confidence_step_accepts_compact_or_full_logits():
     assert torch.equal(dense_batch.input_ids, compact_batch.input_ids)
 
 
+def test_shifted_exp_sum_is_invariant_to_large_additive_offsets():
+    logits = torch.tensor(
+        [[0.0, -0.125, -0.25], [0.0, -0.5, -1.0]], dtype=torch.float32
+    )
+    shifted_logits = logits + 1_000_000.0
+
+    state = local_vocab_state_from_logits(local_logits=logits, vocab_start=0)
+    shifted_state = local_vocab_state_from_logits(
+        local_logits=shifted_logits,
+        vocab_start=0,
+    )
+
+    torch.testing.assert_close(
+        shifted_state.shifted_exp_sum,
+        state.shifted_exp_sum,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shifted_state.max_probs,
+        state.max_probs,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_low_confidence_near_tie_fallback_matches_dense_after_large_shift():
+    logits = torch.tensor(
+        [[1_000_000.0, 1_000_000.0], [0.0, -0.004]],
+        dtype=torch.float32,
+    )
+    states = [
+        local_vocab_state_from_logits(
+            local_logits=logits[:, rank : rank + 1],
+            vocab_start=rank,
+        )
+        for rank in range(2)
+    ]
+    compact_state = merge_vocab_states(states)
+    config = DllmConfig(
+        algorithm="LowConfidence",
+        algorithm_config={"threshold": 0.95},
+        block_size=2,
+        mask_id=99,
+        max_running_requests=1,
+    )
+    algorithm = LowConfidence(config)
+    dense_batch = SimpleNamespace(
+        batch_size=1,
+        input_ids=torch.tensor([99, 99]),
+    )
+    compact_batch = SimpleNamespace(
+        batch_size=1,
+        input_ids=dense_batch.input_ids.clone(),
+    )
+
+    algorithm.step(
+        dense_batch,
+        LogitsProcessorOutput(next_token_logits=None, full_logits=logits),
+        [None],
+    )
+    algorithm.step(
+        compact_batch,
+        LogitsProcessorOutput(
+            next_token_logits=None,
+            dllm_vocab_state=compact_state,
+        ),
+        [None],
+    )
+
+    assert dense_batch.input_ids.tolist() == [99, 0]
+    assert torch.equal(compact_batch.input_ids, dense_batch.input_ids)
+
+
 def test_prefill_cuda_graph_slices_dllm_vocab_state_without_next_logits():
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0]),
         argmax_ids=torch.tensor([7, 8, 9]),
-        logsumexp=torch.tensor([1.5, 2.5, 3.5]),
+        shifted_exp_sum=torch.tensor([2.0, 2.0, 2.0]),
         max_probs=torch.tensor([0.5, 0.6, 0.7]),
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
@@ -286,7 +370,9 @@ def test_prefill_cuda_graph_slices_dllm_vocab_state_without_next_logits():
     torch.testing.assert_close(sliced.full_logits, full_logits[:2])
     torch.testing.assert_close(sliced.dllm_vocab_state.max_values, state.max_values[:2])
     assert torch.equal(sliced.dllm_vocab_state.argmax_ids, state.argmax_ids[:2])
-    torch.testing.assert_close(sliced.dllm_vocab_state.logsumexp, state.logsumexp[:2])
+    torch.testing.assert_close(
+        sliced.dllm_vocab_state.shifted_exp_sum, state.shifted_exp_sum[:2]
+    )
     torch.testing.assert_close(sliced.dllm_vocab_state.max_probs, state.max_probs[:2])
 
 
@@ -322,19 +408,19 @@ def test_merge_vocab_states_tie_breaks_equal_max_values_by_token_id():
         VocabState(
             max_values=torch.tensor([5.0, 7.0, 1.0]),
             argmax_ids=torch.tensor([10, 12, 30]),
-            logsumexp=torch.log(torch.tensor([2.0, 3.0, 5.0])),
+            shifted_exp_sum=torch.tensor([2.0, 3.0, 5.0]),
             max_probs=torch.empty(3),
         ),
         VocabState(
             max_values=torch.tensor([5.0, 6.0, 1.0]),
             argmax_ids=torch.tensor([8, 9, 25]),
-            logsumexp=torch.log(torch.tensor([4.0, 7.0, 11.0])),
+            shifted_exp_sum=torch.tensor([4.0, 7.0, 11.0]),
             max_probs=torch.empty(3),
         ),
         VocabState(
             max_values=torch.tensor([4.0, 7.0, 2.0]),
             argmax_ids=torch.tensor([6, 11, 40]),
-            logsumexp=torch.log(torch.tensor([13.0, 17.0, 19.0])),
+            shifted_exp_sum=torch.tensor([13.0, 17.0, 19.0]),
             max_probs=torch.empty(3),
         ),
     ]
@@ -343,13 +429,18 @@ def test_merge_vocab_states_tie_breaks_equal_max_values_by_token_id():
 
     assert torch.equal(merged.argmax_ids, torch.tensor([8, 11, 40]))
     torch.testing.assert_close(merged.max_values, torch.tensor([5.0, 7.0, 2.0]))
-    torch.testing.assert_close(
-        merged.logsumexp,
-        torch.log(torch.tensor([19.0, 27.0, 35.0])),
+    exp_minus_one = torch.exp(torch.tensor(-1.0))
+    expected_shifted_exp_sum = torch.stack(
+        [
+            2.0 + 4.0 + 13.0 * exp_minus_one,
+            3.0 + 7.0 * exp_minus_one + 17.0,
+            5.0 * exp_minus_one + 11.0 * exp_minus_one + 19.0,
+        ]
     )
+    torch.testing.assert_close(merged.shifted_exp_sum, expected_shifted_exp_sum)
     torch.testing.assert_close(
         merged.max_probs,
-        torch.exp(merged.max_values - merged.logsumexp),
+        expected_shifted_exp_sum.reciprocal(),
     )
 
 
@@ -377,7 +468,7 @@ def test_packed_vocab_state_preserves_exact_ids_at_float32_boundary():
                 [FLOAT32_EXACT_INT_LIMIT, 9, FLOAT32_EXACT_INT_LIMIT],
                 dtype=torch.long,
             ),
-            logsumexp=torch.tensor([2.0, 5.0, 7.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([2.0, 5.0, 7.0], dtype=torch.float32),
             max_probs=torch.empty(3, dtype=torch.float32),
         ),
         VocabState(
@@ -386,7 +477,7 @@ def test_packed_vocab_state_preserves_exact_ids_at_float32_boundary():
                 [FLOAT32_EXACT_INT_LIMIT - 1, 7, 11],
                 dtype=torch.long,
             ),
-            logsumexp=torch.tensor([3.0, 6.0, 6.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([3.0, 6.0, 6.0], dtype=torch.float32),
             max_probs=torch.empty(3, dtype=torch.float32),
         ),
     ]
@@ -400,7 +491,7 @@ def test_packed_vocab_state_preserves_exact_ids_at_float32_boundary():
     assert actual.argmax_ids[1].item() == 7
     assert actual.argmax_ids[2].item() == FLOAT32_EXACT_INT_LIMIT
     torch.testing.assert_close(actual.max_values, expected.max_values)
-    torch.testing.assert_close(actual.logsumexp, expected.logsumexp)
+    torch.testing.assert_close(actual.shifted_exp_sum, expected.shifted_exp_sum)
     torch.testing.assert_close(actual.max_probs, expected.max_probs)
 
 
@@ -409,19 +500,19 @@ def test_packed_vocab_state_merge_matches_legacy_merge_with_tie_break():
         VocabState(
             max_values=torch.tensor([5.0, 7.0, -1.0], dtype=torch.float32),
             argmax_ids=torch.tensor([10, 12, 30]),
-            logsumexp=torch.tensor([5.1, 7.5, 2.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([5.1, 7.5, 2.0], dtype=torch.float32),
             max_probs=torch.empty(3),
         ),
         VocabState(
             max_values=torch.tensor([5.0, 6.0, 0.0], dtype=torch.float32),
             argmax_ids=torch.tensor([8, 9, 25]),
-            logsumexp=torch.tensor([5.2, 6.5, 2.5], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([5.2, 6.5, 2.5], dtype=torch.float32),
             max_probs=torch.empty(3),
         ),
         VocabState(
             max_values=torch.tensor([4.0, 7.0, 1.0], dtype=torch.float32),
             argmax_ids=torch.tensor([6, 11, 40]),
-            logsumexp=torch.tensor([5.3, 7.7, 3.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([5.3, 7.7, 3.0], dtype=torch.float32),
             max_probs=torch.empty(3),
         ),
     ]
@@ -432,7 +523,7 @@ def test_packed_vocab_state_merge_matches_legacy_merge_with_tie_break():
     actual = merge_gathered_packed_vocab_state(gathered)
 
     assert torch.equal(actual.max_values, expected.max_values)
-    assert torch.equal(actual.logsumexp, expected.logsumexp)
+    assert torch.equal(actual.shifted_exp_sum, expected.shifted_exp_sum)
     assert torch.equal(actual.argmax_ids, expected.argmax_ids)
     assert actual.argmax_ids[0].item() == 8
     assert actual.argmax_ids[1].item() == 11
@@ -443,7 +534,7 @@ def test_pack_vocab_state_requires_float32_state_values():
     base = VocabState(
         max_values=torch.tensor([1.0], dtype=torch.float32),
         argmax_ids=torch.tensor([5]),
-        logsumexp=torch.tensor([1.5], dtype=torch.float32),
+        shifted_exp_sum=torch.tensor([1.5], dtype=torch.float32),
         max_probs=torch.tensor([0.6], dtype=torch.float32),
     )
 
@@ -452,17 +543,17 @@ def test_pack_vocab_state_requires_float32_state_values():
             VocabState(
                 max_values=base.max_values.double(),
                 argmax_ids=base.argmax_ids,
-                logsumexp=base.logsumexp,
+                shifted_exp_sum=base.shifted_exp_sum,
                 max_probs=base.max_probs,
             )
         )
 
-    with pytest.raises(ValueError, match="logsumexp"):
+    with pytest.raises(ValueError, match="shifted_exp_sum"):
         pack_vocab_state_for_tp_gather(
             VocabState(
                 max_values=base.max_values,
                 argmax_ids=base.argmax_ids,
-                logsumexp=base.logsumexp.double(),
+                shifted_exp_sum=base.shifted_exp_sum.double(),
                 max_probs=base.max_probs,
             )
         )
@@ -494,19 +585,19 @@ def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
         VocabState(
             max_values=torch.tensor([2.0, 5.0], dtype=torch.float32),
             argmax_ids=torch.tensor([12, 40], dtype=torch.long),
-            logsumexp=torch.tensor([3.0, 6.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([3.0, 6.0], dtype=torch.float32),
             max_probs=torch.empty(2),
         ),
         VocabState(
             max_values=torch.tensor([2.0, 4.0], dtype=torch.float32),
             argmax_ids=torch.tensor([9, 30], dtype=torch.long),
-            logsumexp=torch.tensor([4.0, 7.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([4.0, 7.0], dtype=torch.float32),
             max_probs=torch.empty(2),
         ),
         VocabState(
             max_values=torch.tensor([1.0, 6.0], dtype=torch.float32),
             argmax_ids=torch.tensor([7, 35], dtype=torch.long),
-            logsumexp=torch.tensor([5.0, 8.0], dtype=torch.float32),
+            shifted_exp_sum=torch.tensor([5.0, 8.0], dtype=torch.float32),
             max_probs=torch.empty(2),
         ),
     ]
@@ -533,7 +624,7 @@ def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
 
             values = [state.max_values for state in self.all_states]
             if self.float_call_index == 1:
-                values = [state.logsumexp for state in self.all_states]
+                values = [state.shifted_exp_sum for state in self.all_states]
             output.copy_(torch.cat(values))
             self.float_call_index += 1
 
@@ -558,7 +649,7 @@ def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
 
     torch.testing.assert_close(packed.max_probs, legacy.max_probs)
     assert torch.equal(packed.max_values, legacy.max_values)
-    assert torch.equal(packed.logsumexp, legacy.logsumexp)
+    assert torch.equal(packed.shifted_exp_sum, legacy.shifted_exp_sum)
     assert torch.equal(packed.argmax_ids, legacy.argmax_ids)
 
 
@@ -717,7 +808,9 @@ def test_dllm_vocab_state_logit_scale_matches_full_logits_dtype_order(monkeypatc
 
     torch.testing.assert_close(state.max_values, expected_state.max_values)
     torch.testing.assert_close(state.max_probs, expected_state.max_probs)
-    torch.testing.assert_close(state.logsumexp, expected_state.logsumexp)
+    torch.testing.assert_close(
+        state.shifted_exp_sum, expected_state.shifted_exp_sum
+    )
     assert torch.equal(state.argmax_ids, expected_state.argmax_ids)
 
 
@@ -789,7 +882,7 @@ def test_dllm_vocab_state_softcap_uses_float32_logits(monkeypatch):
     )
 
     assert state.max_values.dtype == torch.float32
-    assert state.logsumexp.dtype == torch.float32
+    assert state.shifted_exp_sum.dtype == torch.float32
     torch.testing.assert_close(state.max_values, expected_state.max_values)
     torch.testing.assert_close(state.max_probs, expected_state.max_probs)
     assert torch.equal(state.argmax_ids, expected_state.argmax_ids)
@@ -811,7 +904,7 @@ def test_consumer_state_trace_emits_full_and_compact_records(tmp_path):
     state = VocabState(
         max_values=torch.empty(2, dtype=torch.float32),
         argmax_ids=torch.empty(2, dtype=torch.int64),
-        logsumexp=torch.empty(2, dtype=torch.float32),
+        shifted_exp_sum=torch.empty(2, dtype=torch.float32),
         max_probs=torch.empty(2, dtype=torch.float32),
     )
 
@@ -983,7 +1076,7 @@ def test_cuda_graph_replay_slice_preserves_compact_vocab_state():
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0, 4.0]),
         argmax_ids=torch.tensor([10, 11, 12, 13]),
-        logsumexp=torch.tensor([1.5, 2.5, 3.5, 4.5]),
+        shifted_exp_sum=torch.tensor([1.5, 2.5, 3.5, 4.5]),
         max_probs=torch.tensor([0.6, 0.7, 0.8, 0.9]),
     )
 
@@ -992,7 +1085,7 @@ def test_cuda_graph_replay_slice_preserves_compact_vocab_state():
     assert sliced is not None
     torch.testing.assert_close(sliced.max_values, torch.tensor([1.0, 2.0]))
     assert torch.equal(sliced.argmax_ids, torch.tensor([10, 11]))
-    torch.testing.assert_close(sliced.logsumexp, torch.tensor([1.5, 2.5]))
+    torch.testing.assert_close(sliced.shifted_exp_sum, torch.tensor([1.5, 2.5]))
     torch.testing.assert_close(sliced.max_probs, torch.tensor([0.6, 0.7]))
 
 
