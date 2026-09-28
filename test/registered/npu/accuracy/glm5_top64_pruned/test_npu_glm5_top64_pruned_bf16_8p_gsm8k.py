@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -46,11 +47,15 @@ OTHER_ARGS = [
 
 
 class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
-    model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
+    model = os.environ.get(
+        "SGLANG_GLM5_TOP64_MODEL_PATH", GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
+    )
+    eval_model_name = "glm-5"
     envs = ENVS
     other_args = OTHER_ARGS
     accuracy = 0.48
     datasets = ["gsm8k"]
+    dataset_dir = os.environ.get("SGLANG_GLM5_GSM8K_DATASET_DIR")
     generation_config = {
         "max_tokens": 2048,
         "temperature": 0.01,

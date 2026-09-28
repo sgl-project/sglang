@@ -331,3 +331,10 @@ inspect other processes, NUMA memory, and Ascend plog for driver-side limits.
 The host-memory availability estimate alone cannot establish which limit was
 hit. For HiCache, repeat on the same runner with a smaller `--hicache-size` to
 separate large-pool pressure from other causes.
+
+To run the GLM-5 top64 pruned GSM8K case outside CI, set
+`SGLANG_GLM5_TOP64_MODEL_PATH` to the local model directory. Its optional
+`SGLANG_GLM5_GSM8K_DATASET_DIR` is an EvalScope dataset cache directory (not
+the path to a single JSONL file). The case requests `--tp-size 16` despite
+`8p` in its filename, so reproducing the CI configuration needs 16 visible
+NPUs.
