@@ -44,6 +44,8 @@ class TestNpuNextnRejectionSampling(GSM8KAscendMixin, CustomTestCase):
         "--disable-cuda-graph",
         "--dtype",
         "bfloat16",
+        "--mamba-ssm-dtype",
+        "bfloat16",
     ]
 
     env = {
