@@ -152,13 +152,12 @@ class MHASubPoolSpec(SubPoolSpec):
             self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
         )
 
-    # Token-major entry: [K_0 | V_0 | K_1 | V_1 | ...] per slot; a page is
-    # page_size such entries back to back.
-
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
     def layout(self) -> DenseEntryLayout:
+        """Token-major entry ``[K_0 | V_0 | K_1 | V_1 | ...]`` per slot; a page
+        is ``page_size`` such entries back to back."""
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
         return DenseEntryLayout(
             entry_bytes=self.entry_bytes(),
@@ -284,7 +283,7 @@ def _assert_kernel_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
     assert n_rows < 2**31, (
         f"sub-pool {sub_pool_name!r}: kernel-facing id space has {n_rows} rows, "
         f"exceeding the int32 bound (2^31) that read-index buffers assume. "
-        "Reduce max_total_num_tokens or the layer count."
+        "Reduce max_total_num_tokens."
     )
 
 

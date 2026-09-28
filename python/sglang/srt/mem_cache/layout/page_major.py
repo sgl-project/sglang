@@ -14,7 +14,8 @@ Every per-layer view is therefore a flat ``(num_pages * page_size, *row_shape)``
 tensor with slot stride ``entry_bytes`` and storage offset
 ``anchor + part offset``, indexed by the PHYSICAL token id
 ``page * page_size + slot``. Parts may differ in row width (K vs V); only their
-offsets differ, never the stride.
+offsets differ, never the stride. The Mamba state
+(``build_page_major_mamba_views``) uses the same per-slot entry at page size 1.
 
 These builders produce views into a raw ``uint8`` buffer; they hold no
 allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
@@ -130,7 +131,10 @@ def build_dense_views(
     ``page * page_size + slot`` (``paged_view`` regroups them by page).
     """
     itemsize = part.dtype.itemsize
-    assert layout.entry_bytes % itemsize == 0 and anchor_bytes % itemsize == 0
+    assert layout.entry_bytes % itemsize == 0 and anchor_bytes % itemsize == 0, (
+        f"build_dense_views: entry {layout.entry_bytes} B and anchor "
+        f"{anchor_bytes} B must be multiples of the {part.dtype} itemsize"
+    )
     n_rows = num_pages * page_size
     end = anchor_bytes + n_rows * layout.entry_bytes
     assert end <= raw.numel() * raw.itemsize, (
@@ -141,8 +145,8 @@ def build_dense_views(
     stride = (layout.entry_bytes // itemsize, *_contiguous_strides(part.row_shape))
     views: List[torch.Tensor] = []
     for layer in range(part.layer_num):
+        # Part offsets and layer strides are ROW_ALIGN_BYTES-aligned (validate()).
         base_bytes = anchor_bytes + part.layer_offset_bytes(layer)
-        assert base_bytes % itemsize == 0
         views.append(
             torch.as_strided(
                 as_dtype_view,

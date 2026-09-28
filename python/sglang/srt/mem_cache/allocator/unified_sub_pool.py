@@ -318,7 +318,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.is_id_owner = is_id_owner
         # Kernel-facing ids are the physical token ids: the token-major views
         # step slots by the whole entry, so there is no per-page block scale.
-        # The kwarg is accepted (and must be 1) until the plumbing is removed.
         assert kernel_page_multiplier in (None, 1), (
             f"kernel_page_multiplier must be 1 (token-major views); got "
             f"{kernel_page_multiplier}"
