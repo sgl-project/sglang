@@ -17,12 +17,33 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    if out is None:
-        return kernel(*args, **kwargs)
+    """Call FA3 kernels across sgl-kernel API revisions.
+
+    Older CUDA 13 sgl-kernel wheels do not expose the ``only_qv`` keyword,
+    although SGLang passes it (as False) through the common FA3 wrapper. Drop
+    that disabled option and retry; never drop it when the NoPE-only-QV path is
+    requested because that would change the computation.
+    """
     try:
+        if out is None:
+            return kernel(*args, **kwargs)
         return kernel(*args, **kwargs, out=out)
     except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
+        message = str(exc)
+        if "unexpected keyword argument 'only_qv'" in message and not kwargs.get(
+            "only_qv", False
+        ):
+            compatible_kwargs = dict(kwargs)
+            compatible_kwargs.pop("only_qv", None)
+            if out is None:
+                return kernel(*args, **compatible_kwargs)
+            try:
+                return kernel(*args, **compatible_kwargs, out=out)
+            except TypeError as retry_exc:
+                if "unexpected keyword argument 'out'" not in str(retry_exc):
+                    raise
+                return kernel(*args, **compatible_kwargs)
+        if "unexpected keyword argument 'out'" not in message:
             raise
         return kernel(*args, **kwargs)
 
