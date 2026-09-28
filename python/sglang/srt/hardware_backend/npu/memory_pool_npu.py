@@ -834,90 +834,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             scale.view(-1, 1),
         )
 
-    def _get_disagg_buffer_view(
-        self,
-        buffer: torch.Tensor,
-        *,
-        page_size: int,
-        uses_global_slots: bool,
-    ) -> torch.Tensor:
-        """Expose the byte stride used by PD without changing kernel views."""
-        if buffer.shape[1] != page_size:
-            raise RuntimeError(
-                "NPU MLA disaggregation buffer page shape is inconsistent: "
-                f"shape={tuple(buffer.shape)}, page_size={page_size}"
-            )
-        transfer_page_size = (
-            page_size * self.dcp_size
-            if uses_global_slots and self.dcp_size > 1
-            else page_size
-        )
-        num_slots = buffer.shape[0] * page_size
-        if num_slots % transfer_page_size:
-            raise RuntimeError(
-                "NPU MLA disaggregation buffer cannot be viewed as integral "
-                f"transfer pages: slots={num_slots}, "
-                f"transfer_page_size={transfer_page_size}"
-            )
-        return buffer.view(
-            num_slots // transfer_page_size,
-            transfer_page_size,
-            *buffer.shape[2:],
-        )
+    def _get_disagg_buffer_entries(self):
+        """Return (buffer, uses_global_slots) entries in PD transfer order."""
+        self._raise_if_native_kv_cache_disabled()
+        global_kv = self.is_draft_worker
+        entries = [(buffer, global_kv) for buffer in self.k_buffer]
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            entries += [(buffer, global_kv) for buffer in self.v_buffer]
+        if self.index_head_dim is not None:
+            entries += [(buffer, True) for buffer in self.index_k_buffer]
+            if self.index_k_scale_buffer is not None:
+                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+        return entries
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        self._raise_if_native_kv_cache_disabled()
-        # DCP target attention K/V is rank-local. The target indexer and every
-        # draft buffer retain allocator-global slots, so their PD page stride
-        # spans dcp_size adjacent physical pages. A transfer-only view exposes
-        # that stride without changing the tensor shape seen by NPU kernels.
-        buffers = list(self.k_buffer)
-        page_sizes = [self.page_size] * len(buffers)
-        uses_global_slots = [self.is_draft_worker] * len(buffers)
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            buffers += list(self.v_buffer)
-            page_sizes += [self.page_size] * self.layer_num
-            uses_global_slots += [self.is_draft_worker] * self.layer_num
-        if self.index_head_dim is not None:
-            buffers += list(self.index_k_buffer)
-            page_sizes += [self.index_page_size] * self.num_indexer_layers
-            uses_global_slots += [True] * self.num_indexer_layers
-            if self.index_k_scale_buffer is not None:
-                buffers += list(self.index_k_scale_buffer)
-                page_sizes += [self.index_page_size] * self.num_indexer_layers
-                uses_global_slots += [True] * self.num_indexer_layers
-
-        transfer_views = [
-            self._get_disagg_buffer_view(
-                buffer,
-                page_size=page_size,
-                uses_global_slots=global_slots,
-            )
-            for buffer, page_size, global_slots in zip(
-                buffers, page_sizes, uses_global_slots
-            )
-        ]
+        entries = self._get_disagg_buffer_entries()
         return (
-            [buffer.data_ptr() for buffer in transfer_views],
-            [buffer.nbytes for buffer in transfer_views],
-            [buffer[0].nbytes for buffer in transfer_views],
+            [buffer.data_ptr() for buffer, _ in entries],
+            [buffer.nbytes for buffer, _ in entries],
+            [
+                buffer[0].nbytes * (self.dcp_size if uses_global_slots else 1)
+                for buffer, uses_global_slots in entries
+            ],
         )
 
     def get_dcp_remote_decode_layout(self) -> list[bool]:
         """Whether each PD entry uses allocator-global slots on decode."""
-        target_global = self.is_draft_worker
-        layout = [target_global] * self.layer_num
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            layout.extend([target_global] * self.layer_num)
-        if self.index_head_dim is not None:
-            layout.extend([True] * self.num_indexer_layers)
-            if self.index_k_scale_buffer is not None:
-                layout.extend([True] * self.num_indexer_layers)
-
-        if len(layout) != len(self.get_contiguous_buf_infos()[0]):
-            raise RuntimeError("NPU MLA DCP layout does not match its transfer buffers")
-        return layout
+        return [
+            uses_global_slots
+            for _, uses_global_slots in self._get_disagg_buffer_entries()
+        ]
 
     def get_kv_layer_ids(self):
         return (

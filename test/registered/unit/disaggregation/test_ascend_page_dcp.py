@@ -97,6 +97,37 @@ class TestAscendPageDcpPlan(CustomTestCase):
 
 
 class TestAscendPageDcpSend(CustomTestCase):
+    def test_same_dcp_uses_advertised_page_strides(self):
+        mgr = object.__new__(AscendKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1_000, 2_000, 3_000],
+            kv_item_lens=[20, 32, 16],
+        )
+        mgr.dcp_size = 4
+        mgr.pp_size = 1
+        mgr.is_hybrid_mla_backend = False
+        mgr.enable_custom_mem_pool = False
+        mgr._validate_envelope_kv_layout = Mock()
+        mgr._transfer_data = Mock(return_value=0)
+
+        result = mgr.send_kvcache(
+            "decode",
+            np.array([1], dtype=np.int32),
+            [10_000, 20_000, 30_000],
+            np.array([2], dtype=np.int32),
+            executor=None,
+        )
+
+        self.assertEqual(result, 0)
+        mgr._transfer_data.assert_called_once_with(
+            "decode",
+            [
+                (1_020, 10_040, 20),
+                (2_032, 20_064, 32),
+                (3_016, 30_032, 16),
+            ],
+        )
+
     def test_sends_local_and_global_entries_without_pack(self):
         mgr = object.__new__(AscendKVManager)
         mgr.kv_args = SimpleNamespace(

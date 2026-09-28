@@ -382,31 +382,38 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         )
         self.assertTrue(torch.equal(got, indices))
 
-    def test_transfer_view_keeps_page_shape_and_strides_global_slots(self):
-        pool = SimpleNamespace(dcp_size=4)
-        raw = torch.empty(4, 8, 1, 2, 3)
-        view = NPUMLATokenToKVPool._get_disagg_buffer_view(
-            pool, raw, page_size=8, uses_global_slots=True
-        )
-        self.assertEqual(view.shape, (1, 32, 1, 2, 3))
-        self.assertEqual(view.numel(), raw.numel())
-        self.assertEqual(view.data_ptr(), raw.data_ptr())
+    def test_pd_buffer_infos_expand_only_global_page_strides(self):
+        pool = object.__new__(NPUMLATokenToKVPool)
+        pool.k_buffer = [torch.empty(4, 8, 1, 2)]
+        pool.v_buffer = [torch.empty(4, 8, 1, 1)]
+        pool.dcp_size = 4
+        pool.is_draft_worker = False
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.index_head_dim = 2
+        pool.page_size = 8
+        pool.index_page_size = 8
+        pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
+        pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
 
-    def test_transfer_view_rank_local_does_not_multiply_page_size(self):
-        pool = SimpleNamespace(dcp_size=4)
-        raw = torch.empty(3, 8, 1, 1, 2)
-        view = NPUMLATokenToKVPool._get_disagg_buffer_view(
-            pool, raw, page_size=8, uses_global_slots=False
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        buffers = (
+            pool.k_buffer
+            + pool.v_buffer
+            + pool.index_k_buffer
+            + pool.index_k_scale_buffer
         )
-        self.assertEqual(view.shape, (3, 8, 1, 1, 2))
 
-    def test_transfer_view_rejects_non_integral_global_pages(self):
-        pool = SimpleNamespace(dcp_size=4)
-        raw = torch.empty(1, 8, 1, 1, 1)
-        with self.assertRaisesRegex(RuntimeError, "integral transfer pages"):
-            NPUMLATokenToKVPool._get_disagg_buffer_view(
-                pool, raw, page_size=8, uses_global_slots=True
-            )
+        self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+        self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
+        self.assertEqual(
+            item_lens,
+            [
+                pool.k_buffer[0][0].nbytes,
+                pool.v_buffer[0][0].nbytes,
+                pool.index_k_buffer[0][0].nbytes * pool.dcp_size,
+                pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
+            ],
+        )
 
     def test_lse_merge_world_size_one_is_identity(self):
         group = _FakeGroup(world_size=1)
