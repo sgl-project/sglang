@@ -6,9 +6,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.constants import (
-    DSV4_COMPRESS_RATIO_NEXTN_LAYER as COMPRESS_RATIO_NEXTN_LAYER,
-)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -43,6 +40,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+COMPRESS_RATIO_NEXTN_LAYER = 0
 
 
 class DeepseekV4ModelNextN(nn.Module):

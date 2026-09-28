@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -29,16 +28,8 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
-from sglang.srt.constants import DSV4_COMPRESS_RATIO_NEXTN_LAYER
-from sglang.srt.disaggregation.decode import (
-    DecodeReqToTokenPool,
-    HybridMambaDecodeReqToTokenPool,
-)
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
-from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -68,7 +59,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
 )
-from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -90,16 +80,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
-from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedPoolBundle,
-    init_unified_mamba_pools,
-    init_unified_mamba_swa_pools,
-    init_unified_swa_pools,
-)
-from sglang.srt.model_executor.pool_configurator import create_memory_pool_configurator
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -114,7 +95,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.server_args import ServerArgs, m3_fp8_attn_gemm_enabled
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -124,41 +105,6 @@ from sglang.srt.utils.common import (
     is_hip,
     is_npu,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-    from sglang.srt.model_executor.model_runner_components.layer_setup import (
-        ModelLayerInfo,
-    )
-    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
-        SpecAuxHiddenStateConfig,
-    )
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-
-
-_is_hip = is_hip()
-_is_npu = is_npu()
-
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.allocator_npu import (
-        NPUPagedTokenToKVPoolAllocator,
-    )
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
-        DSV4NPUTokenToKVPoolAllocator,
-    )
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
-        DSV4NPUTokenToKVPool,
-    )
-    from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
-        DSV4NPUDecodeReqToTokenPool,
-        DSV4NPUReqToTokenPool,
-    )
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-        NPUMHATokenToKVPool,
-        NPUMiniMaxSparseKVPool,
-        NPUMLATokenToKVPool,
-    )
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +120,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     )
 
 
+_is_hip = is_hip()
+
+
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -186,13 +135,17 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     )
 
 
+_is_npu = is_npu()
+
+
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
-
-    return env_gate.is_unified_kv_fp8() and not (
-        is_draft_worker and spec_algorithm.is_dspark()
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
     )
+
+    return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
 
 
 def _should_enable_lazy_compaction() -> bool:
@@ -255,6 +208,22 @@ def _pp_local_per_request_bytes(
         start_layer <= layer_id < end_layer for layer_id in layer_ids
     )
     return total_bytes // len(layer_ids) * local_layer_count
+
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        UnifiedKVPool,
+        UnifiedPoolBundle,
+    )
+    from sglang.srt.model_executor.model_runner_components.layer_setup import (
+        ModelLayerInfo,
+    )
+    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+        SpecAuxHiddenStateConfig,
+    )
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -706,6 +675,7 @@ class KVCacheConfigurator:
         one byte buffer split between the full-attn MHA KV pool and the
         per-request Mamba state pool, with virtual slot ids above the
         allocator."""
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_pools
 
         config = self.mambaish_config
         assert config is not None
@@ -788,6 +758,9 @@ class KVCacheConfigurator:
         """TRI-pool stack for models that are BOTH mambaish and hybrid-SWA
         (Inkling-class): full KV + SWA KV + mamba/conv state in one buffer,
         chain [mamba(up) | swa(float) | full(down)]."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            init_unified_mamba_swa_pools,
+        )
 
         config = self.mambaish_config
         assert config is not None and self.is_hybrid_swa
@@ -895,6 +868,10 @@ class KVCacheConfigurator:
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
         buffer split between the full-attention and SWA KV pools."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedPoolBundle,
+            init_unified_swa_pools,
+        )
 
         assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
@@ -1057,6 +1034,8 @@ class KVCacheConfigurator:
         return mamba_layer_ids
 
     def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
         if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
             return {}
         short_conv_layer_ids = [
@@ -1084,6 +1063,10 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
+        from sglang.srt.disaggregation.decode import (
+            HybridMambaDecodeReqToTokenPool,
+        )
+
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
@@ -1122,12 +1105,14 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        pool_class = (
-            DSV4NPUDecodeReqToTokenPool
-            if _is_npu and is_deepseek_v4(self.model_config.hf_config)
-            else DecodeReqToTokenPool
-        )
-        req_to_token_pool = pool_class(
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUDecodeReqToTokenPool as DecodeReqToTokenPool,
+            )
+        else:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+        req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
@@ -1204,6 +1189,10 @@ class KVCacheConfigurator:
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
         req_to_token_pool_cls = ReqToTokenPool
         if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUReqToTokenPool,
+            )
+
             req_to_token_pool_cls = DSV4NPUReqToTokenPool
 
         req_to_token_pool = req_to_token_pool_cls(
@@ -1472,8 +1461,12 @@ class KVCacheConfigurator:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
+
             compression_ratios = [
-                DSV4_COMPRESS_RATIO_NEXTN_LAYER
+                COMPRESS_RATIO_NEXTN_LAYER
             ] * self.layer_info.num_effective_layers
             kv_source_layers = []
         else:
@@ -1485,6 +1478,10 @@ class KVCacheConfigurator:
         # configurator's C4-SWA/C128-request budgets with a paged allocator
         # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                DSV4NPUTokenToKVPool,
+            )
+
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
         else:
@@ -1604,6 +1601,10 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
+
         kwargs = {}
         if self.is_hybrid_swa_compress:
             kwargs = {
@@ -1643,6 +1644,9 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMiniMaxSparseKVPool,
+        )
 
         token_to_kv_pool = NPUMiniMaxSparseKVPool(
             size=max_total_num_tokens,
@@ -1665,6 +1669,11 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
         is_arch35 = is_npu_arch35()
         use_compact_indexer_layout = (
             is_dsa_model
@@ -1708,6 +1717,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
+
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1727,6 +1740,8 @@ class KVCacheConfigurator:
     def _build_dsa_kv_pool(
         self, *, max_total_num_tokens: int, max_running_requests: int
     ) -> KVCache:
+        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1734,12 +1749,17 @@ class KVCacheConfigurator:
         pool_kwargs = {}
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             pool_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                LayerSplitDSATokenToKVPool,
+            )
+
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
@@ -1913,6 +1933,8 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
         dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
@@ -1922,6 +1944,8 @@ class KVCacheConfigurator:
         enable_hisparse = get_memory().enable_hisparse
         hisparse_kwargs = {}
         if enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
             hisparse_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
@@ -2011,6 +2035,12 @@ class KVCacheConfigurator:
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
+        )
+        from sglang.srt.layers.attention.qsa.config import (
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
@@ -2115,6 +2145,10 @@ class KVCacheConfigurator:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     if is_dsv4_model:
+                        from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+                            DSV4NPUTokenToKVPoolAllocator,
+                        )
+
                         swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
                     else:
                         swa_allocator_cls = SWATokenToKVPoolAllocator
@@ -2128,6 +2162,10 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
+                    from sglang.srt.hardware_backend.npu.allocator_npu import (
+                        NPUPagedTokenToKVPoolAllocator,
+                    )
+
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         sizes.max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2171,6 +2209,10 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
+
                         hisparse_cfg = parse_hisparse_config()
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
@@ -2426,6 +2468,9 @@ class KVCacheConfigurator:
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
@@ -2443,6 +2488,10 @@ class KVCacheConfigurator:
         """Turn a KV byte budget into a pool config via the configurator, re-applying
         the external token constraints (user cap, page alignment, PP sync) and the
         optional ``cap_tokens`` clamp."""
+        # Local import avoids a pool_configurator import cycle.
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
 
         configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(
