@@ -16,10 +16,14 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except (ImportError, OSError):
+    AudioDecoder = None
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
