@@ -19,7 +19,6 @@ for _mod, _fn in [
     ("all_reduce_residual", "all_reduce_pull_res"),
     ("all_reduce_residual", "all_reduce_pull_norm"),
     ("gemm_ag", "gemm_ag_up_proj"),
-    ("gemm_ar", "o_proj_gemm_ar"),
     ("sp_collective", "reduce_scatter_res"),
     ("sp_collective", "reduce_scatter_pull"),
     ("sp_collective", "all_gather"),
