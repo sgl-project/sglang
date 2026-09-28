@@ -372,7 +372,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
@@ -381,7 +381,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> physical id. DCP is rejected for this
         composite at argument validation, so it coincides with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
 

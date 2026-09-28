@@ -273,7 +273,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
 
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
@@ -281,7 +281,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> physical id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
 

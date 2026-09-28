@@ -129,7 +129,7 @@ class KVIndexTranslator:
             # are collapsed by the DCP index kernels, `out_cache_loc` still
             # carries the owner rule in `loc % dcp_size`. Identity with the read
             # translate when dcp_size == 1.
-            self._translate_write_full = alloc.translate_write_loc_for_kernel
+            self._translate_write_full = alloc.translate_write_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1

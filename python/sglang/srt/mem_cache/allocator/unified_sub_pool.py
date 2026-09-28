@@ -1032,7 +1032,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             out_width=out_width,
         )
 
-    def translate_write_loc_for_kernel(
+    def translate_write_loc(
         self,
         widened_loc: torch.Tensor,
         *,
@@ -1047,7 +1047,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
-        with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
+        with record_function("MultiEndedAlloc.translate_write_loc"):
             return self._translate_loc_fused(
                 widened_loc,
                 dcp_size=dcp_size,

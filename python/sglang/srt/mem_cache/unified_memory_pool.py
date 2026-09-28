@@ -296,11 +296,11 @@ def unified_memory_supported_for_model(model_config, *, use_mla_backend: bool) -
     return use_mla_backend or not model_config.has_asymmetric_kv
 
 
-def _assert_kernel_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
-    """Check if kernel-facing ids can flow through int32 read-index buffers."""
+def _assert_physical_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
+    """Physical ids must fit the int32 read-index buffers."""
     assert n_rows < 2**31, (
-        f"sub-pool {sub_pool_name!r}: kernel-facing id space has {n_rows} rows, "
-        f"exceeding the int32 bound (2^31) that read-index buffers assume. "
+        f"sub-pool {sub_pool_name!r}: {n_rows} physical ids exceed the int32 "
+        f"bound (2^31) that read-index buffers assume. "
         "Reduce max_total_num_tokens."
     )
 
@@ -521,7 +521,7 @@ class UnifiedKVPool:
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         num_slots = max_slots // page_size * page_size
-        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
+        _assert_physical_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
         layout = spec.layout()
         k_views, v_views = (
             build_dense_views(
@@ -543,7 +543,7 @@ class UnifiedKVPool:
         page_size: int,
     ) -> List[torch.Tensor]:
         num_slots = max_slots // page_size * page_size
-        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
+        _assert_physical_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
         layout = spec.layout()
         return build_dense_views(
             self._raw,

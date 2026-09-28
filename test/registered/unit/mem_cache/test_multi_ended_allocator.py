@@ -3249,7 +3249,7 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 a = self._build(page_size=2)
                 ids = a.alloc(2 * dcp_size * 3)
-                written = a.translate_write_loc_for_kernel(ids)
+                written = a.translate_write_loc(ids)
                 owned = (ids % dcp_size) == rank
                 # Owned ids agree with the read translate of the collapsed id...
                 self.assertTrue(
