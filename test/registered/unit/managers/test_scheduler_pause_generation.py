@@ -699,5 +699,90 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler._engine_paused)
 
 
+class TestSchedulerPauseMetrics(unittest.TestCase):
+    """The ``sglang:num_paused_reqs`` gauge must report requests held while
+    the engine is paused. The reporter plumbing (field -> SchedulerStats ->
+    gauge) already exists; these tests pin the missing scheduler-side
+    assignment.
+    """
+
+    def setUp(self):
+        from sglang.srt.server_args import ServerArgs
+
+        super().setUp()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _new_scheduler(self) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._engine_paused = False
+        scheduler.enable_overlap = False
+        scheduler.last_batch = None
+        scheduler.cur_batch_for_debug = None
+        scheduler.chunked_req = None
+        scheduler.running_batch = ScheduleBatch(reqs=[])
+        scheduler.running_batch.batch_is_full = False
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.server_args = MagicMock()
+        scheduler.waiting_queue = []
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        # The field exported via SchedulerStats.num_paused_reqs; default 0.
+        scheduler.metrics_reporter.num_paused_reqs = 0
+        scheduler.kv_events_publisher = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+        # pause(retract) evaluates the retract_all(...) kwargs before the call.
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.hisparse_coordinator = None
+        return scheduler
+
+    def _make_req(self, rid: str) -> Req:
+        return Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+
+    def test_retract_pause_records_num_paused_reqs(self):
+        """pause(retract) must account for every paused request."""
+        scheduler = self._new_scheduler()
+        req_a = self._make_req("a")
+        req_b = self._make_req("b")
+        scheduler.running_batch = ScheduleBatch(reqs=[req_a, req_b])
+
+        with patch("sglang.srt.managers.scheduler.retract_all"):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(scheduler.metrics_reporter.num_paused_reqs, 2)
+
+    def test_in_place_pause_records_num_paused_reqs(self):
+        """pause(in_place) keeps running requests but the engine is paused;
+        the gauge must still report them instead of staying at its last
+        value."""
+        scheduler = self._new_scheduler()
+        scheduler.running_batch = ScheduleBatch(
+            reqs=[self._make_req("a"), self._make_req("b")]
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        self.assertEqual(scheduler.metrics_reporter.num_paused_reqs, 2)
+
+    def test_continue_clears_num_paused_reqs(self):
+        """resume must reset the paused gauge so it does not stay non-zero."""
+        scheduler = self._new_scheduler()
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.metrics_reporter.num_paused_reqs = 2
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+
+        self.assertEqual(scheduler.metrics_reporter.num_paused_reqs, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
