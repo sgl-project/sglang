@@ -1527,7 +1527,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # For incremental decoding
-    decoded_texts: List[str]
     decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
