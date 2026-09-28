@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -22,7 +23,22 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["HostMemoryMapping", "SRTPlatform", "PlatformEnum"]
+
+
+@dataclass(frozen=True)
+class HostMemoryMapping:
+    """A device-visible view of a host-memory range.
+
+    ``registered_host_ptr`` is the (possibly page-aligned) address that must be
+    passed back to the runtime. ``owned`` prevents callers from unregistering a
+    mapping that was created by another component, such as torch_npu's pinned
+    allocator.
+    """
+
+    device_ptr: int
+    registered_host_ptr: int
+    owned: bool
 
 
 class SRTPlatform(DeviceMixin):
@@ -143,6 +159,44 @@ class SRTPlatform(DeviceMixin):
         (torch.compile backend).
         """
         return False
+
+    # ------------------------------------------------------------------
+    # Host memory visible to device kernels
+    # ------------------------------------------------------------------
+
+    def register_host_memory(
+        self, host_ptr: int, nbytes: int
+    ) -> Optional[HostMemoryMapping]:
+        """Return a device-visible mapping for the range at ``host_ptr``.
+
+        Some kernels read a table straight out of host memory. On devices with
+        unified addressing (CUDA/ROCm UVA, and the pageable-access devices the
+        ``file`` PLE backend targets) the raw host pointer is already usable, so
+        the default returns ``None`` and callers keep using ``host_ptr``.
+
+        Platforms whose kernels cannot dereference a host address -- an Ascend
+        kernel faults with "The DDR address of the MTE instruction is out of
+        range" -- must override this and map the range, then pass the returned
+        address to the kernel.
+
+        Raises RuntimeError when this platform needs a mapping but cannot make
+        one; callers should surface that instead of falling back to the raw
+        pointer.
+        """
+        return None
+
+    def unregister_host_memory(self, mapping: HostMemoryMapping) -> None:
+        """Release an owned mapping returned by :meth:`register_host_memory`."""
+        pass
+
+    def get_max_kernel_grid_size(self) -> Optional[int]:
+        """Upper bound on a 1-D kernel launch grid, or ``None`` when unbounded.
+
+        Ascend rejects launches whose grid (``coreDim``) exceeds 65535, so
+        kernels that size their grid from the input must clamp it. CUDA has no
+        comparable limit.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Initialization
