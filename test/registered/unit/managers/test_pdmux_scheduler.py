@@ -81,7 +81,14 @@ def _make_chunked_req(*, extend_end, prefix_len):
 
 
 class TestPDMuxScheduler(unittest.TestCase):
-    def test_dp_attn_adapter_uses_active_pdmux_tp_group(self):
+    def test_dp_attn_adapter_resolves_tp_group_at_call_time(self):
+        """The adapter must not capture a TP group at construction.
+
+        PDMux swaps `tp_group` for its duplicate prefill communicator only
+        while the prefill lane runs, so the group has to be read from the
+        parallel context inside the call rather than closed over in the
+        dataclass.
+        """
         tree = ast.parse(DP_ATTN_PATH.read_text(encoding="utf-8"))
         cls = next(
             node
@@ -102,15 +109,19 @@ class TestPDMuxScheduler(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "prepare_mlp_sync_batch_raw"
         )
-        tp_group = next(
-            keyword.value
-            for keyword in prepare_call.keywords
-            if keyword.arg == "tp_group"
-        )
 
-        self.assertIsInstance(tp_group, ast.Call)
-        self.assertIsInstance(tp_group.func, ast.Name)
-        self.assertEqual(tp_group.func.id, "get_tp_group")
+        # No tp_group may be frozen into the dataclass or passed as a
+        # snapshot: the raw helper reads it from `get_parallel()` per call.
+        passed = {keyword.arg for keyword in prepare_call.keywords}
+        self.assertNotIn("tp_group", passed)
+
+        dataclass_fields = {
+            node.target.id
+            for node in cls.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+        }
+        self.assertNotIn("tp_group", dataclass_fields)
 
     def tearDown(self):
         # The prefill lane's TP binding is scoped, so nothing global to clear.
@@ -494,7 +505,7 @@ class TestPDMuxScheduler(unittest.TestCase):
     def test_pdmux_initialization_uses_parallel_state_gpu_id(self):
         config = SimpleNamespace(layer_prefill_chunk_round_robin=False)
         scheduler = SimpleNamespace(
-            ps=SimpleNamespace(gpu_id=3),
+            gpu_id=3,
             pdmux_standard=False,
         )
 
@@ -502,6 +513,10 @@ class TestPDMuxScheduler(unittest.TestCase):
             patch(
                 "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.Stream",
                 return_value=object(),
+            ) as cuda_stream,
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.get_device",
+                return_value=SimpleNamespace(gpu_id=3),
             ),
             patch(
                 "sglang.srt.multiplex.multiplexing_mixin.torch.cuda.stream",
@@ -531,6 +546,8 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         load_pdmux_config.assert_called_once_with("pdmux.yaml")
         initialize_stream_groups.assert_called_once_with(3, config)
+        # The copy stream must be built on the engine's own device, not 0.
+        cuda_stream.assert_any_call(3)
         self.assertEqual(scheduler.real_sm_group_num, 3)
 
     def test_pdmux_prefill_status_is_observable(self):

@@ -28,6 +28,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 NUM_LAYERS = 3
 CONSUMER_INDEX = 7
+TP_SIZE = 1
 
 
 class _LoopFinished(Exception):
@@ -183,6 +184,10 @@ def _stubbed_cuda():
         patch(
             "sglang.srt.multiplex.multiplexing_mixin.get_current_stream_idx",
             lambda: 0,
+        ),
+        patch(
+            "sglang.srt.multiplex.multiplexing_mixin.get_parallel",
+            lambda: SimpleNamespace(tp_size=TP_SIZE),
         ),
     ):
         yield
