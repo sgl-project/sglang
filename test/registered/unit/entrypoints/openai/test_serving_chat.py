@@ -2682,6 +2682,92 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
 
+    def test_streaming_model_output_errors_are_server_errors(self):
+        self.chat.reasoning_parser = "qwen3"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            separate_reasoning=True,
+        )
+
+        async def generate():
+            first = _spec_result(0)
+            first["meta_info"]["finish_reason"] = None
+            yield first
+            yield _spec_result(0)
+
+        for error_type in (ValueError, RuntimeError):
+            with self.subTest(error_type=error_type):
+                self.tm.generate_request.return_value = generate()
+                with patch.object(
+                    self.chat,
+                    "_process_reasoning_stream",
+                    side_effect=[("", "partial"), error_type("Malformed model output")],
+                ):
+                    chunks = self._run_chat_stream(Mock(), req)
+
+                parsed = self._parse_chunks(chunks)
+                errors = [chunk["error"] for chunk in parsed if "error" in chunk]
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["code"], 500)
+                self.assertEqual(errors[0]["type"], "InternalServerError")
+                self.assertEqual(errors[0]["message"], "Malformed model output")
+                self.assertEqual(parsed[1]["choices"][0]["delta"]["content"], "partial")
+                self.assertFalse(
+                    any(
+                        choice.get("finish_reason") is not None
+                        for chunk in parsed
+                        for choice in chunk.get("choices", [])
+                    )
+                )
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                self.assertEqual(chunks.count("data: [DONE]\n\n"), 1)
+
+    def test_streaming_model_output_cancellation_propagates(self):
+        self.chat.reasoning_parser = "qwen3"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            separate_reasoning=True,
+        )
+
+        with patch.object(
+            self.chat, "_process_reasoning_stream", side_effect=asyncio.CancelledError
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                self._run_chat_stream(Mock(), req)
+
+    def test_streaming_generation_value_errors_keep_client_error_behavior(self):
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi"}], stream=True
+        )
+
+        for started in (False, True):
+            with self.subTest(started=started):
+
+                async def generate():
+                    if started:
+                        first = _spec_result(0)
+                        first["meta_info"]["finish_reason"] = None
+                        yield first
+                    raise ValueError("Invalid generation request")
+
+                self.tm.generate_request.return_value = generate()
+                if not started:
+                    with self.assertRaisesRegex(
+                        ValueError, "Invalid generation request"
+                    ):
+                        self._run_chat_stream(Mock(), req)
+                else:
+                    chunks = self._run_chat_stream(Mock(), req)
+                    error = self._parse_chunks(chunks)[-1]["error"]
+                    self.assertEqual(error["code"], 400)
+                    self.assertEqual(error["type"], "BadRequestError")
+                    self.assertEqual(error["message"], "Invalid generation request")
+                    self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"

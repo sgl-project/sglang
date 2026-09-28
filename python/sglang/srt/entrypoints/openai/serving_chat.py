@@ -2053,22 +2053,31 @@ class OpenAIServingChat(OpenAIServingBase):
                     stream_started = True
 
                 # Generate streaming content (override in subclass for custom behavior)
-                async for chunk in self._generate_stream_content(
-                    content=content,
-                    index=index,
-                    request=request,
-                    stream_offsets=stream_offsets,
-                    reasoning_parser_dict=reasoning_parser_dict,
-                    parser_dict=parser_dict,
-                    has_tool_calls=has_tool_calls,
-                    choice_logprobs=choice_logprobs,
-                    finish_reason_type=finish_reason_type,
-                    continuous_usage_stats=continuous_usage_stats,
-                    prompt_tokens=prompt_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    completion_tokens=completion_tokens,
-                ):
-                    yield chunk
+                try:
+                    async for chunk in self._generate_stream_content(
+                        content=content,
+                        index=index,
+                        request=request,
+                        stream_offsets=stream_offsets,
+                        reasoning_parser_dict=reasoning_parser_dict,
+                        parser_dict=parser_dict,
+                        has_tool_calls=has_tool_calls,
+                        choice_logprobs=choice_logprobs,
+                        finish_reason_type=finish_reason_type,
+                        continuous_usage_stats=continuous_usage_stats,
+                        prompt_tokens=prompt_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        completion_tokens=completion_tokens,
+                    ):
+                        yield chunk
+                except Exception as e:
+                    logger.exception("Failed to process streaming model output")
+                    error = self.create_streaming_error_response(
+                        str(e), err_type="InternalServerError", status_code=500
+                    )
+                    yield f"data: {error}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
