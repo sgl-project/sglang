@@ -49,10 +49,15 @@ def paged_kv_view(
 ) -> torch.Tensor:
     """An MHA pool buffer as ``[num_pages, page_size, head_num, head_dim]``.
     A slot-major buffer has its rows shaped and its pages split from its own
-    strides; an HND buffer is already page-split and keeps its plain ``view``."""
+    strides; an HND buffer (``[num_pages, head_num, page_size, head_dim]``) is
+    already page-split and only has its head and token dims swapped."""
     if buf.dim() <= 3:
         return paged_view(buf.view(buf.shape[0], head_num, head_dim), page_size)
-    return buf.view(-1, page_size, head_num, head_dim)
+    assert tuple(buf.shape[1:]) == (head_num, page_size, head_dim), (
+        f"expected an HND buffer [pages, {head_num}, {page_size}, {head_dim}], "
+        f"got {tuple(buf.shape)}"
+    )
+    return buf.permute(0, 2, 1, 3)
 
 
 def paged_row_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:

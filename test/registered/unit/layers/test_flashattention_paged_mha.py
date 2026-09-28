@@ -131,9 +131,9 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertEqual(value_cache.shape, (4, 2, 2, 16))
         self.assertTrue(torch.equal(key_cache[1, 0], k[2]))
 
-    def test_get_paged_mha_kv_cache_keeps_the_hnd_pool_view(self):
+    def test_get_paged_mha_kv_cache_reads_the_hnd_pool_by_head_and_token(self):
         # An HND pool hands over [num_pages, heads, page_size, head_dim]
-        # buffers; they reach the kernel through their plain view.
+        # buffers; the paged cache must index them as [page, token, head].
         backend = _backend()
         backend.page_size = 4
         k = torch.arange(3 * 2 * 4 * 16, dtype=torch.float16).view(3, 2, 4, 16)
@@ -141,10 +141,14 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
 
         key_cache, _ = backend.get_paged_mha_kv_cache(_layer())
 
-        want = k.view(-1, 4, 2, 16)
-        self.assertEqual(key_cache.shape, want.shape)
-        self.assertEqual(key_cache.stride(), want.stride())
-        self.assertEqual(key_cache.data_ptr(), want.data_ptr())
+        self.assertEqual(key_cache.shape, (3, 4, 2, 16))
+        self.assertEqual(key_cache.data_ptr(), k.data_ptr())
+        for page in range(3):
+            for head in range(2):
+                for token in range(4):
+                    self.assertTrue(
+                        torch.equal(key_cache[page, token, head], k[page, head, token])
+                    )
 
     def test_prepare_paged_mha_query_reuses_fa_scaling_policy(self):
         backend = _backend()

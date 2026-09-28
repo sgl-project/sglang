@@ -10,7 +10,8 @@ re-derives the size-1 page dimension's stride from the row at
 entry apart, wider than one row) that stride is then wrong.
 
 An HND pool hands over page-major ``[pages, heads, page_size, head_dim]``
-buffers instead; those keep their plain view.
+buffers instead, which are already the kernel layout: they must reach the
+kernel as themselves, head for head and token for token.
 
 CPU-only.
 
@@ -71,21 +72,22 @@ class TestTRTLLMHAPagedKV(unittest.TestCase):
                                 )
                             )
 
-    def test_reshape_keeps_the_hnd_pool_view(self):
+    def test_reshape_hands_the_hnd_pool_buffer_through(self):
         H, D, pages, page_size = 4, 32, 3, 16
         backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
         backend.page_size = page_size
         layer = SimpleNamespace(tp_k_head_num=H, tp_v_head_num=H)
+        # Distinct values, so equal values mean equal (page, head, token).
         k = torch.arange(pages * H * page_size * D, dtype=torch.float32).view(
             pages, H, page_size, D
         )
-        v = k + 1
+        v = k + 0.5
         outs = backend._reshape_paged_kv_cache(k, v, layer, D)
         for buf, out in zip((k, v), outs):
-            want = buf.view(-1, page_size, H, D).permute(0, 2, 1, 3)
-            self.assertEqual(out.shape, want.shape)
-            self.assertEqual(out.stride(), want.stride())
-            self.assertEqual(out.data_ptr(), want.data_ptr())
+            self.assertEqual(out.shape, buf.shape)
+            self.assertEqual(out.stride(), buf.stride())
+            self.assertEqual(out.data_ptr(), buf.data_ptr())
+            self.assertTrue(torch.equal(out, buf))
 
 
 if __name__ == "__main__":

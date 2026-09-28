@@ -30,7 +30,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import paged_row_view, paged_view
+from sglang.srt.mem_cache.layout.page_major import (
+    paged_kv_view,
+    paged_row_view,
+    paged_view,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -66,6 +70,27 @@ class TestPagedView(unittest.TestCase):
     def test_rejects_partial_pages(self):
         with self.assertRaises(AssertionError):
             paged_view(torch.zeros(10, 2, 16), 4)
+
+
+class TestPagedKVView(unittest.TestCase):
+    def test_hnd_buffer_is_indexed_by_page_token_head(self):
+        pages, H, ps, D = 3, 4, 16, 8
+        hnd = torch.arange(pages * H * ps * D, dtype=torch.float32).view(
+            pages, H, ps, D
+        )
+        out = paged_kv_view(hnd, ps, H, D)
+        self.assertEqual(tuple(out.shape), (pages, ps, H, D))
+        self.assertEqual(out.data_ptr(), hnd.data_ptr())
+        # HND element (page, head, token, dim) sits at this flat offset.
+        for p in range(pages):
+            for t in range(ps):
+                for h in range(H):
+                    want = ((p * H + h) * ps + t) * D
+                    self.assertEqual(int(out[p, t, h, 0]), want)
+
+    def test_hnd_buffer_of_another_geometry_is_refused(self):
+        with self.assertRaises(AssertionError):
+            paged_kv_view(torch.zeros(3, 16, 4, 8), 16, 4, 8)
 
 
 if __name__ == "__main__":
