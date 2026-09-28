@@ -891,7 +891,7 @@ def build_engram_projection(
     """Shard replicated-token WKV columns, gathering outputs before the Engram gate."""
     block = getattr(quant_config, "weight_block_size", None)
     if (
-        tp_size not in (4, 8)
+        tp_size <= 1
         or dp_attention
         or cp_size != 1
         or prefill_cp

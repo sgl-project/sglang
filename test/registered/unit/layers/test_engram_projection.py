@@ -29,7 +29,7 @@ class TestEngramProjection(CustomTestCase):
 
     def test_sharded_weight_loader_reconstructs_original(self):
         full = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
-        for tp_size in (4, 8):
+        for tp_size in (2, 4, 8, 16):
             with self.subTest(tp_size=tp_size):
                 pieces = []
                 for rank in range(tp_size):
@@ -48,8 +48,6 @@ class TestEngramProjection(CustomTestCase):
             dict(prefill_cp=True),
             dict(sequence_parallel=True),
             dict(tp_size=1),
-            dict(tp_size=2),
-            dict(tp_size=16),
         ]:
             with self.subTest(change=change):
                 layer = self.build(**change)
@@ -64,8 +62,8 @@ class TestEngramProjection(CustomTestCase):
     def test_quantization_block_alignment_selects_projection(self):
         # Check layer selection independently of a GPU quantization backend.
         quant_config = SimpleNamespace(weight_block_size=[32, 32])
-        for tp_size in (4, 8):
-            for output_size in (256, 264):
+        for tp_size in (2, 4, 8, 16):
+            for output_size in (32 * tp_size, 33 * tp_size):
                 with self.subTest(tp_size=tp_size, output_size=output_size):
                     with (
                         patch(
@@ -82,7 +80,7 @@ class TestEngramProjection(CustomTestCase):
                         )
                         selected, unused = (
                             (sharded, replicated)
-                            if output_size == 256
+                            if output_size == 32 * tp_size
                             else (replicated, sharded)
                         )
                         selected.assert_called_once()
