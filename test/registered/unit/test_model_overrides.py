@@ -49,6 +49,100 @@ class _FakeArgs:
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
+class TestBoundaryParallelismResolution(CustomTestCase):
+    def config(self, **options):
+        return SimpleNamespace(
+            **dict(
+                dict(
+                    model_path="dummy",
+                    attn_cp_size=1,
+                    enable_prefill_cp=False,
+                    enable_attn_tp_input_scattered=False,
+                    moe_dp_size=1,
+                    cp_strategy=None,
+                    tp_size=4,
+                    dp_size=1,
+                    enable_aiter_allreduce_fusion=False,
+                ),
+                **options,
+            )
+        )
+
+    def test_input_scattered_is_resolved_only_for_forwards_without_the_scope(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        for model_type in (
+            "nemotron_h",
+            "nemotron_h_puzzle",
+            "longcat_flash",
+            "deepseek_v3",
+        ):
+            with self.subTest(model_type=model_type):
+                cfg = self.config(enable_attn_tp_input_scattered=True)
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy"),
+                ):
+                    handle_context_parallelism(cfg)
+                self.assertTrue(cfg.enable_attn_tp_input_scattered)
+                self.assertEqual(
+                    resolving_view(cfg).enable_attn_tp_input_scattered,
+                    model_type == "deepseek_v3",
+                )
+
+    def test_context_parallel_model_support(self):
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        cases = (
+            ("nemotron_h", 2, False, "Nemotron-H.*--attn-cp-size"),
+            ("nemotron_h_puzzle", 2, True, "Nemotron-H.*--attn-cp-size"),
+            ("longcat_flash", 2, True, "LongCat-Flash.*--enable-prefill-cp"),
+            ("nemotron_h", 1, False, None),
+            ("longcat_flash", 1, True, None),
+            ("longcat_flash", 2, False, None),
+            ("deepseek_v3", 2, True, None),
+        )
+        for model_type, cp_size, prefill, error in cases:
+            with self.subTest(model_type=model_type, cp_size=cp_size, prefill=prefill):
+                cfg = self.config(
+                    attn_cp_size=cp_size,
+                    enable_prefill_cp=prefill,
+                    cp_strategy="interleave" if prefill else None,
+                )
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy") as init_cp,
+                ):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_context_parallelism(cfg)
+                        init_cp.assert_not_called()
+                    else:
+                        handle_context_parallelism(cfg)
+                        init_cp.assert_called_once_with(
+                            enable_prefill_cp=prefill,
+                            cp_size=cp_size,
+                            cp_strategy=cfg.cp_strategy,
+                        )
+
+
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(
@@ -78,6 +172,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "moe_runner_backend",
                     "quantization",
                     "enable_dp_attention",
+                    "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",

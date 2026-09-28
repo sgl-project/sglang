@@ -478,7 +478,7 @@ class Step3TextModel(nn.Module):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch)
 
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)

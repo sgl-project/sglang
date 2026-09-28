@@ -1,6 +1,3 @@
-from sglang.srt.layers.communicator import StageKind
-from sglang.test.boundary_fixtures import stub_plan, stub_stage
-
 """Aux owns retained storage, including captures from reusable gather buffers."""
 
 import unittest
@@ -10,8 +7,10 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList, AuxHiddenStatePacker
+from sglang.srt.layers.communicator import StageKind
 from sglang.srt.layers.communicator.residual.access import norm_output
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,7 +118,7 @@ class TestAuxStorage(CustomTestCase):
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    stage._prepare_attention(value, stream, None, **kwargs)
+                    prepare_attention(stage, value, stream, None, **kwargs)
                 value.zero_()
                 torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))
 
@@ -130,7 +129,7 @@ class TestAuxStorage(CustomTestCase):
         move = Mock(return_value=gathered)
         stage = self.boundary(stream, move=move)
         outputs = AuxHiddenStateList()
-        stage._prepare_attention(source, stream, None, outputs)
+        prepare_attention(stage, source, stream, None, outputs)
         gathered.zero_()
         source.zero_()
         torch.testing.assert_close(outputs[0], torch.full((4, 3), 7.0))
@@ -171,10 +170,130 @@ class TestAuxStorage(CustomTestCase):
         with patch.object(
             torch.Tensor, "clone", side_effect=AssertionError("extra clone")
         ):
-            stage._prepare_attention(
-                hidden, stream, None, capture_output=outputs.capture
+            prepare_attention(
+                stage, hidden, stream, None, capture_output=outputs.capture
             )
         torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))
+
+
+class TestBoundCaptureOwnership(CustomTestCase):
+    def exercise(self, *, enabled, backend_accepts=True, custom=False, callback=False):
+        import test_declared_decoder_boundary as fixture
+
+        from sglang.srt.layers import layernorm
+        from sglang.srt.layers.communicator import (
+            ADD,
+            FusedMlpInput,
+            SumGroup,
+            declare_attn,
+            declare_ffn,
+            make_stages,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.test.communicator_patch import patch_communicator
+
+        parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
+        norm = layernorm.RMSNorm(4)
+
+        def inplace_norm(value, residual, unused=None):
+            residual.add_(value)
+            return residual * 2, residual
+
+        norm.forward = inplace_norm
+
+        def fused_kernel(*, input_tensor, residual, **kwargs):
+            if not backend_accepts:
+                return None, None
+            updated = residual + input_tensor * 2
+            return updated * 2, updated
+
+        def custom_fused(value, residual, batch):
+            return inplace_norm(value * 2, residual)
+
+        custom_fusions = (
+            SimpleNamespace(
+                ffn_input=lambda plan: (
+                    FusedMlpInput(completes=SumGroup.ATTN_TP, run=custom_fused),
+                ),
+                attention_input=lambda plan: (),
+            )
+            if custom
+            else None
+        )
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            residual_stream=ResidualStream(torch.full((2, 4), 2.0)),
+        )
+        hidden = fb.residual_stream.leave(torch.full((2, 4), 3.0), ADD)
+        outputs = AuxHiddenStateList()
+        with (
+            fixture.planning(parallel),
+            patch_communicator("_use_aiter", False),
+            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False),
+            patch_communicator(
+                "apply_flashinfer_allreduce_fusion", return_value=enabled
+            ),
+            patch_communicator(
+                "attention_tensor_model_parallel_all_reduce",
+                side_effect=lambda x: x * 2,
+            ),
+            patch.object(layernorm, "_use_aiter", False),
+            patch.object(layernorm, "get_parallel", return_value=parallel),
+            patch(
+                "sglang.srt.distributed.attention_tensor_model_parallel_all_reduce",
+                side_effect=lambda x: x * 2,
+            ),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.flashinfer_allreduce_residual_rmsnorm",
+                side_effect=fused_kernel,
+            ),
+        ):
+            attn, ffn = make_stages(
+                (declare_attn(), fixture.Norm()),
+                (declare_ffn(), norm, {"fusions": custom_fusions}),
+                previous=declare_ffn(),
+            )
+            predicate = attn.entry(fb).capture_preserves_residual
+            self.assertEqual(
+                predicate is not None and predicate(hidden, fb), enabled and not custom
+            )
+            kwargs = (
+                {"capture_output": outputs.capture}
+                if callback
+                else {"captured_last_layer_outputs": outputs}
+            )
+            if enabled and not custom:
+                # Only capture is forbidden from cloning. The real FlashInfer
+                # wrapper's declined-kernel fallback may copy to preserve residual.
+                with patch.object(
+                    torch.Tensor, "clone", side_effect=AssertionError("extra aux clone")
+                ):
+                    attn.prepare(hidden, fb, **kwargs)
+                self.assertIs(outputs[0], fb.residual_stream.residual)
+            else:
+                attn.prepare(hidden, fb, **kwargs)
+                self.assertIsNot(outputs[0], fb.residual_stream.residual)
+            hidden = attn.finish(torch.ones(2, 4), fb)
+            result = ffn.prepare(hidden, fb)
+            torch.testing.assert_close(result, torch.full((2, 4), 14.0))
+            torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
+            torch.testing.assert_close(
+                fb.residual_stream.residual, torch.full((2, 4), 7.0)
+            )
+
+    def test_selected_flashinfer_wrapper_preserves_capture_including_fallback(self):
+        for accepts in (False, True):
+            for callback in (False, True):
+                with self.subTest(accepts=accepts, callback=callback):
+                    self.exercise(
+                        enabled=True, backend_accepts=accepts, callback=callback
+                    )
+
+    def test_in_place_or_custom_read_keeps_capture_owned_by_aux(self):
+        for custom in (False, True):
+            for callback in (False, True):
+                with self.subTest(custom=custom, callback=callback):
+                    self.exercise(enabled=custom, custom=custom, callback=callback)
 
 
 if __name__ == "__main__":

@@ -19,23 +19,26 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.communicator.boundary import FusedMlpInput
+from sglang.srt.layers.communicator.contracts import FusedMlpInput
 from sglang.srt.layers.communicator.layout import SumGroup
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual.add_norm import (
+    NORM_QUANT_READ,
+    Fp8Input,
+    NormQuantRead,
     apply_aiter_all_reduce_fusion,
     apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import post_experts_reduction_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
-def attention_fusions(plan) -> Tuple[Callable, ...]:
+def attention_fusions(plan, read=NORM_QUANT_READ) -> Tuple[Callable, ...]:
     """The fused kernels that complete what the previous layer left together
     with the residual update and the input norm, in the order they are tried.
     Each takes (owed, residual, forward_batch, post_residual_addition) and
@@ -45,12 +48,23 @@ def attention_fusions(plan) -> Tuple[Callable, ...]:
     given = plan.fusions.attention_input(plan) if plan.fusions else ()
     if not hasattr(plan.norm, "forward_with_allreduce_fusion"):
         return given
-    plan._attn_input_fuses_quant = (
-        plan.enable_fused_ar_quant
+    fuses_quant = (
+        isinstance(read, NormQuantRead)
+        and read.fp8_input is not None
         and _use_aiter
+        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false")
+        and get_exec().comm.enable_aiter_allreduce_fusion
         and hasattr(plan.norm, "forward_with_allreduce_fusion_quant_per_group")
     )
-    return (*given, partial(complete_attention_input, plan))
+    return (
+        *given,
+        partial(
+            complete_attention_input,
+            plan,
+            fuses_quant=fuses_quant,
+            keep_bf16=fuses_quant and read.fp8_input is Fp8Input.TUPLE_AND_BF16,
+        ),
+    )
 
 
 def complete_attention_input(
@@ -59,11 +73,14 @@ def complete_attention_input(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     post_residual_addition: Optional[torch.Tensor],
+    *,
+    fuses_quant: bool,
+    keep_bf16: bool,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Complete the sum the previous layer left, add it to the residual and
     apply the input norm in one aiter or flashinfer kernel; None when the
-    kernel does not take this batch. The result is not quantized for
-    ``quant_format``."""
+    kernel does not take this batch. The optional FP8 result follows the consumer read declaration;
+    the separate ``quant_format`` path remains the read adapter's responsibility."""
     if (
         not isinstance(owed, UnreducedOutput)
         # The kernel does not add it.
@@ -78,14 +95,14 @@ def complete_attention_input(
         or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
     ):
         return None
-    if plan._attn_input_fuses_quant:
+    if fuses_quant:
         # Falls back to AR+RMSNorm + separate quant internally when the
         # fully-fused kernel cannot service the shape.
         quant_result = plan.norm.forward_with_allreduce_fusion_quant_per_group(
             hidden_states,
             residual,
             use_attn_tp_group=False,
-            keep_bf16=plan.fused_ar_quant_keep_bf16,
+            keep_bf16=keep_bf16,
         )
         if quant_result is not None:
             return quant_result

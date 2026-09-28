@@ -448,16 +448,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
         self.first_ffn, self.second_attn, self.second_ffn = make_stages(
             (
-                declare_ffn(ordinary_only=True),
+                declare_ffn(),
                 self.post_attention_layernorm[0],
             ),
             (
-                declare_attn(ordinary_only=True),
+                declare_attn(),
                 self.input_layernorm[1],
                 {"qkv_latent_func": self.self_attn[1].prepare_qkv_latent},
             ),
             (
-                declare_ffn(ordinary_only=True),
+                declare_ffn(),
                 self.post_attention_layernorm[1],
             ),
             prepared_from=self.moe_stage.declaration,

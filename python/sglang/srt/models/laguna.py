@@ -607,7 +607,7 @@ class LagunaModel(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = residual_batch.norm(

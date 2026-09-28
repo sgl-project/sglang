@@ -29,6 +29,8 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+# Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -52,12 +54,13 @@ from sglang.srt.layers.communicator import (
 
 # Layers - Attention
 from sglang.srt.layers.communicator.residual import batch as residual_batch
+
+# Layers - Others
+from sglang.srt.layers.communicator.residual.add_norm import Fp8Input, NormQuantRead
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
-
-# Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
@@ -257,32 +260,6 @@ if _is_npu:
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
-
-
-@lru_cache(maxsize=1)
-def _enable_qwen35_fused_ar_quant() -> bool:
-    """Gate the fused AR+RMSNorm+per-group-FP8-quant path for Qwen3.5.
-
-    The single-kernel backend is ROCm/aiter/gfx95-only. The model gate stays
-    tied to ROCm/aiter so non-gfx95 HIP can keep the existing 2-kernel fallback
-    behavior for tuple handoff when this branch is used. It replaces the
-    existing ``--enable-aiter-allreduce-fusion`` 3-kernel path
-    (AR → RMSNorm → per-group quant) with either a single fused kernel (when
-    the fully-fused variant is eligible) or a 2-kernel path
-    (fused AR+RMSNorm + separate per-group quant) that still saves one
-    kernel launch vs. baseline. The stage boundary gracefully falls back
-    to ``forward_with_allreduce_fusion`` (plain AR+RMSNorm) when the fused
-    quant helper returns ``None``, so turning this on never regresses the
-    AR+RMSNorm fusion itself.
-
-    Opt-out: set ``SGLANG_DISABLE_FUSED_AR_QUANT=1`` to fall back to the
-    unmodified AR+RMSNorm fusion path.
-    """
-    if not _use_aiter:
-        return False
-    if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false"):
-        return False
-    return bool(get_exec().comm.enable_aiter_allreduce_fusion)
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -1115,18 +1092,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
         # it. Otherwise, stay on the plain AR+RMSNorm path.
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        )
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         boundary_fusions = _layer_fusions(config, is_nextn)
         self.attn_stage, self.ffn_stage = make_stages(
             (
-                declare_attn(),
+                declare_attn(
+                    read=NormQuantRead(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    )
+                ),
                 self.input_layernorm,
                 {
-                    "enable_fused_ar_quant": enable_fused_ar_quant,
-                    "fused_ar_quant_keep_bf16": enable_fused_ar_quant,
                     "fusions": boundary_fusions,
                 },
             ),
@@ -1322,17 +1298,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
-        )
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
         self.attn_stage, self.ffn_stage = make_stages(
             (
-                declare_attn(),
+                declare_attn(
+                    read=NormQuantRead(
+                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    )
+                ),
                 self.input_layernorm,
                 {
-                    "enable_fused_ar_quant": enable_fused_ar_quant,
-                    "fused_ar_quant_keep_bf16": False,
                     "fusions": boundary_fusions,
                 },
             ),
@@ -1752,6 +1728,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 # Every layer was checked above.
                 can_defer_finalize=lambda layer: True,
                 label="Qwen3.5",
+                # The final GemmaRMSNorm consumes a finalize handoff.
                 terminal_finalize=True,
             )
 

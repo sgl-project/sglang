@@ -53,6 +53,8 @@ class StageRead(Protocol):
     # and the residual is left as it is: what a fused add + norm kernel computes,
     # and what may run on the rows a sum completes onto.
     norms_plainly: bool
+    # Preserve the read on the source rows before a DP gather.
+    before_gather: bool
 
     def enter(self, hidden_states) -> torch.Tensor:
         """The residual the layer stack starts from, given its input."""

@@ -9,7 +9,9 @@ from torch import nn
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import StageKind
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.contracts import BatchVariant
+from sglang.srt.layers.communicator.ops import identity_output
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
@@ -23,7 +25,12 @@ from sglang.srt.models.llama4 import Llama4Model
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.qwen3_vl import Qwen3LLMModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
-from sglang.test.boundary_fixtures import stub_plan, stub_stage
+from sglang.test.boundary_fixtures import (
+    finish_exit,
+    identity_input,
+    stub_plan,
+    stub_stage,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,8 +46,10 @@ MODELS = (
     GptOssModel,
     LagunaModel,
     Qwen3MoeLLMModel,
+    Qwen3Model,
+    Qwen3LLMModel,
+    Llama4Model,
 )
-CAPTURE_MODELS = (*MODELS, Llama4Model, Qwen3Model, Qwen3LLMModel)
 
 
 def all_reduce(hidden_states):
@@ -59,8 +68,8 @@ class DeferringLayer(nn.Module):
         self.layer_communicator = stub_plan()
         self.layer_communicator.norm = None
         self.attn_stage = stub_stage(self.layer_communicator, StageKind.ATTENTION)
-        self.layer_communicator._steps = comm.BoundarySteps(
-            attention=comm.StageEntry(
+        self.layer_communicator._paths[BatchVariant.ORDINARY] = comm.StageSteps(
+            entry=comm.StageEntry(
                 prepare=partial(
                     comm_ops._consumer_step,
                     step=partial(
@@ -73,34 +82,23 @@ class DeferringLayer(nn.Module):
                     carried_fusions=(),
                 ),
                 input_rows=comm.Layout(frozenset()),
-                input_move=comm.CommunicateSimpleFn._trivial,
+                input_move=identity_input,
                 handoff=comm_ops._hand_qkv_hook_its_input,
             ),
-            ffn=comm.StageEntry(
-                prepare=partial(
-                    comm_ops._read_input,
-                    layer_input=None,
-                    enters_stack=False,
-                    read=comm.NORM_READ,
-                    update=comm.ADD,
-                ),
-                input_rows=comm.Layout(frozenset()),
-            ),
-            ffn_output=comm.StageOutput(
+            output=comm.StageOutput(
                 comm.Layout(frozenset()),
                 group=comm.SumGroup.TP,
                 leaves_for_next_layer=True,
             ),
-            ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
-            ffn_sum_is_movable=True,
+            output_move=identity_output,
         )
         self.layer_communicator.output._ffn_sum_moves_to_next_layer = (
-            lambda batch, **_: defer
+            lambda batch, steps, **_: defer
         )
-        self.layer_communicator.is_last_layer = False
-        self.layer_communicator._sp_steps = None
-        self.layer_communicator._input_scattered_steps = None
-        self.layer_communicator._cp_steps = None
+        self.layer_communicator.terminal = False
+        self.layer_communicator._paths[BatchVariant.SEQUENCE_PARALLEL] = None
+        self.layer_communicator._paths[BatchVariant.INPUT_SCATTERED] = None
+        self.layer_communicator._paths[BatchVariant.CONTEXT_PARALLEL] = None
         self.layer_communicator.output.ffn_reduction_group = lambda forward_batch: GROUP
         self.layer_communicator.output._ffn_leaves_sum_to_reduce_scatter = (
             lambda batch, dp_step: False
@@ -118,7 +116,7 @@ class DeferringLayer(nn.Module):
         *args,
         **kwargs,
     ):
-        stream = forward_batch.residual_stream
+        stream = forward_batch.residual_stream if self.stage_api else None
         if stream is not None:
             residual = stream
         if isinstance(residual, ResidualStream):
@@ -132,12 +130,14 @@ class DeferringLayer(nn.Module):
         capture = kwargs.get("capture_output")
         if capture is not None:
             capture(residual.clone())
-        with self.layer_communicator.output.ffn_exit(forward_batch) as ffn_exit:
+        with self.layer_communicator.output.ffn_exit(
+            forward_batch, stream=ResidualStream()
+        ) as ffn_exit:
             partial = torch.full_like(hidden_states, 0.5)
         if stream is not None:
             stream.write(residual)
             residual = stream
-        hidden_states, residual = ffn_exit.finish(partial, residual)
+        hidden_states, residual = finish_exit(ffn_exit, partial, residual)
         if self.stage_api:
             return (hidden_states, None) if self.return_topk else hidden_states
         if self.return_topk:
@@ -164,7 +164,7 @@ def build_model(model_cls, *, defer, capture):
     model.use_hf_deepstack_order = False
     model.dflash_capture = capture
     model.enable_a2a_moe = False
-    model.config = SimpleNamespace(mhc=False)
+    model.config = SimpleNamespace(mhc=False, num_hidden_layers=NUM_LAYERS)
     if model_cls is BailingMoELinearModel:
         # Bailing-v3 captures after the layer; other models use boundary indices
         model.layers_to_capture = [0, 1, 2] if capture else []
@@ -177,13 +177,13 @@ def build_model(model_cls, *, defer, capture):
                 BailingMoEModel,
                 BailingMoELinearModel,
                 GptOssModel,
-                Llama4Model,
-                Qwen3Model,
-                Qwen3LLMModel,
                 Glm4MoeModel,
                 Glm4MoeLiteModel,
                 LagunaModel,
                 Qwen3MoeLLMModel,
+                Qwen3Model,
+                Qwen3LLMModel,
+                Llama4Model,
                 Glm5NextModel,
             ),
         )
@@ -223,7 +223,7 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
         )
-        for model_cls in CAPTURE_MODELS:
+        for model_cls in MODELS:
             for defer in (False, True):
                 for capture in (False, True):
                     with (
@@ -316,6 +316,28 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                 torch.testing.assert_close(snapshots[0], inputs + NUM_LAYERS)
                 torch.testing.assert_close(result, inputs + NUM_LAYERS)
 
+    def test_llama4_split_prefill_preserves_the_stream_between_segments(self):
+        from sglang.srt.models.llama4 import Llama4ForCausalLM, Llama4Model
+
+        model = build_model(Llama4Model, defer=True, capture=False)
+        lm = SimpleNamespace(
+            model=model,
+            lm_head=None,
+            logits_processor=lambda ids, hidden, head, fb: hidden,
+        )
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        inputs = torch.ones(2, 4)
+        result = Llama4ForCausalLM.forward_split_prefill(
+            lm, None, None, fb, (0, 2), inputs.clone()
+        )
+        self.assertIsNone(result)
+        self.assertIsNotNone(fb.residual_stream)
+        result = Llama4ForCausalLM.forward_split_prefill(
+            lm, None, None, fb, (2, NUM_LAYERS)
+        )
+        torch.testing.assert_close(result, inputs + NUM_LAYERS)
+        self.assertIsNone(fb.residual_stream)
+
 
 class TestPipelineResidualReception(CustomTestCase):
     def test_models_keep_the_received_residual_contribution(self):
@@ -327,6 +349,8 @@ class TestPipelineResidualReception(CustomTestCase):
             capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
         )
         for model_cls in MODELS:
+            if model_cls is Llama4Model:
+                continue  # Llama4 has no pipeline model entry.
             with self.subTest(model=model_cls.__name__):
                 model = build_model(model_cls, defer=True, capture=False)
                 model.pp_group.is_first_rank = False
@@ -370,14 +394,20 @@ class TestPipelineResidualReception(CustomTestCase):
         comm_instance = stub_plan()
         comm_instance.norm = None
         comm_instance._batch_steps = lambda batch: SimpleNamespace(
-            attention=SimpleNamespace(input_sum=None)
+            entry=SimpleNamespace(input_sum=None)
         )
         batch = SimpleNamespace(residual_stream=None)
-        comm_instance.residual_in_hidden = True
         streams = torch.randn(2, 4, 3)
-        hidden = stub_stage(comm_instance, StageKind.ATTENTION).from_pp(
-            PPProxyTensors({"hidden_states": streams}), batch
+        from dataclasses import replace
+
+        from sglang.srt.layers.communicator import declare_ffn
+
+        stage = stub_stage(comm_instance, StageKind.ATTENTION)
+        stage.declaration = replace(
+            stage.declaration,
+            previous=declare_ffn(update=SimpleNamespace(at_producer=True)),
         )
+        hidden = stage.from_pp(PPProxyTensors({"hidden_states": streams}), batch)
         residual = batch.residual_stream
         self.assertIs(hidden, streams)
         self.assertIsNone(residual.pending)
@@ -387,7 +417,7 @@ class TestPipelineResidualReception(CustomTestCase):
         comm_instance = stub_plan()
         comm_instance.norm = None
         comm_instance._batch_steps = lambda batch: SimpleNamespace(
-            attention=SimpleNamespace(input_sum=None)
+            entry=SimpleNamespace(input_sum=None)
         )
         batch = SimpleNamespace(residual_stream=None)
         partial = torch.randn(2, 4)

@@ -7,17 +7,16 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.communicator import (
-    BoundarySteps,
     EdgeDecl,
     Layout,
     StageEntry,
     StageInput,
     StageOutput,
+    StageSteps,
     SumGroup,
     make_boundary,
 )
-from sglang.srt.layers.communicator.boundary import StageKind
-from sglang.srt.layers.communicator.construction import StageCommunicator
+from sglang.srt.layers.communicator.contracts import BatchVariant, StageKind
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual.access import add_to_output
 from sglang.srt.layers.communicator.residual.add_norm import ADD
@@ -26,7 +25,9 @@ from sglang.srt.layers.communicator.residual.stream import (
     OwedOutput,
     ResidualStream,
 )
-from sglang.test.boundary_fixtures import stub_plan, stub_stage
+from sglang.srt.layers.communicator.stage import StageCommunicator
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,13 +62,10 @@ class TestResidualStream(CustomTestCase):
             EdgeDecl(StageOutput(rows), StageInput(rows, read=read), rows, rows),
             enters_stack=True,
         )
-        steps = BoundarySteps(
-            StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
-        )
+        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
         stage = StageCommunicator(
             SimpleNamespace(norm=None),
-            StageKind.ATTENTION,
-            None,
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
         )
         value = torch.ones(2, 4)
         hidden, stream = stage._prepare(value, ResidualStream(), None, steps)
@@ -107,13 +105,10 @@ class TestResidualStream(CustomTestCase):
                 rows,
             )
         )
-        steps = BoundarySteps(
-            StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
-        )
+        steps = StageSteps(StageEntry(boundary.prepare, rows), StageOutput(rows), None)
         stage = StageCommunicator(
             SimpleNamespace(norm=None),
-            StageKind.ATTENTION,
-            None,
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
         )
         for increment in (2, 7):
             with self.subTest(increment=increment):
@@ -211,6 +206,17 @@ class TestResidualStream(CustomTestCase):
                 update=ADD,
             )
 
+    def test_snapshot_rejects_stateful_update_without_touching_main_state(self):
+        update = SimpleNamespace(adds_plainly=False, update=Mock())
+        stream = ResidualStream(self.residual)
+        hidden = stream.leave(UnreducedOutput(self.partial, group=self.group), update)
+        with self.assertRaisesRegex(NotImplementedError, "plain residual update"):
+            stream.snapshot(hidden)
+        self.group.all_reduce.assert_not_called()
+        update.update.assert_not_called()
+        self.assertIs(stream.pending.update, update)
+        self.assertIsNotNone(stream.pending.owed)
+
     def test_snapshot_finishes_a_copy_without_consuming_main_work(self):
         snapshot = self.stream.snapshot(self.hidden)
         torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
@@ -263,8 +269,12 @@ class TestResidualStream(CustomTestCase):
             capture_move_allocates=False,
             capture_preserves_residual=None,
         )
-        output, stream = stub_stage(boundary, StageKind.ATTENTION)._prepare_attention(
-            self.hidden, self.stream, None, capture_output=capture
+        output, stream = prepare_attention(
+            stub_stage(boundary, StageKind.ATTENTION),
+            self.hidden,
+            self.stream,
+            None,
+            capture_output=capture,
         )
         self.assertEqual(events, ["add_norm", "capture"])
         self.group.all_reduce.assert_called_once()
@@ -295,7 +305,8 @@ class TestResidualStream(CustomTestCase):
             capture_move_allocates=False,
             capture_preserves_residual=None,
         )
-        output, _ = stub_stage(boundary, StageKind.ATTENTION)._prepare_attention(
+        output, _ = prepare_attention(
+            stub_stage(boundary, StageKind.ATTENTION),
             self.hidden,
             self.stream,
             None,
@@ -431,12 +442,14 @@ class TestBatchStageOwnership(CustomTestCase):
         )
         owner = stub_plan()
         owner.norm = None
-        owner._steps = BoundarySteps(
-            None, StageEntry(boundary.prepare, rows), StageOutput(rows), None, False
+        owner._paths[BatchVariant.ORDINARY] = StageSteps(
+            StageEntry(boundary.prepare, rows), StageOutput(rows), None
         )
-        owner._sp_steps = owner._input_scattered_steps = owner._cp_steps = None
+        owner._paths[BatchVariant.SEQUENCE_PARALLEL] = owner._paths[
+            BatchVariant.INPUT_SCATTERED
+        ] = owner._paths[BatchVariant.CONTEXT_PARALLEL] = None
         stage = stub_stage(owner, StageKind.FFN)
-        a, b = SimpleNamespace(), SimpleNamespace()
+        a, b = [SimpleNamespace(forward_mode=ForwardMode.DECODE) for _ in range(2)]
         batch.start(a)
         batch.start(b)
         first = stage.prepare(torch.ones(2, 4), a)

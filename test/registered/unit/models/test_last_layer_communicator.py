@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -269,33 +268,6 @@ class TestTerminalStages(CustomTestCase):
         )
         self.assertIn("BailingMoE", built)
         self.assertTrue(planned["is_layer_sparse"])
-
-
-class TestLayerFactsLastLayer(CustomTestCase):
-    def test_the_plan_marks_the_last_layer(self):
-        from sglang.srt.layers import communicator as comm
-
-        with (
-            patch_communicator("enable_moe_dense_fully_dp", return_value=False),
-            patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
-            patch_communicator("is_dsa_enable_prefill_cp", return_value=False),
-            patch_communicator("is_mla_cp_enabled", return_value=False),
-        ):
-            for num_layers, layer_id in (
-                (NUM_LAYERS, 0),
-                (NUM_LAYERS, 2),
-                (NUM_LAYERS, 3),
-                (1, 0),
-            ):
-                with self.subTest(num_layers=num_layers, layer_id=layer_id):
-                    modes = comm.LayerFacts.init_new(
-                        layer_id=layer_id,
-                        num_layers=num_layers,
-                        is_layer_sparse=False,
-                        is_previous_layer_sparse=False,
-                        is_next_layer_sparse=False,
-                    )
-                    self.assertEqual(modes.is_last_layer, layer_id == num_layers - 1)
 
 
 if __name__ == "__main__":

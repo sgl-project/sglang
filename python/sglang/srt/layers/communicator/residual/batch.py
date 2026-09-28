@@ -19,9 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 def start(forward_batch):
-    stream = ResidualStream()
-    forward_batch.residual_stream = stream
-    return stream
+    forward_batch.residual_stream = ResidualStream()
 
 
 def current(forward_batch):
@@ -31,7 +29,8 @@ def current(forward_batch):
     return stream
 
 
-def finish(hidden_states, forward_batch):
+def complete_output(hidden_states, forward_batch):
+    """Complete the contribution while retaining its pending residual update."""
     return current(forward_batch).complete(hidden_states)
 
 

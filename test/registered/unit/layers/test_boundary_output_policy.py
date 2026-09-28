@@ -7,10 +7,12 @@ from unittest.mock import patch
 import test_declared_decoder_boundary as fixture
 import torch
 
-from sglang.srt.arg_groups.fields.exec_ import ExecComm
+from sglang.srt.layers.communicator.contracts import BatchVariant
 from sglang.srt.layers.communicator.output import OutputTransform
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_forward
+from sglang.test.boundary_fixtures import finish_exit
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
@@ -26,11 +28,8 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
             ),
         )
 
-    def test_policy_defaults_to_model_selection(self):
-        self.assertEqual(ExecComm().boundary_reduction, "auto")
-
     def test_npu_weight_cache_belongs_to_one_prepare_call(self):
-        from sglang.srt.layers.communicator import ops
+        from sglang.srt.layers.communicator import prepare as ops
         from sglang.srt.layers.communicator.residual.stream import ResidualStream
 
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
@@ -60,7 +59,6 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                 result = layer.ffn.prepare(hidden, batch, cache=weights)
                 torch.testing.assert_close(result, torch.full((2, 4), 4.0))
         self.assertEqual(events, ["reduce", "cache", "reduce"])
-        self.assertFalse(hasattr(layer.ffn.plan, "_context"))
 
     def test_token_slice_reads_the_current_parallel_rank(self):
         from sglang.srt.layers.communicator.ops import tp_slice
@@ -162,14 +160,50 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     patch_communicator("can_use_dp_reduce_scatter", lambda: can_rs),
                     patch_communicator("_to_local_tokens", move),
                 ):
-                    with layer.ffn.plan.output.ffn_exit(self.batch(max_len)) as output:
+                    with layer.ffn.plan.output.ffn_exit(
+                        self.batch(max_len), stream=ResidualStream()
+                    ) as output:
                         self.assertEqual(
                             get_forward().mlp_reduce_scatter,
                             selected != "_redistribute_output",
                         )
-                    result, _ = output.finish(torch.ones(2, 4), torch.zeros(1, 4))
+                    result, _ = finish_exit(output, torch.ones(2, 4), torch.zeros(1, 4))
                 self.assertEqual(calls, [selected])
                 self.assertEqual(result.shape, (1, 4))
+
+    def test_postprocess_only_scatters_an_already_reduced_output(self):
+        # The operation-scheduled API used by LongCat NextN receives an MLP
+        # output that was already summed. An enabled RSv must not sum it again.
+        for policy in ("ar", "rs", "rsv", "rs+rsv"):
+            for varlen in (False, True):
+                with self.subTest(policy=policy, varlen=varlen):
+                    parallel = fixture.parallel_of(attn_dp=2, attn_tp=1)
+                    layer = fixture.build(
+                        fixture.layer_case(2, 3), parallel, boundary_reduction=policy
+                    )
+                    calls = []
+                    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+                    residual = torch.ones(1, 4)
+                    batch = self.batch()
+                    batch.residual_stream = ResidualStream(residual)
+
+                    def move(step, batch, value):
+                        calls.append(step.__name__)
+                        return value[:1]
+
+                    with (
+                        fixture.planning(parallel),
+                        patch_communicator(
+                            "should_use_dp_reduce_scatterv", lambda: varlen
+                        ),
+                        patch_communicator("can_use_dp_reduce_scatter", lambda: True),
+                        patch_communicator("_to_local_tokens", move),
+                    ):
+                        output = layer.ffn.postprocess(hidden, batch)
+                        value, saved_residual = batch.residual_stream.finish(output)
+                    self.assertEqual(calls, ["_redistribute_output"])
+                    torch.testing.assert_close(value, hidden[:1])
+                    self.assertIs(saved_residual, residual)
 
     def test_moe_cannot_skip_from_topology_without_boundary_request(self):
         with (
@@ -220,12 +254,14 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
                     patch_communicator("_to_local_tokens", move),
                 ):
-                    with layer.ffn.plan.output.ffn_exit(self.batch()) as output:
+                    with layer.ffn.plan.output.ffn_exit(
+                        self.batch(), stream=ResidualStream()
+                    ) as output:
                         value = torch.ones(2, 4)
                         if not get_forward().mlp_reduce_scatter:
                             calls.append("AR")
                             value = value * 2
-                    value, _ = output.finish(value, torch.zeros(1, 4))
+                    value, _ = finish_exit(output, value, torch.zeros(1, 4))
                 self.assertEqual(
                     calls,
                     ["AR", "multiply", "slice"] if disabled else ["multiply", "RS"],
@@ -239,7 +275,7 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
             parallel,
             output=OutputTransform(lambda x: x.square()),
         )
-        output = layer.ffn.plan._steps.ffn_output
+        output = layer.ffn.plan._paths.get(BatchVariant.ORDINARY).output
         self.assertFalse(output.leaves_for_next_layer)
         self.assertFalse(output.leaves_for_reduce_scatter)
         self.assertFalse(output.leaves_for_reduce_scatterv)

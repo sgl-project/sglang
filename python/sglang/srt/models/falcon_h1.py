@@ -226,7 +226,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
-                    output=OutputTransform(
+                    output_transform=OutputTransform(
                         self.feed_forward.scale_output, before_reduce_scatter=True
                     ),
                     sparse=self.is_layer_sparse,
@@ -439,7 +439,7 @@ class FalconH1Model(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = residual_batch.norm(

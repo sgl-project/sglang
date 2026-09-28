@@ -14,21 +14,24 @@
 """Bind one stage to predeclared boundaries and reusable batch paths."""
 
 from dataclasses import dataclass
-from enum import Enum, auto
 from functools import cached_property
-from typing import Callable, Optional, Protocol, Tuple
+from typing import Callable, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.communicator.boundary import (
-    BoundarySteps,
-    EdgeDecl,
-    FusedMlpInput,
-    StageDecl,
-    StageEntry,
-    StageKind,
+    _cp_moves,
     make_boundary,
     make_output_boundary,
+)
+from sglang.srt.layers.communicator.contracts import (
+    BatchVariant,
+    CpMoves,
+    EdgeDecl,
+    ProducerReduction,
+    StageEntry,
+    StageKind,
+    StageSteps,
 )
 from sglang.srt.layers.communicator.exit import OutputBoundary
 from sglang.srt.layers.communicator.fusions.allreduce import (
@@ -42,11 +45,14 @@ from sglang.srt.layers.communicator.layout import (
     _generic_prefill_cp_shards_tokens,
     enable_moe_dense_fully_dp,
 )
+from sglang.srt.layers.communicator.prepare import (
+    _hand_qkv_hook_its_input,
+    _hand_scattered_input_to_attention,
+)
 from sglang.srt.layers.communicator.stage import StageCommunicator
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_forward,
     get_lora,
@@ -56,24 +62,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-
-
-class BoundaryFusions(Protocol):
-    """The fused kernels a fusion backend gives a layer, bound to it and tried
-    before the layer's own: at its attention input (each takes what the previous
-    layer left, the residual, the batch and a post-residual addition), at its
-    FFN input, and at its FFN exit (each says what the exit does when its kernel
-    takes the batch)."""
-
-    def attention_input(self, layer: "StagePlan") -> Tuple[Callable, ...]: ...
-
-    def ffn_input(self, layer: "StagePlan") -> Tuple["FusedMlpInput", ...]: ...
-
-    requires_local_reduction: bool
-
-    def can_defer_finalize(
-        self, layer: "StagePlan", forward_batch: ForwardBatch
-    ) -> bool: ...
 
 
 def _refuse_uncovered_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
@@ -118,13 +106,6 @@ def _input_can_be_scattered() -> bool:
     )
 
 
-class BatchVariant(Enum):
-    ORDINARY = auto()
-    CONTEXT_PARALLEL = auto()
-    INPUT_SCATTERED = auto()
-    SEQUENCE_PARALLEL = auto()
-
-
 @dataclass(frozen=True)
 class StageEdges:
     """One stage's incoming and outgoing declarations for one batch variant.
@@ -136,7 +117,7 @@ class StageEdges:
     incoming: EdgeDecl
     outgoing: EdgeDecl
     handoff: Optional[Callable] = None
-    cp_moves: object = None
+    cp_moves: Optional[CpMoves] = None
 
 
 def _requires_branch_input(*args, **kwargs):
@@ -155,26 +136,16 @@ class StagePlan:
         enters_stack=False,
         prepared_input=False,
         terminal=False,
-        fixed_output=False,
-        is_sparse=False,
+        direct_handoff=False,
         qkv_latent_func=None,
-        force_layernorm_before_dp_gather=False,
-        enable_fused_ar_quant=False,
-        fused_ar_quant_keep_bf16=False,
-        residual_in_hidden=False,
         fusions=None,
     ):
-        self.kind = kind
         self.norm = norm
         self.variants = dict(variants)
-        self.is_first_layer = enters_stack
-        self.is_last_layer = terminal
-        self.fixed_output = fixed_output
-        self.is_sparse = is_sparse
+        self.enters_stack = enters_stack
+        self.terminal = terminal
+        self.direct_handoff = direct_handoff
         self.qkv_latent_func = qkv_latent_func
-        self.enable_fused_ar_quant = enable_fused_ar_quant
-        self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
-        self.residual_in_hidden = residual_in_hidden
         self.fusions = fusions
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -183,8 +154,13 @@ class StagePlan:
             get_lora().enable_lora
         )
         self._fusion_rows = None
-        carried = attention_fusions(self) if kind is StageKind.ATTENTION else ()
-        self._carried_fusions = carried
+        carried = (
+            attention_fusions(
+                self, next(iter(self.variants.values())).incoming.need.read
+            )
+            if kind is StageKind.ATTENTION
+            else ()
+        )
         fused = ffn_fusions(self) if kind is StageKind.FFN else ()
         self._paths = {}
         for variant, edges in self.variants.items():
@@ -200,7 +176,6 @@ class StagePlan:
                     edges.incoming,
                     fusions=fused,
                     carried_fusions=carried,
-                    force_layernorm_before_gather=force_layernorm_before_dp_gather,
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                 )
@@ -209,7 +184,6 @@ class StagePlan:
                     input_rows=into.input_rows,
                     input_move=into.input_move,
                     handoff=edges.handoff,
-                    fused=into.fused,
                     capture_move=into.capture_move,
                     capture_move_allocates=into.capture_move_allocates,
                     preserves_residual=into.preserves_residual,
@@ -219,55 +193,54 @@ class StagePlan:
                 )
             out = (
                 None
-                if fixed_output
+                if direct_handoff
                 else make_output_boundary(edges.outgoing, cp_moves=edges.cp_moves)
             )
-            self._paths[variant] = BoundarySteps(
-                attention=entry if kind is StageKind.ATTENTION else None,
-                ffn=entry if kind is StageKind.FFN else None,
-                ffn_output=edges.outgoing.produced,
-                ffn_output_move=None if out is None else out.output_move,
-                ffn_output_move_completes_sum=False
+            self._paths[variant] = StageSteps(
+                entry=entry,
+                output=edges.outgoing.produced,
+                output_move=None if out is None else out.output_move,
+                returns_over_dp=out is not None and out.returns_over_dp,
+                output_move_completes_sum=False
                 if out is None
                 else out.output_move_completes_sum,
-                ffn_sum_is_movable=edges.outgoing.produced.group is not None,
             )
-        self._steps = self._paths[BatchVariant.ORDINARY]
-        self._cp_steps = self._paths.get(BatchVariant.CONTEXT_PARALLEL)
-        self._input_scattered_steps = self._paths.get(BatchVariant.INPUT_SCATTERED)
-        self._sp_steps = self._paths.get(BatchVariant.SEQUENCE_PARALLEL)
 
     @property
-    def input_rows(self):
+    def incoming_residual_rows(self):
         return self.variants[BatchVariant.ORDINARY].incoming.residual
 
     @property
     def input_on_attention_tp_slices(self):
-        return TokenAxis.ATTN_TP_SCATTER in self.input_rows.sharded
+        return TokenAxis.ATTN_TP_SCATTER in self.incoming_residual_rows.sharded
 
     def _variant(self, forward_batch):
-        if self._sp_steps is not None and get_forward().sp_active:
+        # The batch determines its rows; missing paths must not change them.
+        if get_forward().sp_active:
             return BatchVariant.SEQUENCE_PARALLEL
-        if (
-            self._input_scattered_steps is not None
-            and get_attn_tp_context().input_scattered
-        ):
+        if get_attn_tp_context().input_scattered:
             return BatchVariant.INPUT_SCATTERED
-        if self._cp_steps is not None and _batch_shards_over_cp(forward_batch):
+        if _batch_shards_over_cp(forward_batch):
             return BatchVariant.CONTEXT_PARALLEL
         return BatchVariant.ORDINARY
 
     def _batch_steps(self, forward_batch):
-        return self._paths[self._variant(forward_batch)]
+        variant = self._variant(forward_batch)
+        try:
+            return self._paths[variant]
+        except KeyError:
+            raise NotImplementedError(
+                f"no stage boundary path for the active {variant.name} batch"
+            ) from None
 
     def fusion_rows(self, forward_batch):
         if self._fusion_rows is not None:
             return self._fusion_rows[self._variant(forward_batch)]
         entry = self._batch_steps(forward_batch)
-        return (entry.attention or entry.ffn).input_rows
+        return entry.entry.input_rows
 
-    def produced(self, kind, forward_batch):
-        return self._batch_steps(forward_batch).ffn_output
+    def produced(self, forward_batch):
+        return self._batch_steps(forward_batch).output
 
     @cached_property
     def output(self):
@@ -284,24 +257,47 @@ class StagePlan:
         )
 
 
-def make_stage(
-    declaration: StageDecl,
-    *,
-    kind: StageKind,
-    norm,
-    incoming: EdgeDecl,
-    outgoing: EdgeDecl,
-    variants=None,
-    handoff=None,
-    **options,
-) -> StageCommunicator:
-    """Build one real stage from its own declaration and adjacent edges.
+def _bind_stage(declaration, norm, incoming, outgoing, **options):
+    if incoming.consumer != declaration or outgoing.producer != declaration:
+        raise ValueError("connections do not match the stage declaration")
+    if incoming.entries.keys() != outgoing.exits.keys():
+        raise ValueError("incoming and outgoing batch variants disagree")
+    variants = {}
+    for variant, edge in incoming.entries.items():
+        if (
+            declaration.update.at_producer
+            and TokenAxis.ATTN_CP
+            in edge.produced.layout.sharded - edge.need.layout.sharded
+        ):
+            raise NotImplementedError("MHC with a gather over attention CP")
+        handoff = None
+        if declaration.kind is StageKind.ATTENTION:
+            handoff = (
+                _hand_scattered_input_to_attention
+                if variant is BatchVariant.INPUT_SCATTERED
+                and not declaration.update.adds_plainly
+                else _hand_qkv_hook_its_input
+            )
+        moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
+        variants[variant] = StageEdges(edge, outgoing.exits[variant], handoff, moves)
+    plan = StagePlan(
+        declaration.kind,
+        norm,
+        variants,
+        enters_stack=incoming.producer is None,
+        prepared_input=declaration.prepared_from is not None,
+        terminal=declaration.terminal,
+        direct_handoff=declaration.kind is StageKind.ATTENTION
+        and declaration.reduction is ProducerReduction.PARTIAL,
+        **options,
+    )
+    if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None:
+        # Layout eligibility comes from the connected consumer, not a mutable
+        # link to its execution plan. Kernel binding remains consumer-owned.
+        from sglang.srt.layers.communicator.boundary import input_rows
 
-    The optional variants supply the same stage's CP/SP/input-scattered
-    declarations. Neither a paired stage nor its layer facts/norm is needed.
-    """
-    if incoming.need != declaration.input or outgoing.produced != declaration.output:
-        raise ValueError("stage declaration disagrees with its boundaries")
-    paths = dict(variants or {})
-    paths[BatchVariant.ORDINARY] = StageEdges(incoming, outgoing, handoff)
-    return StageCommunicator(StagePlan(kind, norm, paths, **options), kind, norm)
+        plan._fusion_rows = {
+            v: input_rows(edge) for v, edge in outgoing.entries.items()
+        }
+
+    return StageCommunicator(plan, declaration=declaration)

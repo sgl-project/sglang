@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple
 
 import msgspec
 import torch
@@ -51,10 +51,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
-    get_moe_a2a_backend,
-    post_experts_reduction_group,
     post_experts_sum_is_one_all_reduce,
     should_use_dp_reduce_scatterv,
+)
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    post_experts_reduction_group,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -95,32 +97,31 @@ class OutputBoundary:
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        stream: ResidualStream,
         forward_batch: ForwardBatch,
     ):
         """Move a complete output from the operation-scheduled producer path."""
-        stream = residual if isinstance(residual, ResidualStream) else None
+        steps = self.plan._batch_steps(forward_batch)
         hidden_states, residual = self._complete_ffn_output_now(
             hidden_states,
-            stream.residual if stream is not None else residual,
+            stream.residual,
             forward_batch=forward_batch,
             dp_step=None,
+            steps=steps,
         )
         return self._leave_ffn_output(
             hidden_states,
             residual,
             stream,
-            self.plan._batch_steps(forward_batch).ffn_output.update,
+            steps.output.update,
         )
 
     @staticmethod
     def _leave_ffn_output(hidden_states, residual, stream, update, declared_sum=None):
-        if stream is None:
-            return hidden_states, residual
         stream.residual = residual
         if update.at_producer:
-            return stream.write(hidden_states), stream
-        return stream.leave(hidden_states, update, declared_sum=declared_sum), stream
+            return stream.write(hidden_states)
+        return stream.leave(hidden_states, update, declared_sum=declared_sum)
 
     @staticmethod
     def _declared_ffn_sum(steps, skipped_reduction):
@@ -129,74 +130,69 @@ class OutputBoundary:
         if (
             skipped_reduction
             and not steps.returns_over_dp
-            and not steps.ffn_output_move_completes_sum
+            and not steps.output_move_completes_sum
         ):
             return SumGroup.TP
         return None
 
-    def _local_token_move_can_go_to_next_layer(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
+    def _local_token_move_can_go_to_next_layer(self, steps) -> bool:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter, when
         the next layer's input also writes the output into the residual."""
-        steps = self.plan._batch_steps(forward_batch)
-        return steps.returns_over_dp and not steps.ffn_output.update.at_producer
+        return steps.returns_over_dp and not steps.output.update.at_producer
 
     def _postprocess_dp_step(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, steps
     ) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
         """The reduce-scatter that brings this layer's FFN output back to this
         rank's tokens under attention DP; None when the base postprocess would
         only scatter, or does not move tokens."""
-        steps = self.plan._batch_steps(forward_batch)
         if not steps.returns_over_dp:
             return None
         return _reduce_and_redistribute_output_step(
             forward_batch,
-            leaves_for_reduce_scatter=steps.ffn_output.leaves_for_reduce_scatter,
-            leaves_for_reduce_scatterv=steps.ffn_output.leaves_for_reduce_scatterv,
+            leaves_for_reduce_scatter=steps.output.leaves_for_reduce_scatter,
+            leaves_for_reduce_scatterv=steps.output.leaves_for_reduce_scatterv,
         )
 
     def _ffn_leaves_sum_to_reduce_scatter(
-        self, forward_batch: ForwardBatch, dp_step: Optional[Callable]
+        self, steps, dp_step: Optional[Callable]
     ) -> bool:
         """Whether the FFN leaves its sum out because a reduce-scatter completes
         it: the attention-DP one ``dp_step`` names, or the CP / input-scattered
         one."""
-        steps = self.plan._batch_steps(forward_batch)
         if dp_step is not None:
             return True
-        if not steps.ffn_output.leaves_for_reduce_scatter:
+        if not steps.output.leaves_for_reduce_scatter:
             return False
-        if steps.ffn_output_move_completes_sum:
+        if steps.output_move_completes_sum:
             return True
-        return get_attn_tp_context().input_scattered and not self.plan.is_last_layer
+        return get_attn_tp_context().input_scattered and not self.plan.terminal
 
-    def ffn_reduction_group(self, forward_batch: ForwardBatch) -> GroupCoordinator:
+    def ffn_reduction_group(self, steps) -> GroupCoordinator:
         """The group this layer's FFN output owes its sum over: the MoE output's
         group on a sparse layer, the TP group a dense MLP reduces over."""
-        return _sum_group(self.plan._batch_steps(forward_batch).ffn_output.group)
+        return _sum_group(steps.output.group)
 
-    def _select_ffn_completion(self, forward_batch: ForwardBatch) -> FfnCompletion:
+    def _select_ffn_completion(
+        self, forward_batch: ForwardBatch, steps
+    ) -> FfnCompletion:
         """Decide once, before the FFN runs, what it skips and what completes its
         output: the next layer's input, or this layer's postprocess step."""
-        dp_step = self._postprocess_dp_step(forward_batch)
-        mlp_reduce_scatter = self._ffn_leaves_sum_to_reduce_scatter(
-            forward_batch, dp_step
-        )
+        dp_step = self._postprocess_dp_step(forward_batch, steps)
+        mlp_reduce_scatter = self._ffn_leaves_sum_to_reduce_scatter(steps, dp_step)
         complete_now = partial(
             self._complete_ffn_output_now,
             forward_batch=forward_batch,
             dp_step=dp_step,
+            steps=steps,
         )
-        steps = self.plan._batch_steps(forward_batch)
         defer_moe_finalize = (
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
-        if not steps.ffn_output.leaves_for_next_layer and not (
-            self.plan.is_last_layer and defer_moe_finalize
+        if not steps.output.leaves_for_next_layer and not (
+            self.plan.terminal and defer_moe_finalize
         ):
             return FfnCompletion(
                 defer_moe_finalize=False,
@@ -207,10 +203,10 @@ class OutputBoundary:
         # Producers declare remaining work independently of the kernel chosen
         # by the consumer. Every handoff also carries an unfused completion.
         fuse_mlp_allreduce = defer_moe_finalize or self._ffn_sum_moves_to_next_layer(
-            forward_batch, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
+            forward_batch, steps, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
         )
         if fuse_mlp_allreduce:
-            group = self.ffn_reduction_group(forward_batch)
+            group = self.ffn_reduction_group(steps)
             if steps.returns_over_dp:
                 # Under attention DP the next layer also brings the sum back to
                 # this rank's tokens.
@@ -225,8 +221,8 @@ class OutputBoundary:
             complete = partial(_leave_to_next_layer, wrap)
         elif (
             dp_step is not None
-            and not self.plan.is_last_layer
-            and self._local_token_move_can_go_to_next_layer(forward_batch)
+            and not self.plan.terminal
+            and self._local_token_move_can_go_to_next_layer(steps)
         ):
             complete = partial(
                 _leave_to_next_layer,
@@ -253,51 +249,48 @@ class OutputBoundary:
         *,
         forward_batch: ForwardBatch,
         dp_step: Optional[Callable],
+        steps,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's postprocess, run with the attention-DP step already
         chosen: the move back to where the next layer reads the FFN output, then
         the write-back into the residual for a layer that does it itself."""
-        steps = self.plan._batch_steps(forward_batch)
-        if steps.ffn_output.transform is not None:
-            hidden_states = steps.ffn_output.transform.apply(hidden_states)
+        if steps.output.transform is not None:
+            hidden_states = steps.output.transform.apply(hidden_states)
         if steps.returns_over_dp:
             hidden_states = _to_local_tokens(
                 dp_step or _redistribute_output, forward_batch, hidden_states
             )
         else:
-            hidden_states, residual = steps.ffn_output_move(
+            hidden_states, residual = steps.output_move(
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
             )
-        update = steps.ffn_output.update
+        update = steps.output.update
         if residual is not None and update.at_producer:
             hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual
 
-    def mixer_exit(self, forward_batch: ForwardBatch) -> MixerExit:
+    def mixer_exit(
+        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+    ) -> MixerExit:
         """Decide once whether this stage's mixer (an attention-like stage)
         skips its output all-reduce. Use the result as a context manager around
         the mixer, then call ``finish``."""
-        return MixerExit(self, forward_batch)
+        return MixerExit(self, forward_batch, stream=stream)
 
-    def ffn_exit(self, forward_batch: ForwardBatch) -> FfnExit:
+    def ffn_exit(
+        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+    ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call, then call ``finish``."""
-        return FfnExit(self, forward_batch)
+        return FfnExit(self, forward_batch, stream=stream)
 
-    def _ffn_sum_can_move_to_next_layer(self, forward_batch: ForwardBatch) -> bool:
+    def _ffn_sum_can_move_to_next_layer(self, steps) -> bool:
         # Under the MoE-CP all-gather the fusion path would skip postprocess_layer
         # and its MoE-CP scatter, leaving hidden_states longer than the residual.
-        if (
-            (
-                self.plan.fusions is not None
-                and self.plan.fusions.requires_local_reduction
-            )
-            or is_enable_moe_cp_allgather()
-            or not self.plan._batch_steps(forward_batch).ffn_sum_is_movable
-        ):
+        if is_enable_moe_cp_allgather() or steps.output.group is None:
             return False
 
         # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
@@ -324,6 +317,7 @@ class OutputBoundary:
     def _ffn_sum_moves_to_next_layer(
         self,
         forward_batch: ForwardBatch,
+        steps,
         *,
         mlp_reduce_scatter: bool,
         dp_step: Optional[Callable],
@@ -333,8 +327,8 @@ class OutputBoundary:
         same all-reduce the FFN itself would have."""
         return (
             get_parallel().tp_size > 1
-            and not self.plan.is_last_layer
-            and self._ffn_sum_can_move_to_next_layer(forward_batch)
+            and not self.plan.terminal
+            and self._ffn_sum_can_move_to_next_layer(steps)
             and _can_defer_ffn_reduction(forward_batch, self.plan)
             and not mlp_reduce_scatter
             # Under attention DP the next layer must also run postprocess's
@@ -342,7 +336,7 @@ class OutputBoundary:
             and (
                 not is_dp_attention_enabled()
                 or (
-                    self._local_token_move_can_go_to_next_layer(forward_batch)
+                    self._local_token_move_can_go_to_next_layer(steps)
                     and dp_step is None
                 )
             )
@@ -420,16 +414,23 @@ class MixerExit:
         "_stream",
     )
 
-    def __init__(self, communicator: OutputBoundary, forward_batch: ForwardBatch):
-        produced = communicator.plan._batch_steps(forward_batch).ffn_output
-        self._stream = None
+    def __init__(
+        self,
+        boundary: OutputBoundary,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+    ):
+        steps = boundary.plan._batch_steps(forward_batch)
+        produced = steps.output
+        self._stream = stream
         self._update = produced.update
         self._declared_sum = produced.group if produced.always_leaves else None
         self._hands_on = (
             produced.leaves_for_next_layer
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
-            and communicator._ffn_sum_can_move_to_next_layer(forward_batch)
+            and boundary._ffn_sum_can_move_to_next_layer(steps)
         )
         self.skips_reduction = produced.always_leaves or self._hands_on
         self._scope = get_forward().scoped(fuse_mlp_allreduce=self.skips_reduction)
@@ -441,21 +442,15 @@ class MixerExit:
     def __exit__(self, *exc_info):
         return self._scope.__exit__(*exc_info)
 
-    def finish(self, hidden_states: torch.Tensor, residual=None):
-        """The mixer's output: its partial sum to the FFN stage after it, as a
-        value that owes the sum to a mixer after it, or complete."""
-        if self._stream is not None:
-            residual = self._stream
+    def finish(self, hidden_states: torch.Tensor):
+        """Hand the actual mixer result to the next boundary through the stream."""
         if self._hands_on:
             hidden_states = UnreducedOutput(
                 hidden_states, group=get_parallel().tp_group
             )
-        if isinstance(residual, ResidualStream):
-            output = residual.leave(
-                hidden_states, self._update, declared_sum=self._declared_sum
-            )
-            return output if self._stream is not None else (output, residual)
-        return hidden_states
+        return self._stream.leave(
+            hidden_states, self._update, declared_sum=self._declared_sum
+        )
 
 
 class FfnExit:
@@ -464,8 +459,7 @@ class FfnExit:
     ``defer_moe_finalize`` on ``get_forward()``."""
 
     __slots__ = (
-        "communicator",
-        "forward_batch",
+        "boundary",
         "defer_moe_finalize",
         "fuse_mlp_allreduce",
         "mlp_reduce_scatter",
@@ -476,18 +470,23 @@ class FfnExit:
         "_stream",
     )
 
-    def __init__(self, communicator: OutputBoundary, forward_batch: ForwardBatch):
-        self._stream = None
-        self.communicator = communicator
-        self.forward_batch = forward_batch
-        completion = communicator._select_ffn_completion(forward_batch)
+    def __init__(
+        self,
+        boundary: OutputBoundary,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+    ):
+        self._stream = stream
+        self.boundary = boundary
+        steps = boundary.plan._batch_steps(forward_batch)
+        completion = boundary._select_ffn_completion(forward_batch, steps)
         self.defer_moe_finalize = completion.defer_moe_finalize
         self.fuse_mlp_allreduce = completion.fuse_mlp_allreduce
         self.mlp_reduce_scatter = completion.mlp_reduce_scatter
         self._complete = completion.complete
-        steps = communicator.plan._batch_steps(forward_batch)
-        self._update = steps.ffn_output.update
-        self._declared_sum = communicator._declared_ffn_sum(
+        self._update = steps.output.update
+        self._declared_sum = boundary._declared_ffn_sum(
             steps, completion.mlp_reduce_scatter
         )
         self._scope = get_forward().scoped(
@@ -503,21 +502,14 @@ class FfnExit:
     def __exit__(self, *exc_info):
         return self._scope.__exit__(*exc_info)
 
-    def finish(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor = None
-    ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
-        """Leave the reduction to the next layer's input, or postprocess."""
-        if self._stream is not None:
-            residual = self._stream
-        stream = residual if isinstance(residual, ResidualStream) else None
-        if stream is not None:
-            residual = stream.residual
+    def finish(self, hidden_states: torch.Tensor):
+        """Complete or carry this output, preserving its producer update."""
+        residual = self._stream.residual
         if not isinstance(hidden_states, torch.Tensor):
-            # A deferred MoE finalize handoff, consumed by the next prepare_attn.
+            # A deferred MoE finalize handoff, consumed by the next attention input.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
         else:
             hidden_states, residual = self._complete(hidden_states, residual)
-        result = self.communicator._leave_ffn_output(
-            hidden_states, residual, stream, self._update, self._declared_sum
+        return self.boundary._leave_ffn_output(
+            hidden_states, residual, self._stream, self._update, self._declared_sum
         )
-        return result[0] if self._stream is not None else result

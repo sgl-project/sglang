@@ -753,7 +753,7 @@ class NemotronHModel(nn.Module):
             return residual_batch.to_pp(
                 hidden_states, forward_batch, preserve_declared=True
             )
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(
                 residual_batch.snapshot(hidden_states, forward_batch)

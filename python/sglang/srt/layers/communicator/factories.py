@@ -9,21 +9,26 @@ from typing import Mapping, Optional
 import msgspec
 
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.communicator.boundary import (
+from sglang.srt.layers.communicator.adapters.overlap import (
+    resolve_handoff_rows,
+    tbo_handoff,
+)
+from sglang.srt.layers.communicator.boundary import _cp_moves
+from sglang.srt.layers.communicator.construction import (
+    BatchVariant,
+    _bind_stage,
+    _input_can_be_scattered,
+    _refuse_uncovered_cp_moe,
+    _use_ag_after_qlora,
+)
+from sglang.srt.layers.communicator.contracts import (
     EdgeDecl,
+    HandoffRows,
+    ProducerReduction,
     StageDecl,
     StageInput,
     StageKind,
     StageOutput,
-    _cp_moves,
-)
-from sglang.srt.layers.communicator.construction import (
-    BatchVariant,
-    StageEdges,
-    StagePlan,
-    _input_can_be_scattered,
-    _refuse_uncovered_cp_moe,
-    _use_ag_after_qlora,
 )
 from sglang.srt.layers.communicator.layout import (
     Layout,
@@ -35,10 +40,6 @@ from sglang.srt.layers.communicator.layout import (
     sparse_moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.communicator.ops import (
-    _hand_qkv_hook_its_input,
-    _hand_scattered_input_to_attention,
-)
 from sglang.srt.layers.communicator.output import OutputTransform
 from sglang.srt.layers.communicator.residual import StageRead, StageUpdate
 from sglang.srt.layers.communicator.residual.add_norm import (
@@ -46,15 +47,12 @@ from sglang.srt.layers.communicator.residual.add_norm import (
     NORM_QUANT_READ,
     NORM_READ,
 )
-from sglang.srt.layers.communicator.stage import StageCommunicator
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 
-def _variants(*, ordinary_only=False):
+def _variants():
     yield BatchVariant.ORDINARY
-    if ordinary_only:
-        return
     if _generic_prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
     if _input_can_be_scattered():
@@ -79,27 +77,31 @@ def _ffn_decl(
     *,
     sparse,
     terminal=False,
-    next_sparse=False,
-    output=None,
+    output_transform=None,
     read=NORM_READ,
     update=ADD,
-    local_dense=True,
+    dense_tp_size=None,
+    reduction=ProducerReduction.SCOPED,
 ):
     parallel = get_parallel()
-    reduction = get_exec().comm.boundary_reduction
-    if reduction not in ("ar", "rs", "rsv", "rs+rsv"):
+    if dense_tp_size not in (None, 1, parallel.tp_size):
+        raise ValueError("dense FFN rows support local compute or the full TP group")
+    strategy = get_exec().comm.boundary_reduction
+    if strategy not in ("ar", "rs", "rsv", "rs+rsv"):
         raise ValueError(
             "boundary_reduction must be resolved before model construction"
         )
-    can_move_output = output is None or output.before_reduce_scatter
-    use_reduce_scatter = reduction in ("rs", "rs+rsv") and can_move_output
-    use_reduce_scatterv = reduction in ("rsv", "rs+rsv") and can_move_output
+    can_move_output = output_transform is None or output_transform.before_reduce_scatter
+    use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
+    use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
     cp_shards = _generic_prefill_cp_shards_tokens()
     axes, attention, local, full = _rows(variant)
     on_local = (
         is_moe_input_scattered_across_dp_ranks()
         if sparse
-        else (local_dense and enable_moe_dense_fully_dp())
+        else (
+            enable_moe_dense_fully_dp() if dense_tp_size is None else dense_tp_size == 1
+        )
     )
     if parallel.attn_cp_size > 1 and sparse:
         _refuse_uncovered_cp_moe(on_local, cp_shards)
@@ -118,7 +120,7 @@ def _ffn_decl(
                     gathers_itself=frozenset({TokenAxis.ATTN_TP_SCATTER}),
                     read=read,
                 ),
-                StageOutput(local, update=update, transform=output),
+                StageOutput(local, update=update, transform=output_transform),
             ),
             local,
             local,
@@ -136,7 +138,7 @@ def _ffn_decl(
                     leaves_for_reduce_scatter=use_reduce_scatter
                     and (scattered_residual or not terminal),
                     update=update,
-                    transform=output,
+                    transform=output_transform,
                 ),
             ),
             residual,
@@ -156,8 +158,8 @@ def _ffn_decl(
             *((TokenAxis.ATTN_CP,) if on_cp else ()), axis_sizes=axes
         )
     )
-    output = (
-        StageOutput(rows, update=update, transform=output)
+    produced = (
+        StageOutput(rows, update=update, transform=output_transform)
         if on_local
         else StageOutput(
             rows,
@@ -166,22 +168,17 @@ def _ffn_decl(
             and not terminal
             and not update.at_producer
             and update.can_defer_across_layers
-            and output is None,
+            and output_transform is None
+            and reduction is ProducerReduction.SCOPED,
             leaves_for_reduce_scatter=use_reduce_scatter and may_scatter,
             leaves_for_reduce_scatterv=use_reduce_scatterv and may_leave,
             update=update,
-            transform=output,
+            transform=output_transform,
         )
     )
-    gathers_for_tbo = (
-        enable_moe_dense_fully_dp()
-        and get_exec().overlap.enable_two_batch_overlap
-        and not sparse
-        and bool(next_sparse)
-    )
-    returned = local if on_local and not terminal and not gathers_for_tbo else attention
+    returned = local if on_local and not terminal else attention
     return (
-        StageDecl(StageInput(rows, read=read), output),
+        StageDecl(StageInput(rows, read=read), produced),
         local if on_local else attention,
         returned,
     )
@@ -201,13 +198,11 @@ class StageDeclaration:
     update: StageUpdate
     sparse: bool = False
     terminal: bool = False
-    next_sparse: bool = False
-    output: Optional[OutputTransform] = None
-    ordinary_only: bool = False
-    # A mixer with its own exit publishes reduction decisions before compute.
-    mixer_exit: bool = False
-    next_kind: Optional[StageKind] = None
-    return_to_attention: bool = False
+    output_transform: Optional[OutputTransform] = None
+    reduction: ProducerReduction = ProducerReduction.SCOPED
+    gathers_tp_input: bool = False
+    dense_tp_size: Optional[int] = None
+    handoff_rows: Optional[HandoffRows] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -245,10 +240,11 @@ def declare_attn(
     read=NORM_QUANT_READ,
     update=ADD,
     terminal=False,
-    ordinary_only=False,
-    mixer_exit=False,
-    next_kind=None,
+    reduction=ProducerReduction.PARTIAL,
+    gathers_tp_input=True,
 ):
+    if reduction is ProducerReduction.LOCAL_TAIL:
+        raise ValueError("LOCAL_TAIL is not supported for attention stages")
     return StageDeclaration(
         StageKind.ATTENTION,
         read,
@@ -256,9 +252,8 @@ def declare_attn(
         previous=previous,
         prepared_from=prepared_from,
         terminal=terminal,
-        ordinary_only=ordinary_only,
-        mixer_exit=mixer_exit,
-        next_kind=next_kind,
+        reduction=reduction,
+        gathers_tp_input=gathers_tp_input,
     )
 
 
@@ -270,11 +265,14 @@ def declare_ffn(
     read=NORM_READ,
     update=ADD,
     terminal=False,
+    output_transform=None,
     next_sparse=False,
-    output=None,
-    ordinary_only=False,
-    return_to_attention=False,
+    dense_tp_size=None,
+    reduction=ProducerReduction.SCOPED,
+    handoff_rows=None,
 ):
+    if reduction is ProducerReduction.PARTIAL:
+        raise ValueError("PARTIAL is not supported for ffn stages")
     return StageDeclaration(
         StageKind.FFN,
         read,
@@ -283,43 +281,43 @@ def declare_ffn(
         previous=previous,
         prepared_from=prepared_from,
         terminal=terminal,
-        next_sparse=next_sparse,
-        output=output,
-        ordinary_only=ordinary_only,
-        return_to_attention=return_to_attention,
+        output_transform=output_transform,
+        dense_tp_size=dense_tp_size,
+        reduction=reduction,
+        handoff_rows=handoff_rows or tbo_handoff(sparse, next_sparse),
     )
 
 
-def _resolve(stage, variant):
+def _resolve(stage, variant, following=None):
     axes, attention, local, full = _rows(variant)
+    if stage.update.at_producer:
+        if stage.sparse and sparse_moe_gathers_over_moe_cp():
+            raise NotImplementedError(
+                "MHC does not support a MoE gathered over the MoE-CP group"
+            )
+        if get_parallel().attn_cp_size > 1 and _input_can_be_scattered():
+            raise NotImplementedError(
+                "MHC with input-scattered attention under attention CP"
+            )
     if stage.kind is StageKind.FFN:
-        if stage.update.at_producer:
-            if stage.sparse and sparse_moe_gathers_over_moe_cp():
-                raise NotImplementedError(
-                    "MHC does not support a MoE gathered over the MoE-CP group"
-                )
-            if get_parallel().attn_cp_size > 1 and _input_can_be_scattered():
-                raise NotImplementedError(
-                    "MHC with input-scattered attention under attention CP"
-                )
         declaration, residual, returned = _ffn_decl(
             variant,
             sparse=stage.sparse,
             terminal=stage.terminal,
-            next_sparse=stage.next_sparse,
-            output=stage.output,
+            output_transform=stage.output_transform,
             read=stage.read,
             update=stage.update,
-            local_dense=not stage.return_to_attention,
+            dense_tp_size=stage.dense_tp_size,
+            reduction=stage.reduction,
         )
-        if stage.return_to_attention:
+        if resolve_handoff_rows(stage.handoff_rows) is HandoffRows.ATTENTION:
             returned = attention
         return declaration, residual, returned
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
     gathers = (
         frozenset({TokenAxis.ATTN_TP_SCATTER})
-        if not stage.mixer_exit and (sp or scattered or _use_ag_after_qlora)
+        if stage.gathers_tp_input and (sp or scattered or _use_ag_after_qlora)
         else frozenset()
     )
     owes = not sp and axes[TokenAxis.ATTN_TP_SCATTER] > 1
@@ -329,10 +327,14 @@ def _resolve(stage, variant):
             local if sp else attention,
             group=SumGroup.ATTN_TP if owes else None,
             always_leaves=owes
-            and (not stage.mixer_exit or stage.next_kind is StageKind.FFN),
+            and (
+                stage.reduction is ProducerReduction.PARTIAL
+                or (following is not None and following.kind is StageKind.FFN)
+            ),
             leaves_for_next_layer=owes
-            and stage.mixer_exit
-            and stage.next_kind is StageKind.ATTENTION,
+            and stage.reduction is ProducerReduction.SCOPED
+            and following is not None
+            and following.kind is StageKind.ATTENTION,
             update=stage.update,
         ),
     )
@@ -351,9 +353,8 @@ def _connect(producer, consumer, *, residual_from=None):
     if producer is None and consumer is None:
         raise ValueError("a boundary needs at least one declared side")
     before, after = producer, consumer
-    ordinary_only = any(s.ordinary_only for s in (before, after) if s is not None)
     exits, entries = {}, {}
-    for variant in _variants(ordinary_only=ordinary_only):
+    for variant in _variants():
         _, attention, local, _ = _rows(variant)
         if before is None:
             rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
@@ -367,13 +368,16 @@ def _connect(producer, consumer, *, residual_from=None):
             residual = rows
             capabilities = (True,)
         else:
-            decl, during, returned = _resolve(before, variant)
+            decl, during, returned = _resolve(before, variant, following=after)
             if during is None:
                 if residual_from is not None:
                     if residual_from.consumer != producer:
                         raise ValueError("residual source must enter the producer")
                     during = residual_from.entries[variant].residual_to
-                elif before.mixer_exit:
+                elif (
+                    before.kind is StageKind.ATTENTION
+                    and before.reduction is ProducerReduction.SCOPED
+                ):
                     during = attention
                 else:
                     raise ValueError(
@@ -382,16 +386,24 @@ def _connect(producer, consumer, *, residual_from=None):
             exits[variant] = EdgeDecl(
                 decl.output, StageInput(returned), during, returned
             )
-            if before.kind is StageKind.ATTENTION and not before.mixer_exit:
+            if (
+                before.kind is StageKind.ATTENTION
+                and before.reduction is ProducerReduction.PARTIAL
+            ):
                 arrived, residual, capabilities = decl.output, during, ()
             else:
                 owes = (
                     variant is BatchVariant.INPUT_SCATTERED
                     and not before.update.at_producer
                 )
-                carries = (before.mixer_exit or before.return_to_attention) and (
-                    decl.output.always_leaves or decl.output.leaves_for_next_layer
-                )
+                carries = (
+                    (
+                        before.kind is StageKind.ATTENTION
+                        and before.reduction is ProducerReduction.SCOPED
+                    )
+                    or resolve_handoff_rows(before.handoff_rows)
+                    is HandoffRows.ATTENTION
+                ) and (decl.output.always_leaves or decl.output.leaves_for_next_layer)
                 arrived = StageOutput(
                     returned,
                     group=decl.output.group
@@ -413,10 +425,10 @@ def _connect(producer, consumer, *, residual_from=None):
                 if variant is BatchVariant.INPUT_SCATTERED
                 and arrived.always_leaves
                 and arrived.update is None
-                and not after.mixer_exit
+                and after.reduction is ProducerReduction.PARTIAL
                 else residual
             )
-        elif after.return_to_attention:
+        elif resolve_handoff_rows(after.handoff_rows) is HandoffRows.ATTENTION:
             during = (
                 decl.input.layout
                 if residual.sharded <= decl.input.layout.sharded
@@ -440,7 +452,7 @@ def _connect(producer, consumer, *, residual_from=None):
         if (
             before is not None
             and before.kind is StageKind.ATTENTION
-            and not before.mixer_exit
+            and before.reduction is ProducerReduction.PARTIAL
         ):
             exits[variant] = edge
     return StageConnection(producer, consumer, exits, entries)
@@ -453,7 +465,11 @@ def _fork_input(prepared, consumer):
     execute the branch's input norm again.
     """
     entries = {}
-    for variant in _variants(ordinary_only=consumer.ordinary_only):
+    for variant in _variants():
+        if variant is not BatchVariant.ORDINARY:
+            raise NotImplementedError(
+                "prepared branch transport requires ordinary token rows"
+            )
         source = prepared.entries[variant]
         declaration, during, _ = _resolve(consumer, variant)
         entries[variant] = EdgeDecl(
@@ -476,7 +492,7 @@ def _incoming(stage):
         _incoming(previous)
         if previous is not None
         and previous.kind is StageKind.ATTENTION
-        and not previous.mixer_exit
+        and previous.reduction is ProducerReduction.PARTIAL
         else None
     )
     return _connect(
@@ -498,78 +514,12 @@ def _connections(stage, following=None):
     return incoming, outgoing
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, **options):
-    if incoming.consumer != declaration or outgoing.producer != declaration:
-        raise ValueError("connections do not match the stage declaration")
-    if incoming.entries.keys() != outgoing.exits.keys():
-        raise ValueError("incoming and outgoing batch variants disagree")
-    if declaration.update.at_producer:
-        if declaration.sparse and sparse_moe_gathers_over_moe_cp():
-            raise NotImplementedError(
-                "MHC does not support a MoE gathered over the MoE-CP group"
-            )
-        if get_parallel().attn_cp_size > 1 and _input_can_be_scattered():
-            raise NotImplementedError(
-                "MHC with input-scattered attention under attention CP"
-            )
-    variants = {}
-    for variant, edge in incoming.entries.items():
-        if (
-            declaration.update.at_producer
-            and TokenAxis.ATTN_CP
-            in edge.produced.layout.sharded - edge.need.layout.sharded
-        ):
-            raise NotImplementedError("MHC with a gather over attention CP")
-        handoff = None
-        if declaration.kind is StageKind.ATTENTION:
-            handoff = (
-                _hand_scattered_input_to_attention
-                if variant is BatchVariant.INPUT_SCATTERED
-                and not declaration.update.adds_plainly
-                else _hand_qkv_hook_its_input
-            )
-        moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
-        variants[variant] = StageEdges(edge, outgoing.exits[variant], handoff, moves)
-    plan = StagePlan(
-        declaration.kind,
-        norm,
-        variants,
-        enters_stack=incoming.producer is None,
-        prepared_input=declaration.prepared_from is not None,
-        terminal=declaration.terminal,
-        fixed_output=declaration.kind is StageKind.ATTENTION
-        and not declaration.mixer_exit,
-        is_sparse=declaration.sparse,
-        **options,
-    )
-    if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None:
-        # Layout eligibility comes from the connected consumer, not a mutable
-        # link to its execution plan. Kernel binding remains consumer-owned.
-        from sglang.srt.layers.communicator.boundary import make_boundary
-
-        plan._fusion_rows = {
-            v: make_boundary(
-                edge,
-                cp_moves=_cp_moves() if v is BatchVariant.CONTEXT_PARALLEL else None,
-                force_layernorm_before_gather=options.get(
-                    "force_layernorm_before_dp_gather", False
-                ),
-            ).input_rows
-            for v, edge in outgoing.entries.items()
-        }
-    return StageCommunicator(plan, declaration.kind, norm, declaration=declaration)
-
-
 def make_attn_stage(
     *,
     declaration,
     norm,
     following: Optional[StageDeclaration] = None,
     qkv_latent_func=None,
-    force_layernorm_before_dp_gather=False,
-    enable_fused_ar_quant=False,
-    fused_ar_quant_keep_bf16=False,
-    residual_in_hidden=False,
     fusions=None,
 ):
     """Resolve this attention's boundaries, then bind its norm and hooks.
@@ -587,10 +537,6 @@ def make_attn_stage(
         incoming,
         outgoing,
         qkv_latent_func=qkv_latent_func,
-        force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
-        enable_fused_ar_quant=enable_fused_ar_quant,
-        fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
-        residual_in_hidden=residual_in_hidden,
         fusions=fusions,
     )
 
@@ -600,7 +546,6 @@ def make_ffn_stage(
     declaration,
     norm,
     following: Optional[StageDeclaration] = None,
-    force_layernorm_before_dp_gather=False,
     fusions=None,
 ):
     """Resolve this FFN's boundaries and bind its norm; EP stays inside compute."""
@@ -612,13 +557,13 @@ def make_ffn_stage(
         norm,
         incoming,
         outgoing,
-        force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
-        residual_in_hidden=declaration.update.at_producer,
         fusions=fusions,
     )
 
 
-def make_stages(*stages, previous=None, prepared_from=None, terminal=False):
+def make_stages(
+    *stages, previous=None, prepared_from=None, following=None, terminal=False
+):
     """Bind a local linear sequence and return its independent boundaries.
 
     Each item is ``(declaration, norm)`` or ``(declaration, norm, options)``.
@@ -653,53 +598,43 @@ def make_stages(*stages, previous=None, prepared_from=None, terminal=False):
             previous=previous if index == 0 else declarations[-1],
             prepared_from=prepared_from if index == 0 else None,
             terminal=terminal and index == len(stages) - 1,
-            next_kind=stages[index + 1][0].kind
-            if declaration.mixer_exit and index + 1 < len(stages)
-            else declaration.next_kind,
         )
         declarations.append(declaration)
         bindings.append((norm, item[2] if len(item) == 3 else {}))
+    external_consumer = following
     boundaries = []
+    incoming = _incoming(declarations[0])
     for index, (declaration, (norm, options)) in enumerate(zip(declarations, bindings)):
-        build = (
-            make_attn_stage
-            if declaration.kind is StageKind.ATTENTION
-            else make_ffn_stage
+        following = (
+            declarations[index + 1]
+            if index + 1 < len(declarations)
+            else external_consumer
         )
-        boundaries.append(
-            build(
-                declaration=declaration,
-                norm=norm,
-                following=declarations[index + 1]
-                if index + 1 < len(declarations)
-                else None,
-                **options,
-            )
-        )
+        outgoing = _connect(declaration, following, residual_from=incoming)
+        options = dict(options)
+        if declaration.kind is StageKind.FFN:
+            unexpected = options.keys() - {
+                "fusions",
+            }
+            if unexpected:
+                raise TypeError(f"unsupported FFN options: {sorted(unexpected)}")
+        boundaries.append(_bind_stage(declaration, norm, incoming, outgoing, **options))
+        incoming = outgoing
     for producer, consumer in zip(boundaries, boundaries[1:]):
-        if (
-            producer.kind is not StageKind.ATTENTION
-            or producer.declaration.mixer_exit
-            or consumer.kind is not StageKind.FFN
+        if not (
+            producer.kind is StageKind.ATTENTION
+            and producer.declaration.reduction is ProducerReduction.PARTIAL
+            and consumer.kind is StageKind.FFN
         ):
             continue
         for variant, steps in producer.plan._paths.items():
-            predicate = consumer.plan._paths[variant].ffn.preserves_residual
+            next_steps = consumer.plan._paths[variant]
+            predicate = next_steps.entry.preserves_residual
             if predicate is not None:
                 producer.plan._paths[variant] = msgspec.structs.replace(
                     steps,
-                    attention=msgspec.structs.replace(
-                        steps.attention, capture_preserves_residual=predicate
+                    entry=msgspec.structs.replace(
+                        steps.entry, capture_preserves_residual=predicate
                     ),
                 )
-        producer.plan._steps = producer.plan._paths[BatchVariant.ORDINARY]
-        producer.plan._cp_steps = producer.plan._paths.get(
-            BatchVariant.CONTEXT_PARALLEL
-        )
-        producer.plan._input_scattered_steps = producer.plan._paths.get(
-            BatchVariant.INPUT_SCATTERED
-        )
-        producer.plan._sp_steps = producer.plan._paths.get(
-            BatchVariant.SEQUENCE_PARALLEL
-        )
     return tuple(boundaries)

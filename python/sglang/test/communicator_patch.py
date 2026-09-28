@@ -12,19 +12,19 @@ from sglang.srt.layers import communicator as communicator
 from sglang.srt.layers.communicator import (
     boundary,
     construction,
+    contracts,
     exit,
     factories,
-    layer,
     layout,
-    legacy_stage,
     ops,
     output,
+    prepare,
 )
 from sglang.srt.layers.communicator import residual as residual_contract
 from sglang.srt.layers.communicator import (
     stage,
 )
-from sglang.srt.layers.communicator.adapters import attention, branch, lora
+from sglang.srt.layers.communicator.adapters import attention, branch, lora, overlap
 from sglang.srt.layers.communicator.fusions import allreduce
 from sglang.srt.layers.communicator.residual import (
     access,
@@ -40,6 +40,7 @@ COMMUNICATOR_MODULES = (
     exit,
     branch,
     lora,
+    overlap,
     layout,
     output,
     attention,
@@ -50,10 +51,10 @@ COMMUNICATOR_MODULES = (
     ops,
     boundary,
     construction,
+    contracts,
+    prepare,
     factories,
     stage,
-    layer,
-    legacy_stage,
     batch,
     stream,
 )

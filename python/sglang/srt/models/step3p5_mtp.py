@@ -116,7 +116,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             # if forward_batch.return_hidden_states_before_norm:

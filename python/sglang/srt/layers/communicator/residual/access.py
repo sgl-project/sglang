@@ -59,6 +59,8 @@ def fold(hidden_states, residual):
     The following stage receives it with no outstanding residual addition."""
     stream = residual if isinstance(residual, ResidualStream) else None
     if stream is not None:
+        if stream.pending is not None and not stream.pending.update.adds_plainly:
+            raise NotImplementedError("fold requires a plain residual update")
         hidden_states, residual = stream.finish(hidden_states)
     hidden_states = reduce_output(hidden_states)
     if residual is not None:
@@ -70,10 +72,9 @@ def fold(hidden_states, residual):
     )
 
 
-def written(hidden_states, forward_batch):
+def written(hidden_states):
     """Re-enter after a computation that already updated the full residual."""
-    forward_batch.residual_stream = ResidualStream(hidden_states)
-    return hidden_states, forward_batch.residual_stream
+    return hidden_states, ResidualStream(hidden_states)
 
 
 def finish_layer_stack(
@@ -90,16 +91,11 @@ def finish_layer_stack(
     that does a producer's handoff together with its own work
     (``final_norm_takes_handoff``) receives it as it is."""
     if isinstance(residual, ResidualStream):
-        stream = forward_batch.residual_stream
-        if residual is not stream:
-            raise RuntimeError("residual alias belongs to a different invocation")
-        output = stream.finish(
+        return residual.finish(
             hidden_states,
             takes_handoff=final_norm_takes_handoff,
             preserve_declared=preserve_declared,
         )
-        forward_batch.residual_stream = None
-        return output
     if final_norm_takes_handoff and isinstance(hidden_states, HandoffOutput):
         return hidden_states, residual
     return reduce_output(hidden_states), residual
@@ -149,7 +145,9 @@ def snapshot(
     """Copy a complete output with its plain residual. A statically declared
     sum is reduced on a copy; the main output and residual remain unchanged."""
     if isinstance(residual, ResidualStream):
-        return residual.snapshot(hidden_states, group=group)
+        if group is not None:
+            raise ValueError("a residual stream carries its own reduction")
+        return residual.snapshot(hidden_states)
     if group is not None:
         hidden_states = group.all_reduce(hidden_states.clone())
     return hidden_states.clone() if residual is None else hidden_states + residual

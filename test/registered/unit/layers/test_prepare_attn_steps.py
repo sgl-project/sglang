@@ -1,6 +1,3 @@
-from sglang.srt.layers.communicator import StageKind
-from sglang.test.boundary_fixtures import stub_plan, stub_stage
-
 """prepare_attn completes a sum the previous layer left, then adds the residual
 and applies the input norm in the form the attention's quant format wants."""
 
@@ -14,8 +11,12 @@ import msgspec
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import StageKind
+from sglang.srt.layers.communicator import prepare as comm_ops
+from sglang.srt.layers.communicator.contracts import BatchVariant
 from sglang.srt.layers.communicator.fusions.allreduce import attention_fusions
+from sglang.srt.layers.communicator.ops import identity_output
+from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -51,18 +52,16 @@ def communicator(norm):
     c = stub_plan()
     c.norm = norm
     # A layer inside the stack: an absent residual was written back before.
-    c.is_first_layer = False
-    c._sp_steps = None
-    c._input_scattered_steps = None
-    c._cp_steps = None
+    c.enters_stack = False
+    c._paths[BatchVariant.SEQUENCE_PARALLEL] = None
+    c._paths[BatchVariant.INPUT_SCATTERED] = None
+    c._paths[BatchVariant.CONTEXT_PARALLEL] = None
     c.qkv_latent_func = None
-    c.enable_fused_ar_quant = False
-    c.fused_ar_quant_keep_bf16 = False
     # Construction picks the fused entries; call it under the platform patches.
     c._attn_input_fusions = attention_fusions(c)
     # A layer whose attention takes its input as it is and owes nothing on it.
-    c._steps = comm.BoundarySteps(
-        attention=comm.StageEntry(
+    c._paths[BatchVariant.ORDINARY] = comm.StageSteps(
+        entry=comm.StageEntry(
             prepare=partial(
                 comm_ops._consumer_step,
                 adds_plainly=True,
@@ -79,19 +78,8 @@ def communicator(norm):
             input_move=lambda hidden_states, **_: hidden_states,
             handoff=comm_ops._hand_qkv_hook_its_input,
         ),
-        ffn=comm.StageEntry(
-            prepare=partial(
-                comm_ops._read_input,
-                layer_input=None,
-                enters_stack=False,
-                read=comm.NORM_READ,
-                update=comm.ADD,
-            ),
-            input_rows=comm.Layout(frozenset()),
-        ),
-        ffn_output=comm.StageOutput(comm.Layout(frozenset())),
-        ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
-        ffn_sum_is_movable=False,
+        output=comm.StageOutput(comm.Layout(frozenset())),
+        output_move=identity_output,
     )
     return c
 
@@ -132,6 +120,9 @@ def platform(*, use_aiter=False, gfx95=False, fusion=False, kernel_group=True):
                 return_value=SimpleNamespace(input_scattered=False, is_dsa=False),
             )
         )
+        stack.enter_context(
+            patch_communicator("_batch_shards_over_cp", return_value=False)
+        )
         yield kernels, all_reduce, group
 
 
@@ -158,8 +149,12 @@ class TestPrepareAttnSteps(CustomTestCase):
                     platform(**flags) as (kernels, _, _),
                 ):
                     norm = Norm()
-                    stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
-                        torch.ones(2, 4), residual, None, quant_format=quant_format
+                    prepare_input(
+                        stub_stage(communicator(norm), StageKind.ATTENTION),
+                        torch.ones(2, 4),
+                        residual,
+                        None,
+                        quant_format=quant_format,
                     )
                     for name, mock in kernels.items():
                         self.assertEqual(mock.called, name == kernel, name)
@@ -174,9 +169,13 @@ class TestPrepareAttnSteps(CustomTestCase):
         ):
             with self.subTest(quant_format=quant_format), platform(**flags):
                 hidden_states = torch.ones(2, 4)
-                _, residual = stub_stage(
-                    communicator(Norm()), StageKind.ATTENTION
-                )._prepare_input(hidden_states, None, None, quant_format=quant_format)
+                _, residual = prepare_input(
+                    stub_stage(communicator(Norm()), StageKind.ATTENTION),
+                    hidden_states,
+                    None,
+                    None,
+                    quant_format=quant_format,
+                )
                 self.assertIs(residual.residual, hidden_states)
 
     def test_a_pending_sum_is_completed_once(self):
@@ -187,8 +186,11 @@ class TestPrepareAttnSteps(CustomTestCase):
             ):
                 norm = Norm()
                 hidden_states = comm.UnreducedOutput(torch.ones(2, 4), group=group)
-                stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
-                    hidden_states, torch.zeros(2, 4), None
+                prepare_input(
+                    stub_stage(communicator(norm), StageKind.ATTENTION),
+                    hidden_states,
+                    torch.zeros(2, 4),
+                    None,
                 )
                 self.assertEqual(all_reduce.call_count, 0 if fusion else 1)
                 self.assertEqual(
@@ -198,7 +200,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_pending_sum_keeps_the_quant_format_without_fusion(self):
         with platform(use_aiter=True) as (kernels, all_reduce, group):
             norm = Norm()
-            stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
+            prepare_input(
+                stub_stage(communicator(norm), StageKind.ATTENTION),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -211,7 +214,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_pending_sum_over_another_group_skips_the_fused_kernel(self):
         with platform(fusion=True, kernel_group=False) as (_, all_reduce, group):
             norm = Norm()
-            stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
+            prepare_input(
+                stub_stage(communicator(norm), StageKind.ATTENTION),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -222,7 +226,8 @@ class TestPrepareAttnSteps(CustomTestCase):
     def test_a_post_residual_addition_bypasses_the_fused_kernel(self):
         with platform(fusion=True) as (_, all_reduce, group):
             norm = Norm()
-            stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
+            prepare_input(
+                stub_stage(communicator(norm), StageKind.ATTENTION),
                 comm.UnreducedOutput(torch.ones(2, 4), group=group),
                 torch.zeros(2, 4),
                 None,
@@ -241,9 +246,8 @@ class TestPrepareAttnSteps(CustomTestCase):
                 partial = torch.ones(3, 4)
                 local = torch.full((local_rows, 4), 7.0)
                 step = MagicMock(return_value=local)
-                hidden_states, residual = stub_stage(
-                    communicator(norm), StageKind.ATTENTION
-                )._prepare_input(
+                hidden_states, residual = prepare_input(
+                    stub_stage(communicator(norm), StageKind.ATTENTION),
                     comm.UnreducedOutput(partial, reduce_and_redistribute=step),
                     torch.zeros(local_rows, 4),
                     None,
@@ -261,10 +265,10 @@ class TestPrepareAttnSteps(CustomTestCase):
         with platform(fusion=True) as (_, all_reduce, _):
             c = communicator(Norm())
             takes_anything = MagicMock(return_value=("fused", "fused"))
-            c._steps = msgspec.structs.replace(
-                c._steps,
-                attention=msgspec.structs.replace(
-                    c._steps.attention,
+            c._paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
+                c._paths.get(BatchVariant.ORDINARY),
+                entry=msgspec.structs.replace(
+                    c._paths.get(BatchVariant.ORDINARY).entry,
                     prepare=partial(
                         comm_ops._consumer_step,
                         adds_plainly=True,
@@ -281,7 +285,8 @@ class TestPrepareAttnSteps(CustomTestCase):
             )
             partial_sum = torch.ones(3, 4)
             step = MagicMock(return_value=torch.full((1, 4), 7.0))
-            stub_stage(c, StageKind.ATTENTION)._prepare_input(
+            prepare_input(
+                stub_stage(c, StageKind.ATTENTION),
                 comm.UnreducedOutput(partial_sum, reduce_and_redistribute=step),
                 torch.zeros(1, 4),
                 None,
@@ -290,25 +295,44 @@ class TestPrepareAttnSteps(CustomTestCase):
             takes_anything.assert_not_called()
             self.assertEqual(all_reduce.call_count, 0)
 
-    def test_an_unreduced_output_without_a_residual_is_rejected(self):
-        for step in (None, MagicMock()):
-            with (
-                self.subTest(redistributes=step is not None),
-                platform(fusion=True) as (_, all_reduce, _),
-            ):
-                norm = Norm()
-                with self.assertRaises(RuntimeError):
-                    stub_stage(communicator(norm), StageKind.ATTENTION)._prepare_input(
-                        comm.UnreducedOutput(
-                            torch.ones(2, 4), reduce_and_redistribute=step
+
+class TestFusedReadForms(CustomTestCase):
+    def test_consumer_form_and_backend_policy_are_both_required(self):
+        from sglang.srt.layers.communicator.residual.add_norm import (
+            Fp8Input,
+            NormQuantRead,
+        )
+
+        for form in (None, Fp8Input.TUPLE, Fp8Input.TUPLE_AND_BF16):
+            for enabled in (False, True):
+                for disabled_by_env in (False, True):
+                    with (
+                        self.subTest(
+                            form=form, enabled=enabled, disabled_by_env=disabled_by_env
                         ),
-                        None,
-                        None,
-                    )
-                self.assertEqual(all_reduce.call_count, 0)
-                if step is not None:
-                    step.assert_not_called()
-                self.assertEqual(norm.calls, [])
+                        patch_communicator("_use_aiter", True),
+                        patch_communicator(
+                            "get_exec",
+                            return_value=SimpleNamespace(
+                                comm=SimpleNamespace(
+                                    enable_aiter_allreduce_fusion=enabled
+                                )
+                            ),
+                        ),
+                        patch_communicator(
+                            "get_bool_env_var", return_value=disabled_by_env
+                        ),
+                    ):
+                        plan = SimpleNamespace(norm=MagicMock(), fusions=None)
+                        (candidate,) = attention_fusions(
+                            plan, NormQuantRead(fp8_input=form)
+                        )
+                        expected = form is not None and enabled and not disabled_by_env
+                        self.assertEqual(candidate.keywords["fuses_quant"], expected)
+                        self.assertEqual(
+                            candidate.keywords["keep_bf16"],
+                            expected and form is Fp8Input.TUPLE_AND_BF16,
+                        )
 
 
 if __name__ == "__main__":

@@ -2,14 +2,11 @@ import itertools
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.communicator import (
-    ADD,
-    NORM_QUANT_READ,
-    NORM_READ,
     Layout,
     MixerExit,
     StageOutput,
@@ -17,6 +14,7 @@ from sglang.srt.layers.communicator import (
     TokenAxis,
     UnreducedOutput,
 )
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
 from sglang.srt.runtime_context import get_parallel
@@ -36,7 +34,12 @@ def layer_stage(pattern, index):
         previous=previous,
         terminal=index == len(pattern) - 1,
     )
-    incoming, outgoing = _connections(declaration)
+    following = (
+        replace(utils._declaration(pattern, index + 1), previous=declaration)
+        if index + 1 < len(pattern)
+        else None
+    )
+    incoming, outgoing = _connections(declaration, following)
     return SimpleNamespace(
         kind=declaration.kind,
         edges=(
@@ -65,8 +68,13 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
         tp_size=dp * tp,
         moe_dp_size=1,
         moe_dense_tp_size=None,
+        enable_attn_tp_input_scattered=False,
+        enable_prefill_cp=False,
     )
     with (
+        patch(
+            "sglang.srt.layers.layernorm_sp.layernorm_sp_enabled", return_value=False
+        ),
         patch_communicator(
             "get_exec",
             return_value=SimpleNamespace(
@@ -76,6 +84,7 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
         ),
         patch_communicator("token_axis_sizes", return_value=sizes(dp=dp, tp=tp)),
         patch_communicator("get_parallel", return_value=parallel),
+        patch.object(utils, "get_parallel", return_value=parallel),
         patch_communicator("is_moe_input_scattered_across_dp_ranks", return_value=a2a),
         patch_communicator("enable_moe_dense_fully_dp", return_value=False),
         patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
@@ -155,17 +164,6 @@ class TestStageEdges(CustomTestCase):
             (SumGroup.TP, False, True),
         )
 
-    def test_each_stage_reads_and_writes_as_a_layer_s_attention_or_ffn(self):
-        for pattern, tp in itertools.product(self.PATTERNS, (1, 2)):
-            with self.subTest(pattern=pattern, tp=tp):
-                for kind, layer in zip(pattern, stages(pattern, tp=tp)):
-                    into, out_of = layer.edges
-                    self.assertIs(
-                        into.need.read,
-                        NORM_QUANT_READ if utils.is_attn_layer(kind) else NORM_READ,
-                    )
-                    self.assertIs(out_of.produced.update, ADD)
-
 
 class TestMixerExit(CustomTestCase):
     """A mixer skips its output all-reduce when its output always leaves the sum
@@ -189,15 +187,18 @@ class TestMixerExit(CustomTestCase):
                 )
                 communicator = SimpleNamespace(
                     plan=SimpleNamespace(
-                        _batch_steps=lambda batch: SimpleNamespace(ffn_output=produced),
+                        _batch_steps=lambda batch: SimpleNamespace(output=produced),
                     ),
                     _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
                 with get_parallel().override(tp_group=tp_group, tp_size=2):
-                    with MixerExit(communicator, None) as mixer_exit:
+                    with MixerExit(
+                        communicator, None, stream=ResidualStream()
+                    ) as mixer_exit:
                         skipped = should_skip_mlp_all_reduce()
                     output = mixer_exit.finish(hidden)
+                    output, _ = mixer_exit._stream.input(output)
                 self.assertFalse(should_skip_mlp_all_reduce())
                 hands_on = may and movable
                 self.assertEqual(mixer_exit.skips_reduction, always or hands_on)

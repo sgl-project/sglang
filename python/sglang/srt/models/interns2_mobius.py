@@ -20,6 +20,7 @@ from sglang.srt.layers.communicator import (
     make_stages,
 )
 from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.communicator.residual.add_norm import Fp8Input, NormQuantRead
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -49,7 +50,6 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5GatedDeltaNet,
-    _enable_qwen35_fused_ar_quant,
     _linear_accepts_fp8_tuple,
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
@@ -488,18 +488,15 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        )
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         self.attn_stage, self.ffn_stage = make_stages(
             (
-                declare_attn(),
+                declare_attn(
+                    read=NormQuantRead(
+                        fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    )
+                ),
                 self.input_layernorm,
-                {
-                    "enable_fused_ar_quant": enable_fused_ar_quant,
-                    "fused_ar_quant_keep_bf16": enable_fused_ar_quant,
-                },
             ),
             (
                 declare_ffn(
@@ -623,17 +620,15 @@ class InternS2MobiusAttentionDecoderLayer(
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
-        )
+        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         self.attn_stage, self.ffn_stage = make_stages(
             (
-                declare_attn(),
+                declare_attn(
+                    read=NormQuantRead(
+                        fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    )
+                ),
                 self.input_layernorm,
-                {
-                    "enable_fused_ar_quant": enable_fused_ar_quant,
-                    "fused_ar_quant_keep_bf16": False,
-                },
             ),
             (
                 declare_ffn(
@@ -793,7 +788,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                     input_deepstack_embeds[:, start : start + self.hidden_size],
                 )
 
-        hidden_states = residual_batch.finish(hidden_states, forward_batch)
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
