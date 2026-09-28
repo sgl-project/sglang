@@ -89,7 +89,7 @@ def _load_image_bytes(image) -> bytes:
         try:
             with open(path, "rb") as f:
                 return f.read()
-        except OSError as e:
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as e:
             raise ValueError(f"Could not read image from path {path!r}: {e}") from e
 
     from PIL import Image

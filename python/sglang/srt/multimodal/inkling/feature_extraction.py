@@ -44,7 +44,7 @@ def _load_audio_bytes(audio) -> bytes:
         try:
             with open(path, "rb") as f:
                 return f.read()
-        except OSError as e:
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as e:
             raise ValueError(f"Could not read audio from path {path!r}: {e}") from e
     raise TypeError(
         f"Unsupported audio input type for Inkling audio extractor: {type(audio)}"

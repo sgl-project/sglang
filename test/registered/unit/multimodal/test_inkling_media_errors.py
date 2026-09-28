@@ -18,7 +18,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
+import errno
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -199,6 +202,31 @@ class TestLoadImageBytesIsClientError(CustomTestCase):
             _load_image_bytes("/nonexistent/path/that/does/not/exist.png")
         self.assertIsInstance(ctx.exception.__cause__, OSError)
 
+    def test_path_component_that_is_not_a_directory_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            not_a_directory = Path(temp_dir) / "file"
+            not_a_directory.write_bytes(b"x")
+            with self.assertRaisesRegex(ValueError, "Could not read image from path"):
+                _load_image_bytes(str(not_a_directory / "child.png"))
+
+    def test_directory_path_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            self.assertRaisesRegex(ValueError, "Could not read image from path"),
+        ):
+            _load_image_bytes(temp_dir)
+
+    def test_server_os_error_is_not_reclassified_as_client_error(self):
+        with (
+            patch(
+                "builtins.open",
+                side_effect=OSError(errno.EMFILE, "too many open files"),
+            ),
+            self.assertRaises(OSError) as ctx,
+        ):
+            _load_image_bytes("/any/image.png")
+        self.assertEqual(ctx.exception.errno, errno.EMFILE)
+
 
 class TestLoadAudioBytesIsClientError(CustomTestCase):
     """feature_extraction.py::_load_audio_bytes() -- same gap as
@@ -212,6 +240,31 @@ class TestLoadAudioBytesIsClientError(CustomTestCase):
         with self.assertRaises(ValueError) as ctx:
             _load_audio_bytes("/nonexistent/path/that/does/not/exist.wav")
         self.assertIsInstance(ctx.exception.__cause__, OSError)
+
+    def test_path_component_that_is_not_a_directory_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            not_a_directory = Path(temp_dir) / "file"
+            not_a_directory.write_bytes(b"x")
+            with self.assertRaisesRegex(ValueError, "Could not read audio from path"):
+                _load_audio_bytes(str(not_a_directory / "child.wav"))
+
+    def test_directory_path_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            self.assertRaisesRegex(ValueError, "Could not read audio from path"),
+        ):
+            _load_audio_bytes(temp_dir)
+
+    def test_server_os_error_is_not_reclassified_as_client_error(self):
+        with (
+            patch(
+                "builtins.open",
+                side_effect=OSError(errno.EMFILE, "too many open files"),
+            ),
+            self.assertRaises(OSError) as ctx,
+        ):
+            _load_audio_bytes("/any/audio.wav")
+        self.assertEqual(ctx.exception.errno, errno.EMFILE)
 
 
 class TestDecodeAudioIsClientError(CustomTestCase):
