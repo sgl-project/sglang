@@ -470,7 +470,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_pd_get_bootstrapped_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
