@@ -191,7 +191,7 @@ def _aiter_topk_gating_renormalizes_softmax() -> bool:
     # aiter before #4460 ignores need_renorm for softmax; JIT builds make the
     # version string unreliable, so probe the signature.
     try:
-        from aiter.ops.topk import topk_gating
+        from aiter import topk_gating
 
         params = inspect.signature(topk_gating).parameters
         return "need_renorm" in params and "score_func" in params
@@ -213,6 +213,7 @@ def _use_aiter_topk_gating_softmax(
         and _use_aiter_topk_gating
         and _is_gfx95
         and hidden_states.shape[1] == 8192
+        and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
         and gating_output.is_contiguous()
@@ -1080,9 +1081,9 @@ def fused_topk(
                 num_fused_shared_experts,
                 packed_out,
             ):
-                from aiter.ops.topk import topk_gating as aiter_topk_gating
+                from aiter import topk_gating
 
-                aiter_topk_gating(
+                topk_gating(
                     topk_weights,
                     topk_ids,
                     gating_output,
