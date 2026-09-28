@@ -576,6 +576,24 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         })
     }
 
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hash_value = node.hash_value.as_ref().filter(|h| !h.is_empty())?;
+        let device_indices = node.try_device_value(MAMBA)?;
+        // One state per node, valid only at the node's end boundary.
+        Some(PoolTransfer {
+            name: PoolName::Mamba,
+            device_indices: Some(device_indices.shallow_clone()),
+            keys: Some(vec![hash_value[hash_value.len() - 1].clone()]),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
+        })
+    }
+
     /// Post-transfer mamba bookkeeping for the given phase.
     fn commit_hicache_transfer(
         &self,

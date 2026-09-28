@@ -757,9 +757,6 @@ pub enum TreeCoreRuntimeError {
     #[cfg(any(test, feature = "inspection"))]
     #[error("{0}")]
     InspectionAssertion(String),
-    /// Direct external-cache linking does not support this tree component.
-    #[error("external cache linker does not support component {component_type:?}")]
-    ExternalCacheLinkerUnsupportedComponent { component_type: ComponentType },
     /// The existing device anchor must be on the restored endpoint's root path.
     #[error("node {until_node_id} is not an ancestor of node {from_node_id}")]
     ExternalCachePathNotAncestor {

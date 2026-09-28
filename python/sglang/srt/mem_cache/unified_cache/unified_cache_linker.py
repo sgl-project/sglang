@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -155,7 +156,7 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
@@ -368,10 +369,6 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node
@@ -431,7 +428,10 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if (
+                phase == ExternalLinkerLoadPhase.COMMIT
+                and component.linker_indices_are_paged
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [

@@ -400,6 +400,79 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def _mamba_swa_stack(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        def mha_pool(num_layers):
+            return SimpleNamespace(
+                k_buffer=[torch.zeros((8, 3), dtype=torch.uint8)] * num_layers,
+                v_buffer=[torch.zeros((8, 5), dtype=torch.uint8)] * num_layers,
+                k_scale_buffer=None,
+                native_k_scale_buffer=None,
+            )
+
+        kvcache = SWAKVPool.__new__(SWAKVPool)
+        kvcache.start_layer = 0
+        kvcache.full_kv_pool = mha_pool(1)
+        kvcache.swa_kv_pool = mha_pool(2)
+        kvcache.layers_mapping = {0: (0, True), 1: (0, False), 2: (1, True)}
+        conv = torch.zeros((3, 6, 7), dtype=torch.uint8)
+        req_to_token_pool = SimpleNamespace(
+            mamba_ckpt_pool=None,
+            short_conv_pool=SimpleNamespace(enabled=False),
+            ngram_pool=SimpleNamespace(enabled=False),
+            mamba_map={0: 0, 1: 1, 2: 2},
+            mamba_pool=SimpleNamespace(
+                num_mamba_layers=3,
+                mamba_cache=SimpleNamespace(
+                    conv=[conv], temporal=torch.zeros((3, 6, 0), dtype=torch.uint8)
+                ),
+            ),
+        )
+        return kvcache, SimpleNamespace(req_to_token_pool=req_to_token_pool), conv
+
+    def _resolve_mamba_swa(self, kvcache, params):
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            return resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=params,
+                components={ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA},
+            )
+
+    def test_mamba_swa_uses_hybrid_assembler_strategy(self):
+        kvcache, params, conv = self._mamba_swa_stack()
+        group = self._resolve_mamba_swa(kvcache, params)
+
+        self.assertEqual(group.num_layers, 3)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(
+            group.sources,
+            {name: name for name in (PoolName.KV, PoolName.SWA, PoolName.MAMBA)},
+        )
+        kv = group.entry_map[PoolName.KV]
+        self.assertIsNone(kv.get_prepared_layer_range_meta([0], 0))
+        # K and V of one layer land in one page object, after the K of all layers.
+        _, sizes, offsets = kv.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(sizes, [[6, 10]])
+        self.assertEqual(offsets, [[0, 6]])
+        _, sizes, offsets = group.entry_map[PoolName.SWA].get_prepared_layer_range_meta(
+            [0], 2
+        )
+        self.assertEqual(sizes, [[6, 10]])
+        self.assertEqual(offsets, [[6, 22]])
+
+        # Mamba rows are slot ids; the empty temporal state is not transferred.
+        mamba = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba.prepare_locations(torch.tensor([4])), [4])
+        ptrs, sizes, offsets = mamba.get_prepared_layer_range_meta([4], 2)
+        self.assertEqual(ptrs, [[conv[2].data_ptr() + 4 * 7]])
+        self.assertEqual(sizes, [[7]])
+        self.assertEqual(offsets, [[14]])
+
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""
         from sglang.srt.speculative import base_spec_worker as spec
