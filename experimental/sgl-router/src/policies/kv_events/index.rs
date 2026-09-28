@@ -2654,23 +2654,20 @@ async fn pump_loop(
                     }
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
-                } else if seq == STREAM_ORIGIN_SEQ
-                    && cursors
-                        .lock()
-                        .get(&worker)
-                        .is_some_and(|&c| c > STREAM_ORIGIN_SEQ)
-                {
+                } else if seq == STREAM_ORIGIN_SEQ && cursors.lock().contains_key(&worker) {
                     // The resolved-rank counterpart of the regression above,
                     // narrowed to batch 0. Here the comparison is against the
                     // CURSOR, which a graft may have seeded ahead of anything
                     // received, so `seq < cursor` in general means "already
                     // reflected" and stays filtered by `apply_batch`. Batch 0 is
-                    // the exception: a cursor above it proves the publisher
-                    // already emitted later batches, so a new batch 0 can only
-                    // be a restarted publisher — whose whole stream the old
-                    // cursor would otherwise filter until it overtook it. The
-                    // gap check below cannot see this: it flags forward holes,
-                    // and a regressed seq passes it as proof of continuity.
+                    // the exception: any cursor means batch 0 is already
+                    // reflected, so another one is a restarted publisher —
+                    // whose whole stream the old cursor would otherwise filter
+                    // until it overtook it. (Were it a redelivery at cursor 0,
+                    // clearing and re-applying batch 0 rebuilds the same state,
+                    // since batch 0 is all such a cursor reflects.) The gap
+                    // check below cannot see this: it flags forward holes, and
+                    // a regressed seq passes it as proof of continuity.
                     warn!(
                         worker = ?worker,
                         "kv-events pump: batch 0 behind a later cursor; the publisher \
@@ -5342,6 +5339,30 @@ mod tests {
             0,
             "counted once, as warm"
         );
+    }
+
+    /// The boundary: a rank resolved from its origin that has applied ONLY
+    /// batch 0 (cursor 0) restarts in place. Treating the second batch 0 as a
+    /// duplicate would keep the dead batch's state and drop the new one.
+    #[tokio::test]
+    async fn pump_second_batch_zero_at_cursor_zero_replaces_the_rank_state() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+        send_and_await_cursor(&h, &id, &[0], 0).await;
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![stored(None, vec![7777])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(h.tree.match_prefix(None, &[1000]).matched_blocks, 0);
+        assert!(h.tree.match_prefix(None, &[7777]).workers.contains(&id));
     }
 
     /// Same restart while the graft's splice is still unproven: the verdict is
