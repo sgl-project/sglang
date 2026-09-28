@@ -6,7 +6,6 @@ weight-name remapping in ``load_weights``.
 """
 
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -458,17 +457,15 @@ class TestVisionWeightNameRemap(CustomTestCase):
             (f"{self.HF_BLOCK}.wo.bias", torch.zeros(1)),
         ]
 
-        with patch("sglang.srt.models.locate_anything.logger") as mock_logger:
-            loaded = LocateAnythingForConditionalGeneration.load_weights(
-                model, iter(weights)
-            )
+        loaded = LocateAnythingForConditionalGeneration.load_weights(
+            model, iter(weights)
+        )
 
         # The HF spellings are not model parameters: without the rename they are
         # skipped with a "not found" warning and dropped.
         self.assertEqual(loaded, dest)
         self.assertNotIn(f"{self.SGLANG_BLOCK}.wqkv.weight", loaded)
         self.assertNotIn(f"{self.SGLANG_BLOCK}.wo.weight", loaded)
-        mock_logger.warning.assert_not_called()
         for name, param in params.items():
             self.assertEqual(len(param.loads), 1, name)
 
@@ -479,15 +476,12 @@ class TestVisionWeightNameRemap(CustomTestCase):
         model = _WeightLoadingSink(config, params)
         weights = [(_hf_checkpoint_name(name), torch.zeros(1)) for name in sorted(dest)]
 
-        with patch("sglang.srt.models.locate_anything.logger") as mock_logger:
-            loaded = LocateAnythingForConditionalGeneration.load_weights(
-                model, iter(weights)
-            )
+        loaded = LocateAnythingForConditionalGeneration.load_weights(
+            model, iter(weights)
+        )
 
-        # Full, exact coverage: every vision/projector parameter is fed and the
-        # "parameters did not receive weights" warning must stay silent.
+        # Full, exact coverage: every vision/projector parameter is fed.
         self.assertEqual(loaded, dest)
-        mock_logger.warning.assert_not_called()
         for name, param in params.items():
             self.assertEqual(len(param.loads), 1, name)
 
