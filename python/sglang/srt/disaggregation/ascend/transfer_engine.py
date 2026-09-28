@@ -117,6 +117,36 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
+    # Diagnostic kill-switch funnel: every mf data-plane copy (main KV send,
+    # DSV4 state payloads, staged sends) goes through batch_transfer_sync, so
+    # guarding here blocks them all regardless of caller. Decode will time
+    # out; watch only whether prefill still faults.
+    _skip_send_logged = False
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        if envs.SGLANG_DEBUG_SKIP_KV_SEND.get():
+            if not AscendTransferEngine._skip_send_logged:
+                AscendTransferEngine._skip_send_logged = True
+                logger.info("SGLANG_DEBUG_SKIP_KV_SEND=1: every mf transfer is skipped")
+            return 0
+        if envs.SGLANG_DEBUG_MTE_TRACE.get():
+            import time
+
+            print(
+                f"[mte.send] t={time.time():.3f} blocks={len(lengths)} "
+                f"bytes={sum(lengths)}",
+                flush=True,
+            )
+        return super().batch_transfer_sync(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
+
     @staticmethod
     def _get_transfer_protocol() -> str:
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
