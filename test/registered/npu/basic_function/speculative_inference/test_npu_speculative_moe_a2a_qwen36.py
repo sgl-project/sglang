@@ -1,14 +1,15 @@
-"""Exercise draft MoE communication on two Ascend NPUs with Qwen3.6 MTP.
+"""Exercise main/draft MoE routing on two Ascend NPUs with Qwen3.6.
 
 Example (from the repository root):
-    ASCEND_RT_VISIBLE_DEVICES=14,15 \
-    SGLANG_TEST_MODEL_PATH=/home/weights/Qwen3.6-35B-A3B \
+    ASCEND_RT_VISIBLE_DEVICES=0,1 \
+    SGLANG_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B \
     python test/registered/npu/basic_function/speculative_inference/test_npu_speculative_moe_a2a_qwen36.py -v
 
-SGLANG_TEST_TARGET_A2A defaults to deepep; SGLANG_TEST_DRAFT_A2A defaults to none.
-The default compares inherited DeepEP with the draft's local expert dispatch at
-EP=2, including speculative verification and deterministic output parity.
-Set SGLANG_TEST_DRAFT_A2A=deepep to check explicit DeepEP selection instead.
+SGLANG_TEST_TARGET_A2A and SGLANG_TEST_DRAFT_A2A default to none. The default
+covers the NPU none dispatcher at EP=2, both without a draft and with MTP.
+Draft none inherits the target backend, just like an omitted draft option.
+Set SGLANG_TEST_TARGET_A2A=deepep to check inheritance of DeepEP instead.
+Set SGLANG_TEST_EP_SIZE=1 to exercise the unsharded-expert TP path.
 SGLANG_TEST_LOG_DIR preserves the server logs and response/metric artifacts.
 Uses the launch/cleanup pattern in python/sglang/test/ascend.
 """
@@ -40,8 +41,9 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
             "SGLANG_TEST_MODEL_PATH",
             os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.6-35B-A3B"),
         )
-        self.target_backend = os.environ.get("SGLANG_TEST_TARGET_A2A", "deepep")
+        self.target_backend = os.environ.get("SGLANG_TEST_TARGET_A2A", "none")
         self.draft_backend = os.environ.get("SGLANG_TEST_DRAFT_A2A", "none")
+        self.ep_size = int(os.environ.get("SGLANG_TEST_EP_SIZE", "2"))
         log_dir = os.environ.get("SGLANG_TEST_LOG_DIR")
         if log_dir is None:
             temp_dir = tempfile.TemporaryDirectory(prefix="sglang-npu-spec-a2a-")
@@ -69,7 +71,7 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
             for expression in ["19 + 23", "7 * 8", "9 * 9", "45 / 3"]
         ]
 
-    def _run_backend(self, label, draft_backend):
+    def _run_backend(self, label, draft_backend, *, speculative=True):
         base_url = f"http://127.0.0.1:{get_open_port()}"
         args = [
             "--device",
@@ -84,7 +86,7 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
             "--tp-size",
             "2",
             "--ep-size",
-            "2",
+            str(self.ep_size),
             "--moe-a2a-backend",
             self.target_backend,
             "--mem-fraction-static",
@@ -101,25 +103,28 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
             "1024",
             "--disable-radix-cache",
             "--disable-cuda-graph",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "1",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "2",
-            "--speculative-draft-model-quantization",
-            "unquant",
-            "--speculative-draft-attention-backend",
-            "ascend",
-            "--speculative-moe-runner-backend",
-            "auto",
             "--random-seed",
             "0",
         ]
-        if draft_backend is not None:
-            args += ["--speculative-moe-a2a-backend", draft_backend]
+        if speculative:
+            args += [
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--speculative-draft-model-quantization",
+                "unquant",
+                "--speculative-draft-attention-backend",
+                "ascend",
+                "--speculative-moe-runner-backend",
+                "auto",
+            ]
+            if draft_backend is not None:
+                args += ["--speculative-moe-a2a-backend", draft_backend]
         if "ascend_fuseep" in (self.target_backend, draft_backend):
             # DeepEP FuseEP mode 2 accepts INT8 weights only. Probe the BF16
             # checkpoint with mode 1, which exposes a BF16 kernel interface.
@@ -150,9 +155,18 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
                 info_response = self.session.get(f"{base_url}/server_info", timeout=30)
                 info_response.raise_for_status()
                 info = info_response.json()
-                self.assertEqual(info["speculative_algorithm"], "EAGLE")
+                self.assertEqual(info["tp_size"], 2)
+                self.assertEqual(info["ep_size"], self.ep_size)
+                self.assertEqual(
+                    info["speculative_algorithm"], "EAGLE" if speculative else None
+                )
                 self.assertEqual(info["moe_a2a_backend"], self.target_backend)
-                self.assertEqual(info["speculative_moe_a2a_backend"], draft_backend)
+                self.assertEqual(
+                    info["speculative_moe_a2a_backend"],
+                    draft_backend if speculative else None,
+                )
+                if not speculative:
+                    self.assertIsNone(info["speculative_draft_model_path"])
                 outputs = []
                 # Cover a single request and a batch with distinct lengths/content.
                 for prompts, answers in [
@@ -180,10 +194,19 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
                         self.assertEqual(result["text"].strip(), answer, result)
                         meta = result["meta_info"]
                         self.assertGreater(meta["completion_tokens"], 0)
-                        self.assertGreater(meta.get("spec_verify_ct", 0), 0, meta)
-                        self.assertGreater(
-                            meta.get("spec_num_proposed_drafts", 0), 0, meta
-                        )
+                        if speculative:
+                            self.assertGreater(meta.get("spec_verify_ct", 0), 0, meta)
+                            self.assertGreater(
+                                meta.get("spec_num_proposed_drafts", 0), 0, meta
+                            )
+                            self.assertGreater(
+                                meta.get("spec_accepted_drafts", 0), 0, meta
+                            )
+                        else:
+                            self.assertEqual(meta.get("spec_verify_ct", 0), 0, meta)
+                            self.assertEqual(
+                                meta.get("spec_num_proposed_drafts", 0), 0, meta
+                            )
                 return outputs
             except Exception:
                 log_file.flush()
@@ -193,6 +216,9 @@ class TestNpuSpeculativeMoeA2AQwen36(CustomTestCase):
                 if process is not None:
                     kill_process_tree(process.pid)
                     process.wait(timeout=30)
+
+    def test_main_only(self):
+        self._run_backend("main_only", None, speculative=False)
 
     def test_draft_backend_override(self):
         inherited = self._run_backend("inherited", None)
