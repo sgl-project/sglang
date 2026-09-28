@@ -15,7 +15,7 @@ from sglang.srt.layers.attention import aiter_mla_gluon as mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _GLUON_FN = "sglang.srt.layers.attention.aiter_mla_gluon._gluon_fn"
 

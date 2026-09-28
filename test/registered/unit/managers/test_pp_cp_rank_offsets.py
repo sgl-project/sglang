@@ -23,7 +23,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _published_topology():

@@ -10,7 +10,7 @@ from sglang.srt.models.deepseek_v2 import pp_stage_needs_embedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _pp_group(*, rank: int, size: int) -> SimpleNamespace:

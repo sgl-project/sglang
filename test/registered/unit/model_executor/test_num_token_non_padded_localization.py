@@ -19,7 +19,7 @@ second table locks that MoE input x layout x CP decision.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
 from contextlib import contextmanager

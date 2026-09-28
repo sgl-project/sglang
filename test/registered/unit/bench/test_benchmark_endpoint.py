@@ -8,7 +8,7 @@ from sglang.benchmark.endpoint import launch_or_reuse_server
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _noop_launch_server(server_args):
