@@ -1,0 +1,770 @@
+--- a/python/sglang/srt/sampling/bad_words_device.py
++++ b/python/sglang/srt/sampling/bad_words_device.py
+@@ -6,6 +6,7 @@
+ """
+ 
+ from dataclasses import dataclass
++from typing import Optional
+ 
+ import torch
+ import triton
+@@ -111,25 +112,54 @@
+     )
+ 
+ 
+-class DeviceState:
+-    def __init__(self, words, history, device, epoch=0):
+-        words = sorted(set(tuple(w) for w in words))
+-        self.count = len(words)
+-        self.prefix = max((len(w) - 1 for w in words), default=0)
++@dataclass(frozen=True)
++class BadWordsRequestSpec:
++    """Immutable tokenized constraints; constructed once per request generation."""
++
++    words: tuple
++    flat: tuple
++    offsets: tuple
++    prefix: int
++
++    @classmethod
++    def build(cls, words):
++        words = tuple(sorted(set(tuple(w) for w in words)))
++        if any(not w or any(type(t) is not int or t < 0 for t in w) for w in words):
++            raise ValueError("bad_words requires nonempty sequences of token IDs")
++        prefix = max((len(w) - 1 for w in words), default=0)
+         if (
+-            self.count > MAX_WORDS
++            len(words) > MAX_WORDS
+             or sum(map(len, words)) > MAX_WORD_TOKENS
+-            or self.prefix > MAX_PREFIX
++            or prefix > MAX_PREFIX
+         ):
+             raise ValueError(
+                 "CUDA bad_words exceeds limits: 1024 sequences, "
+                 "16384 total tokens, 257 tokens per sequence"
+             )
+-        self.capacity = max(1, self.prefix)
+         flat, offsets = [], [0]
+         for word in words:
+             flat.extend(word)
+             offsets.append(len(flat))
++        return cls(words, tuple(flat), tuple(offsets), prefix)
++
++
++class DeviceState:
++    """Request-owned state, independent of batch row and KV allocation slot.
++
++    Retraction replaces this object. In-flight contexts keep the old generation
++    alive; a late commit can therefore never modify the replacement generation.
++    """
++
++    def __init__(self, words, history, device, epoch=0):
++        self.spec = (
++            words
++            if isinstance(words, BadWordsRequestSpec)
++            else BadWordsRequestSpec.build(words)
++        )
++        self.count = len(self.spec.words)
++        self.prefix = self.spec.prefix
++        self.capacity = max(1, self.prefix)
++        flat, offsets = self.spec.flat, self.spec.offsets
+         suffix = list(history[-self.capacity :])
+         self.state = _upload(
+             [len(suffix), len(suffix) % self.capacity]
+@@ -146,12 +176,19 @@
+ 
+ 
+ @dataclass
++class _StreamFence:
++    # Runtime ordering evolves; the request-to-row mapping remains immutable.
++    event: torch.cuda.Event
++
++
++@dataclass(frozen=True)
+ class DeviceBatch:
+-    states: list
++    states: tuple
++    batch_size: int
+     table: torch.Tensor
+     max_words: int
+     max_prefix: int
+-    ready: torch.cuda.Event
++    ready: _StreamFence
+ 
+     @classmethod
+     def build(cls, params, device, commit_mask=None):
+@@ -160,13 +197,9 @@
+             if not param or not param.get("bad_words_token_ids"):
+                 continue
+             req = param["__req__"]
+-            epoch = getattr(req, "retraction_count", 0)
+-            state = getattr(req, "_bad_words_device", None)
+-            if state is None or state.epoch != epoch:
+-                state = DeviceState(
+-                    param["bad_words_token_ids"], req.output_ids, device, epoch
+-                )
+-                req._bad_words_device = state
++            state = BadWordsStateManager.acquire(
++                req, param["bad_words_token_ids"], device
++            )
+             states.append(state)
+             entries.append(
+                 [
+@@ -185,17 +218,18 @@
+         ready = torch.cuda.Event()
+         ready.record()
+         return cls(
+-            states,
++            tuple(states),
++            len(params),
+             table,
+             max(s.count for s in states),
+             max(s.prefix for s in states),
+-            ready,
++            _StreamFence(ready),
+         )
+ 
+     def use(self):
+         stream = torch.cuda.current_stream(self.table.device)
+         self.table.record_stream(stream)
+-        events = {self.ready, *(state.ready for state in self.states)}
++        events = {self.ready.event, *(state.ready for state in self.states)}
+         for event in events:
+             stream.wait_event(event)
+         for state in self.states:
+@@ -207,7 +241,15 @@
+             raise ValueError(
+                 "CUDA bad_words requires float32 contiguous vocabulary logits"
+             )
+-        if width > 1 and (drafts is None or not drafts.is_contiguous()):
++        if width < 1 or logits.ndim != 2 or logits.shape[0] != self.batch_size * width:
++            raise ValueError("bad_words logits rows do not match the sampling context")
++        if width > 1 and (
++            drafts is None
++            or not drafts.is_contiguous()
++            or tuple(drafts.shape) != (self.batch_size, width)
++            or drafts.device != logits.device
++            or drafts.dtype not in (torch.int32, torch.int64)
++        ):
+             raise ValueError("CUDA bad_words requires contiguous DFlash candidates")
+         self.use()
+         _match[(len(self.states), width, self.max_words)](
+@@ -224,11 +266,29 @@
+         # Order both reads and writes if a request moves to another CUDA stream.
+         event = torch.cuda.Event()
+         event.record()
+-        self.ready = event
++        # The completion event subsumes the table upload dependency. Keeping
++        # both would insert an unnecessary stream wait on every commit.
++        self.ready.event = event
+         for state in self.states:
+             state.ready = event
+ 
+     def commit(self, tokens, lengths=None):
++        if tokens.ndim not in (1, 2) or tokens.shape[0] != self.batch_size:
++            raise ValueError("accepted tokens do not match the sampling context")
++        if tokens.device != self.table.device or tokens.dtype not in (
++            torch.int32,
++            torch.int64,
++        ):
++            raise ValueError(
++                "accepted tokens must be integer IDs on the context device"
++            )
++        if lengths is not None and (
++            lengths.shape != (self.batch_size,)
++            or lengths.device != tokens.device
++            or lengths.dtype not in (torch.int32, torch.int64)
++            or not lengths.is_contiguous()
++        ):
++            raise ValueError("accepted lengths do not match the sampling context")
+         if self.max_prefix == 0:
+             return  # Single-token bans never depend on generated history.
+         self.use()
+@@ -245,19 +305,67 @@
+         self._record_ready()
+ 
+ 
++class BadWordsStateManager:
++    """Admission/resume boundary for persistent request state.
++
++    A request owns its handle, so cancellation/finish needs no global slot free
++    list. Contexts retain state tensors until their last asynchronous GPU use.
++    No pointer table is shared or overwritten between in-flight invocations.
++    """
++
++    @staticmethod
++    def acquire(req, words, device):
++        epoch = getattr(req, "retraction_count", 0)
++        state = getattr(req, "bad_words_state", None)
++        if state is None or state.epoch != epoch:
++            state = DeviceState(words, req.output_ids, device, epoch)
++            req.bad_words_state = state
++        return state
++
++
++@dataclass
++class BadWordsSamplingContext:
++    """One mask/accept transaction with an immutable request-to-row snapshot."""
++
++    view: DeviceBatch
++    verify_width: int
++    committed: bool = False
++
++    def commit_accepted(self, tokens, lengths=None):
++        if self.committed:
++            raise RuntimeError("bad_words accepted tokens were already committed")
++        # Mark only after successful validation/launch. This guards even a caller
++        # holding a second reference to this context, unlike clearing one field.
++        self.view.commit(tokens, lengths)
++        self.committed = True
++
++
+ def apply_device_bad_words(logits, sampling_info, width=1, drafts=None):
+-    # Mapping is invocation-local; retained states belong to requests, not rows.
+-    batch = DeviceBatch.build(
++    if getattr(sampling_info, "bad_words_context", None) is not None:
++        raise RuntimeError("previous bad_words sampling context was not consumed")
++    view = DeviceBatch.build(
+         sampling_info.custom_params, logits.device, sampling_info.bad_words_commit_mask
+     )
+-    sampling_info._bad_words_device_batch = batch
+-    if batch is not None:
+-        batch.apply(logits, width, drafts)
+-
+-
+-def commit_device_bad_words(sampling_info, tokens, lengths=None):
+-    if device_bad_words_enabled():
+-        batch = getattr(sampling_info, "_bad_words_device_batch", None)
+-        if batch is not None:
+-            batch.commit(tokens, lengths)
+-            sampling_info._bad_words_device_batch = None
++    if view is not None:
++        view.apply(logits, width, drafts)
++        sampling_info.bad_words_context = BadWordsSamplingContext(view, width)
++
++
++def take_bad_words_context(sampling_info) -> Optional[BadWordsSamplingContext]:
++    """Move invocation state out of batch metadata before acceptance work."""
++    if sampling_info is None:
++        return None
++    context = getattr(sampling_info, "bad_words_context", None)
++    sampling_info.bad_words_context = None
++    return context
++
++
++def commit_accepted_bad_words(context, tokens, lengths=None):
++    """Shared ordinary-decode / speculative-accept postprocessing boundary.
++
++    lengths includes accepted drafts and the replacement/bonus token. Rejected
++    drafts never enter history. Intermediate prefill chunks are disabled in the
++    view's immutable commit mask. Counts are trusted device acceptance output.
++    """
++    if context is not None:
++        context.commit_accepted(tokens, lengths)
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -24,6 +24,7 @@
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.schedule_batch import ScheduleBatch
++    from sglang.srt.sampling.bad_words_device import BadWordsSamplingContext
+     from sglang.srt.sampling.sampling_observer import SamplingObserver
+ 
+ 
+@@ -77,6 +78,7 @@
+ 
+     # Snapshot per-forward eligibility: middle prefill chunks sample pseudo tokens.
+     bad_words_commit_mask: Optional[List[bool]] = None
++    bad_words_context: Optional[BadWordsSamplingContext] = None
+ 
+     # Used for deterministic sampling
+     sampling_seed: Optional[torch.Tensor] = None
+@@ -534,7 +536,7 @@
+     def copy_for_forward(self):
+         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+         self.update_penalties()
+-        return dataclasses.replace(self, penalizer_orchestrator=None)
++        return dataclasses.replace(self, penalizer_orchestrator=None, bad_words_context=None)
+ 
+ 
+ def merge_bias_tensor(
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -147,6 +147,7 @@
+     from typing import Any, Dict
+ 
+     from sglang.srt.configs.model_config import ModelConfig
++    from sglang.srt.sampling.bad_words_device import DeviceState
+     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+@@ -1268,6 +1269,7 @@
+ 
+         # The number of times this request has been retracted / preempted.
+         self.retraction_count = 0
++        self.bad_words_state: Optional[DeviceState] = None
+         self.retraction_mb_id = None
+ 
+         # For observability
+@@ -1886,6 +1888,8 @@
+         # Increment retraction count before resetting other state. We should not reset this
+         # since we are tracking the total number of retractions for each request.
+         self.retraction_count += 1
++        # In-flight sampling contexts keep the previous generation alive.
++        self.bad_words_state = None
+ 
+         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+         self.routed_experts = None
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -27,7 +27,8 @@
+ )
+ from sglang.srt.sampling.bad_words_device import (
+     apply_device_bad_words,
+-    commit_device_bad_words,
++    commit_accepted_bad_words,
++    take_bad_words_context,
+     device_bad_words_enabled,
+ )
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+@@ -181,6 +182,7 @@
+         # Preprocess logits (custom processors and NaN handling)
+         _trace_e2e_sampler("preprocess_enter")
+         logits = self._preprocess_logits(logits, sampling_info)
++        bad_words_context = take_bad_words_context(sampling_info)
+         _trace_e2e_sampler("preprocess_returned")
+         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
+         return_sampling_mask = sampling_mask_batch_indices is not None
+@@ -319,7 +321,7 @@
+                     sampling_mask_capture,
+                 )
+ 
+-        commit_device_bad_words(sampling_info, batch_next_token_ids)
++        commit_accepted_bad_words(bad_words_context, batch_next_token_ids)
+         _trace_e2e_sampler("forward_returned")
+         return batch_next_token_ids
+ 
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -52,7 +52,10 @@
+     get_spec,
+     mamba_track_grid,
+ )
+-from sglang.srt.sampling.bad_words_device import commit_device_bad_words
++from sglang.srt.sampling.bad_words_device import (
++    commit_accepted_bad_words,
++    take_bad_words_context,
++)
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+@@ -2860,6 +2863,8 @@
+                 draft_tokens=verify_tokens_2d,
+             )
+ 
++        bad_words_context = take_bad_words_context(sampling_info)
++
+         # Constrain every chain position before accept picks from it.
+         if grammar_mask is not None:
+             grammar_mask.apply(logits_output.next_token_logits)
+@@ -2930,7 +2935,7 @@
+                 attn_backend=verify_attn_backend,
+             )
+ 
+-        commit_device_bad_words(sampling_info, out_tokens, commit_lens)
++        commit_accepted_bad_words(bad_words_context, out_tokens, commit_lens)
+         if new_seq_lens is None:
+             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+         if on_publish is not None:
+--- a/test/registered/unit/sampling/test_bad_words_device.py
++++ b/test/registered/unit/sampling/test_bad_words_device.py
+@@ -80,7 +80,7 @@
+             for row, param in enumerate(entries):
+                 histories[row].extend(output[row][: counts[row]])
+                 if param:
+-                    state = param["__req__"]._bad_words_device
++                    state = param["__req__"].bad_words_state
+                     assert suffix(state) == histories[row][-state.capacity :]
+ 
+ 
+@@ -108,8 +108,8 @@
+         batch.apply(logits)
+     second.synchronize()
+     assert torch.isneginf(logits[0, 4]).item()
+-    assert suffix(entry["__req__"]._bad_words_device) == [1, 2, 3]
+-    old = entry["__req__"]._bad_words_device
++    assert suffix(entry["__req__"].bad_words_state) == [1, 2, 3]
++    old = entry["__req__"].bad_words_state
+     entry["__req__"].retraction_count += 1
+     entry["__req__"].output_ids = [7, 8]
+     batch = DeviceBatch.build([entry], "cuda")
+@@ -152,7 +152,7 @@
+     lengths = torch.tensor([3], device="cuda")
+     # Warm up Triton compilation before intercepting runtime host reads.
+     apply_custom_logit_processor(logits, info, 4, draft)
+-    device_module.commit_device_bad_words(info, output, lengths)
++    device_module.commit_accepted_bad_words(device_module.take_bad_words_context(info), output, lengths)
+     for name in ("tolist", "item", "cpu", "numpy"):
+         original = getattr(torch.Tensor, name)
+ 
+@@ -162,7 +162,7 @@
+ 
+         monkeypatch.setattr(torch.Tensor, name, checked)
+     apply_custom_logit_processor(logits, info, 4, draft)
+-    device_module.commit_device_bad_words(info, output, lengths)
++    device_module.commit_accepted_bad_words(device_module.take_bad_words_context(info), output, lengths)
+ 
+ 
+ def test_pointer_lifetime_on_new_request_and_cross_stream():
+@@ -175,7 +175,7 @@
+         logits = torch.zeros(1, 32, device="cuda")
+         batch.apply(logits)
+     replacement = params([[3, 4]], [3])
+-    entry["__req__"]._bad_words_device = None
++    entry["__req__"].bad_words_state = None
+     del entry, batch
+     with torch.cuda.stream(first):
+         other = DeviceBatch.build([replacement], "cuda")
+--- /dev/null
++++ b/test/registered/unit/sampling/test_bad_words_context.py
+@@ -0,0 +1,134 @@
++import dataclasses
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.sampling.bad_words_device import (
++    BadWordsRequestSpec,
++    BadWordsSamplingContext,
++    DeviceBatch,
++    apply_device_bad_words,
++    take_bad_words_context,
++    commit_accepted_bad_words,
++)
++from test_bad_words_device import params, suffix, check_mask
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++
++
++def info(entries, mask=None):
++    return SimpleNamespace(
++        custom_params=entries, bad_words_commit_mask=mask, bad_words_context=None
++    )
++
++
++def test_exactly_once_and_unconsumed_guard():
++    e = params([[1, 2, 3]], [1])
++    i = info([e])
++    apply_device_bad_words(torch.zeros(1, 32, device="cuda"), i)
++    with pytest.raises(RuntimeError, match="not consumed"):
++        apply_device_bad_words(torch.zeros(1, 32, device="cuda"), i)
++    context = take_bad_words_context(i)
++    assert take_bad_words_context(i) is None
++    commit_accepted_bad_words(context, torch.tensor([2], device="cuda"))
++    with pytest.raises(RuntimeError, match="already committed"):
++        commit_accepted_bad_words(context, torch.tensor([9], device="cuda"))
++    assert suffix(e["__req__"].bad_words_state) == [1, 2]
++
++
++@pytest.mark.parametrize("count", [0, 1, 2, 4])
++def test_acceptance_rejection_bonus_and_stale_cpu_history(count):
++    e = params([[1, 2, 3], [2, 4], [7, 8, 9]], [1])
++    i = info([e])
++    draft = torch.tensor([[1, 2, 3, 8]], device="cuda")
++    apply_device_bad_words(torch.zeros(4, 32, device="cuda"), i, 4, draft)
++    context = take_bad_words_context(i)
++    # Tokens come from acceptance, including replacement/bonus, never raw draft.
++    output = [2, 7, 8, 9]
++    commit_accepted_bad_words(
++        context,
++        torch.tensor([output], device="cuda"),
++        torch.tensor([count], device="cuda"),
++    )
++    assert e["__req__"].output_ids == [1]  # Deliberately lagging CPU result handling.
++    view = DeviceBatch.build([e], "cuda")
++    check_mask(view, [e], [[1] + output[:count]], None, 1)
++    assert suffix(view.states[0]) == ([1] + output[:count])[-view.states[0].capacity :]
++
++
++def test_retraction_generation_and_late_old_commit():
++    e = params([[1, 2, 3]], [1])
++    old = BadWordsSamplingContext(DeviceBatch.build([e], "cuda"), 1)
++    e["__req__"].retraction_count += 1
++    e["__req__"].output_ids = [7, 8]
++    new = DeviceBatch.build([e], "cuda")
++    old.commit_accepted(torch.tensor([2], device="cuda"))
++    assert suffix(old.view.states[0]) == [1, 2]
++    assert suffix(new.states[0]) == [7, 8]
++    assert old.view.states[0] is not new.states[0]
++
++
++def test_snapshot_reorder_mixed_requests_and_chunk_mask():
++    a, b = params([[1, 2, 3]], [1]), params([[4, 5, 6]], [4])
++    entries, mask = [a, None, b], [False, True, True]
++    c = BadWordsSamplingContext(DeviceBatch.build(entries, "cuda", mask), 1)
++    entries.reverse()
++    mask[:] = [True, True, False]
++    c.commit_accepted(torch.tensor([2, 9, 5], device="cuda"))
++    assert suffix(a["__req__"].bad_words_state) == [1]
++    assert suffix(b["__req__"].bad_words_state) == [4, 5]
++    with pytest.raises(dataclasses.FrozenInstanceError):
++        c.view.batch_size = 42
++
++
++def test_invalid_launch_shapes_rejected_before_kernel():
++    e = params([[1, 2]], [1])
++    view = DeviceBatch.build([e], "cuda")
++    with pytest.raises(ValueError):
++        view.apply(
++            torch.zeros(4, 32, device="cuda"),
++            4,
++            torch.zeros(1, 3, device="cuda", dtype=torch.int64),
++        )
++    c = BadWordsSamplingContext(view, 1)
++    with pytest.raises(ValueError):
++        c.commit_accepted(torch.tensor([1, 2], device="cuda"))
++    assert not c.committed
++    c.commit_accepted(torch.tensor([3], device="cuda"))
++
++
++@pytest.mark.parametrize("words", [[[]], [[-1]], [[True]], [[1.0]]])
++def test_invalid_spec(words):
++    with pytest.raises(ValueError):
++        BadWordsRequestSpec.build(words)
++
++
++def test_cancel_release_does_not_keep_state_in_global_registry():
++    import gc, weakref
++
++    e = params([[1, 2]], [1])
++    view = DeviceBatch.build([e], "cuda")
++    state_ref = weakref.ref(view.states[0])
++    del e
++    assert state_ref() is not None  # In-flight view owns old request state.
++    del view
++    gc.collect()
++    assert state_ref() is None
++
++
++def test_forward_snapshot_does_not_alias_pending_context():
++    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
++
++    source = SamplingBatchInfo(
++        temperatures=torch.ones(1, 1), top_ps=torch.ones(1),
++        top_ks=torch.ones(1, dtype=torch.int32), min_ps=torch.zeros(1),
++        is_all_greedy=True, is_any_greedy=True, need_top_p_sampling=False,
++        need_top_k_sampling=False, need_min_p_sampling=False, vocab_size=32,
++        penalizer_orchestrator=SimpleNamespace(is_required=False),
++    )
++    marker = object()
++    source.bad_words_context = marker
++    snapshot = source.copy_for_forward()
++    assert snapshot.bad_words_context is None
++    assert source.bad_words_context is marker
+--- /dev/null
++++ b/test/registered/unit/sampling/test_vllm_parity.py
+@@ -0,0 +1,94 @@
++import random
++import torch
++import pytest
++from sglang.srt.sampling.bad_words_device import DeviceBatch
++from test_bad_words_device import params, check_mask
++from vllm_reference_kernel import apply_bad_words
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_full_mask_parity_with_pinned_vllm_v2_kernel():
++    rng = random.Random(7429)
++    for trial in range(100):
++        bs, width = rng.randint(1, 8), rng.choice([1, 2, 4, 16])
++        words, histories, prompts = [], [], []
++        for r in range(bs):
++            h = [rng.randrange(8) for _ in range(rng.randrange(20))]
++            w = (
++                [
++                    [rng.randrange(8) for _ in range(rng.randint(1, 15))]
++                    for _ in range(rng.randint(1, 20))
++                ]
++                if r % 3 != 1
++                else []
++            )
++            # Guarantee some matches against histories as well as random misses.
++            if h and w:
++                w += [h[-min(3, len(h)) :] + [9]]
++            words.append(w)
++            histories.append(h)
++            prompts.append([rng.randrange(8) for _ in range(rng.randint(1, 12))])
++        if not any(words):
++            continue
++        order = list(range(bs))
++        rng.shuffle(order)
++        slots = torch.tensor(order, dtype=torch.int32, device="cuda").repeat_interleave(
++            width
++        )
++        all_ids = torch.zeros(bs, 64, dtype=torch.int32, device="cuda")
++        flat = torch.zeros(bs, 512, dtype=torch.int32, device="cuda")
++        offsets = torch.zeros(bs, 32, dtype=torch.int32, device="cuda")
++        counts = torch.tensor([len(w) for w in words], dtype=torch.int32, device="cuda")
++        prompt_len = torch.tensor(
++            [len(p) for p in prompts], dtype=torch.int32, device="cuda"
++        )
++        total_len = torch.tensor(
++            [len(p) + len(h) for p, h in zip(prompts, histories)],
++            dtype=torch.int32,
++            device="cuda",
++        )
++        for r in range(bs):
++            ids = prompts[r] + histories[r]
++            all_ids[r, : len(ids)] = torch.tensor(ids, device="cuda")
++            tokens = [t for word in words[r] for t in word]
++            ends = [0]
++            for word in words[r]:
++                ends.append(ends[-1] + len(word))
++            if tokens:
++                flat[r, : len(tokens)] = torch.tensor(tokens, device="cuda")
++            offsets[r, : len(ends)] = torch.tensor(ends, device="cuda")
++        draft = torch.tensor(
++            [[rng.randrange(8) for _ in range(width)] for _ in range(bs)],
++            dtype=torch.int32,
++            device="cuda",
++        )
++        ref = torch.zeros(bs * width, 32, device="cuda")
++        apply_bad_words(
++            ref,
++            slots,
++            flat,
++            offsets,
++            counts,
++            all_ids,
++            prompt_len,
++            total_len,
++            draft.flatten(),
++            torch.arange(width, device="cuda").repeat(bs),
++            max(map(len, words)),
++        )
++        entries = [params(words[r], histories[r]) if words[r] else None for r in order]
++        view = DeviceBatch.build(entries, "cuda")
++        actual = torch.zeros_like(ref)
++        view.apply(actual, width, draft if width > 1 else None)
++        assert torch.equal(torch.isneginf(actual), torch.isneginf(ref)), (
++            trial,
++            width,
++            order,
++        )
++        check_mask(
++            view,
++            entries,
++            [histories[r] for r in order],
++            draft if width > 1 else None,
++            width,
++        )
+--- /dev/null
++++ b/test/registered/unit/sampling/vllm_reference_kernel.py
+@@ -0,0 +1,106 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Kernel/functions extracted without modification from vLLM commit
++# ccfd1cea75eff8956c5d08b15a7eaec8891642e9:
++# vllm/v1/worker/gpu/sample/bad_words.py
++import torch
++import triton
++import triton.language as tl
++
++@triton.jit
++def _bad_words_kernel(
++    logits_ptr,
++    logits_stride,
++    expanded_idx_mapping_ptr,
++    bad_word_token_ids_ptr,
++    bad_word_token_ids_stride,
++    bad_word_offsets_ptr,
++    bad_word_offsets_stride,
++    num_bad_words_ptr,
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    prompt_len_ptr,
++    total_len_ptr,
++    input_ids_ptr,
++    expanded_local_pos_ptr,
++):
++    token_idx = tl.program_id(0).to(tl.int64)
++    bw_idx = tl.program_id(1)
++
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
++    num_bad_words = tl.load(num_bad_words_ptr + req_state_idx)
++
++    if bw_idx >= num_bad_words:
++        return
++
++    pos = tl.load(expanded_local_pos_ptr + token_idx)
++    cur_req_first_pos = token_idx - pos
++
++    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
++    total_len = tl.load(total_len_ptr + req_state_idx)
++    output_len = total_len - prompt_len
++    effective_len = output_len + pos
++
++    bd_offsets_base = bad_word_offsets_ptr + req_state_idx * bad_word_offsets_stride
++    bd_tokens_base = bad_word_token_ids_ptr + req_state_idx * bad_word_token_ids_stride
++    output_base = all_token_ids_ptr + req_state_idx * all_token_ids_stride + prompt_len
++
++    start = tl.load(bd_offsets_base + bw_idx)
++    end = tl.load(bd_offsets_base + bw_idx + 1)
++    bad_word_len = end - start
++    prefix_len = bad_word_len - 1
++
++    if prefix_len > effective_len:
++        return
++
++    last_token = tl.load(bd_tokens_base + end - 1)
++    match = 1
++    for i in range(prefix_len):
++        expected = tl.load(bd_tokens_base + start + i)
++        actual_pos = effective_len - prefix_len + i
++
++        from_spec_input = actual_pos >= output_len
++        if from_spec_input:
++            # input_ids at local position 0 is the last committed token;
++            # draft tokens start at local position 1.
++            spec_offset = actual_pos - output_len
++            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
++        else:
++            actual = tl.load(output_base + actual_pos)
++
++        match = match & (expected == actual)
++
++    if match:
++        tl.store(logits_ptr + token_idx * logits_stride + last_token, -float("inf"))
++
++
++def apply_bad_words(
++    logits: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    bad_word_token_ids: torch.Tensor,
++    bad_word_offsets: torch.Tensor,
++    num_bad_words: torch.Tensor,
++    all_token_ids: torch.Tensor,
++    prompt_len: torch.Tensor,
++    total_len: torch.Tensor,
++    input_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    max_num_bad_words: int,
++) -> None:
++    num_tokens = logits.shape[0]
++    _bad_words_kernel[(num_tokens, max_num_bad_words)](
++        logits,
++        logits.stride(0),
++        expanded_idx_mapping,
++        bad_word_token_ids,
++        bad_word_token_ids.stride(0),
++        bad_word_offsets,
++        bad_word_offsets.stride(0),
++        num_bad_words,
++        all_token_ids,
++        all_token_ids.stride(0),
++        prompt_len,
++        total_len,
++        input_ids,
++        expanded_local_pos,
++    )

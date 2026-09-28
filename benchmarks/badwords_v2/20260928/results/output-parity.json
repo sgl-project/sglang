@@ -1,0 +1,30 @@
+{
+  "equal": 5419,
+  "total": 5440,
+  "differing_cases": [
+    {
+      "mode": "regular",
+      "case": "active1",
+      "concurrency": 8,
+      "cross_variant_equal": [
+        63,
+        62
+      ],
+      "requests_per_round": 64,
+      "baseline_cross_round_equal": 64,
+      "candidate-clean_cross_round_equal": 61
+    },
+    {
+      "mode": "dflash",
+      "case": "active1",
+      "concurrency": 8,
+      "cross_variant_equal": [
+        61,
+        49
+      ],
+      "requests_per_round": 64,
+      "baseline_cross_round_equal": 56,
+      "candidate-clean_cross_round_equal": 48
+    }
+  ]
+}

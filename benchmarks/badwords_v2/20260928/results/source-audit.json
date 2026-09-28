@@ -1,0 +1,22 @@
+{
+  "python/sglang/srt/sampling/bad_words_device.py": {
+    "baseline": "ffc80fe1a5260050443f762f3cd6b7a76791b5adf93f336d93dbd2ac4632f434",
+    "candidate": "62f1fc9059943eebfd4c220296a6446a4872c8783e818b8f2e2f31030c4844d1"
+  },
+  "python/sglang/srt/sampling/sampling_batch_info.py": {
+    "baseline": "b3e746e92a12241647f629bd06580a60a70d91a5cf4628549ca8ae21b203030d",
+    "candidate": "11237a462a00a778553f580cab65535c9ddca5d85aba32d0af590062f1f4680c"
+  },
+  "python/sglang/srt/managers/schedule_batch.py": {
+    "baseline": "06777e7b4c8a1d0b978a42c0370cf359a552fe7a23db411262f650db19755f7d",
+    "candidate": "0d45ec9c42c01c552ac8fef84d43503284aa3503405b30723145c2d01ec8920d"
+  },
+  "python/sglang/srt/layers/sampler.py": {
+    "baseline": "e906287b27482ec4ce8fa07148f18b40f9c183874cab63672c0ba2dc573d84e3",
+    "candidate": "c3641ae737ec4aca7f415e7e28cb208a6b3c0814ebfbe4e744b3633321277967"
+  },
+  "python/sglang/srt/speculative/dflash_worker_v2.py": {
+    "baseline": "a9fd5c63f37d4e4ae358ee84b37eaa09f8fa8c4f6b519f57e173fe561cd8cfd5",
+    "candidate": "1caa245895d4e408867ab2a613a7f65f7e020484b6ece9adc417b4cee0f6efc3"
+  }
+}

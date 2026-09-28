@@ -1,0 +1,1770 @@
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index d1509a7..919e5a3 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -342,6 +342,7 @@ class CompletionRequest(BaseModel):
+     echo: bool = False
+     frequency_penalty: float = 0.0
+     logit_bias: Optional[Dict[str, float]] = None
++    bad_words: Optional[List[str]] = None
+     logprobs: Optional[int] = None
+     max_tokens: int = 16
+     n: int = 1
+@@ -856,6 +857,7 @@ class ChatCompletionRequest(BaseModel):
+     )
+     frequency_penalty: float = 0.0
+     logit_bias: Optional[Dict[str, float]] = None
++    bad_words: Optional[List[str]] = None
+     logprobs: bool = False
+     top_logprobs: Optional[int] = None
+     max_tokens: Optional[int] = Field(
+@@ -1145,6 +1147,7 @@ class ChatCompletionRequest(BaseModel):
+             "ignore_eos": self.ignore_eos,
+             "skip_special_tokens": self.skip_special_tokens,
+             "logit_bias": self.logit_bias,
++            "bad_words": self.bad_words,
+             "custom_params": self.custom_params,
+             "sampling_seed": self.seed,
+             "spaces_between_special_tokens": spaces_between_special_tokens,
+diff --git a/python/sglang/srt/entrypoints/openai/serving_completions.py b/python/sglang/srt/entrypoints/openai/serving_completions.py
+index b7da6fd..eeef8e7 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_completions.py
++++ b/python/sglang/srt/entrypoints/openai/serving_completions.py
+@@ -167,6 +167,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
+             "ignore_eos": request.ignore_eos,
+             "skip_special_tokens": request.skip_special_tokens,
+             "logit_bias": request.logit_bias,
++            "bad_words": request.bad_words,
+             "custom_params": request.custom_params,
+             "sampling_seed": request.seed,
+         }
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index d5ee8d8..4fc01d4 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -21,6 +21,15 @@ from sglang.srt.layers.logprob_processor import (
+     OutputLogprobProcessor,
+ )
+ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
++from sglang.srt.sampling.custom_logit_processor import (
++    BadWordsLogitsProcessor,
++    has_bad_words_processor,
++)
++from sglang.srt.sampling.bad_words_device import (
++    apply_device_bad_words,
++    commit_device_bad_words,
++    device_bad_words_enabled,
++)
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.utils.async_probe import sanitize_nan_logits
+@@ -310,6 +319,7 @@ class Sampler(nn.Module):
+                     sampling_mask_capture,
+                 )
+ 
++        commit_device_bad_words(sampling_info, batch_next_token_ids)
+         _trace_e2e_sampler("forward_returned")
+         return batch_next_token_ids
+ 
+@@ -936,6 +946,7 @@ def apply_custom_logit_processor(
+     logits: torch.Tensor,
+     sampling_batch_info: SamplingBatchInfo,
+     num_tokens_in_batch: int = 1,
++    draft_tokens: Optional[torch.Tensor] = None,
+ ):
+     """Apply custom logit processors to the logits.
+     This function will modify the logits in-place.
+@@ -949,29 +960,59 @@ def apply_custom_logit_processor(
+         f"({num_tokens_in_batch})"
+     )
+ 
++    # DFLASH column zero is the already committed bonus token, not a draft.
++    # Position j predicts against H + candidates[1:j+1], including the bonus row.
++    if (
++        num_tokens_in_batch > 1
++        and draft_tokens is None
++        and has_bad_words_processor(sampling_batch_info)
++    ):
++        raise ValueError("Multi-position bad_words matching requires draft tokens.")
++    draft_rows = None
++    if (
++        draft_tokens is not None
++        and has_bad_words_processor(sampling_batch_info)
++        and not device_bad_words_enabled()
++    ):
++        if tuple(draft_tokens.shape) != (len(sampling_batch_info), num_tokens_in_batch):
++            raise ValueError("DFLASH candidate shape does not match verify logits.")
++        draft_rows = draft_tokens.tolist()
++
+     for _, (
+         processor,
+         batch_mask,
+     ) in sampling_batch_info.custom_logit_processor.items():
++        if (
++            isinstance(processor, BadWordsLogitsProcessor)
++            and device_bad_words_enabled()
++        ):
++            apply_device_bad_words(
++                logits, sampling_batch_info, num_tokens_in_batch, draft_tokens
++            )
++            continue
+         # Get the batch indices that need to be processed
+-        batch_indices = batch_mask.nonzero(as_tuple=True)[0]
++        batch_indices = [i for i, enabled in enumerate(batch_mask.tolist()) if enabled]
+ 
+         assert batch_mask.shape[0] == len(sampling_batch_info), (
+             f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
+             f"sampling_batch_info ({len(sampling_batch_info)})"
+         )
+-        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+-        custom_params = [
+-            sampling_batch_info.custom_params[i]
+-            for i in batch_indices
+-            for _ in range(num_tokens_in_batch)
+-        ]
+-
+-        # Apply the processor to the logits
+-        logits[batch_mask] = processor(
+-            logits[batch_mask],
+-            custom_params,
+-        )
++        if isinstance(processor, BadWordsLogitsProcessor):
++            processor.apply_batch(
++                logits,
++                sampling_batch_info.custom_params,
++                batch_indices,
++                num_tokens_in_batch,
++                draft_rows,
++            )
++        else:
++            batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
++            custom_params = [
++                sampling_batch_info.custom_params[i]
++                for i in batch_indices
++                for _ in range(num_tokens_in_batch)
++            ]
++            logits[batch_mask] = processor(logits[batch_mask], custom_params)
+ 
+         logger.debug(
+             f"Custom logit processor {processor.__class__.__name__} is applied."
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 743c8af..dc5898c 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -312,6 +312,9 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
+ from sglang.srt.platforms import current_platform
+ from sglang.srt.plugins import load_plugins
+ from sglang.srt.rust_server.server import RustServer
++from sglang.srt.sampling.custom_logit_processor import (
++    has_bad_words_processor,
++)
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
+ from sglang.srt.session.session_controller import SessionController
+@@ -2047,11 +2050,24 @@ class Scheduler(
+             and len(self.result_queue) > 0
+         )
+ 
++        # CPU suffix matching needs the previous committed output, including
++        # every accepted draft and the bonus token. Drain through the normal
++        # result lifecycle before forwarding a batch that uses bad words.
++        need_bad_words_sync = (
++            batch is not None
++            and len(self.result_queue) > 0
++            and has_bad_words_processor(batch.sampling_info)
++            and (
++                os.environ.get("SGLANG_BAD_WORDS_BACKEND", "python") != "cuda"
++                or os.environ.get("SGLANG_BAD_WORDS_KEEP_SYNC", "0") == "1"
++            )
++        )
++
+         # Algorithms that support grammar overlap advance the FSM inside verify()
+         # via the grammar barrier (overlapping the target forward), which resolves
+         # whatever result is still pending in the queue — including the
+         # extend->decode boundary — so no grammar-specific overlap disable is needed.
+-        return disable_overlap_for_batch or need_grammar_sync
++        return disable_overlap_for_batch or need_grammar_sync or need_bad_words_sync
+ 
+     def _advance_pending_grammar(self):
+         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 1b63fb6..57762c7 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -153,7 +153,11 @@ from sglang.srt.runtime_context import (
+     get_serving,
+     get_spec,
+ )
+-from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
++from sglang.srt.sampling.custom_logit_processor import (
++    prepare_bad_words_request,
++    supports_sampling_mask,
++    validate_bad_words_request,
++)
+ from sglang.srt.sampling.sampling_params import SamplingParams
+ from sglang.srt.server_args import (
+     PortArgs,
+@@ -1462,10 +1466,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             custom_params = dict(sampling_kwargs.get("custom_params") or {})
+             custom_params["thinking_budget"] = obj.max_thinking_tokens
+             sampling_kwargs["custom_params"] = custom_params
++        # String bans are an ingress option; keep the Python/Rust IPC schema unchanged.
++        bad_words = sampling_kwargs.get("bad_words")
++        if "bad_words" in sampling_kwargs:
++            sampling_kwargs = dict(sampling_kwargs)
++            sampling_kwargs.pop("bad_words")
+         sampling_params = self.sampling_params_class(**sampling_kwargs)
+         sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
+ 
++        if isinstance(obj, GenerateReqInput) and bad_words is not None:
++            obj.custom_logit_processor = prepare_bad_words_request(
++                sampling_params,
++                self.tokenizer,
++                obj.custom_logit_processor,
++                bad_words=bad_words,
++                enabled=get_exec().features.enable_custom_logit_processor,
++            )
++            if obj.return_sampling_mask and obj.custom_logit_processor:
++                raise ValueError("bad_words does not yet support return_sampling_mask.")
++
++        if isinstance(obj, GenerateReqInput) and obj.custom_logit_processor:
++            if os.environ.get("SGLANG_BAD_WORDS_BACKEND", "python") == "cuda":
++                from sglang.srt.sampling.custom_logit_processor import (
++                    BadWordsLogitsProcessor,
++                    CustomLogitProcessor,
++                )
++
++                if isinstance(
++                    CustomLogitProcessor.from_str(obj.custom_logit_processor),
++                    BadWordsLogitsProcessor,
++                ):
++                    if (
++                        get_parallel().tp_size != 1
++                        or get_parallel().pp_size != 1
++                        or get_parallel().dp_size != 1
++                        or get_disagg().disaggregation_mode != "null"
++                    ):
++                        raise ValueError(
++                            "CUDA bad_words currently supports only "
++                            "single-device, non-disaggregated serving"
++                        )
++            validate_bad_words_request(
++                obj.custom_logit_processor,
++                sampling_params,
++                self.model_config.vocab_size,
++                enabled=get_exec().features.enable_custom_logit_processor,
++                speculative_algorithm=get_spec().speculative_algorithm,
++                disable_overlap_schedule=get_schedule().disable_overlap_schedule,
++            )
++
+         # Build return object
+         if isinstance(obj, GenerateReqInput):
+             session_params = (
+diff --git a/python/sglang/srt/sampling/custom_logit_processor.py b/python/sglang/srt/sampling/custom_logit_processor.py
+index 48ea396..7899507 100644
+--- a/python/sglang/srt/sampling/custom_logit_processor.py
++++ b/python/sglang/srt/sampling/custom_logit_processor.py
+@@ -1,6 +1,8 @@
+ import json
++import os
+ from abc import ABC, abstractmethod
+ from array import array
++from collections import OrderedDict
+ from functools import lru_cache
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+ 
+@@ -58,6 +60,304 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
+         return logits
+ 
+ 
++_BAD_WORDS_BACKEND = os.environ.get("SGLANG_BAD_WORDS_BACKEND", "python")
++if _BAD_WORDS_BACKEND not in ("python", "cuda", "rust", "rust_parallel"):
++    raise ValueError(
++        "SGLANG_BAD_WORDS_BACKEND must be python, cuda, rust, or rust_parallel"
++    )
++
++
++@lru_cache(maxsize=1)
++def _rust_bad_words_components():
++    try:
++        from _sglang_bad_words import Matcher, match_batch
++    except ImportError as exc:
++        raise RuntimeError(
++            "Rust bad_words backend requires the optional sglang-bad-words extension."
++        ) from exc
++    return Matcher, match_batch
++
++
++class BadWordsLogitsProcessor(CustomLogitProcessor):
++    """Block token sequences in generated output, excluding the prompt.
++
++    Pass bad_words_token_ids (list of non-empty lists) through custom_params.
++    Overlap scheduling synchronizes committed CPU history before this processor.
++    DFLASH supplies a separate effective history for each verification position.
++    """
++
++    @staticmethod
++    def _compiled(params):
++        # Cache on the request, not the processor shared by unrelated requests.
++        # Sampling parameters are immutable for a request's lifetime.
++        req = params["__req__"]
++        words = params["bad_words_token_ids"]
++        cached = getattr(req, "_bad_words_prefix_index", None)
++        if cached is None or cached[0] is not words:
++            by_length = {}
++            for word in words:
++                prefix = tuple(word[:-1])
++                by_length.setdefault(len(prefix), {}).setdefault(prefix, set()).add(
++                    word[-1]
++                )
++            index = tuple(
++                (length, prefixes) for length, prefixes in sorted(by_length.items())
++            )
++            cached = (words, index, max(by_length, default=0))
++            req._bad_words_prefix_index = cached
++        return cached[1], cached[2]
++
++    @staticmethod
++    def _collect(index, history, row, rows, tokens):
++        matched = None
++        for length, prefixes in index:
++            if length > len(history):
++                break
++            suffix = tuple(history[-length:]) if length else ()
++            banned = prefixes.get(suffix)
++            if banned:
++                matched = banned if matched is None else matched | banned
++        if matched:
++            # Different matching prefixes can exclude the same final token.
++            # Give index_put unique coordinates, even though all values are -inf.
++            rows.extend([row] * len(matched))
++            tokens.extend(matched)
++
++    @staticmethod
++    def _mask(logits, rows, tokens):
++        if rows:
++            # One small transfer and one sparse update; never gather full logits.
++            coordinates = torch.tensor(
++                [rows, tokens], dtype=torch.long, device=logits.device
++            )
++            logits[coordinates[0], coordinates[1]] = -float("inf")
++        return logits
++
++    @staticmethod
++    def _apply_rust_batch(
++        logits, custom_params, batch_indices, width, draft_rows, *, parallel
++    ):
++        matcher_type, match_batch = _rust_bad_words_components()
++        matchers, histories = [], []
++        for i in batch_indices:
++            params = custom_params[i]
++            req = params["__req__"]
++            words = params["bad_words_token_ids"]
++            cached = getattr(req, "_bad_words_rust_index", None)
++            if cached is None or cached[0] is not words:
++                matcher = matcher_type(words)
++                cached = (words, matcher, matcher.max_prefix)
++                req._bad_words_rust_index = cached
++            _, matcher, max_prefix = cached
++            matchers.append(matcher)
++            histories.append(list(req.output_ids[-max_prefix:]) if max_prefix else [])
++        candidates = (
++            [draft_rows[i] for i in batch_indices] if draft_rows is not None else None
++        )
++        rows, tokens = match_batch(
++            matchers, histories, candidates, batch_indices, width, parallel=parallel
++        )
++        return BadWordsLogitsProcessor._mask(logits, rows, tokens)
++
++    def apply_batch(self, logits, custom_params, batch_indices, width, draft_rows):
++        if _BAD_WORDS_BACKEND in ("rust", "rust_parallel"):
++            return self._apply_rust_batch(
++                logits,
++                custom_params,
++                batch_indices,
++                width,
++                draft_rows,
++                parallel=_BAD_WORDS_BACKEND == "rust_parallel",
++            )
++        rows, tokens = [], []
++        for i in batch_indices:
++            params = custom_params[i]
++            index, max_prefix = self._compiled(params)
++            history = params["__req__"].output_ids
++            # Bound the history copy independently of output length.
++            effective = list(history[-max_prefix:]) if max_prefix else []
++            for position in range(width):
++                if position and max_prefix:
++                    effective.append(draft_rows[i][position])
++                    if len(effective) > max_prefix:
++                        del effective[0]
++                self._collect(index, effective, i * width + position, rows, tokens)
++        return self._mask(logits, rows, tokens)
++
++    def __call__(self, logits, custom_param_list, *, histories=None):
++        rows, tokens = [], []
++        for row, params in enumerate(custom_param_list):
++            index, _ = self._compiled(params)
++            history = (
++                params["__req__"].output_ids if histories is None else histories[row]
++            )
++            self._collect(index, history, row, rows, tokens)
++        return self._mask(logits, rows, tokens)
++
++
++def has_bad_words_processor(sampling_info):
++    """Inspect processor objects without reading GPU batch masks."""
++    return sampling_info is not None and any(
++        isinstance(processor, BadWordsLogitsProcessor)
++        for processor, _ in (sampling_info.custom_logit_processor or {}).values()
++    )
++
++
++def encode_bad_words(bad_words, tokenizer):
++    """Encode both word-start forms using vLLM's prefix-space policy.
++
++    Reference: vLLM 1668e5976db7457631b84a6a570c64319581b1e7,
++    SamplingParams.update_from_tokenizer.
++    """
++    if not isinstance(bad_words, list) or any(
++        not isinstance(word, str) or not word for word in bad_words
++    ):
++        raise ValueError("bad_words must be a list of non-empty strings.")
++    if not bad_words:
++        return []
++    if tokenizer is None:
++        raise ValueError("bad_words requires an initialized tokenizer.")
++    # The tokenizer configuration is fixed for a serving process. Keep cache
++    # ownership local to that tokenizer and bound both entries and key length.
++    cache = getattr(tokenizer, "_sglang_bad_words_cache", None)
++    if cache is None:
++        cache = OrderedDict()
++        tokenizer._sglang_bad_words_cache = cache
++    normalized = list(dict.fromkeys(word.lstrip() for word in bad_words))
++    resolved = {}
++    missing = []
++    for word in normalized:
++        value = cache.get(word)
++        if value is None:
++            missing.append(word)
++        else:
++            cache.move_to_end(word)
++            resolved[word] = value
++    if missing:
++        texts = [form for word in missing for form in (word, " " + word)]
++        if hasattr(tokenizer, "batch_encode_plus"):
++            encoded = tokenizer.batch_encode_plus(
++                texts,
++                add_special_tokens=False,
++                return_attention_mask=False,
++                return_token_type_ids=False,
++            )["input_ids"]
++        else:
++            encoded = [
++                tokenizer.encode(text, add_special_tokens=False) for text in texts
++            ]
++        for word, plain, spaced in zip(missing, encoded[::2], encoded[1::2]):
++            if not plain:
++                raise ValueError(
++                    "bad_words entries must tokenize to at least one token."
++                )
++            forms = [tuple(plain)]
++            if spaced and spaced[0] != plain[0] and len(spaced) == len(plain):
++                forms.append(tuple(spaced))
++            value = tuple(forms)
++            resolved[word] = value
++            if len(word) <= 1024:
++                cache[word] = value
++                while len(cache) > 1024:
++                    cache.popitem(last=False)
++    sequences = [ids for word in normalized for ids in resolved[word]]
++    # Preserve order; repeated words should not add per-token work.
++    return [list(ids) for ids in dict.fromkeys(tuple(ids) for ids in sequences)]
++
++
++def prepare_bad_words_request(
++    sampling_params, tokenizer, serialized_processor, *, bad_words, enabled
++):
++    """Turn the string API into the same internal token-ID processor contract."""
++    if bad_words is None:
++        return serialized_processor
++    params = sampling_params.custom_params or {}
++    if "bad_words_token_ids" in params:
++        raise ValueError("Pass either bad_words or bad_words_token_ids, not both.")
++    if serialized_processor:
++        raise ValueError("bad_words cannot be combined with custom_logit_processor.")
++    if bad_words and not enabled:
++        raise ValueError("bad_words requires --enable-custom-logit-processor.")
++    sequences = encode_bad_words(bad_words, tokenizer)
++    if not sequences:
++        return None
++    sampling_params.custom_params = {**params, "bad_words_token_ids": sequences}
++    return BadWordsLogitsProcessor.to_str()
++
++
++def validate_bad_words_request(
++    serialized_processor,
++    sampling_params,
++    vocab_size,
++    *,
++    enabled,
++    speculative_algorithm,
++    disable_overlap_schedule,
++):
++    """Validate the opt-in processor before scheduling."""
++    if not serialized_processor or not enabled:
++        return
++    processor = CustomLogitProcessor.from_str(serialized_processor)
++    if not isinstance(processor, BadWordsLogitsProcessor):
++        return
++    if speculative_algorithm and speculative_algorithm != "DFLASH":
++        raise ValueError(
++            "BadWordsLogitsProcessor supports speculative decoding only with DFLASH."
++        )
++    if (
++        speculative_algorithm == "DFLASH"
++        and int(os.environ.get("SGLANG_SIMULATE_ACC_LEN", "0")) > 0
++    ):
++        raise ValueError(
++            "bad_words cannot be used with simulated speculative acceptance."
++        )
++    params = sampling_params.custom_params
++    words = params.get("bad_words_token_ids") if isinstance(params, dict) else None
++    if not isinstance(words, list):
++        raise ValueError(
++            "bad_words_token_ids must be a list of non-empty token ID lists."
++        )
++    for sequence in words:
++        if not isinstance(sequence, list) or not sequence:
++            raise ValueError(
++                "Each bad_words_token_ids sequence must be a non-empty list."
++            )
++        if any(
++            type(token) is not int or not 0 <= token < vocab_size for token in sequence
++        ):
++            raise ValueError(
++                "bad_words_token_ids must contain integer IDs within the vocabulary."
++            )
++    if _BAD_WORDS_BACKEND == "cuda":
++        if (
++            len(words) > 1024
++            or sum(map(len, words)) > 16384
++            or any(len(word) > 257 for word in words)
++        ):
++            raise ValueError(
++                "CUDA bad_words exceeds limits: 1024 sequences, "
++                "16384 total tokens, 257 tokens per sequence"
++            )
++    # Conservatively reserve one token this processor can never mask.
++    if len({sequence[-1] for sequence in words}) >= vocab_size:
++        raise ValueError("bad_words_token_ids may mask the entire vocabulary.")
++    # Additional hard masks require a request-level all-masked recovery path.
++    if any(
++        getattr(sampling_params, name, None)
++        for name in (
++            "json_schema",
++            "regex",
++            "ebnf",
++            "structural_tag",
++            "logit_bias",
++            "min_new_tokens",
++        )
++    ) or (params and "thinking_budget" in params):
++        raise ValueError(
++            "BadWordsLogitsProcessor does not yet support other hard sampling constraints."
++        )
++
++
+ def supports_sampling_mask(serialized_processor: str) -> bool:
+     """Hard exclusion preserves the relative logits needed for mask-based replay."""
+     try:
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index fad02f2..0a4e1b4 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -13,7 +13,11 @@ from sglang.srt.constrained.base_grammar_backend import (
+     GrammarRow,
+ )
+ from sglang.srt.runtime_context import get_exec
+-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
++from sglang.srt.sampling.custom_logit_processor import (
++    CustomLogitProcessor,
++    BadWordsLogitsProcessor,
++    _BAD_WORDS_BACKEND,
++)
+ from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.utils.common import is_pin_memory_available
+@@ -71,6 +75,9 @@ class SamplingBatchInfo:
+         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
+     ] = None
+ 
++    # Snapshot per-forward eligibility: middle prefill chunks sample pseudo tokens.
++    bad_words_commit_mask: Optional[List[bool]] = None
++
+     # Used for deterministic sampling
+     sampling_seed: Optional[torch.Tensor] = None
+ 
+@@ -211,6 +218,7 @@ class SamplingBatchInfo:
+             penalizer_orchestrator=penalizer_orchestrator,
+             has_custom_logit_processor=has_custom_logit_processor,
+             custom_params=custom_params,
++            bad_words_commit_mask=[r is not batch.chunked_req for r in reqs],
+             custom_logit_processor=merged_custom_logit_processor,
+             device=device,
+             logit_bias=logit_bias,
+@@ -367,6 +375,10 @@ class SamplingBatchInfo:
+                     )
+                 )
+ 
++        if self.bad_words_commit_mask is not None:
++            self.bad_words_commit_mask = [
++                self.bad_words_commit_mask[i] for i in keep_indices
++            ]
+         self.adjusted_filter_batch(keep_indices, keep_indices_device)
+ 
+     def _filter_batch_custom_logit_processor(
+@@ -376,9 +388,16 @@ class SamplingBatchInfo:
+         self.custom_logit_processor = {
+             k: (p, mask[keep_indices_device])
+             for k, (p, mask) in self.custom_logit_processor.items()
+-            if torch.any(
+-                mask[keep_indices_device]
+-            )  # ignore the custom logit processor whose mask is all False
++            if (
++                any(
++                    self.custom_params[i]
++                    and self.custom_params[i].get("bad_words_token_ids")
++                    for i in keep_indices
++                )
++                if isinstance(p, BadWordsLogitsProcessor)
++                and _BAD_WORDS_BACKEND == "cuda"
++                else torch.any(mask[keep_indices_device])
++            )  # CUDA bad words uses CPU membership metadata, never a GPU scalar.
+         }
+         self.custom_params = [self.custom_params[i] for i in keep_indices]
+ 
+@@ -454,6 +473,13 @@ class SamplingBatchInfo:
+ 
+         self_len = len(self)
+         other_len = len(other)
++        if (
++            self.bad_words_commit_mask is not None
++            or other.bad_words_commit_mask is not None
++        ):
++            self.bad_words_commit_mask = (
++                self.bad_words_commit_mask or [True] * self_len
++            ) + (other.bad_words_commit_mask or [True] * other_len)
+ 
+         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
+         # See note below on len(self) and len(other).
+diff --git a/python/sglang/srt/sampling/sampling_params.py b/python/sglang/srt/sampling/sampling_params.py
+index 286ada7..9ba3816 100644
+--- a/python/sglang/srt/sampling/sampling_params.py
++++ b/python/sglang/srt/sampling/sampling_params.py
+@@ -32,7 +32,7 @@ except ImportError:
+ _JsonScalar = Union[None, bool, int, float, str]
+ CustomParamValue = Union[
+     _JsonScalar,
+-    List[_JsonScalar],
++    List[Union[_JsonScalar, List[int]]],
+     Dict[str, _JsonScalar],
+ ]
+ 
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 098c34c..b9f4878 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -212,6 +212,7 @@ def apply_dflash_verify_logits_adjustments(
+     next_token_logits: torch.Tensor,
+     sampling_info: Any,
+     draft_token_num: int,
++    draft_tokens: Optional[torch.Tensor] = None,
+ ) -> None:
+     """Apply sampling-time logit adjustments for DFlash verify in place.
+ 
+@@ -240,6 +241,7 @@ def apply_dflash_verify_logits_adjustments(
+             next_token_logits,
+             sampling_info,
+             num_tokens_in_batch=draft_token_num,
++            draft_tokens=draft_tokens,
+         )
+ 
+     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index d64986b..08370d9 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
+     get_spec,
+     mamba_track_grid,
+ )
++from sglang.srt.sampling.bad_words_device import commit_device_bad_words
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+@@ -106,6 +107,7 @@ class _DFlashVerifyRuntimeState:
+     target_attn_backend: Any
+     target_graph_runner: Any
+ 
++
+ _FusedKVMaterializeHelper = None
+ 
+ 
+@@ -2855,6 +2857,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+                 draft_token_num=verify_width,
++                draft_tokens=verify_tokens_2d,
+             )
+ 
+         # Constrain every chain position before accept picks from it.
+@@ -2927,6 +2930,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 attn_backend=verify_attn_backend,
+             )
+ 
++        commit_device_bad_words(sampling_info, out_tokens, commit_lens)
+         if new_seq_lens is None:
+             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+         if on_publish is not None:
+--- /dev/null
++++ b/python/sglang/srt/sampling/bad_words_device.py
+@@ -0,0 +1,263 @@
++"""Request-owned CUDA bad-word suffixes; kernels run outside model CUDA graphs.
++
++Only committed generated tokens enter the ring. DFlash candidate column zero
++is already committed, so row j matches against H + candidates[1:j+1].
++Pointers are retained by DeviceBatch and recorded on each consuming stream.
++"""
++
++from dataclasses import dataclass
++
++import torch
++import triton
++import triton.language as tl
++
++from sglang.srt.sampling.custom_logit_processor import _BAD_WORDS_BACKEND
++
++# Explicit limits bound allocations and compilation; never silently truncate.
++MAX_WORDS = 1024
++MAX_WORD_TOKENS = 16384
++MAX_PREFIX = 256
++
++
++def device_bad_words_enabled():
++    return _BAD_WORDS_BACKEND == "cuda"
++
++
++@triton.jit
++def _match(
++    Table, Logits, Draft, STRIDE: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr
++):
++    request = tl.program_id(0)
++    pos = tl.program_id(1)
++    word = tl.program_id(2)
++    base = Table + request * 7
++    state = tl.load(base).to(tl.pointer_type(tl.int32))
++    tokens = tl.load(base + 1).to(tl.pointer_type(tl.int32))
++    offsets = tl.load(base + 2).to(tl.pointer_type(tl.int32))
++    row = tl.load(base + 3)
++    count = tl.load(base + 4)
++    capacity = tl.load(base + 5).to(tl.int32)
++    if word < count:
++        start = tl.load(offsets + word)
++        end = tl.load(offsets + word + 1)
++        length = end - start - 1
++        valid = tl.load(state)
++        head = tl.load(state + 1)
++        x = tl.arange(0, BLOCK)
++        # Logical index relative to the beginning of the retained history.
++        index = valid + pos - length + x
++        from_history = index < valid
++        ring_index = (head - valid + index + capacity) % capacity
++        history = tl.load(
++            state + 2 + ring_index, (x < length) & (index >= 0) & from_history, other=0
++        )
++        candidate = tl.full((BLOCK,), 0, tl.int32)
++        if WIDTH > 1:
++            candidate = tl.load(
++                Draft + row * WIDTH + index - valid + 1,
++                (x < length) & (index >= valid),
++                other=0,
++            )
++        actual = tl.where(from_history, history, candidate)
++        expected = tl.load(tokens + start + x, x < length, other=0)
++        matches = (valid + pos >= length) & (
++            tl.sum(((x < length) & (actual != expected)).to(tl.int32), 0) == 0
++        )
++        if matches:
++            terminal = tl.load(tokens + end - 1)
++            # Multiple matching words may have the same terminal token.
++            tl.atomic_xchg(
++                Logits + (row * WIDTH + pos) * STRIDE + terminal,
++                -float("inf"),
++                sem="relaxed",
++            )
++
++
++@triton.jit
++def _commit(
++    Table,
++    Tokens,
++    Lengths,
++    WIDTH: tl.constexpr,
++    HAS_LENGTHS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    request = tl.program_id(0)
++    base = Table + request * 7
++    state = tl.load(base).to(tl.pointer_type(tl.int32))
++    row = tl.load(base + 3)
++    capacity = tl.load(base + 5).to(tl.int32)
++    enabled = tl.load(base + 6)
++    if enabled:
++        count = WIDTH
++        if HAS_LENGTHS:
++            count = tl.load(Lengths + row)
++        head = tl.load(state + 1)
++        valid = tl.load(state)
++        # If count exceeds ring capacity, only the last capacity tokens write.
++        x = tl.arange(0, BLOCK)
++        start = tl.maximum(0, count - capacity)
++        index = start + x
++        value = tl.load(Tokens + row * WIDTH + index, index < count, other=0)
++        tl.store(state + 2 + (head + index) % capacity, value, index < count)
++        tl.store(state, tl.minimum(capacity, valid + count))
++        tl.store(state + 1, (head + count) % capacity)
++
++
++def _upload(values, dtype, device):
++    # Pinned staging keeps metadata uploads from synchronizing the forward stream.
++    return torch.tensor(values, dtype=dtype, pin_memory=True).to(
++        device, non_blocking=True
++    )
++
++
++class DeviceState:
++    def __init__(self, words, history, device, epoch=0):
++        words = sorted(set(tuple(w) for w in words))
++        self.count = len(words)
++        self.prefix = max((len(w) - 1 for w in words), default=0)
++        if (
++            self.count > MAX_WORDS
++            or sum(map(len, words)) > MAX_WORD_TOKENS
++            or self.prefix > MAX_PREFIX
++        ):
++            raise ValueError(
++                "CUDA bad_words exceeds limits: 1024 sequences, "
++                "16384 total tokens, 257 tokens per sequence"
++            )
++        self.capacity = max(1, self.prefix)
++        flat, offsets = [], [0]
++        for word in words:
++            flat.extend(word)
++            offsets.append(len(flat))
++        suffix = list(history[-self.capacity :])
++        self.state = _upload(
++            [len(suffix), len(suffix) % self.capacity]
++            + suffix
++            + [0] * (self.capacity - len(suffix)),
++            dtype=torch.int32,
++            device=device,
++        )
++        self.tokens = _upload(flat, torch.int32, device)
++        self.offsets = _upload(offsets, torch.int32, device)
++        self.epoch = epoch
++        self.ready = torch.cuda.Event()
++        self.ready.record()
++
++
++@dataclass
++class DeviceBatch:
++    states: list
++    table: torch.Tensor
++    max_words: int
++    max_prefix: int
++    ready: torch.cuda.Event
++
++    @classmethod
++    def build(cls, params, device, commit_mask=None):
++        entries, states = [], []
++        for row, param in enumerate(params or []):
++            if not param or not param.get("bad_words_token_ids"):
++                continue
++            req = param["__req__"]
++            epoch = getattr(req, "retraction_count", 0)
++            state = getattr(req, "_bad_words_device", None)
++            if state is None or state.epoch != epoch:
++                state = DeviceState(
++                    param["bad_words_token_ids"], req.output_ids, device, epoch
++                )
++                req._bad_words_device = state
++            states.append(state)
++            entries.append(
++                [
++                    state.state.data_ptr(),
++                    state.tokens.data_ptr(),
++                    state.offsets.data_ptr(),
++                    row,
++                    state.count,
++                    state.capacity,
++                    int(commit_mask is None or commit_mask[row]),
++                ]
++            )
++        if not entries:
++            return None
++        table = _upload(entries, torch.int64, device)
++        ready = torch.cuda.Event()
++        ready.record()
++        return cls(
++            states,
++            table,
++            max(s.count for s in states),
++            max(s.prefix for s in states),
++            ready,
++        )
++
++    def use(self):
++        stream = torch.cuda.current_stream(self.table.device)
++        self.table.record_stream(stream)
++        events = {self.ready, *(state.ready for state in self.states)}
++        for event in events:
++            stream.wait_event(event)
++        for state in self.states:
++            for tensor in (state.state, state.tokens, state.offsets):
++                tensor.record_stream(stream)
++
++    def apply(self, logits, width=1, drafts=None):
++        if logits.dtype != torch.float32 or logits.stride(1) != 1:
++            raise ValueError(
++                "CUDA bad_words requires float32 contiguous vocabulary logits"
++            )
++        if width > 1 and (drafts is None or not drafts.is_contiguous()):
++            raise ValueError("CUDA bad_words requires contiguous DFlash candidates")
++        self.use()
++        _match[(len(self.states), width, self.max_words)](
++            self.table,
++            logits,
++            drafts if drafts is not None else self.table,
++            logits.stride(0),
++            width,
++            triton.next_power_of_2(max(1, self.max_prefix)),
++        )
++        self._record_ready()
++
++    def _record_ready(self):
++        # Order both reads and writes if a request moves to another CUDA stream.
++        event = torch.cuda.Event()
++        event.record()
++        self.ready = event
++        for state in self.states:
++            state.ready = event
++
++    def commit(self, tokens, lengths=None):
++        if self.max_prefix == 0:
++            return  # Single-token bans never depend on generated history.
++        self.use()
++        tokens = tokens.contiguous()
++        width = 1 if tokens.ndim == 1 else tokens.shape[1]
++        _commit[(len(self.states),)](
++            self.table,
++            tokens,
++            lengths if lengths is not None else self.table,
++            width,
++            lengths is not None,
++            triton.next_power_of_2(min(width, max(1, self.max_prefix))),
++        )
++        self._record_ready()
++
++
++def apply_device_bad_words(logits, sampling_info, width=1, drafts=None):
++    # Mapping is invocation-local; retained states belong to requests, not rows.
++    batch = DeviceBatch.build(
++        sampling_info.custom_params, logits.device, sampling_info.bad_words_commit_mask
++    )
++    sampling_info._bad_words_device_batch = batch
++    if batch is not None:
++        batch.apply(logits, width, drafts)
++
++
++def commit_device_bad_words(sampling_info, tokens, lengths=None):
++    if device_bad_words_enabled():
++        batch = getattr(sampling_info, "_bad_words_device_batch", None)
++        if batch is not None:
++            batch.commit(tokens, lengths)
++            sampling_info._bad_words_device_batch = None
+--- /dev/null
++++ b/test/registered/unit/sampling/test_bad_words_device.py
+@@ -0,0 +1,187 @@
++"""Reference comparisons for device masking and accepted-history commits."""
++
++import random
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.sampling.bad_words_device import DeviceBatch, DeviceState
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++
++
++def params(words, history=()):
++    return {
++        "bad_words_token_ids": words,
++        "__req__": SimpleNamespace(output_ids=list(history), retraction_count=0),
++    }
++
++
++def suffix(state):
++    values = state.state.cpu().tolist()
++    valid, head = values[:2]
++    return [values[2 + (head - valid + i) % state.capacity] for i in range(valid)]
++
++
++def check_mask(batch, entries, histories, drafts, width):
++    logits = torch.zeros(len(entries) * width, 32, device="cuda")
++    batch.apply(logits, width, drafts)
++    expected = torch.zeros_like(logits, device="cpu", dtype=torch.bool)
++    candidates = drafts.cpu().tolist() if drafts is not None else None
++    for row, param in enumerate(entries):
++        if not param:
++            continue
++        for position in range(width):
++            effective = histories[row] + (
++                candidates[row][1 : position + 1] if candidates else []
++            )
++            for word in param["bad_words_token_ids"]:
++                prefix = word[:-1]
++                if not prefix or (
++                    len(effective) >= len(prefix)
++                    and effective[-len(prefix) :] == prefix
++                ):
++                    expected[row * width + position, word[-1]] = True
++    assert torch.equal(torch.isneginf(logits).cpu(), expected)
++
++
++def test_random_acceptance_and_ring_wrap():
++    rng = random.Random(193)
++    for case in range(100):
++        bs, width = rng.randint(1, 6), rng.choice([1, 2, 4, 16])
++        entries, histories = [], []
++        for row in range(bs):
++            history = [rng.randrange(8) for _ in range(rng.randrange(12))]
++            words = [
++                [rng.randrange(8) for _ in range(rng.randint(1, 12))]
++                for _ in range(rng.randint(1, 20))
++            ]
++            words += words[:2]  # duplicate terminals / complete sequences
++            entries.append(params(words, history) if row % 3 != 1 else None)
++            histories.append(history)
++        for step in range(5):
++            order = list(range(bs))
++            rng.shuffle(order)
++            entries = [entries[i] for i in order]
++            histories = [histories[i] for i in order]
++            batch = DeviceBatch.build(entries, "cuda")
++            draft = torch.tensor(
++                [[rng.randrange(8) for _ in range(width)] for _ in range(bs)],
++                device="cuda",
++            )
++            check_mask(batch, entries, histories, draft if width > 1 else None, width)
++            counts = [rng.randint(1, width) for _ in range(bs)]
++            output = [[rng.randrange(8) for _ in range(width)] for _ in range(bs)]
++            batch.commit(
++                torch.tensor(output, device="cuda"),
++                torch.tensor(counts, device="cuda", dtype=torch.int32),
++            )
++            for row, param in enumerate(entries):
++                histories[row].extend(output[row][: counts[row]])
++                if param:
++                    state = param["__req__"]._bad_words_device
++                    assert suffix(state) == histories[row][-state.capacity :]
++
++
++def test_overlap_prefixes_and_prompt_exclusion():
++    entry = params([[1, 2], [1, 2, 1], [2, 1], [1], [2, 1]])
++    batch = DeviceBatch.build([entry], "cuda")
++    check_mask(batch, [entry], [[]], torch.tensor([[9, 1, 2, 1]], device="cuda"), 4)
++    batch.commit(
++        torch.tensor([[1, 2, 3, 4]], device="cuda"), torch.tensor([2], device="cuda")
++    )
++    check_mask(batch, [entry], [[1, 2]], None, 1)
++
++
++def test_chunk_skip_resume_and_stream_order():
++    entry = params([[1, 2, 3, 4]], [1])
++    first, second = torch.cuda.Stream(), torch.cuda.Stream()
++    with torch.cuda.stream(first):
++        batch = DeviceBatch.build([entry], "cuda", [False])
++        batch.apply(torch.zeros(1, 32, device="cuda"))
++        batch.commit(torch.tensor([9], device="cuda"))
++    with torch.cuda.stream(second):
++        batch = DeviceBatch.build([entry], "cuda")
++        batch.commit(torch.tensor([[2, 3]], device="cuda"))
++        logits = torch.zeros(1, 32, device="cuda")
++        batch.apply(logits)
++    second.synchronize()
++    assert torch.isneginf(logits[0, 4]).item()
++    assert suffix(entry["__req__"]._bad_words_device) == [1, 2, 3]
++    old = entry["__req__"]._bad_words_device
++    entry["__req__"].retraction_count += 1
++    entry["__req__"].output_ids = [7, 8]
++    batch = DeviceBatch.build([entry], "cuda")
++    assert batch.states[0] is not old
++    assert suffix(batch.states[0]) == [7, 8]
++
++
++def test_limits_and_long_prefix():
++    with pytest.raises(ValueError):
++        DeviceState([[1] * 258], [], "cuda")
++    history = list(range(8)) * 32
++    entry = params([history + [9]], history)
++    batch = DeviceBatch.build([entry], "cuda")
++    check_mask(batch, [entry], [history], None, 1)
++
++
++def test_hot_path_has_no_device_to_host_reads(monkeypatch):
++    import sglang.srt.sampling.bad_words_device as device_module
++    from sglang.srt.layers.sampler import apply_custom_logit_processor
++    from sglang.srt.sampling.custom_logit_processor import BadWordsLogitsProcessor
++
++    class Info:
++        custom_params = [params([[1, 2, 3], [1]])]
++        bad_words_commit_mask = [True]
++        custom_logit_processor = {
++            0: (
++                BadWordsLogitsProcessor(),
++                torch.ones(1, device="cuda", dtype=torch.bool),
++            )
++        }
++
++        def __len__(self):
++            return 1
++
++    info = Info()
++    monkeypatch.setattr(device_module, "_BAD_WORDS_BACKEND", "cuda")
++    logits = torch.zeros(4, 32, device="cuda")
++    draft = torch.tensor([[9, 1, 2, 4]], device="cuda")
++    output = torch.tensor([[1, 2, 4, 0]], device="cuda")
++    lengths = torch.tensor([3], device="cuda")
++    # Warm up Triton compilation before intercepting runtime host reads.
++    apply_custom_logit_processor(logits, info, 4, draft)
++    device_module.commit_device_bad_words(info, output, lengths)
++    for name in ("tolist", "item", "cpu", "numpy"):
++        original = getattr(torch.Tensor, name)
++
++        def checked(tensor, *args, _original=original, **kwargs):
++            assert not tensor.is_cuda, "hot path attempted a GPU-to-CPU read"
++            return _original(tensor, *args, **kwargs)
++
++        monkeypatch.setattr(torch.Tensor, name, checked)
++    apply_custom_logit_processor(logits, info, 4, draft)
++    device_module.commit_device_bad_words(info, output, lengths)
++
++
++def test_pointer_lifetime_on_new_request_and_cross_stream():
++    first, second = torch.cuda.Stream(), torch.cuda.Stream()
++    entry = params([[1, 2]], [1])
++    with torch.cuda.stream(first):
++        batch = DeviceBatch.build([entry], "cuda")
++    # Consume the mapping on another stream without a CPU synchronize.
++    with torch.cuda.stream(second):
++        logits = torch.zeros(1, 32, device="cuda")
++        batch.apply(logits)
++    replacement = params([[3, 4]], [3])
++    entry["__req__"]._bad_words_device = None
++    del entry, batch
++    with torch.cuda.stream(first):
++        other = DeviceBatch.build([replacement], "cuda")
++        other_logits = torch.zeros(1, 32, device="cuda")
++        other.apply(other_logits)
++    torch.cuda.synchronize()
++    assert torch.isneginf(logits[0, 2]).item()
++    assert not torch.isneginf(logits[0, 4]).item()
++    assert torch.isneginf(other_logits[0, 4]).item()
+--- /dev/null
++++ b/test/registered/unit/sampling/test_bad_words_processor.py
+@@ -0,0 +1,581 @@
++"""CPU coverage for multi-token bans, transport, and request validation."""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++import random
++import unittest
++from array import array
++from types import SimpleNamespace
++
++import msgspec
++import torch
++
++from sglang.srt.sampling.custom_logit_processor import (
++    BadWordsLogitsProcessor,
++    CustomLogitProcessor,
++    encode_bad_words,
++    prepare_bad_words_request,
++    validate_bad_words_request,
++)
++from sglang.srt.sampling.sampling_params import SamplingParams
++
++
++def params(words, history=(), prompt=()):
++    return {
++        "bad_words_token_ids": words,
++        "__req__": SimpleNamespace(
++            output_ids=array("q", history), origin_input_ids=array("q", prompt)
++        ),
++    }
++
++
++class TestBadWordsProcessor(unittest.TestCase):
++    def test_suffixes_and_batch_isolation(self):
++        entries = [
++            params([[1, 2], [3]], [1]),
++            params([[1, 2]], [4]),
++            params([[0, 1, 2], [1, 3], [1, 3]], [0, 1]),
++            params([[1, 2]], [], [1]),
++            params([], [1]),
++        ]
++        before = torch.arange(30, dtype=torch.float32).reshape(5, 6)
++        expected = before.clone()
++        expected[0, [2, 3]] = -float("inf")
++        expected[2, [2, 3]] = -float("inf")
++        actual = BadWordsLogitsProcessor()(before.clone(), entries)
++        self.assertTrue(torch.equal(actual, expected))
++        # Reordering/removing requests must not reuse another request's state.
++        order = [4, 2, 0]
++        actual = BadWordsLogitsProcessor()(
++            before[order].clone(), [entries[i] for i in order]
++        )
++        self.assertTrue(torch.equal(actual, expected[order]))
++
++    def test_random_reference_equivalence(self):
++        rng = random.Random(17)
++        for _ in range(300):
++            histories = [
++                [rng.randrange(16) for _ in range(rng.randrange(15))] for _ in range(4)
++            ]
++            words = [
++                [
++                    [rng.randrange(16) for _ in range(rng.randrange(1, 6))]
++                    for _ in range(rng.randrange(12))
++                ]
++                for _ in histories
++            ]
++            logits = torch.randn(4, 16)
++            expected = logits.clone()
++            # Reference semantics: ban precisely the last ID of a sequence
++            # whose preceding IDs are a suffix of generated history.
++            for row, (history, sequences) in enumerate(zip(histories, words)):
++                for sequence in sequences:
++                    n = len(sequence) - 1
++                    if (
++                        n <= len(history)
++                        and (history[-n:] if n else []) == sequence[:-1]
++                    ):
++                        expected[row, sequence[-1]] = -float("inf")
++            actual = BadWordsLogitsProcessor()(
++                logits, [params(w, h) for w, h in zip(words, histories)]
++            )
++            self.assertTrue(torch.equal(actual, expected))
++
++    def test_greedy_completion_is_blocked(self):
++        processor = CustomLogitProcessor.from_str(BadWordsLogitsProcessor.to_str())
++        entry = params([[1, 2]])
++        logits = torch.tensor([[0.0, 10.0, 9.0, 8.0]])
++        first = processor(logits.clone(), [entry]).argmax(-1).item()
++        self.assertEqual(first, 1)
++        entry["__req__"].output_ids.append(first)
++        logits = torch.tensor([[0.0, 1.0, 10.0, 9.0]])
++        second = processor(logits, [entry]).argmax(-1).item()
++        self.assertEqual(second, 3)
++
++    def test_nested_ids_survive_typed_msgpack(self):
++        original = SamplingParams(custom_params={"bad_words_token_ids": [[1, 2], [3]]})
++        restored = msgspec.msgpack.decode(
++            msgspec.msgpack.encode(original), type=SamplingParams
++        )
++        self.assertEqual(restored.custom_params, original.custom_params)
++
++    def validate(self, words, **overrides):
++        options = dict(
++            enabled=True, speculative_algorithm=None, disable_overlap_schedule=True
++        )
++        options.update(overrides)
++        validate_bad_words_request(
++            BadWordsLogitsProcessor.to_str(),
++            SamplingParams(custom_params={"bad_words_token_ids": words}),
++            16,
++            **options,
++        )
++
++    def test_validation(self):
++        self.validate([])
++        self.validate([[0], [1, 15]])
++        for words in (
++            None,
++            "foo",
++            [1],
++            [[]],
++            [[True]],
++            [[1.2]],
++            [[-1]],
++            [[16]],
++            [[i] for i in range(16)],
++        ):
++            with self.subTest(words=words), self.assertRaises(ValueError):
++                self.validate(words)
++
++    def test_unsupported_modes(self):
++        with self.assertRaisesRegex(ValueError, "speculative"):
++            self.validate([[1]], speculative_algorithm="EAGLE")
++        from unittest.mock import patch
++
++        with patch.dict("os.environ", {"SGLANG_SIMULATE_ACC_LEN": "3"}):
++            with self.assertRaisesRegex(ValueError, "simulated"):
++                self.validate([[1]], speculative_algorithm="DFLASH")
++        self.validate([[1]], disable_overlap_schedule=False)
++        self.validate(
++            [[1]], speculative_algorithm="DFLASH", disable_overlap_schedule=False
++        )
++
++    def test_other_constraints_rejected(self):
++        for extra in (
++            {"regex": "a"},
++            {"logit_bias": {"1": -100}},
++            {"min_new_tokens": 1},
++        ):
++            with self.subTest(extra=extra), self.assertRaisesRegex(
++                ValueError, "constraints"
++            ):
++                validate_bad_words_request(
++                    BadWordsLogitsProcessor.to_str(),
++                    SamplingParams(
++                        custom_params={"bad_words_token_ids": [[1]]}, **extra
++                    ),
++                    16,
++                    enabled=True,
++                    speculative_algorithm=None,
++                    disable_overlap_schedule=True,
++                )
++
++    def test_string_encoding_policy(self):
++        class Tokenizer:
++            def encode(self, text, add_special_tokens=False):
++                return {
++                    "blue moon": [1, 2],
++                    " blue moon": [3, 2],
++                    "中文": [4, 5],
++                    " 中文": [6, 4, 5],
++                    "same": [7],
++                    " same": [7],
++                    "": [],
++                    " ": [],
++                }[text]
++
++        tokenizer = Tokenizer()
++        self.assertEqual(
++            encode_bad_words(["blue moon", "中文", "same", " blue moon"], tokenizer),
++            [[1, 2], [3, 2], [4, 5], [7]],
++        )
++        self.assertEqual(encode_bad_words([], None), [])
++        for words in ("blue moon", [""], [1], ["   "]):
++            with self.subTest(words=words), self.assertRaises(ValueError):
++                encode_bad_words(words, tokenizer)
++        with self.assertRaisesRegex(ValueError, "tokenizer"):
++            encode_bad_words(["blue moon"], None)
++
++    def test_string_prepare_conflicts(self):
++        class Tokenizer:
++            def encode(self, text, add_special_tokens=False):
++                return [1, 2]
++
++        sampling = SamplingParams(custom_params={"unrelated": 4})
++        serialized = prepare_bad_words_request(
++            sampling,
++            Tokenizer(),
++            None,
++            bad_words=["word"],
++            enabled=True,
++        )
++        self.assertIsInstance(
++            CustomLogitProcessor.from_str(serialized), BadWordsLogitsProcessor
++        )
++        self.assertEqual(
++            sampling.custom_params, {"unrelated": 4, "bad_words_token_ids": [[1, 2]]}
++        )
++        with self.assertRaisesRegex(ValueError, "not both"):
++            prepare_bad_words_request(
++                sampling, Tokenizer(), None, bad_words=["word"], enabled=True
++            )
++        with self.assertRaisesRegex(ValueError, "custom_logit_processor"):
++            prepare_bad_words_request(
++                SamplingParams(),
++                Tokenizer(),
++                serialized,
++                bad_words=["word"],
++                enabled=True,
++            )
++        with self.assertRaisesRegex(ValueError, "enable"):
++            prepare_bad_words_request(
++                SamplingParams(), Tokenizer(), None, bad_words=["word"], enabled=False
++            )
++
++    def test_openai_chat_forwards_bad_words(self):
++
++        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
++
++        request = ChatCompletionRequest(
++            model="test",
++            messages=[{"role": "user", "content": "hello"}],
++            bad_words=["blue moon"],
++        )
++        self.assertEqual(
++            request.to_sampling_params(stop=[], model_generation_config={})[
++                "bad_words"
++            ],
++            ["blue moon"],
++        )
++
++    def test_sampler_mixed_batch(self):
++        from sglang.srt.layers.sampler import apply_custom_logit_processor
++
++        class Batch(SimpleNamespace):
++            def __len__(self):
++                return len(self.custom_params)
++
++        batch = Batch(
++            custom_params=[params([[1, 2]], [1]), {}, params([[1, 3]], [1])],
++            custom_logit_processor={
++                0: (BadWordsLogitsProcessor(), torch.tensor([True, False, True]))
++            },
++        )
++        logits = torch.zeros(3, 5)
++        apply_custom_logit_processor(logits, batch)
++        expected = torch.zeros(3, 5)
++        expected[0, 2] = expected[2, 3] = -float("inf")
++        self.assertTrue(torch.equal(logits, expected))
++
++    def test_request_preprocessing_and_transport(self):
++        from unittest.mock import MagicMock, patch
++
++        from sglang.srt.managers import tokenizer_manager as tm
++        from sglang.srt.managers.io_struct import (
++            GenerateReqInput,
++            _msgpack_decoder,
++            _msgpack_encoder,
++        )
++
++        manager = object.__new__(tm.TokenizerManager)
++        manager.preferred_sampling_params = None
++        manager.sampling_params_class = SamplingParams
++        manager.tokenizer = None
++        manager.model_config = SimpleNamespace(vocab_size=16)
++        request = GenerateReqInput(
++            input_ids=[4, 5],
++            sampling_params={"custom_params": {"bad_words_token_ids": [[1, 2]]}},
++            custom_logit_processor=BadWordsLogitsProcessor.to_str(),
++        )
++        request.normalize_batch_and_arguments()
++        manager.rid_to_state = {request.rid: SimpleNamespace(time_stats=MagicMock())}
++        with (
++            patch.object(
++                tm,
++                "get_exec",
++                return_value=SimpleNamespace(
++                    features=SimpleNamespace(enable_custom_logit_processor=True)
++                ),
++            ),
++            patch.object(
++                tm, "get_spec", return_value=SimpleNamespace(speculative_algorithm=None)
++            ),
++            patch.object(
++                tm,
++                "get_schedule",
++                return_value=SimpleNamespace(disable_overlap_schedule=True),
++            ),
++            patch.object(
++                tm,
++                "get_disagg",
++                return_value=SimpleNamespace(disaggregation_transfer_backend="nixl"),
++            ),
++        ):
++            result = manager._create_tokenized_object(request, "", [4, 5])
++            result.time_stats = None
++            decoded = _msgpack_decoder.decode(_msgpack_encoder.encode(result))
++            self.assertEqual(
++                decoded.sampling_params.custom_params["bad_words_token_ids"], [[1, 2]]
++            )
++            request.sampling_params["custom_params"]["bad_words_token_ids"] = [[16]]
++            with self.assertRaisesRegex(ValueError, "vocabulary"):
++                manager._create_tokenized_object(request, "", [4, 5])
++
++
++class TestBadWordsDFlash(unittest.TestCase):
++    def test_verify_positions_and_no_history_mutation(self):
++        from sglang.srt.layers.sampler import apply_custom_logit_processor
++
++        class Info(SimpleNamespace):
++            def __len__(self):
++                return len(self.custom_params)
++
++        entries = [
++            params([[1, 2], [2, 3], [3, 4]], [1]),
++            None,
++            params([[7, 1, 2], [4]], [7, 1]),
++        ]
++        info = Info(
++            custom_params=entries,
++            custom_logit_processor={
++                0: (BadWordsLogitsProcessor(), torch.tensor([True, False, True]))
++            },
++        )
++        candidates = torch.tensor([[1, 2, 3], [9, 2, 3], [1, 2, 3]])
++        logits = torch.zeros(9, 10)
++        apply_custom_logit_processor(logits, info, 3, draft_tokens=candidates)
++        expected = torch.zeros_like(logits)
++        expected[0, 2] = expected[1, 3] = expected[2, 4] = -float("inf")
++        expected[6, 2] = -float("inf")
++        expected[6:9, 4] = -float("inf")
++        self.assertTrue(torch.equal(logits, expected))
++        self.assertEqual(list(entries[0]["__req__"].output_ids), [1])
++        self.assertEqual(list(entries[2]["__req__"].output_ids), [7, 1])
++
++    def test_random_verify_reference(self):
++        from sglang.srt.layers.sampler import apply_custom_logit_processor
++
++        class Info(SimpleNamespace):
++            def __len__(self):
++                return len(self.custom_params)
++
++        rng = random.Random(73)
++        for width in (1, 2, 4, 16):
++            for _ in range(30):
++                histories = [
++                    [rng.randrange(8) for _ in range(rng.randrange(1, 12))]
++                    for _ in range(3)
++                ]
++                words = [
++                    [
++                        [rng.randrange(8) for _ in range(rng.randrange(1, 6))]
++                        for _ in range(15)
++                    ]
++                    for _ in histories
++                ]
++                candidates = [
++                    [h[-1]] + [rng.randrange(8) for _ in range(width - 1)]
++                    for h in histories
++                ]
++                info = Info(
++                    custom_params=[params(w, h) for w, h in zip(words, histories)],
++                    custom_logit_processor={
++                        0: (BadWordsLogitsProcessor(), torch.ones(3, dtype=torch.bool))
++                    },
++                )
++                actual = torch.randn(3 * width, 8)
++                expected = actual.clone()
++                for req, h in enumerate(histories):
++                    for pos in range(width):
++                        effective = h + candidates[req][1 : pos + 1]
++                        for word in words[req]:
++                            n = len(word) - 1
++                            if (
++                                n <= len(effective)
++                                and (effective[-n:] if n else []) == word[:-1]
++                            ):
++                                expected[req * width + pos, word[-1]] = -float("inf")
++                apply_custom_logit_processor(
++                    actual, info, width, draft_tokens=torch.tensor(candidates)
++                )
++                self.assertTrue(torch.equal(actual, expected))
++
++    def test_rejection_and_full_accept_bonus(self):
++        from sglang.srt.speculative.dflash_utils import (
++            apply_dflash_verify_logits_adjustments,
++            compute_dflash_correct_drafts_and_bonus,
++        )
++
++        class Info(SimpleNamespace):
++            def __len__(self):
++                return len(self.custom_params)
++
++        for banned, expected_accept, expected_bonus in [([2, 3], 1, 0), ([3, 4], 2, 0)]:
++            entry = params([banned], [1])
++            info = Info(
++                custom_params=[entry],
++                has_custom_logit_processor=True,
++                custom_logit_processor={
++                    0: (BadWordsLogitsProcessor(), torch.tensor([True]))
++                },
++                acc_linear_penalties=None,
++                penalizer_orchestrator=None,
++                grammar_mask=None,
++                logit_bias=None,
++            )
++            logits = torch.zeros(3, 8)
++            logits[0, 2] = logits[1, 3] = logits[2, 4] = 10
++            candidates = torch.tensor([[1, 2, 3]])
++            apply_dflash_verify_logits_adjustments(
++                next_token_logits=logits,
++                sampling_info=info,
++                draft_token_num=3,
++                draft_tokens=candidates,
++            )
++            accepted, bonus = compute_dflash_correct_drafts_and_bonus(
++                candidates=candidates, target_predict=logits.argmax(-1).view(1, 3)
++            )
++            self.assertEqual(accepted.item(), expected_accept)
++            self.assertEqual(bonus.item(), expected_bonus)
++            self.assertEqual(list(entry["__req__"].output_ids), [1])
++
++    def test_overlap_sync_only_for_bad_words_with_pending_results(self):
++        from unittest.mock import patch
++        from sglang.srt.managers.scheduler import Scheduler
++        from sglang.srt.sampling.custom_logit_processor import has_bad_words_processor
++
++        info = SimpleNamespace(
++            custom_logit_processor={
++                0: (BadWordsLogitsProcessor(), torch.tensor([True]))
++            }
++        )
++        batch = SimpleNamespace(
++            sampling_info=info,
++            forward_mode=SimpleNamespace(is_extend=lambda: False),
++            spec_algorithm=SimpleNamespace(is_none=lambda: True),
++        )
++        scheduler = SimpleNamespace(require_mlp_sync=False, result_queue=[object()])
++        with patch(
++            "sglang.srt.managers.scheduler.envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get",
++            return_value=False,
++        ):
++            self.assertTrue(
++                Scheduler.is_disable_overlap_for_batch(scheduler, batch, None)
++            )
++            scheduler.result_queue = []
++            self.assertFalse(
++                Scheduler.is_disable_overlap_for_batch(scheduler, batch, None)
++            )
++            scheduler.result_queue = [object()]
++            info.custom_logit_processor = None
++            self.assertFalse(
++                Scheduler.is_disable_overlap_for_batch(scheduler, batch, None)
++            )
++            self.assertFalse(
++                Scheduler.is_disable_overlap_for_batch(scheduler, None, None)
++            )
++        self.assertFalse(has_bad_words_processor(None))
++
++
++class TestBadWordsOptimized(unittest.TestCase):
++    def test_request_cache_lifetime_and_replacement(self):
++        processor = BadWordsLogitsProcessor()
++        entry = params([[1, 2]], [1])
++        processor(torch.zeros(1, 8), [entry])
++        cache = entry["__req__"]._bad_words_prefix_index
++        entry["__req__"].output_ids.append(3)
++        actual = processor(torch.zeros(1, 8), [entry])
++        self.assertFalse(torch.isneginf(actual).any())
++        self.assertIs(entry["__req__"]._bad_words_prefix_index, cache)
++        entry["bad_words_token_ids"] = [[3, 4]]
++        actual = processor(torch.zeros(1, 8), [entry])
++        self.assertTrue(torch.isneginf(actual[0, 4]))
++        self.assertIsNot(entry["__req__"]._bad_words_prefix_index, cache)
++
++    def test_no_hit_skips_sparse_write(self):
++        from unittest.mock import patch
++
++        logits = torch.randn(2, 8)
++        expected = logits.clone()
++        with patch("torch.tensor", side_effect=AssertionError("unexpected transfer")):
++            actual = BadWordsLogitsProcessor()(
++                logits, [params([[1, 2]], [3]), params([], [])]
++            )
++        self.assertIs(actual, logits)
++        self.assertTrue(torch.equal(actual, expected))
++
++    def test_sparse_update_preserves_storage_and_other_logits(self):
++        logits = torch.randn(2, 8)
++        expected = logits.clone()
++        expected[0, 2] = expected[0, 4] = expected[1, 7] = -float("inf")
++        actual = BadWordsLogitsProcessor()(
++            logits,
++            [params([[1, 2], [1, 2], [2], [4]], [1]), params([[7]])],
++        )
++        self.assertIs(actual, logits)
++        self.assertTrue(torch.equal(actual, expected))
++
++    def test_overlapping_prefixes_produce_unique_coordinates(self):
++        processor = BadWordsLogitsProcessor()
++        entry = params([[1, 2], [2], [0, 1, 2]], [0, 1])
++        index, _ = processor._compiled(entry)
++        rows, tokens = [], []
++        processor._collect(index, [0, 1], 3, rows, tokens)
++        self.assertEqual(rows, [3])
++        self.assertEqual(tokens, [2])
++
++    def test_batch_tokenizer_policy(self):
++        class Tokenizer:
++            def batch_encode_plus(self, texts, **kwargs):
++                self.texts = texts
++                return {"input_ids": [[1, 2], [3, 2], [4], [5, 4]]}
++
++        tokenizer = Tokenizer()
++        self.assertEqual(
++            encode_bad_words([" x", "y"], tokenizer), [[1, 2], [3, 2], [4]]
++        )
++        self.assertEqual(tokenizer.texts, ["x", " x", "y", " y"])
++
++    def test_tokenizer_cache_is_bounded_isolated_and_returns_copies(self):
++        class Tokenizer:
++            def __init__(self, token):
++                self.token = token
++                self.calls = 0
++
++            def encode(self, text, add_special_tokens=False):
++                self.calls += 1
++                return [self.token, len(text)]
++
++        first, second = Tokenizer(1), Tokenizer(2)
++        original = encode_bad_words(["word"], first)
++        original[0][0] = 9
++        self.assertEqual(encode_bad_words(["word"], first)[0][0], 1)
++        self.assertEqual(first.calls, 2)
++        self.assertEqual(encode_bad_words(["word"], second)[0][0], 2)
++        encode_bad_words([str(i) for i in range(1100)], first)
++        self.assertEqual(len(first._sglang_bad_words_cache), 1024)
++        self.assertNotIn("word", first._sglang_bad_words_cache)
++        encode_bad_words(["x" * 1025], first)
++        self.assertNotIn("x" * 1025, first._sglang_bad_words_cache)
++
++    def test_generic_processor_mixed_batch(self):
++        from sglang.srt.layers.sampler import apply_custom_logit_processor
++        from sglang.srt.sampling.custom_logit_processor import (
++            DisallowedTokensLogitsProcessor,
++        )
++
++        class Info(SimpleNamespace):
++            def __len__(self):
++                return len(self.custom_params)
++
++        info = Info(
++            custom_params=[{"token_ids": [2]}, None, {"token_ids": [2]}],
++            custom_logit_processor={
++                0: (
++                    DisallowedTokensLogitsProcessor(),
++                    torch.tensor([True, False, True]),
++                )
++            },
++        )
++        logits = torch.zeros(6, 8)
++        apply_custom_logit_processor(logits, info, 2)
++        expected = torch.zeros_like(logits)
++        expected[[0, 1, 4, 5], 2] = -float("inf")
++        self.assertTrue(torch.equal(logits, expected))
++
++
++if __name__ == "__main__":
++    unittest.main()

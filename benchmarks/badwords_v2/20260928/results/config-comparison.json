@@ -1,0 +1,10 @@
+{
+  "regular": {
+    "command_equal": true,
+    "env_equal_except_source": true
+  },
+  "dflash": {
+    "command_equal": true,
+    "env_equal_except_source": true
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "patch_replay": "passed",
+  "verified_final_files": 17,
+  "python_syntax": "passed",
+  "test_report_xml": "passed",
+  "sensitive_pattern_scan": "passed",
+  "public_main_runtime_tests": "not performed; experiment package only",
+  "gpu_tests": "No new GPU execution during publication; archived 202 tests + 33 subtests in each reported run."
+}

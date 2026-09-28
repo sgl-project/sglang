@@ -1,0 +1,17 @@
+{
+  "date": "2026-09-28",
+  "engine_base_commit": "59a0eb4d843c18b23ecb2c77dc7dfbaea3b0a543",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "packages": {
+    "sglang": "0.5.20",
+    "torch": "2.13.0+cu130",
+    "triton": "3.7.1",
+    "sgl-kernel": "no installed distribution metadata",
+    "flashinfer-python": "0.6.18",
+    "transformers": "5.12.1"
+  },
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "tested_gpu_count": 1,
+  "other_gpu_load": "Six other GPUs on the same host were busy; CPU affinity was not pinned.",
+  "image_digest": null
+}

@@ -1,0 +1,290 @@
+[
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 114.14702981710434
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 119.507839748015
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 118.4332634632786
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 112.97100301211078
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 112.80647323777278
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 118.55498732378085
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 119.02285972610116
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 112.7705800657471
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 114.14660684143503
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 122.9639599720637
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 123.50123298044007
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 114.39573019742966
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 114.47476611162226
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 144.47250946735343
+  },
+  {
+    "label": "candidate",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 122.86559989054997
+  },
+  {
+    "label": "baseline",
+    "batch_size": 1,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 114.93910647307833
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 294.27155619487166
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 304.2370096469919
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 303.24523337185383
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 294.2584229943653
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 293.17430686205626
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 303.1470199736456
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 302.91080319633085
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 1,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 298.6421699946125
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 295.4372833482921
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 0,
+    "iterations": 300,
+    "wall_us_per_step": 306.25862379868823
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 306.8712338184317
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 1,
+    "iterations": 300,
+    "wall_us_per_step": 293.8759233802557
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 293.9658666340013
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 2,
+    "iterations": 300,
+    "wall_us_per_step": 305.64599360028905
+  },
+  {
+    "label": "candidate",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 306.17917655035853
+  },
+  {
+    "label": "baseline",
+    "batch_size": 32,
+    "verify_width": 16,
+    "bad_words": 100,
+    "repeat": 3,
+    "iterations": 300,
+    "wall_us_per_step": 294.1935967343549
+  }
+]
