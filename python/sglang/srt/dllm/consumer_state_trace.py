@@ -37,7 +37,7 @@ def vocab_state_nbytes(state: VocabState | None) -> int:
     return (
         tensor_nbytes(state.max_values)
         + tensor_nbytes(state.argmax_ids)
-        + tensor_nbytes(state.logsumexp)
+        + tensor_nbytes(state.shifted_exp_sum)
         + tensor_nbytes(state.max_probs)
     )
 
