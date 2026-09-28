@@ -1,5 +1,6 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -167,7 +168,10 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             disable_radix_cache=True,
             enable_kv_cache_sharding=True,
         )
-        with patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache:
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
+            patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache,
+        ):
             ChunkCache.return_value = MagicMock()
             result = default_radix_cache_factory(ctx)
 
