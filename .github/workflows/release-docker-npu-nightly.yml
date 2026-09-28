@@ -83,7 +83,7 @@ jobs:
           provenance: false
           sbom: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.9.0.post5
+            SGLANG_KERNEL_NPU_TAG=2026.9.0.post6
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
 
