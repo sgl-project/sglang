@@ -5538,21 +5538,10 @@ class Scheduler(
                         # Keep the host destination alive until prefill stops writing.
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
                         continue
-                    receiver = decode_req.kv_receiver
-                    receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
+                    # The receiver arms drain-ack accounting before sending the
+                    # ABORT (see CommonKVReceiver._send_abort_notification), so
+                    # an ack racing back is never dropped.
+                    decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:

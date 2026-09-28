@@ -1,16 +1,15 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
 
-from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h as model
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -56,12 +55,8 @@ def _build(pattern, tp, capture):
         layer = cls.__new__(cls)
         nn.Module.__init__(layer)
         layer.norm = _Norm()
-        if kind in "M*":
-            layer._init_layer_communicator(config, i)
-            layer.mixer = _Mixer(0.5, tp)
-        else:
-            layer._init_layer_communicator(config, i, is_sparse=False)
-            layer.mixer = _Mixer(0.25)
+        layer._init_layer_communicator(config, i)
+        layer.mixer = _Mixer(0.5 if kind in "M*" else 0.25, tp)
         if kind == "M":
             layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)
         layers.append(layer)
@@ -73,7 +68,18 @@ class TestNemotronAuxCapture(CustomTestCase):
     def test_capture_reduces_only_its_snapshot(self):
         """Each auxiliary snapshot equals the full hidden state at its boundary,
         also under DP attention and after later norms update the residual in place."""
-        for pattern in ("*-", "M-", "**-", "*", "*--", "-*"):
+        for pattern in (
+            "*-",
+            "M-",
+            "**-",
+            "*",
+            "*--",
+            "-*",
+            "MM",
+            "-M",
+            "M-M*E",
+            "E*E-",
+        ):
             for dp_enabled, tp in ((True, 2), (True, 1), (False, 2)):
                 with self.subTest(pattern=pattern, dp_enabled=dp_enabled, tp=tp):
                     self._check(pattern, dp_enabled, tp)
@@ -96,6 +102,8 @@ class TestNemotronAuxCapture(CustomTestCase):
             get_flags().dp.override(enabled=dp_enabled),
             get_parallel().override(
                 attn_tp_group=group,
+                tp_group=group,
+                moe_tp_group=group,
                 launch_world_rank=0,
                 tp_rank=0,
                 tp_size=tp,
@@ -112,9 +120,9 @@ class TestNemotronAuxCapture(CustomTestCase):
                 moe_dp_rank=0,
                 moe_dp_size=1,
             ),
-            patch.object(comm, "get_moe_cp_size", return_value=1),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=False),
-            patch.object(comm, "apply_aiter_all_reduce_fusion", return_value=False),
+            patch_communicator("get_moe_cp_size", return_value=1),
+            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=False),
+            patch_communicator("apply_aiter_all_reduce_fusion", return_value=False),
         ):
             baseline = _build(pattern, tp, False)(
                 batch.input_ids, torch.arange(2), batch, inputs_embeds=inputs.clone()
