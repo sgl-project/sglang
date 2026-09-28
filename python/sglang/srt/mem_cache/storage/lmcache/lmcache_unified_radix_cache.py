@@ -248,11 +248,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=len(req.get_fill_ids()))
-        super().cache_unfinished_req(req, chunked=chunked, **kwargs)
+    def checkpoint_req(self, req: Req, *, up_to: int, **kwargs) -> None:
+        self._publish_external_loaded_prefix(req, token_ids_len=up_to)
+        super().checkpoint_req(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.get_fill_ids())
+        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
 
     def on_release(self, req: Req, *, inserted: bool) -> None:
         super().on_release(req, inserted=inserted)
@@ -811,7 +811,6 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
                 component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
-                chunked=True,
                 priority=req.priority or 0,
             )
         )

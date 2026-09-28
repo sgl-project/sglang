@@ -1045,11 +1045,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
-        self, node: UnifiedTreeNode, chunked: bool = False
-    ) -> bool:
+    def _inc_hit_count_and_check(self, node: UnifiedTreeNode, record_end: bool) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted or not record_end:
             return False
         if self.is_write_back:
             return False
@@ -1299,7 +1297,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        if self._inc_hit_count_and_check(node, state.params.record_end):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1361,7 +1359,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
             return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+                state.target_node, state.params.record_end
             )
 
         node = state.target_node

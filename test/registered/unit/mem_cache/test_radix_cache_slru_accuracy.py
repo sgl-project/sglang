@@ -67,7 +67,9 @@ class TestSLRUAccuracy(unittest.TestCase):
 
         # Insert the frequent key multiple times to increase its hit count
         for _ in range(3):
-            self.cache.insert(InsertParams(key=frequent_key, value=frequent_val))
+            self.cache.insert(
+                InsertParams(key=frequent_key, value=frequent_val, record_end=True)
+            )
 
         # Insert first low-frequency key-value pair that should be evicted
         first_low_freq_key = RadixKey(
@@ -76,7 +78,9 @@ class TestSLRUAccuracy(unittest.TestCase):
         first_low_freq_val = torch.tensor([50, 60], dtype=torch.int64)
 
         self.cache.insert(
-            InsertParams(key=first_low_freq_key, value=first_low_freq_val)
+            InsertParams(
+                key=first_low_freq_key, value=first_low_freq_val, record_end=True
+            )
         )
 
         # Insert other key-values once each (low frequency access) - fill up the cache
@@ -84,14 +88,14 @@ class TestSLRUAccuracy(unittest.TestCase):
         for i in range(4):  # Reduce the number to fit in our smaller cache
             key = RadixKey(array("q", [i + 10]))  # Unique keys for low-frequency items
             val = torch.tensor([i + 100], dtype=torch.int64)
-            self.cache.insert(InsertParams(key=key, value=val))
+            self.cache.insert(InsertParams(key=key, value=val, record_end=True))
             other_keys.append(key)
 
         # Now insert more items to trigger evictions
         for i in range(6, 10):  # Add more items to definitely exceed capacity
             key = RadixKey(array("q", [i * 2]))  # Different pattern to avoid conflicts
             val = torch.tensor([i * 200], dtype=torch.int64)
-            self.cache.insert(InsertParams(key=key, value=val))
+            self.cache.insert(InsertParams(key=key, value=val, record_end=True))
 
         # Now trigger eviction explicitly to make space
         evict_result = self.cache.evict(

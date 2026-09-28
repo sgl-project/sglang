@@ -325,19 +325,18 @@ class StreamingSession(BasePrefixCache):
 
         return True
 
-    def try_cache_unfinished_req(
-        self, req: Req, chunked: bool = False, **kwargs
-    ) -> bool:
+    def try_checkpoint_req(self, req: Req, *, up_to: int, **kwargs) -> bool:
         """Handles a streaming-session mid-flight cache op:
-          - chunked prefill: snapshot current KV as prefix, skip radix
+          - extend not finished (chunked prefill): snapshot current KV as
+            prefix, skip radix
           - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
+        Returns False for a first turn whose extend is done (caller must run
+        raw radix insert to set up the initial tree lock)."""
         if not _is_streaming(req):
             return False
-        if chunked:
+        if up_to < len(req.full_untruncated_fill_ids):
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : req.extend_range.end
+                req.kv.req_pool_idx, :up_to
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
@@ -362,10 +361,10 @@ class StreamingSession(BasePrefixCache):
     def insert_req(self, req: Req, **kwargs):
         self.inner.insert_req(req, **kwargs)
 
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        if self.try_cache_unfinished_req(req, **kwargs):
+    def checkpoint_req(self, req: Req, **kwargs):
+        if self.try_checkpoint_req(req, **kwargs):
             return
-        self.inner.cache_unfinished_req(req, **kwargs)
+        self.inner.checkpoint_req(req, **kwargs)
 
     def unpin(self, req: Req) -> None:
         self.inner.unpin(req)

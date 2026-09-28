@@ -363,7 +363,6 @@ class UnifiedCacheLinkerWrapper:
                     if req.kv is not None
                     else {}
                 ),
-                chunked=True,
                 priority=req.priority or 0,
                 track_adopted_ranges=True,
             )

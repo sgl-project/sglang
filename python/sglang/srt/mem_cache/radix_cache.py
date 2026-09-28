@@ -418,7 +418,7 @@ class RadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         priority = params.priority
-        chunked = params.chunked
+        record_end = params.record_end
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -429,7 +429,7 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked
+            self.root_node, key, value, priority, record_end
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
@@ -438,7 +438,7 @@ class RadixCache(BasePrefixCache):
         req: Req,
         token_ids,
         *,
-        chunked: bool = False,
+        record_end: bool = False,
         key_limit: Optional[int] = None,
         split_prompt: bool = False,
     ) -> Tuple[RadixKey, torch.Tensor, int]:
@@ -462,7 +462,7 @@ class RadixCache(BasePrefixCache):
         priority = req.priority or 0
         result = self.insert(
             InsertParams(
-                key=radix_key, value=values, chunked=chunked, priority=priority
+                key=radix_key, value=values, record_end=record_end, priority=priority
             )
         )
         if split_prompt:
@@ -480,9 +480,6 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         priority=priority + 1,
-                        # The request created these nodes moments ago; another
-                        # hit_count bump would promote every prompt node.
-                        chunked=True,
                     )
                 )
 
@@ -496,16 +493,17 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
         token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
-        radix_key, _, _ = self._insert_cache(req, token_ids, split_prompt=True)
+        radix_key, _, _ = self._insert_cache(
+            req, token_ids, record_end=True, split_prompt=True
+        )
         req.kv.cache_protected_len = len(radix_key)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        """Cache request when it is unfinished."""
+    def checkpoint_req(self, req: Req, *, up_to: int):
         if self.disable:
             return
 
         radix_key, kv_indices, _ = self._insert_cache(
-            req, req.get_fill_ids(), chunked=chunked
+            req, req.full_untruncated_fill_ids[:up_to]
         )
 
         # The prefix indices could be updated, reuse it
@@ -525,7 +523,7 @@ class RadixCache(BasePrefixCache):
 
         # With page_size > 1 the partial page sits in req.prefix_indices but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
-        # cache_unfinished_req or release_kv_cache frees the rest.
+        # checkpoint_req or release_kv_cache frees the rest.
         req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)
@@ -687,13 +685,9 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
-        # Skip the hit count update for chunked requests to avoid self-referencing
-        # inflation where a chunked request increments hit_count on nodes it created
-        # in previous chunks.
-        if chunked:
-            return
-        node.hit_count += 1
+    def _inc_hit_count(self, node: TreeNode, record_end: bool):
+        if record_end:
+            node.hit_count += 1
 
     def _insert_helper(
         self,
@@ -701,7 +695,7 @@ class RadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         priority: int = 0,
-        chunked: bool = False,
+        record_end: bool = False,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -727,11 +721,11 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
-                self._inc_hit_count(new_node, chunked)
+                self._inc_hit_count(new_node, record_end)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-                self._inc_hit_count(node, chunked)
+                self._inc_hit_count(node, record_end)
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -740,7 +734,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            self._inc_hit_count(new_node, chunked)
+            self._inc_hit_count(new_node, record_end)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

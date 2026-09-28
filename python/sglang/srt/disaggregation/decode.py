@@ -2199,7 +2199,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc,
         )
 
-        # Truncate fill_len to kv_committed_len so cache_unfinished_req only
+        # Truncate fill_len to kv_committed_len so checkpoint_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
@@ -3111,7 +3111,7 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
+                # Truncate fill_len to kv_committed_len so checkpoint_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:

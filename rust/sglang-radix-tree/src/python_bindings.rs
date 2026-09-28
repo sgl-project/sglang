@@ -535,7 +535,7 @@ pub struct InsertParamsBinding {
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
-    pub chunked: bool,
+    pub record_end: bool,
     pub priority: i64,
     pub track_adopted_ranges: bool,
 }
@@ -543,7 +543,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, record_end = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -554,7 +554,7 @@ impl InsertParamsBinding {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         swa_branching_seqlen: Option<usize>,
-        chunked: bool,
+        record_end: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
@@ -569,7 +569,7 @@ impl InsertParamsBinding {
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
-            chunked,
+            record_end,
             priority,
             track_adopted_ranges,
         })
@@ -1061,7 +1061,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
-            chunked: params.chunked,
+            record_end: params.record_end,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };
@@ -1098,7 +1098,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
-            chunked: params.chunked,
+            record_end: params.record_end,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };

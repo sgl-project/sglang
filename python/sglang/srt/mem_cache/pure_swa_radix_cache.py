@@ -66,13 +66,15 @@ class PureSWARadixCache(RadixCache):
         key_limit = (
             ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
         )
-        radix_key, _, _ = self._insert_cache(req, token_ids, key_limit=key_limit)
+        radix_key, _, _ = self._insert_cache(
+            req, token_ids, record_end=True, key_limit=key_limit
+        )
         req.kv.cache_protected_len = len(radix_key)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def checkpoint_req(self, req: Req, *, up_to: int):
         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
         has happened yet, so standard RadixCache logic is correct."""
-        super().cache_unfinished_req(req, chunked=chunked)
+        super().checkpoint_req(req, up_to=up_to)
 
     def available_and_evictable_str(self) -> str:
         allocator = self.token_to_kv_pool_allocator

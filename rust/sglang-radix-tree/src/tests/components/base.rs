@@ -96,7 +96,7 @@ fn insert_overlap_default_consumes_nothing() {
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
             swa_branching_seqlen: None,
-            chunked: false,
+            record_end: false,
             priority: 0,
             session_id: None,
             track_adopted_ranges: false,

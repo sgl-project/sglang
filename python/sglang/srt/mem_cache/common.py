@@ -169,11 +169,11 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     if req.skip_radix_cache_insert:
         return
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    tree_cache.checkpoint_req(req, up_to=req.extend_range.end)
 
 
 def evict_from_tree_cache(

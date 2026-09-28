@@ -250,14 +250,14 @@ Cache a completed request's KV data into the tree.
 
 ---
 
-### `cache_unfinished_req(req: Req, chunked=False)`
+### `checkpoint_req(req: Req, *, up_to: int)`
 
-Cache an in-progress request's partial KV data (chunked prefill).
+Publish a running request's KV so other requests can match it.
 
 | Aspect | Detail |
 |--------|--------|
-| **Purpose** | During chunked prefill, insert partial results so the next chunk can match the prefix |
-| **Inputs** | `req` — the in-progress request |
+| **Purpose** | Between chunks and after prefill, insert what the request has computed so far so the next chunk or another request can match the prefix; nothing is counted as a cache hit (only `insert_req` bumps `hit_count`) |
+| **Inputs** | `req` — the running request; `up_to` — the row position its published KV ends at (`checkpoint_kv_cache` passes `req.extend_range.end`) |
 | **Output** | `None` |
 | **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
 | **Complexity** | **O(K + D·C)** — two tree traversals: insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |

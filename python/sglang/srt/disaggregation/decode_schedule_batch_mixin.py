@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -120,7 +120,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None
-            maybe_cache_unfinished_req(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

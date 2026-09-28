@@ -79,10 +79,8 @@ class ChunkCache(BasePrefixCache):
     def insert_req(self, req: Req, *, up_to: int):
         pass
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_range.end
-        ]
+    def checkpoint_req(self, req: Req, *, up_to: int):
+        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 

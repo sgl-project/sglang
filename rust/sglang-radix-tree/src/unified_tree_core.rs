@@ -152,8 +152,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
-    /// Whether this is a chunked-prefill insert (no hit-count bump).
-    pub chunked: bool,
+    /// Whether this insert records a request end: the walked path's hit
+    /// counts are bumped (and checked against the write-through threshold).
+    pub record_end: bool,
     /// Eviction priority floor applied along the walked path.
     pub priority: i64,
     /// Whether the result should report which incoming ranges the tree retained.
@@ -238,7 +239,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
-    chunked: bool,
+    record_end: bool,
     priority: i64,
     track_adopted_ranges: bool,
     total_prefix_length: usize,
@@ -1416,9 +1417,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
-    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, chunked: bool) -> bool {
+    pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, record_end: bool) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || chunked {
+        if node.evicted() || !record_end {
             return false;
         }
         if self.is_write_back {
@@ -1518,7 +1519,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: params.chunked,
+            record_end: params.record_end,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
             total_prefix_length: 0,
@@ -1645,7 +1646,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: state.chunked,
+            record_end: state.record_end,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1733,7 +1734,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
-        if self.inc_hit_count_and_check_(node_id, state.chunked) {
+        if self.inc_hit_count_and_check_(node_id, state.record_end) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -1799,7 +1800,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
-            chunked: state.chunked,
+            record_end: state.record_end,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
         };
@@ -1836,7 +1837,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target_node_id: NodeIdx_,
     ) -> bool {
         if state.is_new_leaf {
-            return self.inc_hit_count_and_check_(target_node_id, state.chunked);
+            return self.inc_hit_count_and_check_(target_node_id, state.record_end);
         }
 
         let node = self.arena.node(target_node_id);
