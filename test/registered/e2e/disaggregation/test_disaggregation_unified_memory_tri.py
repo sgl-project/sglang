@@ -37,9 +37,6 @@ register_cuda_ci(est_time=900, stage="extra-a", runner_config="2-gpu-large")
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
 
-# The unified radix tree is what merges the three components into one tree.
-SERVER_ENV = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-
 UNIFIED_TRI_ARGS = [
     "--skip-tokenizer-init",
     "--random-seed",
@@ -72,8 +69,6 @@ class TestUnifiedMemoryDisaggregationTriPool(
     """1 prefill + 1 decode, both unified, vs a non-PD unified reference."""
 
     model = _MODEL_PATH
-    extra_prefill_env = SERVER_ENV
-    extra_decode_env = SERVER_ENV
     prefill_tp_size = 1
     decode_tp_size = 1
     decode_base_gpu_id = 1

@@ -38,7 +38,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -74,6 +73,9 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 )
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.dp_spec_prefill_coordination import (
+    DPSpecPrefillCoordinationPlan,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -99,6 +101,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -117,7 +120,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import (
-    MultiprocessingSerializer,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
@@ -129,7 +131,6 @@ from sglang.srt.utils.common import (
     is_xpu,
     log_info_on_rank0,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -140,85 +141,6 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
-
-
-# Checkpoint spellings of the input embedding across the model families the
-# PP+spec gate admits (GLM/DeepSeek NextN, Bailing MTP, Mistral-style drafts).
-_EMBED_TENSOR_NAMES = (
-    "model.embed_tokens.weight",
-    "embed.weight",
-    "model.word_embeddings.weight",
-    "tok_embeddings.weight",
-)
-
-
-def _find_draft_input_embedding(model) -> "torch.nn.Module":
-    """The draft's input embedding, found by type rather than attribute path.
-
-    Draft models hang it under different names (embed_tokens, word_embeddings,
-    embed, tok_embeddings), but it is always the one VocabParallelEmbedding
-    that is not the ParallelLMHead."""
-    from sglang.srt.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
-
-    found = [
-        (name, module)
-        for name, module in model.named_modules()
-        if isinstance(module, VocabParallelEmbedding)
-        and not isinstance(module, ParallelLMHead)
-    ]
-    if len(found) != 1:
-        raise ValueError(
-            "PP+spec needs exactly one input embedding on the draft model, "
-            f"found {[name for name, _ in found]!r}"
-        )
-    return found[0][1]
-
-
-def _load_checkpoint_tensor(
-    model_path: str, revision, tensor_names: tuple, load_config
-) -> torch.Tensor:
-    """Load one tensor from a checkpoint via the standard weight loader."""
-    from sglang.srt.configs.load_config import LoadFormat
-    from sglang.srt.model_loader.loader import DefaultModelLoader
-    from sglang.srt.model_loader.weight_utils import (
-        pt_weights_iterator,
-        safetensors_weights_iterator,
-    )
-
-    # Streaming and cache-transport formats have no weight files this helper
-    # could reopen; the dummy format is already skipped by the caller.
-    reopenable = (
-        LoadFormat.AUTO,
-        LoadFormat.SAFETENSORS,
-        LoadFormat.FASTSAFETENSORS,
-        LoadFormat.MISTRAL,
-        LoadFormat.PT,
-        LoadFormat.NPCACHE,
-    )
-    if load_config.load_format not in reopenable:
-        raise ValueError(
-            "PP+spec draft embedding loading cannot re-open weights under "
-            f"load format {load_config.load_format!r}; use a disk-backed "
-            "load format or disable SGLANG_ENABLE_PP_SPEC"
-        )
-    # The target's own load config keeps --download-dir, ignore patterns and
-    # the selected format, so hub ids resolve into the same cache the model
-    # was loaded from instead of a fresh default-location download.
-    _, weight_files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
-        model_path, revision, fall_back_to_pt=True
-    )
-    iterator = (
-        safetensors_weights_iterator(weight_files)
-        if use_safetensors
-        else pt_weights_iterator(weight_files)
-    )
-    for name, tensor in iterator:
-        if name in tensor_names:
-            return tensor
-    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
 
 
 def _qsa_index_share_requested(hf_config) -> bool:
@@ -403,32 +325,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
-            # This branch skips the hot-token-map / EAGLE3 head wiring below.
-            assert self.hot_token_id is None and not (
-                self.speculative_algorithm.is_eagle3()
-            ), "PP+spec does not support --speculative-token-map or EAGLE3 drafts yet"
-            # PP+spec: the target's embedding lives on the first PP stage
-            # (PPMissingLayer here on the last stage) and NextN/MTP layers
-            # carry no embedding of their own in the checkpoint, so the
-            # draft's embedding must be loaded from the checkpoint directly
-            # — otherwise it stays randomly initialized and accept_length
-            # collapses to ~1.
-            embed = _find_draft_input_embedding(self.draft_runner.model).weight
-            if get_model().load_format != "dummy":
-                target_runner = self.target_worker.model_runner
-                loaded_embed = _load_checkpoint_tensor(
-                    model_path=target_runner.model_config.model_path,
-                    revision=target_runner.model_config.revision,
-                    tensor_names=_EMBED_TENSOR_NAMES,
-                    load_config=target_runner.load_config,
-                )
-                embed.weight_loader(embed, loaded_embed)
-            head = self.target_worker.model_runner.model.lm_head.weight
-            self.draft_runner.model.set_embed_and_head(embed, head)
-            return
-
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = self._resolve_shared_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -469,6 +366,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _resolve_shared_embed_and_head(self):
+        target_runner = self.target_worker.model_runner
+        return resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -1308,6 +1215,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
+        self.enable_dp_spec_prefill_coordination = (
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        )
+
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_parallel().pp_group.is_last_rank
@@ -1403,49 +1314,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
-            target_capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.FULL
-            )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                capture_hidden_mode=target_capture_mode,
-            )
-
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # A rank that does not host the draft (prefill-side PP builds it only on
-            # the last stage) forwards the target's proxy tensors and stops here.
-            if self._draft_worker is None:
-                return batch_output
-
-            # Draft prefill
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group,
-                    owns_attention=self.draft_worker.draft_owns_attention,
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
+            if not (
+                batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
+                return self._forward_prefill_batch(batch, on_publish, pp_proxy_tensors)
+            else:
+                if batch.dp_spec_prefill_coordination_metadata is None:
+                    raise RuntimeError("Missing DP spec/prefill coordination metadata")
+                plan = DPSpecPrefillCoordinationPlan(
+                    *batch.dp_spec_prefill_coordination_metadata,
+                    draft_width=self.topk,
+                    verify_width=self.speculative_num_draft_tokens,
                 )
-                return batch_output
+                if not plan.heterogeneous:
+                    return self._forward_prefill_batch(
+                        batch, on_publish, pp_proxy_tensors
+                    )
+                else:
+                    return self._forward_dp_spec_prefill_coordination(
+                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                    )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1556,6 +1444,137 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
+
+    def _forward_prefill_batch(
+        self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
+    ):
+        # Target prefill
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch_output = self.target_worker.forward_batch_generation(
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=target_capture_mode,
+        )
+
+        # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+        # Extend processed L prompt tokens; next verify iter expects same L.
+        batch_output.new_seq_lens = batch.seq_lens
+        # Publish before draft_extend so the fence is at target-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        # A rank that does not host the draft (prefill-side PP builds it only on
+        # the last stage) forwards the target's proxy tensors and stops here.
+        if self._draft_worker is None:
+            return batch_output
+
+        if coordination_plan is not None:
+            coordination_plan.apply(
+                batch,
+                "draft_extend",
+                get_parallel().attn_dp_rank,
+                local_only=(
+                    len(batch.global_num_tokens) == 1
+                    or self.draft_worker.draft_owns_attention
+                ),
+            )
+
+        # Draft prefill
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group,
+                owns_attention=self.draft_worker.draft_owns_attention,
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+                batch_output.logits_output.mm_input_embeds,
+            )
+            return batch_output
+
+    def _forward_dp_spec_prefill_coordination(
+        self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+    ):
+        """Run draft, target, and draft-extend with each rank's local mode."""
+        rank = get_parallel().attn_dp_rank
+        target_local_only = len(batch.global_num_tokens) == 1
+        draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
+        is_prefill = batch.forward_mode.is_extend()
+        draft_batch = batch
+        if is_prefill:
+            draft_batch = ScheduleBatch.init_new(
+                [],
+                batch.req_to_token_pool,
+                batch.token_to_kv_pool_allocator,
+                batch.tree_cache,
+                batch.model_config,
+                batch.enable_overlap,
+                batch.spec_algorithm,
+            )
+            draft_batch.prepare_for_idle()
+            draft_batch.global_num_tokens = batch.global_num_tokens
+            draft_batch.global_num_tokens_for_logprob = (
+                batch.global_num_tokens_for_logprob
+            )
+        if draft_batch.spec_info is None:
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
+            )
+            draft_batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+        plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group,
+                owns_attention=self.draft_worker.draft_owns_attention,
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            verify_input = self.draft_worker.draft(draft_batch)
+
+        plan.apply(batch, "target", rank, local_only=target_local_only)
+        if is_prefill:
+            result = self._forward_prefill_batch(
+                batch, on_publish, pp_proxy_tensors, coordination_plan=plan
+            )
+            # Pin the temporary idle tensors through the overlap lifetime.
+            result.extra_keep_alive_refs = list(result.extra_keep_alive_refs or ()) + [
+                draft_batch
+            ]
+            return result
+
+        batch.spec_info = verify_input
+        result = self.verify(batch, grammar_barrier=grammar_barrier)
+        if on_publish is not None:
+            on_publish(result.new_seq_lens)
+        plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group,
+                owns_attention=self.draft_worker.draft_owns_attention,
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            self.draft_worker._draft_extend_for_decode(batch, result)
+        return result
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -1868,25 +1887,3 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
         )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        monkey_patch_torch_reductions()
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.model_runner.tp_rank]
-        )
-        success, message = (
-            self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=recv_req.load_format,
-            )
-        )
-        if not success:
-            return success, message
-
-        success, message = (
-            self.target_worker.model_runner.weight_updater.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=recv_req.load_format,
-            )
-        )
-        return success, message

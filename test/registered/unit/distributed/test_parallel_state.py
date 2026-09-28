@@ -410,7 +410,7 @@ def _read_group_descs(group_name):
             local_rank=0,
             torch_distributed_backend="gloo",
             use_pynccl=False,
-            use_pymscclpp=False,
+            use_mscclpp=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_all_reduce=False,
             use_hpu_communicator=False,
