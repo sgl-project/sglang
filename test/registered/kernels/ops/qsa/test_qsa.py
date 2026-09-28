@@ -598,7 +598,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     monkeypatch.setattr(
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend = QwenSparseAttnBackend()
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -638,7 +638,7 @@ def _make_paged_extend_backend():
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend = QwenSparseAttnBackend()
     backend.forward_metadata = metadata
 
     class Pool:
@@ -974,7 +974,7 @@ class _DispatchIndexer:
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args):
+    def select_decode_tokens(self, *args, defer_expansion=False):
         self.selected = "decode"
         return torch.tensor([2])
 

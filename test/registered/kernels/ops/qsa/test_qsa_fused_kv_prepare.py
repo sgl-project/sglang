@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -116,15 +118,15 @@ def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
 
     storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
     storage.quant_method = UnquantizedKVCacheMethod()
+    storage.dtype = torch.bfloat16
     pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
     pool.full_kv_pool = storage
     cache = torch.zeros(64, 2, 256, device="cuda", dtype=torch.bfloat16)
     pool.get_key_buffer = lambda layer_id: cache
     pool.get_value_buffer = lambda layer_id: cache.clone()
-    backend = backend_module.QwenSparseAttnBackend.__new__(
-        backend_module.QwenSparseAttnBackend
+    backend = backend_module.QwenSparseAttnBackend(
+        SimpleNamespace(token_to_kv_pool=pool)
     )
-    backend.token_to_kv_pool = pool
     metadata = SimpleNamespace(sequence_lengths=torch.ones(width, device="cuda"))
     backend._resolve_metadata = lambda batch: metadata
     marker = object()
@@ -320,3 +322,120 @@ def test_nonconsecutive_writes_keep_slot_matching():
     )
     for actual, ref in zip([counts, ok, ov], expected):
         torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float16])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_fused_pool_eligibility(dtype, quantized, wrapped):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        UnquantizedKVCacheMethod,
+    )
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    storage.dtype = dtype
+    storage.quant_method = object() if quantized else UnquantizedKVCacheMethod()
+    pool = storage
+    if wrapped:
+        pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = storage
+    backend = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=pool))
+    assert backend._fused_kv_pool_eligible == (not quantized and dtype != torch.float16)
+    assert not QwenSparseAttnBackend()._fused_kv_pool_eligible
+    assert not QwenSparseAttnBackend(
+        SimpleNamespace(token_to_kv_pool=object())
+    )._fused_kv_pool_eligible
+
+
+@pytest.mark.parametrize(
+    "mode_name", ["DECODE", "TARGET_VERIFY", "DRAFT_EXTEND_V2", "EXTEND"]
+)
+@pytest.mark.parametrize("ratio,budget", [(4, 2048), (2, 1024), (4, 8192)])
+def test_defer_expansion_metadata(mode_name, ratio, budget):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        UnquantizedKVCacheMethod,
+    )
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    storage.dtype = torch.bfloat16
+    storage.quant_method = UnquantizedKVCacheMethod()
+    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+    pool.full_kv_pool = storage
+    pool.qsa_compress_ratio = ratio
+    pool.qsa_block_topk = budget // ratio
+    pool.qsa_compressed_page_size = 64 // ratio
+    config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=budget,
+        indexer_compress_ratio=ratio,
+    )
+    table = torch.arange(64, device="cuda", dtype=torch.int32).view(1, 64)
+    runner = SimpleNamespace(
+        token_to_kv_pool=pool,
+        device="cuda",
+        req_to_token_pool=SimpleNamespace(req_to_token=table),
+        model_config=SimpleNamespace(hf_config=config, context_len=64),
+    )
+    backend = QwenSparseAttnBackend(runner)
+    mode = getattr(ForwardMode, mode_name)
+    width = 1 if mode.is_decode() else 2
+    lengths = torch.tensor([8], device="cuda", dtype=torch.int32)
+    batch = SimpleNamespace(
+        forward_mode=mode,
+        seq_lens=lengths,
+        seq_lens_cpu=lengths.cpu(),
+        req_pool_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+        positions=torch.arange(8 - width, 8, device="cuda"),
+        out_cache_loc=torch.arange(8 - width, 8, device="cuda"),
+        spec_info=SimpleNamespace(draft_token_num=width, topk=1),
+        input_ids=torch.zeros(width, device="cuda", dtype=torch.int32),
+        extend_seq_lens=torch.tensor([width], device="cuda", dtype=torch.int32),
+        _original_forward_mode=None,
+        mrope_positions=None,
+    )
+    if mode.is_extend_without_speculative():
+        batch.seq_lens = torch.tensor([width], device="cuda", dtype=torch.int32)
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.positions = torch.arange(width, device="cuda")
+    expected = (
+        ratio == 4 and budget == 2048 and mode_name in ("DECODE", "TARGET_VERIFY")
+    )
+    metadata = backend._metadata_from_forward_batch(batch)
+    assert metadata.indexer_metadata.defer_block_expansion == expected
+    if not mode.is_extend_without_speculative():
+        backend.init_cuda_graph_state(1, width)
+        backend.token_to_kv_pool = None
+        backend._fused_kv_pool_eligible = False
+        backend._capture_cuda_graph_metadata(
+            bs=1,
+            num_tokens=width,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            forward_mode=mode,
+            spec_info=batch.spec_info,
+        )
+        assert backend._fused_kv_pool_eligible
+        assert (
+            backend.forward_metadata.indexer_metadata.defer_block_expansion == expected
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

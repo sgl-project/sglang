@@ -40,6 +40,8 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
 )
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
@@ -181,6 +183,9 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
+            self.token_to_kv_pool
+        )
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -716,6 +721,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            defer_block_expansion=(
+                self._can_defer_block_expansion(forward_batch.forward_mode)
+                and decode_logical_positions is not None
+            ),
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -843,6 +852,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._require_chain_speculation(forward_mode, spec_info)
         if self.token_to_kv_pool is None:
             self.token_to_kv_pool = getattr(self.runner, "token_to_kv_pool", None)
+            self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
+                self.token_to_kv_pool
+            )
         if self.req_to_token is None:
             req_pool = getattr(self.runner, "req_to_token_pool", None)
             self.req_to_token = getattr(req_pool, "req_to_token", None)
@@ -900,6 +912,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             decode_logical_positions=self._graph_logical_positions[:metadata_rows],
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
             graph_ring_group_locs=self._graph_ring_group_locs[:metadata_rows],
+            defer_block_expansion=self._can_defer_block_expansion(forward_mode),
         )
         metadata = QwenSparseAttnMetadata(
             sequence_lengths=self._graph_seq_lens[:metadata_rows],
@@ -1263,9 +1276,34 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    @staticmethod
+    def _supports_fused_kv_pool(pool):
+        if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
+            storage = pool.full_kv_pool
+        elif type(pool) is MHATokenToKVPool:
+            storage = pool
+        else:
+            return False
+        return (
+            type(storage) is MHATokenToKVPool
+            and not storage.is_quantized_kv_cache
+            and storage.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        )
+
+    def _can_defer_block_expansion(self, forward_mode):
+        return (
+            self._fused_kv_pool_eligible
+            and self.qsa_profile is not None
+            and self.compress_ratio == 4
+            and self.qsa_profile.block_topk == 512
+            and (forward_mode.is_decode() or forward_mode.is_target_verify())
+        )
+
     def _uses_block_indices(self, indices):
-        profile = getattr(self, "qsa_profile", None)
-        return profile is not None and indices.shape[1] == profile.block_topk
+        return (
+            self.qsa_profile is not None
+            and indices.shape[1] == self.qsa_profile.block_topk
+        )
 
     def _expand_block_indices(self, indices, metadata):
         if not self._uses_block_indices(indices):
@@ -1280,7 +1318,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
-        if not q.is_cuda or k is None or v is None:
+        if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
         if mode.is_decode():
@@ -1292,21 +1330,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is None:
             return None
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-
         pool = self.token_to_kv_pool
-        if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
-            storage = pool.full_kv_pool
-        elif type(pool) is MHATokenToKVPool:
-            storage = pool
-        else:
-            return None
-        if type(storage) is not MHATokenToKVPool or storage.is_quantized_kv_cache:
-            return None
         loc = forward_batch.out_cache_loc
         rows = indices.shape[0]
         if (
@@ -1332,7 +1356,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             or not kc.is_contiguous()
             or not vc.is_contiguous()
             or kc.shape[-1] != 256
-            or kc.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
             or vc.dtype != kc.dtype
             or q.dtype != torch.bfloat16
         ):

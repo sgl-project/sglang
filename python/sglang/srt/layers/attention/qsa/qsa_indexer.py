@@ -613,11 +613,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
-                q.is_cuda
-                and not is_draft_extend
-                and indexer_metadata.decode_logical_positions is not None
-                and self.compress_ratio == 4
-                and self.block_topk == 512,
+                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
