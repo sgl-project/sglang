@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.dsa import kpool_plan
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class _NoDeviceReadTensor(torch.Tensor):

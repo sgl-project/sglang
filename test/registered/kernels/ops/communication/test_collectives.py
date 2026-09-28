@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=34, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=38, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168

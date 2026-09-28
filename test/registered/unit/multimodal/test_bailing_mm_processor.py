@@ -10,7 +10,7 @@ from sglang.srt.multimodal.processors.bailing_mm import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestBailingMMProcessor(CustomTestCase):

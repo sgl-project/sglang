@@ -5,7 +5,7 @@ import unittest
 from sglang.srt.layers.attention.aiter_backend import _aiter_fp8_asm_supports_gqa
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestAiterFp8AsmSupportsGqa(unittest.TestCase):

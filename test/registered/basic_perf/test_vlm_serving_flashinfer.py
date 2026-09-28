@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.vlm_perf_kit import check_vlm_serving_perf
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=195, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=191, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestVLMServingFlashinfer(CustomTestCase):
