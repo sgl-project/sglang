@@ -2192,6 +2192,22 @@ class AbortReq(BaseReq, kw_only=True):
         if self.rid is None:
             self.rid = ""
 
+    def matches_rid(self, other_rid: Optional[str]) -> bool:
+        """Return True if ``other_rid`` should be aborted by this request.
+
+        Matches the named rid exactly plus any child rids the engine itself
+        derives from it (e.g. ``"job-1"`` matches ``"job-1_0"`` and
+        ``"job-1_1"`` from ``GenerateReqInput._normalize_rid``). It does
+        NOT perform a bare prefix match, so aborting ``"job-1"`` will not
+        also abort ``"job-10"``, ``"job-11"``, or any other rid that merely
+        happens to start with the named rid.
+        """
+        if self.abort_all:
+            return True
+        if not self.rid or not other_rid:
+            return False
+        return other_rid == self.rid or other_rid.startswith(self.rid + "_")
+
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
