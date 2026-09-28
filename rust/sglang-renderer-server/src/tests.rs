@@ -29,7 +29,7 @@ mod suite {
         DEFAULT_REQUEST_BODY_LIMIT_BYTES, hosted_routes, render_only_routes, standalone_routes,
     };
     use crate::test_utils::renderer_config;
-    use crate::{RendererError, RendererService, TextTokenizer};
+    use sglang_renderer::{RendererError, RendererService, TextTokenizer};
 
     struct WordTokenizer;
 

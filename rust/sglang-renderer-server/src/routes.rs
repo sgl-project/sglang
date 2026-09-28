@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use sglang_frontend::{
-    OpenAIService, RendererService,
+    OpenAIService,
     http::{inference_routes, renderer_routes},
 };
+use sglang_renderer::RendererService;
 
 use crate::engine::HttpGenerateClient;
 

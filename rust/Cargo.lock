@@ -3781,6 +3781,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-frontend",
+ "sglang-renderer",
  "tokio",
  "tower 0.5.3",
  "tracing",

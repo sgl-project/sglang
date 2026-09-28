@@ -2,7 +2,7 @@
 
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 
-use crate::{GenerateRequest, ResponseError};
+use sglang_renderer::{GenerateRequest, ResponseError, ResponseErrorKind};
 
 mod decode;
 pub(crate) mod response;
@@ -65,14 +65,14 @@ impl GenerationService {
 
 fn invalid(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: crate::ResponseErrorKind::InvalidRequest,
+        kind: ResponseErrorKind::InvalidRequest,
         message: message.into(),
     }
 }
 
 fn internal(message: impl Into<String>) -> ResponseError {
     ResponseError {
-        kind: crate::ResponseErrorKind::Internal,
+        kind: ResponseErrorKind::Internal,
         message: message.into(),
     }
 }

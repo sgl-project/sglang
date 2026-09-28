@@ -4,13 +4,13 @@ use super::{
     ChatCompletionRequest, CompletionRequest,
     error::{json_rejection_response, response_error},
 };
-use crate::RendererService;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
     response::{IntoResponse, Response},
     routing::post,
 };
+use sglang_renderer::RendererService;
 use std::sync::Arc;
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
@@ -58,7 +58,9 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::{RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer};
+    use sglang_renderer::{
+        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer,
+    };
 
     struct WordTokenizer;
 

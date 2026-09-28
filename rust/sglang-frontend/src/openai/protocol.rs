@@ -11,11 +11,11 @@ use dynamo_protocols::types::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
-    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds, TokenIdsRequest,
+use sglang_renderer::{
+    ChatRequest, GenerateRequestIdentity, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    ReasoningEffort, RendererConfig, RendererError, SamplingDefaults, SamplingParams,
+    TextRequestGroup, TokenIds, TokenIdsRequest,
 };
-use sglang_renderer::{GenerateRequestIdentity, TextRequestGroup};
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 

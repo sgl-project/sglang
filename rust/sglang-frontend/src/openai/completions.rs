@@ -12,12 +12,13 @@ use super::{
     unix_seconds_u32,
 };
 use crate::{
-    GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
-    GenerationStream, MatchedStop, RendererService, ResponseError, engine::TokenDecoder,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    MatchedStop, engine::TokenDecoder,
 };
 use dynamo_protocols::types::{CompletionUsage, Prompt};
 use futures::StreamExt;
 use serde::Serialize;
+use sglang_renderer::{GenerateRequest, RendererError, RendererService, ResponseError};
 
 pub(crate) struct SubmittedChoice {
     pub(crate) index: usize,
@@ -119,10 +120,10 @@ fn prepare_response(
     let prompt_echoes = if !echo {
         vec![String::new(); choice_count / n]
     } else if matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_)) {
-        text_completion_prompts(&request.prompt).map_err(crate::RendererError::from)?
+        text_completion_prompts(&request.prompt).map_err(RendererError::from)?
     } else {
         token_ids_completion_prompts(&request.prompt)
-            .map_err(crate::RendererError::from)?
+            .map_err(RendererError::from)?
             .into_iter()
             .map(|ids| tokenizer.detokenize_prompt(ids))
             .collect::<Result<Vec<_>, _>>()?
@@ -460,8 +461,9 @@ mod tests {
     use crate::GenerationOutputExtras;
     use crate::engine::{TokenDecoder, test_utils::tiny_tokenizer};
     use crate::openai::test_utils::{chunk, renderer_config, submitted};
-    use crate::{DynamoTokenizer, PositionLogprobs, RendererService, ResponseError, TokenLogprob};
+    use crate::{PositionLogprobs, TokenLogprob};
     use futures::StreamExt;
+    use sglang_renderer::{DynamoTokenizer, RendererService, ResponseError};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -673,13 +675,13 @@ mod tests {
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            kind: crate::ResponseErrorKind::Unavailable,
+            kind: sglang_renderer::ResponseErrorKind::Unavailable,
             message: "out of memory".into(),
         }))
         .await
         .unwrap();
         let error = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(error.kind, crate::ResponseErrorKind::Unavailable);
+        assert_eq!(error.kind, sglang_renderer::ResponseErrorKind::Unavailable);
 
         tx1.send(chunk("late", true)).await.unwrap();
         let remaining = stream.collect::<Vec<_>>().await;

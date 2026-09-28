@@ -1,10 +1,7 @@
 //! HTTP tokenization adapter.
 
 use super::error::{json_rejection_response, response_error};
-use crate::{
-    RendererService,
-    openai::tokenize::{TokenizeRequest, tokenize as tokenize_request},
-};
+use crate::openai::tokenize::{TokenizeRequest, tokenize as tokenize_request};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -12,6 +9,7 @@ use axum::{
     routing::post,
 };
 use serde_json::Value;
+use sglang_renderer::RendererService;
 use std::sync::Arc;
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
@@ -42,7 +40,9 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    use crate::{RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer};
+    use sglang_renderer::{
+        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer,
+    };
 
     struct PrefixTokenizer;
 

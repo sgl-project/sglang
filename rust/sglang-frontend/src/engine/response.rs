@@ -1,7 +1,8 @@
 //! Generation stream merging and aggregation.
 
-use crate::{GenerationOutput, GenerationStream, ResponseError};
+use crate::{GenerationOutput, GenerationStream};
 use futures::{StreamExt, stream::BoxStream};
+use sglang_renderer::{ResponseError, ResponseErrorKind};
 
 pub(crate) fn merge_indexed(
     streams: Vec<GenerationStream>,
@@ -26,7 +27,7 @@ pub(crate) async fn collect_output(
         }
     }
     Err(ResponseError {
-        kind: crate::ResponseErrorKind::Internal,
+        kind: ResponseErrorKind::Internal,
         message: "response truncated before completion".into(),
     })
 }

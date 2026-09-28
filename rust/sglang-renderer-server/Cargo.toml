@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 sglang-frontend = { path = "../sglang-frontend" }
+sglang-renderer = { path = "../sglang-renderer" }
 async-stream = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

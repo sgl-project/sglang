@@ -1,5 +1,5 @@
-use crate::{PositionLogprobs, TokenLogprob};
-use crate::{RendererConfig, RendererLimits, SamplingDefaults};
+use sglang_frontend::{PositionLogprobs, TokenLogprob};
+use sglang_renderer::{RendererConfig, RendererLimits, SamplingDefaults};
 
 fn logprob(token_id: i32, logprob: f32) -> TokenLogprob {
     TokenLogprob {

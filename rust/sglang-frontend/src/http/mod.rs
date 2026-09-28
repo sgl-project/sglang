@@ -1,8 +1,9 @@
 //! HTTP adapters shared by embedded and standalone frontends.
 
+use crate::OpenAIService;
 use crate::openai::protocol::{ChatCompletionRequest, CompletionRequest};
-use crate::{OpenAIService, RendererService};
 use axum::Router;
+use sglang_renderer::RendererService;
 use std::sync::Arc;
 
 mod chat;

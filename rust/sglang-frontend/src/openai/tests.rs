@@ -5,7 +5,7 @@ use super::protocol::{
     lower_token_ids_completion_request,
 };
 use super::test_utils::renderer_config;
-use crate::SamplingDefaults;
+use sglang_renderer::SamplingDefaults;
 
 #[test]
 fn chat_lowering_preserves_template_controls_and_metadata() {
@@ -323,13 +323,12 @@ fn token_id_completion_lowering_attaches_batched_metadata() {
 #[tokio::test]
 async fn route_operations_decode_tokens_without_http() {
     use super::{OpenAIService, OperationResponse};
+    use crate::GenerationFinishReason;
     use crate::engine::{
         GenerateTransport, GenerationService, TokenDecoder, TokenDelta, TokenStream,
     };
-    use crate::{
-        DynamoTokenizer, GenerateRequest, GenerationFinishReason, RendererService, ResponseError,
-    };
     use futures::{StreamExt, future::BoxFuture};
+    use sglang_renderer::{DynamoTokenizer, GenerateRequest, RendererService, ResponseError};
     use std::sync::{Arc, Mutex};
 
     struct MemoryTransport(Mutex<Vec<GenerateRequest>>);

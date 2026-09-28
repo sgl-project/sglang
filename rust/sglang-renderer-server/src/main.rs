@@ -9,9 +9,6 @@ mod test_utils;
 #[cfg(test)]
 mod tests;
 
-use runtime::{RendererRuntimeConfig, serve};
-use sglang_frontend::*;
-
 fn main() {
     launcher::run_cli().unwrap_or_else(|error| exit(error));
 }

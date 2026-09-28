@@ -2,11 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{
-    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
-    ResponseError,
-};
+use crate::{GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
@@ -18,6 +14,10 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Serialize;
+use sglang_renderer::{
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
+    PreparedChat, RendererService, ResponseError, ResponseErrorKind,
+};
 
 use super::protocol::{ChatCompletionRequest, lower_chat_request};
 use super::{completion_usage, unix_seconds_u32};
@@ -33,9 +33,9 @@ pub(crate) struct ChatResponseContext {
 }
 
 pub(crate) async fn prepare_request(
-    renderer: &crate::RendererService,
+    renderer: &RendererService,
     request: ChatCompletionRequest,
-) -> Result<(String, crate::PreparedChat), ResponseError> {
+) -> Result<(String, PreparedChat), ResponseError> {
     let (response_id, request) = lower_chat_request(renderer.config(), request)?;
     let chat = renderer.prepare_chat(request).await?;
     Ok((response_id, chat))
@@ -72,7 +72,7 @@ pub(crate) async fn unary_chat(
             }) => {
                 let Some(choice) = accumulated.get_mut(choice) else {
                     return Err(ResponseError {
-                        kind: crate::ResponseErrorKind::Internal,
+                        kind: ResponseErrorKind::Internal,
                         message: "chat response choice is out of range".into(),
                     });
                 };
@@ -583,11 +583,12 @@ mod tests {
     use crate::openai::protocol::ChatCompletionRequest;
     use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
     use crate::openai::test_utils::{chat_submitted, chunk};
-    use crate::{
-        ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
-        ResponseError, SamplingDefaults, TokenLogprob,
-    };
+    use crate::{GenerationOutputExtras, PositionLogprobs, TokenLogprob};
     use futures::{FutureExt, StreamExt};
+    use sglang_renderer::{
+        ChatPreprocessor, RendererConfig, RendererLimits, ResponseError, ResponseErrorKind,
+        SamplingDefaults, UpstreamErrorCode,
+    };
 
     fn request() -> ChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -600,7 +601,7 @@ mod tests {
     fn response_processor(
         reasoning_parser: Option<&str>,
         choices: usize,
-    ) -> crate::ChatResponseProcessor {
+    ) -> sglang_renderer::ChatResponseProcessor {
         let config = RendererConfig {
             model_path: String::new(),
             served_model_name: "model".into(),
@@ -888,7 +889,7 @@ mod tests {
         futures::pin_mut!(stream);
 
         tx0.send(Err(ResponseError {
-            kind: crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(429)),
+            kind: ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429)),
             message: "out of memory".into(),
         }))
         .await
@@ -896,7 +897,7 @@ mod tests {
         let error = stream.next().await.unwrap().unwrap_err();
         assert_eq!(
             error.kind,
-            crate::ResponseErrorKind::Upstream(crate::UpstreamErrorCode::Http(429))
+            ResponseErrorKind::Upstream(UpstreamErrorCode::Http(429))
         );
         assert_eq!(error.message, "out of memory");
 

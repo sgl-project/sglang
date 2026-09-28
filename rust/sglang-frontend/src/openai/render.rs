@@ -1,7 +1,7 @@
 //! OpenAI render-only operations, without model execution or HTTP framing.
 
 use super::protocol::{ChatCompletionRequest, CompletionRequest};
-use crate::{GenerateRequest, RendererService, ResponseError};
+use sglang_renderer::{GenerateRequest, RendererService, ResponseError, ResponseErrorKind};
 
 pub(crate) async fn render_chat(
     renderer: &RendererService,
@@ -9,7 +9,7 @@ pub(crate) async fn render_chat(
 ) -> Result<GenerateRequest, ResponseError> {
     if request.n.is_some_and(|n| n > 1) {
         return Err(ResponseError {
-            kind: crate::ResponseErrorKind::InvalidRequest,
+            kind: ResponseErrorKind::InvalidRequest,
             message: "the standalone chat renderer currently requires n=1".into(),
         });
     }

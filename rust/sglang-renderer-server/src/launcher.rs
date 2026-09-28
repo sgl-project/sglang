@@ -9,8 +9,10 @@ use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
 use hf_hub::{Cache, Repo, RepoType};
 use serde_json::Value;
 
-use crate::{RendererConfig, RendererLimits, RendererRuntimeConfig, SamplingDefaults, serve};
-use sglang_frontend::{resolve_model_file, resolve_tokenizer_file};
+use crate::runtime::{RendererRuntimeConfig, serve};
+use sglang_renderer::{
+    RendererConfig, RendererLimits, SamplingDefaults, resolve_model_file, resolve_tokenizer_file,
+};
 
 const DEFAULT_CONTEXT_LEN: u64 = 2048;
 

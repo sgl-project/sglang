@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
+use sglang_renderer::{
+    DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer,
+};
 
 use crate::engine::HttpGenerateClient;
 use crate::routes::{hosted_routes, render_only_routes, standalone_routes};
