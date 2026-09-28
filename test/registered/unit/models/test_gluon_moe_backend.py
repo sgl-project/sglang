@@ -137,6 +137,7 @@ def test_gluon_backend_accepts_serialized_quark_mxfp4(monkeypatch):
     ("ep_size", "tp_size", "local_experts", "intermediate"),
     (
         (1, 4, 256, 512),
+        (4, 1, 64, 2048),
         (1, 8, 256, 256),
         (2, 4, 128, 512),
         (4, 2, 64, 1024),
@@ -259,6 +260,7 @@ def _glm_backend_shell(monkeypatch, total_tp=8, ep_size=1, ep_rank=0, is_nextn=F
     ("total_tp", "ep_size", "ep_rank", "local_experts", "local_intermediate"),
     (
         (4, 1, 0, 256, 512),
+        (4, 4, 3, 64, 2048),
         (8, 1, 0, 256, 256),
         (8, 2, 1, 128, 512),
         (8, 4, 3, 64, 1024),
@@ -285,7 +287,7 @@ def test_glm_backend_rejects_unsupported_topology(monkeypatch):
     backend, layer, experts = _glm_backend_shell(monkeypatch, total_tp=4)
     layer.moe_ep_size = 2
 
-    with pytest.raises(RuntimeError, match="TP4/EP1 or TP8/EP1/2/4/8 topology"):
+    with pytest.raises(RuntimeError, match="TP4/EP1/4 or TP8/EP1/2/4/8 topology"):
         backend.bind(layer, experts)
 
 
@@ -303,7 +305,7 @@ def test_glm_dispatch_covers_tp4_and_tp8_target_and_nextn_ranges():
     for m in range(1, 32769):
         assert _kernel_name(8, 1, False, m).startswith("fused_moe_tp8_")
         assert _kernel_name(8, 1, True, m).startswith("fused_moe_tp8_")
-    for total_tp, ep_size in ((4, 1), (8, 2), (8, 4), (8, 8)):
+    for total_tp, ep_size in ((4, 1), (4, 4), (8, 2), (8, 4), (8, 8)):
         for m in range(1, 16769):
             assert _kernel_name(total_tp, ep_size, False, m).startswith(
                 "fused_moe_tp4_"

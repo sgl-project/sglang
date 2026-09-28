@@ -20,6 +20,7 @@ _WEIGHT_NAMES = (
 _SUPPORTED_TOPOLOGIES = {
     # (total TP, EP): (rank-local experts, rank-local intermediate size)
     (4, 1): (256, 512),
+    (4, 4): (64, 2048),
     (8, 1): (256, 256),
     (8, 2): (128, 512),
     (8, 4): (64, 1024),
@@ -135,7 +136,7 @@ class GlmMxfp4GluonMoeBackend(GluonMoeBackend):
             and getattr(config, "norm_topk_prob", None) is True,
             "serialized MXFP4 target or BF16 NextN experts": serialized_mxfp4
             or nextn_bf16,
-            "TP4/EP1 or TP8/EP1/2/4/8 topology": local_shape
+            "TP4/EP1/4 or TP8/EP1/2/4/8 topology": local_shape
             == (experts._num_local_routed, experts.intermediate_size_per_partition),
             "gfx950 GPU": utils.is_gfx95_supported(),
             "single stream": layer.alt_stream is None,
