@@ -265,7 +265,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             req.is_retracted = False
             req.origin_input_ids = [1]
             req.output_ids = [7, 8]
-            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.dllm_config = SimpleNamespace(
+                block_size=self.block_size, requires_separate_context_encoding=False
+            )
             req.dllm_algo_state = object()
             req.dllm_block_offset = self.block_size
             req.reset_for_retract = lambda r=req: setattr(r, "is_retracted", True)
@@ -412,7 +414,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             origin_input_text="",
             origin_input_ids=array("q", [1, 2, 3, 4]),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=8),
-            dllm_config=SimpleNamespace(block_size=self.block_size),
+            dllm_config=SimpleNamespace(
+                block_size=self.block_size, requires_separate_context_encoding=False
+            ),
         )
         req.output_ids = array("q", [5, 6, 7, 8])
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
@@ -580,7 +584,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         for req in (retracted, aborted):
             req.origin_input_ids = [1]
             req.output_ids = [7]
-            req.dllm_config = SimpleNamespace(block_size=self.block_size)
+            req.dllm_config = SimpleNamespace(
+                block_size=self.block_size, requires_separate_context_encoding=False
+            )
             req.reset_for_retract = lambda: None
             req.reset_dllm_for_retract = lambda: None
             req.time_stats = SimpleNamespace(set_retract_time=lambda: None)

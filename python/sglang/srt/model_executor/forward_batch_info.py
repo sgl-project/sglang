@@ -263,6 +263,9 @@ class ForwardMode(IntEnum):
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
 
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
+
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
@@ -271,9 +274,6 @@ class ForwardMode(IntEnum):
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
-
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering
@@ -1027,13 +1027,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
-        # Override the positions with diffusion LLM or spec_info
-        # DLLM decode uses a fixed-size mask block. Pure DLLM prefill is a
-        # regular EXTEND batch and must use the dynamic position calculation
-        # below so positions match its (potentially larger) extend length.
+        # A dLLM denoise pass rewrites a fixed-size block in place. Pure dLLM
+        # prefill (including separate context encoding) is a regular EXTEND
+        # batch and uses the dynamic position path below, so positions match
+        # its possibly multi-block extend length.
         if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
             block_size = batch.dllm_config.block_size
-            # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(
                 [

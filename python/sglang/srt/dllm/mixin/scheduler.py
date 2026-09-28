@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -27,6 +27,11 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+
+    def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
+        if self.dllm_config is None:
+            return None
+        return self.dllm_config.validate_request(req)
 
     def get_new_batch_dllm(
         self: Scheduler, running_batch: ScheduleBatch
@@ -188,7 +193,8 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         # Pure prefill only commits prompt KV. It produces neither a denoising
-        # state nor generated tokens, including when FDFO is enabled.
+        # state nor generated tokens, including when FDFO is enabled. Separate
+        # context encoding is a pure prefill too.
         if batch.is_dllm_prefill:
             self.metrics_reporter.report_prefill_stats(
                 batch=batch,
@@ -225,10 +231,7 @@ class SchedulerDllmMixin:
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
-
-                    if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
+                    self._finish_dllm_request_if_needed(req)
                     continue
 
                 next_token_ids = result.next_token_ids[idx]
@@ -266,10 +269,7 @@ class SchedulerDllmMixin:
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
-
-                if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
+                self._finish_dllm_request_if_needed(req)
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
@@ -280,6 +280,60 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
+        if (
+            not req.finished()
+            and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
+        ):
+            req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+
+        if req.finished():
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=not self.dllm_config.requires_separate_context_encoding,
+            )
+            req.time_stats.set_completion_time()
+
+    def _stash_dllm_context(self: Scheduler, req: Req) -> None:
+        context_len = req.dllm_block_offset
+        block_size = self.dllm_config.block_size
+        assert req.extend_range.end == context_len + block_size
+        assert req.kv is not None and req.kv.req_pool_idx is not None
+
+        allocated_len = req.kv.kv_allocated_len
+        page_size = self.token_to_kv_pool_allocator.page_size
+        free_start = -(-context_len // page_size) * page_size
+        if free_start < allocated_len:
+            slots = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, free_start:allocated_len
+            ]
+            self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
+
+        req.kv.kv_committed_len = context_len
+        req.kv.kv_allocated_len = context_len
+        assert req.kv.swa_evicted_seqlen <= context_len
+        req.set_extend_range(context_len, context_len)
+        self.stash_chunked_request(req)
+
+    def finish_dllm_forward(self: Scheduler, req: Req) -> None:
+        """Commit or discard KV after one scheduler-visible dLLM forward."""
+        fdfo_mode = self.dllm_config.first_done_first_out_mode
+        if fdfo_mode and req.dllm_incomplete_ids:
+            # Keep the req slot and KV for the unresolved block's next round.
+            return
+
+        if self.dllm_config.requires_separate_context_encoding:
+            if req.is_dllm_prefill():
+                self.stash_chunked_request(req)
+            else:
+                self._stash_dllm_context(req)
+            return
+
+        self.stash_chunked_request(req)
+        if fdfo_mode:
+            self.req_to_token_pool.free(req)
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager

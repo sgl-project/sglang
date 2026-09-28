@@ -21,13 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 def handle_dllm_cuda_graph_compatibility(server_args: Any):
-    """Disable CUDA graphs before memory sizing for dLLM on HIP.
+    """Declare dLLM launch constraints before memory sizing.
 
     The slot matters: a phase disabled here contributes nothing to the graph
-    reserve, and memory sizing generates the prefill bucket list too.
+    reserve, and memory sizing generates the prefill bucket list and budgets
+    for the chunked-prefill size, so both must already be final.
     """
     cfg = resolving_view(server_args)
-    if cfg.dllm_algorithm is None or not get_platform().is_hip:
+    if cfg.dllm_algorithm is None:
+        return
+
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    # Algorithm-owned constraints, e.g. Gemma4Renoise disables the prefill
+    # graph and chunked prefill.
+    get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
+
+    if not get_platform().is_hip:
         return
     if (
         cfg.cuda_graph_config.decode.backend != Backend.DISABLED

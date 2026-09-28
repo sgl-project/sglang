@@ -2911,6 +2911,19 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if error_msg := self.validate_dllm_request(req):
+            abort_req = _make_abort_req(
+                req,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                    "message": error_msg,
+                },
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            return
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
@@ -3635,13 +3648,7 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                if self.dllm_config.first_done_first_out_mode:
-                    if not req.dllm_incomplete_ids:
-                        self.stash_chunked_request(req)
-                        self.req_to_token_pool.free(req)
-                    # Otherwise, keep req slot/KV for reuse.
-                else:
-                    self.stash_chunked_request(req)
+                self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

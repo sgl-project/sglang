@@ -763,6 +763,11 @@ class PrefillAdder:
         self.dllm_prefill_block_size = dllm_config.prefill_block_size
         max_running_reqs = dllm_config.max_running_requests
 
+        if dllm_config.requires_separate_context_encoding and is_prefill:
+            # Context encoding prefills an unaligned context of any length,
+            # bounded only by the ordinary prefill token budget.
+            self.rem_dllm_tokens = self.rem_input_tokens
+            return
         per_req_budget = (
             self.dllm_prefill_block_size if is_prefill else self.dllm_block_size
         )
@@ -949,11 +954,14 @@ class PrefillAdder:
         )
 
     def _get_dllm_remain_tokens(self, req: Req) -> int:
-        per_req_cap = (
-            self.dllm_prefill_block_size
-            if req.is_dllm_prefill()
-            else self.dllm_block_size
-        )
+        separate_context = self.dllm_config.requires_separate_context_encoding
+        if not req.is_dllm_prefill():
+            per_req_cap = self.dllm_block_size
+        elif separate_context:
+            # Context encoding has no block-multiple cap (see _init_dllm_meta).
+            per_req_cap = self.rem_dllm_tokens
+        else:
+            per_req_cap = self.dllm_prefill_block_size
         non_kv_budget = min(
             self.rem_dllm_tokens,
             per_req_cap,
@@ -970,10 +978,26 @@ class PrefillAdder:
         prefix_page_slack = (-len(req.prefix_indices)) % self.page_size
         kv_budget = min(int(self.rem_total_tokens), int(self.cur_rem_tokens))
         kv_budget += prefix_page_slack
+        if separate_context and self.is_hybrid_swa:
+            # The encoded context and the canvas also take sliding-window slots.
+            kv_budget = min(
+                kv_budget, int(self.memory_budget.remaining_swa) - self.page_size
+            )
         return max(0, min(non_kv_budget, kv_budget))
 
     def _get_dllm_extend_len(self, req: Req, prefix_len: int) -> int:
         available = self._get_dllm_remain_tokens(req)
+        if self.dllm_config.requires_separate_context_encoding:
+            if req.is_dllm_prefill():
+                # Encode the whole unaligned context in front of the canvas. A
+                # truncated pass resumes next round, since the prefix is still
+                # short of the block offset.
+                return max(0, min(available, req.dllm_block_offset - prefix_len))
+            # The canvas is denoised whole or not at all.
+            if available < self.dllm_block_size:
+                return 0
+            return self.dllm_block_size
+
         if req.is_dllm_prefill():
             # Do not prefill into the appended mask block. Keep the committed
             # frontier block aligned so a prompt tail shares its final decode
@@ -1025,14 +1049,23 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if (
+            self.dllm_config.requires_separate_context_encoding
+            and req.is_dllm_prefill()
+        ):
+            # Context encoding stops at the canvas, which is denoised next.
+            cand_extend_input_len = min(
+                cand_extend_input_len, req.dllm_block_offset - prefix_len
+            )
         if req.dllm_incomplete_ids and cand_extend_input_len > new_len:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > new_len
         # Held by phase classification: decode needs a whole block present
-        # (determine_dllm_phase) and pure prefill stops one block short of the
-        # appended mask block. Assert rather than clamp -- `_get_dllm_extend_len`
-        # returns a multiple of the block size, so truncating to the fill ids
-        # would emit a partial block and break the offsets downstream reads.
+        # (determine_dllm_phase) and pure prefill stops short of the appended
+        # mask block or canvas. Assert rather than clamp -- a legacy
+        # `_get_dllm_extend_len` returns a multiple of the block size, so
+        # truncating to the fill ids would emit a partial block and break the
+        # offsets downstream reads.
         assert new_len <= cand_extend_input_len, (
             f"dLLM extend {new_len} exceeds the {cand_extend_input_len} fill ids "
             f"available for {req.rid} in phase {req.dllm_phase}"

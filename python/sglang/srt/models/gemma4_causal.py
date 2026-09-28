@@ -216,6 +216,7 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -274,7 +275,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            activation="gelu",
+            activation=activation,
             reduce_results=True,
         )
 

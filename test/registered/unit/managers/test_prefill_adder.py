@@ -458,6 +458,7 @@ class TestPrefillAdder(CustomTestCase):
             block_size=32,
             prefill_block_size=128,
             max_running_requests=2,
+            requires_separate_context_encoding=False,
         )
         return self.create_adder(
             self.create_running_batch(),
@@ -566,7 +567,9 @@ class TestPrefillAdder(CustomTestCase):
             dllm_incomplete_ids=array("q"),
             dllm_block_offset=0,
             extend_range=Range(0, 128),
-            dllm_config=SimpleNamespace(block_size=32, mask_id=0),
+            dllm_config=SimpleNamespace(
+                block_size=32, mask_id=0, requires_separate_context_encoding=False
+            ),
             origin_input_ids=array("q", [1] * 128),
             output_ids=array("q"),
         )
@@ -581,7 +584,9 @@ class TestPrefillAdder(CustomTestCase):
             dllm_incomplete_ids=array("q"),
             dllm_block_offset=0,
             extend_range=None,
-            dllm_config=SimpleNamespace(block_size=32, mask_id=0),
+            dllm_config=SimpleNamespace(
+                block_size=32, mask_id=0, requires_separate_context_encoding=False
+            ),
             origin_input_ids=array("q", [1] * 128),
             output_ids=array("q"),
         )
@@ -868,7 +873,10 @@ class TestPrefillAdder(CustomTestCase):
         # decode reuses its retained block. Selecting prefill by existence alone
         # would stall the round and retract a request that never needed it.
         dllm_config = SimpleNamespace(
-            block_size=32, prefill_block_size=128, max_running_requests=2
+            block_size=32,
+            prefill_block_size=128,
+            max_running_requests=2,
+            requires_separate_context_encoding=False,
         )
         self.mock_token_allocator.available_size.return_value = 0
         prefill = self.create_dllm_req(origin_len=256, prefix_len=0, is_prefill=True)
@@ -1126,7 +1134,9 @@ class TestPrefillAdder(CustomTestCase):
         req = SimpleNamespace(
             origin_input_ids=[1] * 40,
             output_ids=[2] * 8,
-            dllm_config=SimpleNamespace(block_size=32),
+            dllm_config=SimpleNamespace(
+                block_size=32, requires_separate_context_encoding=False
+            ),
             dllm_incomplete_ids=array("q", range(32)),
             dllm_algo_state=object(),
             dllm_block_offset=64,
@@ -1147,7 +1157,9 @@ class TestPrefillAdder(CustomTestCase):
         req = SimpleNamespace(
             origin_input_ids=[1] * 8,
             output_ids=[],
-            dllm_config=SimpleNamespace(block_size=32),
+            dllm_config=SimpleNamespace(
+                block_size=32, requires_separate_context_encoding=False
+            ),
             dllm_incomplete_ids=array("q", range(32)),
             dllm_algo_state=None,
             dllm_block_offset=32,
@@ -1259,7 +1271,11 @@ class TestPrefillAdder(CustomTestCase):
     def test_dllm_prefill_result_skips_fdfo_token_processing(self):
         scheduler = SimpleNamespace(
             metrics_reporter=MagicMock(),
-            dllm_config=SimpleNamespace(first_done_first_out_mode=True, block_size=32),
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True,
+                block_size=32,
+                requires_separate_context_encoding=False,
+            ),
             token_to_kv_pool_allocator=MagicMock(),
             output_streamer=MagicMock(),
         )
@@ -2008,7 +2024,10 @@ class TestPrefillAdder(CustomTestCase):
                 24,
                 None,
                 SimpleNamespace(
-                    block_size=4, prefill_block_size=4, max_running_requests=2
+                    block_size=4,
+                    prefill_block_size=4,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=False,
                 ),
                 4,
                 0,
@@ -2019,7 +2038,10 @@ class TestPrefillAdder(CustomTestCase):
                 24,
                 None,
                 SimpleNamespace(
-                    block_size=4, prefill_block_size=4, max_running_requests=2
+                    block_size=4,
+                    prefill_block_size=4,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=False,
                 ),
                 4,
                 0,
