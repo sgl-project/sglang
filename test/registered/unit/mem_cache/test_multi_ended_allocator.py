@@ -3533,8 +3533,8 @@ class TestDcpWidening(unittest.TestCase):
             allocator.free_group_end()
 
 
-class TestFusedWriteLocTranslate(unittest.TestCase):
-    """`write_loc_to_kernel_ids` must equal the arithmetic it stands for.
+class TestTranslateTokenIds(unittest.TestCase):
+    """`translate_token_ids` must equal the arithmetic it stands for.
 
     Nothing downstream can tell the two apart except by value, so the reference
     here is the definition rather than a recorded expectation. Triton truncates
@@ -3555,7 +3555,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
         return out
 
     def _check(self, *, page_size, dcp_size, dcp_rank, device):
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         span = page_size * dcp_size
         locs = [0, 1, span - 1, span, 2 * span + 3, 5 * span + dcp_rank, -1]
@@ -3571,7 +3571,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
         )
         v2p[min(3, num_pages - 1)] = -1
 
-        got = write_loc_to_kernel_ids(
+        got = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
@@ -3582,7 +3582,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
         self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
         # `out=` must write in place and agree (the cuda-graph-stable path).
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(
+        ret = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
@@ -3606,7 +3606,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     def test_matches_reference_on_a_strided_view(self):
         """A column slice of a wider page table is what the SWA read path hands
         down under cuda graphs, so its ids must equal the flat reference's."""
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         rows, cols, page_size = 3, 5, 4
         v2p = torch.arange(32, dtype=torch.int64, device=_DEV)
@@ -3616,14 +3616,14 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
         self.assertFalse(view.is_contiguous())
 
         want = self._reference(view.reshape(-1).cpu(), v2p.cpu(), page_size, 1, 0)
-        got = write_loc_to_kernel_ids(loc=view, v2p=v2p, page_size=page_size)
+        got = translate_token_ids(loc=view, v2p=v2p, page_size=page_size)
         self.assertEqual(got.shape, view.shape)
         self.assertEqual(got.reshape(-1).tolist(), want)
 
         # `out=` into a slice of a DIFFERENTLY strided backing: the ids land in
         # the sliced columns and the rest of that buffer is left alone.
         dst = torch.full((rows, cols + 7), -9, dtype=torch.int64, device=_DEV)
-        ret = write_loc_to_kernel_ids(
+        ret = translate_token_ids(
             loc=view,
             v2p=v2p,
             page_size=page_size,
@@ -3636,12 +3636,12 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     def test_out_width_needs_a_packed_loc(self):
         """`out_width` addresses a packed lane range, so a strided loc would
         write its tail zeros over live ids."""
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         v2p = torch.arange(16, dtype=torch.int64, device=_DEV)
         loc = torch.arange(12, dtype=torch.int64, device=_DEV)[::2]
         with self.assertRaises(AssertionError):
-            write_loc_to_kernel_ids(
+            translate_token_ids(
                 loc=loc,
                 v2p=v2p,
                 page_size=1,

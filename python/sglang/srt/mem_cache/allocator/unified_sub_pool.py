@@ -44,7 +44,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     bind_inplace,
     free_unbind_inplace,
-    write_loc_to_kernel_ids,
+    translate_token_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1020,9 +1020,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """One launch for the read and write conversions alike; see
-        `write_loc_to_kernel_ids`, which owns the `out=` dtype and shape
+        `translate_token_ids`, which owns the `out=` dtype and shape
         contract for both."""
-        return write_loc_to_kernel_ids(
+        return translate_token_ids(
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,

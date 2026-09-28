@@ -193,11 +193,11 @@ def bind_inplace(
     bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)
 
 
-WRITE_LOC_BLOCK = 512
+TRANSLATE_TOKEN_IDS_BLOCK = 512
 
 
 @triton.jit
-def write_loc_to_kernel_id_kernel(
+def translate_token_ids_kernel(
     loc_ptr,  # in:  [N] int64 — WIDENED virtual token ids
     v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
     out_ptr,  # out: [N] int64 — physical token ids
@@ -270,7 +270,7 @@ def _row_col_strides(t: torch.Tensor) -> Tuple[int, int]:
     return 0, (t.stride(0) if t.dim() == 1 else 1)
 
 
-def write_loc_to_kernel_ids(
+def translate_token_ids(
     *,
     loc: torch.Tensor,
     v2p: torch.Tensor,
@@ -297,26 +297,25 @@ def write_loc_to_kernel_ids(
         out = torch.empty(loc.shape, dtype=torch.int64, device=loc.device)
     width = N if out_width is None else int(out_width)
     assert out.dtype == torch.int64, (
-        f"write_loc_to_kernel_ids: out dtype must be int64 (matches v2p), "
-        f"got {out.dtype}"
+        f"translate_token_ids: out dtype must be int64 (matches v2p), got {out.dtype}"
     )
     if out_width is None:
         # `out` mirrors `loc` whatever its shape; a 2-D page table is legal.
         assert out.shape == loc.shape, (
-            f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
+            f"translate_token_ids: out shape {tuple(out.shape)} must match "
             f"loc shape {tuple(loc.shape)}"
         )
     else:
         assert loc.is_contiguous(), (
-            f"write_loc_to_kernel_ids: out_width writes a packed lane range, "
+            f"translate_token_ids: out_width writes a packed lane range, "
             f"so loc must be packed; got stride {tuple(loc.stride())}"
         )
         assert out.dim() == 1 and out.is_contiguous() and out.numel() >= width, (
-            f"write_loc_to_kernel_ids: out_width needs a packed 1-D out of at "
+            f"translate_token_ids: out_width needs a packed 1-D out of at "
             f"least {width}, got {tuple(out.shape)}"
         )
         assert width >= N, (
-            f"write_loc_to_kernel_ids: out_width {width} is under the batch's "
+            f"translate_token_ids: out_width {width} is under the batch's "
             f"{N} locs, which would drop live rows"
         )
     if width == 0:
@@ -348,14 +347,14 @@ def write_loc_to_kernel_ids(
         out_row_stride = out_col_stride = 1
     else:
         assert loc.dim() <= 2 and out.dim() <= 2, (
-            f"write_loc_to_kernel_ids: a strided loc/out is walked as 2-D, got "
+            f"translate_token_ids: a strided loc/out is walked as 2-D, got "
             f"{loc.dim()}-D loc and {out.dim()}-D out; pass a contiguous view"
         )
         cols = loc.shape[-1] if loc.dim() == 2 else N
         loc_row_stride, loc_col_stride = _row_col_strides(loc)
         out_row_stride, out_col_stride = _row_col_strides(out)
-    grid = (triton.cdiv(width, WRITE_LOC_BLOCK),)
-    write_loc_to_kernel_id_kernel[grid](
+    grid = (triton.cdiv(width, TRANSLATE_TOKEN_IDS_BLOCK),)
+    translate_token_ids_kernel[grid](
         loc,
         v2p,
         out,
@@ -371,6 +370,6 @@ def write_loc_to_kernel_ids(
         DCP_SIZE=dcp_size,
         DCP_RANK=dcp_rank,
         STRIDED=not flat,
-        BLOCK=WRITE_LOC_BLOCK,
+        BLOCK=TRANSLATE_TOKEN_IDS_BLOCK,
     )
     return out
