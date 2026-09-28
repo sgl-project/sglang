@@ -33,7 +33,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -612,7 +612,7 @@ class LLaDA2MoeBlock(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
         is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -645,7 +645,7 @@ class LLaDA2MoeBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
