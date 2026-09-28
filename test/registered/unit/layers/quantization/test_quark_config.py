@@ -1,21 +1,35 @@
-"""Unit tests for QuarkConfig — CPU-only, no model loading."""
+"""Unit tests for QuarkConfig and its MoE scheme — CPU-only, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import sys
+import types
 import unittest
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark.quark import (
     QuarkConfig,
     _build_mixed_precision_layer_quant_config,
     _mixed_precision_layer_map,
     _parse_nvfp4_excludes,
 )
+from sglang.srt.layers.quantization.quark.schemes import (
+    quark_w4a4_mxfp4_moe as quark_moe,
+)
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+    QuarkW4A4MXFp4MoE,
+)
 from sglang.srt.layers.quantization.quark.utils import check_equal_or_regex_match
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.test.test_utils import CustomTestCase
 
 _GET_CAP = "sglang.srt.layers.quantization.quark.quark.get_device_capability"
@@ -205,6 +219,176 @@ class TestParseNvfp4Excludes(CustomTestCase):
         self.assertFalse(
             check_equal_or_regex_match("model.layers.0.mlp.experts", excludes)
         )
+
+
+class TestQuarkPerLayerBlockFp8(CustomTestCase):
+    _BLOCK_FP8_CONFIG = {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_block",
+            "block_size": [128, 128],
+            "is_dynamic": False,
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_group",
+            "group_size": 128,
+            "is_dynamic": True,
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+    def _build_bare_config(self) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "layer_quant_config": {
+                "model.language_model.layers.0.mlp.down_proj": self._BLOCK_FP8_CONFIG
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": {
+                "weight": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": False,
+                    "scale_format": "e8m0",
+                },
+                "input_tensors": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": True,
+                    "scale_format": "e8m0",
+                },
+            },
+        }
+        config.exclude_layers = []
+        config.kv_cache_group = []
+        config.packed_modules_mapping = {}
+        config.excluded_fp8_config = None
+        config._online_quantized_layers = set()
+        return config
+
+    def test_model_mapper_rewrites_explicit_layer_config(self):
+        config = self._build_bare_config()
+
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        self.assertIn(
+            "model.layers.0.mlp.down_proj",
+            config.quant_config["layer_quant_config"],
+        )
+
+    def test_model_mapper_rewrites_fused_visual_exclusion(self):
+        config = self._build_bare_config()
+        config.exclude_layers = ["model.visual.blocks.0.attn.qkv"]
+
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        self.assertEqual(
+            config.exclude_layers,
+            ["visual.blocks.0.attn.qkv_proj"],
+        )
+        self.assertNotIn(
+            "model.language_model.layers.0.mlp.down_proj",
+            config.quant_config["layer_quant_config"],
+        )
+
+    def test_explicit_block_fp8_linear_uses_fp8_method(self):
+        config = self._build_bare_config()
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+        layer = LinearBase.__new__(LinearBase)
+
+        method = config.get_quant_method(layer, "model.layers.0.mlp.down_proj")
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+
+    def test_dynamic_block_fp8_weight_is_not_treated_as_serialized(self):
+        layer_config = deepcopy(self._BLOCK_FP8_CONFIG)
+        layer_config["weight"]["is_dynamic"] = True
+
+        self.assertIsNone(QuarkConfig._get_block_fp8_config(layer_config, {}))
+
+    def test_unmatched_layer_still_uses_global_quark_config(self):
+        config = self._build_bare_config()
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        matched = config._find_matched_config(
+            "model.layers.4.mlp.down_proj", torch.nn.Module()
+        )
+
+        self.assertEqual(matched["weight"]["dtype"], "fp4")
+
+
+class _Runner:
+    """Records the quant_info apply_weights() hands to the runner."""
+
+    def __init__(self):
+        self.quant_info = None
+
+    def run(self, dispatch_output, quant_info):
+        self.quant_info = quant_info
+        return dispatch_output
+
+
+class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
+    """apply_weights assembles what the AITER runner consumes.
+
+    The gfx950 e2e builds AiterMoeQuantInfo by hand, so dropping the gate/up
+    layout, the clamp or the padding here would leave it passing while served
+    experts read the gate and up halves swapped.
+    """
+
+    def test_apply_forwards_clamp_separated_layout_and_padding(self):
+        scheme = object.__new__(QuarkW4A4MXFp4MoE)
+        scheme.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)
+        scheme.runner = _Runner()
+
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 2), dtype=torch.uint8),
+            w2_weight=torch.zeros((1, 2, 2), dtype=torch.uint8),
+            w13_weight_scale=torch.ones((1, 4, 1), dtype=torch.uint8),
+            w2_weight_scale=torch.ones((1, 2, 1), dtype=torch.uint8),
+            hidden_pad=0,
+            intermediate_pad=128,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        layer.w13_weight.is_shuffled = True
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.object(quark_moe, "_is_gfx95", True),
+            patch.object(quark_moe, "_is_gfx1250", False),
+        ):
+            marker = object()
+            result = scheme.apply_weights(layer, marker)
+
+        self.assertIs(result, marker)
+        quant_info = scheme.runner.quant_info
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.hidden_pad, 0)
+        self.assertEqual(quant_info.intermediate_pad, 128)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+        self.assertTrue(quant_info.w13_weight.is_shuffled)
+        self.assertTrue(quant_info.w2_weight.is_shuffled)
 
 
 if __name__ == "__main__":

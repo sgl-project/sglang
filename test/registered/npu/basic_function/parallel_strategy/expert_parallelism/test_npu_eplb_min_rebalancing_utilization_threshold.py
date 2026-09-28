@@ -80,6 +80,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },
@@ -112,7 +113,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["score"],
             self.accuracy,
-            f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {self.accuracy}',
+            f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {self.accuracy}",
         )
 
         """
@@ -154,6 +155,7 @@ class TestEplbMinRebalancingUtilizationThreshold095(
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 **os.environ,
             },

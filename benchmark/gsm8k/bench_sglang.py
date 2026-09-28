@@ -53,9 +53,9 @@ def main(args):
     if args.enable_thinking:
         from transformers import AutoTokenizer
 
-        assert (
-            args.tokenizer_path is not None
-        ), "--tokenizer-path is required when --enable-thinking is set"
+        assert args.tokenizer_path is not None, (
+            "--tokenizer-path is required when --enable-thinking is set"
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer_path, trust_remote_code=True
         )

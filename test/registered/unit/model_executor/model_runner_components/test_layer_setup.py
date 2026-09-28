@@ -8,7 +8,7 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestComputeAttentionAndMoeLayers(unittest.TestCase):
@@ -30,6 +30,20 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
         self.assertEqual(attention_layers, [attn_mqa])
         self.assertEqual(mha_companion_layers, [attn_mha])
         self.assertNotIn("_pcg_mha_companion", vars(attn_mqa))
+
+    def test_pipeline_placeholders_preserve_global_layer_ids(self):
+        local_attention = SimpleNamespace()
+        layer_model = SimpleNamespace(
+            layers=[SimpleNamespace(), SimpleNamespace()]
+            + [SimpleNamespace(self_attn=SimpleNamespace(attn=local_attention))]
+        )
+
+        attention_layers, _, _, _, mha_companion_layers = (
+            compute_attention_and_moe_layers(layer_model)
+        )
+
+        self.assertEqual(attention_layers, [None, None, local_attention])
+        self.assertEqual(mha_companion_layers, [None, None, None])
 
 
 if __name__ == "__main__":

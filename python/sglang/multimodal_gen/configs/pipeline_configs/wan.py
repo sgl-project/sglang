@@ -48,12 +48,13 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 @dataclass
 class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         if num_frames % vae_scale_factor_temporal != 1:
-            logger.warning(
-                f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
-            )
+            if log_adjustment:
+                logger.warning(
+                    f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
+                )
             num_frames = (
                 num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
             )

@@ -18,7 +18,6 @@ from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +28,6 @@ def prepare_moe_topk(
     *,
     model,
     model_config: ModelConfig,
-    server_args: ServerArgs,
     moe_ep_size: int,
     moe_ep_rank: int,
 ) -> None:
@@ -77,7 +75,7 @@ def prepare_moe_topk(
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.distributed import get_moe_ep_group
+    from sglang.srt.runtime_context import get_parallel
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
@@ -90,7 +88,7 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     if metadata is None:
         return
     clear_global_lplb_solvers()
-    ep_group = get_moe_ep_group()
+    ep_group = get_parallel().moe_ep_group
     for lid in range(metadata.num_layers):
         solver = LPLBSolver(
             phy2log=metadata.physical_to_logical_map[lid],

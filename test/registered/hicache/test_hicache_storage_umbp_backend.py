@@ -121,9 +121,11 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         # An absent master address keeps every TP rank in standalone local mode,
         # so this E2E does not require an RDMA-capable CI runner.
         env.pop("UMBP_MASTER_ADDRESS", None)
+        env.pop("UMBP_STANDALONE_ADDRESS", None)
         env.update(
             {
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
                 "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",

@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import k3_ar_fusion
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -64,7 +65,6 @@ def _init_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.runtime_context import get_exec, get_parallel
     from sglang.srt.utils.common import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend

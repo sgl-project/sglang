@@ -16,7 +16,7 @@ from sglang.srt.speculative.spec_registry import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RegistryIsolated(CustomTestCase):
@@ -232,6 +232,7 @@ class TestServerArgsHook(_RegistryIsolated):
             decrypted_draft_config_file=None,
             trust_remote_code=False,
             speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
         )

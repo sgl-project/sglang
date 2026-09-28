@@ -304,6 +304,25 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
+def get_schema_properties(schema: Any) -> Dict[str, Any]:
+    """Top-level ``properties`` of a tool ``parameters`` schema, descending
+    into ``anyOf``/``oneOf``/``allOf`` branches when the top level declares
+    none (legal JSON Schema, e.g. discriminated-union arguments)."""
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return properties
+    merged: Dict[str, Any] = {}
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            for branch in branches:
+                for key, value in get_schema_properties(branch).items():
+                    merged.setdefault(key, value)
+    return merged
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.

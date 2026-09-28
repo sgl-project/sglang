@@ -8,12 +8,14 @@ field aborts before any write; provenance is recorded.
 
 import unittest
 
+import msgspec
+
 from sglang.srt import runtime_context as rc
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestContextOverride(CustomTestCase):
@@ -91,7 +93,7 @@ class TestContextOverride(CustomTestCase):
             speculative_accept_threshold_single=0.5,
             speculative_accept_threshold_acc=0.9,
         )
-        self.assertEqual(rc.get_parallel().config.pp_max_micro_batch_size, 8)
+        self.assertEqual(rc.get_parallel().pp_max_micro_batch_size, 8)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_single, 0.5)
         self.assertEqual(rc.get_spec().speculative_accept_threshold_acc, 0.9)
 
@@ -110,7 +112,7 @@ class TestContextOverride(CustomTestCase):
         # server_args is read-only after resolution: resolved config changes go
         # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
-        object.__setattr__(sa, "_resolution_finished", True)
+        msgspec.Struct.__setattr__(sa, "_resolution_finished", True)
         with self.assertRaises(AttributeError):
             sa.page_size = 999
 

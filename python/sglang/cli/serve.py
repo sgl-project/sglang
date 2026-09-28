@@ -112,6 +112,10 @@ def _run_diffusion(request: ServeRequest) -> None:
         _print_diffusion_help(request)
         return
 
+    from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+
+    apply_plugin_hooks()
+
     from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
         add_multimodal_gen_serve_args,
         execute_serve_cmd,
@@ -195,7 +199,7 @@ def serve(args, extra_argv):
         else:
             registered = registry.get(backend_name)
             logger.info(
-                "Dispatch override enabled: --model-type=%s " "(skip auto detection)",
+                "Dispatch override enabled: --model-type=%s (skip auto detection)",
                 backend_name,
             )
 

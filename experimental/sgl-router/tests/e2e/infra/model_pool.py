@@ -24,14 +24,28 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
 from .model_specs import get_model_spec
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _get_open_port() -> int:
@@ -72,6 +86,19 @@ class ModelInstance:
     model_id: str
     gpu_ids: list[int] = field(default_factory=list)
     kv_events_endpoint: str | None = None
+    log_path: Path | None = None
+    _shutdown_started: bool = field(default=False, init=False, repr=False)
+
+    def log_tail(self, lines: int = 200) -> str:
+        """Last `lines` of the worker's log, for failure diagnostics."""
+        if self.log_path is None:
+            return "(no log file)"
+        try:
+            return "\n".join(
+                self.log_path.read_text(errors="replace").splitlines()[-lines:]
+            )
+        except OSError:
+            return f"({self.log_path} unreadable)"
 
     def __enter__(self) -> "ModelInstance":
         return self
@@ -80,16 +107,31 @@ class ModelInstance:
         self.shutdown()
 
     def shutdown(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            try:
-                self.process.send_signal(signal.SIGTERM)
-                try:
-                    self.process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait()
-            except ProcessLookupError:
-                pass
+        if self.process is None or self._shutdown_started:
+            return
+        self._shutdown_started = True
+        pgid = self.process.pid
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            self.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+
+        if _wait_for_process_group_exit(pgid, timeout=30):
+            return
+
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        self.process.wait()
+        if not _wait_for_process_group_exit(pgid, timeout=5):
+            raise RuntimeError(f"worker process group {pgid} did not exit")
 
 
 def spawn_worker(
@@ -170,13 +212,30 @@ def spawn_worker(
         disagg_mode,
     )
 
-    proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    # Stream the worker's output to a file rather than an unread
+    # subprocess.PIPE. Nothing in this process drains that pipe, so once its
+    # ~64 KB OS buffer fills the engine blocks on write and stops serving —
+    # requests then hang until the client timeout with no log to explain it.
+    # Startup alone (weight load, memory pool, CUDA-graph capture) can
+    # approach that, and a long test's per-request logging goes past it.
+    # `conftest.py`'s session-scoped fixture already learned this; this is the
+    # same fix for the per-test workers.
+    log_path = Path(tempfile.gettempdir()) / f"sglang-worker-{port}.log"
+    log_handle = open(log_path, "w", buffering=1)  # line-buffered
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        # The child keeps its own descriptor, so the parent's copy is done
+        # with. Holding it would leak one fd per worker for the session, and
+        # leave the file open with nothing writing through it. Failures read
+        # the log back from `log_path`, not from this handle.
+        log_handle.close()
 
     inst = ModelInstance(
         url=base_url,
@@ -185,6 +244,7 @@ def spawn_worker(
         model_id=model_id,
         gpu_ids=list(gpu_ids),
         kv_events_endpoint=kv_events_endpoint,
+        log_path=log_path,
     )
 
     # Wait for /health. Cold-start on H200 with weights uncached can take
@@ -192,15 +252,9 @@ def spawn_worker(
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
-            out = b""
-            try:
-                if proc.stdout is not None:
-                    out = proc.stdout.read() or b""
-            except Exception:  # noqa: BLE001
-                pass
             raise RuntimeError(
                 f"sglang worker exited during startup with code {proc.returncode}; "
-                f"cmd: {' '.join(cmd)}\noutput:\n{out.decode(errors='replace')}",
+                f"cmd: {' '.join(cmd)}\noutput:\n{inst.log_tail()}",
             )
         try:
             resp = httpx.get(f"{base_url}/health", timeout=2.0)
@@ -213,5 +267,6 @@ def spawn_worker(
 
     inst.shutdown()
     raise TimeoutError(
-        f"sglang worker did not become healthy at {base_url} within {timeout}s",
+        f"sglang worker did not become healthy at {base_url} within {timeout}s; "
+        f"last log lines:\n{inst.log_tail()}",
     )

@@ -4,8 +4,6 @@ import os
 import subprocess
 from functools import lru_cache
 
-from huggingface_hub import HfApi
-
 from sglang.srt.environ import envs
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
@@ -24,7 +22,17 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _diffusion_deps_available() -> bool:
+    # Locating diffusers is cheap; importing the registry costs ~2 s and then
+    # fails anyway without it. A false positive is caught by the caller.
+    import importlib.util
+
+    return importlib.util.find_spec("diffusers") is not None
+
+
 def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    if not _diffusion_deps_available():
+        return False
     try:
         from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
     except ImportError:
@@ -49,6 +57,8 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
 def _is_gated_diffusion_repo(repo_id: str) -> bool:
     """Query HF model card metadata to check if a gated repo is a diffusers model."""
     try:
+        from huggingface_hub import HfApi  # lazy: ~0.3 s at CLI entry otherwise
+
         info = HfApi().model_info(repo_id)
         return getattr(info, "library_name", None) == "diffusers"
     except Exception:
@@ -126,8 +136,7 @@ def get_model_path(extra_argv):
             )
         else:
             raise Exception(
-                "Error: --model-path is required. "
-                "Please provide the path to the model."
+                "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path
 

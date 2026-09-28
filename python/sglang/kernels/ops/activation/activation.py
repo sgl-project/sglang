@@ -6,9 +6,8 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
+    get_activation_cuda_cflags,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -18,19 +17,9 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-def _fast_math_flags() -> list[str]:
-    # Mirrors sgl-kernel's CMake policy: fast-math on SM90, precise on
-    # SM100+ (Blackwell needs bit-exact expf), off on HIP (clang rejects).
-    if is_hip_runtime():
-        return []
-    if get_jit_cuda_arch().major >= 10:
-        return []
-    return ["--use_fast_math"]
-
-
 @cache_once
 def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
-    fast_math_flags = _fast_math_flags()
+    fast_math_flags = get_activation_cuda_cflags()
     if not fast_math and not fast_math_flags:
         return activation_module(dtype)
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -134,6 +123,11 @@ def run_activation(
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
+        # The JIT kernel indexes expert ids as int32. Routing ids may arrive as
+        # int64 (e.g. from torch.topk) and torch.compile realizes them at their
+        # true dtype, so normalize here instead of asserting downstream.
+        if expert_ids.dtype != torch.int32:
+            expert_ids = expert_ids.to(torch.int32)
         _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
     return out
 
@@ -157,9 +151,9 @@ def run_unary_activation(
     Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
     ``out`` share the same shape.
     """
-    assert (
-        op_name in SUPPORTED_UNARY_ACTIVATIONS
-    ), f"Unsupported unary activation: {op_name}"
+    assert op_name in SUPPORTED_UNARY_ACTIVATIONS, (
+        f"Unsupported unary activation: {op_name}"
+    )
     if out is None:
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)

@@ -723,3 +723,6 @@ class LTX2PipelineConfig(PipelineConfig):
 @dataclasses.dataclass
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
+
+    # original-mode lora swaps invalidate post-warmup timing calibration
+    supports_auto_residency: bool = False

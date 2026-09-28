@@ -187,3 +187,9 @@ response = client.images.generate(
 ```
 
 Base Ideogram 4 presets are `V4_DEFAULT_20`, `V4_QUALITY_48`, and `V4_TURBO_12`. The fal variants automatically select `V4_FAST_20` and `V4_INSTANT_8`, respectively. A preset controls both `num_inference_steps` and guidance, so do not set those fields directly.
+
+## 5. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="image" />

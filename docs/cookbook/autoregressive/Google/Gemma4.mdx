@@ -97,6 +97,8 @@ For other installation methods, please refer to the [official SGLang installatio
 
 ### 3.1 Basic Configuration
 
+The Gemma 4 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, and Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)). The recommended launch configurations vary by hardware and model size.
+
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model variant.
 
 <Gemma4Deployment />
@@ -1455,7 +1457,7 @@ Median ITL (ms):                         15.11
 Reproduce against a running server (`--base-url` points at your endpoint):
 
 ```bash Command
-pip install git+https://github.com/sgl-project/sgl-eval
+pip install sgl-eval
 
 # Sanity-check the endpoint
 sgl-eval ping --base-url http://localhost:30000/v1

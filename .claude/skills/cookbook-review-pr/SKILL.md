@@ -147,6 +147,18 @@ than restating.
   equal what the engine emits from the corresponding cell — same flags, same order. Drift
   here is the most common review miss.
 
+### 5b. ComfyUI section (diffusion pages)
+- A diffusion page ends with `## <n>. Run in ComfyUI` rendering `<ComfyUISupport />`. A
+  reader must not have to guess whether the model is reachable from ComfyUI.
+- The `model` prop is a key that exists in `docs/src/snippets/diffusion/comfyui-support.jsx`.
+  A model-specific key is only correct when the plugin really treats it specially — an entry
+  in `executor_class_dict`
+  (`python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/core/generator.py`) or a dedicated
+  node. Otherwise the generic `image` / `video` key is the honest one; a model-specific key
+  without matching plugin support makes the page claim support that does not exist.
+- Prose describing ComfyUI support inline instead of using the component is a finding: the
+  facts drift from the plugin.
+
 ### 6. Commands / port
 - Launch uses `sglang serve` — flag any `python -m sglang.launch_server` /
   `python3 -m sglang.launch_server` (deprecated). The engine already emits `sglang serve`;

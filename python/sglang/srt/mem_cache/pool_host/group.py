@@ -22,6 +22,10 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
+    # Bind rows to the anchor's virtual IDs when pools share an ID space.
+    # Return buffer indices, or None if allocation fails. Rollback through
+    # device_free_fn takes the anchor's virtual IDs, not the returned indices.
+    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
@@ -166,6 +170,31 @@ class HostPoolGroup:
                 continue
             released += self.free(transfer.host_indices, pool=transfer.name)
         return released
+
+    @property
+    def kv_buffer(self):
+        return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
+
+    @property
+    def index_k_scale_buffer(self):
+        # Delegate to the anchor pool so NpuMemcacheStore sees the same
+        # buffer set as get_page_buffer_meta (which also delegates), keeping
+        # the per-page component-key count consistent (k, v, index_k, scale).
+        return getattr(self.anchor_entry.host_pool, "index_k_scale_buffer", None)
+
+    @property
+    def dsa_kv_cache_store_fp8(self):
+        # Delegate so the L3 store skips the dead v component exactly when
+        # get_page_buffer_meta (which also delegates) skips it.
+        return getattr(self.anchor_entry.host_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
     def size_per_token(self):

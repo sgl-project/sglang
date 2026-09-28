@@ -52,7 +52,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class XverseMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -80,8 +79,7 @@ class XverseMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -93,7 +91,6 @@ class XverseMLP(nn.Module):
 
 
 class XverseMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -195,7 +192,6 @@ class XverseMoE(nn.Module):
 
 
 class XverseAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -281,7 +277,6 @@ class XverseAttention(nn.Module):
 
 
 class XverseDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -352,7 +347,6 @@ class XverseDecoderLayer(nn.Module):
 
 
 class XverseModel(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -401,7 +395,6 @@ class XverseModel(nn.Module):
 
 
 class XverseMoeForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

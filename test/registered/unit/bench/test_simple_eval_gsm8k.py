@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import _run_sgl_eval, run_eval
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-b-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
 
 
 def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None:

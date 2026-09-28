@@ -70,6 +70,16 @@ def fused_add_gate(
     return torch.addcmul(residual, x, gate.unsqueeze(1))
 
 
+def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Complex-valued RoPE table from a hoisted cat([cos, sin], dim=-1)
+    cos_sin_cache tensor, split back in half.
+    """
+    if freqs_cis is None:
+        return None
+    cos, sin = freqs_cis.chunk(2, dim=-1)
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
+
+
 class ModulateWan(nn.Module):
     """Modulation layer for WanX."""
 
@@ -220,6 +230,8 @@ class MMDoubleStreamBlock(nn.Module):
         vec: torch.Tensor,
         vis_freqs_cis: Optional[torch.Tensor] = None,
         txt_freqs_cis: Optional[torch.Tensor] = None,
+        vis_complex_freqs: Optional[torch.Tensor] = None,
+        txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
@@ -268,6 +280,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.img_attn_k_norm,
             head_dim=img_q.shape[-1],
             cos_sin_cache=vis_freqs_cis,
+            freqs_complex=vis_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -295,6 +308,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.txt_attn_k_norm,
             head_dim=txt_q.shape[-1],
             cos_sin_cache=txt_freqs_cis,
+            freqs_complex=txt_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -555,6 +569,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         txt_suffix_len = txt.shape[1] if sequence_shard_enabled else 0
 
+        vis_complex_freqs = _joy_complex_freqs(vis_freqs_cis)
+        txt_complex_freqs = _joy_complex_freqs(txt_freqs_cis)
+
         # Pass through DiT blocks
         for block in self.double_blocks:
             img, txt = block(
@@ -563,6 +580,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vec,
                 vis_freqs_cis,
                 txt_freqs_cis,
+                vis_complex_freqs=vis_complex_freqs,
+                txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
             )
 

@@ -1,0 +1,170 @@
+---
+title: "MiMo-V2.5-Pro"
+metatags:
+  description: "Best Practice for MiMo-V2.5-Pro on Ascend NPU"
+---
+
+<Note>
+This page focuses on the deployment of MiMo-V2.5-Pro (FP4) with DFlash speculative decoding in PD disaggregation mode on the Ascend NPU.
+
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+</Note>
+
+### Model Deployment
+
+MiMo-V2.5-Pro-FP4-DFlash is an MXFP4-quantized checkpoint with a built-in DFlash draft model (located in the `dflash/` subdirectory of the weights). The following example deploys it in 1P1D mode (1 prefill node + 1 decode node, TP8 + DP2 per node).
+
+#### Common environment setup (both nodes)
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   HCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME: network interface name
+# ============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export HCCL_BUFFSIZE=300
+export HCCL_OP_EXPANSION_MODE=AIV
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+# Use the AscendC flash attention
+export ASCEND_USE_FIA=1
+
+# PD disaggregation transfer config
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24669"
+export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+
+# DeepEP
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+
+MODEL_PATH=/path/to/MiMo-V2.5-Pro-FP4-DFlash
+```
+
+#### Prefill node
+
+```bash Command
+export DEEPEP_HCCL_BUFFSIZE=2500
+# Enable chunked dispatch for long sequences
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=0
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 8 --nnodes 1 --node-rank 0 \
+    --chunked-prefill-size 8192 \
+    --trust-remote-code --port 10001 \
+    --host <your prefill ip> --max-running-requests 32 \
+    --mem-fraction-static 0.90 \
+    --swa-full-tokens-ratio 0.3 \
+    --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8996 \
+    --disable-piecewise-cuda-graph \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --moe-a2a-backend deepep --deepep-mode normal
+```
+
+#### Decode node
+
+```bash Command
+# Use eagle_worker_v2 and overlap plan stream to hide the draft/target preparation
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+# DFlash draft model has a longer context length than the derived value
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+
+export DEEPEP_HCCL_BUFFSIZE=1200
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --speculative-draft-model-path $MODEL_PATH/dflash \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 8 --nnodes 1 --node-rank 0 \
+    --trust-remote-code --port 20001 \
+    --host <your decode ip> --max-running-requests 32 \
+    --mem-fraction-static 0.88 \
+    --swa-full-tokens-ratio 0.3 \
+    --cuda-graph-bs 1 2 4 8 12 16 \
+    --disaggregation-mode decode --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8996 \
+    --moe-a2a-backend deepep --deepep-mode low_latency \
+    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --speculative-algorithm DFLASH \
+    --speculative-num-draft-tokens 8
+```
+
+#### Router
+
+```bash Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<your prefill ip>:10001 \
+    --decode http://<your decode ip>:20001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --health-check-interval-secs 3600 --mini-lb
+```
+
+### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+#### Benchmark Prefill Node (TTFT)
+
+```bash Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --model /path/to/MiMo-V2.5-Pro-FP4-DFlash \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 16000 \
+    --random-output-len 1 \
+    --request-rate 0.4 \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 32
+```
+
+#### Benchmark Decode Node (TPOT)
+
+```bash Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --model /path/to/MiMo-V2.5-Pro-FP4-DFlash \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 16000 \
+    --random-output-len 1000 \
+    --request-rate inf \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 32
+```

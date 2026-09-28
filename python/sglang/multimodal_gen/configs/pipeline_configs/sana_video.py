@@ -63,7 +63,7 @@ class SanaVideoPipelineConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         temporal_scale = self.vae_config.arch_config.temporal_compression_ratio
         if num_frames < 1:
             raise ValueError("num_frames must be positive")

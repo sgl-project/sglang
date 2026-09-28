@@ -92,11 +92,11 @@ def rocm_fused_experts_tkw1(
         # AITER tkw1 kernel for FP8 models with `apply_router_weight_on_input`
         # This applies topk_weights on the GEMM output of the first FC layer
         #  rather than the second FC.
-        assert (
-            topk_weights.dim() == 2
-        ), "`topk_weights` should be in shape (num_tokens, topk)"
+        assert topk_weights.dim() == 2, (
+            "`topk_weights` should be in shape (num_tokens, topk)"
+        )
         assert topk_weights.shape[-1] == 1, (
-            "Only support topk=1 when" " `apply_router_weight_on_input` is True"
+            "Only support topk=1 when `apply_router_weight_on_input` is True"
         )
 
         return rocm_aiter_asm_moe_tkw1(
@@ -307,7 +307,9 @@ def upscale_mxfp4(hidden_state, hidden_state_scale, recv_token_num, output_dtype
     OUT_TL = (
         tl.float16
         if output_dtype == torch.float16
-        else tl.bfloat16 if output_dtype == torch.bfloat16 else tl.float32
+        else tl.bfloat16
+        if output_dtype == torch.bfloat16
+        else tl.float32
     )
 
     upscale_fp4x2_block32_kernel[grid](

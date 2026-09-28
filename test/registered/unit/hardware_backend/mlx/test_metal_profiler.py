@@ -20,9 +20,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -96,8 +96,9 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture"),
             ):
                 profiler, result = MetalCaptureProfiler.start_mlx(trace_path)
 
@@ -131,9 +132,10 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
-            ) as mock_stop:
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture") as mock_stop,
+            ):
                 profiler, _ = MetalCaptureProfiler.start_mlx(trace_path)
                 profiler.stop()
                 mock_stop.assert_called_once()
@@ -206,14 +208,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
             SchedulerProfilerManager,
         )
 
-        class FakePS:
-            tp_rank = dp_rank = pp_rank = moe_ep_rank = 0
-            dp_size = pp_size = moe_ep_size = 1
-            gpu_id = 0
-
-        mgr = SchedulerProfilerManager(
-            ps=FakePS(), dp_tp_cpu_group=None, get_forward_ct=lambda: 0
-        )
+        mgr = SchedulerProfilerManager(dp_tp_cpu_group=None, get_forward_ct=lambda: 0)
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr
 
@@ -261,9 +256,13 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
             capture_ctx = MagicMock()
-            with mock_patch.object(
-                torch.mps.profiler, "metal_capture", return_value=capture_ctx
-            ), mock_patch("torch.distributed.barrier"):
+            with (
+                mock_patch.object(
+                    torch.mps.profiler, "metal_capture", return_value=capture_ctx
+                ),
+                mock_patch("torch.distributed.barrier"),
+                get_parallel().override(tp_rank=0, dp_size=1, pp_size=1, moe_ep_size=1),
+            ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)
                 self.assertTrue(mgr.profile_in_progress)

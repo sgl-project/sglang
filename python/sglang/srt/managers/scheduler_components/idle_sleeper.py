@@ -9,7 +9,7 @@ from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.rust_server import RustServer
+    from sglang.srt.rust_server.server import RustServer
 
 
 class IdleSleeper:

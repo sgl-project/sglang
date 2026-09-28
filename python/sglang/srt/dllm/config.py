@@ -1,5 +1,6 @@
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
@@ -25,7 +26,6 @@ class DllmConfig:
     def from_server_args(
         server_args: ServerArgs,
     ):
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
         if cfg.dllm_algorithm is None:

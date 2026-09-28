@@ -309,9 +309,9 @@ def dot_scaled_mxfp8_blockscaled_linear(
             kernel_out_dtype = input_2d.dtype
         else:
             # Activations already MXFP8-quantized by a fused upstream op.
-            assert (
-                input_2d.dtype == MXFP8_VALUE_DTYPE
-            ), "pre-quantized input must be FP8 E4M3 when input_scale is given."
+            assert input_2d.dtype == MXFP8_VALUE_DTYPE, (
+                "pre-quantized input must be FP8 E4M3 when input_scale is given."
+            )
             assert input_scale.dtype == torch.uint8 and input_scale.shape == (
                 m,
                 k // 32,

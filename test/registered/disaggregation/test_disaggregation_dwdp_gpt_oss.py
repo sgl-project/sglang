@@ -6,12 +6,8 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_pd_server,
-)
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=170, stage="extra-b", runner_config="4-gpu-b200")
 
 GPT_OSS_MODEL_PATH = "openai/gpt-oss-120b"
 GSM8K_BASELINE_ACCURACY = 0.88
@@ -23,69 +19,35 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
     NUM_PREFILL_GPUS = 2
     NUM_DECODE_GPUS = 2
 
+    # Drive the base fixture's launchers rather than reimplementing them, so
+    # both sides get the pinned --nccl-port. Deriving it from get_free_port()
+    # on each side races onto the same port and dies at init_process_group
+    # with EADDRINUSE.
+    prefill_tp_size = NUM_PREFILL_GPUS
+    decode_tp_size = NUM_DECODE_GPUS
+    decode_base_gpu_id = NUM_PREFILL_GPUS
+
+    extra_prefill_args = [
+        "--dwdp-size",
+        str(NUM_PREFILL_GPUS),
+        "--disable-flashinfer-autotune",
+        "--mem-fraction-static",
+        "0.85",
+    ]
+    extra_decode_args = [
+        "--dp",
+        str(NUM_DECODE_GPUS),
+        "--enable-dp-attention",
+        "--disable-flashinfer-autotune",
+        "--mem-fraction-static",
+        "0.85",
+    ]
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = GPT_OSS_MODEL_PATH
-
-        cls.start_prefill()
-        cls.start_decode()
-
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            str(cls.NUM_PREFILL_GPUS),
-            "--dwdp-size",
-            str(cls.NUM_PREFILL_GPUS),
-            "--disable-flashinfer-autotune",
-            "--mem-fraction-static",
-            "0.85",
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            str(cls.NUM_DECODE_GPUS),
-            "--dp",
-            str(cls.NUM_DECODE_GPUS),
-            "--enable-dp-attention",
-            "--disable-flashinfer-autotune",
-            "--mem-fraction-static",
-            "0.85",
-            "--base-gpu-id",
-            str(cls.NUM_PREFILL_GPUS),
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
+        cls.launch_all()
 
     def test_gsm8k(self):
         metrics = run_eval(

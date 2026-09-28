@@ -495,9 +495,9 @@ def flash_prefill_with_topk_index(
     assert qk_head_dim <= 256 and v_head_dim <= 256, "head_dim must be less than 256"
     if sink is not None:
         assert sink.shape[0] == num_heads and sink.shape[1] == qk_head_dim
-    assert (
-        init_blocks + local_blocks <= topk
-    ), "init_blocks + local_blocks must be less than topk"
+    assert init_blocks + local_blocks <= topk, (
+        "init_blocks + local_blocks must be less than topk"
+    )
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
     # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into

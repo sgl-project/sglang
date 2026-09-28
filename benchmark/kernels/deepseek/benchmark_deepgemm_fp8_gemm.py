@@ -1,17 +1,16 @@
-from typing import Tuple
-
 import deep_gemm
 import tilelang
 import tilelang.language as T
 import torch
 import triton
-from deep_gemm import ceil_div
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
-)
 
 from sglang.benchmark.bench_utils import run_bench
+from sglang.benchmark.deepseek_utils import (
+    get_weight_shapes,
+    per_block_cast_to_fp8,
+    per_token_cast_to_fp8,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
@@ -59,7 +58,6 @@ def tl_gemm(
             bx,
             by,
         ):
-
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype)
@@ -95,31 +93,6 @@ def tl_gemm(
     return main
 
 
-def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0
-    m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
-        m, n
-    ), (x_amax / 448.0).view(m, -1)
-
-
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-    x_padded = torch.zeros(
-        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
-    )
-    x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(
-        x_view.size(0), x_view.size(2)
-    )
-
-
 def fp8_gemm_deepgemm(
     x_fp8: torch.Tensor,
     x_scale: torch.Tensor,
@@ -151,25 +124,6 @@ def fp8_gemm_sglang(
 
     # Run SGLang kernel
     out = w8a8_block_fp8_matmul(
-        x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
-    )
-    return out
-
-
-def fp8_gemm_vllm(
-    x_fp8: torch.Tensor,
-    x_scale: torch.Tensor,
-    y_fp8: torch.Tensor,
-    y_scale: torch.Tensor,
-    m: int,
-    n: int,
-    k: int,
-):
-    """vLLM implementation of FP8 GEMM"""
-    block_size = [128, 128]  # Matches the block size in per_block_cast_to_fp8
-
-    # Run vLLM kernel
-    out = vllm_w8a8_block_fp8_matmul(
         x_fp8, y_fp8, x_scale, y_scale, block_size, torch.bfloat16
     )
     return out
@@ -231,39 +185,6 @@ def calculate_diff(m: int, n: int, k: int):
         print(f"  - SGLang vs DeepGEMM: {'✅' if sglang_deepgemm_match else '❌'}")
         print(f"  - TileLang vs DeepGEMM: {'✅' if tilelang_deepgemm_match else '❌'}")
         print(f"  - TileLang vs SGLang: {'✅' if tilelang_sglang_match else '❌'}\n")
-
-
-def get_weight_shapes(tp_size):
-    # cannot TP
-    total = [
-        (512 + 64, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (7168, 16384),
-        (7168, 18432),
-    ]
-    # N can TP
-    n_tp = [
-        (18432 * 2, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (24576, 1536),
-        (4096, 7168),
-    ]
-    # K can TP
-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
-
-    weight_shapes = []
-    for t in total:
-        weight_shapes.append(t)
-    for n_t in n_tp:
-        new_t = (n_t[0] // tp_size, n_t[1])
-        weight_shapes.append(new_t)
-    for k_t in k_tp:
-        new_t = (k_t[0], k_t[1] // tp_size)
-        weight_shapes.append(new_t)
-
-    return weight_shapes
 
 
 def create_benchmark_configs(tp_size):
@@ -350,7 +271,7 @@ def get_benchmark(tp_size):
         tflops = flops / (ms * 1e-3) / 1e12
 
         # Print shape-specific results with TFLOPS
-        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
+        print(f"Time: {ms * 1000:.2f} ms, TFLOPS: {tflops:.2f}")
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark

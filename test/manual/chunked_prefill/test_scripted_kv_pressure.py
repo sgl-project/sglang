@@ -62,9 +62,9 @@ class TestKVPressureBasic(ScriptedTestCase):
             f"long req must really chunk under pinned cache; got chunks_done="
             f"{r_long.chunks_done}"
         )
-        assert (
-            r_long.lock_refs == 0
-        ), f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+        assert r_long.lock_refs == 0, (
+            f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+        )
 
         t._release_exhausted_pools()
         final_lock_refs = t.get_all_node_lock_refs()
@@ -409,13 +409,13 @@ class TestKVPressureSmallPool(ScriptedTestCase):
             if (
                 r_chunk.kv_pages == 0
                 and r_chunk.lock_refs == 0
-                and (r_chunk.req is None or r_chunk.req.req_pool_idx is None)
+                and (r_chunk.req is None or r_chunk.req.kv.req_pool_idx is None)
             ):
                 break
             yield
         assert r_chunk.kv_pages == 0, f"kv_pages={r_chunk.kv_pages}"
         assert r_chunk.lock_refs == 0, f"lock_refs={r_chunk.lock_refs}"
-        assert r_chunk.req is None or r_chunk.req.req_pool_idx is None
+        assert r_chunk.req is None or r_chunk.req.kv.req_pool_idx is None
 
         t.abort(ballast)
         for _ in range(200):

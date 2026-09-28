@@ -46,9 +46,9 @@ def native_per_token_group_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
     Note that only `torch.float8_e4m3fn` is supported for now.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
@@ -343,7 +343,6 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(CustomTestCase):
-
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]

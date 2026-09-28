@@ -86,8 +86,8 @@ class ReqDllmMixin:
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        assert (
-            prefix_len % self.dllm_config.block_size == 0
-        ), f"Unexpected prefix len: {prefix_len}"
+        assert prefix_len % self.dllm_config.block_size == 0, (
+            f"Unexpected prefix len: {prefix_len}"
+        )
         if prefix_len > self.dllm_block_offset:
             self.dllm_block_offset = prefix_len

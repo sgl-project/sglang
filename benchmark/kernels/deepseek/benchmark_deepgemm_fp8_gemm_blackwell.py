@@ -1,12 +1,14 @@
 import argparse
-from typing import Tuple
 
 import torch
 import triton
-from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 from sglang.benchmark.bench_utils import run_bench
+from sglang.benchmark.deepseek_utils import (
+    get_weight_shapes,
+    per_block_cast_to_fp8,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
@@ -14,55 +16,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
 
 BLOCK_SIZE = 128
-
-
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    assert BLOCK_SIZE == 128
-    m, n = x.shape
-    x_padded = torch.zeros(
-        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
-    )
-    x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(
-        x_view.size(0), x_view.size(2)
-    )
-
-
-def get_weight_shapes(tp_size):
-    # cannot TP
-    total = [
-        (512 + 64, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (7168, 16384),
-        (7168, 18432),
-    ]
-    # N can TP
-    n_tp = [
-        (18432 * 2, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (24576, 1536),
-        (4096, 7168),
-    ]
-    # K can TP
-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
-
-    weight_shapes = []
-    for t in total:
-        weight_shapes.append(t)
-    for n_t in n_tp:
-        new_t = (n_t[0] // tp_size, n_t[1])
-        weight_shapes.append(new_t)
-    for k_t in k_tp:
-        new_t = (k_t[0], k_t[1] // tp_size)
-        weight_shapes.append(new_t)
-
-    return weight_shapes
 
 
 def create_benchmark_configs(tp_size):
@@ -224,7 +177,7 @@ def _benchmark(m, n, k, tp_size, provider):
     tflops = flops / (ms * 1e-3) / 1e12
 
     # Print shape-specific results with TFLOPS
-    print(f"Time: {ms*1000:.2f} us, TFLOPS: {tflops:.2f}")
+    print(f"Time: {ms * 1000:.2f} us, TFLOPS: {tflops:.2f}")
     return ms, max_ms, min_ms
 
 

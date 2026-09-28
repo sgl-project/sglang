@@ -83,12 +83,11 @@ def _get_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.distributed.parallel_state import get_tp_group
     from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_size <= 1:
         return None
-    group = get_tp_group()
+    group = get_parallel().tp_group
     comm = group.ca_comm
     if (
         not isinstance(comm, CustomAllReduceV2)
@@ -198,9 +197,9 @@ def symm_buffer(
     its own. Each name belongs to one group, so the name alone identifies it.
     """
     if group_name is None:
-        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        group_name = get_tp_group().cpu_group.group_name
+        group_name = get_parallel().tp_group.cpu_group.group_name
     buf: _Buffer = ctx.get_buffer(
         f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype, group_name)
     )

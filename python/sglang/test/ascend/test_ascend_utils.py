@@ -116,6 +116,9 @@ KIMI_K2_5_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.5-
 KIMI_K2_5_EAGLE3_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.5-eagle3"
 )
+KIMI_K3_W4A8_INT_MOE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Kimi/Kimi-K3-w4a8-int-moe"
+)
 LING_LITE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "inclusionAI/Ling-lite")
 LLAMA_2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-2-7B")
 LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -149,6 +152,12 @@ META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
 MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
+MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
+)
+MIMO_V2_5_PRO_FP4_DFLASH_DRAFT_WEIGHTS_PATH = os.path.join(
+    MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH, "dflash"
+)
 MIMO_V2_5_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "solinliu/MiMo-V2.5-W8A8")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(

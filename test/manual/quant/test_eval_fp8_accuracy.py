@@ -46,7 +46,6 @@ class TestEvalFP8Accuracy(CustomTestCase):
 
 
 class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
-
     def _run_test(self, model, other_args, expected_score):
         base_url = DEFAULT_URL_FOR_TEST
         other_args = other_args or []

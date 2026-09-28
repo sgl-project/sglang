@@ -385,8 +385,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
             "(rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH: (
-            "Gemma-style fused residual-add + RMS normalization "
-            "(pure-torch reference)."
+            "Gemma-style fused residual-add + RMS normalization (pure-torch reference)."
         ),
     }
 
@@ -515,6 +514,8 @@ _PHASE25_KERNELS = [
     ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
+    ("hy4_ihc", "fused_hy4_ihc_pre", "triton"),
+    ("hy4_ihc", "fused_hy4_ihc_post", "triton"),
 ]
 for _mod, _fn, _bk in _PHASE25_KERNELS:
     register_kernel(
@@ -525,6 +526,23 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
         )
     )
 del _mod, _fn, _bk
+
+# Fused hyper-connection combine / norm kernels for small speculative batches.
+_HC_NORM_KERNELS = [
+    ("hc_combine_norm", "hc_combine_norm"),
+    ("mhc_post_split_h", "mhc_post_split_h"),
+    ("hc_combine_norm", "hc_combine_norm_mxfp8"),
+    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+]
+for _mod, _fn in _HC_NORM_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.layernorm.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
 
 # The fused-rmsnorm variants physically live in the shared fused-pointwise
 # collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.

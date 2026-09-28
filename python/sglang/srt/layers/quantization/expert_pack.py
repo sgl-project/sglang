@@ -7,7 +7,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel.quantization import ggml_moe_a8_vec
 
 from sglang.kernels.ops.moe.expert_pack_mxfp4 import (
     mxfp4_matvec,
@@ -50,6 +49,7 @@ class ExpertPackConfig(GGUFConfig):
 
     is_fp4_experts = True
     supports_kimi_k3_quantized_latent_projections = True
+    supports_kimi_k3_split_gguf_kv_b = True
 
     def __init__(self, store: ExpertPackStore) -> None:
         super().__init__()
@@ -157,6 +157,10 @@ class ExpertPackMoEMethod(FusedMoEMethodBase):
         weight_type: int,
         output_size: int,
     ) -> torch.Tensor:
+        # sgl_kernel.quantization is CUDA/MUSA-only; keep the import local so
+        # this module stays importable on other devices (see gguf.py:44-70).
+        from sgl_kernel.quantization import ggml_moe_a8_vec
+
         return ggml_moe_a8_vec(
             inputs,
             weights,

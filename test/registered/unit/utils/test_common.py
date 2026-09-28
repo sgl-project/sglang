@@ -1,9 +1,12 @@
+import sys
 import unittest
 from array import array
+from unittest import mock
 
 import torch
 
 from sglang.srt.utils.common import (
+    _get_device_sm_via_nvml,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
@@ -11,7 +14,7 @@ from sglang.srt.utils.common import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -142,6 +145,74 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+class _FakePynvml:
+    """Records the NVML index it was asked for, so a test can tell which
+    physical GPU the helper would have reported."""
+
+    def __init__(self, capability=(9, 0)):
+        self.capability = capability
+        self.requested_index = None
+        self.initialized = False
+
+    def nvmlInit(self):
+        self.initialized = True
+
+    def nvmlShutdown(self):
+        pass
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        self.requested_index = index
+        return f"handle-{index}"
+
+    def nvmlDeviceGetCudaComputeCapability(self, handle):
+        return self.capability
+
+
+class TestGetDeviceSmViaNvml(CustomTestCase):
+    """The torch ordinal and the NVML index differ under CUDA_VISIBLE_DEVICES
+    and MIG; without that mapping the helper must return None, not GPU 0."""
+
+    def test_torch_exposes_the_mapping_api(self):
+        # The cases below install the private attribute themselves, so they stay
+        # green on a torch that dropped it while the helper silently falls back.
+        self.assertTrue(hasattr(torch.cuda, "_get_nvml_device_index"))
+
+    def test_maps_the_torch_ordinal_to_the_nvml_index(self):
+        fake = _FakePynvml(capability=(9, 0))
+        with (
+            mock.patch.dict(sys.modules, {"pynvml": fake}),
+            mock.patch.object(
+                torch.cuda, "_get_nvml_device_index", lambda index: 3, create=True
+            ),
+        ):
+            self.assertEqual(_get_device_sm_via_nvml(), 90)
+        self.assertEqual(fake.requested_index, 3)
+
+    def test_returns_none_when_the_mapping_api_is_absent(self):
+        fake = _FakePynvml()
+        saved = torch.cuda.__dict__.pop("_get_nvml_device_index", None)
+        try:
+            with mock.patch.dict(sys.modules, {"pynvml": fake}):
+                self.assertIsNone(_get_device_sm_via_nvml())
+        finally:
+            if saved is not None:
+                torch.cuda._get_nvml_device_index = saved
+        self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+    def test_returns_none_when_the_mapping_api_raises(self):
+        fake = _FakePynvml()
+
+        def boom(index):
+            raise RuntimeError("no such device")
+
+        with (
+            mock.patch.dict(sys.modules, {"pynvml": fake}),
+            mock.patch.object(torch.cuda, "_get_nvml_device_index", boom, create=True),
+        ):
+            self.assertIsNone(_get_device_sm_via_nvml())
+        self.assertFalse(fake.initialized, "must not query NVML without the mapping")
 
 
 if __name__ == "__main__":

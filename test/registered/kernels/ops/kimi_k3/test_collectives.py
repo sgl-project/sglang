@@ -20,10 +20,11 @@ from sglang.kernels.ops.kimi_k3 import (
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=34, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
@@ -53,6 +54,7 @@ def _init_world():
         local_rank=local_rank,
         backend="nccl",
     )
+    get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     cpu_group = coord.cpu_group
     assert isinstance(cpu_group, dist.ProcessGroup)

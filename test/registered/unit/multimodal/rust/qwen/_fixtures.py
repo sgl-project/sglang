@@ -71,12 +71,13 @@ def make_processor(case, config, image_processor_cls=None):
         model_impl="sglang",
         keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
+        mm_enable_dp_encoder=False,
         image_processor_backend="auto",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
+        # Read by RustMmProcessor._use_feature_shm (single-rank fixture → the
         # inline zero-copy transport, like the 1-GPU e2e).
         tp_size=1,
         dist_init_addr=None,
@@ -94,6 +95,11 @@ def make_processor(case, config, image_processor_cls=None):
     publish(
         ServerArgs(
             model_path="dummy",
+            # Mirrored for the same reason the stub sets it: `get_mm_processor_cls`
+            # reads `model_impl` from this bag now, and "auto" would send it into
+            # `get_resolved_model_impl`, which chokes on the SimpleNamespace
+            # `model_config` these tests hand it.
+            model_impl=server_args.model_impl,
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,

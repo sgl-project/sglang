@@ -112,7 +112,7 @@ class MOVAPipelineConfig(PipelineConfig):
         )
         return image
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         if num_frames is None:
             return num_frames
         if num_frames % self.time_division_factor != self.time_division_remainder:
@@ -122,12 +122,13 @@ class MOVAPipelineConfig(PipelineConfig):
                 * self.time_division_factor
                 + self.time_division_remainder
             )
-            logger.warning(
-                "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
-                "Rounding to %s.",
-                num_frames,
-                adjusted,
-            )
+            if log_adjustment:
+                logger.warning(
+                    "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
+                    "Rounding to %s.",
+                    num_frames,
+                    adjusted,
+                )
             return adjusted
         return num_frames
 
