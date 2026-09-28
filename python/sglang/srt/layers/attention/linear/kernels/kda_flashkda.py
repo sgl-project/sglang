@@ -256,7 +256,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 g=g.view(batch_size * seq_len, num_heads, head_dim),
                 beta=beta.view(batch_size * seq_len, num_heads),
                 A_log=A_log,
-                dt_bias=dt_bias.reshape(-1),
+                dt_bias=dt_bias,
                 out=out_buf.view(batch_size * seq_len, num_heads, head_dim),
                 scale=scale,
                 lower_bound=lower_bound,
