@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
     CMD_LAYERWISE,
     CMD_PUT_META,
@@ -219,14 +220,20 @@ class FlexKVConnector:
 
         # 10. Per-rank in-flight tracking.
         # Loads
-        self._pending_lookups: Dict[str, int] = {}  # rid -> fkv_task_id
-        self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
+        self._pending_lookups: Dict[
+            CacheRequestHandle, int
+        ] = {}  # handle -> fkv_task_id
+        self._inflight_loads: Dict[int, int] = {}  # producer_id -> task id
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
         # Stores
-        self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._inflight_stores: Dict[
+            CacheRequestHandle, int
+        ] = {}  # handle -> fkv_task_id
         # Prefetches
-        self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._ongoing_prefetches: Dict[
+            CacheRequestHandle, int
+        ] = {}  # handle -> fkv_task_id
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
@@ -248,7 +255,7 @@ class FlexKVConnector:
         self,
         token_ids: List[int],
         token_mask: torch.Tensor,
-        rid: Optional[str] = None,
+        handle: Optional[CacheRequestHandle] = None,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -256,8 +263,8 @@ class FlexKVConnector:
           token_ids: full token id sequence we'd like to check.
           token_mask: 1-D bool tensor or array, True for "this token is
             *not* already on GPU and is a candidate for load-back".
-          rid: if set and hit > 0, the held FlexKV task id is stashed
-            under this key so a later ``retrieve_kv(rid, slots)`` call
+          handle: if set and hit > 0, the held FlexKV task id is stashed
+            under this key so a later ``retrieve_kv(handle, slots)`` call
             can resolve it. If not set, the held task is cancelled when
             hit > 0 and the caller didn't ask to track it.
 
@@ -304,29 +311,29 @@ class FlexKVConnector:
             hit_length = aligned
 
         # Decide what to do with the held task. Three cases:
-        #   1. hit_length > 0 and rid given → stash for retrieve_kv later.
-        #   2. hit_length > 0 and rid is None → cancel; caller can't use it.
+        #   1. hit_length > 0 and handle given → stash for retrieve_kv later.
+        #   2. hit_length > 0 and handle is None → cancel; caller can't use it.
         #   3. hit_length == 0 → no work to do; FlexKV already marked the
         #      empty graph COMPLETED inside get_match, cancel would warn.
-        if hit_length > 0 and rid is not None and fkv_task_id >= 0:
-            self._pending_lookups[rid] = fkv_task_id
+        if hit_length > 0 and handle is not None and fkv_task_id >= 0:
+            self._pending_lookups[handle] = fkv_task_id
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
 
         return fkv_task_id, hit_length
 
-    def release_pending(self, rid: str) -> None:
-        """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
+    def release_pending(self, handle: CacheRequestHandle) -> None:
+        """Cancel the task held by an earlier ``lookup_kv(handle=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
+        fkv_task_id = self._pending_lookups.pop(handle, -1)
         if fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
 
     def retrieve_kv(
         self,
-        rid: str,
+        handle: CacheRequestHandle,
         slot_mapping: torch.Tensor,
     ) -> int:
         """Synchronous load: ``launch`` + ``wait``.
@@ -335,7 +342,7 @@ class FlexKVConnector:
         responsible for having allocated ``slot_mapping`` of length
         equal to ``hit_length`` from a prior ``lookup_kv``.
         """
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
+        fkv_task_id = self._pending_lookups.pop(handle, -1)
         if fkv_task_id < 0:
             return 0
 
@@ -371,7 +378,7 @@ class FlexKVConnector:
 
     def start_load_kv_layerwise(
         self,
-        rid: str,
+        handle: CacheRequestHandle,
         slot_mapping: torch.Tensor,
     ) -> Tuple[int, int]:
         """Layerwise load. Fires ``launch(layerwise_transfer=True)`` and
@@ -382,7 +389,7 @@ class FlexKVConnector:
             "start_load_kv_layerwise called but layerwise transfer is "
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
-        fkv_task_id = self._pending_lookups.pop(rid, -1)
+        fkv_task_id = self._pending_lookups.pop(handle, -1)
         if fkv_task_id < 0:
             return 0, -1
 
@@ -450,7 +457,7 @@ class FlexKVConnector:
 
     def store_kv(
         self,
-        rid: str,
+        handle: CacheRequestHandle,
         token_ids: List[int],
         kv_indices: torch.Tensor,
     ) -> int:
@@ -507,7 +514,7 @@ class FlexKVConnector:
                     as_batch=False,
                     layerwise_transfer=False,
                 )
-                self._inflight_stores[rid] = fkv_task_id
+                self._inflight_stores[handle] = fkv_task_id
                 return fkv_task_id
             return -1
 
@@ -530,28 +537,28 @@ class FlexKVConnector:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
-                self._inflight_stores[rid] = fkv_task_id
+                self._inflight_stores[handle] = fkv_task_id
         return fkv_task_id
 
-    def check_completed_stores(self) -> List[str]:
-        """Return rids whose stores have completed since the last call."""
-        completed_rids: List[str] = []
+    def check_completed_stores(self) -> List[CacheRequestHandle]:
+        """Return request handles whose stores have completed since the last call."""
+        completed_handles: List[CacheRequestHandle] = []
         completed_dict: Dict[int, Any] = {}
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             if self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
+                fk_to_handle = {v: k for k, v in self._inflight_stores.items()}
                 try:
                     completed_dict = self.kv_manager.try_wait(
-                        task_ids=list(fk_to_rid.keys())
+                        task_ids=list(fk_to_handle.keys())
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[FlexKV] check_completed_stores: %s", exc)
                     completed_dict = {}
                 for fk_tid in completed_dict:
-                    rid = fk_to_rid[fk_tid]
-                    completed_rids.append(rid)
-                    self._inflight_stores.pop(rid, None)
+                    handle = fk_to_handle[fk_tid]
+                    completed_handles.append(handle)
+                    self._inflight_stores.pop(handle, None)
 
         if self._sync_ctx.is_pp_sender:
             self._sync_ctx.scatter_pp(
@@ -569,39 +576,23 @@ class FlexKVConnector:
                 )
             fk_ids = payload.get("completed_fk_ids", [])
             if fk_ids and self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
+                fk_to_handle = {v: k for k, v in self._inflight_stores.items()}
                 for fk_tid in fk_ids:
-                    if fk_tid in fk_to_rid:
-                        rid = fk_to_rid[fk_tid]
-                        completed_rids.append(rid)
-                        self._inflight_stores.pop(rid, None)
+                    if fk_tid in fk_to_handle:
+                        handle = fk_to_handle[fk_tid]
+                        completed_handles.append(handle)
+                        self._inflight_stores.pop(handle, None)
 
         if self._sync_ctx.needs_sync:
-            completed_rids = self._sync_ctx.scatter(completed_rids)
-        return completed_rids
-
-    def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
-        """Block until a single store task identified by ``rid`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(rid, -1)
-        if fkv_task_id < 0:
-            return True
-        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            return True
-        try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[FlexKV] wait_store: %s", exc)
-            return False
-        return (
-            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-        )
+            completed_handles = self._sync_ctx.scatter(completed_handles)
+        return completed_handles
 
     # ------------------------------------------------------------------
     # Public API — prefetch
     # ------------------------------------------------------------------
 
-    def prefetch_async(self, rid: str, token_ids: List[int]) -> int:
-        if not self._prefetch_enabled or not rid:
+    def prefetch_async(self, handle: CacheRequestHandle, token_ids: List[int]) -> int:
+        if not self._prefetch_enabled:
             return -1
         task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -616,13 +607,13 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter({"task_id": task_id})
             task_id = payload["task_id"]
         if task_id >= 0:
-            self._ongoing_prefetches[rid] = task_id
+            self._ongoing_prefetches[handle] = task_id
         return task_id
 
-    def check_prefetch_progress(self, rid: str) -> bool:
+    def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
         if not self._prefetch_enabled:
             return True
-        task_id = self._ongoing_prefetches.get(rid, -1)
+        task_id = self._ongoing_prefetches.get(handle, -1)
         if task_id < 0:
             return True
         done = False
@@ -637,14 +628,14 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter({"done": done})
             done = payload["done"]
         if done:
-            self._ongoing_prefetches.pop(rid, None)
+            self._ongoing_prefetches.pop(handle, None)
         return done
 
-    def cancel_prefetch(self, rid: str) -> None:
-        self._pending_lookups.pop(rid, None)
+    def cancel_prefetch(self, handle: CacheRequestHandle) -> None:
+        self._pending_lookups.pop(handle, None)
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
-        self._ongoing_prefetches.pop(rid, None)
+        self._ongoing_prefetches.pop(handle, None)
 
     # ------------------------------------------------------------------
     # Layerwise transfer hooks

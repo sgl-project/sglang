@@ -39,6 +39,18 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    dp_size=1,
+                    attn_tp_size=4,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(), device="cpu", cpu_group=object()
+                    ),
+                ),
+            ),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
         ):
@@ -48,12 +60,6 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     prefill_cuda_graph_runner=None,
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     model_config=object(),
-                ),
-                dp_size=1,
-                attn_tp_size=4,
-                attn_cp_size=1,
-                tp_group=SimpleNamespace(
-                    device_group=object(), device="cpu", cpu_group=object()
                 ),
                 get_idle_batch=Mock(
                     side_effect=AssertionError("DP1 must not emit idle batch")
@@ -84,6 +90,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -128,6 +135,46 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+
+class TestPrefillCudaGraphVote(CustomTestCase):
+    def _vote(self, mode):
+        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner.max_context_size = None
+        runner.can_replay_locally.return_value = True
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            extend_num_tokens=4,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[1, 1],
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        vote = dp_attn._local_prefill_cuda_graph_vote(
+            local_batch=batch,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=object(),
+        )
+        return vote, runner
+
+    def test_extend_batch_votes_for_prefill_graph(self):
+        vote, runner = self._vote(ForwardMode.EXTEND)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertFalse(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    def test_mixed_batch_delegates_to_runner_policy(self):
+        vote, runner = self._vote(ForwardMode.MIXED)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
 
 if __name__ == "__main__":

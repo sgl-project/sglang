@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     MambaEvictExcessPathStates,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -404,6 +405,8 @@ class MambaComponent(TreeComponent):
             return x.id
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the state to host before the internal tombstone.
+        self._maybe_backup_node_before_state_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -417,6 +420,35 @@ class MambaComponent(TreeComponent):
         )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
+
+    def _maybe_backup_node_before_state_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's mamba state to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator passes only nodes holding the state on some
+        layer, so a dropped internal state caps the match frontier at this
+        node forever, leaving the subtree's still-resident KV unservable.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        slot allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # for the state slot the way the PREFETCH hook does.
+        if (
+            self._mamba_pool_host is not None
+            and self._mamba_pool_host.available_size() < 1
+        ):
+            cache.evict_host(1, self.component_type)
+        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
@@ -537,8 +569,7 @@ class MambaComponent(TreeComponent):
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
             # the donate to the last flush boundary (where temporal is current)
             # and reset the cursor, keeping the donated checkpoint consistent with
-            # its key length. page_size is asserted == 1, so no realign. Mirrors
-            # MambaRadixCache.cache_finished_req.
+            # its key length. page_size is asserted == 1, so no realign.
             if is_finished:
                 write_pos_buf = (
                     self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
@@ -693,14 +724,15 @@ class MambaComponent(TreeComponent):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        host_indices = self.cache.host_pool_group.alloc(
-            1,
-            pool=PoolName.MAMBA,
-            reclaim=lambda size: self.cache.evict_host(size, ComponentType.MAMBA),
-        )
+        # One state slot per fetch, allocated once the hit is known.
+        return PreparePrefetchResult(staging_tokens=1)
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        host_indices = self._mamba_pool_host.alloc(num_tokens)
         if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+            self.cache.evict_host(num_tokens, ComponentType.MAMBA)
+            host_indices = self._mamba_pool_host.alloc(num_tokens)
+        return host_indices
 
     def build_hicache_transfers(
         self,
@@ -711,6 +743,7 @@ class MambaComponent(TreeComponent):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
@@ -770,11 +803,13 @@ class MambaComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
+            if staging_tokens == 0:
+                return None
+            # Staging is allocated once the hit is known; the placeholder key
+            # carries the single trailing page this pool loads.
             return [
                 PoolTransfer(
                     name=PoolName.MAMBA,
-                    host_indices=host_indices,
                     keys=["__placeholder__"],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
