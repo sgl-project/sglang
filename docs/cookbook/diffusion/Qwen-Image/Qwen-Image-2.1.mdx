@@ -14,9 +14,10 @@ import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
 Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prerelease=allow`,
 then install this integration from its source checkout with
-`uv pip install -e "python[diffusion]"`. Use an authorized checkpoint directory in
-place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux;
-the hardware picker selects a tested single-GPU recipe for the full checkpoint.
+`uv pip install -e "python[diffusion]"`. The picker uses `Qwen/Qwen-Image-2.1`;
+you can also set a local checkpoint directory under **Variables**. The recipes
+target NVIDIA CUDA on Linux; the picker marks which single-GPU workloads have
+been verified with the full checkpoint.
 
 <Deployment config={config} />
 
@@ -27,7 +28,7 @@ steps, and output count. Set reference PNG paths under **Variables**; edits
 upload files from the machine running cURL, so they need not exist on the server.
 
 Hardware selection applies the recommended placement for that GPU. H200,
-B200, and RTX PRO 6000 96GB keep weights resident; RTX 5090 and RTX 4090
+B200, RTX PRO 6000 96GB, and DGX Spark keep weights resident; RTX 5090 and RTX 4090
 offload selected components to fit the full pipeline.
 Untested topologies and feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
@@ -51,6 +52,8 @@ PY
 
 The picker defaults to native BF16/FP32 precision, exact attention, eager
 execution, and full-image VAE decoding.
+Commands omit default values, including one GPU, encoder auto scheduling, and
+batch size one. Explicit placement and attention overrides preserve each recipe.
 
 | GPU | Placement / attention | Generation | Edit | Peak VRAM |
 | --- | --- | --- | --- | --- |
@@ -58,6 +61,7 @@ execution, and full-image VAE decoding.
 | B200 192GB | Resident / FlashAttention | 2.46 s | 3.02 s | 38.5 GiB |
 | RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
+| DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
 
 Measured on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
 request. Times are median HTTP latency after warmup, including PNG serialization
@@ -67,6 +71,25 @@ software versions affect both latency and memory use.
 RTX 5090 uses DiT layerwise offload and Torch SDPA; its recipe has not been
 retested with the updated checkpoint. Both RTX 5090 and RTX PRO 6000 use SDPA
 when FlashAttention is selected in this runtime. CPU offload requires host RAM.
+
+### DGX Spark
+
+Select **DGX Spark** for one GB10 GPU on Linux ARM64 with CUDA 13. Use the
+source installation above. The recommended configuration keeps all components
+resident, uses native BF16/FP32 precision, and lets the runtime select Torch SDPA:
+
+```bash Command
+sglang serve \
+  --model-path Qwen/Qwen-Image-2.1 \
+  --performance-mode speed
+```
+
+The [128 GB unified memory](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
+is shared by the CPU and GPU. CPU offload is unnecessary for the verified
+single-image 1024×1024 workload. Keep full-image VAE decoding and eager execution.
+Generation, editing, transparent generation, and transparent editing were
+verified with PyTorch 2.13.0+cu130. Spark reports no separate VRAM usage in `nvidia-smi`.
+This recipe covers one Spark; multi-node deployment and batching remain unverified.
 
 ### Batching
 
@@ -119,29 +142,24 @@ including partly transparent edges, without thresholding or background removal.
 
 ## 4. Offline requests
 
+Defaults are 1024×1024, 40 steps, CFG 1, and seed 42; output saving is enabled.
+For GPUs that need offload, also pass the placement flags from the picker.
+
 ### Text-to-image
 
 ```bash Command
 sglang generate \
-  --model-path /models/qwen-image-2.1 \
-  --model-id Qwen-Image-2.1 \
-  --prompt "A capybara reading a book by candlelight" \
-  --width 1024 --height 1024 \
-  --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
+  --model-path Qwen/Qwen-Image-2.1 \
+  --prompt "A capybara reading a book by candlelight"
 ```
 
 ### Image-conditioned editing
 
 ```bash Command
 sglang generate \
-  --model-path /models/qwen-image-2.1 \
-  --model-id Qwen-Image-2.1 \
+  --model-path Qwen/Qwen-Image-2.1 \
   --image-path /path/to/input.png \
-  --prompt "Move the scene to a snowy mountain at sunrise" \
-  --width 1024 --height 1024 \
-  --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
+  --prompt "Move the scene to a snowy mountain at sunrise"
 ```
 
 Height and width must be positive multiples of 32. Reference images preserve
@@ -203,7 +221,7 @@ See the [GGUF guide](/docs/sglang-diffusion/quantization#gguf).
 NVFP4 requires Blackwell and compatible ModelOpt exports. Select the component
 directories using `--component-paths.transformer` and/or
 `--component-paths.text_encoder`. Keep the FlashInfer backend at `auto` on
-RTX 5090 and RTX PRO 6000: TensorRT-LLM FP4 GEMM does not support SM120.
+RTX 5090, RTX PRO 6000, and DGX Spark: TensorRT-LLM FP4 GEMM does not support SM12.x.
 These GPUs remain unverified for this model's NVFP4 exports. See the
 [NVFP4 guide](/docs/sglang-diffusion/quantization#modelopt-nvfp4).
 
@@ -216,3 +234,11 @@ Keep eager execution as the default. Breakable CUDA Graph replay requires
 matching resolution and condition-prefix length; unseen shapes run eagerly.
 Text buckets alone do not guarantee replay. SageAttention and Cache-DiT can
 change numerical results and require quality checks for your workload.
+
+### Cache-DiT
+
+Enable `--enable-cache-dit true` or `SGLANG_CACHE_DIT_ENABLED=true`. 2.1 prefix
+KV is per layer: each block slices caches by `_layer_id`. Cache-DiT wraps
+`transformer_blocks` and forwards the same extras to every layer; without that
+slice, later layers reuse layer 0 and the image collapses to color noise.
+See the [Cache-DiT guide](/docs/sglang-diffusion/cache_dit).

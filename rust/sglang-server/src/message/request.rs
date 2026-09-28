@@ -2,11 +2,13 @@
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::LazyLock;
 
 use bytes::Bytes;
 use itertools::izip;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::{DeserializeOwned, SeqAccess, Visitor, value::SeqAccessDeserializer};
+use serde::{Deserialize, Deserializer};
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
@@ -97,6 +99,7 @@ pub struct GenerateBody {
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
     pub rid: Option<OneOrMany<String>>,
     pub text: Option<OneOrMany<String>>,
+    #[serde(default, deserialize_with = "deserialize_input_ids")]
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
@@ -144,6 +147,99 @@ pub struct GenerateBody {
     /// request schema their contents. Other unknown fields remain ignored.
     #[serde(flatten)]
     processor_extensions: ProcessorExtensions,
+}
+
+/// Decode `input_ids` directly into token vectors. The first element selects
+/// flat vs. batched input, avoiding the untagged enum's intermediate value tree.
+fn deserialize_input_ids<'de, D>(deserializer: D) -> Result<Option<OneOrMany<TokenIds>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct InputIds(OneOrMany<TokenIds>);
+
+    enum FirstElement {
+        Token(i32),
+        Tokens(TokenIds),
+    }
+
+    impl<'de> Deserialize<'de> for FirstElement {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct FirstVisitor;
+
+            impl<'de> Visitor<'de> for FirstVisitor {
+                type Value = FirstElement;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("an i32 token or a list of i32 tokens")
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                    i32::try_from(value)
+                        .map(FirstElement::Token)
+                        .map_err(E::custom)
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                    i32::try_from(value)
+                        .map(FirstElement::Token)
+                        .map_err(E::custom)
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    TokenIds::deserialize(SeqAccessDeserializer::new(sequence))
+                        .map(FirstElement::Tokens)
+                }
+            }
+
+            deserializer.deserialize_any(FirstVisitor)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for InputIds {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct TokensVisitor;
+
+            impl<'de> Visitor<'de> for TokensVisitor {
+                type Value = InputIds;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a token list or a list of token lists")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let tokens = match sequence.next_element::<FirstElement>()? {
+                        // Preserve OneOrMany's first-variant choice for [].
+                        None => OneOrMany::One(Vec::new()),
+                        Some(FirstElement::Token(first)) => {
+                            let mut tokens = vec![first];
+                            while let Some(token) = sequence.next_element::<i32>()? {
+                                tokens.push(token);
+                            }
+                            OneOrMany::One(tokens)
+                        }
+                        Some(FirstElement::Tokens(first)) => {
+                            let mut prompts = vec![first];
+                            while let Some(tokens) = sequence.next_element::<TokenIds>()? {
+                                prompts.push(tokens);
+                            }
+                            OneOrMany::Many(prompts)
+                        }
+                    };
+                    Ok(InputIds(tokens))
+                }
+            }
+
+            deserializer.deserialize_seq(TokensVisitor)
+        }
+    }
+
+    Option::<InputIds>::deserialize(deserializer).map(|value| value.map(|tokens| tokens.0))
 }
 
 impl GenerateBody {
@@ -931,6 +1027,71 @@ mod tests {
         assert!(is_batch);
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].input_ids, Some(vec![3]));
+    }
+
+    #[test]
+    fn input_ids_deserialization_matches_untagged() {
+        assert!(
+            serde_json::from_str::<GenerateBody>(r#"{"text":"hi"}"#)
+                .unwrap()
+                .input_ids
+                .is_none()
+        );
+        for value in [
+            "null",
+            "[]",
+            "[0]",
+            "[-2147483648,2147483647]",
+            "[[]]",
+            "[[],[1,-2]]",
+            "[[1,2],[3]]",
+            "[[-2147483648],[2147483647]]",
+            "1",
+            "true",
+            "{}",
+            r#""1""#,
+            "[null]",
+            "[true]",
+            r#"["1"]"#,
+            "[1.0]",
+            "[1e0]",
+            "[-0]",
+            "[2147483648]",
+            "[-2147483649]",
+            "[18446744073709551616]",
+            "[0,2147483648]",
+            "[0,-0]",
+            "[1,[2]]",
+            "[[1],2]",
+            "[[[1]]]",
+            "[[1.0]]",
+            "[[0],[2147483648]]",
+        ] {
+            let expected = serde_json::from_str::<Option<OneOrMany<TokenIds>>>(value);
+            let body = format!(r#"{{"input_ids":{value}}}"#);
+            let actual = serde_json::from_str::<GenerateBody>(&body).map(|body| body.input_ids);
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "{value}"),
+                (Err(_), Err(_)) => {}
+                (expected, actual) => panic!("{value}: expected {expected:?}, got {actual:?}"),
+            }
+        }
+
+        for (body, path) in [
+            (r#"{"input_ids":[true]}"#, "input_ids[0]"),
+            (r#"{"input_ids":[[1,true]]}"#, "input_ids[0][1]"),
+            (r#"{"input_ids":[[1],[2,true]]}"#, "input_ids[1][1]"),
+        ] {
+            let error = axum::Json::<GenerateBody>::from_bytes(body.as_bytes()).unwrap_err();
+            assert!(error.body_text().contains(path), "{error}");
+        }
+        for body in [
+            r#"{"input_ids":null,"input_ids":[1]}"#,
+            r#"{"input_ids":[1],"input_ids":[2]}"#,
+            r#"{"input_ids":[1]} {}"#,
+        ] {
+            assert!(axum::Json::<GenerateBody>::from_bytes(body.as_bytes()).is_err());
+        }
     }
 
     /// Both / neither of text+input_ids is a 400.

@@ -10,9 +10,9 @@
 //! discovered" failure mode is observable.
 
 use crate::discovery::WorkerMode;
-use crate::policies::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
 use crate::server::app_context::AppContext;
 use crate::server::metrics::{escape_label, WorkerSnapshot};
+use crate::state::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
@@ -46,7 +46,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                 // Saturating rather than `as i64`: a guard-accounting
                 // underflow would wrap usize and render as a nonsensical
                 // negative gauge; clamp to a large positive ceiling instead.
-                inflight: i64::try_from(w.active_load()).unwrap_or(i64::MAX),
+                inflight: i64::try_from(w.router_inflight_load()).unwrap_or(i64::MAX),
             }
         })
         .collect();
@@ -188,7 +188,7 @@ mod tests {
     /// cell of the tally.
     #[tokio::test]
     async fn kv_tier_series_render_per_worker_and_per_medium() {
-        use crate::policies::kv_events::{EventKind, EventTally, HashTree, KvWorkerId};
+        use crate::state::kv_events::{EventKind, EventTally, HashTree, KvWorkerId};
 
         let kv = KvIndexMetrics::new(Arc::new(HashTree::new()), Arc::new(EventTally::new()));
         let w = KvWorkerId::new("http://w0:30000".into(), 0);
@@ -231,7 +231,7 @@ mod tests {
     /// calls `clear_worker`.
     #[tokio::test]
     async fn kv_tree_blocks_drop_with_the_worker() {
-        use crate::policies::kv_events::{EventTally, HashTree, KvWorkerId};
+        use crate::state::kv_events::{EventTally, HashTree, KvWorkerId};
 
         let kv = KvIndexMetrics::new(Arc::new(HashTree::new()), Arc::new(EventTally::new()));
         let w = KvWorkerId::new("http://w0:30000".into(), 0);
@@ -254,7 +254,7 @@ mod tests {
     /// all four families.
     #[tokio::test]
     async fn metrics_endpoint_emits_kv_series_when_a_tree_is_maintained() {
-        use crate::policies::kv_events::{EventTally, HashTree, KvWorkerId};
+        use crate::state::kv_events::{EventTally, HashTree, KvWorkerId};
 
         let mut ctx = AppContext::stub();
         let tree = Arc::new(HashTree::new());
