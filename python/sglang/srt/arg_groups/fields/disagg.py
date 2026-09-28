@@ -10,6 +10,7 @@ from typing import (
 
 import msgspec
 
+from sglang.srt.afd.config import AFDConfig, AFDExecutionMode
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
@@ -22,6 +23,21 @@ class Disagg(msgspec.Struct):
     """Namespace ``disagg``."""
 
     _NS_PATH = "disagg"
+
+    afd_execution_mode: A[
+        str,
+        Arg(
+            help="Bounded AFD execution role.",
+            choices=[m.value for m in AFDExecutionMode],
+        ),
+    ] = AFDExecutionMode.OFF.value
+    afd_config: A[
+        Optional[AFDConfig],
+        Arg(
+            help="JSON config for bounded attention/FFN whole-role execution.",
+            type_parser=AFDConfig.from_json,
+        ),
+    ] = None
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.

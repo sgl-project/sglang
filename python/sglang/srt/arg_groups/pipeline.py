@@ -38,6 +38,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    # AFD topology is model-independent and must fail before model loading,
+    # including dummy models. Preserve the standalone FFN role's early gate.
+    from sglang.srt.arg_groups.afd_hook import handle_afd_config
+
+    run_hook(handle_afd_config, server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)

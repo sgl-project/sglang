@@ -344,6 +344,7 @@ class ModelRunner:
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        self.afd_runtime = None
         self.is_draft_worker = is_draft_worker
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
@@ -1030,6 +1031,33 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        self.maybe_init_afd_runtime()
+
+    def maybe_init_afd_runtime(self):
+        if self.is_draft_worker or self.server_args.afd_execution_mode != "attention":
+            return
+        from sglang.srt.afd.integration import build_attention_pipeline
+
+        self.afd_runtime = build_attention_pipeline(
+            model=self.model,
+            attention_backend=self.attn_backend,
+            config=self.server_args.afd_config,
+            device=self.device,
+            dtype=self.dtype,
+            max_rows=self.max_running_requests,
+            lane=self.tp_rank,
+        )
+        self.model.model.set_afd_pipeline(self.afd_runtime)
+
+    def close_afd_runtime(self):
+        if self.afd_runtime is None:
+            return None
+        return self.afd_runtime.close()
+
+    def request_afd_shutdown(self):
+        if self.afd_runtime is not None:
+            self.afd_runtime.request_shutdown()
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
@@ -1269,6 +1297,17 @@ class ModelRunner:
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        if self.device == "cuda" and self.server_args.afd_execution_mode != "off":
+            from sglang.srt.afd.role_graph import cuda_memory_diagnostic
+
+            logger.info(
+                "AFD_MEMORY_STAGE stage=weights_loaded role=%s gpu_id=%s "
+                "current_device=%s memory=%s",
+                self.server_args.afd_execution_mode,
+                self.gpu_id,
+                torch.cuda.current_device(),
+                cuda_memory_diagnostic(self.gpu_id),
+            )
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         self.weight_load_time = time.perf_counter() - tic_total
         # Get quantization config from ModelConfig

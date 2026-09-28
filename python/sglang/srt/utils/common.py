@@ -3872,6 +3872,11 @@ class BumpAllocator:
         self._pointer += size
         return output
 
+    def reset(self):
+        """Rewind without moving the storage, for graph-captured consumers."""
+
+        self._pointer = 0
+
 
 def log_info_on_rank0(logger, msg):
 

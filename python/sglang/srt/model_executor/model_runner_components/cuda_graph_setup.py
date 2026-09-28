@@ -409,11 +409,15 @@ def capture_cuda_graphs(
     )
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, eager_runner=eager_runner
+            )
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, eager_runner=eager_runner
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -470,6 +474,9 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    if getattr(model_runner, "afd_runtime", None) is not None:
+        return result(eager_runner)
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -660,7 +667,9 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+def capture_decode_graph(
+    *, model_runner: ModelRunner, eager_runner: EagerRunner | None = None
+) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
@@ -674,6 +683,21 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         memory_usage_gb=0,
         capture_time=0,
     )
+
+    # AFD owns the full role capture; the outer runner must not capture it again.
+    if getattr(model_runner, "afd_runtime", None) is not None:
+        start_time = time.perf_counter()
+        before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+        model_runner.afd_runtime.capture_startup(
+            eager_runner or model_runner.eager_runner
+        )
+        after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+        return GraphCapture(
+            runner=None,
+            memory_phase=memory_phase,
+            memory_usage_gb=before_mem - after_mem,
+            capture_time=time.perf_counter() - start_time,
+        )
 
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.

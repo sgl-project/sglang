@@ -94,6 +94,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
+    get_disagg,
     get_exec,
     get_forward,
     get_lora,
@@ -427,6 +428,12 @@ class LayerCommunicator:
         # hands its layer's output on there; so does a dense MLP on every rank.
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
         dense_on_local_rows = enable_moe_dense_fully_dp()
+        if get_disagg().afd_execution_mode == "attention":
+            # F completes the sum and returns only this A lane's rows. Reuse
+            # local-row boundaries so A neither gathers lanes nor sums again.
+            if parallel.attn_tp_size != 1 or parallel.attn_cp_size != 1:
+                raise ValueError("AFD attention requires lane-local attention TP/CP")
+            moe_on_local_rows = dense_on_local_rows = True
 
         # Some batch shards its tokens over attention CP.
         cp_shards = _generic_prefill_cp_shards_tokens()

@@ -6070,6 +6070,14 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        if server_args.afd_execution_mode == "attention":
+
+            def request_afd_shutdown(signum, frame):
+                del signum, frame
+                scheduler.tp_worker.model_runner.request_afd_shutdown()
+                scheduler.gracefully_exit = True
+
+            signal.signal(signal.SIGTERM, request_afd_shutdown)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
@@ -6090,6 +6098,10 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            try:
+                scheduler.tp_worker.model_runner.close_afd_runtime()
+            except Exception:
+                logger.exception("AFD explicit scheduler shutdown failed")
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()

@@ -442,6 +442,10 @@ class NCCLLibrary:
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
             exported_functions = NCCLLibrary.exported_functions
+            if hasattr(self.lib, "ncclCommAbort"):
+                exported_functions.append(
+                    Function("ncclCommAbort", ncclResult_t, [ncclComm_t])
+                )
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
@@ -485,11 +489,28 @@ class NCCLLibrary:
         unique_id: ncclUniqueId,
         rank: int,
         config: Optional[ncclConfig_t] = None,
+        *,
+        min_ctas: Optional[int] = None,
+        max_ctas: Optional[int] = None,
     ) -> ncclComm_t:
+        if "ncclCommInitRankConfig" not in self._funcs:
+            raise RuntimeError(
+                "NCCL_COMM_INIT_RANK_CONFIG_ABSENT from the loaded NCCL library"
+            )
         comm = ncclComm_t()
         if config is None:
             # Equivalent to NCCL_CONFIG_INITIALIZER (header-layout version).
             config = ncclConfig_t.create()
+        if min_ctas is not None or max_ctas is not None:
+            raw_version = self.ncclGetRawVersion()
+            if raw_version < 21700:
+                raise RuntimeError(
+                    "NCCL_CTA_CONFIG_UNSUPPORTED: requires NCCL >= 2.17.0"
+                )
+            if min_ctas is not None:
+                config.minCTAs = min_ctas
+            if max_ctas is not None:
+                config.maxCTAs = max_ctas
         self.NCCL_CHECK(
             self._funcs["ncclCommInitRankConfig"](
                 ctypes.byref(comm), world_size, unique_id, rank, ctypes.byref(config)
@@ -635,6 +656,11 @@ class NCCLLibrary:
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+
+    def ncclCommAbort(self, comm: ncclComm_t) -> None:
+        if "ncclCommAbort" not in self._funcs:
+            raise RuntimeError("NCCL library does not expose ncclCommAbort")
+        self.NCCL_CHECK(self._funcs["ncclCommAbort"](comm))
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int

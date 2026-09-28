@@ -21,12 +21,38 @@ inside the function body to preserve that invariant.
 """
 
 import argparse
+import bisect
 import dataclasses
 import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.runtime_context import get_exec
+
+
+def filter_capture_sizes(sizes, *, max_size, alignment=1, request_width=1):
+    """Apply the decode runner's capacity/alignment rules without a ModelRunner."""
+    sizes = list(sizes)
+    if max(sizes) > max_size:
+        sizes.append(max_size)
+    sizes = sorted(
+        {
+            size
+            for size in sizes
+            if size <= max_size and size * request_width % alignment == 0
+        }
+    )
+    assert sizes and sizes[0] > 0, f"{sizes=}"
+    return sizes
+
+
+def pad_to_capture_size(raw_size, sizes):
+    """Smallest configured bucket covering raw_size; eligibility is caller-owned."""
+    assert raw_size <= sizes[-1], (
+        f"size {raw_size} exceeds max captured bucket {sizes[-1]}; "
+        "can_run_graph should have rejected this batch"
+    )
+    return sizes[bisect.bisect_left(sizes, raw_size)]
 
 
 class Phase:

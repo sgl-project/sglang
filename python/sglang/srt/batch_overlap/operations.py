@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -39,6 +39,8 @@ def execute_overlapped_operations(
     inputs_arr: Sequence,
     operations_arr: Sequence,
     delta_stages: Sequence[int],
+    *,
+    stage_contexts: Optional[Sequence[Callable]] = None,
 ) -> Sequence:
     # Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
     inputs_a, inputs_b = inputs_arr
@@ -50,12 +52,19 @@ def execute_overlapped_operations(
     # Each TBO child sub-batch dispatches against its own per-child backend
     # (children[i] has metadata init'd for sub-batch i; the parent's primary
     # has metadata for the full pre-split batch).
-    child_ctx_a, child_ctx_b = _resolve_tbo_child_contexts()
+    child_ctx_a, child_ctx_b = (
+        _resolve_tbo_child_contexts() if stage_contexts is None else (None, None)
+    )
+    context_a, context_b = stage_contexts or (None, None)
 
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
+    executor_a = _StageExecutor(
+        "a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a, stage_context=context_a
+    )
+    executor_b = _StageExecutor(
+        "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, stage_context=context_b
+    )
 
     for _ in range(delta_stage):
         executor_a.next()
@@ -111,6 +120,7 @@ class _StageExecutor:
         stages: List[Stage],
         inputs: dict,
         child_ctx: Optional[ForwardContext] = None,
+        stage_context: Optional[Callable] = None,
     ):
         self._debug_name = debug_name
         self._stages = stages
@@ -123,18 +133,43 @@ class _StageExecutor:
         # parent's primary.
         self._child_ctx = child_ctx
 
-        # handling DP attention
-        forward_batch: ForwardBatch = inputs["forward_batch"]
-        self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
-        self._local_dp_buffer_len = forward_batch.tbo_padded_len
-        self._global_num_tokens = forward_batch.global_num_tokens_cpu
-        self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
+        # A caller owning batch/backend state can supply its execution context.
+        # Native TBO retains its DP buffer and child-backend context by default.
+        self._stage_context = stage_context or self._native_context
+        if stage_context is None:
+            # handling DP attention
+            forward_batch: ForwardBatch = inputs["forward_batch"]
+            self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
+            self._local_dp_buffer_len = forward_batch.tbo_padded_len
+            self._global_num_tokens = forward_batch.global_num_tokens_cpu
+            self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
     def next(self):
         assert not self.done
 
         stage = self._stages[self._index]
 
+        stage_range = operations_nvtx_range(
+            debug_name=f"{self._debug_name}{self._index}",
+            color="orange",
+        )
+        with self._stage_context(), stage_range:
+            for op in stage:
+                with operations_nvtx_range(
+                    debug_name=op.debug_name,
+                    color="yellow",
+                ):
+                    self._stage_output = op.fn(
+                        state=self._stage_state,
+                        **(
+                            self._stage_output if self._stage_output is not None else {}
+                        ),
+                    )
+
+        self._index += 1
+
+    @contextmanager
+    def _native_context(self):
         # TODO: We currently always call set_dp_buffer_len here because sub-batches
         # may have different padded lengths. It can likely be removed after TBO slice &
         # pad logic is refactored.
@@ -150,24 +185,8 @@ class _StageExecutor:
             if self._child_ctx is not None
             else nullcontext()
         )
-        stage_range = operations_nvtx_range(
-            debug_name=f"{self._debug_name}{self._index}",
-            color="orange",
-        )
-        with ctx_mgr, stage_range:
-            for op in stage:
-                with operations_nvtx_range(
-                    debug_name=op.debug_name,
-                    color="yellow",
-                ):
-                    self._stage_output = op.fn(
-                        state=self._stage_state,
-                        **(
-                            self._stage_output if self._stage_output is not None else {}
-                        ),
-                    )
-
-        self._index += 1
+        with ctx_mgr:
+            yield
 
     @property
     def output(self):

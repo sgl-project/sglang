@@ -3340,7 +3340,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+        shutdown_seconds = _SCHEDULER_EXIT_TIMEOUT_SECS
+        if self.server_args.afd_execution_mode == "attention":
+            # The parent must wait through AFD's graph, handshake and abort budgets.
+            shutdown_seconds = max(
+                shutdown_seconds,
+                3 * self.server_args.afd_config.close_timeout_seconds + 5,
+            )
+        deadline = time.monotonic() + shutdown_seconds
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
         stragglers = [proc.pid for proc in collect_scheduler_processes()]
@@ -3348,7 +3355,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # SIGKILL here lands mid-release,
             # which is how GPU memory survives a shutdown. Name the pids.
             logger.warning(
-                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+                f"Schedulers still alive {shutdown_seconds}s after "
                 f"ShutdownReq, killing them before they released: {stragglers}"
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)

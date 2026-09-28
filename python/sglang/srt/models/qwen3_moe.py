@@ -26,6 +26,14 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.afd.config import AFDExecutionMode
+from sglang.srt.afd.model_hooks import (
+    afd_execution_mode,
+    afd_model_forward,
+    afd_owns_expert_weights,
+    afd_stacked_params_mapping,
+)
+from sglang.srt.afd.model_proxy import AFDProxyAttention, AFDProxyMLP
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -811,24 +819,27 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            start_layer=start_layer,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            alt_stream=alt_stream,
-        )
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.self_attn = AFDProxyAttention()
+        else:
+            self.self_attn = Qwen3MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                start_layer=start_layer,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                dual_chunk_attention_config=dual_chunk_attention_config,
+                alt_stream=alt_stream,
+            )
 
         self.layer_id = layer_id
 
@@ -848,7 +859,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        if self.is_layer_sparse:
+        if afd_execution_mode() == AFDExecutionMode.ATTENTION:
+            self.mlp = AFDProxyMLP()
+        elif self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
@@ -911,6 +924,49 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
+
+    def forward_attention_for_afd(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if afd_execution_mode() != AFDExecutionMode.ATTENTION:
+            raise RuntimeError("AFD_QWEN_ATTENTION_COMPUTE_ROLE_INVALID")
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=None,
+            )
+        )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
+
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        del forward_batch
+        if afd_execution_mode() != AFDExecutionMode.FFN:
+            raise RuntimeError("AFD_QWEN_FFN_COMPUTE_ROLE_INVALID")
+        if not get_moe_a2a_backend().is_none():
+            raise RuntimeError("AFD_QWEN_INTERNAL_COLLECTIVE_UNSUPPORTED")
+        if not isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+            raise RuntimeError("AFD_QWEN_FFN_MODULE_INVALID")
+        return self.mlp.forward_normal(hidden_states)
 
     def op_comm_prepare_attn(
         self,
@@ -982,6 +1038,38 @@ class Qwen3MoeModel(Qwen2MoeModel):
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
         )
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.embed_tokens = AFDProxyMLP()
+        self.afd_pipeline = None
+
+    def set_afd_pipeline(self, pipeline) -> None:
+        self.afd_pipeline = pipeline
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if self.afd_pipeline is None:
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        return afd_model_forward(
+            model=self,
+            pipeline=self.afd_pipeline,
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
         self.layers_to_capture = layers_to_capture
@@ -1013,13 +1101,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.model = Qwen3MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
-        )
+        if afd_execution_mode() == AFDExecutionMode.FFN:
+            self.lm_head = AFDProxyMLP()
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         # IPC loading bypasses load_weights(), so initialize the EPLB descriptor here.
@@ -1155,23 +1246,44 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        return self.model.layers[layer_idx].compute_ffn_output(
+            hidden_states,
+            forward_batch,
+        )
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        stacked_params_mapping = [
+        attention_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+        ]
+        dense_mlp_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        stacked_params_mapping = afd_stacked_params_mapping(
+            attention=attention_params_mapping,
+            dense_mlp=dense_mlp_params_mapping,
+        )
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+        expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
+            if afd_owns_expert_weights()
+            else ()
         )
 
         # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.

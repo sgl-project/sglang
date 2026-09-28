@@ -40,6 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.model_executor.forward_batch_view import slice_batch_field
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -691,7 +692,9 @@ class TboForwardBatchPreparer:
             assert old_value.shape[0] == num_tokens, (
                 f"{key=} {old_value=} {num_tokens=} {batch=}"
             )
-            output_dict[key] = old_value[start_token_index:end_token_index]
+            output_dict[key] = slice_batch_field(
+                old_value, slice(start_token_index, end_token_index)
+            )
 
         if batch.out_cache_loc_virtual is not None:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
@@ -739,7 +742,9 @@ class TboForwardBatchPreparer:
             assert len(old_value) == num_seqs, (
                 f"{key=} {old_value=} {num_seqs=} {batch=}"
             )
-            output_dict[key] = old_value[start_seq_index:end_seq_index]
+            output_dict[key] = slice_batch_field(
+                old_value, slice(start_seq_index, end_seq_index)
+            )
 
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(

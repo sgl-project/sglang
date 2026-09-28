@@ -840,6 +840,116 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
+    def _validate_afd_breakable_batch(self, forward_batch: ForwardBatch) -> int:
+        from sglang.srt.afd.contracts import validate_non_speculative_batch
+
+        mode = forward_batch.forward_mode
+        validate_non_speculative_batch(forward_batch)
+        if not mode.is_decode_or_idle():
+            raise RuntimeError(f"AFD_DSA_MODE_UNSUPPORTED: mode={mode!r}")
+        batch_size = int(forward_batch.batch_size)
+        positions = getattr(forward_batch, "positions", None)
+        if batch_size < 1 or positions is None or int(positions.numel()) != batch_size:
+            raise RuntimeError(
+                f"AFD_DSA_SHAPE_MISMATCH: requests={batch_size} "
+                f"positions={None if positions is None else positions.numel()}"
+            )
+        return batch_size
+
+    def init_forward_metadata_for_afd_capture(self, forward_batch: ForwardBatch):
+        """Create address-private DSA graph state for one child-graph capture."""
+
+        batch_size = self._validate_afd_breakable_batch(forward_batch)
+        previous_state = getattr(self, "decode_cuda_graph_metadata", None)
+        previous_metadata = getattr(self, "forward_metadata", None)
+        try:
+            self.init_cuda_graph_state(batch_size, int(forward_batch.positions.numel()))
+            private_state = self.decode_cuda_graph_metadata
+            self.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            capture_metadata = self.forward_metadata
+            state_bank = getattr(self, "_afd_private_graph_states", None)
+            if state_bank is None:
+                state_bank = {}
+                self._afd_private_graph_states = state_bank
+            state_bank[id(capture_metadata)] = {
+                "batch_size": batch_size,
+                "num_tokens": int(forward_batch.positions.numel()),
+                "graph_state": private_state,
+            }
+        except BaseException:
+            if previous_metadata is not None:
+                self.forward_metadata = previous_metadata
+            raise
+        finally:
+            self.decode_cuda_graph_metadata = previous_state
+        self.forward_metadata = capture_metadata
+        return capture_metadata
+
+    def release_afd_capture_metadata(self, capture_metadata) -> None:
+        """Drop a stage's private state after its graph is released; idempotent."""
+        getattr(self, "_afd_private_graph_states", {}).pop(id(capture_metadata), None)
+
+    def owns_afd_capture_metadata(self, capture_metadata, *, batch_size: int) -> bool:
+        """Check a stage owner without exposing the backend's private state bank."""
+        state = getattr(self, "_afd_private_graph_states", {}).get(id(capture_metadata))
+        return state is not None and state["batch_size"] == batch_size
+
+    def prepare_forward_metadata_for_afd_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh one address-private DSA metadata object in place."""
+
+        if static_forward_batch is None:
+            raise RuntimeError(
+                "AFD_DSA_STATIC_BATCH_MISSING: replay requires the "
+                "address-bound ForwardBatch"
+            )
+        batch_size = self._validate_afd_breakable_batch(forward_batch)
+        static_batch_size = self._validate_afd_breakable_batch(static_forward_batch)
+        state = getattr(self, "_afd_private_graph_states", {}).get(id(capture_metadata))
+        if state is None:
+            raise RuntimeError(
+                "AFD_DSA_METADATA_NOT_CAPTURED: no private graph state owns "
+                "the supplied metadata"
+            )
+        expected_batch_size = state["batch_size"]
+        # The captured kernels own the static padded shape, so that must match
+        # exactly. The live batch only has to fit inside it, because AFD pads the
+        # static buffers up to the bucket quantum; requiring equality would
+        # reject every padded decode step. A live batch larger than the capture
+        # has rows with no captured slot and stays fail-closed.
+        if (
+            static_batch_size != expected_batch_size
+            or batch_size > expected_batch_size
+            or int(static_forward_batch.positions.numel()) != state["num_tokens"]
+            or int(forward_batch.positions.numel()) * expected_batch_size
+            != state["num_tokens"] * batch_size
+        ):
+            raise RuntimeError(
+                "AFD_DSA_SHAPE_CHANGED: "
+                f"capture={expected_batch_size} live={batch_size} "
+                f"static={static_batch_size}"
+            )
+        previous_state = getattr(self, "decode_cuda_graph_metadata", None)
+        self.decode_cuda_graph_metadata = state["graph_state"]
+        try:
+            self.init_forward_metadata_out_graph(
+                static_forward_batch,
+                in_capture=False,
+            )
+            if self.forward_metadata is not capture_metadata:
+                raise RuntimeError(
+                    "AFD_DSA_METADATA_IDENTITY_CHANGED: replay selected a "
+                    "different metadata object"
+                )
+        finally:
+            self.decode_cuda_graph_metadata = previous_state
+            self.forward_metadata = capture_metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size

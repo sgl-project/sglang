@@ -2184,6 +2184,17 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        if self.device == "cuda" and self.server_args.afd_execution_mode != "off":
+            from sglang.srt.afd.role_graph import cuda_memory_diagnostic
+
+            logger.info(
+                "AFD_MEMORY_STAGE stage=before_kv_budget role=%s gpu_id=%s "
+                "current_device=%s memory=%s",
+                self.server_args.afd_execution_mode,
+                self.gpu_id,
+                torch.cuda.current_device(),
+                cuda_memory_diagnostic(self.gpu_id),
+            )
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,

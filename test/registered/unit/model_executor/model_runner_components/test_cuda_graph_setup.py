@@ -136,5 +136,27 @@ def test_align_pipeline_layers_uses_absolute_indices():
         )
 
 
+def test_afd_startup_capture_uses_existing_eager_runner_and_native_memory_accounting(
+    monkeypatch,
+):
+    eager = object()
+    seen = []
+    available = iter((12.0, 10.5))
+    monkeypatch.setattr(
+        cuda_graph_setup, "get_available_gpu_memory", lambda *args: next(available)
+    )
+    mr = SimpleNamespace(
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        device="cuda",
+        gpu_id=0,
+        afd_runtime=SimpleNamespace(capture_startup=seen.append),
+    )
+    capture = capture_decode_graph(model_runner=mr, eager_runner=eager)
+    assert seen == [eager]
+    assert capture.runner is None
+    assert capture.memory_usage_gb == 1.5
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

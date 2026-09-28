@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -129,6 +131,104 @@ class FlashAttentionMetadata:
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
+class FlashAttentionMetadataError(RuntimeError):
+    """A static graph metadata contract changed before replay."""
+
+
+def _copy_graph_metadata(value: Any, target: Any = None) -> Any:
+    """Clone once, then refresh tensor contents without changing graph addresses."""
+    if torch.is_tensor(value):
+        if target is None:
+            return value.clone()
+        if (
+            not torch.is_tensor(target)
+            or target.shape != value.shape
+            or target.dtype != value.dtype
+            or target.device != value.device
+        ):
+            raise FlashAttentionMetadataError("FA_STAGE_METADATA_LAYOUT_CHANGED")
+        target.copy_(value)
+        return target
+    if dataclasses.is_dataclass(value):
+        cloning = target is None
+        if cloning:
+            target = copy.copy(value)
+        elif type(target) is not type(value):
+            raise FlashAttentionMetadataError("FA_STAGE_METADATA_LAYOUT_CHANGED")
+        for field in dataclasses.fields(value):
+            setattr(
+                target,
+                field.name,
+                _copy_graph_metadata(
+                    getattr(value, field.name),
+                    None if cloning else getattr(target, field.name),
+                ),
+            )
+        return target
+    if isinstance(value, dict):
+        if target is None:
+            return {key: _copy_graph_metadata(item) for key, item in value.items()}
+        if not isinstance(target, dict) or target.keys() != value.keys():
+            raise FlashAttentionMetadataError("FA_STAGE_METADATA_LAYOUT_CHANGED")
+        for key, item in value.items():
+            target[key] = _copy_graph_metadata(item, target[key])
+        return target
+    if value is None or isinstance(value, (bool, int, float, str, tuple)):
+        return value
+    raise FlashAttentionMetadataError(
+        "FA_STAGE_METADATA_TYPE_UNSUPPORTED", type(value).__name__
+    )
+
+
+class FlashAttentionGraphMetadata:
+    """Own an address-stable snapshot for one interleaved graph operation.
+
+    Native graph metadata remains shared by batch size. Independent operations
+    refresh from that metadata into private tensors before replay; closing one
+    snapshot never removes the shared cache or another operation's buffers.
+    """
+
+    def __init__(self, backend, forward_batch):
+        self._backend = backend
+        self._batch_size = forward_batch.batch_size
+        existing = backend.decode_cuda_graph_metadata.get(self._batch_size)
+        backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=existing is None
+        )
+        self._shared = backend.forward_metadata
+        if self._shared is None:
+            raise FlashAttentionMetadataError("FA_METADATA_CAPTURE_MISSING")
+        if existing is not None and self._shared is not existing:
+            raise FlashAttentionMetadataError("FA_METADATA_OBJECT_DRIFT")
+        self.metadata = _copy_graph_metadata(self._shared)
+        self._identity = self._fingerprint()
+
+    def _fingerprint(self):
+        cache = self._backend.decode_cuda_graph_metadata
+        if not isinstance(cache, dict):
+            return (id(cache),)
+        return (
+            id(cache),
+            tuple(sorted((k, id(v)) for k, v in cache.items() if isinstance(k, str))),
+            id(cache.get(self._batch_size)),
+            id(self._backend._sched_meta_buf),
+        )
+
+    def is_valid(self):
+        return self._backend is not None and self._identity == self._fingerprint()
+
+    def refresh(self, forward_batch):
+        if not self.is_valid() or forward_batch.batch_size != self._batch_size:
+            raise FlashAttentionMetadataError("FA_METADATA_CACHE_DRIFT")
+        self._backend.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+        if self._backend.forward_metadata is not self._shared:
+            raise FlashAttentionMetadataError("FA_METADATA_OBJECT_DRIFT")
+        _copy_graph_metadata(self._shared, self.metadata)
+
+    def close(self):
+        self.metadata = self._shared = self._backend = None
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -146,6 +246,22 @@ class FlashAttentionBackend(AttentionBackend):
     - When server init, init_cuda_graph_state will be called first and then init_cuda_graph_capture will be called.
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
+
+    def create_graph_metadata_snapshot(self, forward_batch):
+        return FlashAttentionGraphMetadata(self, forward_batch)
+
+    def init_interleaved_graph_state(self, max_rows):
+        """Initialize shared graph buffers once and report retained CUDA growth."""
+        if self.decode_cuda_graph_metadata:
+            raise FlashAttentionMetadataError("FA_METADATA_STATE_ALREADY_INITIALIZED")
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        self.init_cuda_graph_state(max_rows, max_rows)
+        return max(
+            0,
+            torch.cuda.memory_allocated(self.device) - allocated,
+            torch.cuda.memory_reserved(self.device) - reserved,
+        )
 
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True

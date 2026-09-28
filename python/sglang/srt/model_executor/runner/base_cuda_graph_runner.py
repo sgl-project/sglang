@@ -15,13 +15,16 @@
 
 from __future__ import annotations
 
-import bisect
 import gc
 import logging
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
+from sglang.srt.model_executor.cuda_graph_config import (
+    filter_capture_sizes,
+    pad_to_capture_size,
+)
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -82,17 +85,12 @@ def get_batch_sizes_to_capture(
 
     # pad `num_max_requests` to avoid being filtered out
     num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
-    if max(capture_bs) > num_max_requests:
-        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [num_max_requests]
-
-    # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
-    capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
-    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
-    capture_bs = list(sorted(set(capture_bs)))
-
-    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+    capture_bs = filter_capture_sizes(
+        capture_bs,
+        max_size=num_max_requests,
+        alignment=mul_base,
+        request_width=alignment_width,
+    )
     compile_bs = (
         [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
         if get_flags().capture.enable_torch_compile
@@ -153,22 +151,7 @@ class BaseCudaGraphRunner(BaseRunner):
         """
         return None
 
-    @staticmethod
-    def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
-        """Return the smallest buckets[i] >= raw_size.
-
-        Caller's can_run_graph must reject raw_size > max(buckets) before
-        reaching load_batch; this assertion makes the contract
-        explicit (bisect_left returns len(buckets) when the value
-        exceeds all buckets, which would otherwise IndexError below
-        with no diagnostic).
-        """
-        assert raw_size <= buckets[-1], (
-            f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
-            f"can_run_graph should have rejected this batch"
-        )
-        index = bisect.bisect_left(buckets, raw_size)
-        return buckets[index]
+    _pad_to_bucket = staticmethod(pad_to_capture_size)
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...
