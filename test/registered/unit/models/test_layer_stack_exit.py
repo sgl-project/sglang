@@ -102,9 +102,6 @@ class Census:
                     and isinstance(call.func, ast.Name)
                     and call.func.id
                     in {
-                        "LayerCommunicator",
-                        "MHCLayerCommunicator",
-                        "make_decoder_stages",
                         "make_stages",
                     }
                     for call in ast.walk(node)
@@ -296,7 +293,7 @@ class TestLayerStackExit(CustomTestCase):
                     and isinstance(call.func, ast.Attribute)
                     and isinstance(call.func.value, ast.Name)
                     and call.func.value.id == "residual_batch"
-                    and call.func.attr in {"norm", "to_pp", "fold", "finish"}
+                    and call.func.attr in {"norm", "to_pp", "finish"}
                 ]
                 if batch_exits and all(
                     not inside_loop(forward, call) for call in batch_exits

@@ -45,11 +45,37 @@ def take_output(hidden_states, forward_batch):
     return hidden_states
 
 
-def norm(hidden_states, forward_batch, layernorm, capture_output=None, **read_kwargs):
-    hidden_states, residual = current(forward_batch).finish(hidden_states)
+def norm(
+    hidden_states,
+    forward_batch,
+    layernorm,
+    capture_output=None,
+    *,
+    handoff_norm=None,
+    skip_empty=False,
+    **read_kwargs,
+):
+    hidden_states, residual = current(forward_batch).finish(
+        hidden_states, takes_handoff=handoff_norm is not None
+    )
     # The terminal consumer now owns the pair. Do not keep layer buffers alive
     # through logits processing or the next forward on this batch.
     forward_batch.residual_stream = None
+    from sglang.srt.layers.communicator.output import HandoffOutput
+
+    if isinstance(hidden_states, HandoffOutput):
+        if residual is None:
+            raise RuntimeError("invalid final deferred MoE handoff")
+        if capture_output is not None:
+            raise RuntimeError(
+                "final handoff capture requires an explicit capture adapter"
+            )
+        hidden_states, _ = handoff_norm.finalize(
+            handoff=hidden_states, residual=residual, gamma=layernorm.gemma_weight
+        )
+        return hidden_states
+    if skip_empty and hidden_states.shape[0] == 0:
+        return hidden_states
     return access.norm_output(
         hidden_states, residual, layernorm, capture_output, **read_kwargs
     )

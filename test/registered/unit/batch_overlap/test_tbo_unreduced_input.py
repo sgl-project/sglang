@@ -24,7 +24,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
         residual = torch.ones(4, 3)
         stream = ResidualStream(residual)
         hidden = stream.leave(UnreducedOutput(torch.ones(4, 3), group=group), ADD)
-        parent_batch = SimpleNamespace(residual_stream=stream)
+        batch = SimpleNamespace(residual_stream=stream, global_forward_mode=None)
         parts_seen = []
 
         def split(hidden_states, residual, **kwargs):
@@ -40,12 +40,15 @@ class TestTboEntryReducesItsInput(CustomTestCase):
             ]
 
         def execute(inputs_arr, **kwargs):
-            self.assertIsNone(parent_batch.residual_stream)
+            self.assertIsNone(batch.residual_stream)
             parts_seen.extend(inputs_arr)
-            self.assertIsNot(inputs_arr[0]["residual"], inputs_arr[1]["residual"])
+            self.assertIsNot(
+                inputs_arr[0]["forward_batch"].residual_stream,
+                inputs_arr[1]["forward_batch"].residual_stream,
+            )
             for part in inputs_arr:
-                state = part["residual"]
-                self.assertIs(state, part["forward_batch"].residual_stream)
+                self.assertNotIn("residual", part)
+                state = part["forward_batch"].residual_stream
                 value = part["hidden_states"]
                 self.assertIsNot(state.pending, stream.pending)
                 self.assertIs(state.pending.update, ADD)
@@ -60,6 +63,13 @@ class TestTboEntryReducesItsInput(CustomTestCase):
             return inputs_arr
 
         with (
+            patch.object(
+                tbo.OperationsStrategy,
+                "init_new_tbo",
+                return_value=SimpleNamespace(
+                    deep_gemm_num_sms=None, operations=[], tbo_delta_stages=0
+                ),
+            ),
             patch.object(tbo, "_model_forward_tbo_split_inputs", split),
             patch.object(tbo, "execute_overlapped_operations", execute),
             patch.object(
@@ -68,21 +78,19 @@ class TestTboEntryReducesItsInput(CustomTestCase):
                 lambda _: empty_context(),
             ),
         ):
-            merged, output = tbo._model_forward_tbo(
-                inputs=dict(
-                    hidden_states=hidden,
-                    residual=stream,
-                    positions=None,
-                    forward_batch=parent_batch,
-                    zero_allocator=None,
-                ),
-                operations_strategy=SimpleNamespace(
-                    deep_gemm_num_sms=None, operations=[], tbo_delta_stages=0
-                ),
-                layer_input_rows=Layout(frozenset()),
+            merged = tbo.model_forward_stages(
+                layers=[
+                    SimpleNamespace(
+                        attn_stage=SimpleNamespace(input_rows=Layout(frozenset()))
+                    )
+                ],
+                enable_tbo=True,
+                positions=None,
+                hidden_states=hidden,
+                forward_batch=batch,
             )
+        output = batch.residual_stream
         self.assertEqual(len(parts_seen), 2)
-        self.assertIs(parent_batch.residual_stream, output)
         self.assertTrue(
             all(part["forward_batch"].residual_stream is None for part in parts_seen)
         )

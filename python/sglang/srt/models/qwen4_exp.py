@@ -1320,7 +1320,8 @@ class Qwen4ExpLayerExtensionMixin:
         for attr_name in (
             "input_layernorm",
             "post_attention_layernorm",
-            "layer_communicator",
+            "attn_stage",
+            "ffn_stage",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)

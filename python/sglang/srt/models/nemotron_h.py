@@ -738,7 +738,7 @@ class NemotronHModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 hidden_states, snapshot = self.layers[i].stage.capture_output(
-                    hidden_states, forward_batch, at_input=True
+                    hidden_states, forward_batch
                 )
                 aux_hidden_states.append(snapshot)
             layer = self.layers[i]

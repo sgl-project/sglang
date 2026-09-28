@@ -7,6 +7,8 @@ import torch
 from torch import nn
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.communicator import StageKind
 from sglang.srt.layers.communicator import ops as comm_ops
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -21,6 +23,7 @@ from sglang.srt.models.llama4 import Llama4Model
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.qwen3_vl import Qwen3LLMModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
+from sglang.test.boundary_fixtures import stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,9 +56,9 @@ class DeferringLayer(nn.Module):
         super().__init__()
         self.return_topk = return_topk
         self.stage_api = stage_api
-        self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        self.layer_communicator.input_layernorm = None
-        self.attn_stage = self.layer_communicator.attn
+        self.layer_communicator = stub_plan()
+        self.layer_communicator.norm = None
+        self.attn_stage = stub_stage(self.layer_communicator, StageKind.ATTENTION)
         self.layer_communicator._steps = comm.BoundarySteps(
             attention=comm.StageEntry(
                 prepare=partial(
@@ -91,16 +94,18 @@ class DeferringLayer(nn.Module):
             ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
             ffn_sum_is_movable=True,
         )
-        self.layer_communicator._ffn_sum_moves_to_next_layer = lambda batch, **_: defer
+        self.layer_communicator.output._ffn_sum_moves_to_next_layer = (
+            lambda batch, **_: defer
+        )
         self.layer_communicator.is_last_layer = False
         self.layer_communicator._sp_steps = None
         self.layer_communicator._input_scattered_steps = None
         self.layer_communicator._cp_steps = None
-        self.layer_communicator.ffn_reduction_group = lambda forward_batch: GROUP
-        self.layer_communicator._ffn_leaves_sum_to_reduce_scatter = (
+        self.layer_communicator.output.ffn_reduction_group = lambda forward_batch: GROUP
+        self.layer_communicator.output._ffn_leaves_sum_to_reduce_scatter = (
             lambda batch, dp_step: False
         )
-        self.layer_communicator._complete_ffn_output_now = (
+        self.layer_communicator.output._complete_ffn_output_now = (
             lambda hidden, residual, **_: (all_reduce(hidden), residual)
         )
 
@@ -127,7 +132,7 @@ class DeferringLayer(nn.Module):
         capture = kwargs.get("capture_output")
         if capture is not None:
             capture(residual.clone())
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.layer_communicator.output.ffn_exit(forward_batch) as ffn_exit:
             partial = torch.full_like(hidden_states, 0.5)
         if stream is not None:
             stream.write(residual)
@@ -175,6 +180,11 @@ def build_model(model_cls, *, defer, capture):
                 Llama4Model,
                 Qwen3Model,
                 Qwen3LLMModel,
+                Glm4MoeModel,
+                Glm4MoeLiteModel,
+                LagunaModel,
+                Qwen3MoeLLMModel,
+                Glm5NextModel,
             ),
         )
         for i in range(NUM_LAYERS)
@@ -185,19 +195,24 @@ def build_model(model_cls, *, defer, capture):
 
 class TestAuxCaptureDeferredAllreduce(CustomTestCase):
     def test_skipping_an_empty_capture_does_not_complete_its_output(self):
-        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        boundary = stub_plan()
+        boundary.norm = None
         partial = torch.empty(0, 4)
-        owed = comm.UnreducedOutput(partial, group=GROUP)
+        batch = SimpleNamespace(residual_stream=ResidualStream(partial))
+        owed = batch.residual_stream.leave(
+            comm.UnreducedOutput(partial, group=GROUP), comm.ADD
+        )
         with patch.object(GROUP, "all_reduce") as reduce:
-            hidden, captured = boundary.capture_output(owed, partial, skip_empty=True)
+            hidden, captured = stub_stage(boundary, StageKind.ATTENTION).capture_output(
+                owed, batch, skip_empty=True
+            )
         self.assertIs(hidden, owed)
         self.assertIsNone(captured)
         reduce.assert_not_called()
 
     def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
-        boundary = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         hidden = torch.ones(2, 4)
-        captured = boundary.snapshot(hidden, None)
+        captured = ResidualStream().snapshot(hidden)
         hidden.zero_()
         torch.testing.assert_close(captured, torch.ones_like(hidden))
 
@@ -233,6 +248,49 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                             torch.testing.assert_close(snapshot, inputs + boundary)
                         self.assertEqual(
                             reduce.call_count, NUM_LAYERS - 1 if defer else 0
+                        )
+
+    def test_glm_capture_owns_contracted_and_multi_rank_gathered_outputs(self):
+        inputs = torch.ones(2, 4)
+        original_capture = AuxHiddenStateList.capture
+        for mhc in (False, True):
+            for size in (1, 2):
+                with self.subTest(mhc=mhc, size=size):
+                    ownership = []
+
+                    def capture(collector, value, *, owned=False):
+                        ownership.append(owned)
+                        original_capture(collector, value, owned=owned)
+
+                    group = SimpleNamespace(
+                        world_size=size,
+                        all_gather=lambda value, dim: (
+                            value if size == 1 else torch.cat([value] * size, dim=dim)
+                        ),
+                    )
+                    model = build_model(Glm5NextModel, defer=True, capture=True)
+                    model.enable_a2a_moe = True
+                    model.config = SimpleNamespace(mhc=mhc, hc_mult=2)
+                    batch = SimpleNamespace(
+                        can_run_tbo=False,
+                        forward_mode=ForwardMode.DECODE,
+                        capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
+                    )
+                    with (
+                        patch.object(AuxHiddenStateList, "capture", capture),
+                        patch(
+                            "sglang.srt.models.glm5_next.get_parallel",
+                            return_value=SimpleNamespace(attn_tp_group=group),
+                        ),
+                    ):
+                        _, snapshots = model(
+                            None, None, batch, input_embeds=inputs.clone()
+                        )
+                    self.assertEqual(ownership, [mhc or size > 1] * 3)
+                    for boundary, value in enumerate(snapshots, 1):
+                        torch.testing.assert_close(
+                            value,
+                            torch.full((2 * size, 2 if mhc else 4), 1.0 + boundary),
                         )
 
     def test_terminal_capture_uses_the_final_norm_boundary(self):
@@ -309,42 +367,45 @@ class TestPipelineResidualReception(CustomTestCase):
         torch.testing.assert_close(result, torch.full_like(inputs, 2.25))
 
     def test_written_streams_do_not_read_a_separate_residual(self):
-        comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        comm_instance._batch_steps = lambda fb: SimpleNamespace(
-            attention=SimpleNamespace(input_sum=None), ffn=None
+        comm_instance = stub_plan()
+        comm_instance.norm = None
+        comm_instance._batch_steps = lambda batch: SimpleNamespace(
+            attention=SimpleNamespace(input_sum=None)
         )
-        comm_instance._residual = SimpleNamespace(
-            ffn_update=SimpleNamespace(at_producer=True)
-        )
+        batch = SimpleNamespace(residual_stream=None)
+        comm_instance.residual_in_hidden = True
         streams = torch.randn(2, 4, 3)
-        hidden, residual = comm_instance.from_pp(
-            PPProxyTensors({"hidden_states": streams}),
-            SimpleNamespace(residual_stream=None),
+        hidden = stub_stage(comm_instance, StageKind.ATTENTION).from_pp(
+            PPProxyTensors({"hidden_states": streams}), batch
         )
+        residual = batch.residual_stream
         self.assertIs(hidden, streams)
         self.assertIsNone(residual.pending)
         self.assertIs(residual.residual, hidden)
 
     def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
-        comm_instance = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        comm_instance._batch_steps = lambda fb: SimpleNamespace(
-            attention=SimpleNamespace(input_sum=None), ffn=None
+        comm_instance = stub_plan()
+        comm_instance.norm = None
+        comm_instance._batch_steps = lambda batch: SimpleNamespace(
+            attention=SimpleNamespace(input_sum=None)
         )
+        batch = SimpleNamespace(residual_stream=None)
         partial = torch.randn(2, 4)
         prior = torch.randn_like(partial)
-        hidden, residual = comm_instance.from_pp(
-            PPProxyTensors({"hidden_states": partial, "residual": prior}),
-            SimpleNamespace(residual_stream=None),
+        hidden = stub_stage(comm_instance, StageKind.ATTENTION).from_pp(
+            PPProxyTensors({"hidden_states": partial, "residual": prior}), batch
         )
+        residual = batch.residual_stream
         self.assertIs(hidden, partial)
         self.assertIs(residual.residual, prior)
         self.assertIs(residual.pending.value, partial)
         missing = PPProxyTensors({"hidden_states": partial})
         with self.assertRaises(KeyError):
-            comm_instance.from_pp(missing, SimpleNamespace(residual_stream=None))
-        hidden, residual = comm_instance.from_pp(
-            missing, SimpleNamespace(residual_stream=None), allow_missing_residual=True
+            stub_stage(comm_instance, StageKind.ATTENTION).from_pp(missing, batch)
+        hidden = stub_stage(comm_instance, StageKind.ATTENTION).from_pp(
+            missing, batch, allow_missing_residual=True
         )
+        residual = batch.residual_stream
         self.assertIs(hidden, partial)
         self.assertIsNone(residual.pending)
         self.assertIs(residual.residual, hidden)

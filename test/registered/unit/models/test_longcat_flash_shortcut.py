@@ -1,11 +1,13 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 from torch import nn
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator.adapters import branch
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.communicator.stage import StageCommunicator
 from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -25,8 +27,8 @@ class TestLongcatShortcut(CustomTestCase):
         attention = comm.Layout(frozenset())
 
         class Communicator(SimpleNamespace):
-            branch_output = comm.LayerCommunicator.branch_output
-            merge_branch = comm.LayerCommunicator.merge_branch
+            branch_output = branch.branch_output
+            merge_branch = branch.merge_branch
 
         fork_hidden = torch.full((rows // tp, 3), 2.0)
         fork_residual = torch.full_like(fork_hidden, 5.0)
@@ -40,17 +42,27 @@ class TestLongcatShortcut(CustomTestCase):
         )
         layer = LongcatFlashDecoderLayer.__new__(LongcatFlashDecoderLayer)
         nn.Module.__init__(layer)
-        layer.moe_layer_communicator = moe_communicator
-        layer.mlp_layer_communicator = [None, dense_communicator]
+        batch = SimpleNamespace(residual_stream=ResidualStream())
+        layer.attn_stage = SimpleNamespace(
+            prepare=lambda h, fb: h, finish=lambda h, fb: h
+        )
+        moe_communicator.post_attention_layernorm = None
+        dense_communicator.post_attention_layernorm = None
+        layer.moe_stage = StageCommunicator(moe_communicator, comm.StageKind.FFN, None)
+        layer.moe_stage.prepare = lambda h, fb: fork_hidden
+        layer.second_ffn = StageCommunicator(
+            dense_communicator, comm.StageKind.FFN, None
+        )
         layer.self_attn = [lambda **kw: kw["hidden_states"]]
         layer.mlp = nn.Identity()
-        layer.forward_mlp = Mock(
-            return_value=(
-                torch.full((rows, 3), 3.0),
-                torch.full((rows, 3), 11.0),
-                None,
-            )
-        )
+
+        def dense_branch(*args):
+            stream = ResidualStream(torch.full((rows, 3), 11.0))
+            hidden = stream.leave(torch.full((rows, 3), 3.0), comm.ADD)
+            batch.residual_stream = stream
+            return hidden, None
+
+        layer.forward_mlp = dense_branch
         with (
             patch_communicator(
                 "get_local_dp_buffer",
@@ -65,9 +77,10 @@ class TestLongcatShortcut(CustomTestCase):
                 return_value=SimpleNamespace(attn_tp_group=object()),
             ),
         ):
-            hidden, residual, _ = layer(
-                torch.arange(rows), torch.zeros(rows, 3), None, None, None, None
+            hidden, _ = layer(
+                torch.arange(rows), torch.zeros(rows, 3), batch, None, None
             )
+        hidden, residual = batch.residual_stream.finish(hidden)
         torch.testing.assert_close(hidden, torch.full((rows, 3), 5.0))
         torch.testing.assert_close(hidden + residual, torch.full((rows, 3), 16.0))
         torch.testing.assert_close(fork_residual, torch.full_like(fork_residual, 5.0))

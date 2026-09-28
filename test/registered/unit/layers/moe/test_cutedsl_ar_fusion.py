@@ -9,12 +9,19 @@ import torch
 from sglang.srt.layers.communicator import (
     ADD,
     NORM_QUANT_READ,
-    LayerCommunicator,
     Layout,
+    StageKind,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
     reduce_output,
+)
+from sglang.srt.layers.communicator.construction import BatchVariant
+from sglang.srt.layers.communicator.fusions.allreduce import (
+    attention_fusions,
+    complete_attention_input,
+    complete_ffn_input,
+    ffn_fusions,
 )
 from sglang.srt.layers.communicator.fusions.cutedsl import (
     CuteDSLFusion,
@@ -24,6 +31,7 @@ from sglang.srt.layers.communicator.fusions.cutedsl import (
 )
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.communicator.residual.access import finish_layer_stack
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -34,6 +42,7 @@ from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseCo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.boundary_fixtures import stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
@@ -50,12 +59,11 @@ def _owned_input(hidden, residual, batch=_DECODE):
 
 
 def _communicator():
-    comm = LayerCommunicator.__new__(LayerCommunicator)
+    comm = stub_plan()
     comm.fusions = CuteDSLFusion()
-    comm.input_layernorm = RMSNorm(8, eps=1e-6)
-    comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+    comm.norm = RMSNorm(8, eps=1e-6)
     comm.enable_fused_ar_quant = False
-    comm._attn_input_fusions = comm._select_attn_input_fusions()
+    comm._attn_input_fusions = attention_fusions(comm)
     # Only the ordinary batches' attention input half, with these entries.
     comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
     comm._steps = SimpleNamespace(
@@ -83,6 +91,15 @@ def _communicator():
 def _bound(entry):
     """What an entry runs and the layer it is bound to."""
     return entry.func, entry.args
+
+
+def _test_layer(**kwargs):
+    comm = _communicator()
+    return SimpleNamespace(
+        attn_stage=stub_stage(comm, StageKind.ATTENTION),
+        ffn_stage=stub_stage(comm, StageKind.FFN),
+        **kwargs,
+    )
 
 
 def _install(layers, **kwargs):
@@ -136,8 +153,8 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
             lambda *a, **k: pytest.fail("fell through to the unfused path"),
         ),
     ):
-        out_hidden, _ = last.prepare_attn(
-            *_owned_input(hidden_states, torch.zeros(8, 8))
+        out_hidden, _ = stub_stage(last, StageKind.ATTENTION)._prepare_input(
+            hidden_states, torch.zeros(8, 8), _DECODE
         )
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
@@ -156,25 +173,33 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         fusion._reduce_output_and_update_and_read_residual,
         (comm,),
     )
-    assert base_input == comm._reduce_output_and_update_and_read_residual
-    base = comm._mlp_input_reduce_output_and_update_and_read_residual
+    assert _bound(base_input) == (complete_attention_input, (comm,))
+    base = (complete_ffn_input, (comm,))
     cutedsl = (fusion._mlp_input_reduce_output_and_update_and_read_residual, (comm,))
     with patch(
         f"{_MODULE}.get_parallel",
         return_value=SimpleNamespace(attn_tp_size=2, tp_size=2),
     ):
-        comm._declared = SimpleNamespace(input_rows=Layout(frozenset()))
-        fusions = comm._select_mlp_input_fusions()
+        comm.variants = {
+            BatchVariant.ORDINARY: SimpleNamespace(
+                incoming=SimpleNamespace(residual=Layout(frozenset()))
+            )
+        }
+        fusions = ffn_fusions(comm)
         assert _bound(fusions[0].run) == cutedsl
-        assert fusions[1].run == base
+        assert _bound(fusions[1].run) == base
         # The workspace reduces over the TP group, which is the attention-TP group here.
         assert [f.completes for f in fusions] == [SumGroup.ATTN_TP] * 2
         # A residual on each rank's slice is gathered first, which the
         # workspace does not do.
-        comm._declared = SimpleNamespace(
-            input_rows=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
-        )
-        assert [f.run for f in comm._select_mlp_input_fusions()] == [base]
+        comm.variants = {
+            BatchVariant.ORDINARY: SimpleNamespace(
+                incoming=SimpleNamespace(
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+                )
+            )
+        }
+        assert [_bound(f.run) for f in ffn_fusions(comm)] == [base]
 
 
 def test_the_fusion_runs_only_on_the_ffn_full_rows():
@@ -204,7 +229,7 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
             (frozenset({TokenAxis.ATTN_TP_SCATTER}), False),
         ):
             comm._batch_steps = lambda fb, rows=Layout(sharded): SimpleNamespace(
-                ffn=SimpleNamespace(input_rows=rows)
+                attention=None, ffn=SimpleNamespace(input_rows=rows)
             )
             assert fusion._common_eligible(comm, _DECODE, 8) is eligible
 
@@ -226,12 +251,18 @@ def test_install_does_not_require_a_fused_successor():
     reset_context()
     publish(ServerArgs(model_path="dummy"), role="test")
     first, last = _communicator(), _communicator()
-    ordinary = SimpleNamespace(layer_communicator=SimpleNamespace(fusions=None))
+    ordinary = SimpleNamespace(ffn_stage=SimpleNamespace(fusions=None))
     install_cutedsl_fusion(
         [
-            SimpleNamespace(layer_communicator=first),
+            SimpleNamespace(
+                attn_stage=stub_stage(first, StageKind.ATTENTION),
+                ffn_stage=stub_stage(first, StageKind.FFN),
+            ),
             ordinary,
-            SimpleNamespace(layer_communicator=last),
+            SimpleNamespace(
+                attn_stage=stub_stage(last, StageKind.ATTENTION),
+                ffn_stage=stub_stage(last, StageKind.FFN),
+            ),
         ],
         hidden_size=8,
         top_k=2,
@@ -244,12 +275,9 @@ def test_install_does_not_require_a_fused_successor():
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
-    layers = [
-        SimpleNamespace(layer_communicator=_communicator(), replicated=value)
-        for value in (True, False)
-    ]
+    layers = [_test_layer(replicated=value) for value in (True, False)]
     _install(layers, requires_local_reduction=lambda layer: layer.replicated)
-    replicated, plain = [layer.layer_communicator for layer in layers]
+    replicated, plain = [layer.ffn_stage.plan for layer in layers]
     assert replicated.fusions.requires_local_reduction
     assert not plain.fusions.requires_local_reduction
     # The restriction belongs to the producer; incoming sums can still fuse.
@@ -261,13 +289,15 @@ def test_a_service_nested_under_a_wrapper_is_prepared():
     an unprepared service declines every M, leaving no fusion at all."""
     prepared = []
     layer = torch.nn.Linear(2, 2)
-    layer.layer_communicator = _communicator()
+    comm = _communicator()
+    layer.attn_stage, layer.ffn_stage = (
+        stub_stage(comm, StageKind.ATTENTION),
+        stub_stage(comm, StageKind.FFN),
+    )
     wrapper = torch.nn.Module()
     wrapper.language_model = torch.nn.Sequential(layer)
     _install([layer])
-    layer.layer_communicator.fusions.service.prepare = lambda *, max_m: prepared.append(
-        max_m
-    )
+    layer.ffn_stage.fusions.service.prepare = lambda *, max_m: prepared.append(max_m)
 
     # The workspace M bound is the largest of every framework source.
     reset_context()
@@ -395,7 +425,7 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
             return residual * 2, residual
 
     comm = _communicator()
-    comm.input_layernorm = AddNorm()
+    comm.norm = AddNorm()
     comm.fusions.service = SimpleNamespace(
         finalize=lambda **kw: pytest.fail("the kernel does not take this batch")
     )
@@ -406,8 +436,8 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
         patch.object(CuteDSLFusion, "_should_use_finalize", return_value=False),
         patch.object(CuteDSLFusion, "_common_eligible", return_value=False),
     ):
-        hidden, residual = comm.prepare_attn(
-            *_owned_input(_handoff(finish), torch.full((2, 8), 2.0))
+        hidden, residual = stub_stage(comm, StageKind.ATTENTION)._prepare_input(
+            _handoff(finish), torch.full((2, 8), 2.0), _DECODE
         )
     finish.assert_called_once_with()
     torch.testing.assert_close(residual.residual, torch.full((2, 8), 3.0))
@@ -415,12 +445,11 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
 
 
 def test_the_layer_stack_hands_a_handoff_only_to_a_final_norm_that_takes_it():
-    comm = LayerCommunicator.__new__(LayerCommunicator)
     for takes, completed in ((True, 0), (False, 1)):
         finish = MagicMock(return_value=torch.ones(2, 8))
         handoff = _handoff(finish)
-        hidden, _ = comm.finish_layer_stack(
-            *_owned_input(handoff, torch.zeros(2, 8)), final_norm_takes_handoff=takes
+        hidden, _ = finish_layer_stack(
+            handoff, torch.zeros(2, 8), _DECODE, final_norm_takes_handoff=takes
         )
         assert finish.call_count == completed
         assert (hidden is handoff) == takes

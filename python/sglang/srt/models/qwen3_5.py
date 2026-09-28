@@ -40,18 +40,17 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-
-# Layers - Attention
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
 from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
+    declare_attn,
+    declare_ffn,
+    make_stages,
 )
 
-# Configs
+# Layers - Attention
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -271,7 +270,7 @@ def _enable_qwen35_fused_ar_quant() -> bool:
     (AR → RMSNorm → per-group quant) with either a single fused kernel (when
     the fully-fused variant is eligible) or a 2-kernel path
     (fused AR+RMSNorm + separate per-group quant) that still saves one
-    kernel launch vs. baseline. The LayerCommunicator gracefully falls back
+    kernel launch vs. baseline. The stage boundary gracefully falls back
     to ``forward_with_allreduce_fusion`` (plain AR+RMSNorm) when the fused
     quant helper returns ``None``, so turning this on never regresses the
     AR+RMSNorm fusion itself.
@@ -1109,14 +1108,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1128,33 +1119,44 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             _enable_qwen35_fused_ar_quant()
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            enable_fused_ar_quant=enable_fused_ar_quant,
-            fused_ar_quant_keep_bf16=enable_fused_ar_quant,
-            fusions=_layer_fusions(config, is_nextn),
+        boundary_fusions = _layer_fusions(config, is_nextn)
+        self.attn_stage, self.ffn_stage = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {
+                    "enable_fused_ar_quant": enable_fused_ar_quant,
+                    "fused_ar_quant_keep_bf16": enable_fused_ar_quant,
+                    "fusions": boundary_fusions,
+                },
+            ),
+            (
+                declare_ffn(
+                    sparse=is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+                {"fusions": boundary_fusions},
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=kwargs.get(
-                    "captured_last_layer_outputs", None
-                ),
-            )
+        hidden_states = self.attn_stage.prepare(
+            hidden_states,
+            forward_batch,
+            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs", None),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1166,11 +1168,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
 
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_stage.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1179,7 +1180,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        return ffn_exit.finish(hidden_states, residual)
+        return ffn_exit.finish(hidden_states)
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
@@ -1311,14 +1312,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1332,14 +1325,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            enable_fused_ar_quant=enable_fused_ar_quant,
-            fused_ar_quant_keep_bf16=False,
-            fusions=_layer_fusions(config, is_nextn),
+        boundary_fusions = _layer_fusions(config, is_nextn)
+        self.attn_stage, self.ffn_stage = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {
+                    "enable_fused_ar_quant": enable_fused_ar_quant,
+                    "fused_ar_quant_keep_bf16": False,
+                    "fusions": boundary_fusions,
+                },
+            ),
+            (
+                declare_ffn(
+                    sparse=is_layer_sparse,
+                    next_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+                {"fusions": boundary_fusions},
+            ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_sparse=is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
         self.alt_stream = alt_stream
@@ -1543,18 +1553,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states = self.attn_stage.prepare(
+            hidden_states,
+            forward_batch,
+            captured_last_layer_outputs=captured_last_layer_outputs,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1567,10 +1573,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        with self.ffn_stage.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1579,7 +1584,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
-        return ffn_exit.finish(hidden_states, residual)
+        return ffn_exit.finish(hidden_states)
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1747,6 +1752,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 # Every layer was checked above.
                 can_defer_finalize=lambda layer: True,
                 label="Qwen3.5",
+                terminal_finalize=True,
             )
 
         # Final normalization
@@ -1821,12 +1827,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = self.layers[
-                self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         aux_hidden_states = AuxHiddenStateList()
         # Pass through decoder layers
@@ -1835,16 +1841,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions=positions,
                     hidden_states=hidden_states,
-                    residual=residual,
                     forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+                    captured_last_layer_outputs=aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None,
                 )
 
             # Process deepstack embeddings if provided
@@ -1854,52 +1857,22 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states, residual = layer.layer_communicator.add_to_output(
+                hidden_states = residual_batch.add_to_output(
                     hidden_states,
-                    residual,
+                    forward_batch,
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states,
-            residual,
-            forward_batch,
-            # The final norm below finalizes a deferred MoE output in its kernel.
-            final_norm_takes_handoff=self.flashinfer_mnnvl_cutedsl_fusion is not None
-            and self.pp_group.is_last_rank,
-            preserve_declared=not self.pp_group.is_last_rank,
-        )
-
-        # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
 
-        # The final layer has no successor to consume its deferred MoE tail.
-        is_deferred_finalize = False
-        if self.flashinfer_mnnvl_cutedsl_fusion is not None:
-            from sglang.srt.layers.communicator.fusions.cutedsl import (
-                MoeFinalizeHandoff,
-            )
-
-            is_deferred_finalize = isinstance(hidden_states, MoeFinalizeHandoff)
-
-        if is_deferred_finalize:
-            if residual is None:
-                raise RuntimeError("invalid final deferred MoE handoff")
-            hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
-                handoff=hidden_states, residual=residual, gamma=self.norm.gemma_weight
-            )
-        elif hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = residual_batch.norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            handoff_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

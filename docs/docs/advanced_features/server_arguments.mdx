@@ -2862,7 +2862,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
 
 ### FFN boundary reduction
 
-Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to both dense and MoE FFN layers. It currently controls models using independently constructed stage boundaries; models still using `LayerCommunicator` retain their existing reduction policy.
+Use `--boundary-reduction` to choose which optional FFN output reductions may combine the sum with token redistribution. The selected policy applies to both dense and MoE FFN layers.
 
 | Value | Behavior |
 | --- | --- |
@@ -2873,8 +2873,6 @@ Use `--boundary-reduction` to choose which optional FFN output reductions may co
 | `rs+rsv` | Permit both, trying the eligible variable-size path first, then fixed-size, then `ar`. |
 
 `auto` selects `ar` for dense Qwen3 language backbones (including Qwen3-VL wrappers) and Moss-VL; `rsv` for BailingMoELinear/BailingMoeV2_5, LongCat Flash and Step3-VL; and `rs+rsv` otherwise. Qwen3-MoE, Qwen3-Next and Qwen3.5 are not matched by the dense Qwen3 rule and resolve to `rs+rsv`.
-
-LongCat Flash and Moss-VL resolve these defaults, but still use the layer communicator at this revision and do not yet consume this option.
 
 With `auto`, an independent speculative draft resolves its own model default; same-model MTP inherits the target policy. An explicit value applies to both target and draft. The result is recorded in the `speculative_boundary_reduction` server args field (`no_cli=True`); it has no separate CLI flag or independent override during resolution.
 

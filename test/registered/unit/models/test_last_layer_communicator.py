@@ -175,15 +175,11 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
 
     from sglang.srt.layers.communicator import declare_attn, declare_ffn
 
-    if hasattr(module, "make_stages"):
-        patches = dict(
-            declare_attn=declare_attn,
-            declare_ffn=declare_ffn,
-            make_stages=communicator,
-        )
-    else:
-        facts = MagicMock()
-        patches = dict(LayerCommunicator=communicator, LayerFacts=facts)
+    patches = dict(
+        declare_attn=declare_attn,
+        declare_ffn=declare_ffn,
+        make_stages=communicator,
+    )
     patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
@@ -192,18 +188,6 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
             config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    if not hasattr(module, "make_stages"):
-        passed = communicator.call_args.kwargs
-        planned = facts.init_new.call_args.kwargs
-        return (
-            passed,
-            {
-                "terminal": planned["layer_id"] == planned["num_layers"] - 1,
-                "enters_stack": planned["layer_id"] == 0,
-                "is_layer_sparse": planned["is_layer_sparse"],
-            },
-            built,
-        )
     declaration = communicator.call_args.args[1][0]
     sequence = communicator.call_args.kwargs
     return (
@@ -236,17 +220,6 @@ class TestTerminalStages(CustomTestCase):
                         planned_as_last(case, NUM_LAYERS, layer_id),
                         layer_id == NUM_LAYERS - 1,
                     )
-
-    def test_step3p5_dense_layers_never_defer_their_sum(self):
-        """A Step-3.5 dense layer's MLP all-reduces its own output unless
-        postprocess reduce-scatters it; its communicator is told it never leaves
-        the sum to the next layer. The MoE layers may."""
-        for layer_id in range(NUM_LAYERS):
-            with self.subTest(layer_id=layer_id):
-                passed, planned, _ = build("step3p5", NUM_LAYERS, layer_id)
-                self.assertIs(
-                    passed["allow_deferred_ffn_reduction"], planned["is_layer_sparse"]
-                )
 
     def test_draft_model_layer_is_last(self):
         """The single decoder layer of a NextN / MTP draft model is marked last,

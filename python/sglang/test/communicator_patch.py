@@ -35,8 +35,6 @@ from sglang.srt.layers.communicator.residual import (
 )
 
 COMMUNICATOR_MODULES = (
-    layer,
-    legacy_stage,
     communicator,
     allreduce,
     exit,
@@ -54,6 +52,8 @@ COMMUNICATOR_MODULES = (
     construction,
     factories,
     stage,
+    layer,
+    legacy_stage,
     batch,
     stream,
 )

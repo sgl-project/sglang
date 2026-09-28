@@ -161,7 +161,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         attn_input = torch.cat([embeds, hidden_states], dim=-1)
 
         # MLA's forward_absorb_prepare reads the qkv-down projection result
-        # from attn_tp_context. We bypass LayerCommunicator here (the eagle3
+        # from attn_tp_context. We bypass layer boundary preparation here (the eagle3
         # draft layer is one isolated layer with custom pre-attention norms),
         # so publish the attention input ourselves.
         get_attn_tp_context().set_attn_inputs(

@@ -4,22 +4,12 @@ from typing import Optional
 
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.communicator import (
-    NORM_QUANT_READ,
-    LayerCommunicator,
-    LayerFacts,
-    LayerStage,
-    Layout,
-    StageDecl,
-    StageInput,
     StageKind,
-    StageOutput,
-    SumGroup,
-    TokenAxis,
-    stage_edges,
-    token_axis_sizes,
+    declare_attn,
+    declare_ffn,
+    make_stages,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
 
@@ -37,87 +27,35 @@ def _stage_kind(pattern: str, layer_idx: int) -> Optional[StageKind]:
     return StageKind.ATTENTION if is_attn_layer(pattern[layer_idx]) else StageKind.FFN
 
 
-def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
-    """What the stage at ``layer_idx`` declares. A mixer reads its input as
-    an attention does, computes on the attention's rows and leaves its
-    attention-TP sum to an FFN stage after it, or, when a fused kernel takes
-    it, to a mixer after it. An FFN computes on the TP group's rows, a MoE
-    dispatched by an a2a backend on this rank's own, and may leave its sum to a
-    mixer after it."""
-    axis_sizes = token_axis_sizes()
-    attention = Layout.sharded_over(
-        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
-    )
+def _declaration(pattern: str, layer_idx: int):
     following = _stage_kind(pattern, layer_idx + 1)
     if is_attn_layer(pattern[layer_idx]):
-        owes = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
-        return StageDecl(
-            StageInput(attention, read=NORM_QUANT_READ),
-            StageOutput(
-                attention,
-                group=SumGroup.ATTN_TP if owes else None,
-                always_leaves=owes and following is StageKind.FFN,
-                leaves_for_next_layer=owes and following is StageKind.ATTENTION,
-            ),
+        return declare_attn(
+            mixer_exit=True,
+            next_kind=following,
+            ordinary_only=True,
         )
-    sparse = pattern[layer_idx] == MOE
-    if sparse and not get_moe_a2a_backend().is_none():
-        local = Layout.sharded_over(
-            TokenAxis.ATTN_DP,
-            TokenAxis.ATTN_CP,
-            TokenAxis.ATTN_TP_SCATTER,
-            axis_sizes=axis_sizes,
-        )
-        return StageDecl(StageInput(local), StageOutput(local))
-    full = Layout.sharded_over(axis_sizes=axis_sizes)
-    return StageDecl(
-        StageInput(full),
-        StageOutput(
-            full,
-            group=SumGroup.MOE_OUTPUT if sparse else SumGroup.TP,
-            leaves_for_next_layer=following is StageKind.ATTENTION,
-            leaves_for_reduce_scatter=True,
-            leaves_for_reduce_scatterv=True,
-        ),
-    )
-
-
-def layer_stage(pattern: str, layer_idx: int) -> LayerStage:
-    """The layer's stage and its two boundaries, from its own declaration and
-    the previous stage's."""
-    rows = Layout.sharded_over(
-        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=token_axis_sizes()
-    )
-    return LayerStage(
-        kind=_stage_kind(pattern, layer_idx),
-        edges=stage_edges(
-            previous=(
-                _stage_decl(pattern, layer_idx - 1).output if layer_idx > 0 else None
-            ),
-            stage=_stage_decl(pattern, layer_idx),
-            rows=rows,
-        ),
-        enters_stack=layer_idx == 0,
+    return declare_ffn(
+        sparse=pattern[layer_idx] == MOE,
+        ordinary_only=True,
+        return_to_attention=True,
     )
 
 
 def make_stage_boundary(layer_norm: RMSNorm, *, pattern: str, layer_idx: int):
-    """The communicator of a layer that is one stage: only its own norm, and
-    boundaries built from the stages next to it in the pattern."""
-    stage = layer_stage(pattern, layer_idx)
-    for_attn = stage.kind is StageKind.ATTENTION
-    boundaries = LayerCommunicator(
-        layer_facts=LayerFacts(
-            is_layer_sparse=pattern[layer_idx] == MOE,
-            is_last_layer=layer_idx == len(pattern) - 1,
-        ),
-        input_layernorm=layer_norm if for_attn else None,
-        post_attention_layernorm=None if for_attn else layer_norm,
-        # With attention TP > 1, the default gather adds the residual to one
-        # rank's partial in bf16 before the cross-rank sum.
-        force_layernorm_before_dp_gather=True,
-        allow_reduce_scatter=not for_attn,
-        stage=stage,
-    )
+    from sglang.srt.layers import layernorm_sp
+    from sglang.srt.runtime_context import get_parallel
 
-    return boundaries.attn if for_attn else boundaries.ffn
+    if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
+        raise NotImplementedError("a Nemotron stage with attention CP or LayerNorm SP")
+    previous = _declaration(pattern, layer_idx - 1) if layer_idx > 0 else None
+    (boundary,) = make_stages(
+        (
+            _declaration(pattern, layer_idx),
+            layer_norm,
+            {"force_layernorm_before_dp_gather": True},
+        ),
+        previous=previous,
+        terminal=layer_idx == len(pattern) - 1,
+    )
+    return boundary

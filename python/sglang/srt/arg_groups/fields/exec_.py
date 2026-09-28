@@ -626,9 +626,8 @@ class ExecComm(msgspec.Struct):
             help="Select FFN boundary reduction: ar uses all-reduce then token "
             "redistribution; rs and rsv permit fixed-size and variable-size "
             "reduce-scatter respectively; rs+rsv permits both (RSv first). "
-            "Unsupported paths fall back to ar. The option applies only to FFN "
-            "layers using stage boundaries, where auto resolves the model default. "
-            "Required attention and MoE collectives and "
+            "Unsupported paths fall back to ar. auto resolves the model default "
+            "for all FFN layers. Required attention and MoE collectives and "
             "all-reduce fusion are unaffected.",
             resolvable=True,
         ),
