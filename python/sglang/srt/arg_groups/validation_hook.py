@@ -31,6 +31,7 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         # Qwen3.5 (dense / MoE, text and multimodal); folded in from #39602.
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
