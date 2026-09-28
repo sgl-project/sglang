@@ -807,7 +807,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         detector = ResponseTemplateToolDetector(response_template=template)
 
         opened = detector.parse_streaming_increment("<call:get_weather>{", [_tool()])
-        closed = detector.parse_streaming_increment("}", [_tool()])
+        detector.parse_streaming_increment("}", [_tool()])
         closed = detector.parse_streaming_increment("</call>", [_tool()])
 
         self.assertEqual(
