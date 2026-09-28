@@ -255,6 +255,37 @@ class TestTritonDSAZeroRope(CustomTestCase):
                 torch.cuda.synchronize()
                 torch.testing.assert_close(captured, eager, atol=0, rtol=0)
 
+    def test_glm53_mixed_rows_and_physical_padding_graph_replay(self):
+        live_counts = (0, 1, 3, 4, 511, 512, 2047, 2048, 2049, 2051, 512, 3, 1)
+        physical_tokens = len(live_counts) + 4
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+                    tokens=physical_tokens, heads=heads
+                )
+                for row, live_topk in enumerate(live_counts):
+                    indices[row, :, live_topk:] = -1
+                indices[len(live_counts) :].fill_(-1)
+
+                expected = _torch_sparse_attention(
+                    q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                )
+                eager = self._run(q, kv, indices).squeeze(0)
+                torch.testing.assert_close(eager, expected, atol=0.04, rtol=0.04)
+                self.assertTrue(
+                    torch.equal(
+                        eager[len(live_counts) :],
+                        torch.zeros_like(eager[len(live_counts) :]),
+                    )
+                )
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._run(q, kv, indices)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured.squeeze(0), eager, atol=0, rtol=0)
+
     def test_glm53_production_grids_are_finite(self):
         kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
         base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
