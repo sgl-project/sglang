@@ -85,7 +85,6 @@ def create_mla_kv_page_table_for_dcp(
     v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
     req_to_token_stride: tl.constexpr,
     block_table_stride: tl.constexpr,
-    mult,  # runtime: kernel_page_multiplier of the target sub-pool
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
@@ -97,7 +96,8 @@ def create_mla_kv_page_table_for_dcp(
     ``HAS_V2P`` picks the id space the emitted page number is in: the
     DCP-collapsed page IS physical on a static pool, and still VIRTUAL under
     the unified memory pool, where it takes one more gather through ``v2p_ptr``
-    and a ``mult`` scale to reach the per-layer views.
+    to reach the per-layer views. No scale: under the token-major views a
+    physical page IS the kernel-facing page.
     """
     req = tl.program_id(0)
     page_block = tl.program_id(1)
@@ -118,7 +118,7 @@ def create_mla_kv_page_table_for_dcp(
         # 0, the reserved padding page.
         pages = tl.where(virtual_locs < 0, 0, pages)
         physical = tl.load(v2p_ptr + pages, mask=mask, other=0)
-        pages = tl.maximum(physical * mult, 0)
+        pages = tl.maximum(physical, 0)
     tl.store(
         block_kv_indices_ptr + req * block_table_stride + page_offsets,
         pages.to(tl.int32),

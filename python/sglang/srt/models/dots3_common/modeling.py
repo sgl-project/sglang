@@ -1036,7 +1036,7 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
                     out_cache_loc
                 )
-        return KVWriteLoc(forward_batch.out_cache_loc, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(

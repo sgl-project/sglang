@@ -18,6 +18,7 @@ from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
@@ -305,13 +306,16 @@ class DeepseekMHARocmForwardMixin:
     ):
         if _use_aiter_gfx95:
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+                self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
     def _get_mla_kv_buffer_rocm(

@@ -400,6 +400,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner_list[
                     step
                 ].attn_backend = self.draft_extend_attn_backend_list[-1]
+            # Boot guard: every backend a draft forward reaches must carry
+            # its runner's translator or the index builders emit virtual ids.
+            translator = self.draft_runner_list[step].kv_index_translator
+            if translator.is_translating:
+                translator.bind_and_verify_backends(
+                    [self.draft_extend_attn_backend_list[-1]]
+                )
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
