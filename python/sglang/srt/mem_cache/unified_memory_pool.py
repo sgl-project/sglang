@@ -658,16 +658,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """Physical growth direction used by this sub-pool's L1 allocator."""
         return self._unified_buffer.spec(self._sub_pool_name).grow_direction
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        """A physical token id IS the kernel-facing id, so the host copy needs
-        no rewrite; the override drops the arguments the parent ignores."""
-        return super().get_cpu_copy(indices)
-
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
-        super().load_cpu_copy(kv_cache_cpu, indices)
-
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
             "prefix-valid commit is unsupported under the unified layout "
@@ -750,16 +740,6 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
-
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        """A physical token id IS the kernel-facing id, so the host copy needs
-        no rewrite; the override drops the arguments the parent ignores."""
-        return super().get_cpu_copy(indices)
-
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
-        super().load_cpu_copy(kv_cache_cpu, indices)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
