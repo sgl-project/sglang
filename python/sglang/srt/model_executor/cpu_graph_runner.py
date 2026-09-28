@@ -606,6 +606,7 @@ def register_fake_ops(tp_size: int):
         track_state=None,
         track_chunk_idx=None,
         eps=1e-6,
+        scale=None,
     ):
         output = torch.empty_like(value)
         final_state = initial_state.to(torch.float32)

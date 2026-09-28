@@ -334,7 +334,8 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
     bool output_intermediate_states,
     const std::optional<at::Tensor>& track_state,
     const std::optional<at::Tensor>& track_chunk_idx,
-    double eps = 1e-6);
+    double eps = 1e-6,
+    std::optional<double> scale = std::nullopt);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -847,7 +848,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor cu_seqlens, Tensor initial_state_indices, Tensor? A_log=None, Tensor? dt_bias=None, "
       "float? lower_bound=None, bool beta_is_raw=False, bool use_qk_l2norm_in_kernel=True, "
       "bool output_intermediate_states=False, Tensor? track_state=None, Tensor? track_chunk_idx=None, "
-      "float eps=1e-6) -> (Tensor, Tensor, Tensor?)");
+    "float eps=1e-6, float? scale=None) -> (Tensor, Tensor, Tensor?)");
   m.impl("chunk_kda_cpu", torch::kCPU, &chunk_kda_cpu);
 
   // weight prepack
