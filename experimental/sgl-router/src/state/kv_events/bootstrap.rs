@@ -173,7 +173,13 @@ pub enum SweepOutcome {
 
 impl SweepOutcome {
     /// Every variant, so the metrics surface can emit a zero row per label.
-    pub const ALL: [Self; 4] = [Self::Found, Self::NoPeers, Self::FleetCold, Self::TimedOut];
+    pub const ALL: [Self; 5] = [
+        Self::Found,
+        Self::NoPeers,
+        Self::FleetCold,
+        Self::TimedOut,
+        Self::RanksResolved,
+    ];
 
     pub fn as_label(self) -> &'static str {
         match self {
@@ -216,7 +222,7 @@ pub enum RankOutcome {
 
 impl RankOutcome {
     /// Every variant, so the metrics surface can emit a zero row per label.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Warm,
         Self::Gap,
         Self::WarmUnwitnessed,
@@ -225,6 +231,7 @@ impl RankOutcome {
         Self::Overflow,
         Self::PublisherReset,
         Self::TreeRejected,
+        Self::FromOrigin,
     ];
 
     pub fn as_label(self) -> &'static str {

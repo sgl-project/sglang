@@ -439,6 +439,13 @@ impl BootstrapTracker {
     /// The deadline is always armed (see [`BootstrapTracker::new`]), so this
     /// cannot stay `false` forever regardless of what does or does not get
     /// registered.
+    /// Whether any registered rank is still [`BootstrapState::Pending`]. Every
+    /// such rank has an obligation some sweep owns, so its verdict is still to
+    /// come.
+    pub fn any_pending(&self) -> bool {
+        self.states.lock().values().any(|s| !s.is_terminal())
+    }
+
     pub fn settled(&self) -> bool {
         if self.latched.load(Ordering::Relaxed) {
             return true;
