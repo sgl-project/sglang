@@ -22,6 +22,15 @@ def tensor_nbytes(tensor: torch.Tensor | None) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
+def tensor_trace_metadata(tensor: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "numel": int(tensor.numel()),
+        "nbytes": tensor_nbytes(tensor),
+    }
+
+
 def vocab_state_nbytes(state: VocabState | None) -> int:
     if state is None:
         return 0
@@ -78,9 +87,13 @@ def emit_full_vocab_trace(
     tp_size: int,
     rank: int,
     consumer_contract: str,
+    tp_gather_metadata: dict[str, Any] | None = None,
     fallback_reason: str | None = None,
 ) -> None:
     rows = int(full_logits.shape[0]) if full_logits is not None else 0
+    tp_gather_metadata = tp_gather_metadata or {}
+    gather_input = tp_gather_metadata.get("input", {})
+    gather_output = tp_gather_metadata.get("output", {})
     emit_consumer_state_trace(
         {
             "component": component,
@@ -93,10 +106,23 @@ def emit_full_vocab_trace(
             "local_vocab_size": int(full_logits.shape[-1])
             if full_logits is not None and full_logits.ndim > 0
             else 0,
+            "full_vocab_materialized_shape": (
+                list(full_logits.shape) if full_logits is not None else None
+            ),
+            "full_vocab_materialized_dtype": (
+                str(full_logits.dtype) if full_logits is not None else None
+            ),
             "full_vocab_materialized_bytes": tensor_nbytes(full_logits),
             "full_vocab_reread_bytes": 0,
             "compact_state_bytes": 0,
-            "tp_gather_bytes": tensor_nbytes(full_logits) if int(tp_size) > 1 else 0,
+            "tp_gather_kind": tp_gather_metadata.get("kind"),
+            "tp_gather_input_shape": gather_input.get("shape"),
+            "tp_gather_input_dtype": gather_input.get("dtype"),
+            "tp_gather_input_bytes": gather_input.get("nbytes", 0),
+            "tp_gather_output_shape": gather_output.get("shape"),
+            "tp_gather_output_dtype": gather_output.get("dtype"),
+            "tp_gather_output_bytes": gather_output.get("nbytes", 0),
+            "tp_gather_bytes": gather_output.get("nbytes", 0),
             "fallback_reason": fallback_reason,
             "exact_replay_status": "runtime_metadata_only",
         }
