@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -43,7 +42,7 @@ class TestDeepseekV4AttnSinkCache(CustomTestCase):
 
         # Param is updated, but forward still reads the pre-update cache.
         torch.testing.assert_close(attn.attn_sink, new_sink)
-        self.assertIs(attn._local_attn_sink(), cache)
+        self.assertEqual(attn._local_attn_sink().data_ptr(), cache.data_ptr())
         torch.testing.assert_close(cache[:8], torch.arange(8, 16, dtype=torch.float32))
         self.assertFalse(torch.equal(cache[:8], new_sink[8:]))
 
@@ -59,9 +58,10 @@ class TestDeepseekV4AttnSinkCache(CustomTestCase):
         )
         model.model = SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
 
+        model.wo_a_fp8 = False
+
         new_sink = _load_new_sink(attn)
-        with patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False):
-            model.post_load_weights()
+        model.post_load_weights()
 
         torch.testing.assert_close(cache[:8], new_sink[8:])
 
@@ -74,10 +74,10 @@ class TestDeepseekV4AttnSinkCache(CustomTestCase):
         attn.refresh_attn_sink_cache()
 
         # CUDA graph captures the cache address, so it must remain the same after refresh
-        self.assertIs(attn._local_attn_sink(), cache)
-        self.assertEqual(cache.data_ptr(), data_ptr)
+        self.assertEqual(attn._local_attn_sink().data_ptr(), data_ptr)
         torch.testing.assert_close(cache[:8], new_sink[8:])
         torch.testing.assert_close(cache[8:], torch.zeros(56))
+        torch.testing.assert_close(attn._local_attn_sink(8), new_sink[8:])
 
     def test_refresh_uses_build_time_head_slice(self):
         # The cache is built under the decode attn TP layout; after refresh, TP state is restored to default layout
