@@ -356,6 +356,48 @@ failure: the model and CI runner may consume much more memory. The closest
 reproduction is still the existing community CI runner with its cached model,
 using `SGLANG_NPU_PINNED_HOST_DEBUG=1` to compare all ranks and Ascend plog.
 
+If DeepSeek-V2-Lite-W8A8 is already available, the nightly HiCache MLA case
+is a closer control than the allocator-only probe. Its default `--tp-size 4`
+and `--hicache-size 30` request about 30 GB of Host cache **per rank**, whereas
+the probe above holds only 0.5 GB per worker. Run from the repository root in
+the same NPU Python environment, replacing the model path:
+
+```bash
+export PYTHONPATH="$PWD/python:${PYTHONPATH:-}"
+export SGLANG_NPU_HICACHE_MLA_MODEL_PATH=/absolute/path/to/DeepSeek-V2-Lite-W8A8
+export SGLANG_NPU_PINNED_HOST_DEBUG=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+set -o pipefail
+SGLANG_NPU_HICACHE_MLA_SMOKE=1 SGLANG_NPU_HICACHE_MLA_SIZE_GB=4 \
+  python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_mla.py \
+  2>&1 | tee /tmp/hicache-mla-4gb.log
+SGLANG_NPU_HICACHE_MLA_SMOKE=1 SGLANG_NPU_HICACHE_MLA_SIZE_GB=30 \
+  python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_mla.py \
+  2>&1 | tee /tmp/hicache-mla-30gb.log
+```
+
+The case needs four visible NPUs. The smoke setting skips GSM8K evaluation but
+still starts all four ranks, allocates the Host cache, and sends an inference
+request. If both smoke runs start, repeat without that setting for the nightly
+1319-question load:
+
+```bash
+SGLANG_NPU_HICACHE_MLA_SIZE_GB=30 \
+  python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_mla.py \
+  2>&1 | tee /tmp/hicache-mla-30gb-full.log
+SGLANG_NPU_HICACHE_MLA_DISABLE_HICACHE=1 \
+  python3 test/registered/npu/basic_function/HiCache/test_npu_hicache_mla.py \
+  2>&1 | tee /tmp/hicache-mla-no-cache-full.log
+```
+
+`SGLANG_NPU_HICACHE_MLA_GSM8K_DATA_PATH` can point to an existing `test.jsonl`;
+otherwise the test downloads the small GSM8K file. A failure only at 30 GB
+implicates large pinned Host pools; growth in `pinned_active_bytes` suggests
+live allocations, while a growing reserved-minus-active gap suggests allocator
+caching. These tests do not establish that the separate GLM failure has the
+same cause.
+
 To run the GLM-5 top64 pruned GSM8K case outside CI, set
 `SGLANG_GLM5_TOP64_MODEL_PATH` to the local model directory. Its optional
 `SGLANG_GLM5_GSM8K_DATASET_DIR` is an EvalScope dataset cache directory (not

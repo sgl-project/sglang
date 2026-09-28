@@ -62,6 +62,10 @@ def _memory_snapshot() -> dict[str, object]:
                 "pinned_reserved_bytes": stats.get("allocated_bytes.current"),
                 "pinned_active_peak_bytes": stats.get("active_bytes.peak"),
                 "pinned_reserved_peak_bytes": stats.get("allocated_bytes.peak"),
+                "pinned_active_requests": stats.get("active_requests.current"),
+                "pinned_owned_blocks": stats.get("allocations.current"),
+                "pinned_host_alloc_calls": stats.get("num_host_alloc"),
+                "pinned_host_free_calls": stats.get("num_host_free"),
             }
         )
     except Exception as exc:  # noqa: BLE001

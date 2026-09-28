@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -17,7 +18,10 @@ register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8": {
+    os.environ.get(
+        "SGLANG_NPU_HICACHE_MLA_MODEL_PATH",
+        "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8",
+    ): {
         "accuracy": 0.34,
         "latency": 1000,
         "output_throughput": 6,
@@ -39,10 +43,15 @@ class TestAscendMlaHicache(CustomTestCase):
             "ascend",
             "--tp-size",
             4,
-            "--enable-hierarchical-cache",
-            "--hicache-size",
-            30,
         ]
+        if os.environ.get("SGLANG_NPU_HICACHE_MLA_DISABLE_HICACHE") != "1":
+            cls.common_args.extend(
+                [
+                    "--enable-hierarchical-cache",
+                    "--hicache-size",
+                    int(os.environ.get("SGLANG_NPU_HICACHE_MLA_SIZE_GB", "30")),
+                ]
+            )
 
     def test_a_gsm8k(self):
         for model in self.models:
@@ -57,14 +66,19 @@ class TestAscendMlaHicache(CustomTestCase):
                 )
 
                 try:
-                    if _is_pr_pipeline:
+                    if (
+                        _is_pr_pipeline
+                        or os.environ.get("SGLANG_NPU_HICACHE_MLA_SMOKE") == "1"
+                    ):
                         run_npu_pr_smoke(self.base_url)
                     else:
                         print(f"##=== Testing accuracy: {model} ===##")
 
                         args = SimpleNamespace(
                             num_shots=5,
-                            data_path=None,
+                            data_path=os.environ.get(
+                                "SGLANG_NPU_HICACHE_MLA_GSM8K_DATA_PATH"
+                            ),
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=128,
