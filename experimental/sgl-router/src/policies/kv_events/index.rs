@@ -1056,7 +1056,7 @@ impl KvEventIndex {
 
     async fn snapshot_entry(&self, max_age: Duration) -> (Arc<PeerSnapshot>, Bytes) {
         // Pinned BEFORE the lock; see "Single-flight" on `peer_snapshot_body`.
-        // `None` — an age reaching back past this process's clock origin —
+        // `None` — an age reaching back past the monotonic clock's origin —
         // accepts any cached export, which is what such an age means.
         let exported_after = Instant::now().checked_sub(max_age);
         let mut cache = self.snapshot_cache.lock().await;
@@ -2311,7 +2311,11 @@ fn spawn_mode_recheck(
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
 /// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=0 (after sending END_SEQ) is not filtered.
+/// restarting from seq=0 (after sending END_SEQ) is not filtered. Without
+/// that event, a regression is still read as a restart where it is
+/// unambiguous: any backwards step in a Pending rank's received sequence, and
+/// a batch 0 behind any cursor — both replace the rank's state with the new
+/// stream rather than being skipped.
 ///
 /// Also the sole writer of tree state, including snapshot grafts arriving as
 /// [`PumpControl`]; see the single-writer property in [`super::tree`].
@@ -2618,22 +2622,33 @@ async fn pump_loop(
                 // rank has already evicted.
                 if bootstrap.state_of(&worker) == Some(BootstrapState::Pending) {
                     let last_held = held.get(&worker).and_then(|q| q.back()).map(|(s, _)| *s);
+                    // The last seq this rank RECEIVED: the held queue's tail, or
+                    // with nothing held, its cursor. A Pending rank's cursor is
+                    // always a raw arrival seq, never a graft watermark — the
+                    // only way back to Pending is a gap retry, and every gap
+                    // path clears the seeded cursor before it replays or
+                    // applies batches (`fail_rank` on the held-queue gap, the
+                    // deferred gap below, `demote_unproven_rank` on a probe);
+                    // a fresh incarnation starts with none, because its
+                    // `ForgetRanks` is queued on the control channel, which the
+                    // pump drains first, before its subscriber delivers.
+                    let last_received = last_held.or_else(|| cursors.lock().get(&worker).copied());
                     if last_held.is_none() && seq == STREAM_ORIGIN_SEQ {
                         // Nothing to wait on a peer for: this stream starts at
                         // its publisher's origin.
                         resolve_from_origin(&pump_state, &mut held, &worker);
-                    } else if last_held.is_some_and(|last| seq < last) {
-                        // The held queue is raw arrival order — no cursor has
-                        // been seeded into it — and PUB/SUB neither reorders nor
-                        // replays, so a regression inside it is the publisher
+                    } else if last_received.is_some_and(|last| seq < last) {
+                        // Received order is raw arrival order — no watermark is
+                        // seeded into it — and PUB/SUB neither reorders nor
+                        // replays, so a regression in it is the publisher
                         // renumbering: the engine restarted in place without an
-                        // `END_SEQ`. The queued prefix is a dead stream. Holding
+                        // `END_SEQ`. Anything queued is a dead stream. Holding
                         // on would graft a snapshot whose old-numbering watermark
                         // then filters the entire new stream, with no gap ever
                         // detected — dead state served warm, live updates lost.
                         warn!(
                             worker = ?worker,
-                            last_held_seq = last_held,
+                            last_received_seq = last_received,
                             seq,
                             "kv-bootstrap: sequence regressed while holding; the publisher \
                              restarted without END_SEQ, discarding the dead stream's batches",
@@ -5328,6 +5343,106 @@ mod tests {
         }
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(2));
         assert_eq!(rank_count(&tracker, "from_origin"), 1);
+    }
+
+    /// Wait until the pump has RECEIVED everything sent so far. It processes a
+    /// batch synchronously in the iteration that received it, so once the
+    /// channel is drained each batch has been applied or held — and a control
+    /// message sent next cannot overtake it.
+    async fn await_drained(h: &PumpHarness) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.tx.capacity() != h.tx.max_capacity() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pump drains its event channel");
+    }
+
+    /// The restart check must not stop at an empty hold queue. A rank back in
+    /// Pending for a gap retry holds nothing yet but carries the raw cursor its
+    /// replay left (50). Its engine restarts in place and batch 0 is lost, so
+    /// the new stream shows up at 3 — a regression only against that cursor.
+    /// Holding it instead let a peer's old-numbering cursor (50) graft, pass
+    /// the splice check (3 <= 51), and seed a watermark that filtered the new
+    /// stream as already reflected: old-stream state served warm.
+    #[tokio::test]
+    async fn pump_restart_after_a_gap_retry_is_caught_against_the_cursor() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        // Held 48..=50 against a snapshot watermarked at 10: a held-queue gap,
+        // so the rank replays them cold (cursor 50) and is re-queued Pending.
+        for seq in [48, 49, 50] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![stored(None, vec![seq + 1000])]),
+            })
+            .await
+            .unwrap();
+        }
+        await_drained(&h).await;
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 10)),
+            })
+            .await
+            .unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(5), h.bootstrap_rx.recv())
+            .await
+            .expect("the gapped rank is re-queued")
+            .expect("queue open");
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(50));
+
+        // Restarted in place, batch 0 lost: the new stream arrives at 3.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 3,
+            batch: batch(vec![stored(None, vec![1003])]),
+        })
+        .await
+        .unwrap();
+        await_drained(&h).await;
+        // A peer that also missed the restart still reports the old stream.
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: retry.obligations,
+                vetted: Box::new(vetted_for(&id, 50)),
+            })
+            .await
+            .unwrap();
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 4,
+            batch: batch(vec![stored(None, vec![1004])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        for dead in [1048, 1049, 1050, 100, 200] {
+            assert_eq!(
+                h.tree.match_prefix(None, &[dead]).matched_blocks,
+                0,
+                "block {dead} belongs to the dead stream or the stale snapshot",
+            );
+        }
+        for live in [1003, 1004] {
+            assert!(
+                h.tree.match_prefix(None, &[live]).workers.contains(&id),
+                "new-stream block {live} must be applied, not filtered",
+            );
+        }
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(4));
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(rank_count(&tracker, "warm"), 0, "never tallied warm");
+        assert_eq!(rank_count(&tracker, "publisher_reset"), 1);
     }
 
     /// A regression that does not land on batch 0 is still a restart, but the
