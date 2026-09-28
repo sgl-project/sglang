@@ -141,7 +141,6 @@ class TestInklingUnifiedTriPool(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.server_args(),
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -235,7 +234,6 @@ class TestInklingUnifiedVsStaticParity(CustomTestCase):
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         try:
             out = []

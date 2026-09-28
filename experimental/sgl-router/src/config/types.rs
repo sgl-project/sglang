@@ -55,6 +55,13 @@ impl Default for InflightLoadConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ChatRoutingKind {
+    #[default]
+    Legacy,
+    Reorg,
+}
+
 /// Routing strategies accepted by `--policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
@@ -323,6 +330,8 @@ pub struct ModelConfig {
     pub eligibility: Option<EligibilityConfig>,
     /// Fleet sampling defaults and conflict behavior. See [`SamplingOverrides`].
     pub sampling_overrides: SamplingOverrides,
+    /// Worker `--default-chat-template-kwargs`, applied when rendering.
+    pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
 }
 
 /// External KV Indexer client settings.
