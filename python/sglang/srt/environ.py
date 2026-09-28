@@ -331,8 +331,10 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
-    # dLLM: exchange consumer-sufficient statistics instead of full TP logits.
+    # Opt-in CUDA path for `--dllm-algorithm LowConfidence --tp-size <N>`.
+    # Unsupported devices, modes, and LM heads fall back to full TP logits.
     SGLANG_DLLM_TP_LOCAL_VOCAB = EnvBool(False)
+    # Pack state into one FP32 gather; IDs above 2^24 use typed gathers.
     SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER = EnvBool(True)
 
     # ===================================================================
