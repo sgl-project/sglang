@@ -82,11 +82,9 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
 
     def test_mtp_draft_defaults_and_requested_depth(self):
         with tempfile.TemporaryDirectory() as directory:
-            IQuestQ1MTPConfig(
-                target_config=IQuestQ1Config().to_dict(),
-                sliding_window=512,
-                swa_rope_theta=10000.0,
-            ).save_pretrained(directory)
+            IQuestQ1MTPConfig(target_config=IQuestQ1Config().to_dict()).save_pretrained(
+                directory
+            )
             for algorithm, steps, backend in (
                 ("EAGLE", None, None),
                 ("EAGLE", 2, "fa3"),

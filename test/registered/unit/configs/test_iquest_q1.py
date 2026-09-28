@@ -67,7 +67,7 @@ class TestIQuestQ1Config(CustomTestCase):
         self.assertEqual(target, original)
         self.assertEqual(target["num_hidden_layers"], 88)
         self.assertEqual(target["sliding_window"], 4096)
-        full = IQuestQ1MTPConfig(target_config=target)
+        full = IQuestQ1MTPConfig(target_config=target, sliding_window=None)
         self.assertEqual(full.layer_types, ["full_attention"])
         self.assertIsNone(full.sliding_window)
 
@@ -77,7 +77,7 @@ class TestIQuestQ1Config(CustomTestCase):
             {"num_draft_slots": 0},
             {"num_target_layers": 0},
             {"num_target_layers": 87, "target_config": {"num_hidden_layers": 88}},
-            {"sliding_window": 512},
+            {"sliding_window": 512, "swa_rope_theta": None},
             {"sliding_window": -1, "swa_rope_theta": 10000.0},
         ):
             with self.subTest(**kwargs), self.assertRaises(ValueError):

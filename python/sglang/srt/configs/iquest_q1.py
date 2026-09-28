@@ -171,9 +171,9 @@ class IQuestQ1MTPConfig(IQuestQ1Config):
         target_config: Optional[dict] = None,
         num_draft_slots: int = 7,
         num_target_layers: Optional[int] = None,
-        sliding_window: Optional[int] = None,
-        swa_rope_theta: Optional[float] = None,
-        fp32_residual_connection: bool = False,
+        sliding_window: Optional[int] = 512,
+        swa_rope_theta: Optional[float] = 10000.0,
+        fp32_residual_connection: bool = True,
         **kwargs,
     ):
         if kwargs.get("num_hidden_layers", 1) != 1:
