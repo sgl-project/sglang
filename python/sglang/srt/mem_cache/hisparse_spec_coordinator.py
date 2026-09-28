@@ -98,6 +98,26 @@ class HiSparseSpecCoordinator:
         key = SpecTxnKey(req.kv.req_pool_idx, owner.generation, owner.iteration)
         self.backend.bind(key, req, old_kv_len)
         try:
+            # Accepted KV is durable in the host pool, but a short request may
+            # still own only its initial page of hot slots. Grow before any
+            # new arena/readers; the stream boundary above drained prior users.
+            c, slot = self.c, key.request_slot
+            old_cap = int(c.req_device_buffer_size[slot])
+            needed = min(old_kv_len, c.device_buffer_size)
+            if old_cap < needed:
+                lengths_cpu = torch.tensor([needed], dtype=torch.int64)
+                slots_cpu = torch.tensor([slot], dtype=torch.int64)
+                c._grow_device_buffers(
+                    lengths_cpu.to(c.device),
+                    slots_cpu.to(c.device),
+                    lengths_cpu,
+                    slots_cpu,
+                )
+                new_cap = min(int(c.req_device_buffer_size[slot]), c.device_buffer_size)
+                # Initial allocation labels even unallocated padding with an
+                # arange. New physical slots contain no committed KV yet: force
+                # host misses on every layer, retaining existing hot mappings.
+                c.req_device_buffer_tokens[:, slot, old_cap:new_cap] = -1
             arena = self.lifecycle.begin(
                 key, old_kv_len, logical_write_ids, reserved_rows
             )
