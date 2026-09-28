@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -225,6 +225,10 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+
+    # Physical write locations prepared once for this batch. None means the
+    # backend resolves them when requested by a writer.
+    kv_write_locations: Optional[torch.Tensor] = None
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -840,7 +844,49 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        # ScheduleBatch assigns the reserved write slots before metadata init.
+        # TBO calls this hook separately with each child's sliced locations.
+        # Decode capture records the translate, so replay reads current mapping
+        # and input-buffer contents instead of a capture-time tensor snapshot.
+        # Prefill graph runners do not all capture this hook; keep their writes
+        # on the per-layer fallback rather than retaining an eager translation.
+        if (
+            _is_hip
+            and _IS_GFX95
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            self.forward_metadata = replace(
+                self.forward_metadata,
+                kv_write_locations=self.token_to_kv_pool.translate_write_locations(
+                    forward_batch.out_cache_loc
+                ),
+            )
+
+    def get_kv_write_locations(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        # Attention metadata is initialized before any layer runs. A missing
+        # prepared tensor is valid for modes whose graph lifecycle does not
+        # capture slot preparation (prefill and draft extend).
+        # An idle draft forward may select a per-step child whose metadata was
+        # last prepared for an active batch; resolve the current padded slots.
+        if forward_batch.forward_mode.is_idle() or (
+            getattr(forward_batch, "actual_forward_mode", None) == ForwardMode.IDLE
+        ):
+            return super().get_kv_write_locations(forward_batch)
+        metadata = self.forward_metadata
+        assert metadata is not None, (
+            "Attention metadata must be initialized before KV writes"
+        )
+        if metadata.kv_write_locations is not None:
+            return metadata.kv_write_locations
+        return super().get_kv_write_locations(forward_batch)
+
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, prepare_write_locations: bool = True
+    ):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
@@ -1153,6 +1199,8 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        if prepare_write_locations:
+            self.init_forward_metadata_in_graph(forward_batch)
 
     def _cal_indexer_k_start_end(
         self,
@@ -3689,7 +3737,10 @@ class DeepseekSparseAttnMultiStepBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            self.attn_backends[i].init_forward_metadata(
+                forward_batch, prepare_write_locations=False
+            )
+        self.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
@@ -3887,5 +3938,35 @@ class DeepseekSparseAttnMultiStepBackend:
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if (
+            _is_hip
+            and _IS_GFX95
+            and forward_batch.forward_mode.is_decode()
+            and getattr(forward_batch, "actual_forward_mode", None) != ForwardMode.IDLE
+            and self.topk > 0
+            and self.speculative_num_steps > 1
+        ):
+            from sglang.srt.speculative.eagle_utils import (
+                per_step_draft_out_cache_loc,
+            )
+
+            # Translate the shared reservation once, then give each draft step
+            # the same row it will write through in EagleWorkerV2.draft_forward.
+            first = self.attn_backends[0]
+            physical = first.token_to_kv_pool.translate_write_locations(
+                forward_batch.out_cache_loc
+            )
+            step_locations = per_step_draft_out_cache_loc(
+                physical,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            ).contiguous()
+            for i, backend in enumerate(self.attn_backends):
+                backend.forward_metadata = replace(
+                    backend.forward_metadata,
+                    kv_write_locations=step_locations[i],
+                )
+            return
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
