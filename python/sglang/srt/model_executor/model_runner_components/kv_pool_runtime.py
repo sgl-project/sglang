@@ -50,6 +50,7 @@ def compute_post_capture_kv_resize(
     model_runner: ModelRunner,
     *,
     draft_runners: tuple[ModelRunner, ...] = (),
+    reserved_bytes: int = 0,
 ) -> PostCaptureKVResize:
     """Resize the KV pool after capture and return the new sizes for the
     orchestrator to assign. Takes the live ModelRunner because it reads
@@ -112,6 +113,7 @@ def compute_post_capture_kv_resize(
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
         - canary_workspace_bytes
+        - reserved_bytes
     )
     config = model_runner.kv_cache_configurator.config_from_budget(
         budget_bytes, cap_tokens=model_runner.max_total_num_tokens

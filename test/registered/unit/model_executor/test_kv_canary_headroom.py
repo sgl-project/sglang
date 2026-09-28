@@ -32,6 +32,8 @@ def _manager(slots, groups):
 
 
 class TestCanaryHeadroom(CustomTestCase):
+    reserved_bytes = 0
+
     def _resize(self, target, drafts=(), *, graph_borrow=False, eager_gap=False):
         config = MemoryPoolConfig(max_total_num_tokens=1024)
         pool = Mock(post_capture_backed_bytes=2 * _GIB, dtype="bfloat16")
@@ -81,6 +83,7 @@ class TestCanaryHeadroom(CustomTestCase):
             resize = kv_pool_runtime.compute_post_capture_kv_resize(
                 runner,
                 draft_runners=tuple(SimpleNamespace(canary_manager=m) for m in drafts),
+                reserved_bytes=self.reserved_bytes,
             )
         pool.finalize_backing.assert_called_once_with(config)
         runner.token_to_kv_pool_allocator.resize.assert_called_once_with(config)
@@ -103,6 +106,12 @@ class TestCanaryHeadroom(CustomTestCase):
                     ),
                     (20 - headroom - 1 + 2) * _GIB,
                 )
+
+    def test_late_allocations_preserve_activation_headroom(self):
+        self.reserved_bytes = 3 * _GIB
+        self.assertEqual(
+            self._resize(None, eager_gap=True), (20 - 8 - 1 + 2 - 3) * _GIB
+        )
 
     def test_workspace_is_added_to_other_headroom_at_installed_capacity(self):
         manager = _manager(1_000_000, 3)
