@@ -366,7 +366,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    dp_rank = dp_slot_in(global_num_tokens)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
