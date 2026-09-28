@@ -8,6 +8,8 @@ after its DONE barrier -- never from the bootstrap thread for an active room.
 """
 
 import unittest
+from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -16,7 +18,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _prefill_mgr(cls=CommonKVManager, enabled=True):
@@ -24,8 +26,10 @@ def _prefill_mgr(cls=CommonKVManager, enabled=True):
     mgr = cls.__new__(cls)
     mgr.enable_deferred_decode_kv_release = enabled
     mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_fanout_snapshots = {}
     mgr._staging_outstanding = {}
     mgr.request_status = {}
+    mgr.transfer_infos = {}
     mgr._sent = []
     # Capture acks instead of opening a socket.
     mgr._send_abort_ack = lambda ip, port, room: mgr._sent.append((ip, port, room))
@@ -56,6 +60,73 @@ class TestDeferredAckTargets(CustomTestCase):
     def test_unregistered_room_is_noop(self):
         mgr = _prefill_mgr()
         mgr._maybe_ack_drained_abort(999)
+        self.assertEqual(mgr._sent, [])
+
+    def test_drain_ack_fans_out_to_every_room_peer(self):
+        """With prefill TP < decode TP the room has several decode peers but the
+        registry keeps only the last ABORT sender; the drain ack must reach every
+        peer (dummy pairings included) or the others hold until the timeout."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[7] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.1", dst_port=5000),
+            "sess1": SimpleNamespace(endpoint="10.0.0.2", dst_port=5001),
+            # Dummy pairing: the decode rank still counts this prefill's ack.
+            "sess2": SimpleNamespace(endpoint="10.0.0.3", dst_port=5002),
+        }
+        # Rank 1 registered last and overwrote rank 0's registration.
+        mgr.register_deferred_ack_target(7, "10.0.0.2", 5001)
+
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            sorted(mgr._sent),
+            [
+                ("10.0.0.1", 5000, 7),
+                ("10.0.0.2", 5001, 7),
+                ("10.0.0.3", 5002, 7),
+            ],
+        )
+
+        # pop() semantics survive the fan-out: a second drain acks nobody.
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(len(mgr._sent), 3)
+
+    def test_drain_ack_fanout_survives_mid_flight_teardown(self):
+        """The sender's clear() can pop transfer_infos while a chunk is still in
+        flight; the peers snapshotted when the ABORT registered must still be
+        acked when the worker finally drains, or they hold until the timeout."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[7] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.1", dst_port=5000),
+            "sess1": SimpleNamespace(endpoint="10.0.0.2", dst_port=5001),
+        }
+        mgr._staging_outstanding[7] = 1
+        mgr.register_deferred_ack_target(7, "10.0.0.2", 5001)
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [])  # still writing -> held
+
+        # Scheduler clears the sender mid-flight; the worker drains after.
+        mgr.transfer_infos.clear()
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            sorted(mgr._sent),
+            [("10.0.0.1", 5000, 7), ("10.0.0.2", 5001, 7)],
+        )
+        self.assertNotIn(7, mgr._deferred_ack_fanout_snapshots)
+
+    def test_drain_ack_after_teardown_falls_back_to_registered_target(self):
+        mgr = _prefill_mgr()
+        mgr.register_deferred_ack_target(9, "10.0.0.4", 5003)
+        mgr._maybe_ack_drained_abort(9)
+        self.assertEqual(mgr._sent, [("10.0.0.4", 5003, 9)])
+
+    def test_populated_room_without_registration_acks_nobody(self):
+        """A normal (non-aborted) drain must not fan out spurious acks."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[12] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.5", dst_port=5004),
+        }
+        mgr._maybe_ack_drained_abort(12)
         self.assertEqual(mgr._sent, [])
 
     def test_prefill_unique_rank_matches_success_sync_formula(self):
@@ -167,6 +238,73 @@ class TestNixlAbortNotification(CustomTestCase):
     def test_non_abort_message_is_not_claimed(self):
         mgr = self._mgr()
         self.assertFalse(mgr._handle_abort_notification([b"STAGING_REQ", b"11"]))
+
+
+class _StopWorker(Exception):
+    pass
+
+
+class _OneChunkQueue:
+    """Feeds the worker a single chunk, then unblocks it out of its loop."""
+
+    def __init__(self, chunk):
+        self._chunk = chunk
+        self._served = False
+
+    def get(self):
+        if self._served:
+            raise _StopWorker
+        self._served = True
+        return self._chunk
+
+
+class _SettledFailureReq:
+    """Transfer info whose first use raises a settled transport error."""
+
+    room = 7
+    is_dummy = False
+    endpoint = "10.0.0.9"
+    dst_port = 6009
+
+    @property
+    def agent_name(self):
+        raise RuntimeError("NIXL transfer encountered ERR")
+
+
+class TestNixlWorkerSettledFailureReleasesAck(CustomTestCase):
+    """Bug regression: a settled transfer failure (every handle settled, decode
+    told via conclude_failure) left the chunk counted in _staging_outstanding,
+    so the abort ack for the room could never fire and the decode's deferred
+    KV release always ran out the full timeout instead of draining."""
+
+    def test_settled_failure_uncounts_chunk_and_releases_held_ack(self):
+        mgr = _prefill_mgr(NixlKVManager)
+        mgr._staging_outstanding = defaultdict(int)
+        mgr.enable_staging = False
+        mgr.exceptions = {}
+        mgr.decode_kv_args_table = {}
+        mgr.request_status[7] = KVPoll.WaitingForInput
+        mgr.check_status = lambda r: mgr.request_status[r]
+        mgr.update_status = lambda r, s: mgr.request_status.__setitem__(r, s)
+        mgr.record_failure = MagicMock()
+        mgr._await_handles = lambda handles, failure_seen=False: (True, True)
+        mgr.transfer_infos[7] = {"sess0": _SettledFailureReq()}
+        # The decode learns of the failure and its ABORT lands while the chunk
+        # is still counted -- the interleaving that held the ack forever.
+        mgr.conclude_failure = MagicMock(
+            side_effect=lambda **kw: mgr._handle_abort_notification(
+                [b"ABORT", b"7", b"10.0.0.9", b"6009"]
+            )
+        )
+        chunk = SimpleNamespace(room=7, staging_counted=False)
+
+        with self.assertRaises(_StopWorker):
+            mgr.transfer_worker(_OneChunkQueue(chunk))
+
+        mgr.conclude_failure.assert_called_once()
+        self.assertEqual(mgr._staging_outstanding[7], 0)
+        self.assertEqual(mgr._sent, [("10.0.0.9", 6009, 7)])
+        self.assertNotIn(7, mgr._deferred_ack_targets)
 
 
 class TestNixlDecodeAckIngest(CustomTestCase):

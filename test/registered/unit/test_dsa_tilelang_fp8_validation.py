@@ -11,11 +11,10 @@ from sglang.srt.arg_groups.overrides import _check_tilelang_dsa_fp8_kv
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDsaTilelangFp8Validation(CustomTestCase):
-
     def test_cuda_fp8_tilelang_decode_rejected(self):
         with self.assertRaises(ValueError):
             _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "tilelang", hip=False)

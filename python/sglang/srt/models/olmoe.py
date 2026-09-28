@@ -107,7 +107,6 @@ class OlmoeMoE(nn.Module):
 
 
 class OlmoeAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -196,7 +195,6 @@ class OlmoeAttention(nn.Module):
 
 
 class OlmoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -261,7 +259,6 @@ class OlmoeDecoderLayer(nn.Module):
 
 
 class OlmoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -311,7 +308,6 @@ class OlmoeModel(nn.Module):
 
 
 class OlmoeForCausalLM(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(

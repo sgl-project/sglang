@@ -61,15 +61,18 @@ def _ensure_single_rank_parallel_state():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from sglang.srt.utils.network import get_free_port
+    from sglang.test.test_utils import publish_build_topology
 
     init_distributed_environment(
-        backend="nccl",
+        backend="gloo",
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="tcp://127.0.0.1:29811",
+        distributed_init_method=f"tcp://127.0.0.1:{get_free_port()}",
     )
-    initialize_model_parallel(tensor_model_parallel_size=1)
+    publish_build_topology(tp_size=1)
+    initialize_model_parallel(backend="gloo")
     _DIST_READY = True
 
 
@@ -215,14 +218,15 @@ def _run_arm_in_subprocess(arm: str) -> str:
         timeout=300,
     )
     marker = [l for l in out.stdout.splitlines() if l.startswith("ARM_RESULT:")]
-    assert (
-        marker
-    ), f"arm subprocess produced no result: {out.stdout[-2000:]} {out.stderr[-2000:]}"
+    assert marker, (
+        f"arm subprocess produced no result: {out.stdout[-2000:]} {out.stderr[-2000:]}"
+    )
     return marker[-1].split(":", 1)[1].strip()
 
 
 def _arm_main(arm: str) -> None:
     torch.cuda.init()
+    _ensure_single_rank_parallel_state()
     case = TestMixRunningIndicesLifetime("test_gather_survives_aging_out")
     # The violation fires ~19/20 per attempt under this allocator; bound the
     # retry so a miss is negligible while a FIXED build stays clean across

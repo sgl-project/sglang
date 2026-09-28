@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision_override,
+)
 
 logger = init_logger(__name__)
 
@@ -175,6 +178,10 @@ class TextEncodingStage(ConditionEncodingStage):
                 stage_name=stage_name,
                 component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
                 preferred_ready_after_request=i == 0,
+                target_dtype=resolve_component_precision_override(
+                    server_args,
+                    "text_encoder" if i == 0 else f"text_encoder_{i + 1}",
+                ),
             )
             for i in range(len(self.text_encoders))
         ]
@@ -473,9 +480,11 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.string_not_none(x)
-            or isinstance(x, str),
+            lambda x: (
+                not batch.do_classifier_free_guidance
+                or V.string_not_none(x)
+                or isinstance(x, str)
+            ),
         )
         result.add_check(
             "do_classifier_free_guidance",
@@ -861,8 +870,10 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.list_of_tensors_with_min_dims(x, 2),
+            lambda x: (
+                not batch.do_classifier_free_guidance
+                or V.list_of_tensors_with_min_dims(x, 2)
+            ),
         )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")
