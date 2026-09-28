@@ -8810,7 +8810,7 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                     req.kv.mamba_next_track_idx
                 ].clone()
                 req.last_node = cache.root_node_handle()
-                cache.cache_finished_req(req, is_insert=True, owned_kv_len=11)
+                finish_req(cache, req, 11)
                 match = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", tokens)))
                 )
