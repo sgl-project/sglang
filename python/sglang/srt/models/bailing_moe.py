@@ -33,9 +33,9 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
-    complete_deferred_allreduce,
+    LayerFacts,
     enable_moe_dense_fully_dp,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -660,7 +660,7 @@ class BailingMoEBlock(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=False
+            config, layer_id=layer_id, is_nextn=is_nextn
         )
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False
@@ -669,15 +669,14 @@ class BailingMoEBlock(nn.Module):
             config, layer_id=layer_id + 1, is_nextn=False
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            # A NextN draft is a one-layer model.
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
-
-        self.is_last_layer = is_nextn or (self.layer_id == config.num_hidden_layers - 1)
 
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
@@ -704,11 +703,10 @@ class BailingMoEBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=self.is_last_layer,
         )
 
     def _is_layer_sparse(
@@ -827,7 +825,7 @@ class BailingMoEModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(
                         hidden_states if residual is None else hidden_states + residual
                     )
