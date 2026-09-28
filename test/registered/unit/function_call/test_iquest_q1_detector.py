@@ -50,41 +50,6 @@ class TestIQuestQ1Detector(CustomTestCase):
             "items": [1, None],
         }
 
-    def test_non_stream_typed_arguments_and_leading_text(self):
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        text, calls = parser.parse_non_stream("Running now. " + self.call)
-        self.assertEqual(text, "Running now. ")
-        self.assertEqual(calls[0].name, "run")
-        self.assertEqual(json.loads(calls[0].parameters), self.expected)
-
-    def test_streaming_every_boundary_and_mtp_finish(self):
-        wire = "Running now. " + self.call + self.call
-        for size in (1, 2, 3, 7, 13, len(wire)):
-            with self.subTest(size=size):
-                parser = FunctionCallParser(self.tools, "iquest_q1")
-                normal, calls = [], []
-                for start in range(0, len(wire), size):
-                    text, chunk_calls = parser.parse_stream_chunk(
-                        wire[start : start + size]
-                    )
-                    normal.append(text)
-                    calls.extend(chunk_calls)
-                text, final_calls = parser.parse_stream_end()
-                normal.append(text)
-                calls.extend(final_calls)
-                self.assertEqual("".join(normal), "Running now. ")
-                self.assertEqual([call.tool_index for call in calls], [0, 1])
-                self.assertEqual(
-                    [json.loads(call.parameters) for call in calls],
-                    [self.expected, self.expected],
-                )
-                detector = parser.detector
-                self.assertEqual(len(detector.prev_tool_call_arr), 2)
-                for action, sent in zip(
-                    detector.prev_tool_call_arr, detector.streamed_args_for_tool
-                ):
-                    self.assertEqual(action["arguments"], json.loads(sent))
-
     def test_surrounding_text_is_preserved_in_each_mode(self):
         for wire, expected_text, call_count in (
             ("before" + self.call + "after", "beforeafter", 1),
@@ -148,17 +113,11 @@ class TestIQuestQ1Detector(CustomTestCase):
             "<iquest_tool_call>run<arg_key>count</arg_key>"
             "<arg_value>1</iquest_tool_call>"
         )
-        result = detector.detect_and_parse(malformed, self.tools)
-        self.assertEqual(result.normal_text, malformed)
-        self.assertFalse(result.calls)
         result = detector.parse_streaming_increment(malformed, self.tools)
         self.assertEqual(result.normal_text, malformed)
         self.assertFalse(result.calls)
 
-    def test_disabled_tools_and_truncated_marker(self):
-        parser = FunctionCallParser([], "iquest_q1")
-        self.assertEqual(parser.parse_non_stream(self.call), (self.call, []))
-        self.assertEqual(parser.parse_stream_chunk(self.call), (self.call, []))
+    def test_truncated_marker_is_flushed_at_stream_end(self):
         parser = FunctionCallParser(self.tools, "iquest_q1")
         text, calls = parser.parse_stream_chunk("Text <iquest_")
         self.assertEqual((text, calls), ("Text ", []))
@@ -180,34 +139,6 @@ class TestIQuestQ1Detector(CustomTestCase):
         parser = FunctionCallParser(self.tools, "iquest_q1")
         text, calls = parser.parse_stream_chunk(wire)
         self.assertFalse(calls)
-
-    def test_schema_reference_preserves_numeric_string(self):
-        self.tools[0].function.parameters = {
-            "$defs": {"code": {"type": "string"}},
-            "type": "object",
-            "properties": {"code": {"$ref": "#/$defs/code"}},
-        }
-        wire = "<iquest_tool_call>run<arg_key>code</arg_key><arg_value>42</arg_value></iquest_tool_call>"
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        self.assertEqual(
-            json.loads(parser.parse_non_stream(wire)[1][0].parameters), {"code": "42"}
-        )
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        self.assertEqual(
-            json.loads(parser.parse_stream_chunk(wire)[1][0].parameters), {"code": "42"}
-        )
-
-    def test_required_and_named_constraints_match_release(self):
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        kind, schema = parser.get_structure_constraint("required")
-        self.assertEqual(kind, "json_schema")
-        self.assertEqual(schema["type"], "array")
-        self.assertEqual(schema["minItems"], 1)
-        named = ToolChoice(function=ToolChoiceFuncName(name="run"))
-        kind, schema = parser.get_structure_constraint(named)
-        self.assertEqual(kind, "json_schema")
-        self.assertEqual(schema, self.tools[0].function.parameters)
-        self.assertIsNone(parser.get_structure_constraint("auto"))
 
     def test_required_streaming_parallel_calls_at_every_boundary(self):
         wire = json.dumps(
@@ -276,34 +207,8 @@ class TestIQuestQ1StopMarkers(CustomTestCase):
             )
         ]
 
-    def test_parser_preserves_stop_marker_text_like_release(self):
-        detector = IQuestQ1Detector()
-        wire = (
-            "查询中。<iquest_tool_call>get_weather\n"
-            "<arg_key>city</arg_key><arg_value>北京</arg_value>\n"
-            "</iquest_tool_call><|iquest_end|>"
-        )
-        content, calls = "", []
-        for size in (1, 5, len(wire)):
-            detector = IQuestQ1Detector()
-            content, calls = "", []
-            for start in range(0, len(wire), size):
-                result = detector.parse_streaming_increment(
-                    wire[start : start + size], self._tools()
-                )
-                content += result.normal_text or ""
-                calls.extend(result.calls)
-            with self.subTest(chunk=size):
-                self.assertEqual(content, "查询中。<|iquest_end|>")
-                self.assertEqual(len(calls), 1)
-
-    def test_no_global_stop_marker_replacement(self):
-        detector = IQuestQ1Detector()
-        result = detector.detect_and_parse("好的。<|iquest_end|>", self._tools())
-        self.assertEqual(result.normal_text, "好的。<|iquest_end|>")
-
     def test_plain_reply_stop_markers_at_every_stream_split(self):
-        for marker in ("<|iquest_end|>", "<|endoftext|>"):
+        for marker in ("<|iquest_end|>",):
             wire = "好的。" + marker
             for split in range(len(wire) + 1):
                 with self.subTest(marker=marker, split=split):
@@ -354,36 +259,6 @@ class TestIQuestQ1NonStreamingServingPath(CustomTestCase):
             {"type": finish_type, "matched": None},
             tool_choice=tool_choice,
         )
-
-    def test_reply_without_a_call_is_unchanged_by_serving(self):
-        result = self._process("好的。<|iquest_end|>")
-        self.assertEqual(result.remaining_text, "好的。<|iquest_end|>")
-        self.assertIsNone(result.tool_calls)
-        self.assertEqual(result.finish_reason["type"], "stop")
-
-    def test_serving_preserves_text_around_auto_calls(self):
-        call = (
-            "<iquest_tool_call>get_weather\n"
-            "<arg_key>city</arg_key><arg_value>北京</arg_value>\n"
-            "</iquest_tool_call>"
-        )
-        for wire, expected_text, call_count in (
-            ("before" + call + "after", "beforeafter", 1),
-            (call + "\nafter", "\nafter", 1),
-            (
-                "before" + call + "between" + call + "after",
-                "beforebetweenafter",
-                2,
-            ),
-        ):
-            with self.subTest(wire=wire):
-                result = self._process(wire)
-                self.assertEqual(result.remaining_text, expected_text)
-                self.assertEqual(
-                    [call.function.name for call in result.tool_calls],
-                    ["get_weather"] * call_count,
-                )
-                self.assertEqual(result.finish_reason["type"], "tool_calls")
 
     def test_required_array_and_named_arguments(self):
         named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))

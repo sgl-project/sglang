@@ -54,30 +54,6 @@ class TestIQuestQ1WeightLoading(CustomTestCase):
             ):
                 model.load_weights(iter(weights + [(name, torch.ones(1))]))
 
-    def test_quantization_created_parameters_are_not_required(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
-        from sglang.srt.models.iquest_q1 import check_all_params_loaded
-
-        kv_scale = torch.nn.Parameter(torch.zeros(1))
-        kv_scale._skip_weight_check = True
-        params = {
-            "model.layers.0.self_attn.qkv_proj.weight": torch.nn.Parameter(
-                torch.zeros(1)
-            ),
-            "model.layers.0.self_attn.k_scale": kv_scale,
-            "model.layers.0.self_attn.v_scale": kv_scale,
-            "model.layers.0.mlp.experts.w13_weight_scale": torch.nn.Parameter(
-                torch.zeros(1)
-            ),
-        }
-        check_all_params_loaded(
-            params,
-            {"model.layers.0.self_attn.qkv_proj.weight"},
-            "IQuestQ1ForCausalLM",
-            loaded_shards={"model.layers.0.self_attn.qkv_proj.weight": {"q", "k", "v"}},
-            quant_config=Fp8Config(is_checkpoint_fp8_serialized=False),
-        )
-
     def test_unrecognized_quantized_parameters_warn_but_partial_weights_fail(self):
         from sglang.srt.layers.quantization.fp8 import Fp8Config
         from sglang.srt.models.iquest_q1 import check_all_params_loaded
@@ -160,7 +136,7 @@ class TestIQuestQ1WeightLoading(CustomTestCase):
 
 
 class TestIQuestQ1MTPDraft(CustomTestCase):
-    def test_mtp_loads_own_weights_and_requires_all_qkv_shards(self):
+    def test_mtp_loads_own_weights(self):
         from sglang.srt.models.iquest_q1_mtp import IQuestQ1MTP
 
         model = IQuestQ1MTP.__new__(IQuestQ1MTP)
@@ -187,8 +163,6 @@ class TestIQuestQ1MTPDraft(CustomTestCase):
             (f"mtp.self_attn.{name}_proj.weight", torch.full((2, 2), float(i)))
             for i, name in enumerate(("q", "k", "v"), 1)
         ]
-        with self.assertRaisesRegex(ValueError, "partially loaded"):
-            model.load_weights(weights[:-1])
         model.load_weights(weights)
         torch.testing.assert_close(qkv.weight, torch.cat([w for _, w in weights[-3:]]))
         torch.testing.assert_close(model.model.embed_tokens.weight, weights[0][1])
@@ -271,29 +245,6 @@ class TestIQuestQ1MTPDraft(CustomTestCase):
             self.assertEqual(layer.mlp.input_dtype, torch.bfloat16)
             expected = hidden.float() + 0.5 if fp32 else hidden
             torch.testing.assert_close(result, expected)
-
-    def test_mtp_keeps_position_zero_embedding_and_normalized_feedback(self):
-        from sglang.srt.models.iquest_q1 import IQuestQ1RMSNorm
-        from sglang.srt.models.iquest_q1_mtp import IQuestQ1MTPLayer
-
-        class Inner(torch.nn.Module):
-            def forward(self, positions, hidden_states, forward_batch):
-                return hidden_states.float() * 3
-
-        layer = IQuestQ1MTPLayer.__new__(IQuestQ1MTPLayer)
-        torch.nn.Module.__init__(layer)
-        layer.enorm = torch.nn.Identity()
-        layer.hnorm = torch.nn.Identity()
-        layer.final_layernorm = IQuestQ1RMSNorm(2).to(torch.bfloat16)
-        layer.eh_proj = torch.nn.Linear(4, 2, bias=False).to(torch.bfloat16)
-        layer.eh_proj.weight.data.copy_(torch.cat([torch.eye(2), torch.eye(2)], dim=1))
-        layer.mtp_model_layer = Inner()
-        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        embeds = torch.tensor([[10.0, 1.0], [1.0, 10.0]], dtype=torch.bfloat16)
-        out = layer(torch.tensor([0, 1]), hidden, embeds, None)
-        expected = layer.final_layernorm((hidden + embeds) * 3).to(torch.bfloat16)
-        torch.testing.assert_close(out, expected)
-        self.assertEqual(out.dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

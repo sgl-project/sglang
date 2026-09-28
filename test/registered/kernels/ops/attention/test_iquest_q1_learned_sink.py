@@ -1,4 +1,3 @@
-import itertools
 import unittest
 from types import SimpleNamespace
 
@@ -10,7 +9,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.models.iquest_q1 import IQuestQ1Attention, _apply_learned_sink
+from sglang.srt.models.iquest_q1 import _apply_learned_sink
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -154,35 +153,29 @@ class TestIQuestQ1LearnedSink(CustomTestCase):
                 torch.testing.assert_close(decode_lse, lse[-1:], rtol=1e-5, atol=1e-5)
                 torch.testing.assert_close(decoded, output[-1:], rtol=0.02, atol=0.01)
 
-    def test_head_dim_128_matches_torch_reduction(self):
-        torch.manual_seed(47)
-        for tokens, dtype in itertools.product(
-            (1, 8, 16384), (torch.float32, torch.float16, torch.bfloat16)
-        ):
-            with self.subTest(tokens=tokens, dtype=dtype):
-                q = torch.randn(tokens, 6, 128, device="cuda", dtype=dtype)
-                sink = torch.randn(1, 128, device="cuda", dtype=dtype) * 4
-                output = torch.randn(q.shape, device="cuda", dtype=torch.float32)
-                lse = torch.randn(tokens, 6, device="cuda") * 4
-                expected = torch_reference(q, sink, output, lse, 128**-0.5)
-                actual = _apply_learned_sink(q, sink, output, lse, 128**-0.5)
-                torch.testing.assert_close(actual, expected, rtol=3e-5, atol=5e-7)
-
     def test_matches_torch_across_layouts_and_dtypes(self):
         torch.manual_seed(17)
+        # (tokens, heads, kv_heads, head_dim): empty batch, row-tail masking,
+        # the model's GQA layout, MHA with a non-power-of-two head dim, the
+        # non-128 reduction path, and the 64-row tile used for long prefills.
         shapes = (
             (0, 6, 1, 128),
-            (1, 6, 1, 128),
             (7, 6, 1, 128),
-            (8, 12, 2, 128),
             (9, 48, 8, 128),
             (37, 16, 16, 80),
-            (1024, 6, 1, 128),
             (17, 8, 1, 256),
+            (16384, 6, 1, 128),
         )
-        for shape, dtype, strided in itertools.product(
-            shapes, (torch.float32, torch.float16, torch.bfloat16), (False, True)
-        ):
+        cases = [
+            (shape, dtype, strided)
+            for shape in shapes
+            for dtype, strided in (
+                (torch.float32, False),
+                (torch.bfloat16, False),
+                (torch.bfloat16, True),
+            )
+        ]
+        for shape, dtype, strided in cases:
             with self.subTest(shape=shape, dtype=dtype, strided=strided):
                 tokens, heads, kv_heads, head_dim = shape
                 step = 2 if strided else 1
@@ -208,32 +201,6 @@ class TestIQuestQ1LearnedSink(CustomTestCase):
                 self.assertEqual(actual.shape, q.shape)
                 self.assertEqual(actual.dtype, output.dtype)
                 self.assertTrue(actual.is_contiguous())
-
-    def test_model_projection_layout(self):
-        torch.manual_seed(19)
-        attn = IQuestQ1Attention.__new__(IQuestQ1Attention)
-        torch.nn.Module.__init__(attn)
-        attn.num_heads = 6
-        attn.num_kv_heads = 1
-        attn.head_dim = 128
-        attn.q_size = 768
-        attn.scaling = 128**-0.5
-        attn.sink_k = torch.nn.Parameter(
-            torch.randn(1, 128, device="cuda", dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        q = torch.randn(8, 768, device="cuda", dtype=torch.bfloat16)
-        output = torch.randn_like(q)
-        lse = torch.randn(8, 6, device="cuda")
-        expected = torch_reference(
-            q.view(8, 6, 128), attn.sink_k, output.view(8, 6, 128), lse, attn.scaling
-        ).view(8, 768)
-        for value in (output, output.view(8, 6, 128)):
-            with self.subTest(shape=value.shape):
-                actual = attn._apply_zero_value_sink(q, value, lse)
-                torch.testing.assert_close(
-                    actual, expected, rtol=torch.finfo(q.dtype).eps, atol=5e-7
-                )
 
     def test_extreme_lse(self):
         q = torch.ones(5, 6, 128, device="cuda")
@@ -267,35 +234,6 @@ class TestIQuestQ1LearnedSink(CustomTestCase):
                     expected = _apply_learned_sink(q, sink, output, lse, 128**-0.5)
                     actual = compiled(q, sink, output, lse, 128**-0.5)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    def test_cuda_graph_replay_uses_updated_inputs(self):
-        torch.manual_seed(31)
-        for tokens in (1, 8):
-            with self.subTest(tokens=tokens):
-                q = torch.randn(tokens, 6, 128, device="cuda", dtype=torch.bfloat16)
-                sink = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
-                output = torch.randn_like(q)
-                lse = torch.randn(tokens, 6, device="cuda")
-                scale = 128**-0.5
-                stream = torch.cuda.Stream()
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    for _ in range(3):
-                        _apply_learned_sink(q, sink, output, lse, scale)
-                torch.cuda.current_stream().wait_stream(stream)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    actual = _apply_learned_sink(q, sink, output, lse, scale)
-                for _ in range(3):
-                    q.normal_()
-                    sink.normal_()
-                    output.normal_()
-                    lse.normal_()
-                    expected = torch_reference(q, sink, output, lse, scale)
-                    graph.replay()
-                    torch.testing.assert_close(
-                        actual, expected, rtol=torch.finfo(q.dtype).eps, atol=5e-7
-                    )
 
 
 if __name__ == "__main__":

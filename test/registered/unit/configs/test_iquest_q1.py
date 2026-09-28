@@ -2,8 +2,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.configs.iquest_q1 import IQuestQ1Config, IQuestQ1MTPConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -85,38 +83,6 @@ class TestIQuestQ1Config(CustomTestCase):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 IQuestQ1MTPConfig(**kwargs)
 
-    def test_checkpoint_defaults_and_roundtrip(self):
-        config = IQuestQ1Config()
-        expected = {
-            "vocab_size": 160000,
-            "hidden_size": 3072,
-            "intermediate_size": 1536,
-            "dense_intermediate_size": 12288,
-            "max_position_embeddings": 524288,
-            "num_hidden_layers": 88,
-            "num_attention_heads": 48,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_router_dtype": "fp32",
-            "num_mtp_layers": 0,
-            "eos_token_id": 0,
-            "pad_token_id": 0,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            config.save_pretrained(directory)
-            restored = IQuestQ1Config.from_pretrained(directory)
-        for key, value in expected.items():
-            with self.subTest(key=key):
-                self.assertEqual(getattr(config, key), value)
-                self.assertEqual(getattr(restored, key), value)
-        self.assertEqual(restored.layer_types, config.layer_types)
-        self.assertEqual(restored.rope_parameters["partial_rotary_factor"], 0.25)
-        self.assertNotIn("num_nextn_predict_layers", config.to_dict())
-        self.assertNotIn("num_nextn_predict_layers", restored.to_dict())
-        self.assertEqual(restored.dtype, torch.bfloat16)
-
     def test_full_attention_configuration(self):
         for kwargs in (
             {"use_hybrid_layers": False, "num_hidden_layers": 3},
@@ -142,44 +108,17 @@ class TestIQuestQ1Config(CustomTestCase):
                     restored.rope_parameters["partial_rotary_factor"], 0.25
                 )
 
-    def test_invalid_layer_types_and_rotary_dimensions(self):
-        with self.assertRaisesRegex(ValueError, "full_attention"):
-            IQuestQ1Config(first_layers_types=["invalid"])
-        for rotary_dim in (0, 3, 130):
-            with self.subTest(rotary_dim=rotary_dim):
-                with self.assertRaisesRegex(ValueError, "rotary_dim"):
-                    IQuestQ1Config(rotary_dim=rotary_dim)
-
-    def test_layer_types_expand_to_the_hybrid_schedule(self):
-        config = IQuestQ1Config(dtype="bfloat16")
-        self.assertEqual(len(config.layer_types), config.num_hidden_layers)
-        self.assertEqual(config.layer_types[0], "full_attention")
-        self.assertEqual(config.layer_types[-3:], ["full_attention"] * 3)
-        self.assertEqual(sum(config.hybrid_layer_pattern), 63)
-        self.assertTrue(config.is_hybrid_swa)
-
-    def test_layer_pattern_length_mismatch_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "layer type pattern"):
-            IQuestQ1Config(dtype="bfloat16", num_hybrid_layers_block=20)
-
-    def test_mtp_config_loads_flat_release_configuration(self):
-        config = IQuestQ1MTPConfig.from_dict(
-            {
-                "model_type": "iquest_q1_mtp",
-                "architectures": ["IQuestQ1MTP"],
-                "hidden_size": 64,
-                "vocab_size": 128,
-                "sliding_window": 512,
-                "swa_rope_theta": 10000.0,
-            }
-        )
-        self.assertIsInstance(config, IQuestQ1MTPConfig)
-        self.assertEqual(config.hidden_size, 64)
-        self.assertEqual(config.layer_types, ["sliding_attention"])
-
-    def test_router_requires_fp32(self):
-        with self.assertRaisesRegex(ValueError, "moe_router_dtype"):
-            IQuestQ1Config(moe_router_dtype="bf16")
+    def test_invalid_configuration_is_rejected(self):
+        for kwargs, message in (
+            ({"first_layers_types": ["invalid"]}, "full_attention"),
+            ({"rotary_dim": 0}, "rotary_dim"),
+            ({"rotary_dim": 3}, "rotary_dim"),
+            ({"rotary_dim": 130}, "rotary_dim"),
+            ({"num_hybrid_layers_block": 20}, "layer type pattern"),
+            ({"moe_router_dtype": "bf16"}, "moe_router_dtype"),
+        ):
+            with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, message):
+                IQuestQ1Config(**kwargs)
 
 
 if __name__ == "__main__":

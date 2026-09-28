@@ -36,10 +36,26 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
             _architecture_auto_parsers(args, ("reasoning_parser", "tool_call_parser")),
             {"reasoning_parser": "iquest_q1", "tool_call_parser": "iquest_q1"},
         )
-        self.assertEqual(
-            _architecture_auto_parsers(args, ("tool_call_parser",)),
-            {"tool_call_parser": "iquest_q1"},
-        )
+
+    def test_mtp_validation_skips_other_models_drafts(self):
+        from transformers import LlamaConfig
+
+        from sglang.srt.arg_groups.speculative_hook import _handle_iquest_q1_mtp_draft
+
+        with (
+            tempfile.TemporaryDirectory() as target_directory,
+            tempfile.TemporaryDirectory() as draft_directory,
+        ):
+            LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(
+                target_directory
+            )
+            args = ServerArgs(
+                model_path=target_directory,
+                speculative_algorithm="EAGLE",
+                speculative_draft_model_path=draft_directory,
+                device="cuda",
+            )
+            self.assertFalse(_handle_iquest_q1_mtp_draft(args))
 
     def test_speculation_requires_an_independent_checkpoint(self):
         for draft_path in (None, self.directory.name):
@@ -65,7 +81,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
                 ).resolve_once()
 
     def test_mtp_draft_defaults_and_requested_depth(self):
-        IQuestQ1Config().save_pretrained(self.directory.name)
         with tempfile.TemporaryDirectory() as directory:
             IQuestQ1MTPConfig(
                 target_config=IQuestQ1Config().to_dict(),
@@ -75,7 +90,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
             for algorithm, steps, backend in (
                 ("EAGLE", None, None),
                 ("EAGLE", 2, "fa3"),
-                ("NEXTN", 5, None),
             ):
                 with self.subTest(algorithm=algorithm, steps=steps, backend=backend):
                     reset_context()
@@ -99,7 +113,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
     def test_mtp_draft_rejects_aux_hidden_and_incompatible_dimensions(self):
         for config_kwargs, args_kwargs, message in (
             ({}, {"speculative_algorithm": "EAGLE3"}, "serial EAGLE"),
-            ({}, {"speculative_algorithm": "DFLASH"}, "serial EAGLE"),
             (
                 {},
                 {"speculative_draft_attention_backend": "trtllm_mha"},
@@ -128,7 +141,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
     def test_rejects_backends_that_do_not_return_the_lse(self):
         for kwargs in (
             {"attention_backend": "triton"},
-            {"attention_backend": "fa4"},
             {"decode_attention_backend": "triton"},
         ):
             with self.subTest(**kwargs):

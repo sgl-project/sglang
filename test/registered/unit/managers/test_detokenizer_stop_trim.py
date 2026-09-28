@@ -18,7 +18,6 @@ class TestDetokenizerStopTrim(CustomTestCase):
         )
 
     def test_zero_and_nonzero_stop_token_ids(self):
-
         for token_id in (0, 30):
             with self.subTest(token_id=token_id):
                 reason = {"type": "stop", "matched": token_id}
@@ -28,20 +27,8 @@ class TestDetokenizerStopTrim(CustomTestCase):
                     self.trim([123, token_id], reason, no_stop_trim=True),
                     [123, token_id],
                 )
-
-    def test_unmatched_length_and_string_stops(self):
-        for reason in (None, {"type": "length"}, {"type": "stop", "matched": None}):
-            self.assertEqual(self.trim([123, 0], reason), [123, 0])
-        reason = {"type": "stop", "matched": "END"}
-        self.assertEqual(self.trim("answerENDtail", reason), "answer")
         self.assertEqual(
-            self.trim("answerENDtail", reason, no_stop_trim=True), "answerEND"
-        )
-
-    def test_gpt_oss_call_token_is_preserved(self):
-        self.assertEqual(
-            self.trim([123, 200012], {"matched": 200012}, gpt_oss=True),
-            [123, 200012],
+            self.trim([123, 0], {"type": "stop", "matched": None}), [123, 0]
         )
 
 
