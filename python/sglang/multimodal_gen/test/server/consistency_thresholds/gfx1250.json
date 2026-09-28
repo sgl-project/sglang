@@ -1,0 +1,4 @@
+{
+    "_comment": "MI455x / gfx1250. Overlays h100.json: anything absent here keeps the h100 value, and a case with no entry anywhere falls back to the DEFAULT_*_VIDEO/IMAGE constants in test_utils.py. Ground truth for this platform is gfx1250's own output under diffusion-ci/consistency_gt/sglang_generated/gfx1250, so these thresholds gate run-to-run drift on one architecture, not AMD-vs-NVIDIA parity. Add a per-case entry only once the case has been measured on real gfx1250 hardware -- a guessed threshold either passes everything or blocks the lane on noise.",
+    "cases": {}
+}

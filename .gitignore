@@ -283,3 +283,7 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Output of scripts/ci/amd/local/run_mi45x_local.sh: per-run logs, step
+# summaries and reports from hand-triggered MI455x runs.
+local-ci-results/
