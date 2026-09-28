@@ -60,10 +60,6 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
 ${UV_PIP_INSTALL} pybind11 pyyaml decorator scipy attrs psutil
 
-# Install MemFabric (memfabric-hybrid) and MemCache (memcache-hybrid)
-# 1.2.1 已发布在 PyPI，950 与 a3 同版本。顺序不能换：先装 memfabric_hybrid（提供 mfcli），
-# 再 `mfcli kernel install`（内部按 SoC 决定是否装 kernel ops，A3 自动跳过），最后装 memcache_hybrid。
-# 这里不写 -i，用环境里配置好的 index（CI 会把它设成内网 pypi 缓存），和改动前 a3 分支的行为一致。
 ${PIP_INSTALL} memfabric-hybrid==1.2.1
 mfcli kernel install
 ${PIP_INSTALL} memcache-hybrid==1.2.1
