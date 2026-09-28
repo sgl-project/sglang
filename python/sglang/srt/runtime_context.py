@@ -537,6 +537,7 @@ class MoeFlags(_FlagGroupBase):
     speculative_runner_backend: Any = None
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
+    mscclpp_mode: Any = None
     deepep_config: str | None = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None

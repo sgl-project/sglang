@@ -27,6 +27,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_mscclpp_mode,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
@@ -39,6 +40,10 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+    MSCCLPPDispatcher,
+    MSCCLPPOutputLayout,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -54,6 +59,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
+    is_mscclpp_ll_rank_major,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -223,6 +229,21 @@ def create_moe_dispatcher(
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             moe_runner_config=moe_runner_config,
+        )
+    elif a2a_backend.is_mscclpp():
+        return MSCCLPPDispatcher(
+            group=get_tp_group().cpu_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            mscclpp_mode=get_mscclpp_mode(),
+            output_layout=(
+                MSCCLPPOutputLayout.RANK_MAJOR
+                if is_mscclpp_ll_rank_major()
+                else MSCCLPPOutputLayout.EXPERT_MAJOR
+            ),
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")

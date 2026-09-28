@@ -1252,6 +1252,10 @@ class Envs:
     # their existing behavior.
     SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    # MSCCL++ EP
+    SGLANG_MSCCLPP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
+    # default static local-batch path.
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.

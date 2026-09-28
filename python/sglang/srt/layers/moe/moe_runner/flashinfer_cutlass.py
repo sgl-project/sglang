@@ -9,7 +9,7 @@ small quant_info payload and route through ``MoeRunner``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -22,8 +22,14 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
+    MoeRunnerCore,
+    RunnerInput,
+    RunnerOutput,
     register_fused_func,
+    register_post_permute,
+    register_pre_permute,
 )
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
@@ -33,10 +39,17 @@ if TYPE_CHECKING:
         FlashinferCombineInput,
         FlashinferDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+        MSCCLPPCombineInput,
+        MSCCLPPDispatchOutput,
+        MSCCLPPRankMajorLLCombineInput,
+        MSCCLPPRankMajorLLDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 
 @dataclass
@@ -153,6 +166,28 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
     padded_hidden: Optional[int] = None
+
+
+@dataclass
+class FlashInferCutlassRunnerInput(RunnerInput):
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_output: TopKOutput
+    output: Optional[torch.Tensor] = None
+    enable_alltoall: bool = False
+
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.FLASHINFER_CUTLASS
+
+
+@dataclass
+class FlashInferCutlassRunnerOutput(RunnerOutput):
+    hidden_states: torch.Tensor
+
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.FLASHINFER_CUTLASS
 
 
 def _flashinfer_cutlass_fused_moe():
@@ -331,6 +366,108 @@ def _run_flashinfer_cutlass(
     if quant_info.quant_type in ("bf16", "fp8"):
         _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
     return output
+
+
+class FlashInferCutlassRunnerCore(MoeRunnerCore):
+    def run(
+        self,
+        runner_input: FlashInferCutlassRunnerInput,
+        quant_info: MoeQuantInfo,
+        running_state: dict,
+        hooks: Optional[Any] = None,
+    ) -> FlashInferCutlassRunnerOutput:
+        del running_state
+        if hooks is not None:
+            raise NotImplementedError(
+                "LoRA hooks are not supported by the FlashInfer CUTLASS MoE runner"
+            )
+        assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+            f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+        )
+        assert not self.config.apply_router_weight_on_input, (
+            "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+        )
+
+        output = _run_flashinfer_cutlass(
+            dispatch_output=runner_input,
+            quant_info=quant_info,
+            runner_config=self.config,
+            output=runner_input.output,
+            enable_alltoall=runner_input.enable_alltoall,
+        )
+        return FlashInferCutlassRunnerOutput(hidden_states=output)
+
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.FLASHINFER_CUTLASS
+
+
+@register_pre_permute("mscclpp", "flashinfer_cutlass")
+def pre_permute_mscclpp_to_flashinfer_cutlass(
+    dispatch_output: MSCCLPPDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> FlashInferCutlassRunnerInput:
+    del quant_info, runner_config, running_state
+    if dispatch_output.hidden_states.dim() != 2:
+        raise ValueError("MSCCL++ token-major dispatch tokens must be two-dimensional")
+
+    return FlashInferCutlassRunnerInput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        topk_output=dispatch_output.topk_output,
+    )
+
+
+@register_post_permute("flashinfer_cutlass", "mscclpp")
+def post_permute_flashinfer_cutlass_to_mscclpp(
+    runner_output: FlashInferCutlassRunnerOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MSCCLPPCombineInput:
+    del quant_info, runner_config, running_state
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import MSCCLPPCombineInput
+
+    return MSCCLPPCombineInput(hidden_states=runner_output.hidden_states)
+
+
+@register_pre_permute("mscclpp_ll_rank_major", "flashinfer_cutlass")
+def pre_permute_mscclpp_rank_major_ll_to_flashinfer_cutlass(
+    dispatch_output: MSCCLPPRankMajorLLDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> FlashInferCutlassRunnerInput:
+    del quant_info, runner_config, running_state
+    if dispatch_output.hidden_states.dim() != 2:
+        raise ValueError("MSCCL++ rank-major dispatch tokens must be two-dimensional")
+
+    return FlashInferCutlassRunnerInput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        topk_output=dispatch_output.topk_output,
+        output=dispatch_output.expert_output_buffer,
+        enable_alltoall=True,
+    )
+
+
+@register_post_permute("flashinfer_cutlass", "mscclpp_ll_rank_major")
+def post_permute_flashinfer_cutlass_to_mscclpp_rank_major_ll(
+    runner_output: FlashInferCutlassRunnerOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MSCCLPPRankMajorLLCombineInput:
+    del quant_info, runner_config, running_state
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+        MSCCLPPRankMajorLLCombineInput,
+    )
+
+    return MSCCLPPRankMajorLLCombineInput(
+        hidden_states=runner_output.hidden_states,
+    )
 
 
 @register_fused_func("none", "flashinfer_cutlass")

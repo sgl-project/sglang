@@ -31,6 +31,14 @@ if TYPE_CHECKING:
         DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        MSCCLPPCombineInput,
+        MSCCLPPDispatchOutput,
+        MSCCLPPExpertMajorLLCombineInput,
+        MSCCLPPExpertMajorLLDispatchOutput,
+        MSCCLPPLLCombineInput,
+        MSCCLPPLLDispatchOutput,
+        MSCCLPPRankMajorLLCombineInput,
+        MSCCLPPRankMajorLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -161,6 +169,29 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_flashinfer()
 
     @staticmethod
+    def format_is_mscclpp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPDispatchOutput]:
+        return dispatch_output.format.is_mscclpp()
+
+    @staticmethod
+    def format_is_mscclpp_ll(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll()
+
+    @staticmethod
+    def format_is_mscclpp_ll_expert_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll_expert_major()
+
+    @staticmethod
+    def format_is_mscclpp_ll_rank_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPRankMajorLLDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_ll_rank_major()
+
     def format_is_deepep_v2(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPv2DispatchOutput]:
@@ -174,6 +205,9 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    MSCCLPP = "mscclpp"
+    MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
+    MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -195,6 +229,21 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_mscclpp(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP
+
+    def is_mscclpp_ll(self) -> bool:
+        return self in [
+            DispatchOutputFormat.MSCCLPP_LL_EXPERT_MAJOR,
+            DispatchOutputFormat.MSCCLPP_LL_RANK_MAJOR,
+        ]
+
+    def is_mscclpp_ll_expert_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LL_EXPERT_MAJOR
+
+    def is_mscclpp_ll_rank_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LL_RANK_MAJOR
 
     def is_deepep_v2(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_V2
@@ -264,6 +313,32 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
     @staticmethod
+    def format_is_mscclpp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP
+
+    @staticmethod
+    def format_is_mscclpp_ll(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPLLCombineInput]:
+        return combine_input.format in [
+            CombineInputFormat.MSCCLPP_LL_EXPERT_MAJOR,
+            CombineInputFormat.MSCCLPP_LL_RANK_MAJOR,
+        ]
+
+    @staticmethod
+    def format_is_mscclpp_ll_expert_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LL_EXPERT_MAJOR
+
+    @staticmethod
+    def format_is_mscclpp_ll_rank_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPRankMajorLLCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LL_RANK_MAJOR
+
     def format_is_deepep_v2(
         combine_input: CombineInput,
     ) -> TypeGuard[DeepEPv2CombineInput]:
@@ -277,6 +352,9 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    MSCCLPP = "mscclpp"
+    MSCCLPP_LL_EXPERT_MAJOR = "mscclpp_ll_expert_major"
+    MSCCLPP_LL_RANK_MAJOR = "mscclpp_ll_rank_major"
 
 
 class RoutewiseLayout(Enum):

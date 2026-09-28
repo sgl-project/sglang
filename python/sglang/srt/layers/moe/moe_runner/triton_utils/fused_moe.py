@@ -900,8 +900,12 @@ def _fused_moe_kernel_sequence(
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None
                 out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
+        elif topk == 1 and not _use_intermediate:
+            # The down kernel wrote the (already top-k-weighted) result directly
+            # into out_hidden_states; intermediate_cache3 was never populated, so
+            # apply any routed scaling in place rather than reducing it.
+            if routed_scaling_factor != 1.0:
+                out_hidden_states.mul_(routed_scaling_factor)
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
                 intermediate_cache3[:, 0],

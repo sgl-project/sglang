@@ -18,7 +18,6 @@
     },
     "forwardPorts": [],
     "runArgs": [
-        "--gpus",
         "all"
     ],
     // The two lines below ensures that your local changes in the sglang

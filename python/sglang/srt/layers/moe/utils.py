@@ -46,6 +46,7 @@ class MoeA2ABackend(Enum):
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
+    MSCCLPP = "mscclpp"
 
     @classmethod
     def _missing_(cls, value):
@@ -94,6 +95,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_mscclpp(self):
+        return self == MoeA2ABackend.MSCCLPP
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -277,6 +281,40 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+class MSCCLPPMode(Enum):
+    """Transport mode for the single ``mscclpp`` MoE a2a backend.
+
+    Mirrors DeepEP's two-mode design (``deepep`` backend + ``deepep_mode``):
+    one ``mscclpp`` a2a backend that runs either the high-throughput intranode
+    (``normal``) dispatcher or the low-latency (``low_latency``) dispatcher,
+    selected here instead of via separate a2a backends.
+    """
+
+    NORMAL = "normal"
+    LOW_LATENCY = "low_latency"
+    AUTO = "auto"
+
+    def enable_normal(self) -> bool:
+        return self in (MSCCLPPMode.NORMAL, MSCCLPPMode.AUTO)
+
+    def enable_low_latency(self) -> bool:
+        return self in (MSCCLPPMode.LOW_LATENCY, MSCCLPPMode.AUTO)
+
+    def resolve(self, is_extend_in_batch: bool) -> MSCCLPPMode:
+        if self != MSCCLPPMode.AUTO:
+            return self
+        return MSCCLPPMode.NORMAL if is_extend_in_batch else MSCCLPPMode.LOW_LATENCY
+
+    def is_normal(self) -> bool:
+        return self == MSCCLPPMode.NORMAL
+
+    def is_low_latency(self) -> bool:
+        return self == MSCCLPPMode.LOW_LATENCY
+
+    def is_auto(self) -> bool:
+        return self == MSCCLPPMode.AUTO
+
+
 class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
@@ -391,12 +429,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     return DispatcherOutputDtype.FP8
 
 
-def get_ascend_dispatcher_output_dtype(dispatcher):
-    """
-    Automatically choose the dispatch output dtype for Ascend.
-    """
-
-    # 1. Parse quant config to determine the output dtype of dispatcher
+def get_ascend_dispatcher_output_dtype(dispatcher) -> DispatcherOutputDtype:
+    """Choose the dispatch output dtype for Ascend."""
     if dispatcher.quant_config is not None:
         dispatcher_output_dtype = dispatcher.quant_config.get(
             "dispatcher_output_dtype", None
@@ -404,7 +438,6 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 2. Ascend dispatch defaults to BF16
     return DispatcherOutputDtype.BF16
 
 
@@ -465,6 +498,7 @@ def initialize_moe_config():
         else moe.a2a_backend
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
+    moe.mscclpp_mode = MSCCLPPMode(exec_moe.mscclpp_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
@@ -603,6 +637,22 @@ def get_deepep_mode() -> DeepEPMode:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
         moe.deepep_mode = DeepEPMode.AUTO
     return moe.deepep_mode
+
+
+def get_mscclpp_mode() -> MSCCLPPMode:
+    moe = get_flags().moe
+    if moe.mscclpp_mode is None:
+        logger.warning("MSCCLPP_MODE is not initialized, using auto mode")
+        moe.mscclpp_mode = MSCCLPPMode.AUTO
+    return moe.mscclpp_mode
+
+
+def is_mscclpp_ll_rank_major() -> bool:
+    return (
+        get_moe_a2a_backend().is_mscclpp()
+        and get_mscclpp_mode().enable_low_latency()
+        and get_moe_runner_backend().is_flashinfer_cutlass()
+    )
 
 
 def get_deepep_config() -> str:
@@ -749,7 +799,7 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
     # combine, sum each token's expert outputs back to its source rank.
-    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe() or get_moe_a2a_backend().is_mscclpp()
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:

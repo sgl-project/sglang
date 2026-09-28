@@ -708,6 +708,7 @@ class ExecMoe(msgspec.Struct):
             "ascend_tp",
             "pplx",
             "flashinfer_megamoe",
+            "mscclpp",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -724,6 +725,7 @@ class ExecMoe(msgspec.Struct):
                 "pplx",
                 "ascend_tp",
                 "flashinfer_megamoe",
+                "mscclpp",
             ],
             resolvable=True,
         ),
@@ -759,6 +761,10 @@ class ExecMoe(msgspec.Struct):
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+    ] = "auto"
+    mscclpp_mode: A[
+        Literal["auto", "normal", "low_latency"],
+        "Transport mode for the `mscclpp` MoE A2A backend. `auto` uses normal throughput for prefill and low latency for decode.",
     ] = "auto"
     fuseep_mode: A[
         Literal[1, 2],

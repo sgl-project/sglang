@@ -3982,15 +3982,12 @@ def require_mlp_tp_gather():
             return True
         elif get_moe_a2a_backend().is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
-            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
-            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
-            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
-            # replay different-sized graphs -> geometry mismatch -> illegal memory
-            # access (issue #30242). No literal MLP TP-gather happens here -- the
-            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
-            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
-            # max-based graph bucket). See #30432 re: the misleading flag name.
+        elif (
+            get_moe_a2a_backend().is_flashinfer() or get_moe_a2a_backend().is_mscclpp()
+        ):
+            # Fixed-geometry MoE A2A backends need a rank-invariant,
+            # DP-synchronized per-rank token count. No literal MLP TP-gather
+            # happens here; reuse this flag's DP-sync bookkeeping.
             return True
         elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"

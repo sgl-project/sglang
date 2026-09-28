@@ -308,6 +308,7 @@ POSITIONAL_FIELD_ORDER = (
     "moe_runner_backend",
     "flashinfer_mxfp4_moe_precision",
     "deepep_mode",
+    "mscclpp_mode",
     "fuseep_mode",
     "deepep_dispatcher_output_dtype",
     "ep_num_redundant_experts",
