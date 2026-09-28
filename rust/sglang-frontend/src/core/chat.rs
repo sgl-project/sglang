@@ -580,9 +580,9 @@ impl super::OpenAIService {
 #[cfg(test)]
 mod tests {
     use super::{ChatResponseContext, chat_event_stream, chat_logprobs, unary_chat};
-    use crate::openai::protocol::ChatCompletionRequest;
-    use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
-    use crate::openai::test_utils::{chat_submitted, chunk};
+    use crate::core::protocol::ChatCompletionRequest;
+    use crate::core::protocol::{chat_sampling_params, lower_chat_request};
+    use crate::core::test_utils::{chat_submitted, chunk};
     use crate::{GenerationOutputExtras, PositionLogprobs, TokenLogprob};
     use futures::{FutureExt, StreamExt};
     use sglang_renderer::{
