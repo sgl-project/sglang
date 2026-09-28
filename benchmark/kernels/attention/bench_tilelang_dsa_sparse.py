@@ -17,12 +17,11 @@ from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
     sparse_mla_fwd_decode_partial,
 )
 
-HEADS = 16
 DIM = 512
 TOPK = 2112
-LIVE_TOPK = 2051
-KV_LEN = 13_299_712
-PRODUCTION_M = (8192, 16384)
+DEFAULT_LIVE_TOPK = 2051
+DEFAULT_KV_LEN = 13_299_712
+DEFAULT_M = (128, 512, 2048, 4096, 8192, 12288, 16384)
 
 
 def _time_ms(fn, warmup: int, repeats: int) -> float:
@@ -42,6 +41,7 @@ def _time_ms(fn, warmup: int, repeats: int) -> float:
 
 
 def _build_kernels(
+    heads: int,
     block_i: int,
     inner_iter: int,
     threads: int,
@@ -50,7 +50,7 @@ def _build_kernels(
     assert TOPK % (block_i * inner_iter) == 0
     groups = TOPK // (block_i * inner_iter)
     partial = sparse_mla_fwd_decode_partial(
-        HEADS,
+        heads,
         DIM,
         0,
         TOPK,
@@ -61,7 +61,7 @@ def _build_kernels(
         num_stages=num_stages,
     )
     combine = sparse_mla_fwd_decode_combine(
-        HEADS,
+        heads,
         DIM,
         groups * block_i,
         head_per_block=4,
@@ -73,7 +73,10 @@ def _build_kernels(
 
 def _run_cell(
     kv: torch.Tensor,
+    heads: int,
     m: int,
+    live_topk: int,
+    kv_len: int,
     block_i: int,
     inner_iter: int,
     threads: int,
@@ -83,18 +86,18 @@ def _run_cell(
     index_pattern: str,
     backend: str,
 ):
-    q = torch.randn((m, HEADS, DIM), device="cuda", dtype=torch.bfloat16) * 0.01
+    q = torch.randn((m, heads, DIM), device="cuda", dtype=torch.bfloat16) * 0.01
     if index_pattern == "shared":
         indices = (
-            torch.randint(0, KV_LEN, (1, 1, TOPK), device="cuda", dtype=torch.int32)
+            torch.randint(0, kv_len, (1, 1, TOPK), device="cuda", dtype=torch.int32)
             .expand(m, -1, -1)
             .contiguous()
         )
     else:
         indices = torch.randint(
-            0, KV_LEN, (m, 1, TOPK), device="cuda", dtype=torch.int32
+            0, kv_len, (m, 1, TOPK), device="cuda", dtype=torch.int32
         )
-    indices[..., LIVE_TOPK:] = -1
+    indices[..., live_topk:] = -1
     if backend == "triton":
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
             triton_sparse_mla_fwd,
@@ -115,14 +118,18 @@ def _run_cell(
         complete_ms = _time_ms(run_complete, warmup, repeats)
         return actual, {
             "backend": backend,
+            "heads": heads,
             "m": m,
+            "live_topk": live_topk,
             "complete_ms": complete_ms,
         }
 
     q4 = q.unsqueeze(0)
     kv4 = kv.unsqueeze(0)
     indices4 = indices.unsqueeze(0)
-    partial, combine, groups = _build_kernels(block_i, inner_iter, threads, num_stages)
+    partial, combine, groups = _build_kernels(
+        heads, block_i, inner_iter, threads, num_stages
+    )
 
     def run_partial():
         return partial(q4, kv4, indices4)
@@ -142,7 +149,9 @@ def _run_cell(
     complete_ms = _time_ms(run_complete, warmup, repeats)
     return actual, {
         "backend": backend,
+        "heads": heads,
         "m": m,
+        "live_topk": live_topk,
         "block_i": block_i,
         "inner_iter": inner_iter,
         "groups": groups,
@@ -159,6 +168,10 @@ def main():
     parser.add_argument(
         "--candidate-backend", choices=("tilelang", "triton"), default="tilelang"
     )
+    parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
+    parser.add_argument("--m", type=int, nargs="+", default=DEFAULT_M)
+    parser.add_argument("--live-topk", type=int, default=DEFAULT_LIVE_TOPK)
+    parser.add_argument("--kv-len", type=int, default=DEFAULT_KV_LEN)
     parser.add_argument("--block-i", type=int, default=64)
     parser.add_argument("--inner-iter", type=int, default=33)
     parser.add_argument("--threads", type=int, default=256)
@@ -169,14 +182,19 @@ def main():
         "--index-pattern", choices=("shared", "random"), default="shared"
     )
     args = parser.parse_args()
+    if not 0 <= args.live_topk <= TOPK:
+        parser.error(f"--live-topk must be in [0, {TOPK}]")
 
     torch.manual_seed(20260928)
-    kv = torch.zeros((KV_LEN, 1, DIM), device="cuda", dtype=torch.bfloat16)
-    for m in PRODUCTION_M:
+    kv = torch.zeros((args.kv_len, 1, DIM), device="cuda", dtype=torch.bfloat16)
+    for m in args.m:
         torch.manual_seed(20260928 + m)
         baseline, baseline_row = _run_cell(
             kv,
+            args.heads,
             m,
+            args.live_topk,
+            args.kv_len,
             64,
             33,
             256,
@@ -189,7 +207,10 @@ def main():
         torch.manual_seed(20260928 + m)
         candidate, candidate_row = _run_cell(
             kv,
+            args.heads,
             m,
+            args.live_topk,
+            args.kv_len,
             args.block_i,
             args.inner_iter,
             args.threads,

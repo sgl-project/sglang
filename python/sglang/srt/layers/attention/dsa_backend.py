@@ -102,15 +102,19 @@ def _use_glm53_triton_sparse_prefill(
     kv: torch.Tensor,
     indices: torch.Tensor,
     d_v: int,
+    is_prefill: bool,
 ) -> bool:
-    """Use the validated Triton kernel only for the profiled GLM-5.3 cells."""
+    """Use Triton only inside the validated GLM-5.3 prefill envelope."""
+    max_tokens_by_heads = {8: 131072, 16: 65536}
     return (
-        _IS_GFX95
+        is_prefill
+        and _IS_GFX95
         and q.dtype == torch.bfloat16
         and kv.dtype == torch.bfloat16
         and q.ndim == 3
-        and q.shape[0] in (8192, 16384)
-        and q.shape[1:] == (16, 512)
+        and q.shape[1] in max_tokens_by_heads
+        and 0 < q.shape[0] <= max_tokens_by_heads[q.shape[1]]
+        and q.shape[2] == 512
         and kv.shape[-1] == 512
         and indices.shape[-1] == 2112
         and d_v == 512
@@ -2122,6 +2126,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                is_prefill=True,
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2437,6 +2442,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                is_prefill=False,
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3081,6 +3087,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        is_prefill: bool,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -3097,7 +3104,9 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
-        if _use_glm53_triton_sparse_prefill(q_all, kv_cache, page_table_1, v_head_dim):
+        if _use_glm53_triton_sparse_prefill(
+            q_all, kv_cache, page_table_1, v_head_dim, is_prefill
+        ):
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
