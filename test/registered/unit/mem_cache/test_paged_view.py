@@ -13,13 +13,12 @@
 # ==============================================================================
 """``paged_view`` regroups ``[slots, ...]`` into ``[pages, page_size, ...]``.
 
-The pool's per-layer buffers are strided views: consecutive slots are a whole
-entry apart, not one row. So the page dimension the paged backends want cannot
-come from ``.view()`` -- that is only legal on a contiguous tensor, and where
-it is legal at ``page_size == 1`` it gives the size-1 slot dimension the ROW
-stride instead of the SLOT stride. A kernel stepping that dimension then walks
-into the next layer's bytes. These tests pin the strides the helper produces,
-at both page sizes, against the buffer addresses they must reproduce.
+A pool's per-layer buffer may be a strided view: consecutive slots are a whole
+entry apart, not one row. The page split must then keep that slot stride on
+dim 1 at every page size; ``.view()`` does not, since at ``page_size == 1`` it
+gives the size-1 page dim the ROW stride. These tests pin the strides the
+helper produces, at both page sizes, against the buffer addresses they must
+reproduce.
 
 CPU-only.
 
@@ -50,8 +49,8 @@ class TestPagedView(unittest.TestCase):
         self.assertEqual(out.data_ptr(), flat.data_ptr())
 
     def test_strided_slots_keep_their_stride(self):
-        # ps == 1 is the case `.view()` gets wrong: the size-1 slot dimension
-        # must still step a whole entry, not one row.
+        # At ps == 1 the size-1 page dim must still carry the slot stride
+        # (a whole entry), where `.view()` would give it the row stride.
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 N, H, D, E = 12, 2, 16, 2 * 16 + 96

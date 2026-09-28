@@ -90,9 +90,10 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertEqual(value_cache.shape, (16, 1, 1, 16))
 
     def test_get_paged_mha_kv_cache_refuses_head_groups_on_a_strided_pool(self):
-        # A unified pool's per-layer view is a whole ENTRY apart; without the
-        # guard the head re-chunk raised PyTorch's "view size is not compatible".
-        H, D, slots = 2, 16, 8
+        # A unified pool's slots are a whole ENTRY apart, and no view of the
+        # head dim can regroup pages over that stride: refuse it loudly.
+        layer = _layer()
+        H, D, slots = layer.tp_k_head_num, layer.head_dim, 8
         entry = 64 * H * D  # every layer's K and V share the slot
         backing = torch.zeros(slots * entry)
         strided = backing.as_strided((slots, H, D), (entry, D, 1))
@@ -101,13 +102,6 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         backend = _backend()
         backend.token_to_kv_pool = SimpleNamespace(
             get_kv_buffer=Mock(return_value=(strided, strided))
-        )
-        layer = SimpleNamespace(
-            layer_id=3,
-            tp_k_head_num=H,
-            tp_v_head_num=H,
-            head_dim=D,
-            v_head_dim=D,
         )
 
         with self.assertRaises(AssertionError) as caught:

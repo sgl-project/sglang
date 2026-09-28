@@ -42,8 +42,8 @@ class TestTRTLLMHAPagedKV(unittest.TestCase):
         H, D, pages = 4, 32, 3
         slot_stride = 3 * H * D
         layer = SimpleNamespace(tp_k_head_num=H, tp_v_head_num=H)
-        # 16 is the smallest page size trtllm_mha runs at; 1 is the case a
-        # view gets wrong.
+        # 16 is the smallest page size trtllm_mha runs at; at 1, `.view()`
+        # would give the size-1 page dim the row stride.
         for page_size in (1, 16):
             backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
             backend.page_size = page_size
