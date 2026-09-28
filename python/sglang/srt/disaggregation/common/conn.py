@@ -2040,11 +2040,9 @@ class CommonKVReceiver(BaseKVReceiver):
         # ack racing back -- or fanned out by a peer rank's earlier abort of
         # the same room -- is counted instead of dropped. Prealloc-queue
         # receivers (init_time None) never enter the deferred-release flow
-        # that would clean the tracker up, so they stay unarmed. init_time is
-        # only set once the WHOLE send_metadata loop succeeds, so a partial
-        # publish (earlier ranks already hold destinations, a later send threw)
-        # leaves it None while writes are possible; callers that go on to defer
-        # the release pass force_arm, since their flow guarantees cleanup.
+        # that would clean the tracker up, so they stay unarmed -- except on a
+        # partial publish, where init_time is still None but earlier ranks
+        # already hold destinations; those callers defer and pass force_arm.
         if self.kv_mgr.enable_deferred_decode_kv_release and (
             force_arm or self.init_time is not None
         ):

@@ -2685,14 +2685,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if deferrable and not decode_req.kv_receiver.abort_notified:
                     # A failure decode did not initiate (prefill fault, transport
                     # error, hicache restore failure) can still have sibling-rank
-                    # writes in flight toward these pages; tell every prefill
-                    # rank to stop and drain-ack, so the hold arms for every
-                    # failure kind, not only decode-initiated aborts. force_arm:
-                    # a send_metadata that failed partway leaves init_time None
-                    # while earlier ranks already hold destinations; without it
-                    # the acks are dropped and every such hold runs out the full
-                    # timeout. This path always reaches _do_release, which
-                    # cleans the tracker up.
+                    # writes in flight toward these pages. force_arm: a partial
+                    # send_metadata leaves init_time None though earlier ranks
+                    # already hold destinations; this path always reaches
+                    # _do_release, which clears the tracker.
                     decode_req.kv_receiver.ensure_abort_notified(force_arm=True)
                 if requires_host_drain or (
                     deferrable and decode_req.kv_receiver.abort_notified
