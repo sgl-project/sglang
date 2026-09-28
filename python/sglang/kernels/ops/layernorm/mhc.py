@@ -2273,7 +2273,7 @@ _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
-# CDNA has no TF32: Triton lowers "ieee" to the fp32 MFMA, one rounding per product at every M
+# Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
 _HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
 # num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
 # short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
