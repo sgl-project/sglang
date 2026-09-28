@@ -814,7 +814,7 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     weights = empty((routes,), torch.float32)
     xq = empty((2 * m, h // 2), torch.uint8)
     xs = empty((2 * m, h // 32), torch.uint8)
-    gu = None if m in (4, 8, 16) else empty((routes, splits, 2 * intermediate), torch.float32)
+    gu = None if 3 <= m <= 8 or m == 16 else empty((routes, splits, 2 * intermediate), torch.float32)
     aq = empty((routes, intermediate // 2), torch.uint8)
     aqs = empty((routes, intermediate // 32), torch.uint8)
     down_output = None if direct else empty((m if m <= 8 else routes, h), torch.float32)
@@ -827,7 +827,7 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
         else:
             _stream_paired_down[16 * (m // 2), h // (64 * 16)](aq, aqs, w2, w2_scale, ids, weights, out, h, intermediate, 64, 4, TILE_GROUP=16, num_warps=4, enable_fp_fusion=False)
         return out
-    if m in (4, 8):
+    if 3 <= m <= 8:
         _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 2, router_splits, m == 4, False, routed_scaling_factor, num_warps=2, enable_fp_fusion=False)
         tail_width, tail_warps = (64, 4)
         tail_group = 16 if m == 8 else 96

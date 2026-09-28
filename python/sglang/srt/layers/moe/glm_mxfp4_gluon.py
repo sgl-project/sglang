@@ -68,7 +68,9 @@ def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
         if m <= 16768:
             return "fused_moe_tp4_m4193_16768_shared"
     elif is_nextn:
-        if 1 <= m <= 17:
+        if 1 <= m <= 8:
+            return "fused_moe_tp8_m1_16"
+        if m <= 17:
             return "fused_moe_tp8_m1_16_mtp"
         if m <= 1023:
             return "fused_moe_tp8_m32_256_mtp"
