@@ -45,7 +45,7 @@ own `/_sglang_renderer/ready` endpoint returns HTTP 204 with
 `x-sglang-renderer: ready`; engine readiness is checked separately.
 
 For preprocessing without an engine, omit `--engine-url`. This mode serves render
-and tokenization endpoints without inference.
+and tokenize/detokenize endpoints without inference.
 
 ```sh
 rust/target/release/sglang-renderer meta-llama/Llama-3.1-8B-Instruct \
