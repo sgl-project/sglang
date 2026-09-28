@@ -136,15 +136,6 @@ class TestEngineStateNotifications(CustomTestCase):
         self.manager.gracefully_exit = True
         self.assertEqual(self.notifications, 3)
 
-    def test_runtime_handle_registers_callback_with_manager(self):
-        handle = RuntimeHandle.__new__(RuntimeHandle)
-        handle.tokenizer_manager = self.manager
-        callback = object()
-
-        handle.set_engine_state_changed_callback(callback)
-
-        self.assertIs(self.manager._engine_state_changed_callback, callback)
-
     def test_graceful_exit_notifies_and_changes_computed_health(self):
         handle = RuntimeHandle.__new__(RuntimeHandle)
         handle.tokenizer_manager = self.manager

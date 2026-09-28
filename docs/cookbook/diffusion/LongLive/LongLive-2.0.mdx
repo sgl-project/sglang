@@ -117,3 +117,9 @@ The image is used as the first-frame condition.
 - SGLang supports T2V sizes 1280x704, 704x1280, 832x480, and 480x832.
 - I2V request images follow the Wan TI2V preprocessing path in SGLang. This is different from the original LongLive dataset resize path.
 - For multi-shot runs, set `num_frames` to match `len(shot_prompts) * chunks_per_shot * 8` latent frames, that is `num_frames = (len(shot_prompts) * chunks_per_shot * 8 - 1) * 4 + 1`.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />
