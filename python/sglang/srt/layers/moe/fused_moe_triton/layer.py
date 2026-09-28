@@ -98,6 +98,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _GLM_NEXTN_GLUON_LOCAL_EXPERTS = {
     (1, 4): 256,
+    (4, 1): 64,
     (1, 8): 256,
     (2, 4): 128,
     (4, 2): 64,
