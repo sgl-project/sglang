@@ -202,3 +202,24 @@ class Cosmos3Config(PipelineConfig):
             keep_resident_min_available_gb=threshold_gb,
             keep_resident_components=("dit", "vae"),
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.cosmos3 import (
+        Cosmos3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Cosmos3SamplingParams,
+        pipeline_config_cls=Cosmos3Config,
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
+            "nvidia/Cosmos3-Super",
+            "nvidia/Cosmos3-Super-Text2Image",
+            "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
+        ],
+        model_detectors=[lambda hf_id: "cosmos3omni" in hf_id.lower()],
+    )

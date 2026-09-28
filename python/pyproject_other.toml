@@ -83,6 +83,7 @@ runtime_common = [
 srt_empty = ["sglang[runtime_base]"]
 
 diffusion_common = [
+  "accelerate",
   "addict",
   "cloudpickle",
   "diffusers==0.37.0",

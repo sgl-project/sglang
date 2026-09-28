@@ -94,6 +94,19 @@ MODEL_ROOT="${MODEL_ROOT:-}"
 # Root used to RESOLVE the snapshot hash; defaults to MODEL_ROOT. Set it when
 # MODEL_ROOT is node-local and therefore unreadable from the driver node.
 MODEL_RESOLVE_ROOT="${MODEL_RESOLVE_ROOT:-$MODEL_ROOT}"
+# Optional node-local mirror of the model cache, for clusters where shared
+# storage cannot serve every rank at once. Resolution stays on the shared root:
+# resolve_snapshot runs on the driver node, which has no mirror. Must be assigned
+# after MODEL_RESOLVE_ROOT, which keeps the readable root.
+MODEL_LOCAL_ROOT="${MODEL_LOCAL_ROOT:-}"
+if [[ -n "$MODEL_LOCAL_ROOT" ]]; then
+    if [[ -z "$MODEL_RESOLVE_ROOT" ]]; then
+        echo "ERROR: MODEL_LOCAL_ROOT is set but MODEL_ROOT/MODEL_RESOLVE_ROOT is empty;" >&2
+        echo "       the snapshot hash has to be resolved against a root the driver can read." >&2
+        exit 1
+    fi
+    MODEL_ROOT="$MODEL_LOCAL_ROOT"
+fi
 MODEL_ROOT_FROM="${MODEL_ROOT_FROM:-/it-share/model_coverage}"
 relocate_model_root() {
     local p="$1"
@@ -511,6 +524,13 @@ if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
     done
 fi
 IONIC_EOF
+
+# drive.sh is a quoted heredoc and expands nothing, so its staging check gets the
+# resolved paths through a file, as model_flags.sh does. Empty path = no check.
+{
+    printf 'STAGE_LOCAL_PATH=%q\n' "${MODEL_LOCAL_ROOT:+$MODEL_PATH}"
+    printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
+} > "$WORKDIR/stage_check.sh"
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
@@ -1045,7 +1065,7 @@ $PREFILL_WAIT_ROUTER
       [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
       python3 -m sglang.test.few_shot_gsm8k \
         --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
-        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
+        --max-new-tokens 512 --host 127.0.0.1 --port $LBPORT \
         \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
       ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
       [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
@@ -1327,6 +1347,25 @@ PIP=$(resolve_ip "$PNODE") || exit 1
 DIP=$(resolve_ip "$DNODE") || exit 1
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
+# The local copy is staged out of band and does not survive a reboot. Without
+# this the container falls back to the shared root and the only symptom is a
+# health-wait timeout 50 minutes later.
+source "$WORKDIR/stage_check.sh"
+if [[ -n "$STAGE_LOCAL_PATH" ]]; then
+  _stage_bad=0
+  for n in "${NODES[@]}"; do
+    if ! srun_local_or_step "$n" test -d "$STAGE_LOCAL_PATH" >/dev/null 2>&1; then
+      echo "ERROR: $n is missing the node-local snapshot $STAGE_LOCAL_PATH" >&2
+      _stage_bad=1
+    fi
+  done
+  if (( _stage_bad )); then
+    echo "ERROR: re-stage the model onto every allocated node, or unset MODEL_LOCAL_ROOT" >&2
+    echo "       to read from $STAGE_SHARED_ROOT (slow: large checkpoints will time out)." >&2
+    exit 1
+  fi
+  echo "[drive] node-local snapshot present on all ${#NODES[@]} nodes"
+fi
 if (( DW > 1 )); then
   echo "[drive] NOTE: router + bench use the first decode engine only;"
   echo "[drive]       multi-decode fan-out is not wired yet (LB work)."

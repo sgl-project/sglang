@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferDestination,
     KVTransferMetric,
     StateType,
 )
@@ -294,6 +295,7 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            and self.supports_deferred_decode_kv_release
         )
         self._dcp_pack_buffers = None
         self._dcp_pack_max_tokens: Optional[int] = None
@@ -353,7 +355,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
-        self._deferred_ack_targets: Dict[int, AckTarget] = {}
+        self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
@@ -825,18 +827,33 @@ class CommonKVManager(BaseKVManager):
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
-        target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
+        self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
+
+    def _send_abort_acks(
+        self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
+    ) -> None:
+        # With prefill TP < decode TP several decode ranks share one room and
+        # each sends its own ABORT; fan the ACK out to every one of them.
+        for target in (targets or {}).values():
             self._send_abort_ack(room, target)
 
     def register_deferred_ack_target(self, room: int, target: AckTarget) -> None:
         """Hold this generation's ACK until the room's transfer drains.
 
-        Active-room callers must mark the room Failed before registering so no
-        new chunk can be accepted after the ACK is sent.
+        Targets are kept per decode endpoint, so each decode rank that aborted
+        the room gets an ACK for its own latest generation. Active-room callers
+        must mark the room Failed before registering so no new chunk can be
+        accepted after the ACK is sent.
         """
-        if room not in self._deferred_ack_poisoned_rooms:
-            self._deferred_ack_targets[room] = target
+        if room in self._deferred_ack_poisoned_rooms:
+            return
+        # Replace instead of mutating in place: a concurrent drain pops the dict
+        # and iterates it. If the pop wins, the caller's immediate
+        # _maybe_ack_drained_abort retry re-sends the merged set, and a
+        # duplicate ACK is harmless because decode records ACKs in a set.
+        targets = dict(self._deferred_ack_targets.get(room, ()))
+        targets[(target.ip, target.port)] = target
+        self._deferred_ack_targets[room] = targets
 
     def poison_deferred_ack_room(self, room: int) -> None:
         """Drop an ACK target when the backend cannot prove the room drained."""
@@ -2072,6 +2089,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         raise NotImplementedError
 
