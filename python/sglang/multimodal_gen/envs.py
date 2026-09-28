@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
+    SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -334,6 +335,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "comfy_kitchen" forces one backend.
     "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
+    ),
+    # Path to a Parallel Decoding Distillation head stack (one fused output head
+    # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
+    # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
+    "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"

@@ -7,6 +7,22 @@ description: Use when choosing the fastest SGLang Diffusion flags for a model, G
 
 Use this skill when the user wants the fastest command line, lower VRAM, or the right performance flags for a specific model and GPU setup.
 
+## Start from the model's cookbook page
+
+Tune from the deployment we already recommend, not from scratch: read
+`docs/cookbook/diffusion/<Family>/` for the model first, take its command as
+the baseline, then apply the options below. The cookbook page is what users
+follow, so a recipe that silently disagrees with it on GPU count, parallelism
+degrees, or offload flags is a recipe for a configuration nobody runs.
+
+Families with a cookbook page: Cosmos, Ernie-Image, FLUX, Ideogram, JoyEcho,
+Krea, LTX, LingBot-Video, LingBot-World, LongLive, MOVA, MiniMax, Qwen-Image,
+SANA-Video, SANA-WM, Wan, Z-Image.
+
+`test/` configs are pinned CI setups for correctness and regression checks, not
+deployment advice. Use them when you need an exactly reproducible run, and note
+which cookbook flags you diverged from.
+
 Before running any `sglang generate` command below inside the diffusion container:
 - use `python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py` to derive the repo root, verify write access, and choose idle GPU(s)
 - export `HF_TOKEN` first when the selected model lives in a gated Hugging Face repo such as `black-forest-labs/FLUX.*`
@@ -152,7 +168,7 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 | **Cache-DiT** | Native: per-request `--enable-cache-dit true\|false` + `--cache-dit-params <json>` (sampling params; also via API `extra_body`). `SGLANG_CACHE_DIT_ENABLED` / `SGLANG_CACHE_DIT_*` env vars are the server-wide defaults for requests that leave them unset. Diffusers backend: `--backend diffusers --cache-dit-config <yaml-or-json>` | Caches intermediate residuals across denoising steps and skips redundant computations via DBCache, TaylorSeer, and optional SCM. | ~1.5-2x on supported models | Quality depends on cache policy. Compatible with `--dit-layerwise-offload`: skipped blocks are not streamed, and the first layer after a skip may sync-load. Models that touch every layer before the block loop (for example a full-stack AdaLN prepass) must keep that prepass off while caching. Do not pass `--cache-dit-config` for native SGLang tuning unless you are intentionally using the diffusers backend flow. |
 | **CFG Gating** | Per-request `--cfg-gate-step 0.5` (sampling param; also via API `extra_body`). `SGLANG_DIFFUSION_CFG_GATE_STEP` is the server-wide default (1.0 = off). | After the given fraction of denoising steps, reuses the cached cond-uncond residual instead of running the unconditional branch each step. | Up to ~2x on the gated tail of CFG models (skips one of two branches) | Lossy; no-op without classifier-free guidance or with `--enable-cfg-parallel`. Lower fractions gate earlier and drift more. |
 | **TeaCache** | `--enable-teacache` (uses model sampling presets) | Reuses residuals when adjacent denoising steps are sufficiently similar. | Model- and threshold-dependent | Approximate and model-specific. Mutually exclusive with Spectrum. Fix prompt/seed/shape/steps and validate temporal consistency, not only single frames. |
-| **Spectrum** | `--enable-spectrum` plus optional `--spectrum-*` controls | Forecasts DiT features and skips selected denoising steps. | Defaults target an accuracy/speed tradeoff; aggressive windows can be much faster | Native `sglang generate` only for FLUX.1, Wan, HunyuanVideo, and SD3; not FLUX.2 or server requests. Mutually exclusive with TeaCache. `--debug` adds shadow validation and is not representative latency. |
+| **Spectrum** | `--enable-spectrum` plus optional `--spectrum-*` controls | Forecasts DiT features and skips selected denoising steps. | Defaults target an accuracy/speed tradeoff; aggressive windows can be much faster | Native `sglang generate` for FLUX.1, Wan, HunyuanVideo, SD3, and MiniMax-H3; not FLUX.2 or server requests. Mutually exclusive with TeaCache. `--debug` is not representative latency. |
 | **Progressive Resolution** | `--progressive-mode dct_rewind --progressive-levels N --progressive-delta D` | Runs early denoising at lower latent resolution, then spectrally upsamples and switches to the target resolution. | Model- and schedule-dependent | Approximate and pipeline-specific. Keep the switch schedule fixed and compare detail, composition, and temporal stability. |
 | **Causal KV-Cache Quantization** | `--kv-cache-quant int4\|int2` plus optional `--kv-cache-quant-*` controls | Compresses completed causal KV-cache chunks with Quant-VideoGen PRQ while keeping the mutable/current chunk and recent chunks in BF16. | Primarily a long-session memory saving | Currently limited to LingBot World realtime causal serving; requires `quant-videogen`. INT4 is the starting point; INT2 saves more memory with more error. It quantizes cache state, not checkpoint weights. |
 | **Quantized Models (Nunchaku / SVDQuant)** | `--enable-svdquant --transformer-weights-path <path>` + optional `--quantization-precision int4\|nvfp4`, `--quantization-rank 32` | W4A4-style quantization via [Nunchaku](https://nunchaku.tech). Reduces DiT weight memory by ~4x. Precision/rank can be auto-inferred from weight filename or set explicitly. | ~1.5–2x compute speedup | Lossy quantization; quality depends on rank and precision. Requires pre-quantized weights. Ampere (SM8x) or SM12x only (no Hopper SM90). Higher rank = better quality but more memory. |
@@ -508,7 +524,7 @@ Use these as first commands to benchmark, not as universal winners.
 | FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
 | LingBot Video MoE 30B | 384x640, 17 frames, 12 steps for the current GPU case | `--model-path robbyant/lingbot-video-moe-30b-a3b --text-encoder-cpu-offload` | Native T2V path. Prompts are structured JSON captions, not raw free text; keep that contract when comparing latency or quality. Current main can mount the fused Triton RMSNorm path at `quality=extra-high` or `quality=high`; keep `lossless` as the reference. `--text-encoder-cpu-offload` targets memory-bound multi-GPU or small-VRAM cards; on a single large-VRAM GPU (e.g. 275 GB B300) the whole model stays resident (~73 GB peak), so dropping the flag removes H2D/D2H traffic and was 8% faster end to end (3.80s -> 3.49s, bit-identical). |
-| MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
+| MOVA / Helios / LingBot World | Start from the family's cookbook page — it pins the GPU count and parallelism these realtime paths need (e.g. LingBot World is served with `--num-gpus 4 --ulysses-degree 4`, LingBot World 2.0 with 8) | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. Realtime keeps up with playback only at the documented GPU count, so do not tune down from it by accident. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
 
 ## Historical PR Watchlist
 

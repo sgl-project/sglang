@@ -81,7 +81,12 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let body = request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap))?;
+    let engine_rid = request.engine_rid(pd.is_some());
+    let body = request.into_outgoing_body(
+        ctx,
+        pd.as_ref().map(|(_, bootstrap)| bootstrap),
+        engine_rid.as_deref(),
+    )?;
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -112,6 +117,7 @@ pub(super) async fn forward_chat_request(
         &response_worker,
         &headers,
         body,
+        engine_rid.as_deref(),
         response_load_guards,
         &metrics,
         expiration_token.clone(),
@@ -124,7 +130,7 @@ pub(super) async fn forward_chat_request(
             model: metrics.model.clone(),
         }),
     };
-    let log_context = metrics.record_dispatch_result(&result);
+    let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -171,6 +177,7 @@ fn spawn_prefill_request(
                 CHAT_PATH,
                 &headers,
                 body,
+                None,
             )
             .await
         {
@@ -188,11 +195,13 @@ fn spawn_prefill_request(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
     headers: &HeaderMap,
     body: Bytes,
+    engine_rid: Option<&str>,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
@@ -209,6 +218,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
@@ -226,6 +236,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
             )
             .await
     }
@@ -295,6 +306,7 @@ impl DispatchMetrics {
     fn record_dispatch_result(
         &self,
         result: &Result<Response<Body>, ApiError>,
+        engine_rid: Option<String>,
     ) -> RequestLogContext {
         let http_status = match result {
             Ok(response) => response.status().as_u16(),
@@ -326,6 +338,7 @@ impl DispatchMetrics {
             model_id: self.model.clone(),
             streaming: self.streaming,
             outcome,
+            engine_rid,
         }
     }
 }
