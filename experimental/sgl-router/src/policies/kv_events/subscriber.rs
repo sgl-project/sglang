@@ -19,7 +19,7 @@
 //!    socket; we defensively recognise the same value on the PUB stream
 //!    and surface it as a [`WorkerEvent::PublisherReset`] so the
 //!    downstream pump can clear its cursor before a reconnecting publisher
-//!    restarts from seq=1.
+//!    restarts from seq=0.
 //! 3. `payload` — msgpack-encoded [`KvEventBatch`].
 //!
 //! # Endpoint construction
@@ -136,7 +136,7 @@ pub enum WorkerEvent {
     },
     /// The publisher emitted its `END_SEQ` (-1) sentinel, signalling
     /// shutdown. A re-connecting publisher will restart its sequence
-    /// counter from 1; the pump uses this to reset the cursor so those
+    /// counter from 0; the pump uses this to reset the cursor so those
     /// fresh events are not filtered as out-of-order.
     PublisherReset { worker: KvWorkerId },
 }

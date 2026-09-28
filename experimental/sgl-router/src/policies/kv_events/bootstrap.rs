@@ -226,6 +226,10 @@ pub enum SweepOutcome {
     NoPeers,
     FleetCold,
     TimedOut,
+    /// Every rank the sweep was run for left `Pending` without this sweep's
+    /// snapshot — resolved from its own stream's origin, or settled cold
+    /// because every sibling proved it holds nothing for that rank.
+    RanksResolved,
 }
 
 impl SweepOutcome {
@@ -235,6 +239,7 @@ impl SweepOutcome {
             Self::NoPeers => "no_peers",
             Self::FleetCold => "fleet_cold",
             Self::TimedOut => "timed_out",
+            Self::RanksResolved => "ranks_resolved",
         }
     }
 }
@@ -279,6 +284,10 @@ pub enum RankOutcome {
     PublisherReset,
     /// The tree refused the snapshot's structure at graft time.
     TreeRejected,
+    /// The rank's first held batch was the publisher's first batch ever, so
+    /// its history is complete without a snapshot and nothing was fetched.
+    /// See `STREAM_ORIGIN_SEQ` in the index module.
+    FromOrigin,
 }
 
 impl RankOutcome {
@@ -292,6 +301,7 @@ impl RankOutcome {
             Self::Overflow => "overflow",
             Self::PublisherReset => "publisher_reset",
             Self::TreeRejected => "tree_rejected",
+            Self::FromOrigin => "from_origin",
         }
     }
 }
@@ -893,7 +903,7 @@ pub struct BootstrapTracker {
     /// deadline. A worker removed and re-added inside that window is `Pending`
     /// again, so the in-flight task's snapshot would be grafted onto the NEW
     /// incarnation and seed a watermark from the OLD publisher's numbering —
-    /// after which every batch from the fresh publisher (restarting at seq 1) is
+    /// after which every batch from the fresh publisher (restarting at seq 0) is
     /// filtered as out-of-order. The rank then sits on stale tree state
     /// indefinitely while reporting `Recovered`: "run wrong", which this module
     /// otherwise rules out. A process-wide counter is NOT sufficient, because a
