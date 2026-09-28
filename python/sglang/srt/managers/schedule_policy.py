@@ -123,6 +123,10 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
+# Same queue length at which LPM stops matching the waiting queue; bounds the
+# per-round cost of the cache-agnostic prefix refresh.
+WAITING_PREFIX_REFRESH_MAX_QUEUE = 128
+
 
 def _ceil_div(value: int, divisor: int) -> int:
     return -(-value // divisor)
@@ -266,12 +270,19 @@ class SchedulePolicy:
         policy = self._determine_active_policy(waiting_queue)
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
-        # set it in _compute_prefix_matches; do the same full match for
-        # cache-agnostic policies when the radix supports it, so the load
-        # snapshot has it. Skip on decode (never prefills).
+        # set it in _compute_prefix_matches; do the same full match for cache-agnostic
+        # policies. The match also refreshes last_access_time on the waiting request's
+        # prefix; without it the LRU evicts that prefix while the request waits behind
+        # prompts that exhaust the budget. Skip on decode (never prefills).
         if (
             not isinstance(policy, CacheAwarePolicy)
-            and self.tree_cache.supports_fast_match_prefix()
+            and (
+                self.tree_cache.supports_fast_match_prefix()
+                or (
+                    envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+                    and len(waiting_queue) <= WAITING_PREFIX_REFRESH_MAX_QUEUE
+                )
+            )
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
