@@ -2925,6 +2925,80 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         info = checker._parallelism_info(role="target")
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
+    def _striped_decode_context(self):
+        """This process is rank 5 of a TP-8 deployment striping KV eight ways."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", tp_size=8, dcp_size=8),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=5),
+        )
+
+    def _decode_context_names(self):
+        parallel = get_parallel()
+        return (
+            parallel.dcp_enabled,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            parallel.attn_dcp_size,
+            parallel.attn_dcp_rank,
+            parallel.dcp_group,
+        )
+
+    def test_the_decode_context_swap_states_every_member_it_installs(self):
+        """A draft that kept the target's group or rank beside a narrowed width
+        would describe a topology no deployment produces."""
+        from sglang.srt.distributed import parallel_state
+
+        self._striped_decode_context()
+        self.assertEqual(get_parallel().attn_dcp_size, 8)
+        with parallel_state.patch_decode_context_parallel_group(None):
+            self.assertEqual(self._decode_context_names(), (False, 1, 0, 1, 0, None))
+            self.assertIsNone(parallel_state.get_dcp_group_no_assert())
+        self.assertEqual(get_parallel().attn_dcp_size, 8)
+        self.assertEqual(get_parallel().attn_dcp_rank, 5)
+
+    def test_the_decode_context_swap_nests(self):
+        """Draft chain decode runs inside a draft forward, so an inner scope
+        cannot know whether an outer one is open."""
+        from sglang.srt.distributed import parallel_state
+
+        self._striped_decode_context()
+        with parallel_state.patch_decode_context_parallel_group(None):
+            with parallel_state.patch_decode_context_parallel_group(None):
+                self.assertFalse(get_parallel().dcp_enabled)
+            self.assertFalse(get_parallel().dcp_enabled)
+            self.assertEqual(get_parallel().attn_dcp_size, 1)
+        self.assertTrue(get_parallel().dcp_enabled)
+
+    def test_the_decode_context_swap_restores_after_a_raise(self):
+        from sglang.srt.distributed import parallel_state
+
+        self._striped_decode_context()
+        with self.assertRaises(RuntimeError):
+            with parallel_state.patch_decode_context_parallel_group(None):
+                raise RuntimeError("draft init failed")
+        self.assertTrue(get_parallel().dcp_enabled)
+        self.assertEqual(get_parallel().attn_dcp_size, 8)
+
+    def test_the_decode_context_swap_is_inert_without_striping(self):
+        """Every deployment without DCP already reads what the scope installs."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", tp_size=8),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=5),
+        )
+        before = (get_parallel().dcp_enabled, get_parallel().attn_dcp_size)
+        with parallel_state.patch_decode_context_parallel_group(None):
+            self.assertEqual(
+                (get_parallel().dcp_enabled, get_parallel().attn_dcp_size), before
+            )
+
 
 def _calls_named(text: str, name: str) -> int:
     """How many times ``name`` is called in ``text``."""

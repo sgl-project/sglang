@@ -245,6 +245,7 @@ _RANK_AND_WIDTH = (
     ("attn_tp_rank", "attn_tp_size"),
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
+    ("attn_dcp_rank", "attn_dcp_size"),
     ("moe_ep_rank", "moe_ep_size"),
 )
 
@@ -255,6 +256,7 @@ _WIDTH_AND_GROUP = (
     ("pp_size", "pp_group"),
     ("attn_tp_size", "attn_tp_group"),
     ("attn_cp_size", "attn_cp_group"),
+    ("attn_dcp_size", "dcp_group"),
     ("moe_ep_size", "moe_ep_group"),
 )
 
