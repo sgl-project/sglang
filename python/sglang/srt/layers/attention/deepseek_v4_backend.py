@@ -2852,13 +2852,30 @@ class DeepseekV4AttnBackend(
         core = self.forward_metadata.core_metadata
         state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
         kv, score = layer.compressor.project(x)
-        fuse_pool_norm = (
+        if (
             get_platform().is_sm90
             and 0 < x.shape[0] <= 64
             and layer.compressor.norm.weight.shape == (512,)
-            and layer.compressor.norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and layer.compressor.norm.weight.dtype == torch.bfloat16
             and layer.compressor.norm.weight.is_contiguous()
-        )
+            and layer.compressor.norm.weight.data_ptr() % 4 == 0
+            and self.token_to_kv_pool.get_extra_key_layout(layer.layer_id)
+            is KVLayout.V4
+            and (
+                layer.indexer is None
+                or not layer.indexer.owns_k
+                or (
+                    layer.indexer.index_head_dim == 128
+                    and layer.indexer.k_norm.weight.dtype == torch.bfloat16
+                    and layer.indexer.k_norm.weight.is_contiguous()
+                    and layer.indexer.k_norm.weight.data_ptr() % 4 == 0
+                )
+            )
+        ):
+            self._low_ratio_compress_fused(
+                layer, x, req, pos, kv_score_input=torch.cat((kv, score), dim=-1)
+            )
+            return
         pooled, group_pos, slots = c2_decode_pool(
             kv,
             score,
@@ -2870,8 +2887,6 @@ class DeepseekV4AttnBackend(
             state.kv_score_buffer.score,
             state.kv_score_buffer.shape[0] - 1,
             ring_size=state.ring_size,
-            norm_weight=layer.compressor.norm.weight if fuse_pool_norm else None,
-            norm_eps=layer.compressor.norm.eps,
         )
         self._low_ratio_write_group(
             layer,
@@ -2879,10 +2894,11 @@ class DeepseekV4AttnBackend(
             slots,
             group_pos,
             fuse_index_store=is_sm100_or_newer(),
-            normalized=fuse_pool_norm,
         )
 
-    def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
+    def _low_ratio_compress_fused(
+        self, layer, x, req, pos, *, draft_len=1, kv_score_input=None
+    ) -> None:
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
@@ -2921,8 +2937,19 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
+            out = None
+            if kv_score_input is None:
+                kv_score_input = compressor.project_fused(x)
+            else:
+                # C2 leaves incomplete and padded rows untouched; initialize
+                # them before the index projection on every graph replay.
+                out = torch.zeros(
+                    (kv_score_input.shape[0], kv_score_input.shape[1] // 2),
+                    dtype=torch.bfloat16,
+                    device=kv_score_input.device,
+                )
             latent = c2_decode_norm_rope_store(
-                compressor.project_fused(x),
+                kv_score_input,
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,
@@ -2935,6 +2962,7 @@ class DeepseekV4AttnBackend(
                 ring_size=state.ring_size,
                 draft_len=draft_len,
                 layout=kv_layout,
+                out=out,
             )
             out_loc = core.c2_out_loc
 
@@ -3034,10 +3062,9 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
-        normalized=False,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = pooled if normalized else layer.compressor.finish(pooled)
+        latent = layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.

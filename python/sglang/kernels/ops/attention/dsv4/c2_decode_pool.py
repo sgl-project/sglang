@@ -114,35 +114,13 @@ def c2_decode_pool(
     pad_row: int,
     *,
     ring_size: int = 0,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ratio-2 decode pair pooling; updates `state_kv` / `state_score` in place.
 
     With ring_size > 0 the state halves may be views of an interleaved
     CompressStatePool ring, one row per request otherwise; pad_row is the
-    padded-graph-row sentinel and is never written when ring_size > 0.
-    With norm_weight, use the C2 JIT to return the BF16 pre-RoPE latent
-    after pool rounding and RMSNorm.
+    padded-graph-row sentinel and is never written.
     """
-    if norm_weight is not None:
-        from .low_ratio_compress import _c2_decode_pool_norm
-
-        return _c2_decode_pool_norm(
-            kv,
-            score,
-            pos,
-            raw_out_loc,
-            out_loc,
-            req,
-            state_kv,
-            state_score,
-            pad_row,
-            ring_size=ring_size,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-        )
-
     assert kv.is_contiguous() and score.is_contiguous()
     assert state_kv.stride(1) == state_score.stride(1) == 1
     assert kv.dtype == torch.float32 and score.dtype == torch.float32

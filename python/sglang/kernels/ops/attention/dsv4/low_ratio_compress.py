@@ -112,33 +112,21 @@ def _jit_c2_module(
     rope_dim: int,
     page_size: int,
     layout: KVLayout,
-    *,
-    pool_norm_only: bool = False,
-    weight_dtype: torch.dtype = torch.bfloat16,
 ) -> Module:
-    template_args = (
+    args = make_cpp_args(
         head_dim,
         rope_dim,
         page_size,
         layout.cpp_name,
         is_arch_support_pdl(),
     )
-    if pool_norm_only:
-        if head_dim != 512 or weight_dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("C2 pool/norm requires head_dim=512 and BF16/FP32 weights")
-        template_args += ("C2Mode::PoolNorm", weight_dtype)
-    args = make_cpp_args(*template_args)
-    name, entry = (
-        ("pool_norm", "run_pool_norm")
-        if pool_norm_only
-        else ("decode_fusion", "run_decode_fusion")
-    )
     return load_jit(
         make_name("c2_decode"),
-        *(arg.replace("::", "_") for arg in args),
+        *args,
         cuda_files=["deepseek_v4/c2.cuh"],
-        cuda_wrappers=[(name, f"FlashCompress2Kernel<{args}>::{entry}")],
-        extra_cuda_cflags=["--fmad=false"] if pool_norm_only else None,
+        cuda_wrappers=[
+            ("decode_fusion", f"FlashCompress2Kernel<{args}>::run_decode_fusion"),
+        ],
     )
 
 
@@ -196,50 +184,3 @@ def c2_decode_norm_rope_store(
         draft_len,
     )
     return out
-
-
-def _c2_decode_pool_norm(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    pos: torch.Tensor,
-    raw_out_loc: torch.Tensor,
-    out_loc: torch.Tensor,
-    req: torch.Tensor,
-    state_kv: torch.Tensor,
-    state_score: torch.Tensor,
-    pad_row: int,
-    *,
-    ring_size: int,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pool/norm mode of the C2 kernel for separate FP32 projections."""
-    pooled = torch.empty_like(kv, dtype=torch.bfloat16)
-    group_pos = torch.empty_like(pos)
-    slots = torch.empty(kv.shape[0], dtype=out_loc.dtype, device=out_loc.device)
-    module = _jit_c2_module(
-        kv.shape[-1],
-        0,
-        0,
-        KVLayout.V4,
-        pool_norm_only=True,
-        weight_dtype=norm_weight.dtype,
-    )
-    module.pool_norm(
-        kv,
-        score,
-        pos,
-        raw_out_loc,
-        out_loc,
-        req,
-        state_kv,
-        state_score,
-        pad_row,
-        ring_size,
-        norm_weight,
-        norm_eps,
-        pooled,
-        group_pos,
-        slots,
-    )
-    return pooled, group_pos, slots

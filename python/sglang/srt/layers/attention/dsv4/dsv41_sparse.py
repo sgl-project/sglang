@@ -87,9 +87,10 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels pack fp4 with
-    `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
-    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
+    """Select the packed projection layout and full decode/verify path.
+
+    Hopper C2 decode separately reuses the kernels with split projections.
+    """
     if not torch.cuda.is_available() or torch.version.hip is not None:
         return False
     return torch.cuda.get_device_capability()[0] >= 10
