@@ -6,13 +6,13 @@ SGLang can reuse exact conditioning across requests and cache intermediate denoi
 
 ## Conditioning cache
 
-Native pipelines enable a CPU conditioning cache by default. Repeated inputs can reuse text embeddings (including negative prompts), image or vision-language encoder outputs, and VAE posteriors. The shared LRU holds at most **512 MiB per executor/rank**, with at most 128 entries. It does not retain cached tensors on the GPU between executions. Oversized results are not admitted to the CPU cache.
+Native pipelines enable a conditioning cache by default. Repeated inputs can reuse text embeddings (including negative prompts), image or vision-language encoder outputs, and VAE posteriors. The shared LRU holds at most **512 MiB per executor/rank** across CPU and device entries, with at most 128 entries. The common text stage keeps consumed negative conditioning on its original device to avoid repeated CPU-to-GPU transfers and postprocessing. Other entries live on the CPU. Oversized results are not admitted.
 
 Within a grouped or batched stage, the same conditioning boundary can reuse a device result before consulting the CPU cache. The common text stage and the Qwen-Image 2.1, Ming-Image, and LingBot-Video text stages share read-only consumed tensors and give each request its own containers. Other cached boundaries return private copies, with device snapshots limited to 512 MiB and 128 entries per stage. These temporary references are released when the stage finishes or fails. Group reuse remains available when cross-request caching is disabled or its CPU budget is too small.
 
 The standard text encoding stage stores the final embeddings, pooled outputs, masks, and sequence lengths. A hit skips encoder weight preparation, token uploads, and mask construction; CPU tokenization still runs to match the inputs. Qwen-Image 2.1 also caches its consumed prompt embeddings and image-token slots before processor execution, while retaining separate vision-feature reuse for changed edit instructions. Other custom stages and batch-DP encoding retain caching at the native encoder boundary.
 
-Hits restore outputs to their original devices. This can change peak GPU allocation even though entries live on the CPU; measure memory as well as latency when using a tight VRAM budget.
+CPU hits restore outputs to their original devices; device hits return private device copies. Negative conditioning can therefore retain GPU memory between requests, within the shared cache budget. Measure memory as well as latency when using a tight VRAM budget.
 
 This is most useful when generating several variations from the same prompt or reference image, especially with a layerwise-offloaded encoder. A changed edit instruction recomputes the joint vision-language embedding, while the unchanged image can still reuse its vision features and VAE posterior. Separate CLI invocations start separate processes and cannot share this cache. Denoising and output decoding still run for every request, so end-to-end gains depend on how much time the original request spends encoding conditioning.
 
@@ -22,13 +22,13 @@ To disable cross-request conditioning reuse:
 sglang serve --model-path Qwen/Qwen-Image-2.1 --disable-conditioning-cache
 ```
 
-To increase the CPU budget:
+To increase the shared cache budget:
 
 ```bash
 sglang serve --model-path Qwen/Qwen-Image-2.1 --conditioning-cache-max-size-mb 1024
 ```
 
-The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_conditioning_cache` and `conditioning_cache_max_size_mb`. A capacity of `0` also disables the CPU cache. Neither setting disables conditioning reuse within a grouped stage or changes per-output seeds.
+The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_conditioning_cache` and `conditioning_cache_max_size_mb`. A capacity of `0` also disables both cross-request tiers. Neither setting disables conditioning reuse within a grouped stage or changes per-output seeds.
 
 ### Matching and correctness
 
@@ -45,7 +45,7 @@ The common encoder boundary covers native CLIP, T5/UMT5, Llama, Mistral 3, Gemma
 
 Cosmos3 has no separate text encoder: its deterministic understanding pathway caches immutable per-layer K/V results, which are copied into fresh request state. SenseNova-U1 caches reference-image vision features; its noisy-image vision path still runs at each denoising step. VLA keeps its model-owned observation/prefix cache.
 
-FSDP disables cross-request caching and caching inside sharded modules. Consumed text-conditioning outputs still support group-local reuse, with all ranks agreeing before skipping the encoder. The common text stage also reuses consumed outputs from library fallback encoders within a group. Batch-DP can skip encoding and its output gather only when all participating ranks have the group result; otherwise each encoder copy retains its normal cache and gather behavior.
+FSDP disables cross-request caching and caching inside sharded modules. Consumed text-conditioning outputs still support group-local reuse, with all ranks agreeing before skipping the encoder. The common text stage also reuses consumed outputs from library fallback encoders within a group and keeps their negative conditioning device-hot across requests. Batch-DP can skip encoding and its output gather only when all participating ranks have the consumed result; this includes device-hot negatives. Otherwise each encoder copy retains its normal cache and gather behavior.
 
 Stateful autoregressive calls (`use_cache=True` or existing `past_key_values`), training/autograd, CUDA Graph capture, unsupported tensor or output types, and distributed VAE encoding bypass the shared caches. External SRT encoders and the Diffusers pipeline backend keep their own cache behavior. The global disable flag also disables existing realtime text and VLA prefix reuse; those model-specific caches otherwise retain their own memory settings.
 

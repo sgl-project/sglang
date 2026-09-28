@@ -3042,7 +3042,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--conditioning-cache-max-size-mb",
             type=float,
             default=ServerArgs.conditioning_cache_max_size_mb,
-            help="Per-worker CPU conditioning cache capacity in MiB (default: 512; 0 disables).",
+            help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
         )
         parser.add_argument(
             "--backend",

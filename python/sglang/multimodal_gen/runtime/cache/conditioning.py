@@ -153,8 +153,50 @@ class _CacheEntry:
     ready: tuple[torch.cuda.Event, ...]
     owner: int
     preferred: bool
+    device_resident: bool = False
+
+    @classmethod
+    def snapshot(cls, output, size, owner, preferred, device_resident):
+        tensors = {}
+        copy_streams = {}
+
+        def snapshot_tensor(t):
+            if id(t) not in tensors:
+                if t.device.type == "cuda":
+                    copy_streams[t.device] = torch.cuda.current_stream(t.device)
+                if device_resident:
+                    stored = t.detach().clone()
+                elif t.device.type == "cuda":
+                    stored = torch.empty_like(t, device="cpu", pin_memory=True)
+                    stored.copy_(t.detach(), non_blocking=True)
+                else:
+                    stored = t.detach().to("cpu", copy=True)
+                tensors[id(t)] = (
+                    stored if device_resident else _HostTensor(stored, t.device)
+                )
+            return tensors[id(t)]
+
+        stored = _map_output(output, snapshot_tensor)
+        # snapshot before downstream mutations on each producing stream
+        ready = []
+        for stream in copy_streams.values():
+            event = torch.cuda.Event()
+            event.record(stream)
+            ready.append(event)
+        return cls(stored, size, tuple(ready), owner, preferred, device_resident)
 
     def wait(self):
+        if self.device_resident:
+            for event in self.ready:
+                torch.cuda.current_stream(event.device).wait_event(event)
+
+            def record(t):
+                if t.device.type == "cuda":
+                    t.record_stream(torch.cuda.current_stream(t.device))
+                return t
+
+            _map_output(self.output, record)
+            return
         for event in self.ready:
             event.synchronize()
 
@@ -230,7 +272,7 @@ def _map_output(value, tensor_fn, *, restore=False):
 
 
 class ConditioningCache:
-    """One cache per executor/rank with private host entries and scoped device reuse."""
+    """One bounded cache per rank with host entries and device-hot conditioning."""
 
     def __init__(self, max_bytes: int):
         if max_bytes < 0:
@@ -285,6 +327,9 @@ class ConditioningCache:
             entries=len(self._entries),
             bytes=self.bytes,
             group_hits=self.group_hits,
+            device_bytes=sum(
+                entry.size for entry in self._entries.values() if entry.device_resident
+            ),
         )
 
     def _identity(self, owner):
@@ -364,6 +409,7 @@ class ConditioningCache:
         namespace=None,
         share_in_group=False,
         cross_request=True,
+        keep_on_device=False,
     ):
         group_entries = self._group_entries.get()
         cross_request = cross_request and _cross_request_cache.get()
@@ -421,7 +467,15 @@ class ConditioningCache:
                     restored[id(t)] = t.data.to(t.device, copy=True, non_blocking=True)
                 return restored[id(t)]
 
-            output = _map_output(entry.output, restore, restore=True)
+            output = (
+                _copy_output(entry.output)
+                if entry.device_resident
+                else _map_output(entry.output, restore, restore=True)
+            )
+            if keep_on_device and not entry.device_resident:
+                self._entries[key] = _CacheEntry.snapshot(
+                    output, entry.size, entry.owner, True, True
+                )
             self._remember_group(key, output, entry.owner, share_in_group)
             return output
         if key is None:
@@ -478,30 +532,8 @@ class ConditioningCache:
             removed.wait()
             self.bytes -= removed.size
             self.evictions += 1
-        tensors = {}
-        copy_streams = {}
-
-        def snapshot(t):
-            if id(t) not in tensors:
-                if t.device.type == "cuda":
-                    copy_streams[t.device] = torch.cuda.current_stream(t.device)
-                    host = torch.empty_like(t, device="cpu", pin_memory=True)
-                    host.copy_(t.detach(), non_blocking=True)
-                else:
-                    host = t.detach().to("cpu", copy=True)
-                tensors[id(t)] = _HostTensor(host, t.device)
-            return tensors[id(t)]
-
-        stored = _map_output(output, snapshot)
-        # Copies precede downstream mutations on each producing stream. Wait
-        # only before reading or freeing host storage, not on the cold path.
-        ready = []
-        for stream in copy_streams.values():
-            event = torch.cuda.Event()
-            event.record(stream)
-            ready.append(event)
-        self._entries[key] = _CacheEntry(
-            stored, size, tuple(ready), self._identity(model), preferred
+        self._entries[key] = _CacheEntry.snapshot(
+            output, size, self._identity(model), preferred, keep_on_device
         )
         self.bytes += size
         logger.debug(
@@ -542,6 +574,10 @@ def cached_encoder_call(
     share_in_group=False,
     cross_request=True,
 ):
+    # only consumed negative conditioning is device-hot; raw hidden states and
+    # other encoder boundaries keep their host-cache policy
+    keep_on_device = namespace is not None and share_in_group and _prefer_cache.get()
+    cross_request = cross_request or keep_on_device
     cache = _inference_cache(
         model, share_in_group=share_in_group, cross_request=cross_request
     )
@@ -576,6 +612,7 @@ def cached_encoder_call(
         namespace=namespace,
         share_in_group=share_in_group,
         cross_request=cross_request,
+        keep_on_device=keep_on_device,
     )
 
 

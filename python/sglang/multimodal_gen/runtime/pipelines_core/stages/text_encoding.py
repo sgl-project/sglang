@@ -749,8 +749,8 @@ class TextEncodingStage(ConditionEncodingStage):
                     cache_group = get_replica_group()
                 elif cache_group is None:
                     cache_group = get_tp_group()
-            # consumed embeddings have no intermediate-state size limit; library
-            # and batch-DP encoders retain them only for the current group
+            # library and batch-DP positives retain consumed outputs only within
+            # the group; preferred negatives also use the bounded device cache
             conditioning = cached_encoder_call(
                 text_encoder,
                 (cache_inputs,),

@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -388,13 +389,65 @@ def test_grouped_conditioning_reuses_positive_and_negative_independently(
 
     second = executor.execute_group([stage], requests(), args)
     assert stage.forward.call_count == 4
-    persistent = capacity == 4096 and not fsdp and native and not warmup
-    assert encoder.calls == (3 if persistent else 6)
+    persistent = capacity == 4096 and not fsdp and not warmup
+    expected_calls = (3 if native else 5) if persistent else 6
+    assert encoder.calls == expected_calls
     torch.testing.assert_close(second[0].prompt_embeds[0], expected, rtol=0, atol=0)
     assert second[0].prompt_seq_lens == [[2]]
     assert executor.conditioning_cache.bytes <= capacity
-    if fsdp or not native:
+    if fsdp:
         assert executor.conditioning_cache.bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("native", [False, True])
+@torch.no_grad()
+def test_negative_conditioning_keeps_private_device_snapshot(native):
+    encoder = (FullHiddenStateEncoder() if native else LibraryEncoder()).cuda().eval()
+    config = make_text_config("structured")
+    config.postprocess_text_funcs[0] = Mock(wraps=config.postprocess_text_funcs[0])
+    args = make_server_args(pipeline_config=config)
+    with patch(_GLOBAL_ARGS_PATCH, return_value=args):
+        stage = TextEncodingStage([encoder], [object()])
+    stage._text_encode_dp_group = Mock(return_value=None)
+    stage._begin_text_encoder_use = Mock()
+    stage.encode_text = partial(stage.encode_text, device="cuda")
+    cache = ConditioningCache(4096)
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+
+    with cache.scope(), torch.cuda.stream(producer):
+        first = stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+        expected = first[0][0].clone()
+        first[0][0].zero_()
+        first[1][0].zero_()
+        first[4][0][0] = 0
+        entry = next(iter(cache._entries.values()))
+        assert entry.device_resident
+        assert entry.output[0].device.type == "cuda"
+        assert entry.output[0].data_ptr() != first[0][0].data_ptr()
+        assert cache.stats()["device_bytes"] == cache.bytes <= 4096
+
+    consumer.wait_stream(producer)
+    with cache.scope(), torch.cuda.stream(consumer):
+        for _ in range(2):
+            hit = stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+            torch.testing.assert_close(hit[0][0], expected, rtol=0, atol=0)
+            assert hit[1][0].tolist() == [[1, 1]]
+            assert hit[4] == [[2]]
+            hit[0][0].zero_()
+        assert encoder.calls == config.postprocess_text_funcs[0].call_count == 1
+        stage._begin_text_encoder_use.assert_called_once_with(0)
+        conditioning.invalidate_conditioning_caches([encoder])
+        assert cache.bytes == cache.stats()["device_bytes"] == 0
+        stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+        assert encoder.calls == 2
+        with cache.scope(refresh=True):
+            stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+        assert encoder.calls == 3
+        stage.get_or_compute_negative_text_embedding(
+            make_req(negative_prompt="changed negative"), args, [0]
+        )
+        assert encoder.calls == 4
 
 
 @torch.no_grad()
@@ -662,7 +715,7 @@ class TextEncodingDPGroup:
         return torch.cat(outputs, dim=dim)
 
 
-def run_text_encoding_dp(rank, rendezvous, grouped):
+def run_text_encoding_dp(rank, rendezvous, grouped, negative):
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -683,6 +736,7 @@ def run_text_encoding_dp(rank, rendezvous, grouped):
             torch.no_grad(),
             cache.scope(),
             cache.group_scope(enabled=grouped),
+            conditioning.prefer_conditioning_cache() if negative else nullcontext(),
             patch(f"{stage_module}.model_parallel_is_initialized", return_value=True),
             patch(f"{stage_module}.get_replica_group", return_value=group),
         ):
@@ -693,23 +747,24 @@ def run_text_encoding_dp(rank, rendezvous, grouped):
                 outputs = stage.encode_text(
                     ["a", "bb", "ccc"], args, device="cpu", return_attention_mask=True
                 )
-                if grouped and attempt == 2:
+                if (grouped or negative) and attempt == 2:
                     assert group.gathers == before
                 else:
                     assert group.gathers > before
                 assert outputs[0][0][:, 0, 0].tolist() == [10, 11, 12]
                 assert outputs[4] == [[2, 2, 2]]
-        assert encoder.calls == (2 if rank == 0 else 1)
-        assert cache.hits == (1 if rank == 0 else 2)
+        assert encoder.calls == (2 if negative or rank == 0 else 1)
+        assert cache.hits == (1 if negative or rank == 0 else 2)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("grouped", [False, True])
-def test_batch_dp_requires_consensus_to_skip_gather(tmp_path, grouped):
+@pytest.mark.parametrize("negative", [False, True])
+def test_batch_dp_requires_consensus_to_skip_gather(tmp_path, grouped, negative):
     mp.spawn(
         run_text_encoding_dp,
-        args=(f"file://{tmp_path / 'dp-rendezvous'}", grouped),
+        args=(f"file://{tmp_path / 'dp-rendezvous'}", grouped, negative),
         nprocs=2,
         join=True,
     )

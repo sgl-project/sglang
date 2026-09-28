@@ -127,6 +127,43 @@ def test_lru_budget_and_oversized_outputs():
 
 
 @torch.no_grad()
+def test_device_hot_promotion_shares_budget_and_eviction_with_host_entries():
+    cache = ConditioningCache(32)
+    model = Encoder().eval()
+    namespace = Encoder().eval()
+
+    def encode(value):
+        return cached_encoder_call(
+            model,
+            (value,),
+            {},
+            lambda: model(torch.full((4,), value)),
+            namespace=namespace,
+            share_in_group=True,
+        )
+
+    with cache.scope():
+        encode(1.0)
+        encode(2.0)
+        assert cache.bytes == 32 and cache.stats()["device_bytes"] == 0
+        with prefer_conditioning_cache():
+            promoted = encode(1.0)
+            promoted.last_hidden_state.zero_()
+            assert cache.bytes == 32 and cache.stats()["device_bytes"] == 16
+            encode(3.0)
+        assert cache.bytes == cache.stats()["device_bytes"] == 32
+        encode(4.0)  # a cold positive must not evict either preferred negative
+        assert cache.bytes == cache.stats()["device_bytes"] == 32
+        with prefer_conditioning_cache():
+            torch.testing.assert_close(encode(1.0).last_hidden_state, torch.ones(4))
+            encode(5.0)  # replaces the least-recent negative within the same budget
+        assert cache.evictions == 2
+        assert cache.bytes == cache.stats()["device_bytes"] == 32
+        cache.clear()
+        assert cache.bytes == cache.stats()["device_bytes"] == 0
+
+
+@torch.no_grad()
 def test_warmup_executes_nested_encoders_and_seeds_serving_cache():
     cache = ConditioningCache(4096)
     model = VisionLanguageEncoder().eval()
