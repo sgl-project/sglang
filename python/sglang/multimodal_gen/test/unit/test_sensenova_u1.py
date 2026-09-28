@@ -1042,6 +1042,10 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         guidance_scale=4.5,
         num_inference_steps=30,
         num_outputs_per_prompt=2,
+        profile=True,
+        profile_all_stages=True,
+        num_profiled_timesteps=3,
+        perf_dump_path="/tmp/sensenova-perf.json",
         cfg_norm="global",
         timestep_shift=9.0,
         think_mode=True,
@@ -1058,6 +1062,11 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
     assert "think_mode" not in cli_args
+    request = Req(sampling_params=SenseNovaU1SamplingParams(**cli_args))
+    assert request.profile
+    assert request.profile_all_stages
+    assert request.num_profiled_timesteps == 3
+    assert request.perf_dump_path == "/tmp/sensenova-perf.json"
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():

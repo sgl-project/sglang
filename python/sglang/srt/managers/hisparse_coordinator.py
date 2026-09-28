@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.kvcache.hisparse import HiSparseSpecState
@@ -79,7 +80,6 @@ class HiSparseTokenStats(NamedTuple):
 def resolve_shared_index_layers(
     *,
     hf_text_config,
-    pp_size: int,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
 
@@ -97,7 +97,9 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1:
+    # Speculative decoding is supported by the HiSparse multi-step swap path;
+    # only pipeline parallelism still prevents the shared-index prefetch plan.
+    if get_parallel().pp_size != 1:
         logger.warning(
             "HiSparse shared-index prefetch is unsupported under pipeline "
             "parallelism; falling back to synchronous swap-in."
