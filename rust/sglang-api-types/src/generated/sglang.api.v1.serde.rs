@@ -483,6 +483,351 @@ impl<'de> ::serde::Deserialize<'de> for ErrorBody {
     }
 }
 
+impl ::serde::Serialize for Matched {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(matched::Value::Token(v)) => v.serialize(serializer),
+            Some(matched::Value::Str(v)) => v.serialize(serializer),
+            Some(matched::Value::Tokens(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for Matched {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = Matched;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the Matched shapes")
+            }
+            fn visit_i64<E: ::serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Matched {
+                    value: Some(matched::Value::Token(v)),
+                })
+            }
+            fn visit_u64<E: ::serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                let v = i64::try_from(v).map_err(|_| E::custom("integer out of range"))?;
+                Ok(Matched {
+                    value: Some(matched::Value::Token(v)),
+                })
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Matched {
+                    value: Some(matched::Value::Str(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(Matched {
+                    value: Some(matched::Value::Str(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <MatchedTokens as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(Matched {
+                    value: Some(matched::Value::Tokens(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for MatchedTokens {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.ids.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for MatchedTokens {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(MatchedTokens {
+            ids: <::prost::alloc::vec::Vec<i64> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for FinishStop {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.matched {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for FinishStop {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = FinishStop;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct FinishStop")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_matched = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "matched" => {
+                            if f_matched.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("matched"));
+                            }
+                            f_matched = Some(map.next_value::<Option<Matched>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(FinishStop {
+                    matched: f_matched.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for FinishLength {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.length {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for FinishLength {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = FinishLength;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct FinishLength")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_length = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "length" => {
+                            if f_length.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("length"));
+                            }
+                            f_length = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(FinishLength {
+                    length: f_length.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for FinishAbort {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "status_code", &self.status_code)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "err_type", &self.err_type)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for FinishAbort {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = FinishAbort;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct FinishAbort")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_message = None;
+                let mut f_status_code = None;
+                let mut f_err_type = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "status_code" => {
+                            if f_status_code.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("status_code"));
+                            }
+                            f_status_code = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "err_type" => {
+                            if f_err_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("err_type"));
+                            }
+                            f_err_type =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(FinishAbort {
+                    message: f_message.flatten(),
+                    status_code: f_status_code.flatten(),
+                    err_type: f_err_type.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for FinishReason {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.kind {
+            Some(finish_reason::Kind::Stop(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "stop")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", &v.matched)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(finish_reason::Kind::Length(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "length")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", &v.length)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(finish_reason::Kind::Abort(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "abort")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &v.message)?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "status_code",
+                    &v.status_code,
+                )?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "err_type", &v.err_type)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(finish_reason::Kind::Unknown(v)) => ::serde::Serialize::serialize(
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+                serializer,
+            ),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for FinishReason {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn fallback<E: ::serde::de::Error>(
+            raw: ::serde_json::Map<String, ::serde_json::Value>,
+        ) -> Result<FinishReason, E> {
+            Ok(FinishReason {
+                kind: Some(finish_reason::Kind::Unknown(
+                    ::serde_json::Value::Object(raw).to_string(),
+                )),
+            })
+        }
+        let raw = ::serde_json::Map::<String, ::serde_json::Value>::deserialize(deserializer)?;
+        let tag = raw.get("type").and_then(::serde_json::Value::as_str);
+        #[allow(clippy::redundant_closure_call)]
+        (|raw: ::serde_json::Map<String, ::serde_json::Value>| match tag {
+            Some("stop") => {
+                let payload = FinishStop {
+                    matched: match raw.get("matched") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<Matched>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(FinishReason {
+                    kind: Some(finish_reason::Kind::Stop(payload.into())),
+                })
+            }
+            Some("length") => {
+                let payload = FinishLength {
+                    length: match raw.get("length") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<u64>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(FinishReason {
+                    kind: Some(finish_reason::Kind::Length(payload.into())),
+                })
+            }
+            Some("abort") => {
+                let payload =
+                    FinishAbort {
+                        message: match raw.get("message") {
+                            None | Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        status_code: match raw.get("status_code") {
+                            None | Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<u32>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        err_type: match raw.get("err_type") {
+                            None | Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                    };
+                Ok(FinishReason {
+                    kind: Some(finish_reason::Kind::Abort(payload.into())),
+                })
+            }
+            _ => fallback(raw),
+        })(raw.clone())
+    }
+}
+
 impl SamplingParams {
     /// The schema default when unset (protobuf arrival).
     pub fn max_new_tokens_or_default(&self) -> i64 {
@@ -981,351 +1326,6 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             }
         }
         deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for Matched {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.value {
-            Some(matched::Value::Token(v)) => v.serialize(serializer),
-            Some(matched::Value::Str(v)) => v.serialize(serializer),
-            Some(matched::Value::Tokens(v)) => v.serialize(serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for Matched {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = Matched;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("one of the Matched shapes")
-            }
-            fn visit_i64<E: ::serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(Matched {
-                    value: Some(matched::Value::Token(v)),
-                })
-            }
-            fn visit_u64<E: ::serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-                let v = i64::try_from(v).map_err(|_| E::custom("integer out of range"))?;
-                Ok(Matched {
-                    value: Some(matched::Value::Token(v)),
-                })
-            }
-            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(Matched {
-                    value: Some(matched::Value::Str(v.to_owned())),
-                })
-            }
-            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(Matched {
-                    value: Some(matched::Value::Str(v)),
-                })
-            }
-            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
-                self,
-                seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let v = <MatchedTokens as ::serde::Deserialize>::deserialize(
-                    ::serde::de::value::SeqAccessDeserializer::new(seq),
-                )?;
-                Ok(Matched {
-                    value: Some(matched::Value::Tokens(v)),
-                })
-            }
-        }
-        deserializer.deserialize_any(V)
-    }
-}
-
-impl ::serde::Serialize for MatchedTokens {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.ids.iter())
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for MatchedTokens {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(MatchedTokens {
-            ids: <::prost::alloc::vec::Vec<i64> as ::serde::Deserialize>::deserialize(
-                deserializer,
-            )?,
-        })
-    }
-}
-
-impl ::serde::Serialize for FinishStop {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.matched {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", v)?;
-        }
-        ::serde::ser::SerializeMap::end(map)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for FinishStop {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = FinishStop;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct FinishStop")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_matched = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "matched" => {
-                            if f_matched.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("matched"));
-                            }
-                            f_matched = Some(map.next_value::<Option<Matched>>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(FinishStop {
-                    matched: f_matched.flatten(),
-                })
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for FinishLength {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.length {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", v)?;
-        }
-        ::serde::ser::SerializeMap::end(map)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for FinishLength {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = FinishLength;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct FinishLength")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_length = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "length" => {
-                            if f_length.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("length"));
-                            }
-                            f_length = Some(map.next_value::<Option<u64>>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(FinishLength {
-                    length: f_length.flatten(),
-                })
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for FinishAbort {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "status_code", &self.status_code)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "err_type", &self.err_type)?;
-        ::serde::ser::SerializeMap::end(map)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for FinishAbort {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = FinishAbort;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct FinishAbort")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_message = None;
-                let mut f_status_code = None;
-                let mut f_err_type = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "message" => {
-                            if f_message.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("message"));
-                            }
-                            f_message =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "status_code" => {
-                            if f_status_code.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("status_code"));
-                            }
-                            f_status_code = Some(map.next_value::<Option<u32>>()?);
-                        }
-                        "err_type" => {
-                            if f_err_type.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("err_type"));
-                            }
-                            f_err_type =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(FinishAbort {
-                    message: f_message.flatten(),
-                    status_code: f_status_code.flatten(),
-                    err_type: f_err_type.flatten(),
-                })
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for FinishReason {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.kind {
-            Some(finish_reason::Kind::Stop(v)) => {
-                let mut map = serializer.serialize_map(None)?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "stop")?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", &v.matched)?;
-                ::serde::ser::SerializeMap::end(map)
-            }
-            Some(finish_reason::Kind::Length(v)) => {
-                let mut map = serializer.serialize_map(None)?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "length")?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", &v.length)?;
-                ::serde::ser::SerializeMap::end(map)
-            }
-            Some(finish_reason::Kind::Abort(v)) => {
-                let mut map = serializer.serialize_map(None)?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "abort")?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &v.message)?;
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "status_code",
-                    &v.status_code,
-                )?;
-                ::serde::ser::SerializeMap::serialize_entry(&mut map, "err_type", &v.err_type)?;
-                ::serde::ser::SerializeMap::end(map)
-            }
-            Some(finish_reason::Kind::Unknown(v)) => ::serde::Serialize::serialize(
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-                serializer,
-            ),
-            None => serializer.serialize_none(),
-        }
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for FinishReason {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        fn fallback<E: ::serde::de::Error>(
-            raw: ::serde_json::Map<String, ::serde_json::Value>,
-        ) -> Result<FinishReason, E> {
-            Ok(FinishReason {
-                kind: Some(finish_reason::Kind::Unknown(
-                    ::serde_json::Value::Object(raw).to_string(),
-                )),
-            })
-        }
-        let raw = ::serde_json::Map::<String, ::serde_json::Value>::deserialize(deserializer)?;
-        let tag = raw.get("type").and_then(::serde_json::Value::as_str);
-        #[allow(clippy::redundant_closure_call)]
-        (|raw: ::serde_json::Map<String, ::serde_json::Value>| match tag {
-            Some("stop") => {
-                let payload = FinishStop {
-                    matched: match raw.get("matched") {
-                        None | Some(::serde_json::Value::Null) => None,
-                        Some(v) => match ::serde_json::from_value::<Matched>(v.clone()) {
-                            Ok(v) => Some(v),
-                            Err(_) => return fallback(raw),
-                        },
-                    },
-                };
-                Ok(FinishReason {
-                    kind: Some(finish_reason::Kind::Stop(payload.into())),
-                })
-            }
-            Some("length") => {
-                let payload = FinishLength {
-                    length: match raw.get("length") {
-                        None | Some(::serde_json::Value::Null) => None,
-                        Some(v) => match ::serde_json::from_value::<u64>(v.clone()) {
-                            Ok(v) => Some(v),
-                            Err(_) => return fallback(raw),
-                        },
-                    },
-                };
-                Ok(FinishReason {
-                    kind: Some(finish_reason::Kind::Length(payload.into())),
-                })
-            }
-            Some("abort") => {
-                let payload =
-                    FinishAbort {
-                        message: match raw.get("message") {
-                            None | Some(::serde_json::Value::Null) => None,
-                            Some(v) => match ::serde_json::from_value::<
-                                ::prost::alloc::string::String,
-                            >(v.clone())
-                            {
-                                Ok(v) => Some(v),
-                                Err(_) => return fallback(raw),
-                            },
-                        },
-                        status_code: match raw.get("status_code") {
-                            None | Some(::serde_json::Value::Null) => None,
-                            Some(v) => match ::serde_json::from_value::<u32>(v.clone()) {
-                                Ok(v) => Some(v),
-                                Err(_) => return fallback(raw),
-                            },
-                        },
-                        err_type: match raw.get("err_type") {
-                            None | Some(::serde_json::Value::Null) => None,
-                            Some(v) => match ::serde_json::from_value::<
-                                ::prost::alloc::string::String,
-                            >(v.clone())
-                            {
-                                Ok(v) => Some(v),
-                                Err(_) => return fallback(raw),
-                            },
-                        },
-                    };
-                Ok(FinishReason {
-                    kind: Some(finish_reason::Kind::Abort(payload.into())),
-                })
-            }
-            _ => fallback(raw),
-        })(raw.clone())
     }
 }
 

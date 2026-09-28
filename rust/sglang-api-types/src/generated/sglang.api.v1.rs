@@ -151,64 +151,6 @@ pub struct ErrorBody {
     #[prost(uint32, tag = "2")]
     pub code: u32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SamplingParams {
-    /// JSON: absent = 128, explicit null = no limit (Python `Optional\[int\] =  128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
-    /// gRPC entry); no limit needs an explicit large value.
-    #[prost(int64, optional, tag = "1")]
-    pub max_new_tokens: ::core::option::Option<i64>,
-    #[prost(message, optional, tag = "2")]
-    pub stop: ::core::option::Option<StringOrList>,
-    #[prost(message, optional, tag = "3")]
-    pub stop_token_ids: ::core::option::Option<Int64List>,
-    #[prost(message, optional, tag = "4")]
-    pub stop_regex: ::core::option::Option<StringOrList>,
-    #[prost(double, optional, tag = "5")]
-    pub temperature: ::core::option::Option<f64>,
-    #[prost(double, optional, tag = "6")]
-    pub top_p: ::core::option::Option<f64>,
-    /// Default 1 \<\< 30 (TOP_K_ALL): "consider the whole vocabulary".
-    #[prost(int64, optional, tag = "7")]
-    pub top_k: ::core::option::Option<i64>,
-    #[prost(double, optional, tag = "8")]
-    pub min_p: ::core::option::Option<f64>,
-    #[prost(double, optional, tag = "9")]
-    pub frequency_penalty: ::core::option::Option<f64>,
-    #[prost(double, optional, tag = "10")]
-    pub presence_penalty: ::core::option::Option<f64>,
-    #[prost(double, optional, tag = "11")]
-    pub repetition_penalty: ::core::option::Option<f64>,
-    #[prost(int64, optional, tag = "12")]
-    pub min_new_tokens: ::core::option::Option<i64>,
-    #[prost(int64, optional, tag = "13")]
-    pub n: ::core::option::Option<i64>,
-    #[prost(string, optional, tag = "14")]
-    pub json_schema: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "15")]
-    pub regex: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "16")]
-    pub ebnf: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "17")]
-    pub structural_tag: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bool, optional, tag = "18")]
-    pub ignore_eos: ::core::option::Option<bool>,
-    #[prost(bool, optional, tag = "19")]
-    pub skip_special_tokens: ::core::option::Option<bool>,
-    #[prost(bool, optional, tag = "20")]
-    pub spaces_between_special_tokens: ::core::option::Option<bool>,
-    #[prost(bool, optional, tag = "21")]
-    pub no_stop_trim: ::core::option::Option<bool>,
-    #[prost(int64, optional, tag = "22")]
-    pub stream_interval: ::core::option::Option<i64>,
-    /// Token id (numeric-string key, Python parity) -> bias.
-    #[prost(map = "string, double", tag = "23")]
-    pub logit_bias: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
-    #[prost(int64, optional, tag = "24")]
-    pub sampling_seed: ::core::option::Option<i64>,
-    /// Opaque JSON forwarded to a custom logit processor; never inspected here.
-    #[prost(string, optional, tag = "25")]
-    pub custom_params: ::core::option::Option<::prost::alloc::string::String>,
-}
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -276,6 +218,64 @@ pub mod finish_reason {
         #[prost(string, tag = "4")]
         Unknown(::prost::alloc::string::String),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SamplingParams {
+    /// JSON: absent = 128, explicit null = no limit (Python `Optional\[int\] =  128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
+    /// gRPC entry); no limit needs an explicit large value.
+    #[prost(int64, optional, tag = "1")]
+    pub max_new_tokens: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "2")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "3")]
+    pub stop_token_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "4")]
+    pub stop_regex: ::core::option::Option<StringOrList>,
+    #[prost(double, optional, tag = "5")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "6")]
+    pub top_p: ::core::option::Option<f64>,
+    /// Default 1 \<\< 30 (TOP_K_ALL): "consider the whole vocabulary".
+    #[prost(int64, optional, tag = "7")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "8")]
+    pub min_p: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "9")]
+    pub frequency_penalty: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "10")]
+    pub presence_penalty: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "11")]
+    pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "12")]
+    pub min_new_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "13")]
+    pub n: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "14")]
+    pub json_schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "15")]
+    pub regex: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "16")]
+    pub ebnf: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "17")]
+    pub structural_tag: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "18")]
+    pub ignore_eos: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "19")]
+    pub skip_special_tokens: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "20")]
+    pub spaces_between_special_tokens: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "21")]
+    pub no_stop_trim: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "22")]
+    pub stream_interval: ::core::option::Option<i64>,
+    /// Token id (numeric-string key, Python parity) -> bias.
+    #[prost(map = "string, double", tag = "23")]
+    pub logit_bias: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
+    #[prost(int64, optional, tag = "24")]
+    pub sampling_seed: ::core::option::Option<i64>,
+    /// Opaque JSON forwarded to a custom logit processor; never inspected here.
+    #[prost(string, optional, tag = "25")]
+    pub custom_params: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
