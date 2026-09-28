@@ -1522,7 +1522,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 req.disagg_kv_sender.abort()
                 self.clear_pending_chunk_send(req)
-                # Keep the request queued for rank-consistent transfer-failure cleanup.
                 return
 
             # Most state payloads read token-pool rows and should match the KV
