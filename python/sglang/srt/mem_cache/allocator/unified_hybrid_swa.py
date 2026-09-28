@@ -316,12 +316,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
-
-        The SWA counterpart of the above, and it must translate against the
-        SWA sub-pool's own table: `translate_loc_from_full_to_swa` takes
-        FULL-side ids, whereas the transfer engine hands over virtual ids.
-        """
+        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids, for the PD
+        transfer engine: the same translate as `translate_loc_from_full_to_swa`,
+        on int64 ids."""
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def _move_gate_targets(self):

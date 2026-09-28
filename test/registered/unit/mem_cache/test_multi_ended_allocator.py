@@ -2488,10 +2488,10 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
     def test_translate_accepts_an_int32_page_table(self):
-        """REGRESSION: fa3 translates its own page table, which is int32 and
-        2-D. A gather that requires an int64 index (`torch.take`) crashes the
-        scheduler there while every int64 caller stays green. Both page sizes:
-        at ps == 1 the index IS the caller's tensor, at ps > 1 it is derived."""
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there. Both page
+        sizes: at ps == 1 the index IS the caller's tensor, at ps > 1 it is
+        derived."""
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 self.PS = ps

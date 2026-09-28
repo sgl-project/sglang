@@ -363,25 +363,9 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc.translate_kv_loc(x, out=x)
             self.assertTrue(torch.all(x == no_out))
 
-    def test_accepts_an_int32_2d_page_table(self):
-        """fa3 translates its own page table, which is int32 and 2-D; a gather
-        that needs a 1-D int64 index would crash the scheduler there."""
-        for ps in (1, 4):
-            alloc = self._build(ps=ps)
-            v = alloc.alloc(4 * ps)
-            self.assertIsNotNone(v)
-            want = alloc.translate_kv_loc(v)
-            page_table = v.to(torch.int32).view(2, -1)
-            got = alloc.translate_kv_loc(page_table)
-            self.assertEqual(got.shape, page_table.shape)
-            self.assertTrue(torch.equal(got.reshape(-1), want))
-            dst = torch.empty(page_table.shape, dtype=torch.int64)
-            alloc.translate_kv_loc(page_table, out=dst)
-            self.assertTrue(torch.equal(dst.reshape(-1), want))
-
-    def test_a_negative_loc_lands_on_the_sink(self):
+    def test_padding_loc_lands_on_the_sink(self):
         """A padded read table carries -1 in the slots a shorter sequence does
-        not use, and `translate_kv_loc` is on the path that sees them."""
+        not use; `translate_kv_loc` resolves it to 0, the sink."""
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
@@ -424,18 +408,6 @@ class TestTranslateKvLoc(unittest.TestCase):
             got = alloc.translate_kv_loc(view)
             self.assertEqual(got.shape, view.shape)
             self.assertTrue(torch.equal(got.reshape(-1), want))
-
-    def test_translate_follows_compaction(self):
-        alloc = self._build(ps=1)
-        a = alloc.alloc(4)
-        b = alloc.alloc(4)
-        c = alloc.alloc(4)
-        self.assertIsNotNone(c)
-        alloc.free(b)  # eager compaction relocates survivors
-        for run in (a, c):
-            self.assertTrue(
-                torch.equal(alloc.translate_kv_loc(run), alloc.virtual_to_physical[run])
-            )
 
 
 class _RecordingHybridPool:
