@@ -27,24 +27,6 @@ from typing import (
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
-from sglang.multimodal_gen.configs.pipeline_configs import (
-    Cosmos3Config,
-    FastH3PipelineConfig,
-    FastHunyuanConfig,
-    FluxPipelineConfig,
-    HeliosDistilledConfig,
-    HeliosMidConfig,
-    HeliosT2VConfig,
-    HunyuanConfig,
-    LingBotWorldCausalDMDConfig,
-    LingBotWorldV2CausalDMDConfig,
-    MiniMaxH3PipelineConfig,
-    WanI2V480PConfig,
-    WanI2V720PConfig,
-    WanT2V480PConfig,
-    WanT2V720PConfig,
-    ZImagePipelineConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
@@ -357,6 +339,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
@@ -378,6 +361,9 @@ def register_configs(
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
+    pipeline_config_registry_entries: Optional[
+        Dict[str, Tuple[Type[PipelineConfig], Type[Any]]]
+    ] = None,
 ) -> str:
     """
     Registers configuration classes for a new model family.
@@ -399,6 +385,11 @@ def register_configs(
     if model_detectors:
         for detector in model_detectors:
             _MODEL_NAME_DETECTORS.append((model_id, detector))
+
+    if pipeline_config_registry_entries:
+        for pipeline_name, (pc_cls, sp_cls) in pipeline_config_registry_entries.items():
+            _PIPELINE_CONFIG_REGISTRY.setdefault(pipeline_name, (pc_cls, sp_cls))
+
     return model_id
 
 
@@ -460,6 +451,56 @@ def register_pipeline(
         pipeline_name,
         pipeline_cls.__module__,
     )
+
+
+_configs_discovered: bool = False
+
+# SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
+# SANA-Video (register before generic SANA to avoid detector overlap).
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video")
+
+
+def _discover_and_register_configs() -> None:
+    global _configs_discovered
+    if _configs_discovered:
+        return
+    _configs_discovered = True
+
+    package_name = "sglang.multimodal_gen.configs.pipeline_configs"
+    package = importlib.import_module(package_name)
+
+    discovered = []
+    for _, module_name, ispkg in pkgutil.walk_packages(
+        package.__path__, package.__name__ + "."
+    ):
+        if not ispkg:
+            try:
+                config_module = importlib.import_module(module_name)
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping config module {module_name} during discovery due to import failure: {exc}",
+                )
+                continue
+            if hasattr(config_module, "register"):
+                discovered.append((module_name, config_module))
+
+    def _sort_key(item):
+        short_name = item[0].rsplit(".", 1)[-1]
+        try:
+            return (0, _CONFIG_REGISTER_PRIORITY.index(short_name))
+        except ValueError:
+            return (1, 0)
+
+    discovered.sort(key=_sort_key)
+
+    for module_name, config_module in discovered:
+        try:
+            config_module.register()
+        except Exception as exc:
+            logger.warning(
+                f"register() failed for {module_name}: {exc}",
+                exc_info=True,
+            )
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -1462,6 +1503,7 @@ def _register_configs():
 
 
 _register_configs()
+_discover_and_register_configs()
 
 
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:

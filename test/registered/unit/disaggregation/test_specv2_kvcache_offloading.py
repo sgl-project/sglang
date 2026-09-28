@@ -55,7 +55,7 @@ def _make_mock_req(
         kv_allocated_len=kv_allocated_len,
     )
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv.kv_committed_len
+    req.owned_kv_len = lambda: req.kv.kv_committed_len
     return req
 
 
@@ -107,6 +107,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
+    manager.kv_cache = MagicMock()
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
@@ -194,20 +195,21 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
 
-    def test_prefix_indices_decremented(self):
-        """protected_size_ is decremented by len(req.prefix_indices)."""
-        manager, _ = _make_manager(pool_size=32)
-        manager.tree_cache.protected_size_ = 10
+    def test_matched_prefix_stays_with_the_tree(self):
+        """A prefix matched at prealloc is tree-owned: unlocked, never freed."""
+        manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=20,
             kv_allocated_len=20,
             prefix_indices_len=5,
         )
+        req.kv.cache_protected_len = 5
 
         manager._release_finished_req(req)
 
-        self.assertEqual(manager.tree_cache.protected_size_, 5)
+        manager.tree_cache.unpin.assert_called_once_with(req)
+        self.assertTrue(torch.equal(freed[0], torch.arange(5, 20, dtype=torch.int64)))
 
     def test_release_finished_req_frees_prefill_and_pops_state(self):
         """
@@ -287,6 +289,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -409,6 +412,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -441,6 +445,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(8, 12, dtype=torch.int64),
             [14, 15, 16, 17],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -486,7 +491,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 processor = SimpleNamespace(decode_offload_manager=manager)
                 if inflight:
                     manager.offload_inflight[req] = 1
-                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0)
+                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])
                     manager.cache_controller = MagicMock()
                     manager.cache_controller.ack_write_queue = [
                         HiCacheAck(None, _FinishedEvent(), [1])

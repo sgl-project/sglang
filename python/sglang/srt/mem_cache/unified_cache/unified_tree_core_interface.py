@@ -282,6 +282,15 @@ class UnifiedTreeCoreInterface(ABC):
         counts; the result carries the freed slots."""
         ...
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
+
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
     @abstractmethod
@@ -348,6 +357,10 @@ class UnifiedTreeCoreInterface(ABC):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         ...
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
 
     @abstractmethod
     def full_evictable_size(self) -> int: ...
@@ -510,6 +523,9 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,

@@ -329,6 +329,14 @@ class C128SidecarComponent(TreeComponent):
         ].clone()
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        logical_len = cache_len
+        if self.tree_core.is_eagle and logical_len > 0:
+            logical_len -= 1
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        floored = logical_len // group_tokens * group_tokens
+        return floored + 1 if self.tree_core.is_eagle and floored > 0 else floored
+
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             for page_ids in action.indices:

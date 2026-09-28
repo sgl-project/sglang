@@ -1,0 +1,249 @@
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#fafbfc, #11151b);
+  --fg: light-dark(#172331, #e8edf4);
+  --muted: light-dark(#627084, #a1acbd);
+  --line: light-dark(#dce2ea, #2a3543);
+  --surface: light-dark(#fff, #171e27);
+  --sampling: light-dark(#2673db, #76adff);
+  --tool: light-dark(#168b72, #65d0b2);
+  --wait: light-dark(#a27619, #dfbc68);
+  --s3: light-dark(#b266ba, #ce9bd2);
+  --s4: light-dark(#ce643a, #efa278);
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    14px system-ui,
+    sans-serif;
+}
+main {
+  max-width: 1500px;
+  margin: auto;
+  padding: 28px;
+}
+header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+h1 {
+  font-size: 24px;
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.badge {
+  font-size: 12px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--tool);
+}
+nav {
+  display: flex;
+  gap: 24px;
+  border-bottom: 1px solid var(--line);
+  margin: 24px 0 18px;
+}
+button,
+input,
+select {
+  font: inherit;
+}
+button,
+select {
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 7px 11px;
+  cursor: pointer;
+}
+nav button {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 0 0 12px;
+  color: var(--muted);
+}
+nav button[aria-selected="true"] {
+  color: var(--fg);
+  border-bottom: 2px solid var(--sampling);
+}
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.controls label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.position {
+  flex: 1;
+  min-width: 150px;
+}
+.position input {
+  width: 100%;
+}
+.time {
+  font-variant-numeric: tabular-nums;
+}
+.legend {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.legend span {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+}
+.note {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.timeline {
+  position: relative;
+}
+svg {
+  display: block;
+  max-width: 100%;
+  overflow: visible;
+}
+.detail {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  margin-top: 16px;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+.detail-grid span {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.detail-grid strong {
+  font-size: 15px;
+  font-weight: 500;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px 20px;
+}
+.panel {
+  min-width: 0;
+}
+.panel h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+.metric-legend {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-top: 8px;
+}
+.metric-legend button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+.metric-legend button[aria-pressed="false"] {
+  opacity: 0.4;
+}
+.metric-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 3px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+.source {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 7px;
+  min-height: 30px;
+  line-height: 1.4;
+}
+.tip {
+  position: absolute;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  border-radius: 5px;
+  pointer-events: none;
+  font-size: 12px;
+  z-index: 5;
+  white-space: pre-line;
+  line-height: 1.6;
+  max-width: 270px;
+}
+.empty {
+  font-size: 12px;
+  fill: var(--muted);
+}
+[hidden] {
+  display: none !important;
+}
+footer {
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+a {
+  color: var(--sampling);
+}
+@media (max-width: 1000px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .detail-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  main {
+    padding: 16px;
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  .detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

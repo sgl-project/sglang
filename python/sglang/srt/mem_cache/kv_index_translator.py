@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -94,12 +95,6 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     entry_page_size: int  # what one entry covers: 1 = a token, N = a page of N
     is_translated: bool  # entries are already kernel-facing ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
-
-    def sliding_window_read_ids(self) -> torch.Tensor:
-        """Which array a sliding-window gather reads: the parallel swa array
-        when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
 
 
 class KVIndexTranslator:
@@ -162,6 +157,10 @@ class KVIndexTranslator:
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
                 if isinstance(token_to_kv_pool, BaseSWAKVPool)
+                and (
+                    not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    or token_to_kv_pool.request_window is None
+                )
                 else None
             )
 

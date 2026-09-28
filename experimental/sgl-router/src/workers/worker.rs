@@ -13,19 +13,19 @@ use std::time::Instant;
 /// Fixed for the worker's lifetime: it is derived by `manager::resolve_protocol`
 /// from the engine's `--enable-http2` launch flag and the dialed URL scheme,
 /// neither of which changes while the process runs. The asymmetry that drives
-/// the default: HTTP/1.1 is accepted by every engine, while h2c is
-/// prior-knowledge only and fails outright against an engine that does not
+/// the default: the negotiating client is accepted by every engine, while h2c
+/// is prior-knowledge only and fails outright against an engine that does not
 /// serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WireProtocol {
-    /// HTTP/1.1, in cleartext and over TLS alike. Safe for every engine, so it
-    /// is also the fallback.
+    /// The negotiating client. Safe for every engine, so it is also the
+    /// fallback.
     ///
-    /// Not ALPN-negotiated: `Cargo.toml` builds reqwest with
-    /// `default-features = false` and does not enable `http2`, so the
-    /// forwarding client advertises only `http/1.1` and a TLS engine running
-    /// `--enable-http2` still gets HTTP/1.1. Enabling that feature is what
-    /// would make this variant negotiate.
+    /// HTTP/1.1 in cleartext, ALPN-negotiated over TLS: this crate enables
+    /// reqwest's `http2` feature (see `Cargo.toml`), so the client advertises
+    /// `h2, http/1.1` and a TLS engine running `--enable-http2` reaches HTTP/2
+    /// on its own. Dropping that feature silently reduces this variant to
+    /// HTTP/1.1 everywhere.
     #[default]
     Http1,
     /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
@@ -246,7 +246,7 @@ impl Worker {
         self.protocol
     }
 
-    pub fn active_load(&self) -> usize {
+    pub fn router_inflight_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
 
@@ -284,7 +284,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("protocol", &self.protocol)
-            .field("active_load", &self.active_load())
+            .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
 }
@@ -304,15 +304,15 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
         });
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         let g2 = w.load_guard();
-        assert_eq!(w.active_load(), 2);
+        assert_eq!(w.router_inflight_load(), 2);
         drop(g);
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         drop(g2);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -321,11 +321,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -334,11 +334,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.timestamped_load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 1);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
     }
 
@@ -477,7 +477,7 @@ mod tests {
         let cutoff = Instant::now();
         let _g_new1 = w.timestamped_load_guard();
         let _g_new2 = w.timestamped_load_guard();
-        assert_eq!(w.active_load(), 3);
+        assert_eq!(w.router_inflight_load(), 3);
         assert_eq!(
             w.slots_acquired_since(cutoff),
             2,

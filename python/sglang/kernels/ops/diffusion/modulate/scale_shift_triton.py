@@ -6,6 +6,7 @@ from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
+    is_xpu,
     lazy_fallback,
     select_impl,
 )
@@ -278,7 +279,7 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
-    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
+    scale_constant: tl.constexpr,  # None omits the constant addition.
     inner_dim,
     seq_len,
     num_frames,
@@ -310,8 +311,13 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
-    output = normalized * (scale_const_tensor + scale) + shift
+    if scale_constant is None:
+        # CuTe's residual path has no extra +0 on the gate. In particular,
+        # adding +0 would change a negative-zero gate before multiplication.
+        output = normalized * scale + shift
+    else:
+        scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+        output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
@@ -384,6 +390,51 @@ def fuse_scale_shift_kernel_blc_opt(
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
+def try_fused_scaled_residual_bf16(
+    residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor | None:
+    """Return CuTe's BF16 residual output without computing its unused norm."""
+    if (
+        not is_cuda()
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or residual.dtype != x.dtype
+        or gate.dtype != torch.float32
+        or residual.device != x.device
+        or gate.device != x.device
+        or x.ndim != 3
+        or residual.shape != x.shape
+        or gate.ndim != 4
+        or gate.shape[0] != x.shape[0]
+        or gate.shape[2:] != (1, x.shape[-1])
+        or gate.shape[1] == 0
+        or x.shape[1] % gate.shape[1] != 0
+        or not x.is_contiguous()
+        or x.numel() == 0
+    ):
+        return None
+    batch, tokens, channels = x.shape
+    frames = gate.shape[1]
+    output = torch.empty_like(x)
+    block_n = max(64, min(512, triton.next_power_of_2(channels)))
+    _fused_scale_shift_4d_kernel[(batch * tokens, triton.cdiv(channels, block_n))](
+        output,
+        x,
+        gate.reshape(batch * frames, channels).contiguous(),
+        residual.contiguous(),
+        None,
+        channels,
+        tokens,
+        frames,
+        tokens // frames,
+        BLOCK_N=block_n,
+        num_warps=2 if block_n == 64 else 4,
+    )
+    return output
+
+
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -420,8 +471,8 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        if shift.dim() == 4 and is_hip():
-            # ROCm has no fused CUTLASS scale-shift kernel, so this native path
+        if shift.dim() == 4 and (is_hip() or is_xpu()):
+            # ROCm and XPU lack a fused CUTLASS scale-shift kernel, so this path
             # handles the causal Wan / LingBot output AdaLN, which passes a
             # per-frame shift [B, F, 1, C]. Broadcast it across each frame's
             # tokens to per-token [B, L, C] before flattening to [B*L, C],
@@ -524,6 +575,66 @@ def fuse_scale_shift_kernel(
             num_stages=2,
         )
     return output
+
+
+def expand_scale_shift_cpu_param(
+    tensor: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    B, L, C = x.shape
+
+    if tensor.numel() == 1:
+        return tensor.reshape(1, 1, 1).expand(B, L, C)
+
+    if tensor.dim() == 1:
+        if tensor.shape[0] != C:
+            raise ValueError(f"1D modulation tensor must have shape [{C}]")
+        tensor = tensor.reshape(1, 1, C)
+
+    elif tensor.dim() == 2:
+        tensor = tensor[:, None, :]
+
+    elif tensor.dim() == 3:
+        pass
+
+    elif tensor.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        if tensor.shape[2] != 1:
+            raise ValueError("4D modulation tensor must have shape [B, F, 1, C]")
+        num_frames = tensor.shape[1]
+        if L % num_frames != 0:
+            raise ValueError("sequence length must be divisible by num_frames")
+        frame_seqlen = L // num_frames
+        tensor = tensor.expand(
+            tensor.shape[0], num_frames, frame_seqlen, tensor.shape[-1]
+        ).reshape(tensor.shape[0], L, tensor.shape[-1])
+
+    else:
+        raise ValueError("modulation tensor must be scalar or 1D/2D/3D/4D")
+    return tensor.expand(B, L, C)
+
+
+def _fuse_scale_shift_kernel_cpu(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    scale_constant: float = 1.0,
+    block_l: int = 128,
+    block_c: int = 128,
+) -> torch.Tensor:
+    import sgl_kernel  # noqa: F401
+
+    del block_l, block_c
+
+    scale = expand_scale_shift_cpu_param(scale, x)
+    shift = expand_scale_shift_cpu_param(shift, x)
+
+    return torch.ops.sgl_kernel.fused_scale_shift_cpu(
+        x,
+        scale,
+        shift,
+        scale_constant,
+    )
 
 
 def fuse_layernorm_scale_shift_gate_select01_kernel(
@@ -733,5 +844,5 @@ fuse_scale_shift_kernel = select_impl(
     npu=lazy_fallback("npu", "fuse_scale_shift_native"),
     mps=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     musa=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
-    cpu=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
+    cpu=_fuse_scale_shift_kernel_cpu,
 )
