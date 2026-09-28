@@ -90,7 +90,7 @@ The shared CP breakable-prefill-graph path currently requires `zigzag`, the `trt
 
 In supported DSA deployments, `--enable-dsa-cache-layer-split` distributes GPU KV/indexer cache layers across CP ranks to reduce per-rank cache memory. Each rank owns a range of layers and uses scratch storage for remote-layer data. This is layer-wise cache ownership, separate from the interleave token assignment used for computation, and is not applied to draft workers.
 
-LayerSplit requires a PD prefill worker (`--disaggregation-mode prefill`), `--enable-prefill-cp --cp-strategy interleave`, and PP=1. It currently supports the `mooncake` and `mooncake_tcp` transfer backends. Do not enable LayerSplit on decode or non-PD workers; the decode side receives full cache shards through PD transfer. Use the [PD disaggregation guide](/docs/advanced_features/pd_disaggregation) and model-specific launch recipes to configure both sides of the transfer; enabling prefill CP alone does not configure a PD deployment.
+LayerSplit requires a PD prefill worker (`--disaggregation-mode prefill`), `--enable-prefill-cp --cp-strategy interleave`, and PP=1. It currently supports the `mooncake` and `mooncake_tcp` transfer backends. Do not enable LayerSplit on decode or non-PD workers; the decode side receives full cache shards through PD transfer. Use the [PD disaggregation guide](https://docs.sglang.io/docs/advanced_features/pd_disaggregation) and model-specific launch recipes to configure both sides of the transfer; enabling prefill CP alone does not configure a PD deployment.
 
 ## Usage and Examples
 
@@ -148,7 +148,7 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.85
 ```
 
-For model-specific deployment combinations, see [context parallelism in the GLM-5.3 cookbook](/cookbook/autoregressive/GLM/GLM-5.3#3-5-context-parallelism).
+For model-specific deployment combinations, see [context parallelism in the GLM-5.3 cookbook](https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.3#3-5-context-parallelism).
 
 ## References
 
