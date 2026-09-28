@@ -27,11 +27,13 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
+    MHCLayerCommunicator,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    layer_input_buffer,
+    reduce_output,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -51,6 +53,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -106,7 +109,6 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    get_forward,
     get_lora,
     get_mm,
     get_parallel,
@@ -725,7 +727,7 @@ class Glm5NextDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -783,13 +785,10 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         shared_kwargs: Dict[str, Any] = dict(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
             ),
@@ -797,7 +796,6 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.config.mhc:
             mhc_kwargs: Dict[str, Any] = dict(
-                is_first_layer=(self.layer_id == 0),
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
@@ -922,7 +920,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        hidden_states_orig = hidden_states
+        hidden_states_orig = layer_input_buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -935,7 +933,9 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
             prev_topk_indices=prev_topk_indices,
         )
         if isinstance(hidden_states, tuple):
@@ -948,16 +948,6 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-        )
-
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
         )
 
         if isinstance(self.mlp, Glm5NextMLP):
@@ -974,26 +964,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
-            mlp_reduce_scatter=use_reduce_scatter,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
                 hidden_states,
-                residual,
                 forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 
@@ -1181,6 +1158,7 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_state = self._prepare_aux_hidden_state(
                         hidden_states, residual
                     )
@@ -1208,12 +1186,13 @@ class Glm5NextModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
@@ -1360,6 +1339,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
+        if getattr(text_config, "n_shared_experts", None) != 1:
+            return "Shared experts fusion requires exactly one shared expert."
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
@@ -1371,20 +1352,78 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         "ModelOpt FP4 keeps shared experts unquantized while routed "
                         "experts are quantized."
                     )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
-            return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        if get_moe_a2a_backend().is_deepep():
-            return (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
+
+        if _is_cuda:
+            if _device_sm is not None and _device_sm < 80:
+                return "Shared experts fusion requires SM80 or newer GPUs."
+            if get_moe_a2a_backend().is_deepep():
+                return (
+                    "Shared experts fusion is not supported when Deepep MoE backend "
+                    "is enabled."
+                )
+        else:
+            if not _use_aiter_gfx95:
+                return "HIP shared experts fusion requires AITER on a gfx950 device."
+            if not get_moe_a2a_backend().is_none():
+                return (
+                    "HIP shared experts fusion is not supported when an MoE A2A "
+                    "backend is enabled."
+                )
+            parallel = get_parallel()
+            if (
+                parallel.tp_size not in (4, 8)
+                or parallel.moe_tp_size != parallel.tp_size
+            ):
+                return "HIP shared experts fusion is validated only for TP4 and TP8."
+            if (
+                getattr(text_config, "model_type", None) != "glm5_next_text"
+                or getattr(text_config, "hidden_size", None) != 4096
+                or getattr(text_config, "moe_intermediate_size", None) != 2048
+                or getattr(text_config, "n_routed_experts", None) != 288
+                or getattr(text_config, "num_experts_per_tok", None) != 8
+            ):
+                return (
+                    "HIP shared experts fusion is validated only for the "
+                    "GLM-5.3-Flash E=288/topk=8 expert geometry."
+                )
+            if (
+                getattr(text_config, "hidden_act", None) != "silu"
+                or getattr(text_config, "swiglu_limit", None) != 10.0
+            ):
+                return (
+                    "HIP shared experts fusion requires the validated "
+                    "clamped SiLU G1U1 activation."
+                )
+            if (
+                quant_config is None
+                or quant_config.get_name() != "fp8"
+                or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+                or getattr(quant_config, "weight_block_size", None) != [128, 128]
+                or getattr(quant_config, "activation_scheme", None) != "dynamic"
+            ):
+                return (
+                    "HIP shared experts fusion requires serialized dynamic "
+                    "128x128 block-FP8 experts."
+                )
+            ignored_layers = getattr(quant_config, "ignored_layers", [])
+            packed_mapping = getattr(quant_config, "packed_modules_mapping", {})
+            first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+            for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+                moe_prefix = f"model.layers.{layer_id}.mlp"
+                if is_layer_skipped(
+                    f"{moe_prefix}.experts", ignored_layers, packed_mapping
+                ) or is_layer_skipped(
+                    f"{moe_prefix}.shared_experts", ignored_layers, packed_mapping
+                ):
+                    return (
+                        "HIP shared experts fusion requires routed and shared "
+                        "experts to use the same block-FP8 layout."
+                    )
         return None
 
     def determine_num_fused_shared_experts(self):

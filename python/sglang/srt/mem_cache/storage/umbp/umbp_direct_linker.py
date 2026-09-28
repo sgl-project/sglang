@@ -457,10 +457,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # every layer, and a layer is read back as a byte range inside it.
         return component_keys, multiplier
 
-    def _object_keys(self, transfer: PoolTransfer) -> list[str]:
-        keys, _ = self._object_keys_for_pages(list(transfer.keys or []), transfer)
-        return keys
-
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
         entry = self.pools[transfer.name]
         objects_per_page = 1 if entry.packed else len(entry.components)

@@ -96,12 +96,6 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     is_translated: bool  # entries are already kernel-facing ids
     sliding_window_ids: Optional[torch.Tensor]  # SWA models: the parallel swa array
 
-    def sliding_window_read_ids(self) -> torch.Tensor:
-        """Which array a sliding-window gather reads: the parallel swa array
-        when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
-
 
 class KVIndexTranslator:
     """Built once per ModelRunner."""
