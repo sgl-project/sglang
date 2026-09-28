@@ -3,6 +3,7 @@
 import threading
 import unittest
 import unittest.mock
+from functools import partial
 
 import torch
 
@@ -313,6 +314,67 @@ class TestHostMemoryBudget(CustomTestCase):
 
 class TestHostPoolGroup(CustomTestCase):
     @staticmethod
+    def _backup_under_host_pressure(
+        order: tuple[PoolName, ...],
+    ) -> tuple[list[str], set[str], dict[PoolName, list[int]]]:
+        pools = {
+            name: LogicalHostPool(2, page_size=1)
+            for name in (PoolName.SWA, PoolName.MAMBA)
+        }
+        leaves: dict[str, dict[PoolName, torch.Tensor]] = {"a": {}, "b": {}}
+        for slots in leaves.values():
+            for name, pool in pools.items():
+                indices = pool.alloc(1)
+                assert indices is not None
+                slots[name] = indices
+
+        # Independent component evictions can give SWA and Mamba opposite host LRUs.
+        lru = {PoolName.SWA: ["a", "b"], PoolName.MAMBA: ["b", "a"]}
+        victims: list[str] = []
+
+        def evict(name: PoolName, size: int) -> None:
+            for leaf in lru[name]:
+                if pools[name].available_size() >= size:
+                    break
+                if leaf in leaves:
+                    victims.append(leaf)
+                    # A host-leaf eviction releases every component, not just name.
+                    for pool_name, indices in leaves.pop(leaf).items():
+                        pools[pool_name].free(indices)
+
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=name,
+                    host_pool=pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer: layer,
+                    host_evict_fn=partial(evict, name),
+                )
+                for name, pool in pools.items()
+            ]
+        )
+        transfers = [
+            PoolTransfer(name=name, device_indices=torch.tensor([0])) for name in order
+        ]
+        assert group.resolve_host_transfers(transfers) is transfers
+        assert tuple(transfer.name for transfer in transfers) == order
+        assert len(victims) == 1
+        assert all(pool.available_size() == 0 for pool in pools.values())
+
+        allocations = {}
+        for transfer in transfers:
+            assert transfer.host_indices is not None
+            allocations[transfer.name] = transfer.host_indices.tolist()
+        return victims, set(leaves), allocations
+
+    def test_host_reclamation_is_independent_of_transfer_order(self):
+        # Rust HashMap iteration can deliver these two orders to different TP ranks.
+        swa_first = self._backup_under_host_pressure((PoolName.SWA, PoolName.MAMBA))
+        mamba_first = self._backup_under_host_pressure((PoolName.MAMBA, PoolName.SWA))
+        self.assertEqual(swa_first, mamba_first)
+
+    @staticmethod
     def _group(**sizes):
         return HostPoolGroup(
             [
@@ -349,7 +411,7 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 2)
 
     def test_resolve_rolls_back_partial_allocation(self):
-        group = self._group(kv=4, swa=2, mamba=1)
+        group = self._group(kv=4, swa=1, mamba=2)
         transfers = [
             PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
             PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
@@ -357,7 +419,9 @@ class TestHostPoolGroup(CustomTestCase):
 
         self.assertIsNone(group.resolve_host_transfers(transfers))
         self.assertIsNone(transfers[0].host_indices)
-        self.assertEqual(group.available_size(PoolName.SWA), 2)
+        self.assertIsNone(transfers[1].host_indices)
+        self.assertEqual(group.available_size(PoolName.SWA), 1)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 2)
 
 
 if __name__ == "__main__":

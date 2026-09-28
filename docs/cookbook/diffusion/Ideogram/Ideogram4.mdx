@@ -188,6 +188,12 @@ response = client.images.generate(
 
 Base Ideogram 4 presets are `V4_DEFAULT_20`, `V4_QUALITY_48`, and `V4_TURBO_12`. The fal variants automatically select `V4_FAST_20` and `V4_INSTANT_8`, respectively. A preset controls both `num_inference_steps` and guidance, so do not set those fields directly.
 
+You can also produce captions with a separate SRT LLM using
+[prompt enhancement](/docs/sglang-diffusion/models_with_pe). Configure an
+Ideogram-specific JSON caption template and schema; the generic prose template
+is not appropriate for these checkpoints. This does not reproduce fal's
+checkpoint-specific prompt expander or establish equivalent image quality.
+
 ## 5. Run in ComfyUI
 
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
