@@ -104,10 +104,12 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         )
         self.assertTrue(fb.can_run_decode_cuda_graph)
 
-    def test_draft_input_without_hidden_states_can_be_padded(self):
+    def test_draft_input_without_hidden_states_runs_padding_hook(self):
+        pad_batch = MagicMock()
         spec_info = SimpleNamespace(
             is_draft_input=lambda: True,
             hidden_states=None,
+            pad_batch=pad_batch,
         )
         fb = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -126,6 +128,12 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=2, bs=1)
 
         self.assertIsNone(spec_info.hidden_states)
+        pad_batch.assert_called_once()
+        pad_tensor_to_size, batch_size = pad_batch.call_args.args
+        self.assertEqual(batch_size, 1)
+        torch.testing.assert_close(
+            pad_tensor_to_size(torch.tensor([1]), 2), torch.tensor([1, 0])
+        )
 
     def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
         fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])

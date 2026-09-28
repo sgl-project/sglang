@@ -33,7 +33,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     reduce_output,
 )
@@ -669,7 +669,7 @@ class BailingMoEBlock(nn.Module):
             config, layer_id=layer_id + 1, is_nextn=False
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             # A NextN draft is a one-layer model.
             num_layers=1 if is_nextn else config.num_hidden_layers,
@@ -703,7 +703,7 @@ class BailingMoEBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
