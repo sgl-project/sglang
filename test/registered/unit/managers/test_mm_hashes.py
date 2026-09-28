@@ -6,22 +6,23 @@ Verifies the contract that:
      overwrite it via hash_feature().
   3. The derived pad_value is deterministic across requests with identical
      mm_hashes — the property external KV routers depend on.
-
-The wiring step that copies GenerateReqInput.mm_hashes into per-item
-MultimodalDataItem.hash lives in tokenizer_manager.py and is exercised by
-the e2e serve tests; this file pins the unit-level invariants the wiring
-relies on.
+  4. TokenizerManager rebuilds processor-built padded_input_ids after it
+     applies the caller hashes, so the ids carry the caller-derived pads.
 """
 
+import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalProcessorOutput,
     _compute_pad_value,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,6 +86,42 @@ class TestMmHashesContract(CustomTestCase):
 
         self.assertEqual(item.hash, 0xBBBB)
         self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+
+    def test_caller_hashes_repad_processor_padded_input_ids(self):
+        """Caller mm_hashes must reach the padded ids a processor precomputed;
+        the scheduler reuses them, so a stale pad leaves no slot for the embedding."""
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+        expanded_ids = [1, 2, 9, 9, 9, 4]
+        item = MultimodalDataItem(modality=Modality.IMAGE, offsets=[(2, 4)])
+        item.set_hash(0xAAAA)
+        tm = TokenizerManager.__new__(TokenizerManager)
+        tm.model_config = Mock()
+        tm.model_config.hf_config.architectures = []
+        tm.max_req_input_len = 128
+        tm.mm_processor = Mock(prefer_tokenized_input=True)
+        tm.mm_processor.process_mm_data_async = AsyncMock(
+            return_value=MultimodalProcessorOutput(
+                mm_items=[item],
+                input_ids=expanded_ids,
+                padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
+                    expanded_ids, [item]
+                ),
+            )
+        )
+        tm._validate_one_request = Mock()
+        tm._create_tokenized_object = Mock()
+        obj = GenerateReqInput(
+            input_ids=[1, 2, 9, 4], image_data=["image"], mm_hashes=["bbbb"]
+        )
+
+        asyncio.run(tm._tokenize_one_request(obj))
+
+        mm_inputs = tm._create_tokenized_object.call_args.args[4]
+        pad = _compute_pad_value(0xBBBB)
+        self.assertEqual(mm_inputs.padded_input_ids, [1, 2, pad, pad, pad, 4])
 
 
 if __name__ == "__main__":
