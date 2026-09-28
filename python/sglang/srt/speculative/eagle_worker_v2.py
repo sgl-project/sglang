@@ -9,7 +9,6 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.mem_cache.hisparse_spec_runtime import eager_hisparse_worker_boundary
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -42,6 +41,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.hisparse_spec_runtime import eager_hisparse_worker_boundary
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,

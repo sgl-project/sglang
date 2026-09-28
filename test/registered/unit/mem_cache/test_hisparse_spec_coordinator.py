@@ -13,6 +13,10 @@
 # ==============================================================================
 import contextlib
 import unittest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -135,6 +139,7 @@ class TestCoordinator(unittest.TestCase):
 
     def test_noncontiguous_physical_token_rows_and_wrapper(self):
         from unittest.mock import patch
+
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         self.c.req_device_buffer_token_locs[0, 0] = torch.tensor([65, 79, 97, 126])
@@ -165,6 +170,7 @@ class TestCoordinator(unittest.TestCase):
 
     def test_prepare_orders_prior_streams(self):
         from unittest.mock import patch
+
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         c = HiSparseCoordinator.__new__(HiSparseCoordinator)

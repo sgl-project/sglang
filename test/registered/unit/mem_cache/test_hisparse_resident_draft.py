@@ -1,6 +1,10 @@
 """Actual configurator calls with CPU allocation and GPU pool constructors mocked."""
 
 import unittest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -110,3 +114,7 @@ class TestHiSparseResidentDraft(unittest.TestCase):
         sparse.assert_not_called()
         self.assertEqual(resident.call_args.args, (512,))
         self.assertNotIn("host_to_device_ratio", resident.call_args.kwargs)
+
+
+if __name__ == "__main__":
+    unittest.main()

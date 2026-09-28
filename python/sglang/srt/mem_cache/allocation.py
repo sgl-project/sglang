@@ -751,10 +751,10 @@ def alloc_for_spec_decode(
             device_type = getattr(
                 batch.device, "type", str(batch.device).split(":", 1)[0]
             )
+            from sglang.srt.environ import envs
             from sglang.srt.mem_cache.allocator.hisparse import (
                 HiSparseTokenToKVPoolAllocator,
             )
-            from sglang.srt.environ import envs
 
             allocator = tree_cache.token_to_kv_pool_allocator
             if isinstance(allocator, HiSparseTokenToKVPoolAllocator):

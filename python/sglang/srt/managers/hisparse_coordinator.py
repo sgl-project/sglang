@@ -437,7 +437,7 @@ class HiSparseCoordinator:
             adapter.teardown(req)
 
     def create_speculative_host_backend(self, resolve_owner):
-        """Opt-in eager adapter, inactive until scheduler lifecycle hooks land.
+        """Opt-in eager adapter owned by the scheduler transaction lifecycle.
 
         resolve_owner(slot) returns (request_object, generation). The scheduler
         must serialize calls, bind the committed host length per transaction,
