@@ -183,7 +183,6 @@ def fused_qk_norm_rope(
     """
     if rotary_dim is None:
         rotary_dim = head_dim
-
     fused_qk_norm_rope_out(
         qkv,
         q_weight,

@@ -219,7 +219,6 @@ YARN_SCALING = {
 
 
 @pytest.mark.parametrize("rope_scaling", [None, YARN_SCALING], ids=["default", "yarn"])
-# head_dim >= 128: below that, RotaryEmbedding.forward_xpu takes the bf16-cache fallback.
 @pytest.mark.parametrize("head_dim,rotary_dim", [(128, 128), (128, 64), (256, 256)])
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(32, 4), (8, 1)])
@@ -233,7 +232,7 @@ def test_qknorm_rope_matches_model_unfused_path(
     num_kv_heads: int,
     num_tokens: int,
 ) -> None:
-    """The fused call fed from a model's RotaryEmbedding matches its unfused apply_qk_norm + rotary_emb path."""
+    """ Test for the fused call fed from a model's RotaryEmbedding matches its unfused apply_qk_norm + rotary_emb path."""
     max_position = 131072
     rotary_emb = get_rope(
         head_dim,
