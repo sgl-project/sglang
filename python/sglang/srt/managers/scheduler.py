@@ -556,7 +556,11 @@ class Scheduler(
             time.sleep(t)
 
         # HCCL and custom AiCPU must start before MemCache maps Host memory.
-        self.maybe_init_hccl_dp_prewarm()
+        prewarm_before_cache = (
+            self.server_args.hicache_storage_backend == "npu_memcache"
+        )
+        if prewarm_before_cache:
+            self.maybe_init_hccl_dp_prewarm()
 
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
@@ -606,6 +610,8 @@ class Scheduler(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
         self.emit_metrics_constants()
+        if not prewarm_before_cache:
+            self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
