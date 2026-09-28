@@ -311,7 +311,7 @@ class _FakeKVCache:
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
-class TestTranslateKvLocForKernel(unittest.TestCase):
+class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
@@ -333,38 +333,109 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return full_alloc
 
-    def test_kernel_id_is_the_physical_id(self):
+    def test_translate_matches_v2p_formula(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(3 * ps)
             self.assertIsNotNone(v)
-            phys = alloc.translate_kv_loc(v)
-            kernel = alloc.translate_kv_loc_for_kernel(v)
-            self.assertTrue(torch.equal(kernel, phys), f"ps={ps}")
             v2p = alloc.virtual_to_physical
-            self.assertTrue(torch.equal(kernel, v2p[v // ps] * ps + v % ps))
+            want = v2p[v // ps] * ps + v % ps
+            self.assertTrue(torch.equal(alloc.translate_kv_loc(v), want), f"ps={ps}")
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
         # never-allocated virtual ids -> v2p == -1 -> id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        kernel = alloc.translate_kv_loc_for_kernel(virt)
-        self.assertTrue(torch.all(kernel == 0))
+        self.assertTrue(torch.all(alloc.translate_kv_loc(virt) == 0))
 
     def test_out_matches_and_aliases(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(2 * ps)
             self.assertIsNotNone(v)
-            no_out = alloc.translate_kv_loc_for_kernel(v)
+            no_out = alloc.translate_kv_loc(v)
             out = torch.empty_like(v)
-            ret = alloc.translate_kv_loc_for_kernel(v, out=out)
+            ret = alloc.translate_kv_loc(v, out=out)
             self.assertIs(ret, out)
             self.assertTrue(torch.all(out == no_out))
             # canonical in-place aliasing: translate(x, out=x)
             x = v.clone()
-            alloc.translate_kv_loc_for_kernel(x, out=x)
+            alloc.translate_kv_loc(x, out=x)
             self.assertTrue(torch.all(x == no_out))
+
+    def test_accepts_an_int32_2d_page_table(self):
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            v = alloc.alloc(4 * ps)
+            self.assertIsNotNone(v)
+            want = alloc.translate_kv_loc(v)
+            page_table = v.to(torch.int32).view(2, -1)
+            got = alloc.translate_kv_loc(page_table)
+            self.assertEqual(got.shape, page_table.shape)
+            self.assertTrue(torch.equal(got.reshape(-1), want))
+            dst = torch.empty(page_table.shape, dtype=torch.int64)
+            alloc.translate_kv_loc(page_table, out=dst)
+            self.assertTrue(torch.equal(dst.reshape(-1), want))
+
+    def test_a_negative_loc_lands_on_the_sink(self):
+        """A padded read table carries -1 in the slots a shorter sequence does
+        not use, and `translate_kv_loc` is on the path that sees them."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            got = alloc.translate_kv_loc(torch.tensor([-1], dtype=torch.int64))
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_a_loc_past_the_sentinel_lands_on_the_sink(self):
+        """Only `-1` reaches the trailing v2p sentinel; a loc below it floors
+        onto a REAL page, so a translate that merely indexes with it hands back
+        a live slot belonging to another request."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            alloc.virtual_to_physical[-2] = 7  # bind the last real page
+            got = alloc.translate_kv_loc(torch.tensor([-(ps + 1)], dtype=torch.int64))
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_an_out_of_range_loc_lands_on_the_sink(self):
+        """A misuse -- re-running a full->swa map on already-translated ids --
+        indexes past the table; the read must resolve, not fault."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            self.assertIsNotNone(alloc.alloc(4 * ps))
+            past = int(alloc.virtual_to_physical.numel()) * ps * 4
+            got = alloc.translate_kv_loc(torch.tensor([past], dtype=torch.int64))
+            self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
+
+    def test_translate_accepts_a_strided_page_table(self):
+        """The SWA read path hands down `page_table[:bs, :max_seq_len]`, a
+        column slice of the capture-stable buffer."""
+        for ps in (1, 4):
+            alloc = self._build(ps=ps)
+            v = alloc.alloc(4 * ps)
+            self.assertIsNotNone(v)
+            want = alloc.translate_kv_loc(v)
+            backing = torch.full((2, 2 * v.numel()), -1, dtype=torch.int64)
+            view = backing[:, : v.numel() // 2]
+            view.copy_(v.view(2, -1))
+            self.assertFalse(view.is_contiguous())
+            got = alloc.translate_kv_loc(view)
+            self.assertEqual(got.shape, view.shape)
+            self.assertTrue(torch.equal(got.reshape(-1), want))
+
+    def test_translate_follows_compaction(self):
+        alloc = self._build(ps=1)
+        a = alloc.alloc(4)
+        b = alloc.alloc(4)
+        c = alloc.alloc(4)
+        self.assertIsNotNone(c)
+        alloc.free(b)  # eager compaction relocates survivors
+        for run in (a, c):
+            self.assertTrue(
+                torch.equal(alloc.translate_kv_loc(run), alloc.virtual_to_physical[run])
+            )
 
 
 class _RecordingHybridPool:
