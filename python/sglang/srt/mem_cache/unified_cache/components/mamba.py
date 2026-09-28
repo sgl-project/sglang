@@ -604,10 +604,10 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                selected = self._select_finished_checkpoint(req, token_ids_len)
-                if selected is None:
+                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
+                if checkpoint is None:
                     return 0
-                cache_len, keep_idx = selected
+                cache_len, keep_idx = checkpoint
                 insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
@@ -682,10 +682,10 @@ class MambaComponent(TreeComponent):
 
             if self.cache.enable_mamba_extra_buffer:
                 # Keep the slot prepare picked, so cleanup cannot pick another.
-                selected = (
+                prepared_keep_idx = (
                     insert_params.mamba_keep_idx if insert_params is not None else None
                 )
-                keep_idx = selected if mamba_value_inserted else None
+                keep_idx = prepared_keep_idx if mamba_value_inserted else None
                 pool.free_mamba_cache(
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )

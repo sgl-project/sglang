@@ -526,10 +526,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
         ):
-            # No external-event support (e.g. HIP) means the declared in-graph
-            # marker cannot be recorded. Falling back to PRE_REPLAY would fence
-            # the scheduler before the replay's shared reads; POST_REPLAY is the
-            # sound fallback because the event then covers the whole replay.
+            # no in-graph marker (e.g. HIP): only a post-replay event covers its reads
             return SharedReadEnds.POST_REPLAY
         return declared
 

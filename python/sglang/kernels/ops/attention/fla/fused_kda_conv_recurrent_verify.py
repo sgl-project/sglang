@@ -42,8 +42,8 @@ from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
 # numerics-safe at num_warps=4 (bit-exact vs the BV=32 original).
 KDA_VERIFY_BLOCK_V = 4
-# gfx950, GLM TP4 at T=6 or 8 with fp32 conv weights: from B=3 wider V tiles
-# share the q/k convolution across more lanes (B=8 T=6: 29.5 -> 22.3 us).
+# gfx950 V-tile width for the measured GLM TP4 shapes: wider tiles share the q/k
+# convolution across more lanes
 KDA_VERIFY_BLOCK_V_HIP = 16
 
 
@@ -442,8 +442,7 @@ def fused_kda_conv_gating_verify(
     # T=8 safe gate. conv_state is not comparable to the reference at all.
     # The ReplaySSM ring values are bit-exact at any num_warps: they are
     # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
-    # ROCm defaults to 1: on gfx950 it is also the faster choice (GLM T=6 B=8:
-    # 80.8 -> 22.3 us) and matches the reference bit for bit.
+    # None picks 1 on ROCm (faster on gfx950 and bit-exact with the reference), else 4
     num_warps: Optional[int] = None,
     # ReplaySSM fused ring-write; same parameter names as the unfused
     # fused_sigmoid_gating_delta_rule_update so ring_kwargs pass through both.
