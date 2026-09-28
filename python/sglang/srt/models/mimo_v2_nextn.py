@@ -23,7 +23,7 @@ from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_si
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -116,7 +116,7 @@ class MiMoV2MTPLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1,
             is_layer_sparse=self.is_layer_sparse,
@@ -124,7 +124,7 @@ class MiMoV2MTPLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_deferred_ffn_reduction=False,
