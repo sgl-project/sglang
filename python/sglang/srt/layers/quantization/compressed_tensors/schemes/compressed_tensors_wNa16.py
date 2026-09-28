@@ -39,10 +39,9 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_xpu
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-_is_xpu = is_xpu()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -52,7 +51,7 @@ ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CompressedTensorsWNA16"]
+__all__ = ["CompressedTensorsWNA16", "XPUCompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {
     4: scalar_types.uint4b8,
     8: scalar_types.uint8b128
@@ -90,19 +89,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.quant_type = (WNA16_ZP_SUPPORTED_TYPES_MAP[num_bits]
                            if not self.symmetric else
                            WNA16_SUPPORTED_TYPES_MAP[num_bits])
-
-        # XPU has no Marlin kernel; lower to the torch int4pack op instead.
-        self.xpu_kernel = None
-        if _is_xpu:
-            from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_kernels import (
-                CompressedTensorsWNA16XPULinearKernel,
-            )
-
-            self.xpu_kernel = CompressedTensorsWNA16XPULinearKernel(
-                group_size=self.group_size,
-                symmetric=bool(self.symmetric),
-                has_g_idx=self.has_g_idx,
-            )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -229,10 +215,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.w_zp_name = "weight_zero_point"
         self.w_gidx_name = "weight_g_idx"
 
-        if self.xpu_kernel is not None:
-            self.xpu_kernel.process_weights_after_loading(layer)
-            return
-
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
@@ -321,9 +303,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
-        if self.xpu_kernel is not None:
-            return self.xpu_kernel.apply(layer, x, bias)
-
         c = self.kernel_config
 
         def _get_weight_params(
@@ -359,3 +338,52 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             is_k_full=self.is_k_full,
             bias=bias,
         )
+
+
+class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):
+    """WNA16 on Intel XPU: Using torch's int4pack op."""
+
+    def __init__(self,
+                 strategy: str,
+                 num_bits: int,
+                 group_size: Optional[int] = None,
+                 symmetric: Optional[bool] = True,
+                 actorder: Optional[ActivationOrdering] = None):
+        super().__init__(strategy, num_bits, group_size, symmetric, actorder)
+
+        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_wna16_kernels import (
+            CompressedTensorsWNA16XPULinearKernel,
+        )
+        from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
+            SUPPORTED_GROUP_SIZES,
+        )
+
+        # _weight_int4pack_mm_with_scales_and_zeros cannot express any of these,
+        # so reject at construction rather than after the weights are loaded.
+        if num_bits != 4:
+            raise NotImplementedError(
+                f"compressed-tensors WNA16 on XPU supports 4-bit weights only, "
+                f"got num_bits={num_bits}.")
+        if self.group_size not in SUPPORTED_GROUP_SIZES:
+            raise NotImplementedError(
+                f"compressed-tensors WNA16 on XPU requires group_size in "
+                f"{SUPPORTED_GROUP_SIZES}, got {self.group_size} "
+                "(channelwise/-1 is out of scope).")
+        if not self.symmetric:
+            raise NotImplementedError(
+                "compressed-tensors WNA16 on XPU only supports symmetric weight "
+                "quantization; this checkpoint carries a weight zero-point.")
+        if self.has_g_idx:
+            raise NotImplementedError(
+                "compressed-tensors WNA16 on XPU does not support activation "
+                "reordering (actorder=group).")
+
+        self.kernel = CompressedTensorsWNA16XPULinearKernel(
+            group_size=self.group_size)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
+                      bias: Optional[torch.Tensor]) -> torch.Tensor:
+        return self.kernel.apply(layer, x, bias)

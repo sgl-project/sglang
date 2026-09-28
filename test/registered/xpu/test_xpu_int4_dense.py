@@ -300,7 +300,7 @@ class TestXPUCompressedTensorsWNA16Kernel(CustomTestCase):
                     self._run_wna16(8, k, n, gs, dtype, with_bias=True)
 
     def _run_wna16(self, m, k, n, gs, dtype, with_bias=False):
-        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_kernels import (
+        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_wna16_kernels import (
             CompressedTensorsWNA16XPULinearKernel,
         )
 
@@ -321,9 +321,7 @@ class TestXPUCompressedTensorsWNA16Kernel(CustomTestCase):
         )
         layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
 
-        kernel = CompressedTensorsWNA16XPULinearKernel(
-            group_size=gs, symmetric=True, has_g_idx=False
-        )
+        kernel = CompressedTensorsWNA16XPULinearKernel(group_size=gs)
         kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x, bias)
 
@@ -333,38 +331,27 @@ class TestXPUCompressedTensorsWNA16Kernel(CustomTestCase):
         self.assertLess(rel, REL_TOL[dtype], f"rel={rel:.2e}")
 
     def test_wna16_rejects_unsupported_configs(self):
-        # The native XPU op cannot express these; fail loudly instead of
-        # producing silently wrong weights.
-        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_kernels import (
-            CompressedTensorsWNA16XPULinearKernel,
+        """Configs the native XPU op cannot express must fail at scheme
+        construction, not after the weights are loaded -- 8-bit WNA16 in
+        particular, which would otherwise be packed as int4."""
+        from compressed_tensors.quantization import ActivationOrdering
+
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            XPUCompressedTensorsWNA16,
         )
 
-        k, n, gs = 128, 64, 32
-        # Only the config is under test; the checks fire before any weight is
-        # replaced, so one layer is safe to reuse.
-        layer = _make_layer()
-        layer.weight_packed = torch.nn.Parameter(
-            torch.zeros(n, k // 8, dtype=torch.int32, device=DEV), requires_grad=False
-        )
-        layer.weight_scale = torch.nn.Parameter(
-            torch.ones(n, k // gs, device=DEV, dtype=torch.float16),
-            requires_grad=False,
-        )
-
+        base = dict(strategy="group", num_bits=4, group_size=32, symmetric=True)
         cases = (
-            (dict(group_size=48, symmetric=True, has_g_idx=False), r"group_size"),
-            (dict(group_size=-1, symmetric=True, has_g_idx=False), r"group_size"),
-            (dict(group_size=gs, symmetric=False, has_g_idx=False), r"symmetric"),
-            (
-                dict(group_size=gs, symmetric=True, has_g_idx=True),
-                r"activation reordering",
-            ),
+            ({**base, "num_bits": 8, "group_size": 128}, r"4-bit"),
+            ({**base, "group_size": 48}, r"group_size"),
+            ({**base, "strategy": "channel", "group_size": -1}, r"group_size"),
+            ({**base, "symmetric": False}, r"symmetric"),
+            ({**base, "actorder": ActivationOrdering.GROUP}, r"activation reordering"),
         )
         for kwargs, pattern in cases:
             with self.subTest(**kwargs):
-                kernel = CompressedTensorsWNA16XPULinearKernel(**kwargs)
-                with self.assertRaisesRegex(ValueError, pattern):
-                    kernel.process_weights_after_loading(layer)
+                with self.assertRaisesRegex(NotImplementedError, pattern):
+                    XPUCompressedTensorsWNA16(**kwargs)
 
 
 if __name__ == "__main__":
