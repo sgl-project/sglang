@@ -66,22 +66,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
-        self._host_offload = any(
-            getattr(module, "requires_npu_host_offload_graph", False)
-            for module in cuda_graph_runner.model_runner.model.modules()
-        )
-        if self._host_offload and self._enable_torch_compile:
-            raise NotImplementedError(
-                "NPU PLE segmented graphs do not support --enable-torch-compile"
-            )
-        if (
-            self._host_offload
-            and self._memory_saver_adapter is not None
-            and self._memory_saver_adapter.enabled
-        ):
-            raise NotImplementedError(
-                "NPU PLE segmented graphs do not support graph memory saver"
-            )
+        # Whether capture needs host-lookup segments is resolved on the first
+        # capture, when the model is guaranteed to be loaded.
+        self._model_runner = cuda_graph_runner.model_runner
+        self._host_offload: Optional[bool] = None
         # Reuse one device-bound worker for graph input updates.
         self._update_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -101,6 +89,28 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    def _uses_host_offload_graph(self) -> bool:
+        """Whether the model does host-table lookups that split the graph."""
+        if self._host_offload is None:
+            host_offload = any(
+                getattr(module, "requires_npu_host_offload_graph", False)
+                for module in self._model_runner.model.modules()
+            )
+            if host_offload and self._enable_torch_compile:
+                raise NotImplementedError(
+                    "NPU PLE segmented graphs do not support --enable-torch-compile"
+                )
+            if (
+                host_offload
+                and self._memory_saver_adapter is not None
+                and self._memory_saver_adapter.enabled
+            ):
+                raise NotImplementedError(
+                    "NPU PLE segmented graphs do not support graph memory saver"
+                )
+            self._host_offload = host_offload
+        return self._host_offload
+
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -109,6 +119,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
+
+        # Before warmup, so unsupported combinations fail without running the model.
+        host_offload = self._uses_host_offload_graph()
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
@@ -119,7 +132,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        if self._host_offload:
+        if host_offload:
             from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
                 NPUHostOffloadGraph,
             )
