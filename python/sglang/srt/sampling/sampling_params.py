@@ -164,6 +164,47 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     is_normalized: bool = False  # set by normalize()
     ebnf_full_assistant: bool = False
 
+    @staticmethod
+    def validate_trace_decode_compatibility(
+        trace_decode_token_ids: Optional[List[int]],
+        *,
+        custom_logit_processor: Optional[str] = None,
+        custom_params: Optional[Dict[str, CustomParamValue]] = None,
+        require_reasoning: bool = False,
+        max_thinking_tokens: Optional[int] = None,
+        enable_strict_thinking: bool = False,
+    ) -> None:
+        """Reject request features that would invalidate trace replay.
+
+        Trace replay replaces the sampled token but keeps the model's scores.
+        A grammar or a logit processor would either reject the forced token or
+        change the distribution those scores describe, so these combinations
+        are intentionally rejected before the request reaches the scheduler.
+        """
+        if trace_decode_token_ids is None:
+            return
+
+        conflicts = []
+        if custom_logit_processor is not None:
+            conflicts.append("custom_logit_processor")
+
+        custom_params = custom_params or {}
+        has_reasoning_end_ids = REQUEST_REASONING_END_TOKEN_IDS_KEY in custom_params
+        has_thinking_budget = "thinking_budget" in custom_params
+        if max_thinking_tokens is not None or has_thinking_budget:
+            conflicts.append("thinking budget")
+        if require_reasoning or has_reasoning_end_ids:
+            conflicts.append("reasoning grammar")
+        if enable_strict_thinking:
+            conflicts.append("--enable-strict-thinking")
+
+        if conflicts:
+            raise ValueError(
+                "trace_decode_token_ids cannot be combined with "
+                + ", ".join(conflicts)
+                + ". Trace replay requires unconstrained sampling."
+            )
+
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -293,6 +334,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         )
 
         if self.trace_decode_token_ids is not None:
+            self.validate_trace_decode_compatibility(
+                self.trace_decode_token_ids,
+                custom_params=self.custom_params,
+            )
             if not self.trace_decode_token_ids:
                 raise ValueError("trace_decode_token_ids must not be empty.")
             if self.n != 1:
@@ -436,6 +481,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         max_trace_len = max(context_len - prompt_len - reserved_tokens, 0)
         self.trace_decode_token_ids = self.trace_decode_token_ids[:max_trace_len]
         trace_len = len(self.trace_decode_token_ids)
+        if trace_len == 0:
+            raise ValueError(
+                "trace_decode_token_ids has no tokens remaining after "
+                "context-length truncation."
+            )
         if self.max_new_tokens is None:
             self.max_new_tokens = trace_len
         else:

@@ -109,10 +109,12 @@ class SamplingBatchInfo:
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
     # Trace replay state. The token table is [batch_size, max_trace_len]; rows
-    # with no trace have a zero trace length.
+    # with no trace have a zero trace length. The step is tracked separately
+    # from model positions because SamplingBatchInfo survives across decode
+    # iterations and can be merged/filtered while requests are running.
     trace_decode_token_ids: Optional[torch.Tensor] = None
     trace_decode_token_lens: Optional[torch.Tensor] = None
-    trace_decode_prompt_lens: Optional[torch.Tensor] = None
+    trace_decode_steps: Optional[torch.Tensor] = None
 
     @staticmethod
     def _build_trace_decode_tensors(reqs, device):
@@ -133,14 +135,14 @@ class SamplingBatchInfo:
         trace_lens_cpu = torch.zeros(
             len(reqs), dtype=torch.int32, pin_memory=_pin
         )
-        prompt_lens_cpu = torch.zeros(
+        trace_steps_cpu = torch.zeros(
             len(reqs), dtype=torch.int64, pin_memory=_pin
         )
         for i, (req, trace) in enumerate(zip(reqs, traces)):
-            prompt_ids = req.origin_input_ids
-            prompt_lens_cpu[i] = len(prompt_ids) if prompt_ids is not None else 0
             if trace:
                 trace_lens_cpu[i] = len(trace)
+                output_ids = getattr(req, "output_ids", None)
+                trace_steps_cpu[i] = len(output_ids) if output_ids is not None else 0
                 token_ids_cpu[i, : len(trace)] = torch.tensor(
                     trace, dtype=torch.int32
                 )
@@ -148,8 +150,17 @@ class SamplingBatchInfo:
         return (
             token_ids_cpu.to(device, non_blocking=True),
             trace_lens_cpu.to(device, non_blocking=True),
-            prompt_lens_cpu.to(device, non_blocking=True),
+            trace_steps_cpu.to(device, non_blocking=True),
         )
+
+    def advance_trace_decode_steps(self):
+        """Advance replay rows before the next decode forward pass."""
+        if self.trace_decode_steps is None or self.trace_decode_token_lens is None:
+            return
+        trace_rows = (self.trace_decode_token_lens > 0).to(
+            dtype=self.trace_decode_steps.dtype
+        )
+        self.trace_decode_steps = self.trace_decode_steps + trace_rows
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -271,7 +282,7 @@ class SamplingBatchInfo:
         (
             trace_decode_token_ids,
             trace_decode_token_lens,
-            trace_decode_prompt_lens,
+            trace_decode_steps,
         ) = cls._build_trace_decode_tensors(reqs, device)
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -321,7 +332,7 @@ class SamplingBatchInfo:
             ),
             trace_decode_token_ids=trace_decode_token_ids,
             trace_decode_token_lens=trace_decode_token_lens,
-            trace_decode_prompt_lens=trace_decode_prompt_lens,
+            trace_decode_steps=trace_decode_steps,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -477,7 +488,7 @@ class SamplingBatchInfo:
             "sampling_seed",
             "trace_decode_token_ids",
             "trace_decode_token_lens",
-            "trace_decode_prompt_lens",
+            "trace_decode_steps",
         ]:
             value = getattr(self, item, None)
             if value is not None:
@@ -656,9 +667,9 @@ class SamplingBatchInfo:
             self_len,
             other_len,
         )
-        self.trace_decode_prompt_lens = self._merge_trace_metadata(
-            self.trace_decode_prompt_lens,
-            other.trace_decode_prompt_lens,
+        self.trace_decode_steps = self._merge_trace_metadata(
+            self.trace_decode_steps,
+            other.trace_decode_steps,
             self_len,
             other_len,
         )

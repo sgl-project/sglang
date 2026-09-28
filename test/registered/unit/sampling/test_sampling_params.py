@@ -484,6 +484,28 @@ class TestSamplingParamsNormalize(CustomTestCase):
         self.assertEqual(sampling_params.trace_decode_token_ids, [7, 8])
         self.assertEqual(sampling_params.max_new_tokens, 2)
 
+    def test_trace_decode_token_ids_rejects_sampling_conflicts(self):
+        conflict_cases = [
+            {"custom_logit_processor": "processor"},
+            {"custom_params": {"thinking_budget": 16}},
+            {"require_reasoning": True},
+            {"enable_strict_thinking": True},
+        ]
+        for kwargs in conflict_cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
+                ValueError, "trace_decode_token_ids cannot be combined"
+            ):
+                SamplingParams.validate_trace_decode_compatibility(
+                    [7], **kwargs
+                )
+
+    def test_trace_decode_token_ids_rejects_empty_context_truncation(self):
+        sampling_params = SamplingParams(trace_decode_token_ids=[7])
+        with self.assertRaisesRegex(ValueError, "no tokens remaining"):
+            sampling_params.normalize_trace_decode_token_ids(
+                prompt_len=8, context_len=8, vocab_size=32000
+            )
+
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
     def test_rust_sampling_schema_stays_in_lockstep(self):

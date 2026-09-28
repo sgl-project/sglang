@@ -714,6 +714,7 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.trace_decode_token_ids = trace
         req.custom_logit_processor = None
         req.origin_input_ids = prompt_ids if prompt_ids is not None else [1, 2]
+        req.output_ids = []
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -864,15 +865,22 @@ class TestFromScheduleBatch(CustomTestCase):
 
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         sampled = torch.tensor([0])
-        first = apply_trace_decode_tokens(
-            sampled, info, torch.tensor([2], dtype=torch.int64)
-        )
-        second = apply_trace_decode_tokens(
-            sampled, info, torch.tensor([3], dtype=torch.int64)
-        )
+        first = apply_trace_decode_tokens(sampled, info)
+        info.advance_trace_decode_steps()
+        second = apply_trace_decode_tokens(sampled, info)
 
         self.assertTrue(torch.equal(first, torch.tensor([7])))
         self.assertTrue(torch.equal(second, torch.tensor([8])))
+
+    def test_trace_replay_step_starts_after_existing_output(self):
+        req = self._make_req(trace=[7, 8], prompt_ids=[1, 2, 3])
+        req.output_ids = [99]
+        batch = MagicMock(reqs=[req], device=DEVICE)
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        replayed = apply_trace_decode_tokens(torch.tensor([0]), info)
+
+        self.assertTrue(torch.equal(replayed, torch.tensor([8])))
 
 
 if __name__ == "__main__":

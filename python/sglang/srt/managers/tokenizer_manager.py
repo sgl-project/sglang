@@ -1316,6 +1316,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         trace_decode_token_ids = request_sampling_params.get(
             "trace_decode_token_ids"
         )
+        if isinstance(obj, GenerateReqInput):
+            SamplingParams.validate_trace_decode_compatibility(
+                trace_decode_token_ids,
+                custom_logit_processor=obj.custom_logit_processor,
+                custom_params=request_sampling_params.get("custom_params"),
+                require_reasoning=obj.require_reasoning,
+                max_thinking_tokens=obj.max_thinking_tokens,
+                enable_strict_thinking=get_serving().enable_strict_thinking,
+            )
         max_new_tokens = (
             None
             if trace_decode_token_ids is not None
@@ -1491,6 +1500,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
+        if isinstance(obj, GenerateReqInput):
+            SamplingParams.validate_trace_decode_compatibility(
+                sampling_kwargs.get("trace_decode_token_ids"),
+                custom_logit_processor=obj.custom_logit_processor,
+                custom_params=sampling_kwargs.get("custom_params"),
+                require_reasoning=obj.require_reasoning,
+                max_thinking_tokens=obj.max_thinking_tokens,
+                enable_strict_thinking=get_serving().enable_strict_thinking,
+            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.normalize_trace_decode_token_ids(

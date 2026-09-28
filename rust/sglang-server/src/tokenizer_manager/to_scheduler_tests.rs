@@ -316,6 +316,26 @@ fn input_length_is_checked_unconditionally() {
     );
 }
 
+#[test]
+fn trace_replay_rejects_empty_auto_truncation() {
+    let limits = Limits {
+        context_len: 2,
+        allow_auto_truncate: true,
+        ..test_limits()
+    };
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2]),
+        sampling_params: SamplingParams {
+            trace_decode_token_ids: Some(vec![7]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let err = check_total_tokens(&mut g, &limits).expect_err("trace must not become empty");
+    assert!(err.to_string().contains("no tokens remaining"), "{err}");
+}
+
 /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
 /// `max_new_tokens` can leave `min_new_tokens > max_new_tokens`. Nothing
 /// downstream re-checks — `is_normalized: true` makes the scheduler's own

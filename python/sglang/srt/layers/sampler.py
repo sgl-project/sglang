@@ -79,24 +79,22 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 def apply_trace_decode_tokens(
     sampled_token_ids: torch.Tensor,
     sampling_info: SamplingBatchInfo,
-    positions: torch.Tensor,
 ) -> torch.Tensor:
     """Replace sampled IDs with the next IDs from each request's trace."""
     trace_token_ids = sampling_info.trace_decode_token_ids
     trace_token_lens = sampling_info.trace_decode_token_lens
-    trace_prompt_lens = sampling_info.trace_decode_prompt_lens
+    trace_steps = sampling_info.trace_decode_steps
     if (
         trace_token_ids is None
         or trace_token_lens is None
-        or trace_prompt_lens is None
+        or trace_steps is None
         or trace_token_ids.shape[1] == 0
     ):
         return sampled_token_ids
 
     original_shape = sampled_token_ids.shape
     sampled_token_ids = sampled_token_ids.reshape(-1)
-    positions = positions.to(torch.int64).reshape(-1)
-    trace_step = positions - trace_prompt_lens + 1
+    trace_step = trace_steps.to(torch.int64).reshape(-1)
     should_replay = (trace_step >= 0) & (trace_step < trace_token_lens)
 
     safe_trace_step = trace_step.clamp(min=0, max=trace_token_ids.shape[1] - 1)
@@ -321,7 +319,7 @@ class Sampler(nn.Module):
         # the forced trace token.
         if sampling_info.trace_decode_token_ids is not None:
             batch_next_token_ids = apply_trace_decode_tokens(
-                batch_next_token_ids, sampling_info, positions
+                batch_next_token_ids, sampling_info
             )
 
         if return_logprob:

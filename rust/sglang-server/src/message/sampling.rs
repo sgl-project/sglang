@@ -656,6 +656,15 @@ impl SamplingParams {
                     "trace_decode_token_ids must contain token ids in [0, {vocab_size})"
                 )));
             }
+            if self.custom_params.as_ref().is_some_and(|params| {
+                params.contains_key("thinking_budget")
+                    || params.contains_key(REQUEST_REASONING_END_TOKEN_IDS_KEY)
+            }) {
+                return Err(bad(
+                    "trace_decode_token_ids cannot be combined with thinking or reasoning controls"
+                        .into(),
+                ));
+            }
         }
         // Grammars are mutually exclusive.
         let grammars = [

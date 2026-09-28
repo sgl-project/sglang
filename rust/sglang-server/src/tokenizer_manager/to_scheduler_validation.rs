@@ -140,6 +140,12 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
         let available_tokens = usize::try_from(max_req_len.saturating_sub(input_len))
             .unwrap_or(usize::MAX);
         trace_decode_token_ids.truncate(available_tokens);
+        if trace_decode_token_ids.is_empty() {
+            return Err(Error::Validation(
+                "trace_decode_token_ids has no tokens remaining after context-length truncation"
+                    .into(),
+            ));
+        }
         let trace_len = i64::try_from(trace_decode_token_ids.len()).unwrap_or(i64::MAX);
         g.sampling_params.max_new_tokens = Some(
             g.sampling_params
