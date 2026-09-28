@@ -187,6 +187,9 @@ pub enum RankOutcome {
     PublisherReset,
     /// The tree refused the snapshot's structure.
     TreeRejected,
+    /// The rank's first held batch was its publisher's first batch ever, so its
+    /// history is complete without a snapshot and none was grafted.
+    FromOrigin,
 }
 
 impl RankOutcome {
@@ -200,6 +203,7 @@ impl RankOutcome {
             Self::Overflow => "overflow",
             Self::PublisherReset => "publisher_reset",
             Self::TreeRejected => "tree_rejected",
+            Self::FromOrigin => "from_origin",
         }
     }
 }

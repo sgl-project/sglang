@@ -46,7 +46,7 @@ use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
-use fallback::{discard_graft, fail_rank};
+use fallback::{discard_graft, fail_rank, resolve_from_origin};
 use graft::{apply_snapshot, leaves_gap, still_owed};
 use producer::CachedSnapshot;
 
@@ -75,6 +75,24 @@ const EVENT_CHANNEL_BUFFER: usize = 1024;
 /// Sized to match `EVENT_CHANNEL_BUFFER`: if the pump is that far behind, the
 /// snapshot is not arriving in time anyway.
 const PENDING_BATCH_LIMIT: usize = 1024;
+
+/// Sequence number of the FIRST batch a publisher ever emits.
+///
+/// SGLang's `ZmqEventPublisher` numbers batches from `itertools.count()`, and it
+/// is constructed once per scheduler process, alongside an empty radix cache. A
+/// `Pending` rank whose first held batch carries this number has therefore
+/// received its publisher's stream from the beginning: no block exists on that
+/// engine that the held batches do not describe, so no sibling can hand over
+/// anything the rank lacks, and the rank is resolved on the spot rather than
+/// swept for. See `resolve_from_origin`.
+///
+/// Only an exact match on the FIRST held batch counts. A first batch at 1
+/// means batch 0 was missed — ZMQ's slow-joiner window drops whatever is
+/// published before the SUB filter reaches the publisher — and that batch may
+/// have stored blocks, so the rank keeps waiting for a snapshot. A batch 0
+/// arriving later is a publisher restart instead; see the regression arms in
+/// `pump_loop`.
+const STREAM_ORIGIN_SEQ: i64 = 0;
 
 // Constructed by the peer sweep, which lands next.
 #[allow(dead_code)]
@@ -184,7 +202,7 @@ pub struct KvEventIndex {
     /// any batch whose `seq` is not strictly greater than the previously
     /// applied one. Cleared on `remove_worker` because a re-added worker
     /// may legitimately have a fresh publisher whose sequence numbers
-    /// restart from 1.
+    /// restart from 0.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     /// Applied events by kind and storage medium, for the `/metrics` scrape.
     /// Written only by the pump.
@@ -639,7 +657,11 @@ struct PumpDeps {
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
 /// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=1 (after sending END_SEQ) is not filtered.
+/// restarting from seq=0 (after sending END_SEQ) is not filtered. Without
+/// that event, a regression is still read as a restart where it is
+/// unambiguous: any backwards step in a Pending rank's received sequence, and
+/// a batch 0 behind any cursor — both replace the rank's state with the new
+/// stream rather than being skipped.
 ///
 /// Also the sole writer of tree state, including snapshot grafts arriving as
 /// [`PumpControl`]; see the single-writer property in [`super::tree`].
@@ -769,7 +791,7 @@ async fn pump_loop(
             }
             WorkerEvent::PublisherReset { worker } => {
                 // A reset means the engine restarted with an empty cache and
-                // renumbers from 1: any splice proof, grafted state or held
+                // renumbers from 0: any splice proof, grafted state or held
                 // batch describes a cache that no longer exists, so drop all of
                 // it and relearn from the new stream.
                 if awaiting_splice_proof.remove(&worker).is_some() {
@@ -816,7 +838,49 @@ async fn pump_loop(
                 if bootstrap.enabled()
                     && bootstrap.state_of(&worker) == Some(BootstrapState::Pending)
                 {
-                    if held.get(&worker).map_or(0, VecDeque::len) >= PENDING_BATCH_LIMIT {
+                    let last_held = held.get(&worker).and_then(|q| q.back()).map(|(s, _)| *s);
+                    // The last seq this rank RECEIVED: the held queue's tail, or
+                    // with nothing held, its cursor. A Pending rank's cursor is
+                    // a raw arrival seq, never a graft watermark: a graft moves
+                    // the rank out of Pending, every path that discards one
+                    // clears the cursor it seeded, and a fresh incarnation
+                    // starts with none, because its `ForgetRanks` is queued on
+                    // the control channel, which the pump drains first.
+                    let last_received = last_held.or_else(|| cursors.lock().get(&worker).copied());
+                    if last_held.is_none() && seq == STREAM_ORIGIN_SEQ {
+                        // Nothing to wait on a peer for: this stream starts at
+                        // its publisher's origin.
+                        resolve_from_origin(&pump_state, &mut held, &worker);
+                    } else if last_received.is_some_and(|last| seq < last) {
+                        // Received order is raw arrival order — no watermark is
+                        // seeded into it — and PUB/SUB neither reorders nor
+                        // replays, so a regression in it is the publisher
+                        // renumbering: the engine restarted in place without an
+                        // `END_SEQ`. Anything queued is a dead stream. Holding
+                        // on would graft a snapshot whose old-numbering watermark
+                        // then filters the entire new stream, with no gap ever
+                        // detected — dead state served warm, live updates lost.
+                        warn!(
+                            worker = ?worker,
+                            last_received_seq = last_received,
+                            seq,
+                            "kv-bootstrap: sequence regressed while holding; the publisher \
+                             restarted without END_SEQ, discarding the dead stream's batches",
+                        );
+                        if seq == STREAM_ORIGIN_SEQ {
+                            resolve_from_origin(&pump_state, &mut held, &worker);
+                        } else {
+                            // The new stream's head is gone too, so nothing can
+                            // be spliced: run cold from this batch on.
+                            fail_rank(
+                                &pump_state,
+                                &mut held,
+                                &worker,
+                                true,
+                                RankOutcome::PublisherReset,
+                            );
+                        }
+                    } else if held.get(&worker).map_or(0, VecDeque::len) >= PENDING_BATCH_LIMIT {
                         // Dropping from the middle of the stream would leave a
                         // hole the snapshot cannot be spliced across, so give up
                         // on bootstrapping this rank and let it run live. The
@@ -856,6 +920,35 @@ async fn pump_loop(
                     }
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
+                } else if seq == STREAM_ORIGIN_SEQ && cursors.lock().contains_key(&worker) {
+                    // The resolved-rank counterpart of the regression above,
+                    // narrowed to batch 0. Here the comparison is against the
+                    // CURSOR, which a graft may have seeded ahead of anything
+                    // received, so `seq <= cursor` in general means "already
+                    // reflected" and stays filtered by `apply_batch`. Batch 0 is
+                    // the exception: any cursor means batch 0 is already
+                    // reflected, so another one is a restarted publisher —
+                    // whose whole stream the old cursor would otherwise filter
+                    // until it overtook it. (Were it a redelivery at cursor 0,
+                    // clearing and re-applying batch 0 rebuilds the same state,
+                    // since batch 0 is all such a cursor reflects. Were it a
+                    // graft the pump took before this rank's first batch, the
+                    // stream from its origin rebuilds what the graft held.) The gap
+                    // check below cannot see this: it flags forward holes, and
+                    // a regressed seq passes it as proof of continuity.
+                    warn!(
+                        worker = ?worker,
+                        "kv-events pump: batch 0 behind a later cursor; replacing this rank's \
+                         state with the stream from its origin (the publisher restarted without \
+                         END_SEQ, or a graft landed before its first batch)",
+                    );
+                    if awaiting_splice_proof.remove(&worker).is_some() {
+                        // The graft's verdict is final now: its state is gone,
+                        // and what replaces it is the new stream from its origin.
+                        bootstrap.record_rank_outcome(RankOutcome::FromOrigin);
+                    }
+                    tree.clear_worker(&worker);
+                    cursors.lock().remove(&worker);
                 }
                 // First batch after a graft proves — or disproves — that the
                 // snapshot joins up with this rank's live stream.

@@ -5,7 +5,7 @@ use super::*;
 use crate::state::kv_events::wire::{BlockRemoved, BlockStored};
 use crate::state::load_monitor::engine_reported_load::LoadStat;
 
-/// A restarted publisher renumbers from 1, so its cursor MUST be cleared.
+/// A restarted publisher renumbers from 0, so its cursor MUST be cleared.
 ///
 /// Without this, every post-restart batch has `seq < last_applied` and is
 /// dropped as out-of-order: the rank's tree freezes at pre-restart state
@@ -49,6 +49,68 @@ async fn pump_publisher_reset_clears_cursor_so_restarted_stream_applies() {
         !h.tree.match_prefix(None, &[11]).workers().contains(&id),
         "pre-reset blocks must not survive as false cache hits",
     );
+}
+
+/// The same restart without the `END_SEQ` that raises `PublisherReset` — the
+/// engine killed and restarted in place. Its batch 0 lands behind the old
+/// stream's cursor; skipping it as out-of-order would filter the whole new
+/// stream until it overtook the old numbering, serving the dead cache's blocks
+/// meanwhile.
+#[tokio::test]
+async fn pump_batch_zero_behind_a_cursor_restarts_the_rank_without_bootstrap() {
+    let id = worker_id("http://w1", 0);
+    let h = spawn_pump(std::slice::from_ref(&id));
+
+    for (seq, hash) in [(9, 11), (0, 22), (1, 33)] {
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq,
+            batch: batch(vec![stored(None, vec![hash])]),
+        })
+        .await
+        .unwrap();
+    }
+    drop(h.tx);
+    drop(h.ctrl_tx);
+    h.pump.await.unwrap();
+
+    assert!(
+        !h.tree.match_prefix(None, &[11]).workers().contains(&id),
+        "the dead stream's blocks must not survive as false cache hits",
+    );
+    for live in [22, 33] {
+        assert!(
+            h.tree.match_prefix(None, &[live]).workers().contains(&id),
+            "new-stream block {live} must be applied, not filtered",
+        );
+    }
+    assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
+}
+
+/// A backwards step that does not land on batch 0 is still filtered: past the
+/// origin, a cursor may be a graft watermark ahead of anything received, so a
+/// lower seq means "already reflected", not "restarted".
+#[tokio::test]
+async fn pump_regression_past_the_origin_is_still_filtered_without_bootstrap() {
+    let id = worker_id("http://w1", 0);
+    let h = spawn_pump(std::slice::from_ref(&id));
+
+    for (seq, hash) in [(9, 11), (3, 22)] {
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq,
+            batch: batch(vec![stored(None, vec![hash])]),
+        })
+        .await
+        .unwrap();
+    }
+    drop(h.tx);
+    drop(h.ctrl_tx);
+    h.pump.await.unwrap();
+
+    assert!(h.tree.match_prefix(None, &[11]).workers().contains(&id));
+    assert!(!h.tree.match_prefix(None, &[22]).workers().contains(&id));
+    assert_eq!(h.cursors.lock().get(&id).copied(), Some(9));
 }
 
 /// `ForgetRanks` must drop the pump-local queue and splice proof, or a

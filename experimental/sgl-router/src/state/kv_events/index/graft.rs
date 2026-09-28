@@ -419,7 +419,7 @@ mod tests {
 
     /// A snapshot fetched for a PREVIOUS incarnation must not graft: it would
     /// seed a watermark from the old publisher's numbering, and every batch
-    /// from the fresh publisher (restarting at seq 1) would then be filtered
+    /// from the fresh publisher (restarting at seq 0) would then be filtered
     /// as out-of-order while the rank reports Recovered.
     #[tokio::test]
     async fn pump_snapshot_from_a_stale_incarnation_is_discarded() {
