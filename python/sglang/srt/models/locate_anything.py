@@ -200,6 +200,10 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             )
 
             if is_vision_weight:
+                # MoonViT attention runs through sglang's VisionAttention (attn.qkv_proj/
+                # attn.proj); the checkpoint fuses these as wqkv/wo, so rename or the vision
+                # blocks never get their weights. Same remap as the Kimi-VL loader.
+                name = name.replace("wqkv.", "attn.qkv_proj.").replace("wo.", "attn.proj.")
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
