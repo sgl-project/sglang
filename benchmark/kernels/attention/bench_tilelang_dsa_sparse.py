@@ -124,6 +124,35 @@ def _run_cell(
             "complete_ms": complete_ms,
         }
 
+    if backend == "triton-decode":
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        workspace = []
+
+        def run_complete():
+            return triton_sparse_mla_decode_splitk(
+                q,
+                q[..., DIM:],
+                kv,
+                indices,
+                1.0 / math.sqrt(256),
+                d_v=DIM,
+                workspace=workspace,
+            )
+
+        actual = run_complete()
+        torch.cuda.synchronize()
+        complete_ms = _time_ms(run_complete, warmup, repeats)
+        return actual, {
+            "backend": backend,
+            "heads": heads,
+            "m": m,
+            "live_topk": live_topk,
+            "complete_ms": complete_ms,
+        }
+
     q4 = q.unsqueeze(0)
     kv4 = kv.unsqueeze(0)
     indices4 = indices.unsqueeze(0)
@@ -166,7 +195,9 @@ def _run_cell(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--candidate-backend", choices=("tilelang", "triton"), default="tilelang"
+        "--candidate-backend",
+        choices=("tilelang", "triton", "triton-decode"),
+        default="tilelang",
     )
     parser.add_argument("--heads", type=int, choices=(8, 16), default=16)
     parser.add_argument("--m", type=int, nargs="+", default=DEFAULT_M)

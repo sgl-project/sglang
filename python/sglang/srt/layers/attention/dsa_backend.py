@@ -97,18 +97,16 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 
-def _use_glm53_triton_sparse_prefill(
+def _use_glm53_triton_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
     d_v: int,
-    is_prefill: bool,
 ) -> bool:
-    """Use Triton only inside the validated GLM-5.3 prefill envelope."""
+    """Use Triton only inside the validated GLM-5.3 sparse-attention envelope."""
     max_tokens_by_heads = {8: 131072, 16: 65536}
     return (
-        is_prefill
-        and _IS_GFX95
+        _IS_GFX95
         and q.dtype == torch.bfloat16
         and kv.dtype == torch.bfloat16
         and q.ndim == 3
@@ -3104,9 +3102,19 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
-        if _use_glm53_triton_sparse_prefill(
-            q_all, kv_cache, page_table_1, v_head_dim, is_prefill
+        if _use_glm53_triton_sparse_attention(
+            q_all, kv_cache, page_table_1, v_head_dim
         ):
+            if not is_prefill:
+                return self._forward_triton_decode(
+                    q_nope=q_all[..., :v_head_dim],
+                    q_rope=q_all[..., v_head_dim:],
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                )
+
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
