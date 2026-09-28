@@ -71,359 +71,6 @@ struct Compress2DecodeParams {
   float eps;
 };
 
-/// Elements per thread; 256 threads per token measured fastest on B200 decode batches.
-/// At (512, 64) it also keeps the nope/rope split warp-aligned, as the fp8 amax reduction requires.
-constexpr uint32_t kC2VecSize = 2;
-
-/// \brief grid = num_tokens, block = kHeadDim / kC2VecSize.
-///
-/// An odd position completes a group with its even predecessor; an even one parks in the state.
-///
-/// Under target-verify, `draft_len` consecutive positions per request: `blockIdx.x` is the
-/// position inside the block, `blockIdx.y` the request, and every row but the first takes its
-/// partner from the previous `kv_input` row instead of the ring.
-///
-/// The three reductions have different widths and are not interchangeable: the RMSNorm
-/// statistic spans the row, an fp8 store scale 64 elements, an fp4 block 16.
-///
-/// kLayout is the cache's page format: V4 and V41 store the fake-quantized value; V41_FP4
-/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding happens once.
-template <
-    bool kVerify,
-    int64_t kHeadDim,
-    int64_t kRopeDim,
-    int32_t kPageBits,
-    typename PosT,
-    typename LocT,
-    deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
-__global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const Compress2DecodeParams params) {
-  using namespace device;
-  using deepseek_v4::KVLayout;
-  using deepseek_v4::fp8::cast_to_ue8m0;
-  using deepseek_v4::fp8::inv_scale_ue8m0;
-  using deepseek_v4::fp8::pack_fp8;
-
-  constexpr uint32_t kVecSize = kC2VecSize;
-  constexpr uint32_t kCTASize = kHeadDim / kVecSize;
-  constexpr int64_t kStride = kHeadDim * 2;
-  /// Threads covering the fp8 nope part; the rest carry the bf16 RoPE tail.
-  constexpr uint32_t kNopeThreads = (kHeadDim - kRopeDim) / kVecSize;
-  constexpr uint32_t kFp8Lanes = 64 / kVecSize;
-  constexpr uint32_t kFp4Lanes = deepseek_v4::fp4::kCompressedKVBlockSize / kVecSize;
-  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
-
-  static_assert(kHeadDim == (kVecSize * kCTASize));
-  static_assert(kCTASize % kWarpThreads == 0);
-  static_assert(kNopeThreads % kFp8Lanes == 0, "the nope part must end on an fp8 scale block");
-  static_assert(kWarpThreads % kFp8Lanes == 0 && kWarpThreads % kFp4Lanes == 0);
-  static_assert(kHeadDim == 512 && kRopeDim == 64, "the FlashMLA layouts require (512, 64)");
-  using fp32_vec_t = AlignedVector<float, kVecSize>;
-  using bf16_vec_t = AlignedVector<bf16x2_t, kVecSize / 2>;
-
-  const auto tx = threadIdx.x;
-  // Verify gives each request a CTA column; decode a flat grid of one row each.
-  const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
-  PDLWaitPrimary<kUsePDL>();
-  // Slots fit in int32 whatever width the scheduler hands them in.
-  const auto raw_out_loc = static_cast<int32_t>(static_cast<const LocT*>(params.raw_out_loc)[row]);
-  // CUDA graph padding is a completely inert row: do not read schedule, input,
-  // state, or RoPE data, and do not publish output or update the cache.
-  if (raw_out_loc == 0) return PDLTriggerSecondary<kUsePDL>();
-  const auto pos = static_cast<const PosT*>(params.positions)[row];
-  // A completing row reads the slot left by `pos - 1`;
-  // a pending row writes its own slot, so reads and writes stay disjoint.
-  const auto rid = params.req[row];
-
-  fp32_vec_t kv_new, score_new;
-  kv_new.load(params.kv_input + row * kStride, tx);
-  score_new.load(params.kv_input + row * kStride, tx + kCTASize);
-
-  const auto ring = static_cast<int64_t>(rid) * params.ring_size;
-  const auto read_row = ring + (pos - 1 + params.ring_size) % params.ring_size;
-  const auto write_row = ring + pos % params.ring_size;
-
-  fp32_vec_t kv_old, score_old;
-  const float* partner = params.kv_state + read_row * kStride;
-  if constexpr (kVerify) {
-    if (blockIdx.x != 0) partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
-  }
-  kv_old.load(partner, tx);
-  score_old.load(partner, tx + kCTASize);
-
-  if ((pos & 1) == 0) {
-    kv_new.store(params.kv_state + write_row * kStride, tx);
-    score_new.store(params.kv_state + write_row * kStride, tx + kCTASize);
-    return PDLTriggerSecondary<kUsePDL>();
-  }
-
-  constexpr uint32_t kNumWarps = kCTASize / kWarpThreads;
-  __shared__ float s_warp_sum[kNumWarps];
-  fp32_vec_t staged, freq;
-  bf16_vec_t weight, out;
-  weight.load(params.norm_weight, tx);
-  if (tx >= kNopeThreads) freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
-
-  // With two scores `exp(-|s0 - s1|)` is the whole softmax: one exp, argument
-  // always <= 0, so no max-subtraction pass and no overflow.
-#pragma unroll
-  for (uint32_t i = 0; i < kVecSize; ++i) {
-    const auto delta = score_old[i] - score_new[i];
-    const auto scale = expf(-fabsf(delta));
-    const auto scale_0 = delta > 0 ? 1.0f : scale;
-    const auto scale_1 = delta > 0 ? scale : 1.0f;
-    staged[i] = (kv_old[i] * scale_0 + kv_new[i] * scale_1) / (1.0f + scale);
-  }
-
-  // `finish` casts to bf16 before the norm, so the sum of squares must see the rounded values.
-  round_c2_norm_input(staged);
-  float local_sqrsum = 0.0f;
-#pragma unroll
-  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto x = staged[i * 2 + 0];
-    const auto y = staged[i * 2 + 1];
-    local_sqrsum += x * x;
-    local_sqrsum += y * y;
-  }
-  const auto warp_sum = warp::reduce_sum(local_sqrsum);
-  s_warp_sum[tx / kWarpThreads] = warp_sum;
-  __syncthreads();
-
-  float sqrsum = 0.0f;
-#pragma unroll
-  for (uint32_t i = 0; i < kNumWarps; ++i) {
-    sqrsum += s_warp_sum[i];
-  }
-  constexpr float kInvScale = 1.0f / static_cast<float>(kHeadDim);
-  const auto norm_factor = math::rsqrt(sqrsum * kInvScale + params.eps);
-
-  fp32_vec_t norm_weights;
-#pragma unroll
-  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto [wx, wy] = cast<fp32x2_t>(weight[i]);
-    norm_weights[i * 2 + 0] = wx;
-    norm_weights[i * 2 + 1] = wy;
-  }
-  out = finish_c2_norm(staged, norm_weights, norm_factor);
-  // The pre-RoPE latent, for the index-K branch's `wk` projection. Published
-  // before the trigger because that GEMM is the successor that reads it.
-  out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
-  PDLTriggerSecondary<kUsePDL>();
-
-  // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
-  // Match finish()'s bf16 rounding before RoPE.
-#pragma unroll
-  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto [x, y] = cast<fp32x2_t>(out[i]);
-    staged[i * 2 + 0] = x;
-    staged[i * 2 + 1] = y;
-  }
-
-  if (tx >= kNopeThreads) {
-    // Match rope_tail()'s bf16 rounding before fake quantization.
-    // Only odd positions reach here; the latent represents `pos - 1`.
-#pragma unroll
-    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto x_real = staged[i * 2 + 0];
-      const auto x_imag = staged[i * 2 + 1];
-      const auto f_real = x_real * freq[i * 2 + 0] - x_imag * freq[i * 2 + 1];
-      const auto f_imag = x_real * freq[i * 2 + 1] + x_imag * freq[i * 2 + 0];
-      const auto rotated = cast<bf16x2_t>(fp32x2_t{f_real, f_imag});
-      const auto [r0, r1] = cast<fp32x2_t>(rotated);
-      staged[i * 2 + 0] = r0;
-      staged[i * 2 + 1] = r1;
-    }
-  }
-
-  if constexpr (kLayout == KVLayout::V41_FP4) {
-    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
-    const int32_t out_loc = raw_out_loc >> 1;
-    const auto kv_row = Paged::row(params.kvcache, out_loc);
-    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
-  }
-
-  // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
-  {
-    float amax = fabsf(staged[0]);
-#pragma unroll
-    for (uint32_t i = 1; i < kVecSize; ++i) {
-      amax = fmaxf(amax, fabsf(staged[i]));
-    }
-    amax = warp::reduce_max<kFp4Lanes>(amax);
-    const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
-#pragma unroll
-    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto [x, y] = deepseek_v4::fp4::fake_quant_compressed_kv_x2({staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
-      staged[i * 2 + 0] = x;
-      staged[i * 2 + 1] = y;
-    }
-  }
-
-  // `raw_out_loc / ratio`; ratio 2 makes it a shift.
-  const int32_t out_loc = raw_out_loc >> 1;
-  const auto kv_row = Paged::row(params.kvcache, out_loc);
-
-  if constexpr (kLayout == KVLayout::V41) {
-    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
-    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
-  }
-
-  const auto value_ptr = kv_row.data;
-
-  if (tx >= kNopeThreads) {
-    bf16_vec_t rope_out;
-#pragma unroll
-    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      rope_out[i] = cast<bf16x2_t>(fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]});
-    }
-    rope_out.store(value_ptr + (kHeadDim - kRopeDim), tx - kNopeThreads);
-  } else {
-    // fp8 e4m3 with one ue8m0 scale per 64 elements.
-    auto abs_max = fabsf(staged[0]);
-#pragma unroll
-    for (uint32_t i = 1; i < kVecSize; ++i) {
-      abs_max = fmaxf(abs_max, fabsf(staged[i]));
-    }
-    abs_max = warp::reduce_max<kFp8Lanes>(abs_max);
-    const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
-    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-#pragma unroll
-    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx * (kVecSize / 2) + i] =
-          pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
-    }
-    kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
-  }
-}
-
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
-struct FlashCompress2Kernel {
-  static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
-  static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
-  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
-  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
-  template <bool kVerify, typename PosT, typename LocT>
-  static constexpr auto kernel =
-      flash_c2_decode_kernel<kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
-
-  /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <bool kVerify>
-  static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kVerify, int32_t, int32_t> : kernel<kVerify, int32_t, int64_t>;
-    return loc_i32 ? kernel<kVerify, int64_t, int32_t> : kernel<kVerify, int64_t, int64_t>;
-  }
-
-  // The sum of squares reduces through a fixed-size shared array, so the CTA must be whole warps.
-  static_assert(kHeadDim % (4 * device::kWarpThreads) == 0, "head_dim must be a multiple of 128");
-  static_assert(std::has_single_bit(kPageSize), "the page/slot split needs a power-of-two page");
-
-  /// \brief `run_decode_fusion` for a target-verify block.
-  ///
-  /// `draft_len` consecutive positions per request, request-major, which the
-  /// grid reproduces as `draft_len x batch`.
-  static void run_decode_fusion(
-      const tvm::ffi::TensorView kv_input,
-      const tvm::ffi::TensorView kv_state,
-      const tvm::ffi::TensorView kv_output,
-      const tvm::ffi::TensorView norm_weight,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView req,
-      const tvm::ffi::TensorView raw_out_loc,
-      const float eps,
-      const tvm::ffi::TensorView freqs_cis,
-      const tvm::ffi::TensorView kvcache,
-      const int64_t ring_size,
-      const int64_t draft_len) {
-    launch(
-        kv_input,
-        kv_state,
-        kv_output,
-        norm_weight,
-        positions,
-        req,
-        raw_out_loc,
-        eps,
-        ring_size,
-        freqs_cis,
-        kvcache,
-        draft_len);
-  }
-
- private:
-  static void launch(
-      const tvm::ffi::TensorView kv_input,
-      const tvm::ffi::TensorView kv_state,
-      const tvm::ffi::TensorView kv_output,
-      const tvm::ffi::TensorView norm_weight,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView req,
-      const tvm::ffi::TensorView raw_out_loc,
-      const float eps,
-      const int64_t ring_size,
-      const tvm::ffi::TensorView freqs_cis,
-      const tvm::ffi::TensorView kvcache,
-      const int64_t draft_len) {
-    using namespace host;
-
-    auto N = SymbolicSize{"num_tokens"};
-    auto device_ = SymbolicDevice{};
-    device_.set_options<kDLGPU>();
-
-    TensorMatcher({N, kHeadDim * 2}).with_dtype<fp32_t>().with_device(device_).verify(kv_input);
-    TensorMatcher({-1, kHeadDim * 2}).with_dtype<fp32_t>().with_device(device_).verify(kv_state);
-    // Only rows that complete a group are written.
-    TensorMatcher({N, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(kv_output);
-    TensorMatcher({kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(norm_weight);
-    // Metadata retains its original dtypes: the scheduler uses int64 locations,
-    // while callers may also supply int32 locations and positions.
-    auto pos_dtype = SymbolicDType{};
-    auto loc_dtype = SymbolicDType{};
-    TensorMatcher({N}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
-    TensorMatcher({N}).with_dtype<int64_t>().with_device(device_).verify(req);
-    TensorMatcher({N}).with_dtype<int32_t, int64_t>(loc_dtype).with_device(device_).verify(raw_out_loc);
-
-    // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
-    TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(freqs_cis);
-    // The pool allocates the buffer as uint8 and hands it out viewed as its
-    // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
-    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
-
-    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
-    if (num_tokens == 0) return;
-    const auto is_verify = draft_len > 1;
-    CHECK_HOST(ring_size > 0 && draft_len >= 1);
-    CHECK_HOST(!is_verify || num_tokens % draft_len == 0);
-    CHECK_HOST(!is_verify || ring_size > draft_len)
-        << "the pair-state ring (" << ring_size << ") must be wider than the draft length (" << draft_len << ")";
-    const auto params = Compress2DecodeParams{
-        .kv_input = static_cast<const float*>(kv_input.data_ptr()),
-        .kv_state = static_cast<float*>(kv_state.data_ptr()),
-        .kv_output = static_cast<bf16_t*>(kv_output.data_ptr()),
-        .norm_weight = static_cast<const bf16_t*>(norm_weight.data_ptr()),
-        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
-        .positions = positions.data_ptr(),
-        .req = static_cast<const int64_t*>(req.data_ptr()),
-        .raw_out_loc = raw_out_loc.data_ptr(),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
-        .ring_size = static_cast<uint32_t>(ring_size),
-        .eps = eps,
-    };
-    // `LaunchKernel` is move-only, so each arm builds its own.
-    const auto pos_i32 = pos_dtype.is_type<int32_t>();
-    const auto loc_i32 = loc_dtype.is_type<int32_t>();
-    if (is_verify) {
-      const auto block = static_cast<uint32_t>(draft_len);
-      const auto k = select<true>(pos_i32, loc_i32);
-      LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
-          .enable_pdl(kUsePDL)(k, params);
-    } else {
-      const auto k = select<false>(pos_i32, loc_i32);
-      LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
-          .enable_pdl(kUsePDL)(k, params);
-    }
-  }
-};
-
 /// \brief Separate projections and strided state for the pool/norm-only C2 path.
 struct Compress2PoolNormParams {
   const float* __restrict__ kv;
@@ -463,110 +110,390 @@ SGL_DEVICE float c2_pool_pair_exact(float old_kv, float new_kv, float old_score,
   return __fadd_rn(t0, t1);
 }
 
-/// \brief Pool and normalize without instantiating the SM100 RoPE/FP4/cache-store path.
-template <int64_t kHeadDim, typename WeightT, typename PosT, typename RawLocT, typename OutLocT, bool kUsePDL>
-__global__ __launch_bounds__(128) void c2_pool_norm_kernel(const Compress2PoolNormParams params) {
-  using namespace device;
-  constexpr uint32_t kThreads = 128;
-  constexpr uint32_t kValues = kHeadDim / kThreads;
-  static_assert(kHeadDim == 512 && kValues == 4);
+/// \brief Select the existing full-store contract or separate-projection pool/norm.
+enum class C2Mode { FullStore, PoolNorm };
 
-  const auto row = static_cast<int64_t>(blockIdx.x);
+template <C2Mode kMode>
+using C2Params = std::conditional_t<kMode == C2Mode::FullStore, Compress2DecodeParams, Compress2PoolNormParams>;
+
+/// Elements per thread; 256 threads per token measured fastest on B200 decode batches.
+/// At (512, 64) it also keeps the nope/rope split warp-aligned, as the fp8 amax reduction requires.
+constexpr uint32_t kC2VecSize = 2;
+
+/// \brief C2 decode with a full cache-store or exact pool/norm contract.
+///
+/// An odd position completes a group with its even predecessor; an even one parks in the state.
+/// PoolNorm publishes every row and leaves RoPE and cache stores to the caller.
+///
+/// FullStore target-verify uses `draft_len` consecutive positions per request: `blockIdx.x` is the
+/// position inside the block, `blockIdx.y` the request, and every row but the first takes its
+/// partner from the previous `kv_input` row instead of the ring.
+///
+/// The three reductions have different widths and are not interchangeable: the RMSNorm
+/// statistic spans the row, an fp8 store scale 64 elements, an fp4 block 16.
+///
+/// kLayout is the cache's page format: V4 and V41 store the fake-quantized value; V41_FP4
+/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding happens once.
+template <
+    bool kVerify,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    int32_t kPageBits,
+    typename PosT,
+    typename LocT,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL,
+    C2Mode kMode = C2Mode::FullStore,
+    typename WeightT = bf16_t,
+    typename OutLocT = LocT>
+__global__ __launch_bounds__(kMode == C2Mode::PoolNorm ? 128 : kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
+    const C2Params<kMode> params) {
+  using namespace device;
+  constexpr bool kPoolNorm = kMode == C2Mode::PoolNorm;
+  constexpr uint32_t kVecSize = kPoolNorm ? 4 : kC2VecSize;
+  constexpr uint32_t kCTASize = kHeadDim / kVecSize;
+  constexpr uint32_t kNumWarps = kCTASize / kWarpThreads;
+  constexpr uint32_t kNopeThreads = (kHeadDim - kRopeDim) / kVecSize;
+  constexpr int64_t kStride = kHeadDim * 2;
+  static_assert(kHeadDim == 512 && kCTASize % kWarpThreads == 0);
+  static_assert(!kPoolNorm || !kVerify, "pool/norm only supports decode");
+  static_assert(kPoolNorm || kRopeDim == 64, "the FlashMLA layouts require (512, 64)");
+  using fp32_vec_t = AlignedVector<float, kVecSize>;
+  using bf16_vec_t = AlignedVector<bf16x2_t, kVecSize / 2>;
+
   const auto tx = threadIdx.x;
+  // Verify gives each request a CTA column; decode a flat grid of one row each.
+  const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
   PDLWaitPrimary<kUsePDL>();
+  // The full writer retains its int32 cache-slot arithmetic.
+  using RawLocValueT = std::conditional_t<kPoolNorm, LocT, int32_t>;
+  const auto raw_out_loc = static_cast<RawLocValueT>(static_cast<const LocT*>(params.raw_out_loc)[row]);
+  if constexpr (!kPoolNorm) {
+    // Full-store padding does not read inputs or publish output.
+    if (raw_out_loc == 0) return PDLTriggerSecondary<kUsePDL>();
+  }
   const auto pos = static_cast<const PosT*>(params.positions)[row];
-  const auto raw_loc = static_cast<const RawLocT*>(params.raw_out_loc)[row];
-  const auto out_loc = static_cast<const OutLocT*>(params.out_loc)[row];
-  const auto req = params.req[row];
+  OutLocT out_loc{};
+  if constexpr (kPoolNorm) {
+    out_loc = static_cast<const OutLocT*>(params.out_loc)[row];
+  }
+  const auto rid = params.req[row];
   const bool odd = pos % 2 == 1;
-  int64_t read_row;
-  int64_t write_row;
-  if (params.ring_size != 0) {
-    read_row = (raw_loc == 0 || pos == 0)
-                   ? params.pad_row
-                   : req * params.ring_size + c2_ring_offset(pos - 1, params.ring_size, params.ring_mask);
-    write_row = req * params.ring_size + c2_ring_offset(pos, params.ring_size, params.ring_mask);
+  fp32_vec_t kv_new, score_new, kv_old, score_old, staged, freq, norm_weights;
+  bf16_vec_t weight, out;
+
+  if constexpr (kPoolNorm) {
+    int64_t read_row, write_row;
+    if (params.ring_size != 0) {
+      read_row = (raw_out_loc == 0 || pos == 0)
+                     ? params.pad_row
+                     : rid * params.ring_size + c2_ring_offset(pos - 1, params.ring_size, params.ring_mask);
+      write_row = rid * params.ring_size + c2_ring_offset(pos, params.ring_size, params.ring_mask);
+    } else {
+      read_row = raw_out_loc == 0 ? params.pad_row : rid;
+      write_row = read_row;
+    }
+    // Match the reference RMSNorm's aligned, four-adjacent-column Triton layout.
+    // Scalar accesses retain the split state views' independent row strides.
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize; ++i) {
+      const auto column = tx * kVecSize + i;
+      kv_new[i] = params.kv[static_cast<int64_t>(row) * kHeadDim + column];
+      score_new[i] = params.score[static_cast<int64_t>(row) * kHeadDim + column];
+      kv_old[i] = params.state_kv[read_row * params.state_kv_stride + column];
+      score_old[i] = params.state_score[read_row * params.state_score_stride + column];
+      if (params.ring_size != 0) {
+        if (raw_out_loc != 0) {
+          params.state_kv[write_row * params.state_kv_stride + column] = kv_new[i];
+          params.state_score[write_row * params.state_score_stride + column] = score_new[i];
+        }
+      } else {
+        params.state_kv[write_row * params.state_kv_stride + column] = odd ? kv_old[i] : kv_new[i];
+        params.state_score[write_row * params.state_score_stride + column] = odd ? score_old[i] : score_new[i];
+      }
+      norm_weights[i] = cast<float>(static_cast<const WeightT*>(params.norm_weight)[column]);
+    }
   } else {
-    read_row = raw_loc == 0 ? params.pad_row : req;
-    write_row = read_row;
+    kv_new.load(params.kv_input + row * kStride, tx);
+    score_new.load(params.kv_input + row * kStride, tx + kCTASize);
+    const auto ring = static_cast<int64_t>(rid) * params.ring_size;
+    const auto read_row = ring + (pos - 1 + params.ring_size) % params.ring_size;
+    const auto write_row = ring + pos % params.ring_size;
+    const float* partner = params.kv_state + read_row * kStride;
+    if constexpr (kVerify) {
+      if (blockIdx.x != 0) partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
+    }
+    kv_old.load(partner, tx);
+    score_old.load(partner, tx + kCTASize);
+    if ((pos & 1) == 0) {
+      kv_new.store(params.kv_state + write_row * kStride, tx);
+      score_new.store(params.kv_state + write_row * kStride, tx + kCTASize);
+      return PDLTriggerSecondary<kUsePDL>();
+    }
+    weight.load(params.norm_weight, tx);
+    if (tx >= kNopeThreads) freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
   }
 
-  AlignedVector<float, kValues> staged, weights;
-  // The reference RMSNorm's allocated BF16 input/output select a coalesced
-  // Triton layout with four adjacent columns per thread, for both weight dtypes.
+  // Pooling arithmetic and reduction preserve each caller's rounding contract.
 #pragma unroll
-  for (uint32_t i = 0; i < kValues; ++i) {
-    const auto column = tx * kValues + i;
-    const auto kv = params.kv[row * kHeadDim + column];
-    const auto score = params.score[row * kHeadDim + column];
-    const auto old_kv = params.state_kv[read_row * params.state_kv_stride + column];
-    const auto old_score = params.state_score[read_row * params.state_score_stride + column];
-    if (params.ring_size != 0) {
-      if (raw_loc != 0) {
-        params.state_kv[write_row * params.state_kv_stride + column] = kv;
-        params.state_score[write_row * params.state_score_stride + column] = score;
-      }
+  for (uint32_t i = 0; i < kVecSize; ++i) {
+    if constexpr (kPoolNorm) {
+      staged[i] = c2_pool_pair_exact(kv_old[i], kv_new[i], score_old[i], score_new[i]);
     } else {
-      params.state_kv[write_row * params.state_kv_stride + column] = odd ? old_kv : kv;
-      params.state_score[write_row * params.state_score_stride + column] = odd ? old_score : score;
+      const auto delta = score_old[i] - score_new[i];
+      const auto scale = expf(-fabsf(delta));
+      const auto scale_0 = delta > 0 ? 1.0f : scale;
+      const auto scale_1 = delta > 0 ? scale : 1.0f;
+      staged[i] = (kv_old[i] * scale_0 + kv_new[i] * scale_1) / (1.0f + scale);
     }
-    staged[i] = c2_pool_pair_exact(old_kv, kv, old_score, score);
-    weights[i] = cast<float>(static_cast<const WeightT*>(params.norm_weight)[column]);
   }
   round_c2_norm_input(staged);
-
-  // Match the four-warp Triton reduction, including the per-thread element order.
-  float sqrsum = __fmul_rn(staged[0], staged[0]);
-#pragma unroll
-  for (uint32_t i = 1; i < kValues; ++i) {
-    sqrsum = __fadd_rn(sqrsum, __fmul_rn(staged[i], staged[i]));
-  }
-#pragma unroll
-  for (uint32_t distance = 16; distance != 0; distance /= 2) {
-    sqrsum = __fadd_rn(sqrsum, __shfl_xor_sync(0xffffffffu, sqrsum, distance));
-  }
-  __shared__ float warp_sums[4];
-  const auto lane = get_lane_id();
-  if (lane == 0) warp_sums[tx / kWarpThreads] = sqrsum;
-  __syncthreads();
-  sqrsum = __fadd_rn(__fadd_rn(warp_sums[0], warp_sums[2]), __fadd_rn(warp_sums[1], warp_sums[3]));
-  float mean_square;
-  asm("div.full.f32 %0, %1, %2;" : "=f"(mean_square) : "f"(sqrsum), "f"(static_cast<float>(kHeadDim)));
-  const auto variance = __fadd_rn(mean_square, params.eps);
+  __shared__ float s_warp_sum[kNumWarps];
   float norm_factor;
-  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(norm_factor) : "f"(variance));
-  const auto output = finish_c2_norm(staged, weights, norm_factor);
+  if constexpr (kPoolNorm) {
+    // Preserve the four-warp Triton reduction, including per-thread element order.
+    float sqrsum = __fmul_rn(staged[0], staged[0]);
 #pragma unroll
-  for (uint32_t i = 0; i < kValues / 2; ++i) {
-    const auto packed = output[i];
-    const auto& values = unpack(packed);
-    params.pooled[row * kHeadDim + tx * kValues + 2 * i] = values[0];
-    params.pooled[row * kHeadDim + tx * kValues + 2 * i + 1] = values[1];
+    for (uint32_t i = 1; i < kVecSize; ++i) {
+      sqrsum = __fadd_rn(sqrsum, __fmul_rn(staged[i], staged[i]));
+    }
+#pragma unroll
+    for (uint32_t distance = 16; distance != 0; distance /= 2) {
+      sqrsum = __fadd_rn(sqrsum, __shfl_xor_sync(0xffffffffu, sqrsum, distance));
+    }
+    const auto lane = get_lane_id();
+    if (lane == 0) s_warp_sum[tx / kWarpThreads] = sqrsum;
+    __syncthreads();
+    sqrsum = __fadd_rn(__fadd_rn(s_warp_sum[0], s_warp_sum[2]), __fadd_rn(s_warp_sum[1], s_warp_sum[3]));
+    float mean_square;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(mean_square) : "f"(sqrsum), "f"(static_cast<float>(kHeadDim)));
+    const auto variance = __fadd_rn(mean_square, params.eps);
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(norm_factor) : "f"(variance));
+  } else {
+    float local_sqrsum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const auto x = staged[i * 2 + 0];
+      const auto y = staged[i * 2 + 1];
+      local_sqrsum += x * x;
+      local_sqrsum += y * y;
+    }
+    const auto warp_sum = warp::reduce_sum(local_sqrsum);
+    s_warp_sum[tx / kWarpThreads] = warp_sum;
+    __syncthreads();
+    float sqrsum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < kNumWarps; ++i) {
+      sqrsum += s_warp_sum[i];
+    }
+    constexpr float kInvScale = 1.0f / static_cast<float>(kHeadDim);
+    norm_factor = math::rsqrt(sqrsum * kInvScale + params.eps);
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const auto [wx, wy] = cast<fp32x2_t>(weight[i]);
+      norm_weights[i * 2 + 0] = wx;
+      norm_weights[i * 2 + 1] = wy;
+    }
   }
-  if (tx == 0) {
-    static_cast<PosT*>(params.group_pos)[row] = odd ? pos - 1 : pos;
-    static_cast<OutLocT*>(params.slots)[row] = out_loc >= 0 ? out_loc : 0;
+  out = finish_c2_norm(staged, norm_weights, norm_factor);
+  if constexpr (kPoolNorm) {
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const auto packed = out[i];
+      const auto& values = unpack(packed);
+      params.pooled[static_cast<int64_t>(row) * kHeadDim + tx * kVecSize + 2 * i] = values[0];
+      params.pooled[static_cast<int64_t>(row) * kHeadDim + tx * kVecSize + 2 * i + 1] = values[1];
+    }
+    if (tx == 0) {
+      static_cast<PosT*>(params.group_pos)[row] = odd ? pos - 1 : pos;
+      static_cast<OutLocT*>(params.slots)[row] = out_loc >= 0 ? out_loc : 0;
+    }
+  } else {
+    out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   }
   PDLTriggerSecondary<kUsePDL>();
+
+  if constexpr (!kPoolNorm) {
+    using deepseek_v4::KVLayout;
+    using deepseek_v4::fp8::cast_to_ue8m0;
+    using deepseek_v4::fp8::inv_scale_ue8m0;
+    using deepseek_v4::fp8::pack_fp8;
+    constexpr uint32_t kFp8Lanes = 64 / kVecSize;
+    constexpr uint32_t kFp4Lanes = deepseek_v4::fp4::kCompressedKVBlockSize / kVecSize;
+    using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+    static_assert(kNopeThreads % kFp8Lanes == 0, "the nope part must end on an fp8 scale block");
+    static_assert(kWarpThreads % kFp8Lanes == 0 && kWarpThreads % kFp4Lanes == 0);
+    // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
+    // Match finish()'s bf16 rounding before RoPE.
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const auto [x, y] = cast<fp32x2_t>(out[i]);
+      staged[i * 2 + 0] = x;
+      staged[i * 2 + 1] = y;
+    }
+
+    if (tx >= kNopeThreads) {
+      // Match rope_tail()'s bf16 rounding before fake quantization.
+      // Only odd positions reach here; the latent represents `pos - 1`.
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        const auto x_real = staged[i * 2 + 0];
+        const auto x_imag = staged[i * 2 + 1];
+        const auto f_real = x_real * freq[i * 2 + 0] - x_imag * freq[i * 2 + 1];
+        const auto f_imag = x_real * freq[i * 2 + 1] + x_imag * freq[i * 2 + 0];
+        const auto rotated = cast<bf16x2_t>(fp32x2_t{f_real, f_imag});
+        const auto [r0, r1] = cast<fp32x2_t>(rotated);
+        staged[i * 2 + 0] = r0;
+        staged[i * 2 + 1] = r1;
+      }
+    }
+
+    if constexpr (kLayout == KVLayout::V41_FP4) {
+      // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
+      const int32_t out_loc = raw_out_loc >> 1;
+      const auto kv_row = Paged::row(params.kvcache, out_loc);
+      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+    }
+
+    // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
+    {
+      float amax = fabsf(staged[0]);
+#pragma unroll
+      for (uint32_t i = 1; i < kVecSize; ++i) {
+        amax = fmaxf(amax, fabsf(staged[i]));
+      }
+      amax = warp::reduce_max<kFp4Lanes>(amax);
+      const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        const auto [x, y] =
+            deepseek_v4::fp4::fake_quant_compressed_kv_x2({staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
+        staged[i * 2 + 0] = x;
+        staged[i * 2 + 1] = y;
+      }
+    }
+
+    // `raw_out_loc / ratio`; ratio 2 makes it a shift.
+    const int32_t out_loc = raw_out_loc >> 1;
+    const auto kv_row = Paged::row(params.kvcache, out_loc);
+
+    if constexpr (kLayout == KVLayout::V41) {
+      // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+    }
+
+    const auto value_ptr = kv_row.data;
+
+    if (tx >= kNopeThreads) {
+      bf16_vec_t rope_out;
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        rope_out[i] = cast<bf16x2_t>(fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]});
+      }
+      rope_out.store(value_ptr + (kHeadDim - kRopeDim), tx - kNopeThreads);
+    } else {
+      // fp8 e4m3 with one ue8m0 scale per 64 elements.
+      auto abs_max = fabsf(staged[0]);
+#pragma unroll
+      for (uint32_t i = 1; i < kVecSize; ++i) {
+        abs_max = fmaxf(abs_max, fabsf(staged[i]));
+      }
+      abs_max = warp::reduce_max<kFp8Lanes>(abs_max);
+      const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx * (kVecSize / 2) + i] =
+            pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
+      }
+      kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
+    }
+  }
 }
 
-/// \brief C2 pool/norm entry point with the separate-projection Hopper contract.
-template <int64_t kHeadDim, typename WeightT, bool kUsePDL>
-struct Compress2PoolNormKernel {
-  static_assert(kHeadDim == 512);
-  static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, float>);
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL,
+    C2Mode kMode = C2Mode::FullStore,
+    typename WeightT = bf16_t>
+struct FlashCompress2Kernel {
+  static constexpr uint32_t kBlockSize = kMode == C2Mode::PoolNorm ? 128 : kHeadDim / kC2VecSize;
+  static constexpr int32_t kPageBits = kMode == C2Mode::FullStore ? std::bit_width(kPageSize) - 1 : 0;
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
+  template <bool kVerify, typename PosT, typename LocT, typename OutLocT = LocT>
+  static constexpr auto kernel = flash_c2_decode_kernel<
+      kVerify,
+      kHeadDim,
+      kRopeDim,
+      kPageBits,
+      PosT,
+      LocT,
+      kLayout,
+      kUsePDL,
+      kMode,
+      WeightT,
+      OutLocT>;
 
-  template <typename PosT, typename RawLocT, typename OutLocT>
-  static constexpr auto kernel = c2_pool_norm_kernel<kHeadDim, WeightT, PosT, RawLocT, OutLocT, kUsePDL>;
-
-  template <typename PosT>
-  static auto select(bool raw_i32, bool out_i32) {
-    if (raw_i32) return out_i32 ? kernel<PosT, int32_t, int32_t> : kernel<PosT, int32_t, int64_t>;
-    return out_i32 ? kernel<PosT, int64_t, int32_t> : kernel<PosT, int64_t, int64_t>;
+  /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
+  template <bool kVerify>
+  static auto select(const bool pos_i32, const bool loc_i32) {
+    if (pos_i32) return loc_i32 ? kernel<kVerify, int32_t, int32_t> : kernel<kVerify, int32_t, int64_t>;
+    return loc_i32 ? kernel<kVerify, int64_t, int32_t> : kernel<kVerify, int64_t, int64_t>;
   }
 
-  static void
-  run(const tvm::ffi::TensorView kv,
+  template <typename PosT>
+  static auto select_pool(const bool raw_i32, const bool out_i32) {
+    if (raw_i32) return out_i32 ? kernel<false, PosT, int32_t, int32_t> : kernel<false, PosT, int32_t, int64_t>;
+    return out_i32 ? kernel<false, PosT, int64_t, int32_t> : kernel<false, PosT, int64_t, int64_t>;
+  }
+
+  static_assert(kMode != C2Mode::PoolNorm || kHeadDim == 512);
+  static_assert(std::is_same_v<WeightT, bf16_t> || (kMode == C2Mode::PoolNorm && std::is_same_v<WeightT, float>));
+  // The sum of squares reduces through a fixed-size shared array, so the CTA must be whole warps.
+  static_assert(kHeadDim % (4 * device::kWarpThreads) == 0, "head_dim must be a multiple of 128");
+  static_assert(
+      kMode != C2Mode::FullStore || std::has_single_bit(kPageSize), "the page/slot split needs a power-of-two page");
+
+  /// \brief `run_decode_fusion` for a target-verify block.
+  ///
+  /// `draft_len` consecutive positions per request, request-major, which the
+  /// grid reproduces as `draft_len x batch`.
+  static void run_decode_fusion(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t ring_size,
+      const int64_t draft_len) {
+    static_assert(kMode == C2Mode::FullStore);
+    launch(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        draft_len);
+  }
+
+  /// \brief Pool and normalize separate projections, preserving the decode state/metadata contract.
+  static void run_pool_norm(
+      const tvm::ffi::TensorView kv,
       const tvm::ffi::TensorView score,
       const tvm::ffi::TensorView positions,
       const tvm::ffi::TensorView raw_out_loc,
@@ -581,6 +508,7 @@ struct Compress2PoolNormKernel {
       const tvm::ffi::TensorView pooled,
       const tvm::ffi::TensorView group_pos,
       const tvm::ffi::TensorView slots) {
+    static_assert(kMode == C2Mode::PoolNorm);
     using namespace host;
     auto N = SymbolicSize{"num_tokens"};
     auto R = SymbolicSize{"state_rows"};
@@ -667,8 +595,83 @@ struct Compress2PoolNormKernel {
     };
     const auto raw_i32 = raw_dtype.is_type<int32_t>();
     const auto out_i32 = out_dtype.is_type<int32_t>();
-    const auto k = pos_dtype.is_type<int32_t>() ? select<int32_t>(raw_i32, out_i32) : select<int64_t>(raw_i32, out_i32);
-    LaunchKernel(static_cast<uint32_t>(N.unwrap()), 128, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
+    const auto k =
+        pos_dtype.is_type<int32_t>() ? select_pool<int32_t>(raw_i32, out_i32) : select_pool<int64_t>(raw_i32, out_i32);
+    LaunchKernel(static_cast<uint32_t>(N.unwrap()), kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
+  }
+
+ private:
+  static void launch(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const int64_t ring_size,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const int64_t draft_len) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({N, kHeadDim * 2}).with_dtype<fp32_t>().with_device(device_).verify(kv_input);
+    TensorMatcher({-1, kHeadDim * 2}).with_dtype<fp32_t>().with_device(device_).verify(kv_state);
+    // Only rows that complete a group are written.
+    TensorMatcher({N, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(kv_output);
+    TensorMatcher({kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(norm_weight);
+    // Metadata retains its original dtypes: the scheduler uses int64 locations,
+    // while callers may also supply int32 locations and positions.
+    auto pos_dtype = SymbolicDType{};
+    auto loc_dtype = SymbolicDType{};
+    TensorMatcher({N}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device_).verify(req);
+    TensorMatcher({N}).with_dtype<int32_t, int64_t>(loc_dtype).with_device(device_).verify(raw_out_loc);
+
+    // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
+    TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(freqs_cis);
+    // The pool allocates the buffer as uint8 and hands it out viewed as its
+    // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
+    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
+    const auto is_verify = draft_len > 1;
+    CHECK_HOST(ring_size > 0 && draft_len >= 1);
+    CHECK_HOST(!is_verify || num_tokens % draft_len == 0);
+    CHECK_HOST(!is_verify || ring_size > draft_len)
+        << "the pair-state ring (" << ring_size << ") must be wider than the draft length (" << draft_len << ")";
+    const auto params = Compress2DecodeParams{
+        .kv_input = static_cast<const float*>(kv_input.data_ptr()),
+        .kv_state = static_cast<float*>(kv_state.data_ptr()),
+        .kv_output = static_cast<bf16_t*>(kv_output.data_ptr()),
+        .norm_weight = static_cast<const bf16_t*>(norm_weight.data_ptr()),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .req = static_cast<const int64_t*>(req.data_ptr()),
+        .raw_out_loc = raw_out_loc.data_ptr(),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .ring_size = static_cast<uint32_t>(ring_size),
+        .eps = eps,
+    };
+    // `LaunchKernel` is move-only, so each arm builds its own.
+    const auto pos_i32 = pos_dtype.is_type<int32_t>();
+    const auto loc_i32 = loc_dtype.is_type<int32_t>();
+    if (is_verify) {
+      const auto block = static_cast<uint32_t>(draft_len);
+      const auto k = select<true>(pos_i32, loc_i32);
+      LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(k, params);
+    } else {
+      const auto k = select<false>(pos_i32, loc_i32);
+      LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(k, params);
+    }
   }
 };
 

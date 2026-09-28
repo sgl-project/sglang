@@ -6,8 +6,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.c2_decode_pool import c2_decode_pool
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
-    _jit_c2_pool_norm_module,
+    _jit_c2_module,
 )
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -254,7 +255,9 @@ def test_pool_norm_cpp_rejects_invalid_tensor_contract(invalid, error):
         weight = torch.ones(2 * DIM, device="cuda")[::2]
     latent = torch.empty(2, DIM, device="cuda", dtype=torch.bfloat16)
     group_pos, slots = torch.empty_like(pos), torch.empty_like(out)
-    module = _jit_c2_pool_norm_module(DIM, torch.float32)
+    module = _jit_c2_module(
+        DIM, 0, 0, KVLayout.V4, pool_norm_only=True, weight_dtype=torch.float32
+    )
     with pytest.raises(RuntimeError, match=error):
         module.pool_norm(
             kv,
@@ -283,7 +286,9 @@ def test_pool_norm_cpp_rejects_cpu_tensors_for_empty_batch():
     loc = torch.empty(0, dtype=torch.int32, device="cpu")
     weight = torch.ones(DIM, dtype=torch.float32, device="cpu")
     latent = torch.empty(0, DIM, dtype=torch.bfloat16, device="cpu")
-    module = _jit_c2_pool_norm_module(DIM, torch.float32)
+    module = _jit_c2_module(
+        DIM, 0, 0, KVLayout.V4, pool_norm_only=True, weight_dtype=torch.float32
+    )
     with pytest.raises(RuntimeError, match="Device value .*not in the allowed options"):
         module.pool_norm(
             kv,
