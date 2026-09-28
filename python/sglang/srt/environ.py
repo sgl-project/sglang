@@ -703,6 +703,10 @@ class Envs:
     # a 1-token decode. DSPARK only, without DP attention or PP; unsupported setups
     # warn and fall back (see verify_merged_mixed_enabled).
     SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION = EnvBool(False)
+    # DeepSeek-V4 verify-merged mixed step: copy only this rank's TP-local attention
+    # heads into the output buffer; the padded heads are left stale (the model reads
+    # only the TP slice).
+    SGLANG_OPT_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
