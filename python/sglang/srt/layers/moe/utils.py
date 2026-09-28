@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_server_args,
@@ -329,10 +330,10 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
 
     The decision follows several checks in priority order:
     0. Parse server argument.
-    1. Parse deprecated environment variables.
-    2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse a mode-specific dtype from quant_config.
-    4. Parse a generic dtype from quant_config.
+    1. If quant_config contains input_global_scale → NVFP4 path.
+    2. Parse a mode-specific dtype from quant_config.
+    3. Parse a generic dtype from quant_config.
+    4. Parse deprecated environment variables if the layer has no explicit dtype.
     5. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
     6. Otherwise default for NPU → BF16 (the default for NPU).
     7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
@@ -343,7 +344,29 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
         return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
 
-    # 1. Parse deprecated environment variables.
+    # 1. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    if self.quant_config is not None:
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            return DispatcherOutputDtype.NVFP4
+
+        # 2. Some MoE kernels require different wire formats for prefill and
+        # decode. Prefer a mode-specific override when the dispatcher exposes
+        # its concrete mode (normal or low_latency).
+        dispatch_mode = getattr(self, "dispatch_mode", None)
+        if dispatch_mode is not None:
+            mode_dispatcher_output_dtype = self.quant_config.get(
+                f"{dispatch_mode.value}_dispatcher_output_dtype", None
+            )
+            if mode_dispatcher_output_dtype is not None:
+                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
+
+        # 3. Parse quant config to determine the output dtype of dispatcher
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return DispatcherOutputDtype(dispatcher_output_dtype)
+
+    # 4. Legacy hints apply only when the layer does not specify a wire format.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
         logger.warning_once(
             "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
@@ -359,28 +382,6 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
             "`--deepep-dispatcher-output-dtype int8` instead."
         )
         return DispatcherOutputDtype.INT8
-
-    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
-    if self.quant_config is not None:
-        input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
-            return DispatcherOutputDtype.NVFP4
-
-        # 3. Some MoE kernels require different wire formats for prefill and
-        # decode. Prefer a mode-specific override when the dispatcher exposes
-        # its concrete mode (normal or low_latency).
-        dispatch_mode = getattr(self, "dispatch_mode", None)
-        if dispatch_mode is not None:
-            mode_dispatcher_output_dtype = self.quant_config.get(
-                f"{dispatch_mode.value}_dispatcher_output_dtype", None
-            )
-            if mode_dispatcher_output_dtype is not None:
-                return DispatcherOutputDtype(mode_dispatcher_output_dtype)
-
-        # 4. Parse quant config to determine the output dtype of dispatcher
-        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
-        if dispatcher_output_dtype is not None:
-            return DispatcherOutputDtype(dispatcher_output_dtype)
 
     # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
@@ -740,31 +741,65 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
+def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
+    """Whether the experts' output owes no sum over the MoE-TP group
+    (``is_tp_path=True``) or the EP group: the combine already summed it, or each
+    rank computed its own tokens in full.
+
+    This is a property of the MoE configuration. Whether the MoE block or a later
+    step runs a sum that is still owed is decided separately.
+    """
+    if get_parallel().dwdp_size > 1:
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The combine reduce-scatters back to the local tokens.
+        return True
+    a2a = get_moe_a2a_backend()
+    # The flashinfer and pplx combines, and the megamoe kernel's internal
+    # combine, sum each token's expert outputs back to its source rank.
+    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+
+
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether a downstream component will fuse, replace, or absorb the post-experts all-reduce.
+    """Whether the MoE block should leave out its post-experts all-reduce: a later
+    step runs it (fused into the next norm, or as the reduce-scatter back to the
+    local tokens), or there is nothing to sum.
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    if should_skip_mlp_all_reduce():
-        return True
-    if get_parallel().dwdp_size > 1:
-        return True
-    if should_use_dp_reduce_scatterv():
-        return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
-        return True
-    if get_moe_a2a_backend().is_flashinfer():
-        return True
-    if get_moe_a2a_backend().is_pplx():
-        # pplx's AllToAll.combine already sums each token's expert outputs back
-        # to the source rank
-        return True
-    if get_moe_a2a_backend().is_flashinfer_megamoe():
-        # The mega kernel does its EP all-to-all + combine internally and
-        # returns per-rank outputs, so any further EP/TP all-reduce would
-        # double-count. Same opt-in as the flashinfer a2a dispatcher.
-        return True
-    return False
+    return (
+        should_skip_mlp_all_reduce()
+        or should_use_dp_reduce_scatterv()
+        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    )
+
+
+def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """All-reduce a MoE block's output (routed plus shared experts) over TP,
+    unless a later step does it or there is nothing to sum."""
+    from sglang.srt.distributed.communication_op import (
+        tensor_model_parallel_all_reduce,
+    )
+
+    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ):
+        return tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
 def can_merge_post_experts_all_reduce() -> bool:
@@ -812,23 +847,45 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def post_experts_sum_is_one_all_reduce() -> bool:
+    """Whether the sum an FFN leaves out when it skips its post-experts (or
+    down-projection) all-reduce is one full-precision all-reduce over the TP
+    group itself, on a plain partial sum: the all-reduce a later step can run
+    instead. Not when the combine already summed the output, the reduction is
+    quantized, a replicated shared expert is added after it, LoRA-B runs on
+    the unreduced activations, or the EP and MoE-TP sums run in two steps or
+    over another group."""
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and not post_experts_output_is_complete(is_tp_path=True)
+        and not get_exec().comm.enable_quant_communications
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        and not get_lora().enable_lora
+        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+        and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+        and post_experts_reduction_group() is parallel.tp_group
+    )
+
+
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    Called when the fused residual+LN kernel cannot service the shape. Reduces
-    over the same group ``resolve_fusion_group`` builds the workspace on.
+    Called when the fused residual+LN kernel cannot service the shape.
     """
-    from sglang.srt.distributed.communication_op import (
-        moe_expert_parallel_all_reduce,
-        moe_tensor_model_parallel_all_reduce,
-        tensor_model_parallel_all_reduce,
-    )
-
-    if can_merge_post_experts_all_reduce():
-        return tensor_model_parallel_all_reduce(hidden_states)
-    if get_parallel().moe_ep_size > 1:
-        return moe_expert_parallel_all_reduce(hidden_states)
-    return moe_tensor_model_parallel_all_reduce(hidden_states)
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager

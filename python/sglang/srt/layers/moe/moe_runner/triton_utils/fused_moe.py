@@ -58,11 +58,16 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     if _use_aiter:
         try:
@@ -669,6 +674,14 @@ def _fused_moe_kernel_sequence(
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
+    elif activation == "silu_rounded" and is_gated:
+        if _is_cuda:
+            silu_and_mul_with_activation_rounding(
+                intermediate_cache1.view(-1, N), intermediate_cache2
+            )
+        else:
+            gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+            intermediate_cache2.copy_(F.silu(gate) * up)
     elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
@@ -715,7 +728,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),
@@ -770,29 +783,38 @@ def _fused_moe_kernel_sequence(
         if situ_linear_beta is not None:
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
         intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
-    elif activation == "gelu" and is_gated:
+    elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
+            activation_fn = (
+                gelu_tanh_and_mul if activation == "gelu_tanh" else gelu_and_mul
+            )
             if filter_expert and _is_cuda:
-                gelu_and_mul(
+                activation_fn(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                activation_fn(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
-                vllm_ops.gelu_and_mul(
+                getattr(vllm_ops, f"{activation}_and_mul")(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
             else:
                 # Fallback: native PyTorch gelu_and_mul
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
-                intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+                intermediate_cache2.copy_(
+                    F.gelu(
+                        x[..., :d],
+                        approximate="tanh" if activation == "gelu_tanh" else "none",
+                    )
+                    * x[..., d:]
+                )
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
