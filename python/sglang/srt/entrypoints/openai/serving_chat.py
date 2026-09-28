@@ -1375,7 +1375,7 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_thinking = (request.chat_template_kwargs or {}).get(
                 "enable_thinking"
             )
-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+            parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,

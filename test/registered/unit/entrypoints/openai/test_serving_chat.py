@@ -1295,6 +1295,69 @@ class ServingChatTestCase(CustomTestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_glm47_constraint_includes_message_tools(self):
+        """Constrain every active message tool, but none when tool use is disabled.
+
+        A terminal GLM47 grammar on ``tool_choice="none"`` ends generation early,
+        while omitting message-scoped tools rejects otherwise valid tool calls.
+        """
+        import xgrammar as xgr
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        message_tool = {
+            "type": "function",
+            "function": {"name": "message_tool", "parameters": {"type": "object"}},
+        }
+        top_level_tool = {
+            "type": "function",
+            "function": {"name": "top_level_tool", "parameters": {"type": "object"}},
+        }
+        named = ToolChoice(function=ToolChoiceFuncName(name="message_tool"))
+        for role in ("system", "developer"):
+            for tools in (None, [], [top_level_tool]):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(role=role, tools=tools, choice=choice):
+                        request = ChatCompletionRequest(
+                            model="x",
+                            messages=[
+                                {"role": role, "content": "", "tools": [message_tool]},
+                                {"role": "user", "content": "Use message_tool."},
+                            ],
+                            tools=tools,
+                            tool_choice=choice,
+                            chat_template_kwargs={"enable_thinking": False},
+                        )
+                        result = self.chat._process_messages(
+                            request, is_multimodal=False
+                        )
+                        if choice == "none":
+                            self.assertIsNone(result.tool_call_constraint)
+                            continue
+                        self.assertIsNotNone(result.tool_call_constraint)
+                        kind, ebnf = result.tool_call_constraint
+                        self.assertEqual(kind, "full_assistant_ebnf")
+                        grammar = compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+                        for name, allowed in (
+                            ("message_tool", True),
+                            ("top_level_tool", bool(tools) and choice != named),
+                            ("unknown_tool", False),
+                        ):
+                            matcher = xgr.GrammarMatcher(grammar)
+                            accepted = (
+                                matcher.accept_string(f"<tool_call>{name}</tool_call>")
+                                and matcher.is_completed()
+                            )
+                            self.assertEqual(accepted, allowed, name)
+
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
         self.template_manager.chat_template_name = None
