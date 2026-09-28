@@ -382,11 +382,6 @@ jobs:
             node_size: 2
             test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90.py
             test_type: 'perf'
-          # deepseek_v4_pro performance tests
-          - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_
-            node_size: 2
-            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_.py
-            test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4

@@ -40,17 +40,6 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "SGLANG_OPT_FP8_WO_A_GEMM": "False",
     # [DEEPEP]
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "30",
-    # [MTP]
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "TRANSFORMERS_VERBOSITY": "error",
-    # dspark
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
-    "SGLANG_DSPARK_QUANT_AUDIT": "1",
-    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
 }
 
 
@@ -70,7 +59,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.68,
+    0.8,
     "--quantization",
     "modelslim",
     "--chunked-prefill-size",
@@ -94,17 +83,6 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--disable-radix-cache",
-    # # DSPARK speculative decoding with the bundled draft weights.
-    # "--speculative-algorithm",
-    # "DSPARK",
-    # "--speculative-draft-model-path",
-    # DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    # "--speculative-draft-model-quantization",
-    # "modelslim",
-    # "--speculative-draft-attention-backend",
-    # "ascend",
-    # "--speculative-num-draft-tokens",
-    # 6,
 ]
 
 
