@@ -2984,6 +2984,8 @@ class MQALayer(MqaAttentionBase):
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
+            # Only heads [tp_slice] may be read: with
+            # SGLANG_OPT_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY the other heads of `o` are stale.
             o = o[:, tp_slice, :]
         o = self._project_wo_a(
             o,
