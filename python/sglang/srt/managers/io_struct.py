@@ -155,6 +155,30 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
 
+    def __post_init__(self):
+        if self.id is not None and not isinstance(self.id, str):
+            raise TypeError(
+                f"session_params.id must be a string or None, got {type(self.id).__name__}"
+            )
+        if self.rid is not None and not isinstance(self.rid, str):
+            raise TypeError(
+                f"session_params.rid must be a string or None, got {type(self.rid).__name__}"
+            )
+        if self.offset is not None and type(self.offset) is not int:
+            raise TypeError(
+                f"session_params.offset must be an integer or None, got {type(self.offset).__name__}"
+            )
+        if self.replace is not None and not isinstance(self.replace, bool):
+            raise TypeError(
+                f"session_params.replace must be a bool or None, got {type(self.replace).__name__}"
+            )
+        if self.drop_previous_output is not None and not isinstance(
+            self.drop_previous_output, bool
+        ):
+            raise TypeError(
+                f"session_params.drop_previous_output must be a bool or None, got {type(self.drop_previous_output).__name__}"
+            )
+
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
