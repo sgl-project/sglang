@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
@@ -282,9 +283,12 @@ class Gemma4Renoise(DllmAlgorithm):
     def step(
         self,
         forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         states: List[Any],
     ) -> List[bool]:
+        full_logits = logits_output.full_logits
+        if full_logits is None:
+            raise ValueError("Gemma4Renoise requires dense full logits")
         logits = full_logits.view(
             forward_batch.batch_size, self.block_size, self.vocab_size
         )

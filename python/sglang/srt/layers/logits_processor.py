@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.dllm.consumer_state_trace import (
     emit_compact_vocab_state_trace,
     emit_full_vocab_trace,
+    tensor_trace_metadata,
 )
 from sglang.srt.dllm.tp_local_vocab_state import (
     VocabState,
@@ -874,6 +875,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        tp_gather_metadata: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -914,18 +916,28 @@ class LogitsProcessor(nn.Module):
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
+            if tp_gather_metadata is not None:
+                tp_gather_metadata["input"] = tensor_trace_metadata(logits)
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
             if self.use_attn_tp_group:
+                if tp_gather_metadata is not None:
+                    tp_gather_metadata["kind"] = "attn_tp_all_gather"
                 logits = self._gather_attn_tp_logits(logits)
             elif self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             ):
+                if tp_gather_metadata is not None:
+                    tp_gather_metadata["kind"] = "tp_lm_head_all_to_all"
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             else:
+                if tp_gather_metadata is not None:
+                    tp_gather_metadata["kind"] = "multimem_all_gather"
                 logits = self._logits_gatherer(logits)
+            if tp_gather_metadata is not None:
+                tp_gather_metadata["output"] = tensor_trace_metadata(logits)
             _trace_e2e_logits(
                 "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
             )
@@ -1176,7 +1188,15 @@ class LogitsProcessor(nn.Module):
                     hidden_states, lm_head, logits_metadata
                 ),
             )
-        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        tp_gather_metadata = (
+            {} if envs.SGLANG_CONSUMER_STATE_TRACE_JSONL.get() else None
+        )
+        full_logits = self._get_logits(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            tp_gather_metadata=tp_gather_metadata,
+        )
         emit_full_vocab_trace(
             component="sglang.logits_processor._get_dllm_logits",
             full_logits=full_logits,
@@ -1184,6 +1204,7 @@ class LogitsProcessor(nn.Module):
             tp_size=int(get_parallel().tp_size),
             rank=_tp_rank_for_trace(),
             consumer_contract="dllm_full_logits",
+            tp_gather_metadata=tp_gather_metadata,
         )
         return LogitsProcessorOutput(
             full_logits=full_logits,

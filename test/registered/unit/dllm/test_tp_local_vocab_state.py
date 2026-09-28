@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
 
 ENDPOINT_BASELINE_URL_ENV = "SGLANG_DLLM_BASELINE_URL"
 ENDPOINT_TP_LOCAL_URL_ENV = "SGLANG_DLLM_TP_LOCAL_VOCAB_URL"
@@ -795,11 +799,14 @@ def test_consumer_state_trace_emits_full_and_compact_records(tmp_path):
     from sglang.srt.dllm.consumer_state_trace import (
         emit_compact_vocab_state_trace,
         emit_full_vocab_trace,
+        tensor_trace_metadata,
     )
     from sglang.srt.environ import envs
 
     trace_path = tmp_path / "trace.jsonl"
     full_logits = torch.empty(2, 5, dtype=torch.float32)
+    gather_input = torch.empty(2, 3, dtype=torch.bfloat16)
+    gather_output = torch.empty(2, 5, dtype=torch.bfloat16)
     local_logits = torch.empty(2, 3, dtype=torch.bfloat16)
     state = VocabState(
         max_values=torch.empty(2, dtype=torch.float32),
@@ -816,6 +823,11 @@ def test_consumer_state_trace_emits_full_and_compact_records(tmp_path):
             tp_size=2,
             rank=1,
             consumer_contract="full",
+            tp_gather_metadata={
+                "kind": "multimem_all_gather",
+                "input": tensor_trace_metadata(gather_input),
+                "output": tensor_trace_metadata(gather_output),
+            },
         )
         emit_compact_vocab_state_trace(
             component="unit.compact",
@@ -832,14 +844,69 @@ def test_consumer_state_trace_emits_full_and_compact_records(tmp_path):
     records = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert [record["framework"] for record in records] == ["sglang", "sglang"]
     assert records[0]["path"] == "full_vocab_materialized"
+    assert records[0]["full_vocab_materialized_shape"] == [2, 5]
+    assert records[0]["full_vocab_materialized_dtype"] == "torch.float32"
     assert records[0]["full_vocab_materialized_bytes"] == 2 * 5 * 4
-    assert records[0]["tp_gather_bytes"] == 2 * 5 * 4
+    assert records[0]["tp_gather_kind"] == "multimem_all_gather"
+    assert records[0]["tp_gather_input_shape"] == [2, 3]
+    assert records[0]["tp_gather_input_dtype"] == "torch.bfloat16"
+    assert records[0]["tp_gather_input_bytes"] == 2 * 3 * 2
+    assert records[0]["tp_gather_output_shape"] == [2, 5]
+    assert records[0]["tp_gather_output_dtype"] == "torch.bfloat16"
+    assert records[0]["tp_gather_output_bytes"] == 2 * 5 * 2
+    assert records[0]["tp_gather_bytes"] == 2 * 5 * 2
 
     assert records[1]["path"] == "consumer_sufficient_compact"
     assert records[1]["local_vocab_materialized_bytes"] == 2 * 3 * 2
     assert records[1]["avoidable_full_vocab_materialized_bytes"] == 2 * 9 * 2
     assert records[1]["compact_state_bytes"] == 2 * (4 + 8 + 4 + 4)
     assert records[1]["tp_gather_bytes"] == 2 * 2 * 3 * 4
+
+
+def test_dense_trace_captures_gather_dtype_before_fp32_buffer_copy():
+    import sglang.srt.layers.logits_processor as logits_processor
+
+    local_logits = torch.empty(2, 3, dtype=torch.bfloat16)
+    processor = SimpleNamespace(
+        do_tensor_parallel_all_gather_dp_attn=False,
+        do_tensor_parallel_all_gather=True,
+        use_attn_tp_group=False,
+        use_tp_lm_head_all_to_all=False,
+        logit_scale=None,
+        final_logit_softcapping=None,
+        _gather_dp_attn_hidden_states=lambda hidden, metadata: (hidden, hidden),
+        _compute_lm_head=lambda hidden, lm_head, embedding_bias: local_logits,
+        _can_use_tp_lm_head_all_to_all=lambda *args: False,
+        _logits_gatherer=lambda logits: torch.cat([logits, logits], dim=-1),
+        _scatter_dp_attn_logits=lambda logits, local_hidden, metadata: logits,
+        _copy_logits_to_buffer=lambda logits, metadata, use_buffer: logits.float(),
+    )
+    metadata = {}
+
+    full_logits = logits_processor.LogitsProcessor._get_logits(
+        processor,
+        torch.empty(2, 1),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        tp_gather_metadata=metadata,
+    )
+
+    assert full_logits.dtype == torch.float32
+    assert metadata == {
+        "kind": "multimem_all_gather",
+        "input": {
+            "shape": [2, 3],
+            "dtype": "torch.bfloat16",
+            "numel": 6,
+            "nbytes": 12,
+        },
+        "output": {
+            "shape": [2, 6],
+            "dtype": "torch.bfloat16",
+            "numel": 12,
+            "nbytes": 24,
+        },
+    }
 
 
 def _endpoint_url(env_key: str) -> str | None:
@@ -927,3 +994,7 @@ def test_cuda_graph_replay_slice_preserves_compact_vocab_state():
     assert torch.equal(sliced.argmax_ids, torch.tensor([10, 11]))
     torch.testing.assert_close(sliced.logsumexp, torch.tensor([1.5, 2.5]))
     torch.testing.assert_close(sliced.max_probs, torch.tensor([0.6, 0.7]))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
