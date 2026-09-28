@@ -84,10 +84,7 @@ logger = logging.getLogger(__name__)
 
 
 class _LastRowTrunk:
-    """Wraps a model's headless trunk so a forward returns only its last row.
-
-    Attribute access (``embed_tokens``, ``args``, ...) resolves to the real trunk.
-    """
+    """Runs the trunk and returns only the last position of its output."""
 
     __slots__ = ("_trunk",)
 
@@ -102,15 +99,10 @@ class _LastRowTrunk:
 
 
 class _LastRowModel:
-    """Stand-in ``self`` for ``Model.__call__`` that computes logits for the last position only.
+    """``self`` for ``Model.__call__`` whose ``.model`` yields its last row only.
 
-    mlx-lm models run ``self.model`` (the trunk) and then apply the head to every
-    position, so a chunk of T tokens produces a [T, vocab] logits array of which
-    the runner reads one row. Calling ``type(model).__call__(_LastRowModel(model),
-    ...)`` runs the same method with ``.model`` replaced by a trunk whose output is
-    sliced to its last row, so the head, and whatever the model does after it
-    (soft-capping, scaling), run on one row. Every other attribute resolves to the
-    real model, and nothing on the model is mutated.
+    The model's own forward then applies the head (and any op after it) to one
+    position. Every other attribute resolves to the real model.
     """
 
     __slots__ = ("_model", "model")
@@ -1203,11 +1195,8 @@ class MlxModelRunner:
             logits = self._extract_logits(model_output)
             return mx.argmax(logits[:, -1, :], axis=-1), None
         if input_ids.shape[1] > 1 and self._trunk is not None:
-            # Only the last row of the logits is read, but the model's own
-            # forward applies the head to every position: [chunk, vocab] bf16
-            # logits, 2.3 GB for an 8192-token chunk of a 152k vocab, and the
-            # largest transient allocation in the process. The trunk still runs
-            # once over the whole chunk, so the KV cache is unchanged.
+            # Head on the last position only; a [chunk, vocab] logits array is
+            # otherwise the largest transient in the process.
             model_output = type(self.model).__call__(
                 _LastRowModel(self.model, self._trunk), input_ids, cache=cache
             )
