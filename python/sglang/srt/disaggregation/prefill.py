@@ -451,9 +451,6 @@ class PrefillBootstrapQueue:
             return []
 
         if self.pp_size > 1:
-            assert get_disagg().optimistic_prefill_attempts == 0, (
-                "PP prefill is incompatible with optimistic prefill"
-            )
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
