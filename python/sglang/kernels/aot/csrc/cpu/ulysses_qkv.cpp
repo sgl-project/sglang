@@ -5,6 +5,8 @@
 
 #include <cstring>
 
+#include "common.h"
+
 /*
  * Pack Q/K/V into destination-major layout for Ulysses all-to-all.
  *
@@ -57,7 +59,6 @@ void pack_qkv_destination_major_cpu(
   const int64_t head_size = q.size(2);
   TORCH_CHECK(global_heads % world_size == 0, "world_size must divide global_heads");
   const int64_t local_heads = global_heads / world_size;
-  TORCH_CHECK(output.device().is_cpu(), "output must be a CPU tensor");
   TORCH_CHECK(output.scalar_type() == q.scalar_type(), "output must have the same dtype as q/k/v");
   TORCH_CHECK(
       output.size(0) == world_size && output.size(1) == rows && output.size(2) == local_heads &&

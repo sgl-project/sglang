@@ -656,10 +656,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_direct_gpu_weight_loading()
         if self.lora_alpha is not None and self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be a positive integer")
-        if current_platform.is_cpu():
-            self._validate_cpu_parallelism()
-        else:
-            self._validate_parallelism()
+        self._validate_parallelism()
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
@@ -1432,9 +1429,9 @@ class ServerArgs(DisaggServerArgsMixin):
             self.tp_size = 1
 
         if current_platform.is_cpu() and (
-            self.tp_size > 1 or (self.ulysses_degree or 1) > 1
+            self.tp_size > 1 or (self.sp_degree or 1) > 1
         ):
-            self.num_gpus = self.tp_size * (self.ulysses_degree or 1)
+            self.num_gpus = self.tp_size * self.sp_degree
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
@@ -3773,7 +3770,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
                 f") = {num_gpus_per_group}"
             )
-
+        if current_platform.is_cpu() and self.ring_degree != 1:
+            raise ValueError("CPU currently supports Ulysses SP only")
         if self.sp_degree != self.ring_degree * self.ulysses_degree:
             raise ValueError(
                 f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
@@ -3788,20 +3786,6 @@ class ServerArgs(DisaggServerArgsMixin):
                     "cache-dit is enabled with hybrid parallelism (SP + TP). "
                     "Proceeding anyway (SGLang integration may support this mode)."
                 )
-
-    def _validate_cpu_parallelism(self):
-        # TODO: Add Ring SP support on CPU.
-        # The initial CPU sequence-parallel implementation only enables Ulysses.
-        if self.ring_degree not in (None, 1):
-            raise ValueError("CPU currently supports Ulysses SP only")
-
-        ulysses_degree = self.ulysses_degree or 1
-
-        if self.sp_degree != ulysses_degree:
-            raise ValueError(
-                f"For CPU Ulysses, sp_degree ({self.sp_degree}) "
-                f"must equal ulysses_degree ({ulysses_degree})"
-            )
 
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
