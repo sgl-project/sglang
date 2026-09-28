@@ -176,6 +176,9 @@ class Sampler(nn.Module):
         _trace_e2e_sampler("preprocess_returned")
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = sampling_mask_batch_indices is not None
+        sampling_support_logprobs_capture_indices = (
+            sampling_info.sampling_support_logprobs_capture_indices
+        )
         sampling_mask_capture = None
 
         if sampling_info.is_all_greedy:
@@ -296,7 +299,9 @@ class Sampler(nn.Module):
             if sampling_info.is_all_greedy:
                 logits_output.sampling_mask_output = (
                     self._build_greedy_sampling_mask_output(
-                        sampling_mask_batch_indices, batch_next_token_ids
+                        sampling_mask_batch_indices,
+                        batch_next_token_ids,
+                        sampling_support_logprobs_capture_indices,
                     )
                 )
             else:
@@ -309,6 +314,7 @@ class Sampler(nn.Module):
                 logits_output.sampling_mask_output = self._build_sampling_mask_output(
                     batch_next_token_ids,
                     sampling_mask_capture,
+                    sampling_support_logprobs_capture_indices,
                 )
 
         _trace_e2e_sampler("forward_returned")
@@ -461,6 +467,7 @@ class Sampler(nn.Module):
         self,
         batch_indices: torch.Tensor,
         batch_next_token_ids: torch.Tensor,
+        support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         token_ids = batch_next_token_ids.index_select(0, batch_indices).to(torch.int32)
         num_requests = batch_indices.numel()
@@ -471,6 +478,15 @@ class Sampler(nn.Module):
             ),
             selected_logprobs=torch.zeros(
                 num_requests, dtype=torch.float32, device=token_ids.device
+            ),
+            support_logprobs=(
+                torch.zeros(
+                    (support_capture_indices.numel(), 1),
+                    dtype=torch.float32,
+                    device=token_ids.device,
+                )
+                if support_capture_indices is not None
+                else None
             ),
             statuses=torch.full(
                 (num_requests,),
@@ -484,6 +500,7 @@ class Sampler(nn.Module):
         self,
         batch_next_token_ids: torch.Tensor,
         sampling_mask_capture: _SamplingMaskCapture,
+        support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
         batch_indices = sampling_mask_capture.batch_rows
@@ -549,18 +566,27 @@ class Sampler(nn.Module):
 
         packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
         if token_ids is None:
-            _, packed_positions = torch.topk(
+            packed_weights, packed_positions = torch.topk(
                 weights, k=packed_size, dim=-1, largest=True, sorted=True
             )
             packed_token_ids = packed_positions.to(torch.int32)
         else:
             # The PyTorch producer already sorts weights and IDs together.
             packed_token_ids = token_ids[:, :packed_size].contiguous()
+            packed_weights = weights[:, :packed_size]
+
+        support_logprobs = None
+        if support_capture_indices is not None:
+            support_logprobs = torch.log(
+                packed_weights.index_select(0, support_capture_indices).float()
+                / support_mass.index_select(0, support_capture_indices).unsqueeze(-1)
+            )
 
         return SamplingMaskOutput(
             token_ids=packed_token_ids,
             lengths=realized_lengths.clamp(max=packed_size),
             selected_logprobs=selected_logprobs,
+            support_logprobs=support_logprobs,
             statuses=statuses,
         )
 
