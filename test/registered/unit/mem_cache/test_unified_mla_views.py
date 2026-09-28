@@ -100,7 +100,7 @@ def _make_unified(page_size=1, n_full_tokens=64, n_mamba_slots=8):
 def _build_views(raw, ps, num_pages):
     layout = _mla_spec().layout()
     return build_dense_views(
-        raw, layout=layout, part=layout.part("kv"), page_size=ps, num_pages=num_pages
+        raw, layout=layout, part_name="kv", num_slots=num_pages * ps
     )
 
 

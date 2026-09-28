@@ -502,16 +502,15 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        num_pages = max_slots // page_size
-        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_pages * page_size)
+        num_slots = max_slots // page_size * page_size
+        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
         layout = spec.layout()
         k_views, v_views = (
             build_dense_views(
                 self._raw,
                 layout=layout,
-                part=layout.part(name),
-                page_size=page_size,
-                num_pages=num_pages,
+                part_name=name,
+                num_slots=num_slots,
                 anchor_bytes=anchor_bytes,
             )
             for name in ("k", "v")
@@ -525,15 +524,14 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> List[torch.Tensor]:
-        num_pages = max_slots // page_size
-        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_pages * page_size)
+        num_slots = max_slots // page_size * page_size
+        _assert_kernel_id_bound(sub_pool_name=spec.name, n_rows=num_slots)
         layout = spec.layout()
         return build_dense_views(
             self._raw,
             layout=layout,
-            part=layout.part("kv"),
-            page_size=page_size,
-            num_pages=num_pages,
+            part_name="kv",
+            num_slots=num_slots,
             anchor_bytes=anchor_bytes,
         )
 

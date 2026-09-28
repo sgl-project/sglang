@@ -84,10 +84,10 @@ def _make_raw(ps, num_pages, entry=_ENTRY, short=0):
 
 def _build_views(raw, ps, num_pages, head_dim=_D, v_head_dim=None, layer_num=_L):
     layout = _mha_spec(head_dim, v_head_dim, layer_num).layout()
-    kw = dict(layout=layout, page_size=ps, num_pages=num_pages)
+    kw = dict(layout=layout, num_slots=num_pages * ps)
     return (
-        build_dense_views(raw, part=layout.part("k"), **kw),
-        build_dense_views(raw, part=layout.part("v"), **kw),
+        build_dense_views(raw, part_name="k", **kw),
+        build_dense_views(raw, part_name="v", **kw),
     )
 
 

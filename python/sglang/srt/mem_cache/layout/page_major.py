@@ -121,24 +121,23 @@ def build_dense_views(
     raw: torch.Tensor,
     *,
     layout: DenseEntryLayout,
-    part: DensePart,
-    page_size: int,
-    num_pages: int,
+    part_name: str,
+    num_slots: int,
     anchor_bytes: int = 0,
 ) -> List[torch.Tensor]:
-    """Per-layer views of one part: ``(num_pages * page_size, *row_shape)`` with
-    slot stride ``layout.entry_bytes``, indexed by the physical token id
-    ``page * page_size + slot`` (``paged_view`` regroups them by page).
+    """Per-layer views of one part: ``(num_slots, *row_shape)`` with slot
+    stride ``layout.entry_bytes``, indexed by the physical token id
+    (``paged_view`` regroups them by page).
     """
+    part = layout.part(part_name)
     itemsize = part.dtype.itemsize
     assert layout.entry_bytes % itemsize == 0 and anchor_bytes % itemsize == 0, (
         f"build_dense_views: entry {layout.entry_bytes} B and anchor "
         f"{anchor_bytes} B must be multiples of the {part.dtype} itemsize"
     )
-    n_rows = num_pages * page_size
-    end = anchor_bytes + n_rows * layout.entry_bytes
+    end = anchor_bytes + num_slots * layout.entry_bytes
     assert end <= raw.numel() * raw.itemsize, (
-        f"build_dense_views: {n_rows} slots of {layout.entry_bytes} B end at byte "
+        f"build_dense_views: {num_slots} slots of {layout.entry_bytes} B end at byte "
         f"{end} but the raw buffer holds only {raw.numel() * raw.itemsize} bytes"
     )
     as_dtype_view = raw.view(part.dtype)
@@ -150,7 +149,7 @@ def build_dense_views(
         views.append(
             torch.as_strided(
                 as_dtype_view,
-                size=(n_rows, *part.row_shape),
+                size=(num_slots, *part.row_shape),
                 stride=stride,
                 storage_offset=base_bytes // itemsize,
             )

@@ -66,9 +66,8 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
         views = build_dense_views(
             raw,
             layout=layout,
-            part=layout.part("kv"),
-            page_size=page_size,
-            num_pages=num_pages,
+            part_name="kv",
+            num_slots=num_pages * page_size,
             anchor_bytes=0,
         )
         torch.manual_seed(0)
@@ -129,9 +128,8 @@ class TestMHAEnvelopeTransferAddressing(CustomTestCase):
             build_dense_views(
                 raw,
                 layout=layout,
-                part=layout.part(name),
-                page_size=page_size,
-                num_pages=num_pages,
+                part_name=name,
+                num_slots=num_pages * page_size,
                 anchor_bytes=0,
             )
             for name in ("k", "v")
@@ -194,9 +192,8 @@ class TestMHAEnvelopeTransferAddressing(CustomTestCase):
             build_dense_views(
                 raw,
                 layout=layout,
-                part=layout.part(name),
-                page_size=page_size,
-                num_pages=num_pages,
+                part_name=name,
+                num_slots=num_pages * page_size,
                 anchor_bytes=0,
             )
             for name in ("k", "v")
