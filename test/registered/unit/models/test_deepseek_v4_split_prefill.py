@@ -139,9 +139,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
         split_batch = SimpleNamespace(hidden_states=None, model_specific_states=None)
 
         self.assertIsNone(self._run_split(split_model, split_batch, (0, 1)))
-        split_result, split_aux = self._run_split(
-            split_model, split_batch, (1, 2)
-        )
+        split_result, split_aux = self._run_split(split_model, split_batch, (1, 2))
 
         one_shot_model, _ = self._make_model()
         one_shot_model.dspark_layers_to_capture = [0, 1]
@@ -233,7 +231,7 @@ class TestDeepseekV4SplitPrefill(unittest.TestCase):
                 start_layer=0,
                 forward_split_prefill=Mock(
                     return_value=((torch.tensor([1.0]), torch.tensor([2.0])), aux)
-                )
+                ),
             ),
             logits_processor=Mock(return_value="logits"),
             lm_head=object(),

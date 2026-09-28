@@ -158,8 +158,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         disagg = get_disagg()
         if (
             getattr(disagg, "enable_pdmux", False)
-            and getattr(disagg, "pdmux_prefill_mode", "layer_split")
-            == "layer_split"
+            and getattr(disagg, "pdmux_prefill_mode", "layer_split") == "layer_split"
             and not getattr(
                 self.model_runner.model, "supports_pdmux_dspark_prefill", False
             )

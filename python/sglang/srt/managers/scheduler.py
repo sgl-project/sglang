@@ -4415,9 +4415,7 @@ class Scheduler(
             batch_result.extra_keep_alive_refs = keep_alive
 
             if batch.spec_algorithm.is_none():
-                self._relay_forward_payload(
-                    batch, batch.req_pool_indices, batch_result
-                )
+                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
 
             batch_result.copy_done = self.device_module.Event()
             self._launch_result_copy(

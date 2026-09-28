@@ -366,9 +366,7 @@ class TestPDMuxStandardPrefillLoop(unittest.TestCase):
         window = journal[submit_at + 1 : finalize_at]
 
         self.assertEqual([e for e in window if e[0] == "switch"], [])
-        self.assertEqual(
-            [e for e in window if e[0] == "sync" and e[1].lane == "P"], []
-        )
+        self.assertEqual([e for e in window if e[0] == "sync" and e[1].lane == "P"], [])
         # The decode lane kept stepping (and draining itself) meanwhile.
         self.assertTrue(any(e[0] == "sync" and e[1].lane == "D" for e in window))
         self.assertEqual(scheduler.decode_backend_switches[:1], [1])
@@ -585,9 +583,7 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
 
     def test_standard_lane_keeps_a_caller_published_backend(self):
         """The multi-step draft regression: a per-step backend must survive."""
-        backend, active = self._resolve_decode_under(
-            self.per_step, pdmux_standard=True
-        )
+        backend, active = self._resolve_decode_under(self.per_step, pdmux_standard=True)
 
         self.assertIs(backend, self.per_step)
         self.assertIs(active, self.per_step)
@@ -598,9 +594,7 @@ class TestEagerRunnerBackendResolution(unittest.TestCase):
         This is the routing DSpark's draft block and the target verify rely on;
         the exception for caller-published backends must not disable it.
         """
-        backend, active = self._resolve_decode_under(
-            self.default, pdmux_standard=True
-        )
+        backend, active = self._resolve_decode_under(self.default, pdmux_standard=True)
 
         self.assertIs(backend, self.group)
         self.assertIs(active, self.group)
@@ -654,9 +648,7 @@ class TestPdmuxStandardPrefillMode(unittest.TestCase):
     def _disagg(*, enable_pdmux, mode):
         with patch(
             "sglang.srt.runtime_context.get_disagg",
-            lambda: SimpleNamespace(
-                enable_pdmux=enable_pdmux, pdmux_prefill_mode=mode
-            ),
+            lambda: SimpleNamespace(enable_pdmux=enable_pdmux, pdmux_prefill_mode=mode),
         ):
             yield
 

@@ -4842,9 +4842,7 @@ class DeepseekV4Model(nn.Module):
     ):
         start, end = split_interval
         model_start_layer = getattr(self, "start_layer", 0)
-        hc_pre_from_prev_sublayer = getattr(
-            self, "hc_pre_from_prev_sublayer", False
-        )
+        hc_pre_from_prev_sublayer = getattr(self, "hc_pre_from_prev_sublayer", False)
 
         if start == model_start_layer:
             hidden_states = (
@@ -4866,9 +4864,7 @@ class DeepseekV4Model(nn.Module):
                 )
                 input_ids_global = input_ids_global.squeeze(-1)
             else:
-                input_ids_global = getattr(
-                    forward_batch, "input_ids_global", input_ids
-                )
+                input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
             for attr in ("freqs_cis_c4", "freqs_cis_c128"):
                 if hasattr(forward_batch, attr):
@@ -4898,9 +4894,7 @@ class DeepseekV4Model(nn.Module):
                             hash_ids = torch.cat(
                                 [
                                     hash_ids,
-                                    hash_ids.new_zeros(
-                                        pad_rows, *hash_ids.shape[1:]
-                                    ),
+                                    hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:]),
                                 ]
                             )
                     elif (
@@ -4959,9 +4953,7 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = tail.rows(hidden_states)
                     prev_pre = tail.rows(prev_pre)
                     states["input_ids"] = tail.rows(states["input_ids"])
-                    states["input_ids_global"] = tail.rows(
-                        states["input_ids_global"]
-                    )
+                    states["input_ids_global"] = tail.rows(states["input_ids_global"])
                     states["positions"] = tail.positions
                     if states["hash_ids"] is not None:
                         states["hash_ids"] = tail.rows(states["hash_ids"])
@@ -4982,9 +4974,9 @@ class DeepseekV4Model(nn.Module):
                         and self.config.vision_n_layers > 0
                     ):
                         hidden_states = torch.where(
-                            (
-                                states["input_ids"] == self.config.image_token_id
-                            )[:, None, None],
+                            (states["input_ids"] == self.config.image_token_id)[
+                                :, None, None
+                            ],
                             before_engram,
                             hidden_states,
                         )
@@ -4998,9 +4990,7 @@ class DeepseekV4Model(nn.Module):
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(
-                        i
-                    )
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 next_norm = None
                 next_input = []
@@ -5059,9 +5049,7 @@ class DeepseekV4Model(nn.Module):
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(
-                        i
-                    )
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
                     hidden_states, prev_residual, prev_post, prev_comb = layer(
@@ -5093,9 +5081,7 @@ class DeepseekV4Model(nn.Module):
             return None
 
         if states["saved_full"] is not None:
-            get_attn_backend().exit_late_layer_tail(
-                states["saved_full"], forward_batch
-            )
+            get_attn_backend().exit_late_layer_tail(states["saved_full"], forward_batch)
 
         if not hc_pre_from_prev_sublayer and self.use_fused_mhc_post_pre:
             hidden_states = last_layer.hc_post(

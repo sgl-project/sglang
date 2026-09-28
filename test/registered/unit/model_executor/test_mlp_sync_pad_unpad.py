@@ -228,9 +228,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         fb.post_forward_mlp_sync_batch(None)
 
         self.assertEqual(fb.batch_size, 2)
-        torch.testing.assert_close(
-            fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3])
-        )
+        torch.testing.assert_close(fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3]))
         torch.testing.assert_close(fb.seq_lens, torch.tensor([3, 4]))
         torch.testing.assert_close(fb.req_pool_indices, torch.tensor([1, 2]))
 

@@ -52,8 +52,7 @@ class TestDSparkPDMux(unittest.TestCase):
 
         with (
             patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2."
-                "get_disagg",
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_disagg",
                 return_value=SimpleNamespace(
                     enable_pdmux=True, pdmux_prefill_mode="layer_split"
                 ),

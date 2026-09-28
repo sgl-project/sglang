@@ -128,8 +128,7 @@ def _check_pdmux_standard_prefill(cfg: Any) -> None:
         "--enable-two-batch-overlap."
     )
     assert not cfg.enable_unified_memory, (
-        "--pdmux-prefill-mode standard is not compatible with "
-        "--enable-unified-memory."
+        "--pdmux-prefill-mode standard is not compatible with --enable-unified-memory."
     )
     for name, value in (
         ("--ep-size", cfg.ep_size),
@@ -137,8 +136,7 @@ def _check_pdmux_standard_prefill(cfg: Any) -> None:
         ("--dcp-size", cfg.dcp_size),
     ):
         assert value == 1, (
-            f"--pdmux-prefill-mode standard is not compatible with "
-            f"{name}={value}."
+            f"--pdmux-prefill-mode standard is not compatible with {name}={value}."
         )
 
 

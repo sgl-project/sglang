@@ -195,7 +195,9 @@ class TestDSV4FlashTP8PDMuxConcurrent(CustomTestCase):
         self.assertTrue(
             first_token_seen.wait(timeout=180), "decode stream never started"
         )
-        self.assertIsNone(stream_state["error"], f"stream failed: {stream_state['error']}")
+        self.assertIsNone(
+            stream_state["error"], f"stream failed: {stream_state['error']}"
+        )
 
         # Inject long prompts while the stream is decoding: running_batch and
         # split_prefill_batch are now concurrently non-empty.
@@ -212,7 +214,9 @@ class TestDSV4FlashTP8PDMuxConcurrent(CustomTestCase):
 
         stream_thread.join(timeout=300)
         self.assertFalse(stream_thread.is_alive(), "stream request never finished")
-        self.assertIsNone(stream_state["error"], f"stream failed: {stream_state['error']}")
+        self.assertIsNone(
+            stream_state["error"], f"stream failed: {stream_state['error']}"
+        )
 
         # (ii) cross-segment numerics + cross-request KV isolation.
         for code, future in zip(NEEDLE_CODES, futures):

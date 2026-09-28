@@ -1917,9 +1917,7 @@ class ModelRunner:
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
                     forward_count=(
-                        split_forward_count
-                        if split_forward_count is not None
-                        else 1
+                        split_forward_count if split_forward_count is not None else 1
                     ),
                 )
             elif (

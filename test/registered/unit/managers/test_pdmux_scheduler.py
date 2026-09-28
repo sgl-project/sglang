@@ -93,8 +93,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         cls = next(
             node
             for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "SchedulerDPAttnAdapter"
+            if isinstance(node, ast.ClassDef) and node.name == "SchedulerDPAttnAdapter"
         )
         method = next(
             node
@@ -118,8 +117,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         dataclass_fields = {
             node.target.id
             for node in cls.body
-            if isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
         }
         self.assertNotIn("tp_group", dataclass_fields)
 
@@ -392,9 +390,7 @@ class TestPDMuxScheduler(unittest.TestCase):
             stream_groups=[(f"p{i}", f"d{i}") for i in range(group_num)],
         )
         scheduler._update_decode_attn_backends = lambda stream_idx: (
-            SchedulerMultiplexMixin._update_decode_attn_backends(
-                scheduler, stream_idx
-            )
+            SchedulerMultiplexMixin._update_decode_attn_backends(scheduler, stream_idx)
         )
         return scheduler
 
@@ -503,7 +499,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
     def test_pdmux_initialization_uses_parallel_state_gpu_id(self):
-        config = SimpleNamespace(layer_prefill_chunk_round_robin=False)
+        config = SimpleNamespace()
         scheduler = SimpleNamespace(
             gpu_id=3,
             pdmux_standard=False,
