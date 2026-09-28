@@ -311,7 +311,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
-        return self.forward_normal(hidden_states)
 
     def get_moe_weights(self):
         return [
