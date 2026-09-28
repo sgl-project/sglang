@@ -77,28 +77,6 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-### Qwen-Image 2.1
-
-The native `QwenImage21Pipeline` supports text-to-image and reference-image
-conditioning with Qwen3-VL, a single-stream block-causal DiT, and the 64-channel
-VAE. Use the public checkpoint:
-
-```bash
-sglang generate --model-path Qwen/Qwen-Image-2.1 \
-  --prompt "A capybara reading a book by candlelight" \
-  --height 1024 --width 1024 --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
-```
-
-Add `--image-path /path/to/input.png` for editing. Dimensions must be multiples
-of 32. Full-checkpoint generation and editing have been tested on H200; see the
-[model cookbook](../../../docs/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1.mdx)
-for component requirements and optimization boundaries. Compatible text-to-image
-requests support opt-in dynamic batching with `--batching-max-size 2` when
-serving. Image edits are not merged across requests; use `n` for multiple
-outputs within an edit request. Batching can improve offload throughput, but
-changes floating-point rounding and is not always faster with resident weights.
-
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
