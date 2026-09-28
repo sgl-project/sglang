@@ -91,6 +91,7 @@ from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -774,7 +775,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
 
 
 class _GraftReq:
-    """Minimal Req stand-in for cache_unfinished/finished_req."""
+    """Minimal Req stand-in for cache_unfinished_req / insert_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
@@ -918,13 +919,13 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)
         )
 
-    def test_cache_finished_decline_frees_duplicates_and_suffix(self):
+    def test_insert_req_decline_frees_duplicates_and_suffix(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        finish_req(tree, req, 12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -932,7 +933,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         self.assertEqual(set(released.tolist()), set(own_locs.tolist()))
         self.assertEqual(_match_len(tree, req.fill_ids), 8)
 
-    def test_cache_finished_same_base_keeps_the_tail_cached(self):
+    def test_insert_req_same_base_keeps_the_tail_cached(self):
         """Control for the decline test: with an agreeing base the tail is
         grafted and only the matched duplicates are freed."""
         tree, freed = self._tree_with_spy()
@@ -940,7 +941,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        finish_req(tree, req, 12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.

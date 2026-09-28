@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
+    get_lora,
     get_model,
     get_parallel,
     get_server_args,
@@ -848,6 +849,27 @@ def post_experts_reduction_group():
     if parallel.moe_ep_size > 1:
         return parallel.moe_ep_group
     return parallel.moe_tp_group
+
+
+def post_experts_sum_is_one_all_reduce() -> bool:
+    """Whether the sum an FFN leaves out when it skips its post-experts (or
+    down-projection) all-reduce is one full-precision all-reduce over the TP
+    group itself, on a plain partial sum: the all-reduce a later step can run
+    instead. Not when the combine already summed the output, the reduction is
+    quantized, a replicated shared expert is added after it, LoRA-B runs on
+    the unreduced activations, or the EP and MoE-TP sums run in two steps or
+    over another group."""
+    parallel = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and not post_experts_output_is_complete(is_tp_path=True)
+        and not get_exec().comm.enable_quant_communications
+        and not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        and not get_lora().enable_lora
+        # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
+        and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+        and post_experts_reduction_group() is parallel.tp_group
+    )
 
 
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:

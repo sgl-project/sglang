@@ -6,6 +6,7 @@ fused matmul fast-paths need a real TP group and are covered by the e2e test.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,17 @@ import torch
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers.communicator import (
+    Layout,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+)
+from sglang.srt.layers.communicator import boundary as comm_boundary
+from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator import (
+    sequence_parallel_layer_sides,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -23,9 +35,23 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+def sp_region_steps():
+    """The steps a layer runs while a LayerNorm SP region is active."""
+    return comm_boundary._select_boundary_steps(
+        sequence_parallel_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: 1,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+    )
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
@@ -148,26 +174,55 @@ class TestSpRegionSteps(CustomTestCase):
 
     def communicator(self, *, first_layer):
         c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        c._sp_region = True
-        c.layer_scatter_modes = SimpleNamespace(is_first_layer=first_layer)
+        c._sp_steps = sp_region_steps()
+        c._input_scattered_steps = None
+        c._cp_steps = None
+        c.layer_facts = SimpleNamespace(
+            is_first_layer=first_layer, is_layer_sparse=False
+        )
+        c.allow_reduce_scatter = False
         c._attn_input_fusions = ()
         c.input_layernorm = _Norm()
         c.post_attention_layernorm = _Norm()
         c.qkv_latent_func = None
         c._context = SimpleNamespace(cache=None)
-        c._communicate_simple_fn = MagicMock(side_effect=AssertionError("moved"))
-        c._communicate_summable_tensor_pair_fn = MagicMock(
-            side_effect=AssertionError("postprocess ran")
-        )
+        c._steps = self.ordinary_steps(MagicMock(side_effect=AssertionError("moved")))
         return c
+
+    def ordinary_steps(self, attention_input):
+        """The layer's steps outside the region, which must not run inside it."""
+        return comm.BoundarySteps(
+            attention=comm.StageEntry(
+                prepare=partial(
+                    comm_ops._consumer_step,
+                    step=partial(
+                        comm_ops._read_input,
+                        layer_input=None,
+                        enters_stack=False,
+                        read=comm.NORM_QUANT_READ,
+                        update=comm.ADD,
+                    ),
+                    carried_fusions=(),
+                ),
+                input_rows=comm.Layout(frozenset()),
+                input_move=attention_input,
+                handoff=comm_ops._hand_qkv_hook_its_input,
+            ),
+            ffn=comm.StageEntry(
+                prepare=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
+                input_rows=Layout(frozenset()),
+            ),
+            ffn_output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
+            ffn_output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
+            ffn_sum_is_movable=True,
+        )
 
     def run_prepare_attn(self, communicator, mode, hidden, residual):
         batch = SimpleNamespace(forward_mode=mode)
         with (
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=False),
-            patch.object(
-                comm,
+            patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ),
@@ -190,20 +245,19 @@ class TestSpRegionSteps(CustomTestCase):
 
     def test_decode_leaves_the_region_closed(self):
         communicator = self.communicator(first_layer=True)
-        communicator._communicate_simple_fn = MagicMock(
-            side_effect=lambda **k: k["hidden_states"]
-        )
+        move = MagicMock(side_effect=lambda **k: k["hidden_states"])
+        communicator._steps = self.ordinary_steps(move)
         (h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
         self.assertFalse(active)
         scatter.assert_not_called()
-        communicator._communicate_simple_fn.assert_called_once()
+        move.assert_called_once()
 
     def test_a_later_layer_does_not_reopen_the_region(self):
         communicator = self.communicator(first_layer=False)
-        communicator._communicate_simple_fn = MagicMock(
-            side_effect=lambda **k: k["hidden_states"]
+        communicator._steps = self.ordinary_steps(
+            MagicMock(side_effect=lambda **k: k["hidden_states"])
         )
         _, active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.EXTEND, torch.ones(2, 4), torch.ones(2, 4)
@@ -218,8 +272,7 @@ class TestSpRegionSteps(CustomTestCase):
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=True),
         ):
-            with patch.object(
-                comm,
+            with patch_communicator(
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ):

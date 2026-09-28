@@ -110,6 +110,7 @@ from sglang.srt.server_args import (
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -1728,7 +1729,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
 
-    def test_cache_finished_req_insert(self):
+    def test_insert_req(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1752,7 +1753,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1784,7 +1785,7 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(len(prompt_only.device_indices), prompt_aligned_len)
         cache.sanity_check()
 
-    def test_cache_finished_req_strips_thinking(self):
+    def test_insert_req_strips_thinking(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1810,10 +1811,10 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        # cache_finished_req reads get_serving().strip_thinking_cache
+        # owned_kv_len reads get_serving().strip_thinking_cache
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
-            cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+            finish_req(cache, req, req.owned_kv_len())
             start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
@@ -1834,7 +1835,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-    def test_cache_finished_req_no_insert(self):
+    def test_release_without_insert(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 2)
@@ -2002,7 +2003,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_paged_cache_finished_unaligned_tail_freed(self):
+    def test_paged_insert_req_unaligned_tail_freed(self):
         if self.cfg.page_size == 1:
             self.skipTest("page_size > 1 only")
         if self.cfg.has_swa:
@@ -2031,7 +2032,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -8745,7 +8746,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req.kv.mamba_last_track_seqlen = len(tokens)
         return req
 
-    def _cache_finished(self, cache, allocator, req_to_token_pool, tokens):
+    def _finished_req(self, cache, allocator, req_to_token_pool, tokens):
         req = self._make_req(req_to_token_pool, tokens)
         kv_indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(kv_indices)
@@ -8754,7 +8755,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -8764,14 +8765,14 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         ckpt_initial = ckpt_pool.available_size()
         tokens = [1, 2, 3, 4]
 
-        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self._finished_req(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), active_initial
         )
         self.assertEqual(ckpt_pool.available_size(), ckpt_initial - 1)
         self.assertEqual(cache.mamba_evictable_size(), 1)
 
-        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self._finished_req(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), active_initial
         )
