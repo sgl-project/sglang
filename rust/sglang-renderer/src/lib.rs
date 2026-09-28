@@ -15,10 +15,9 @@ pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
 pub(crate) use preprocessing::ChatFormatter;
-pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{
-    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
-    TextTokenizer, load_tokenizer,
+    ChatPreprocessor, ChatRequest, DynamoTokenizer, LoweredChat, PreparedChat, ReasoningEffort,
+    RendererService, SamplingParams, TextTokenizer, load_tokenizer,
 };
 pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,

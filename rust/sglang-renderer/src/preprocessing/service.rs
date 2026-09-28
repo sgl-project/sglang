@@ -40,9 +40,7 @@ impl RendererService {
         worker_count: usize,
         queue_capacity: usize,
     ) -> Self {
-        let (formatter, formatter_error) = load_chat_support(&config);
-        let chat_preprocessor =
-            ChatPreprocessor::new(&config, formatter).with_formatter_error(formatter_error);
+        let chat_preprocessor = ChatPreprocessor::from_config(&config);
         Self {
             config,
             chat_preprocessor,
@@ -189,7 +187,9 @@ impl RendererService {
     }
 }
 
-fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<String>) {
+pub(super) fn load_chat_support(
+    config: &RendererConfig,
+) -> (Option<ChatFormatter>, Option<String>) {
     if config.tokenizer_path.is_empty() {
         return (None, None);
     }

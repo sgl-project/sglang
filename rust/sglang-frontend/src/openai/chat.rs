@@ -584,8 +584,8 @@ mod tests {
     use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
     use crate::openai::test_utils::{chat_submitted, chunk};
     use crate::{
-        GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits, ResponseError,
-        SamplingDefaults, TokenLogprob,
+        ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
+        ResponseError, SamplingDefaults, TokenLogprob,
     };
     use futures::{FutureExt, StreamExt};
 
@@ -627,19 +627,8 @@ mod tests {
         }))
         .unwrap();
         let (_, chat) = lower_chat_request(&config, request).unwrap();
-        struct WordTokenizer;
-        impl crate::TextTokenizer for WordTokenizer {
-            fn encode(&self, _: &str, _: bool) -> Result<Vec<i32>, crate::RendererError> {
-                Ok(vec![1])
-            }
-        }
-        let renderer = crate::RendererService::with_tokenizer(
-            config,
-            std::sync::Arc::new(WordTokenizer),
-            1,
-            8,
-        );
-        futures::executor::block_on(renderer.prepare_chat(chat))
+        ChatPreprocessor::from_config(&config)
+            .preprocess(chat)
             .unwrap()
             .response_processor
     }
