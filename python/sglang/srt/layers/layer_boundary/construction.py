@@ -108,10 +108,15 @@ def _input_can_be_scattered() -> bool:
 
 @dataclass(frozen=True)
 class StageEdges:
-    """One stage's incoming and outgoing declarations for one batch variant.
+    """One stage's incoming and outgoing contracts for one batch variant.
 
-    No adjacent stage object is required. Edges can come from a local model
-    assembler, pipeline contract or branch adapter.
+    Fields:
+        incoming: Consumer-side contract used to bind prepare.
+        outgoing: Producer-side contract used to bind exit transport.
+        handoff: Optional attention adapter run after input preparation/movement.
+        cp_moves: Strategy-specific context-parallel gather and return operations.
+
+    No executable neighbouring stage or neighbouring norm is required.
     """
 
     incoming: EdgeDecl
@@ -125,7 +130,25 @@ def _requires_branch_input(*args, **kwargs):
 
 
 class StagePlan:
-    """Precomputed paths for one stage; never owns the neighbouring norm."""
+    """Bind reusable entry/exit paths from a stage's resolved declarations.
+
+    Args:
+        kind: Boundary role selecting attention or FFN fusion adapters.
+        norm: This stage's consumer normalization module.
+        variants: Mapping from BatchVariant to StageEdges. Construction binds
+            each entry once; a forward selects an existing path by batch facts.
+        enters_stack: Whether this stage initializes the residual from embeddings.
+        prepared_input: Branch reusing an already-read input; requires branch_input
+            instead of a normal prepare to avoid repeating the read/update.
+        terminal: Whether the stage ends the model's layer stack.
+        direct_handoff: Attention can publish its output with finish instead of
+            an exit scope and output transport.
+        qkv_latent_func: Optional hook for prepared attention input.
+        fusions: Optional backend provider of ordered consumer fusion candidates.
+
+    The plan owns static paths, not per-forward tensors or a neighbour's norm.
+    Runtime residual state belongs to the ForwardBatch's ResidualStream.
+    """
 
     def __init__(
         self,

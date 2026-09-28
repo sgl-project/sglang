@@ -25,7 +25,13 @@ from sglang.srt.layers.layer_boundary.residual import StageUpdate
 
 
 class CarriedSum(msgspec.Struct, frozen=True):
-    """Work left by the producer, including a move back to local token rows."""
+    """Runtime reduction left by an exit decision.
+
+    Fields:
+        group: All-reduce group when no redistribution callable is supplied.
+        reduce_and_redistribute: Optional callable(value) returning a reduced
+            value on destination rows; takes precedence over group.
+    """
 
     group: Optional[GroupCoordinator] = None
     reduce_and_redistribute: Optional[Callable] = None
@@ -46,7 +52,15 @@ class DeclaredSum(msgspec.Struct, frozen=True):
 
 
 class Contribution(msgspec.Struct):
-    """The sole owner of an output's value, update and remaining work."""
+    """Own a producer's output, residual update and outstanding completion.
+
+    Fields:
+        value: Contribution tensor, or None for an opaque finalize handoff.
+        update: Producer operation to apply before the consumer reads input.
+        owed: Runtime sum, declared sum, producer-specific finalize, or None.
+
+    Completing owed work clears owed but does not apply the residual update.
+    """
 
     value: Optional[torch.Tensor]
     update: StageUpdate
@@ -80,11 +94,20 @@ class OwedOutput(msgspec.Struct, frozen=True):
 
 
 class ResidualStream:
-    """Uninitialized, written, or holding one pending producer contribution.
+    """Own residual state for one forward or TBO microbatch.
 
-    Each forward or TBO microbatch owns its stream. A prepare consumes its
-    pending contribution once; completing a sum for capture leaves the update
-    pending. No layout or batch selection is stored on the value.
+    Args:
+        residual: Already-written residual, or None before stack entry.
+
+    Fields:
+        residual: Residual tensor retained across stages, or None initially.
+        pending: Contribution awaiting a residual update, or None. Its owed
+            field separately records incomplete reduction/finalize work.
+
+    The states are initial (both None), written (residual only), and pending.
+    Prepare consumes pending once and writes the resulting residual. Completing
+    communication for capture leaves the update pending. Layouts and batch-path
+    selection live on the bound stage, not on tensor values.
     """
 
     __slots__ = ("residual", "pending")
@@ -95,7 +118,18 @@ class ResidualStream:
 
     @classmethod
     def arrive(cls, hidden, residual, update, *, declared_sum=None):
-        """Rebuild an explicit tensor handoff, including each TBO microbatch."""
+        """Reconstruct a stream from a tensor handoff, including a TBO microbatch.
+
+        Args:
+            hidden: Received output or already-written residual tensor.
+            residual: Separate residual tensor. None means hidden already holds
+                the written residual, rather than an uninitialized stack.
+            update: Producer operation for a separate contribution/residual pair.
+            declared_sum: Static sum owed by hidden when residual is separate.
+
+        Returns:
+            (handle, stream). Use start() for a fresh, uninitialized stack instead.
+        """
         stream = cls(residual)
         if residual is None:
             return stream.write(hidden), stream
@@ -107,6 +141,18 @@ class ResidualStream:
         return residual
 
     def leave(self, output, update, *, declared_sum=None):
+        """Record one producer contribution without applying its residual update.
+
+        Args:
+            output: Complete tensor, UnreducedOutput, or producer-specific HandoffOutput.
+            update: Producer operation that the next boundary must apply.
+            declared_sum: SumGroup statically owed by a raw tensor, or None. Cannot
+                be combined with another output wrapper's completion contract.
+
+        Returns:
+            The tensor when complete, otherwise an opaque OwedOutput. Replacing an
+            unconsumed contribution is an error; retain the returned handle.
+        """
         if self.pending is not None:
             raise RuntimeError("cannot replace an unconsumed producer contribution")
         if declared_sum is not None:
@@ -174,7 +220,19 @@ class ResidualStream:
         return value.clone() if self.residual is None else value + self.residual
 
     def finish(self, hidden, *, takes_handoff=False, preserve_declared=False):
-        """Export the contribution/residual pair; keep the stream available to readers."""
+        """Export the output/residual pair without closing or consuming the stream.
+
+        Args:
+            hidden: Current stream tensor or opaque owed handle.
+            takes_handoff: Pass a producer-specific finalize handoff through for a
+                terminal adapter that can consume it; otherwise complete it here.
+            preserve_declared: Export a raw declared partial sum for a receiver
+                whose incoming contract reconstructs that sum (for example PP).
+
+        Returns:
+            (output, residual), completing outstanding work unless explicitly
+            preserved. Does not apply the pending residual update.
+        """
         self.check(hidden)
         if self.pending is None:
             return hidden, None

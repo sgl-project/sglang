@@ -22,11 +22,15 @@ from sglang.srt.distributed import GroupCoordinator
 
 
 class OutputTransform(msgspec.Struct, frozen=True):
-    """An operation on the producer contribution, before residual addition.
+    """Transform a producer contribution before its residual update.
 
-    Some existing implementations apply it to a partial before reduce-scatter
-    but to a complete value after all-reduce. These are explicit alternatives,
-    not an assumption that an arbitrary operation commutes with reduction.
+    Fields:
+        apply: Callable(tensor) returning the transformed contribution.
+        before_reduce_scatter: Permit this operation on a partial before
+            reduce-scatter. Otherwise the transform follows completion.
+
+    This explicitly preserves an implementation's order; it does not imply
+    that arbitrary transforms commute with reduction or floating-point rounding.
     """
 
     apply: Callable[[torch.Tensor], torch.Tensor]
@@ -34,10 +38,18 @@ class OutputTransform(msgspec.Struct, frozen=True):
 
 
 class UnreducedOutput(msgspec.Struct, frozen=True):
-    """A layer output that still owes its sum, left for the next layer's input.
-    Hand it to the next layer, or pass it through reduce_output() before reading
-    it any other way. The producer says what is owed: one all-reduce over
-    ``group`` that keeps the layout, or ``reduce_and_redistribute``."""
+    """Internal adapter value describing an unfinished reduction.
+
+    Fields:
+        partial: Tensor containing this rank's contribution to the sum.
+        group: All-reduce group when no redistribution callable is supplied.
+        reduce_and_redistribute: Callable(partial) completing the sum and moving
+            it to destination rows; takes precedence over group.
+
+    Exits hand this form to ResidualStream.leave(), which exposes an opaque
+    OwedOutput to models. Low-level adapters use reduce_output() before reading
+    it. A group is required when reduce_and_redistribute is absent.
+    """
 
     partial: torch.Tensor
     group: Optional[GroupCoordinator] = None

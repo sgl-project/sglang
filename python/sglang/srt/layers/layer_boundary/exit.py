@@ -379,9 +379,18 @@ def _can_defer_ffn_reduction(forward_batch: ForwardBatch, boundary=None) -> bool
 
 
 class FfnCompletion(msgspec.Struct, frozen=True):
-    """One FFN's reduction decision. The flags are published while the FFN runs;
-    ``complete(hidden_states, residual)`` then either wraps the output for the
-    next layer's input to complete, or runs this layer's postprocess step."""
+    """One decision shared by compute flags and the matching output completion.
+
+    Fields:
+        defer_moe_finalize: Compute may return a producer-specific finalize handoff.
+        fuse_mlp_allreduce: Compute skips its all-reduce; completion runs it later
+            or carries it to the next consumer, whether fused there or unfused.
+        mlp_reduce_scatter: Compute leaves reduction to the selected scatter path.
+        complete: Callable(output, residual) returning the completed or wrapped
+            output and its corresponding residual rows.
+
+    Do not independently reselect completion after compute has used these flags.
+    """
 
     defer_moe_finalize: bool
     fuse_mlp_allreduce: bool
@@ -454,9 +463,22 @@ class MixerExit:
 
 
 class FfnExit:
-    """The scope that publishes an FfnCompletion while the FFN runs: inside the
-    ``with`` block it is ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` /
-    ``defer_moe_finalize`` on ``get_forward()``."""
+    """Scope a selected FFN output decision and retain its completion action.
+
+    Args:
+        boundary: OutputBoundary that owns the producer's bound paths.
+        forward_batch: Batch selecting reduction/finalize eligibility.
+        stream: This invocation's residual stream, updated by finish().
+
+    Fields:
+        boundary: The owning output boundary.
+        defer_moe_finalize: Whether compute may return a finalize handoff.
+        fuse_mlp_allreduce: Whether compute leaves its all-reduce to completion.
+        mlp_reduce_scatter: Whether compute leaves reduction to a scatter path.
+
+    The three flags are published on get_forward() only inside the context.
+    finish(output) uses the same selected action after successful compute.
+    """
 
     __slots__ = (
         "boundary",

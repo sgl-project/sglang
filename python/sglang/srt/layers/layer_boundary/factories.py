@@ -186,11 +186,31 @@ def _ffn_decl(
 
 @dataclass(frozen=True)
 class StageDeclaration:
-    """A computation and its input source, without an execution plan.
+    """Describe one computation's boundaries without binding kernels or norms.
 
-    ``previous`` consumes a producer's output. ``prepared_from`` reuses an
-    already-read input for a branch; the two sources are mutually exclusive.
-    Sources may be reconstructed locally, including across pipeline ranks.
+    Fields:
+        kind: Selects attention/mixer or FFN boundary adapters; does not run
+            the corresponding computation.
+        read: Consumer operation that derives compute input from the residual.
+        update: Producer operation that writes compute output into the residual.
+        sparse: Whether this FFN is a MoE; used to resolve input/output rows.
+            Expert routing and all-to-all remain inside the MoE computation.
+        terminal: Whether this stage ends the model's layer stack. Prevents
+            leaving work that requires a following layer.
+        output_transform: Optional operation on the FFN contribution before
+            residual update, with an explicit reduction-order contract.
+        reduction: Whether compute always leaves a partial sum, obeys the
+            exit scope, or adds a replicated component after its own sum.
+        gathers_tp_input: Whether attention gathers TP-sharded input itself.
+        dense_tp_size: Dense FFN compute width: None uses the configured width,
+            1 means local compute, and the full TP size means TP compute.
+        handoff_rows: Required FFN output rows at the layer or branch handoff.
+        previous: Declaration whose output this stage consumes. It may be
+            reconstructed locally, including across pipeline ranks.
+        prepared_from: Declaration whose already-read input a branch reuses.
+            Mutually exclusive with previous; avoids a second update/read.
+
+    Sources contain declarations, never executable boundary objects.
     """
 
     kind: StageKind
@@ -217,10 +237,16 @@ class StageDeclaration:
 
 @dataclass(frozen=True)
 class StageConnection:
-    """The producer's exit and consumer's entry for each batch variant.
+    """Immutable, norm-free contracts for the two sides of a connection.
 
-    Immutable, norm-free declarations. Independently constructed equivalent
-    connections work across pipeline partitions; object identity is irrelevant.
+    Fields:
+        producer: Source declaration, or None at stack entry.
+        consumer: Destination declaration, or None at a layer/stack handoff.
+        exits: Producer-side EdgeDecl for each supported BatchVariant.
+        entries: Consumer-side EdgeDecl for each supported BatchVariant.
+
+    Equivalent declarations can be reconstructed across pipeline partitions;
+    adjacent layers need not share the same connection object.
     """
 
     producer: Optional[StageDeclaration]
@@ -243,6 +269,21 @@ def declare_attn(
     reduction=ProducerReduction.PARTIAL,
     gathers_tp_input=True,
 ):
+    """Declare attention or a mixer; construct its executable boundary later.
+
+    Args:
+        previous: Producer declaration whose output this stage consumes.
+        prepared_from: Source of an already-read branch input, instead of previous.
+        read: Input operation; defaults to normalization with quantization support.
+        update: Operation that adds this stage's output to the residual.
+        terminal: Whether this stage ends the model's layer stack.
+        reduction: PARTIAL for an output projection that always skips reduction;
+            SCOPED for a mixer that follows its exit scope's reduction decision.
+        gathers_tp_input: Whether compute gathers attention-TP input slices itself.
+
+    Returns:
+        A StageDeclaration with no norm, tensors or execution plan.
+    """
     if reduction is ProducerReduction.LOCAL_TAIL:
         raise ValueError("LOCAL_TAIL is not supported for attention stages")
     return StageDeclaration(
@@ -271,6 +312,27 @@ def declare_ffn(
     reduction=ProducerReduction.SCOPED,
     handoff_rows=None,
 ):
+    """Declare a dense or MoE FFN independently of its compute module.
+
+    Args:
+        previous: Producer declaration whose output this stage consumes.
+        prepared_from: Source of an already-read branch input, instead of previous.
+        sparse: Whether the FFN is a MoE; EP dispatch stays inside compute.
+        read: Operation deriving FFN input from the residual.
+        update: Operation writing FFN output into the residual.
+        terminal: Whether this stage ends the model's layer stack.
+        output_transform: Optional contribution transform before residual update.
+        next_sparse: Whether the next decoder layer's FFN is sparse; used only
+            to derive the TBO handoff when handoff_rows is not supplied.
+        dense_tp_size: Dense compute width: None for configuration, 1 for local
+            compute, or the full TP size.
+        reduction: How compute cooperates with the exit's reduction decision.
+        handoff_rows: Explicit output-row requirement; otherwise derived from
+            the adjacent FFN kinds and TBO configuration.
+
+    Returns:
+        A StageDeclaration with no norm, tensors or execution plan.
+    """
     if reduction is ProducerReduction.PARTIAL:
         raise ValueError("PARTIAL is not supported for ffn stages")
     return StageDeclaration(
@@ -522,11 +584,20 @@ def make_attn_stage(
     qkv_latent_func=None,
     fusions=None,
 ):
-    """Resolve this attention's boundaries, then bind its norm and hooks.
+    """Resolve one attention/mixer's boundaries and bind its input norm.
 
-    ``following`` supplies the consumer declaration for a stage inside a
-    layer. With no following stage, the output is handed across a layer or
-    stack boundary; the receiver binds its own read independently.
+    Args:
+        declaration: Attention StageDeclaration, including its input source.
+        norm: This consumer's normalization module, never its neighbour's norm.
+        following: Local consumer declaration whose previous is declaration.
+            None leaves a layer/stack handoff for an independently bound reader.
+        qkv_latent_func: Optional attention input hook, invoked after preparation
+            and movement onto the compute input rows.
+        fusions: Optional backend provider of ordered attention_input(plan) and
+            ffn_input(plan) candidates and can_defer_finalize(plan, batch) policy.
+
+    Returns:
+        A StageBoundary with precomputed paths for supported batch variants.
     """
     if declaration.kind is not StageKind.ATTENTION:
         raise TypeError("make_attn_stage requires an attention declaration")
@@ -548,7 +619,18 @@ def make_ffn_stage(
     following: Optional[StageDeclaration] = None,
     fusions=None,
 ):
-    """Resolve this FFN's boundaries and bind its norm; EP stays inside compute."""
+    """Resolve one FFN's boundaries and bind its input norm.
+
+    Args:
+        declaration: FFN StageDeclaration, including its input source.
+        norm: This FFN's input normalization module.
+        following: Local consumer declaration whose previous is declaration;
+            None leaves a layer/stack handoff for an independently bound reader.
+        fusions: Optional backend fusion provider, as in make_attn_stage.
+
+    Returns:
+        A StageBoundary. Expert routing and all-to-all stay inside compute.
+    """
     if declaration.kind is not StageKind.FFN:
         raise TypeError("make_ffn_stage requires an FFN declaration")
     incoming, outgoing = _connections(declaration, following)
@@ -564,18 +646,23 @@ def make_ffn_stage(
 def make_stages(
     *stages, previous=None, prepared_from=None, following=None, terminal=False
 ):
-    """Bind a local linear sequence and return its independent boundaries.
+    """Bind a local linear sequence of any positive number of stages.
 
-    Each item is ``(declaration, norm)`` or ``(declaration, norm, options)``.
-    Options are the stage-specific keyword arguments of ``make_attn_stage``
-    or ``make_ffn_stage``; they are consumed only during construction.
-    Declarations in the sequence have no input source: this function connects
-    them in order. Only the final boundary is terminal when requested.
+    Args:
+        *stages: Items of (declaration, norm) or (declaration, norm, options).
+            Declarations must have no source or terminal flag. Options are
+            constructor keywords: fusions, and qkv_latent_func for attention.
+        previous: External producer declaration consumed by the first stage.
+        prepared_from: Already-read input declaration reused by the first stage
+            of a branch; mutually exclusive with previous.
+        following: External consumer declaration after the last local stage.
+            None denotes a layer/stack handoff with an independently bound read.
+        terminal: Marks only the final stage as the end of the model's stack.
 
-    ``previous`` describes an external producer's output. ``prepared_from``
-    describes an already-read branch input, obtainable from the source
-    boundary's immutable ``declaration``. Neither takes an executable boundary.
-    No sequence object or runtime routing is retained.
+    Returns:
+        A tuple of independent StageBoundary objects in declaration order.
+        Sources are connected on copied declarations; caller inputs are unchanged.
+        No sequence object or runtime routing is retained.
     """
     if not stages:
         raise ValueError("make_stages needs at least one stage")

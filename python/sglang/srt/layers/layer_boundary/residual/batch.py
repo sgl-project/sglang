@@ -19,6 +19,11 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 def start(forward_batch):
+    """Reset forward_batch.residual_stream at entry to a fresh layer-stack call.
+
+    Call once before the first local stage on an embedding path, not per layer.
+    Pipeline reception and TBO adapters reconstruct their own streams.
+    """
     forward_batch.residual_stream = ResidualStream()
 
 
@@ -54,6 +59,23 @@ def norm(
     skip_empty=False,
     **read_kwargs,
 ):
+    """Complete the layer stack and apply its terminal normalization.
+
+    Args:
+        hidden_states: Current stream output or opaque owed handle.
+        forward_batch: Batch owning the residual stream.
+        layernorm: Final norm supporting the model's output/residual pair.
+        capture_output: Optional callback retaining the same updated residual;
+            it must copy borrowed storage when retention requires ownership.
+        handoff_norm: Optional adapter with finalize(handoff, residual, gamma)
+            for a producer-specific finalize handoff; cannot be combined with capture.
+        skip_empty: Skip the ordinary norm on a zero-row completed output.
+        **read_kwargs: Extra arguments forwarded to the two-input final norm.
+
+    Returns:
+        Normalized tensor. Add and norm remain together to preserve the kernel's
+        accumulation/rounding order; a snapshot is not used as the norm input.
+    """
     hidden_states, residual = current(forward_batch).finish(
         hidden_states, takes_handoff=handoff_norm is not None
     )
@@ -81,6 +103,16 @@ def norm(
 
 
 def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
+    """Export hidden_states and residual as PPProxyTensors.
+
+    Args:
+        hidden_states: Current stream output or opaque owed handle.
+        forward_batch: Batch owning the stream.
+        preserve_declared: Keep a statically declared partial unreduced only
+            when the receiver reconstructs that same sum in from_pp (the default).
+
+    Runtime-selected completion work is finished before transport.
+    """
     hidden_states, residual = current(forward_batch).finish(
         hidden_states, preserve_declared=preserve_declared
     )
