@@ -7,6 +7,7 @@ import triton.language as tl
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -108,9 +109,13 @@ def dequantize_k_cache_paged_v41(
     """
     layout = KVLayout.parse(layout)
     assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
-    if is_hip_runtime() or get_jit_cuda_arch().major < 10:
+    if is_hip_runtime():
+        supported = is_gfx95_supported()
+    else:
+        supported = get_jit_cuda_arch().major >= 10
+    if not supported:
         raise RuntimeError(
-            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer"
+            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer, or gfx950"
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
@@ -153,6 +158,7 @@ def dequantize_k_cache_paged_v41(
         SCALE_BYTES=layout.scale_bytes,
         TILE_SIZE=layout.tile_size,
         S_OFFSET_BYTES=layout.scale_offset(page_size),
+        IS_HIP=is_hip_runtime(),
     )
     return out
 
@@ -368,6 +374,18 @@ def _e2m1_code_to_fp32(code):
 
 
 @triton.jit
+def _v41_dequant_to_bf16(value, IS_HIP: tl.constexpr):
+    result = value.to(tl.bfloat16)
+    if IS_HIP:
+        # HIP conversion can produce negative NaNs; match the torch format
+        # reference's canonical positive BF16 NaN without changing finite bits.
+        bits = result.to(tl.uint16, bitcast=True)
+        bits = tl.where((bits & 0x7FFF) > 0x7F80, 0x7FC0, bits).to(tl.uint16)
+        result = bits.to(tl.bfloat16, bitcast=True)
+    return result
+
+
+@triton.jit
 def _dequantize_k_cache_paged_v41_fp8_kernel(
     output_ptr,
     buf_fp8_ptr,
@@ -380,6 +398,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    IS_HIP: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
@@ -397,7 +416,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     out = vals * _ue8m0_to_fp32(scale_u8)
     tl.store(
         output_ptr + token_id * output_stride_0 + offs,
-        out.to(output_ptr.dtype.element_ty),
+        _v41_dequant_to_bf16(out, IS_HIP),
     )
 
 
@@ -414,6 +433,7 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    IS_HIP: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
     # then 32 e4m3 scales (one per 16 values).
@@ -435,8 +455,8 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     lo = _e2m1_code_to_fp32(packed & 0xF) * scale
     hi = _e2m1_code_to_fp32(packed >> 4) * scale
     out_base = output_ptr + token_id * output_stride_0
-    tl.store(out_base + 2 * boffs, lo.to(output_ptr.dtype.element_ty))
-    tl.store(out_base + 2 * boffs + 1, hi.to(output_ptr.dtype.element_ty))
+    tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
+    tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
 
 
 @triton.jit
