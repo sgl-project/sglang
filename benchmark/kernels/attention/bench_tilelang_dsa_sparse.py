@@ -1,8 +1,8 @@
-"""Benchmark gfx950 TileLang DSA sparse attention at GLM-5.3 production shapes.
+"""Benchmark gfx950 DSA sparse attention at GLM-5.3 production shapes.
 
 Example:
   python benchmark/kernels/attention/bench_tilelang_dsa_sparse.py \
-    --block-i 64 --inner-iter 33 --threads 256 --num-stages 1
+    --candidate-backend triton
 """
 
 import argparse
@@ -81,6 +81,7 @@ def _run_cell(
     warmup: int,
     repeats: int,
     index_pattern: str,
+    backend: str,
 ):
     q = torch.randn((m, HEADS, DIM), device="cuda", dtype=torch.bfloat16) * 0.01
     if index_pattern == "shared":
@@ -94,6 +95,30 @@ def _run_cell(
             0, KV_LEN, (m, 1, TOPK), device="cuda", dtype=torch.int32
         )
     indices[..., LIVE_TOPK:] = -1
+    if backend == "triton":
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            triton_sparse_mla_fwd,
+        )
+
+        def run_complete():
+            return triton_sparse_mla_fwd(
+                q,
+                q[..., DIM:],
+                kv,
+                indices,
+                1.0 / math.sqrt(256),
+                d_v=DIM,
+            )
+
+        actual = run_complete()
+        torch.cuda.synchronize()
+        complete_ms = _time_ms(run_complete, warmup, repeats)
+        return actual, {
+            "backend": backend,
+            "m": m,
+            "complete_ms": complete_ms,
+        }
+
     q4 = q.unsqueeze(0)
     kv4 = kv.unsqueeze(0)
     indices4 = indices.unsqueeze(0)
@@ -108,8 +133,7 @@ def _run_cell(
         return combine(partial_o, partial_lse)
 
     def run_complete():
-        po, pl = run_partial()
-        return combine(po, pl)
+        return combine(*run_partial())
 
     actual = run_combine()
     torch.cuda.synchronize()
@@ -117,6 +141,7 @@ def _run_cell(
     combine_ms = _time_ms(run_combine, warmup, repeats)
     complete_ms = _time_ms(run_complete, warmup, repeats)
     return actual, {
+        "backend": backend,
         "m": m,
         "block_i": block_i,
         "inner_iter": inner_iter,
@@ -131,10 +156,13 @@ def _run_cell(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--block-i", type=int, required=True)
-    parser.add_argument("--inner-iter", type=int, required=True)
-    parser.add_argument("--threads", type=int, required=True)
-    parser.add_argument("--num-stages", type=int, required=True)
+    parser.add_argument(
+        "--candidate-backend", choices=("tilelang", "triton"), default="tilelang"
+    )
+    parser.add_argument("--block-i", type=int, default=64)
+    parser.add_argument("--inner-iter", type=int, default=33)
+    parser.add_argument("--threads", type=int, default=256)
+    parser.add_argument("--num-stages", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument(
@@ -156,6 +184,7 @@ def main():
             args.warmup,
             args.repeats,
             args.index_pattern,
+            "tilelang",
         )
         torch.manual_seed(20260928 + m)
         candidate, candidate_row = _run_cell(
@@ -168,6 +197,7 @@ def main():
             args.warmup,
             args.repeats,
             args.index_pattern,
+            args.candidate_backend,
         )
         delta = candidate.float() - baseline.float()
         candidate_row.update(

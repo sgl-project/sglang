@@ -1,4 +1,4 @@
-"""DSA packed-cache and HIP TileLang kernels must accept GLM's 256+0 geometry without changing 512+64."""
+"""DSA sparse kernels must accept GLM's zero-RoPE geometry."""
 
 import math
 import unittest
@@ -192,6 +192,88 @@ class TestTileLangDSAZeroRope(CustomTestCase):
                 self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
                 del q, indices, actual
                 empty_gpu_cache()
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    "the GLM-5.3 Triton specialization is enabled only on gfx950",
+)
+class TestTritonDSAZeroRope(CustomTestCase):
+    @staticmethod
+    def _run(q, kv, indices):
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            triton_sparse_mla_fwd,
+        )
+
+        return triton_sparse_mla_fwd(
+            q,
+            q[..., 512:],
+            kv,
+            indices,
+            1.0 / math.sqrt(256),
+            d_v=512,
+        )
+
+    def test_glm53_matches_torch_with_duplicates_and_padding(self):
+        q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(tokens=17)
+        expected = _torch_sparse_attention(
+            q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+        )
+        actual = self._run(q, kv, indices).squeeze(0)
+        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+        repeated = self._run(q, kv, indices).squeeze(0)
+        torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    def test_glm53_all_masked_rows_are_finite_zeros(self):
+        q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(tokens=1, all_masked=True)
+        actual = self._run(q, kv, indices)
+        self.assertTrue(torch.isfinite(actual).all())
+        self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+
+    def test_glm53_cuda_graph_replay(self):
+        q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(tokens=17)
+        eager = self._run(q, kv, indices)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = self._run(q, kv, indices)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+
+    def test_glm53_production_grids_are_finite(self):
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
+        base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        base_indices[2051:] = -1
+        for tokens in (8192, 16384):
+            with self.subTest(tokens=tokens):
+                q = torch.zeros(tokens, 16, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                actual = self._run(q, kv, indices)
+                self.assertEqual(actual.shape, (1, tokens, 16, 512))
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+                del q, indices, actual
+                empty_gpu_cache()
+
+    def test_glm53_dispatch_gate_is_exact(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            _use_glm53_triton_sparse_prefill,
+        )
+
+        q = torch.empty(8192, 16, 512, device="meta", dtype=torch.bfloat16)
+        kv = torch.empty(13_299_712, 1, 512, device="meta", dtype=torch.bfloat16)
+        indices = torch.empty(8192, 2112, device="meta", dtype=torch.int32)
+        self.assertTrue(_use_glm53_triton_sparse_prefill(q, kv, indices, 512))
+        self.assertFalse(
+            _use_glm53_triton_sparse_prefill(q[:4096], kv, indices[:4096], 512)
+        )
+        self.assertFalse(
+            _use_glm53_triton_sparse_prefill(q, kv, indices[:, :2048], 512)
+        )
+        self.assertFalse(_use_glm53_triton_sparse_prefill(q.float(), kv, indices, 512))
 
 
 if __name__ == "__main__":

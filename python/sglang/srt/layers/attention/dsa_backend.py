@@ -96,6 +96,27 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
 
+
+def _use_glm53_triton_sparse_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    d_v: int,
+) -> bool:
+    """Use the validated Triton kernel only for the profiled GLM-5.3 cells."""
+    return (
+        _IS_GFX95
+        and q.dtype == torch.bfloat16
+        and kv.dtype == torch.bfloat16
+        and q.ndim == 3
+        and q.shape[0] in (8192, 16384)
+        and q.shape[1:] == (16, 512)
+        and kv.shape[-1] == 512
+        and indices.shape[-1] == 2112
+        and d_v == 512
+    )
+
+
 if is_cuda():
     import deep_gemm
 
@@ -3074,6 +3095,20 @@ class DeepseekSparseAttnBackend(
                     page_table_1.new_full((*page_table_1.shape[:-1], padding), -1),
                 ),
                 dim=-1,
+            )
+
+        if _use_glm53_triton_sparse_prefill(q_all, kv_cache, page_table_1, v_head_dim):
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            return triton_sparse_mla_fwd(
+                q_nope=q_all,
+                q_rope=q_all[..., v_head_dim:],
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
             )
 
         return tilelang_sparse_fwd(
