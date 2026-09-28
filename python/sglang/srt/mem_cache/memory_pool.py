@@ -2117,6 +2117,15 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
             return
 
+        # The tiled copy moves `data_strides[i]` bytes per slot, so it is only
+        # correct on dense slot rows; on a strided view it would copy past the
+        # row into the neighbouring slot.
+        for buf in self._slot_move_pointer_buffers():
+            assert buf.stride(0) == math.prod(buf.shape[1:]), (
+                "the tiled KV copy needs dense slot rows (slot stride == row "
+                f"width); got shape {tuple(buf.shape)}, strides {buf.stride()}"
+            )
+
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096

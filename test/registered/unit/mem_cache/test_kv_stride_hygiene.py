@@ -17,8 +17,9 @@ A per-layer KV buffer may be a strided view into a larger buffer (slot stride
 larger than ``head_num * head_dim``). Every helper that computes a slot address
 must then use ``stride(0)``; deriving it from ``prod(shape[1:])`` silently
 addresses the wrong slot, and ``.contiguous()`` silently snapshots instead of
-aliasing the live pool. These tests pin the stride-derived behaviour on views
-that differ from contiguous buffers.
+aliasing the live pool. A kernel that uses the slot stride as its copy width
+(the tiled slot move) must refuse such views instead. These tests pin the
+stride-derived behaviour on views that differ from contiguous buffers.
 
 CPU-only.
 
@@ -109,21 +110,26 @@ class TestMakeRowSourceAliases(unittest.TestCase):
             make_row_source(layer_buffer=layer, read_bytes=16)
 
 
+def _strided_mha_pool(L=2, N=5, H=2, D=16, E=2 * (2 * 16) + 64):
+    """An MHA pool whose K and V of every layer share one slot of E elements."""
+    backing = torch.zeros(N * E, dtype=torch.float16)
+    pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    pool.device = "cpu"
+    pool.layer_num = L
+    pool.k_buffer = [
+        backing.as_strided((N, H, D), (E, D, 1), l * 2 * H * D) for l in range(L)
+    ]
+    pool.v_buffer = [
+        backing.as_strided((N, H, D), (E, D, 1), (l * 2 + 1) * H * D) for l in range(L)
+    ]
+    return pool
+
+
 class TestDataStridesFollowViews(unittest.TestCase):
     def test_data_strides_use_stride0(self):
-        # K and V of both layers share one slot of E elements.
-        L, N, H, D, E = 2, 5, 2, 16, 2 * (2 * 16) + 64
+        L, H, D, E = 2, 2, 16, 2 * (2 * 16) + 64
         itemsize = 2
-        backing = torch.zeros(N * E, dtype=torch.float16)
-        pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        pool.device = "cpu"
-        pool.k_buffer = [
-            backing.as_strided((N, H, D), (E, D, 1), l * 2 * H * D) for l in range(L)
-        ]
-        pool.v_buffer = [
-            backing.as_strided((N, H, D), (E, D, 1), (l * 2 + 1) * H * D)
-            for l in range(L)
-        ]
+        pool = _strided_mha_pool(L=L, H=H, D=D, E=E)
         pool._init_data_ptrs_and_strides()
         self.assertEqual(pool.data_strides.tolist(), [E * itemsize] * (2 * L))
         self.assertNotEqual(E * itemsize, H * D * itemsize)
@@ -131,6 +137,14 @@ class TestDataStridesFollowViews(unittest.TestCase):
             pool.data_ptrs.tolist(),
             [x.data_ptr() for x in pool.k_buffer + pool.v_buffer],
         )
+
+    def test_tiled_kv_copy_refuses_strided_views(self):
+        # The tiled copy moves one slot stride of bytes per slot: on these views
+        # that is a whole entry, which would spill into the neighbouring slot.
+        pool = _strided_mha_pool()
+        pool._init_data_ptrs_and_strides()
+        with self.assertRaisesRegex(AssertionError, "dense slot rows"):
+            pool._init_kv_copy_and_warmup()
 
 
 if __name__ == "__main__":
