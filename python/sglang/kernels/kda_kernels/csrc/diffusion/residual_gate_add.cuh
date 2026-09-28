@@ -1,4 +1,4 @@
-// KDA provenance: BBuf/KDA-Pilot, merged in SGLang PR #29361.
+// KDA provenance: SGLang PR #29361.
 // CUDA fast path for bit-exact diffusion residual-gate updates:
 //   out = residual + update * gate
 

@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=6500,
-    suite="nightly-acc-2-npu-a3",
+    suite="full-acc-2-npu-a3",
     nightly=True,
 )
 
@@ -40,7 +40,7 @@ OTHER_ARGS = [
     "--trust-remote-code",
     "--mem-fraction-static",
     0.75,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

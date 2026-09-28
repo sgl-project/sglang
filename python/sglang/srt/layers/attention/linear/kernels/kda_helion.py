@@ -20,6 +20,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
     """
 
     supports_packed_decode = True
+    supports_track_state_snapshot: bool = True
 
     def __init__(
         self,
@@ -188,4 +189,6 @@ class HelionKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
         )

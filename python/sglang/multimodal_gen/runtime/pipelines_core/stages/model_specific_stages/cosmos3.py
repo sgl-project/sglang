@@ -1063,6 +1063,11 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
 
 
 class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /

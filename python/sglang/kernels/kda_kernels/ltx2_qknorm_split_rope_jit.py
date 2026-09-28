@@ -13,14 +13,15 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_ltx2_qknorm_split_rope_module() -> Module:
+def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Module:
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
         cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
-                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run",
+                "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run"
+                f"<{str(round_intermediates).lower()}>",
             )
         ],
     )
@@ -38,6 +39,7 @@ def _fake_impl(
     eps: float,
     num_heads: int,
     head_dim: int,
+    round_intermediates: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(q, dtype=torch.bfloat16), torch.empty_like(
         k, dtype=torch.bfloat16
@@ -61,10 +63,11 @@ def _ltx2_qknorm_split_rope_custom_op(
     eps: float,
     num_heads: int,
     head_dim: int,
+    round_intermediates: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q_out = torch.empty_like(q, dtype=torch.bfloat16)
     k_out = torch.empty_like(k, dtype=torch.bfloat16)
-    module = _jit_ltx2_qknorm_split_rope_module()
+    module = _jit_ltx2_qknorm_split_rope_module(round_intermediates)
     module.ltx2_qknorm_split_rope_pair(
         q_out,
         k_out,
@@ -130,6 +133,15 @@ def _is_sm100_or_newer(x: torch.Tensor) -> bool:
         return False
 
 
+def _is_sm90(x: torch.Tensor) -> bool:
+    if not x.is_cuda or torch.version.hip is not None:
+        return False
+    try:
+        return torch.cuda.get_device_capability(x.device) == (9, 0)
+    except RuntimeError:
+        return False
+
+
 def can_use_ltx2_qknorm_split_rope_cuda(
     q: torch.Tensor,
     q_cos: torch.Tensor,
@@ -142,9 +154,10 @@ def can_use_ltx2_qknorm_split_rope_cuda(
     *,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool = False,
 ) -> bool:
     return (
-        _is_sm100_or_newer(q)
+        (_is_sm100_or_newer(q) or (allow_sm90 and _is_sm90(q)))
         and _supported_side(
             q,
             q_cos,
@@ -177,6 +190,7 @@ def ltx2_qknorm_split_rope_cuda(
     eps: float,
     num_heads: int,
     head_dim: int,
+    allow_sm90: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not can_use_ltx2_qknorm_split_rope_cuda(
         q,
@@ -189,6 +203,7 @@ def ltx2_qknorm_split_rope_cuda(
         k_weight,
         num_heads=num_heads,
         head_dim=head_dim,
+        allow_sm90=allow_sm90,
     ):
         raise RuntimeError("unsupported input for LTX2 QKNorm split-RoPE CUDA")
     return _ltx2_qknorm_split_rope_custom_op(
@@ -203,4 +218,5 @@ def ltx2_qknorm_split_rope_cuda(
         float(eps),
         int(num_heads),
         int(head_dim),
+        round_intermediates=allow_sm90 and _is_sm90(q),
     )

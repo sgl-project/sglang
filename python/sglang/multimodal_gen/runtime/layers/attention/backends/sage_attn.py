@@ -10,26 +10,12 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-def _trailing_padding_used_len(
-    *,
-    total_tokens: int,
-    max_seqlen: int,
-    bounds: tuple[int, ...],
-) -> int | None:
-    """Return live token count for H3-style [0, used, total] trailing padding."""
-    if len(bounds) != 3:
-        return None
-    start, used, total = bounds
-    if start != 0 or used >= total or total != total_tokens or used != max_seqlen:
-        return None
-    return used
 
 
 class SageAttentionBackend(AttentionBackend):
@@ -66,6 +52,9 @@ class SageAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
 
     def forward(
         self,
@@ -125,10 +114,14 @@ class SageAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         # MiniMax-H3 packs one live document as bounds=(0, used, total):
         # [0, used) are real tokens; [used, total) is 64-aligned tail padding.
-        used = _trailing_padding_used_len(
-            total_tokens=query.shape[0],
-            max_seqlen=max_seqlen,
-            bounds=bounds,
+        used = (
+            trailing_padding_used_len(
+                total_tokens=query.shape[0],
+                max_seqlen=max_seqlen,
+                bounds=bounds,
+            )
+            if self.packed_trailing_padding
+            else None
         )
         if used is not None:
             live_out = self.forward(
