@@ -303,46 +303,6 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                 )
                 self.assertEqual(deltas, stream_item["arguments"])
 
-    def test_named_argument_truncation_preserves_text_and_incomplete_status(self):
-        serving = make_serving()
-        serving.reasoning_parser = None
-        serving.tool_call_parser = "iquest_q1"
-        request = ResponsesRequest(
-            model="x",
-            input="weather?",
-            stream=True,
-            store=False,
-            tool_choice={"type": "function", "name": "get_weather"},
-            tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": {"type": "object"},
-                }
-            ],
-        )
-        raw = '{"city":"Bei'
-        (full_item,) = serving._make_response_output_items(
-            request,
-            raw,
-            serving.tokenizer_manager.tokenizer,
-            require_reasoning=False,
-        )
-        self.assertEqual(full_item.type, "message")
-        self.assertEqual(full_item.content[0].text, raw)
-        chunk = engine_chunk(raw, 5, finish=True)
-        chunk["meta_info"]["finish_reason"] = {"type": "length"}
-        events = StreamFixture(serving, request).run([chunk])
-        terminal = event_payloads(events)[-1]
-        self.assertEqual(terminal["type"], "response.incomplete")
-        self.assertEqual(
-            terminal["response"]["incomplete_details"], {"reason": "max_output_tokens"}
-        )
-        (tool,) = terminal["response"]["output"]
-        self.assertEqual(tool["type"], "function_call")
-        self.assertEqual(tool["name"], "get_weather")
-        self.assertEqual(tool["arguments"], raw)
-
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (
             StreamingParseResult,

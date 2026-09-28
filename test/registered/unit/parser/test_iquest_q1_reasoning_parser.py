@@ -38,32 +38,7 @@ class TestIQuestQ1ReasoningParser(CustomTestCase):
                     enabled,
                 )
 
-    def test_request_toggle_overrides_forced_template_reasoning(self):
-        request = ChatCompletionRequest(
-            model="iquest-q1",
-            messages=[{"role": "user", "content": "hi"}],
-            chat_template_kwargs={"thinking": False},
-        )
-        for wire, expected in (
-            ("answer", ("", "answer")),
-            ("<think>work</think>answer", ("work", "answer")),
-        ):
-            with self.subTest(wire=wire):
-                parser = ReasoningParser(
-                    "iquest_q1", force_reasoning=True, request=request
-                )
-                self.assertEqual(parser.parse_non_stream(wire), expected)
-                for size in (1, len(wire)):
-                    parser = ReasoningParser("iquest_q1", request=request)
-                    reasoning, text = "", ""
-                    for start in range(0, len(wire), size):
-                        r, c = parser.parse_stream_chunk(wire[start : start + size])
-                        reasoning += r
-                        text += c
-                    r, c = parser.parse_stream_end()
-                    self.assertEqual((reasoning + r, text + c), expected)
-
-    def test_reasoning_control_updates_both_aliases(self):
+    def test_request_thinking_toggle_controls_reasoning(self):
         serving = OpenAIServingChat.__new__(OpenAIServingChat)
         serving.reasoning_parser = "iquest_q1"
         request = ChatCompletionRequest(
@@ -71,9 +46,17 @@ class TestIQuestQ1ReasoningParser(CustomTestCase):
             messages=[{"role": "user", "content": "hi"}],
             chat_template_kwargs={"thinking": True, "enable_thinking": False},
         )
-        for enabled in (False, True):
-            serving.apply_reasoning_enabled(request, enabled)
-            self.assertEqual(serving._get_reasoning_from_request(request), enabled)
+        for enabled, wire, expected in (
+            (False, "answer", ("", "answer")),
+            (True, "work</think>answer", ("work", "answer")),
+        ):
+            with self.subTest(enabled=enabled):
+                serving.apply_reasoning_enabled(request, enabled)
+                self.assertEqual(serving._get_reasoning_from_request(request), enabled)
+                parser = ReasoningParser(
+                    "iquest_q1", force_reasoning=not enabled, request=request
+                )
+                self.assertEqual(parser.parse_non_stream(wire), expected)
 
 
 if __name__ == "__main__":

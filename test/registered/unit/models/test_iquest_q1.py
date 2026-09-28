@@ -90,14 +90,10 @@ class TestIQuestQ1WeightLoading(CustomTestCase):
                 loaded_shards={name: {"q"}},
                 quant_config=Fp8Config(),
             )
-
-    def test_skip_weight_check_applies_without_a_scale_suffix(self):
-        from sglang.srt.models.iquest_q1 import check_all_params_loaded
-
-        param = torch.nn.Parameter(torch.zeros(1))
-        param._skip_weight_check = True
+        generated = torch.nn.Parameter(torch.zeros(1))
+        generated._skip_weight_check = True
         check_all_params_loaded(
-            {"generated_parameter": param}, set(), "IQuestQ1ForCausalLM"
+            {"generated_parameter": generated}, set(), "IQuestQ1ForCausalLM"
         )
 
     def test_target_fused_loaders_require_every_checkpoint_shard(self):

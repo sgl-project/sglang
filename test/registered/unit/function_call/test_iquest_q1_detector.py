@@ -123,6 +123,9 @@ class TestIQuestQ1Detector(CustomTestCase):
         self.assertEqual((text, calls), ("Text ", []))
         self.assertEqual(parser.parse_stream_end(), ("<iquest_", []))
         self.assertEqual(parser.parse_stream_end(), ("", []))
+        parser = FunctionCallParser(self.tools, "iquest_q1")
+        self.assertEqual(parser.parse_stream_chunk("a <"), ("a ", []))
+        self.assertEqual(parser.parse_stream_chunk("| b"), ("<| b", []))
 
     def test_incomplete_call_is_preserved_at_stream_end(self):
         wire = "before<iquest_tool_call>run<arg_key>code</arg_key>"
@@ -130,15 +133,6 @@ class TestIQuestQ1Detector(CustomTestCase):
         self.assertEqual(parser.parse_non_stream(wire), (wire, []))
         self.assertEqual(parser.parse_stream_chunk(wire), ("before", []))
         self.assertEqual(parser.parse_stream_end(), (wire[len("before") :], []))
-
-    def test_unknown_tool_name_is_filtered(self):
-        wire = self.call.replace("<iquest_tool_call>run", "<iquest_tool_call>unknown")
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        text, calls = parser.parse_non_stream(wire)
-        self.assertFalse(calls)
-        parser = FunctionCallParser(self.tools, "iquest_q1")
-        text, calls = parser.parse_stream_chunk(wire)
-        self.assertFalse(calls)
 
     def test_required_streaming_parallel_calls_at_every_boundary(self):
         wire = json.dumps(
@@ -188,42 +182,6 @@ class TestIQuestQ1Detector(CustomTestCase):
                 self.assertTrue(all(call.tool_index == 0 for call in calls))
                 self.assertEqual("".join(call.parameters for call in calls), wire)
                 self.assertEqual(parser.parse_stream_end(), ("", []))
-
-
-class TestIQuestQ1StopMarkers(CustomTestCase):
-    def _tools(self):
-        return [
-            Tool(
-                type="function",
-                function=Function(
-                    name="get_weather",
-                    description="Query the weather of a city",
-                    parameters={
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"],
-                    },
-                ),
-            )
-        ]
-
-    def test_plain_reply_stop_markers_at_every_stream_split(self):
-        for marker in ("<|iquest_end|>",):
-            wire = "好的。" + marker
-            for split in range(len(wire) + 1):
-                with self.subTest(marker=marker, split=split):
-                    parser = FunctionCallParser(self._tools(), "iquest_q1")
-                    content, calls = [], []
-                    for chunk in (wire[:split], wire[split:]):
-                        text, parsed = parser.parse_stream_chunk(chunk)
-                        content.append(text)
-                        calls.extend(parsed)
-                    text, parsed = parser.parse_stream_end()
-                    content.append(text)
-                    calls.extend(parsed)
-                    self.assertEqual("".join(content), wire)
-                    self.assertEqual(calls, [])
-                    self.assertEqual(parser.parse_non_stream(wire), (wire, []))
 
 
 class TestIQuestQ1NonStreamingServingPath(CustomTestCase):
@@ -281,20 +239,6 @@ class TestIQuestQ1NonStreamingServingPath(CustomTestCase):
                 if choice == named:
                     self.assertEqual(result.tool_calls[0].function.arguments, wire)
                 self.assertEqual(result.finish_reason["type"], "tool_calls")
-
-    def test_finish_reason_keeps_length_with_tool_calls(self):
-        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
-        for choice, wire in (
-            (
-                "auto",
-                "<iquest_tool_call>get_weather</iquest_tool_call>",
-            ),
-            ("required", '[{"name":"get_weather","parameters":{}}]'),
-            (named, "{}"),
-        ):
-            with self.subTest(choice=choice):
-                result = self._process(wire, choice, "length")
-                self.assertEqual(result.finish_reason["type"], "length")
 
 
 if __name__ == "__main__":

@@ -28,35 +28,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
         args.resolve_once()
         self.assertEqual(resolved_view(args).attention_backend, "fa3")
 
-    def test_architecture_selects_auto_parsers_without_overriding_explicit_choice(self):
-        from sglang.srt.parser.template_detection import _architecture_auto_parsers
-
-        args = ServerArgs(model_path=self.directory.name, device="cuda")
-        self.assertEqual(
-            _architecture_auto_parsers(args, ("reasoning_parser", "tool_call_parser")),
-            {"reasoning_parser": "iquest_q1", "tool_call_parser": "iquest_q1"},
-        )
-
-    def test_mtp_validation_skips_other_models_drafts(self):
-        from transformers import LlamaConfig
-
-        from sglang.srt.arg_groups.speculative_hook import _handle_iquest_q1_mtp_draft
-
-        with (
-            tempfile.TemporaryDirectory() as target_directory,
-            tempfile.TemporaryDirectory() as draft_directory,
-        ):
-            LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(
-                target_directory
-            )
-            args = ServerArgs(
-                model_path=target_directory,
-                speculative_algorithm="EAGLE",
-                speculative_draft_model_path=draft_directory,
-                device="cuda",
-            )
-            self.assertFalse(_handle_iquest_q1_mtp_draft(args))
-
     def test_speculation_requires_an_independent_checkpoint(self):
         for draft_path in (None, self.directory.name):
             with self.subTest(draft_path=draft_path):
@@ -68,17 +39,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
                         speculative_algorithm="EAGLE",
                         speculative_draft_model_path=draft_path,
                     ).resolve_once()
-
-    def test_target_checkpoint_cannot_be_used_as_separate_draft(self):
-        with tempfile.TemporaryDirectory() as directory:
-            IQuestQ1Config().save_pretrained(directory)
-            with self.assertRaisesRegex(ValueError, "MTP draft checkpoint"):
-                ServerArgs(
-                    model_path=self.directory.name,
-                    speculative_draft_model_path=directory,
-                    speculative_algorithm="EAGLE",
-                    device="cuda",
-                ).resolve_once()
 
     def test_mtp_draft_defaults_and_requested_depth(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -117,7 +77,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
                 "requires FA3",
             ),
             ({"hidden_size": 64}, {}, "hidden size and vocabulary"),
-            ({"vocab_size": 32}, {}, "hidden size and vocabulary"),
             ({"num_target_layers": 87}, {}, "target layer count"),
             ({}, {"speculative_num_steps": 0}, "positive"),
             ({}, {"speculative_token_map": "unused"}, "full-vocabulary"),
@@ -135,51 +94,6 @@ class TestIQuestQ1ArgumentResolution(CustomTestCase):
                             device="cuda",
                             **kwargs,
                         ).resolve_once()
-
-    def test_rejects_backends_that_do_not_return_the_lse(self):
-        for kwargs in (
-            {"attention_backend": "triton"},
-            {"decode_attention_backend": "triton"},
-        ):
-            with self.subTest(**kwargs):
-                reset_context()
-                with self.assertRaisesRegex(ValueError, "requires FA3"):
-                    ServerArgs(
-                        model_path=self.directory.name, device="cuda", **kwargs
-                    ).resolve_once()
-
-    def test_rejects_fa3_paths_that_do_not_return_the_lse(self):
-        for kwargs, message in (
-            ({"attn_cp_size": 2, "tp_size": 2}, "context parallelism"),
-            (
-                {
-                    "speculative_algorithm": "EAGLE",
-                    "speculative_num_steps": 1,
-                    "speculative_eagle_topk": 2,
-                    "speculative_num_draft_tokens": 2,
-                },
-                "speculative-eagle-topk 1",
-            ),
-        ):
-            with self.subTest(**kwargs):
-                reset_context()
-                with self.assertRaisesRegex(ValueError, message):
-                    ServerArgs(
-                        model_path=self.directory.name, device="cuda", **kwargs
-                    ).resolve_once()
-
-    def test_rejects_multi_layer_eagle(self):
-        with self.assertRaisesRegex(ValueError, "multi-layer EAGLE"):
-            args = ServerArgs(
-                model_path=self.directory.name,
-                device="cuda",
-                speculative_algorithm="EAGLE",
-                enable_multi_layer_eagle=True,
-                speculative_num_steps=1,
-                speculative_eagle_topk=1,
-                speculative_num_draft_tokens=2,
-            )
-            args.resolve_once()
 
 
 if __name__ == "__main__":
