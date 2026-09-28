@@ -201,6 +201,7 @@ pub(super) fn witness_snapshot(entries: &[(&str, u32, i64)]) -> PeerSnapshot {
             .map(|(i, (_, _, seq))| (i as u32, *seq))
             .collect(),
         nodes: Vec::new(),
+        empty_ranks: vec![],
     }
 }
 

@@ -438,6 +438,7 @@ mod tests {
             workers,
             cursors: vec![],
             nodes,
+            empty_ranks: vec![],
         }
     }
 

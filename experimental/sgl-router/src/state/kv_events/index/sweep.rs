@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use super::{KvEventIndex, ObligationBatch, PumpControl};
 use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
 use crate::state::kv_events::bootstrap::{
-    fetch_snapshot, BootstrapTracker, FetchAnswer, PeerRegistry,
+    fetch_snapshot, BootstrapState, BootstrapTracker, FetchAnswer, PeerRegistry,
 };
 use crate::state::kv_events::bootstrap::{
     PeerSnapshot, SnapshotOutcome, SweepOutcome, VettedSnapshot,
@@ -132,6 +132,11 @@ pub(super) enum SweepResult {
         peers_tried: usize,
         last_reason: Option<String>,
     },
+    /// Every obligation the sweep was run for left `Pending` on its own
+    /// incarnation without this sweep's snapshot — resolved from its stream's
+    /// origin (`resolve_from_origin`), settled cold per rank, or forgotten.
+    /// Nothing is owed to them, so delivery sends no control message.
+    RanksResolved,
 }
 
 impl SweepResult {
@@ -143,6 +148,7 @@ impl SweepResult {
             Self::NoPeers => SweepOutcome::NoPeers,
             Self::FleetCold { .. } => SweepOutcome::FleetCold,
             Self::TimedOut { .. } => SweepOutcome::TimedOut,
+            Self::RanksResolved => SweepOutcome::RanksResolved,
         }
     }
 
@@ -152,7 +158,7 @@ impl SweepResult {
     fn peers_tried(&self) -> usize {
         match self {
             Self::Found(_) => 1,
-            Self::NoPeers => 0,
+            Self::NoPeers | Self::RanksResolved => 0,
             Self::FleetCold { peers_tried } | Self::TimedOut { peers_tried, .. } => *peers_tried,
         }
     }
@@ -164,11 +170,19 @@ impl SweepResult {
 ///
 /// Retries every `PEER_RETRY_INTERVAL` because the peer watch can deliver its
 /// first list after worker discovery. Settles early when every candidate
-/// answers cold or incompatible. `freshness_floor` is re-derived into a max
-/// age per attempt.
+/// answers cold or incompatible, and settles a single rank early when every
+/// candidate proves it holds nothing for that rank. `freshness_floor` is
+/// re-derived into a max age per attempt; a peer that has already answered is
+/// asked for something newer still (see `SweepState::export_floor`).
+///
+/// Each pass sweeps only the obligations still `Pending` on the incarnation they
+/// were registered under. A rank can leave `Pending` while the sweep runs — the
+/// pump resolves it from its stream's origin, or the worker is removed — and a
+/// rank nobody is waiting on must neither keep the sweep alive nor decide which
+/// peer's snapshot is "covering".
 pub(super) async fn sweep_until_deadline(
     deps: &BootstrapDeps,
-    ranks: &[KvWorkerId],
+    obligations: &[(KvWorkerId, u64)],
     deadline: Duration,
     freshness_floor: Instant,
 ) -> SweepResult {
@@ -185,11 +199,23 @@ pub(super) async fn sweep_until_deadline(
     let last_reason: Mutex<Option<String>> = Mutex::new(None);
     let attempt = async {
         let mut state = SweepState::new();
+        let mut active: Vec<(KvWorkerId, u64)> = obligations.to_vec();
         loop {
-            match sweep_peers(&ctx, ranks, &mut state, &last_reason).await {
+            active.retain(|(rank, epoch)| still_pending(&deps.bootstrap, rank, *epoch));
+            if active.is_empty() {
+                return Some(SweepResult::RanksResolved);
+            }
+            let ranks: Vec<KvWorkerId> = active.iter().map(|(r, _)| r.clone()).collect();
+            match sweep_peers(&ctx, &ranks, &mut state, &last_reason).await {
                 SweepPass::Found(vetted) => return Some(SweepResult::Found(vetted)),
                 SweepPass::FleetCold { peers_tried } => {
                     return Some(SweepResult::FleetCold { peers_tried })
+                }
+                SweepPass::NothingToRecover { ranks, peers_tried } => {
+                    settle_ranks_cold(deps, &mut active, &ranks, peers_tried).await;
+                    if active.is_empty() {
+                        return Some(SweepResult::RanksResolved);
+                    }
                 }
                 SweepPass::KeepLooking => {}
             }
@@ -213,9 +239,56 @@ pub(super) async fn sweep_until_deadline(
     }
 }
 
+/// Release `ranks` cold now, mid-sweep, because every sibling proved it holds
+/// nothing for them, and stop sweeping for them.
+///
+/// Sent from here rather than at delivery because the sweep keeps running for
+/// its other ranks, and a rank no sibling can supply must not hold its batches —
+/// or `/readyz` — until THEY resolve. Each obligation carries the incarnation it
+/// was registered under, so the pump drops the release for a rank re-registered
+/// since. The final delivery for this sweep still names these obligations; by
+/// then they are not `Pending`, which every pump handler already treats as a
+/// no-op.
+async fn settle_ranks_cold(
+    deps: &BootstrapDeps,
+    active: &mut Vec<(KvWorkerId, u64)>,
+    ranks: &[KvWorkerId],
+    peers_tried: usize,
+) {
+    let (settled, rest): (Vec<_>, Vec<_>) = std::mem::take(active)
+        .into_iter()
+        .partition(|(r, _)| ranks.contains(r));
+    *active = rest;
+    info!(
+        ranks = settled.len(),
+        peers_tried,
+        still_sweeping = active.len(),
+        "kv-bootstrap: every sibling replica holds nothing for these ranks; \
+         settling them cold without waiting out the deadline",
+    );
+    if deps
+        .ctrl_tx
+        .send(PumpControl::AbandonBootstrap {
+            obligations: settled,
+        })
+        .await
+        .is_err()
+    {
+        warn!("kv-bootstrap: pump is gone; per-rank cold settle discarded");
+    }
+}
+
+/// Whether the obligation `(rank, epoch)` still has a rank waiting on it: the
+/// rank is registered under that incarnation and has not left `Pending`.
+pub(super) fn still_pending(bootstrap: &BootstrapTracker, rank: &KvWorkerId, epoch: u64) -> bool {
+    bootstrap.epoch_of(rank) == Some(epoch)
+        && bootstrap.state_of(rank) == Some(BootstrapState::Pending)
+}
+
 /// Turn a sweep result into the single [`PumpControl`] message its obligations
-/// are owed. Every exit path sends exactly one, which is what releases the ranks
-/// from `Pending`.
+/// are owed. Every exit path that leaves ranks `Pending` sends exactly one,
+/// which is what releases them; [`SweepResult::RanksResolved`] sends none,
+/// because its ranks have already left `Pending`.
 async fn deliver_bootstrap(
     deps: &BootstrapDeps,
     obligations: Vec<(KvWorkerId, u64)>,
@@ -227,6 +300,13 @@ async fn deliver_bootstrap(
         .record_sweep_result(result.outcome(), result.peers_tried());
     match &result {
         SweepResult::Found(_) => {}
+        SweepResult::RanksResolved => {
+            debug!(
+                ranks = n,
+                "kv-bootstrap: every rank left Pending before a peer snapshot was needed",
+            );
+            return;
+        }
         SweepResult::NoPeers => info!(
             ranks = n,
             "kv-bootstrap: no sibling replicas to bootstrap from; ranks will run cold",
@@ -283,6 +363,13 @@ enum SweepPass {
     /// the candidate set the verdict was proven over; see
     /// [`SweepResult::FleetCold`].
     FleetCold { peers_tried: usize },
+    /// Not cold as a fleet, but every candidate's latest word says it holds
+    /// nothing for `ranks` (see [`SweepState::nothing_to_recover`]). Only these
+    /// ranks settle; the sweep goes on for the rest.
+    NothingToRecover {
+        ranks: Vec<KvWorkerId>,
+        peers_tried: usize,
+    },
 }
 
 /// Per-sweep peer state carried across passes.
@@ -305,6 +392,15 @@ struct SweepState {
     /// dropped on any warmer or unknown answer, since the fleet proving cold
     /// is only meaningful when EVERY peer's latest word is "I have nothing".
     cold_witnessed: HashSet<String>,
+    /// Per peer, the ranks its latest answer named in
+    /// [`PeerSnapshot::empty_ranks`] — the per-rank sibling of
+    /// `cold_witnessed`, with the same lifetime: kept across cooldowns,
+    /// replaced by each answer, dropped when the peer stops answering. Wire
+    /// identities, not [`KvWorkerId`]s, because this is evidence about a rank
+    /// rather than a routing identity.
+    holds_nothing: HashMap<String, HashSet<(String, u32)>>,
+    /// Per peer, when its latest body arrived; see [`Self::export_floor`].
+    received_at: HashMap<String, Instant>,
 }
 
 impl SweepState {
@@ -314,7 +410,38 @@ impl SweepState {
             cooldown: HashMap::new(),
             strikes: HashMap::new(),
             cold_witnessed: HashSet::new(),
+            holds_nothing: HashMap::new(),
+            received_at: HashMap::new(),
         }
+    }
+
+    /// The instant a fetch from `peer` must demand an export newer than: the
+    /// sweep's `floor`, or the arrival of this peer's last body if later.
+    ///
+    /// The second term exists because a producer reuses its cached export
+    /// for any requester whose `max_age` it meets (see
+    /// `KvEventIndex::peer_snapshot_body`), and a floor fixed at sweep start is
+    /// met by that export for the whole sweep: a re-fetch after a useless
+    /// answer — no coverage, empty, nothing we know — would get the same
+    /// document back even after the peer has since learned what we need. An export is always sampled before it is sent, so "newer than
+    /// its arrival here" excludes exactly the answer already seen, whatever the
+    /// transit latency, and forces the peer to take a fresh one.
+    ///
+    /// Only re-fetches ratchet, and only as often as cooldown lets this peer
+    /// be asked. Requesters still share any build that started after the
+    /// instant each demands, however long they queue behind it, because the
+    /// producer pins that instant on arrival — so a herd re-fetching one peer
+    /// still pays about one walk per build-duration of arrival spread.
+    fn export_floor(&self, peer: &str, floor: Instant) -> Instant {
+        self.received_at
+            .get(peer)
+            .map_or(floor, |&at| at.max(floor))
+    }
+
+    /// Record that `peer` answered with a body at `at`; see
+    /// [`Self::export_floor`].
+    fn note_received(&mut self, peer: &str, at: Instant) {
+        self.received_at.insert(peer.to_string(), at);
     }
 
     /// A peer that did not answer has unknown warmth: it cannot count toward
@@ -325,6 +452,7 @@ impl SweepState {
     /// that is itself serving traffic.
     fn note_unreachable(&mut self, peer: &str) {
         self.cold_witnessed.remove(peer);
+        self.holds_nothing.remove(peer);
         self.start_cooldown(peer);
     }
 
@@ -337,6 +465,13 @@ impl SweepState {
         } else {
             self.cold_witnessed.remove(peer);
         }
+        self.holds_nothing.insert(
+            peer.to_string(),
+            snap.empty_ranks
+                .iter()
+                .map(|w| (w.url.clone(), w.dp_rank))
+                .collect(),
+        );
     }
 
     /// Permanent rejection is terminal on its own — a peer whose state we can
@@ -387,6 +522,29 @@ impl SweepState {
                 .iter()
                 .all(|p| self.permanently_rejected.contains(p) || self.cold_witnessed.contains(p))
     }
+
+    /// The per-rank verdict: every candidate's latest word says it has nothing
+    /// for `rank` — it named the rank in `empty_ranks`, or it is hopeless as a
+    /// whole (the two `fleet_is_cold` classes). Same veto rules: a candidate
+    /// that has never answered, or whose last answer does not name the rank
+    /// (it may not have discovered it yet), keeps the rank waiting, and an
+    /// empty candidate set proves nothing.
+    ///
+    /// Waiting cannot help such a rank: the answers were exported after this
+    /// replica subscribed, so whatever a sibling learns about the rank from here
+    /// on arrives over this replica's own subscription too. The one thing lost
+    /// is what a sibling still bootstrapping the rank holds back from before
+    /// our subscription — the price of not letting a fleet whose every member
+    /// is waiting on every other member burn its whole deadline.
+    fn nothing_to_recover(&self, rank: &KvWorkerId, candidates: &[String]) -> bool {
+        let key = (rank.url.clone(), rank.dp_rank);
+        !candidates.is_empty()
+            && candidates.iter().all(|p| {
+                self.permanently_rejected.contains(p)
+                    || self.cold_witnessed.contains(p)
+                    || self.holds_nothing.get(p).is_some_and(|s| s.contains(&key))
+            })
+    }
 }
 
 /// One pass over the candidates, returning the first snapshot that vets and
@@ -427,12 +585,17 @@ async fn sweep_peers(
         if state.cooling(peer) {
             continue;
         }
-        // Ask for an export that beats the floor. Derived per attempt, not once:
-        // the condition is "newer than the floor", and only the age it
+        // Ask for an export that beats the floor — and, once this peer has
+        // answered, that beats its last answer too (see
+        // `SweepState::export_floor`). Derived per attempt, not once: the
+        // condition is "newer than that instant", and only the age it
         // corresponds to moves as the sweep retries.
-        let max_age = freshness_floor.elapsed();
+        let max_age = state.export_floor(peer, *freshness_floor).elapsed();
         let fetched = match fetch_snapshot(http, peer, Some(max_age)).await {
-            Ok(FetchAnswer::Body(s)) => Ok(s),
+            Ok(FetchAnswer::Body(s)) => {
+                state.note_received(peer, Instant::now());
+                Ok(s)
+            }
             // Reachable but no usable body — the status names which kind of
             // wrong: 404 is an older router image that does not serve the
             // route, 5xx is a sick sibling. Both retriable.
@@ -528,23 +691,36 @@ async fn sweep_peers(
             }
         }
     }
-    if !state.fleet_is_cold(&candidates) {
-        return SweepPass::KeepLooking;
-    }
-    // Discard the cold verdict if candidate membership changed mid-pass
-    // (compared as sets; a same-length swap counts): the newcomer was never
-    // consulted.
+    let verdict = if state.fleet_is_cold(&candidates) {
+        SweepPass::FleetCold {
+            peers_tried: candidates.len(),
+        }
+    } else {
+        let barren: Vec<KvWorkerId> = ranks
+            .iter()
+            .filter(|r| state.nothing_to_recover(r, &candidates))
+            .cloned()
+            .collect();
+        if barren.is_empty() {
+            return SweepPass::KeepLooking;
+        }
+        SweepPass::NothingToRecover {
+            ranks: barren,
+            peers_tried: candidates.len(),
+        }
+    };
+    // Discard the cold verdict — fleet-wide or per rank — if candidate
+    // membership changed mid-pass (compared as sets; a same-length swap
+    // counts): the newcomer was never consulted.
     if peers.candidates().into_iter().collect::<HashSet<_>>()
         != candidates.iter().cloned().collect::<HashSet<_>>()
     {
         // Not silent: this is how a flapping EndpointSlice turns a cold
         // fleet's quick settle into a full-deadline wait.
-        info!("kv-bootstrap: candidate set changed mid-pass; discarding the cold-fleet verdict");
+        info!("kv-bootstrap: candidate set changed mid-pass; discarding the cold verdict");
         return SweepPass::KeepLooking;
     }
-    SweepPass::FleetCold {
-        peers_tried: candidates.len(),
-    }
+    verdict
 }
 
 impl KvEventIndex {
@@ -554,8 +730,9 @@ impl KvEventIndex {
     ///
     /// Runs detached: `/readyz` is gated by the tracker, not by awaiting this,
     /// so a slow peer delays readiness only up to the bootstrap deadline. Every
-    /// exit path sends exactly one [`PumpControl`] message, which is what
-    /// guarantees the held-back batches are eventually released.
+    /// exit path that leaves ranks `Pending` sends exactly one [`PumpControl`]
+    /// message, which is what guarantees the held-back batches are eventually
+    /// released (see `deliver_bootstrap`).
     pub(super) fn spawn_bootstrap(&self, batch: ObligationBatch) {
         let deps = self.bootstrap_deps();
         tokio::spawn(async move {
@@ -563,9 +740,8 @@ impl KvEventIndex {
                 obligations,
                 holding_since,
             } = batch;
-            let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
             let deadline = deps.deadline();
-            let result = sweep_until_deadline(&deps, &ranks, deadline, holding_since).await;
+            let result = sweep_until_deadline(&deps, &obligations, deadline, holding_since).await;
             deliver_bootstrap(&deps, obligations, result, deadline).await;
         });
     }
@@ -791,6 +967,7 @@ mod tests {
                 workers: vec![0],
                 tiers: vec![],
             }],
+            empty_ranks: vec![],
         }
     }
 
@@ -806,7 +983,12 @@ mod tests {
         // fast instead, and reaching it IS the regression.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("a cold fleet settles immediately, not at the deadline");
@@ -832,8 +1014,13 @@ mod tests {
             &["http://w1:30000"],
         );
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { peers_tried: 2, .. }),
             "an unanswered peer keeps the sweep waiting until the deadline",
@@ -849,8 +1036,13 @@ mod tests {
         let (warm, q) = serve_snapshot_sequence(vec![warm_snapshot("http://w2:30000", 64)]).await;
         let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         let SweepResult::TimedOut {
             peers_tried: 1,
             last_reason,
@@ -888,7 +1080,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("an incompatible fleet settles immediately, not at the deadline");
@@ -915,8 +1112,13 @@ mod tests {
         let deps = sweep_deps(vec!["http://127.0.0.1:1".into()], 64, &["http://w1:30000"]);
         deps.peers.replace(vec![]);
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { .. }),
             "an empty candidate set is no information, not a cold fleet",
@@ -932,7 +1134,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("a confirmed-empty discovery settles immediately");
@@ -957,7 +1164,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("the warm answer ends the sweep on its refetch pass");
@@ -1083,7 +1295,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("the peer settles on its second answer, well inside the deadline");
@@ -1178,8 +1395,13 @@ mod tests {
             ..sweep_deps(vec![], 64, &["http://w1:30000"])
         };
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { .. }),
             "a mid-pass membership swap must veto the verdict, length unchanged or not",
@@ -1212,5 +1434,351 @@ mod tests {
             "the verdict must be tallied exactly once; got {:?}",
             bootstrap.sweep_result_counts(),
         );
+    }
+
+    // ---- per-rank settle, freshness ratchet, resolved ranks ----
+
+    /// A warm sibling (a real tree, carried by `carrier`) that names each of
+    /// `empty` in `empty_ranks`: subscribed to it, holding nothing for it.
+    fn warm_snapshot_holding_nothing_for(carrier: &str, empty: &[&str]) -> PeerSnapshot {
+        PeerSnapshot {
+            empty_ranks: empty
+                .iter()
+                .map(|u| WireWorker {
+                    url: (*u).to_string(),
+                    dp_rank: 0,
+                })
+                .collect(),
+            ..warm_snapshot(carrier, 64)
+        }
+    }
+
+    /// The fresh-engine incident from the consumer side: every sibling is warm
+    /// but each is itself waiting on the new rank, so none will ever cover it.
+    /// Once they all say so the rank settles cold rather than waiting out the
+    /// deadline.
+    #[tokio::test]
+    async fn sweep_settles_a_rank_every_peer_holds_nothing_for() {
+        let body = warm_snapshot_holding_nothing_for("http://w2:30000", &["http://w1:30000"]);
+        let (p1, _q1) = serve_snapshot_sequence(vec![body.clone()]).await;
+        let (p2, _q2) = serve_snapshot_sequence(vec![body]).await;
+        let (deps, mut ctrl_rx) =
+            sweep_deps_with_ctrl(vec![p1, p2], 64, &["http://w1:30000", "http://w2:30000"]);
+        let obligations = deps.bootstrap.register(&[worker_id("http://w1:30000", 0)]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(
+                &deps,
+                &obligations,
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("a rank no sibling can supply settles now, not at the deadline");
+        assert!(matches!(result, SweepResult::RanksResolved));
+        match ctrl_rx.try_recv() {
+            Ok(PumpControl::AbandonBootstrap { obligations: sent }) => {
+                assert_eq!(sent, obligations, "released under its own incarnation")
+            }
+            other => panic!("expected the rank released cold, got {other:?}"),
+        }
+    }
+
+    /// Per rank, not per sweep: a rank some sibling might still supply keeps
+    /// the sweep alive, but must not hold back the one nobody can.
+    #[tokio::test]
+    async fn sweep_settles_only_the_ranks_every_peer_holds_nothing_for() {
+        let body = warm_snapshot_holding_nothing_for("http://w2:30000", &["http://w1:30000"]);
+        let (p, _q) = serve_snapshot_sequence(vec![body]).await;
+        let (deps, mut ctrl_rx) = sweep_deps_with_ctrl(
+            vec![p],
+            64,
+            &["http://w1:30000", "http://w2:30000", "http://w3:30000"],
+        );
+        let barren = worker_id("http://w1:30000", 0);
+        let unknown = worker_id("http://w3:30000", 0);
+        let obligations = deps.bootstrap.register(&[barren.clone(), unknown.clone()]);
+        let result = sweep_until_deadline(
+            &deps,
+            &obligations,
+            Duration::from_millis(800),
+            Instant::now(),
+        )
+        .await;
+        assert!(
+            matches!(result, SweepResult::TimedOut { .. }),
+            "the rank the peer does not speak for keeps the sweep waiting",
+        );
+        match ctrl_rx.try_recv() {
+            Ok(PumpControl::AbandonBootstrap { obligations: sent }) => {
+                let ranks: Vec<_> = sent.into_iter().map(|(r, _)| r).collect();
+                assert_eq!(
+                    ranks,
+                    vec![barren],
+                    "only the rank nobody can supply settles"
+                );
+            }
+            other => panic!("expected a mid-sweep release, got {other:?}"),
+        }
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "nothing else is released mid-sweep"
+        );
+    }
+
+    /// A sibling that does not name the rank may simply not have discovered it
+    /// yet — the case `covers_any` exists for — so one such sibling vetoes the
+    /// per-rank settle, however many others hold nothing.
+    #[tokio::test]
+    async fn sweep_keeps_waiting_on_a_rank_while_any_peer_is_silent_on_it() {
+        let (names_it, _q1) = serve_snapshot_sequence(vec![warm_snapshot_holding_nothing_for(
+            "http://w2:30000",
+            &["http://w1:30000"],
+        )])
+        .await;
+        let (silent, _q2) =
+            serve_snapshot_sequence(vec![warm_snapshot("http://w2:30000", 64)]).await;
+        let (deps, mut ctrl_rx) = sweep_deps_with_ctrl(
+            vec![names_it, silent],
+            64,
+            &["http://w1:30000", "http://w2:30000"],
+        );
+        let obligations = deps.bootstrap.register(&[worker_id("http://w1:30000", 0)]);
+        let result = sweep_until_deadline(
+            &deps,
+            &obligations,
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
+        assert!(matches!(result, SweepResult::TimedOut { .. }));
+        assert!(ctrl_rx.try_recv().is_err(), "no rank released");
+    }
+
+    /// The per-rank verdict primitives: every candidate must speak for the rank
+    /// — by naming it, or by being hopeless as a whole — and silence, an
+    /// unreachable spell, or an empty candidate set vetoes.
+    #[test]
+    fn nothing_to_recover_needs_every_candidate_to_speak_for_the_rank() {
+        let mut state = SweepState::new();
+        let (a, b) = ("http://a:30000".to_string(), "http://b:30000".to_string());
+        let candidates = [a.clone(), b.clone()];
+        let rank = worker_id("http://w1:30000", 0);
+        let other = worker_id("http://w9:30000", 0);
+        let names_it = warm_snapshot_holding_nothing_for("http://w2:30000", &["http://w1:30000"]);
+
+        assert!(
+            !state.nothing_to_recover(&rank, &[]),
+            "no candidates, no proof"
+        );
+        state.note_answer(&a, &names_it);
+        assert!(
+            !state.nothing_to_recover(&rank, &candidates),
+            "b never answered"
+        );
+        state.note_answer(&b, &warm_snapshot("http://w2:30000", 64));
+        assert!(
+            !state.nothing_to_recover(&rank, &candidates),
+            "b is silent on it"
+        );
+        state.note_answer(&b, &names_it);
+        assert!(state.nothing_to_recover(&rank, &candidates));
+        assert!(
+            !state.nothing_to_recover(&other, &candidates),
+            "evidence is per rank"
+        );
+        state.note_unreachable(&b);
+        assert!(
+            !state.nothing_to_recover(&rank, &candidates),
+            "an unreachable spell erases the evidence",
+        );
+        state.note_answer(&b, &witness_snapshot(&[]));
+        assert!(
+            state.nothing_to_recover(&rank, &candidates),
+            "an empty tree has nothing for any rank",
+        );
+        let mut state = SweepState::new();
+        state.note_answer(&a, &names_it);
+        state.note_permanent_reject(&b);
+        assert!(
+            state.nothing_to_recover(&rank, &candidates),
+            "a peer we can never consume has nothing for us",
+        );
+    }
+
+    /// Serve a REAL producer on the snapshot path, honouring `max_age_ms` the
+    /// way the route does — the ratchet is only observable against the
+    /// producer's own cache.
+    async fn serve_producer(index: Arc<KvEventIndex>) -> String {
+        use crate::state::kv_events::bootstrap::{MAX_AGE_PARAM, PRODUCER_CACHE_TTL};
+        let app = axum::Router::new().route(
+            SNAPSHOT_PATH,
+            axum::routing::get(move |q: axum::extract::Query<HashMap<String, String>>| {
+                let index = Arc::clone(&index);
+                async move {
+                    let max_age = q
+                        .get(MAX_AGE_PARAM)
+                        .and_then(|v| v.parse().ok())
+                        .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
+                    index.peer_snapshot_body(max_age).await.identity
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The freshness ratchet: a peer that answered without covering our rank
+    /// and has SINCE learned it must be able to say so. Against a floor fixed
+    /// at sweep start alone, the producer would replay the export it built
+    /// right after that floor for the whole sweep.
+    #[tokio::test]
+    async fn a_refetch_demands_an_export_newer_than_the_peers_last_answer() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        oracle.set_bigram(false);
+        let producer =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let (ours, theirs) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+        );
+        producer.seed_stored_block_for_test(&theirs, 3, 222);
+        let peer = serve_producer(Arc::clone(&producer)).await;
+
+        let deps = sweep_deps(vec![peer], 64, &["http://w1:30000", "http://w2:30000"]);
+        // Far enough behind the first export that reusing it under the floor
+        // alone is not a matter of transit-latency luck.
+        let floor = Instant::now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ctx = SweepCtx {
+            http: &deps.http,
+            peers: &deps.peers,
+            bootstrap: &deps.bootstrap,
+            live_workers: &deps.live_workers,
+            oracle: &deps.oracle,
+            freshness_floor: floor,
+        };
+        let last_reason = Mutex::new(None);
+        let mut state = SweepState::new();
+        let ranks = vec![ours.clone()];
+
+        let first = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        assert!(
+            !matches!(first, SweepPass::Found(_)),
+            "the peer does not know our rank yet",
+        );
+        // The peer learns our rank after answering; its cache still holds the
+        // export it answered with, which does meet the sweep's floor.
+        producer.seed_stored_block_for_test(&ours, 5, 111);
+        state.cooldown.clear();
+        let second = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        match second {
+            SweepPass::Found(vetted) => assert_eq!(vetted.cursor_for(&ours), Some(5)),
+            _ => panic!("the re-fetch must see a fresh export, not a replay of the last answer"),
+        }
+    }
+
+    #[test]
+    fn export_floor_is_the_later_of_the_sweep_floor_and_the_last_answer() {
+        let mut state = SweepState::new();
+        let floor = Instant::now();
+        let peer = "http://a:30000";
+        assert_eq!(state.export_floor(peer, floor), floor, "never answered");
+        let answered = floor + Duration::from_secs(1);
+        state.note_received(peer, answered);
+        assert_eq!(state.export_floor(peer, floor), answered);
+        assert_eq!(
+            state.export_floor("http://b:30000", floor),
+            floor,
+            "per peer: another peer's answer ratchets nothing here",
+        );
+        let later_floor = answered + Duration::from_secs(1);
+        assert_eq!(
+            state.export_floor(peer, later_floor),
+            later_floor,
+            "the ratchet never loosens the sweep's own floor",
+        );
+    }
+
+    /// Once the pump resolves a rank from its stream's origin, the sweep
+    /// launched for it must stop. Here the only peer is warm but will never
+    /// cover the rank, so only the rank leaving `Pending` can end the sweep
+    /// before its deadline.
+    #[tokio::test]
+    async fn sweep_stops_once_every_rank_has_left_pending() {
+        let (warm, _q) = serve_snapshot_sequence(vec![warm_snapshot("http://w2:30000", 64)]).await;
+        let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
+        let rank = worker_id("http://w1:30000", 0);
+        let obligations = deps.bootstrap.register(std::slice::from_ref(&rank));
+        let tracker = Arc::clone(&deps.bootstrap);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tracker.set(&rank, BootstrapState::Recovered);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(
+                &deps,
+                &obligations,
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("a sweep with nobody left waiting must end, not run to the deadline");
+        assert!(matches!(result, SweepResult::RanksResolved));
+    }
+
+    /// Obligations nobody is waiting on — resolved already, or superseded by a
+    /// re-registration — cost no fetch at all.
+    #[tokio::test]
+    async fn sweep_fetches_nothing_for_obligations_nobody_waits_on() {
+        let (warm, q) = serve_snapshot_sequence(vec![warm_snapshot("http://w1:30000", 64)]).await;
+        let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
+        let resolved = worker_id("http://w1:30000", 0);
+        let superseded = worker_id("http://w2:30000", 0);
+        let obligations = deps
+            .bootstrap
+            .register(&[resolved.clone(), superseded.clone()]);
+        deps.bootstrap.set(&resolved, BootstrapState::Recovered);
+        deps.bootstrap.forget(std::slice::from_ref(&superseded));
+        deps.bootstrap.register(std::slice::from_ref(&superseded));
+        // The stale incarnation's obligation is still the one handed over.
+        assert_ne!(deps.bootstrap.epoch_of(&superseded), Some(obligations[1].1));
+
+        let result =
+            sweep_until_deadline(&deps, &obligations, Duration::from_secs(5), Instant::now()).await;
+        assert!(matches!(result, SweepResult::RanksResolved));
+        assert!(
+            q.lock().expect("queries lock").is_empty(),
+            "no fetch for ranks nobody is waiting on",
+        );
+    }
+
+    /// `RanksResolved` owes its ranks nothing: they already left `Pending`. It
+    /// is still tallied, so the sweep counter sums to the sweeps run.
+    #[tokio::test]
+    async fn deliver_bootstrap_sends_nothing_for_resolved_ranks() {
+        let (deps, mut ctrl_rx) = sweep_deps_with_ctrl(vec![], 64, &[]);
+        let bootstrap = Arc::clone(&deps.bootstrap);
+        deliver_bootstrap(
+            &deps,
+            vec![(worker_id("http://w1:30000", 0), 1)],
+            SweepResult::RanksResolved,
+            Duration::from_secs(5),
+        )
+        .await;
+        drop(deps);
+        assert!(
+            ctrl_rx.recv().await.is_none(),
+            "no control message for ranks that already left Pending",
+        );
+        assert!(bootstrap
+            .sweep_result_counts()
+            .contains(&("ranks_resolved", 1)));
     }
 }

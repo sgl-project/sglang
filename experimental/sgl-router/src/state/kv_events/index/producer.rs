@@ -205,9 +205,21 @@ impl KvEventIndex {
                 .filter_map(|(w, seq)| index_of.get(w).map(|&i| (i, *seq)))
                 .collect()
         };
+        // Live ranks the walk found no node for — see `PeerSnapshot::empty_ranks`.
+        // Read after the walk, so a rank whose first node lands mid-walk can be
+        // reported empty. That errs only toward a consumer settling that rank
+        // cold, which is safe, never toward it grafting state that is not here.
+        let empty_ranks: Vec<WireWorker> = self
+            .live_workers
+            .lock()
+            .iter()
+            .filter(|w| !index_of.contains_key(w))
+            .map(WireWorker::from)
+            .collect();
         let has_nodes = !nodes.is_empty();
         let workers = worker_table.iter().map(WireWorker::from).collect();
-        let snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
+        let mut snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
+        snap.empty_ranks = empty_ranks;
         // Encode on the blocking pool for the same reason the walk goes there:
         // serialising and compressing a fleet-sized tree is CPU-bound with no
         // await point, and this runs on the runtime that is also proxying
@@ -270,6 +282,7 @@ impl KvEventIndex {
             workers,
             cursors,
             nodes,
+            empty_ranks: Vec::new(),
         }
     }
 
@@ -403,6 +416,40 @@ mod tests {
             exported_at >= before && exported_at <= after,
             "the stamp must sit inside the build, at its start",
         );
+    }
+
+    /// The evidence a consumer's per-rank settle stands on: every LIVE rank the
+    /// export holds no node for is named — one never applied (what a rank the
+    /// producer is still bootstrapping looks like) and one whose applied stream
+    /// left nothing standing — and a rank that does carry nodes is not.
+    #[tokio::test]
+    async fn snapshot_names_the_live_ranks_it_holds_nothing_for() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let (warm, pending, emptied) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+            worker_id("http://w3:30000", 0),
+        );
+        for w in [&warm, &pending, &emptied] {
+            index.live_workers.lock().insert(w.clone());
+        }
+        index.seed_stored_block_for_test(&warm, 3, 111);
+        index.seed_cursor_only_for_test(&emptied, 2);
+
+        let body = index.peer_snapshot_body(Duration::ZERO).await;
+        let snap: PeerSnapshot = serde_json::from_slice(&body.identity).expect("valid JSON");
+        assert!(
+            snap.wire_cursor_for(&warm.url, 0).is_some(),
+            "the warm rank is covered"
+        );
+        assert!(!snap.holds_nothing_for(&warm.url, 0));
+        assert!(snap.holds_nothing_for(&pending.url, 0));
+        assert!(snap.holds_nothing_for(&emptied.url, 0));
+        assert_eq!(snap.empty_ranks.len(), 2);
     }
 
     /// This body answers one integer per rank, so it must carry the cursors
