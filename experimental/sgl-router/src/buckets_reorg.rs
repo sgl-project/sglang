@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Order buckets by request length; each bucket owns the groups used to pick engines.
+//! Order length-compatible buckets by optional SLO preferences, then capacity and rank.
 //!
 //! ```text
 //! BucketResolver (one model's buckets)
-//!   -> Bucket (token limits, context capacity, rank)
+//!   -> Bucket (token limits, context capacity, rank, SLO estimates)
 //!        -> Plain: one EngineGroup
 //!        -> PD: prefill + decode EngineGroups
 //!             -> each EngineGroup: worker membership + its own Policy
@@ -18,7 +18,7 @@
 //! The handler tries buckets in order, advancing on missing candidates or admission
 //! rejection. Both P/D picks must succeed in the same bucket before dispatch.
 //! [`WorkerRegistry`] owns live workers; groups reference their IDs. Policies own
-//! their load/KV/affinity dependencies and share observations within each attempt.
+//! their load/KV/affinity dependencies and pass selected observations to admission.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -120,12 +120,15 @@ pub struct BucketPick {
 #[derive(Debug)]
 pub struct Bucket {
     pub id: String,
-    /// Break ties between equally sized buckets; lower ranks win.
+    /// Break ties within an SLO tier between equally sized buckets; lower ranks win.
     pub rank: u32,
     /// Inclusive input-token range used to choose the bucket.
     pub limits: TokenLimits,
     /// Full sequence capacity, checked against the expected peak when known.
     pub max_context_tokens: Option<u64>,
+    /// Optional service estimates used only for bucket ordering.
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
     pub groups: BucketGroups,
 }
 
@@ -136,6 +139,8 @@ impl Bucket {
             rank: 0,
             limits: TokenLimits::default(),
             max_context_tokens: None,
+            ttft_ms: None,
+            tokens_per_second: None,
             groups,
         }
     }
@@ -225,10 +230,30 @@ impl Bucket {
     }
 }
 
+/// Soft preference; nonpreferred buckets remain available for fallback.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SloPreference {
+    #[default]
+    Disabled,
+    SloFirst,
+    BestEffort,
+}
+
+impl SloPreference {
+    fn penalty(self, matches: Option<bool>) -> u8 {
+        match (self, matches) {
+            (Self::SloFirst, Some(false)) | (Self::BestEffort, Some(true)) => 1,
+            _ => 0,
+        }
+    }
+}
+
 /// Model-specific bucket configuration. Selection does not inspect engine state.
 #[derive(Debug, Default)]
 pub struct BucketResolver {
     pub buckets: Vec<Bucket>,
+    pub ttft_slo: SloPreference,
+    pub tps_slo: SloPreference,
 }
 
 impl BucketResolver {
@@ -237,19 +262,37 @@ impl BucketResolver {
         for bucket in &buckets {
             bucket.validate()?;
         }
-        Ok(Self { buckets })
+        Ok(Self {
+            buckets,
+            ..Self::default()
+        })
     }
 
-    /// Return all length-compatible buckets, ordered by input capacity, rank, and ID.
+    /// Return all length-compatible buckets, ordered by unmet SLO preferences,
+    /// then input capacity, rank, and ID. Both preferences have equal weight.
     /// The caller tries their groups in order until a complete engine selection succeeds.
     pub fn resolve(
         &self,
         input_tokens: u64,
         expected_peak_tokens: Option<u64>,
+        ttft_ms: Option<u64>,
+        tokens_per_second: Option<f64>,
     ) -> Result<Vec<&Bucket>, PickError> {
         if expected_peak_tokens.is_some_and(|tokens| tokens < input_tokens) {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
+            ));
+        }
+        if self.ttft_slo != SloPreference::Disabled && ttft_ms == Some(0) {
+            return Err(PickError::InvalidSignal(
+                "requested TTFT must be positive".into(),
+            ));
+        }
+        if self.tps_slo != SloPreference::Disabled
+            && tokens_per_second.is_some_and(|tps| !tps.is_finite() || tps <= 0.0)
+        {
+            return Err(PickError::InvalidSignal(
+                "requested tokens per second must be finite and positive".into(),
             ));
         }
         let mut buckets: Vec<_> = self
@@ -257,7 +300,20 @@ impl BucketResolver {
             .iter()
             .filter(|bucket| bucket.fits(input_tokens, expected_peak_tokens))
             .collect();
-        buckets.sort_by_key(|bucket| (bucket.input_capacity(), bucket.rank, &bucket.id));
+        buckets.sort_by_key(|bucket| {
+            let ttft_matches = ttft_ms.map(|target| {
+                bucket
+                    .ttft_ms
+                    .is_some_and(|estimate| estimate > 0 && estimate <= target)
+            });
+            let tps_matches = tokens_per_second.map(|target| {
+                bucket.tokens_per_second.is_some_and(|estimate| {
+                    estimate.is_finite() && estimate > 0.0 && estimate >= target
+                })
+            });
+            let penalty = self.ttft_slo.penalty(ttft_matches) + self.tps_slo.penalty(tps_matches);
+            (penalty, bucket.input_capacity(), bucket.rank, &bucket.id)
+        });
         Ok(buckets)
     }
 }

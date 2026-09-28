@@ -118,7 +118,12 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         }
         let pod_uid: Option<&str> = ep.target_ref.as_ref().and_then(|r| r.uid.as_deref());
         for addr in &ep.addresses {
-            let url = format!("http://{addr}:{port}");
+            let host = if es.address_type == "IPv6" {
+                format!("[{addr}]")
+            } else {
+                addr.clone()
+            };
+            let url = format!("http://{host}:{port}");
             let id = match pod_uid {
                 Some(uid) => WorkerId(format!("{ns}/{uid}")),
                 None => WorkerId(format!("{ns}/{slice_name}/{addr}:{port}")),
@@ -330,7 +335,12 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    // `peer_selector` names sibling routers, not the workers streamed here.
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        peer_selector: _,
+    } = cfg;
 
     let client = Client::try_default()
         .await
@@ -539,6 +549,15 @@ mod tests {
         assert_eq!(ws[0].mode, WorkerMode::Prefill);
         let ws = extract_workers(&s, WorkerMode::Decode);
         assert_eq!(ws[0].mode, WorkerMode::Decode);
+    }
+
+    #[test]
+    fn brackets_ipv6_worker_addresses() {
+        let mut slice = make_slice(&["2001:db8::1"], 30000, true);
+        slice.address_type = "IPv6".into();
+        let workers = extract_workers(&slice, WorkerMode::Plain);
+        assert_eq!(workers[0].url, "http://[2001:db8::1]:30000");
+        assert!(url::Url::parse(&workers[0].url).is_ok());
     }
 
     #[test]
