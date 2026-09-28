@@ -1096,6 +1096,10 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output, input, REDUCE_OP_SUM)
         else:
             reduce_scatter_single(output, input, group=self.device_group)
         return output
@@ -1112,7 +1116,6 @@ class GroupCoordinator:
                 .view_as(output)
             )
         elif _is_npu or _is_cpu:
-            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1305,6 +1308,10 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_allgather_into_tensor(output, input)
         else:
             all_gather_single(output, input, group=self.device_group)
 
@@ -1328,7 +1335,6 @@ class GroupCoordinator:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_cpu:
-            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
