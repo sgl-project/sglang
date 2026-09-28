@@ -1746,8 +1746,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 rms_epsilon=config.rms_norm_eps,
                 # Every layer was checked above.
                 can_defer_finalize=lambda layer: True,
-                # The final GemmaRMSNorm closes out the last layer's handoff.
-                final_norm_consumes_handoff=True,
                 label="Qwen3.5",
             )
 
@@ -1870,6 +1868,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             # The final norm below finalizes a deferred MoE output in its kernel.
             final_norm_takes_handoff=self.flashinfer_mnnvl_cutedsl_fusion is not None
             and self.pp_group.is_last_rank,
+            preserve_declared=not self.pp_group.is_last_rank,
         )
 
         # Return intermediate tensors for pipeline parallelism

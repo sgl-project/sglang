@@ -40,7 +40,6 @@ from sglang.srt.layers.communicator.boundary import (
 from sglang.srt.layers.communicator.layer import (
     FfnCompletion,
     FfnExit,
-    FfnExitFusion,
     LayerCommunicator,
     LayerFacts,
     MHCLayerCommunicator,
@@ -91,7 +90,6 @@ __all__ = [
     "FUSE_ALLREDUCE_MAX_BATCH_SIZE",
     "FfnCompletion",
     "FfnExit",
-    "FfnExitFusion",
     "FusedMlpInput",
     "HandoffOutput",
     "LayerCommunicator",

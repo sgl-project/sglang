@@ -1,3 +1,4 @@
+import unittest
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,6 @@ import torch
 from sglang.srt.layers.communicator import (
     ADD,
     NORM_QUANT_READ,
-    FfnExitFusion,
     LayerCommunicator,
     Layout,
     SumGroup,
@@ -56,7 +56,6 @@ def _communicator():
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
     comm.enable_fused_ar_quant = False
     comm._attn_input_fusions = comm._select_attn_input_fusions()
-    comm._ffn_exit_fusions = comm._select_ffn_exit_fusions()
     # Only the ordinary batches' attention input half, with these entries.
     comm._context = SimpleNamespace()
     comm._sp_steps = comm._input_scattered_steps = comm._cp_steps = None
@@ -75,6 +74,7 @@ def _communicator():
                 carried_fusions=comm._attn_input_fusions,
             ),
             input_move=None,
+            input_sum=None,
             handoff=None,
         )
     )
@@ -127,7 +127,6 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
             )
         ),
         hands_off_finalize=False,
-        next_input_absorbs=False,
         output_is_replicated=False,
     )
     hidden_states = UnreducedOutput(torch.zeros(8, 8))
@@ -143,8 +142,7 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
         )
 
     assert torch.equal(out_hidden, torch.ones(8, 8))
-    defer, absorb, _ = last._ffn_exit_fusions
-    assert defer(_DECODE) is None and absorb(_DECODE) is None
+    assert not last.fusions.can_defer_finalize(last, _DECODE)
 
 
 def test_cutedsl_entries_come_before_the_base_fused_kernel():
@@ -212,54 +210,51 @@ def test_the_fusion_runs_only_on_the_ffn_full_rows():
             assert fusion._common_eligible(comm, _DECODE, 8) is eligible
 
 
-def test_the_exit_tries_the_handoff_then_the_absorb_then_the_base_kernel(eligible):
+def test_finalize_handoff_is_a_producer_capability(eligible):
     comm = _communicator()
     fusion = comm.fusions
-    defer, absorb, base = comm._ffn_exit_fusions
-    assert _bound(defer) == (fusion._defer_moe_finalize, (comm,))
-    assert _bound(absorb) == (fusion._absorb_all_reduce, (comm,))
-    assert base == comm._next_input_norm_takes_ffn_sum
-    # Before install() chooses them, neither CuTe DSL kernel takes the sum.
-    assert defer(_DECODE) is None and absorb(_DECODE) is None
+    assert not fusion.can_defer_finalize(comm, _DECODE)
     fusion.install(
-        SimpleNamespace(),
-        hands_off_finalize=True,
-        next_input_absorbs=True,
-        output_is_replicated=False,
+        SimpleNamespace(), hands_off_finalize=True, output_is_replicated=False
     )
     with patch.object(CuteDSLFusion, "_should_use_finalize", return_value=True):
-        assert defer(_DECODE) is FfnExitFusion.DEFER_MOE_FINALIZE
-    assert absorb(_DECODE) is FfnExitFusion.NEXT_INPUT
+        assert fusion.can_defer_finalize(comm, _DECODE)
+        fusion.requires_local_reduction = True
+        assert not fusion.can_defer_finalize(comm, _DECODE)
+
+
+def test_install_does_not_require_a_fused_successor():
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+    first, last = _communicator(), _communicator()
+    ordinary = SimpleNamespace(layer_communicator=SimpleNamespace(fusions=None))
+    install_cutedsl_fusion(
+        [
+            SimpleNamespace(layer_communicator=first),
+            ordinary,
+            SimpleNamespace(layer_communicator=last),
+        ],
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: True,
+        label="test",
+    )
+    assert first.fusions.hands_off_finalize
+    assert last.fusions.hands_off_finalize
 
 
 def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
-    """A TP1 shared expert (or TP1 dense MLP) is not partial; handing its layer's
-    reduction onward would scale the replicated output by tp_size."""
     layers = [
-        SimpleNamespace(layer_communicator=_communicator(), replicated=replicated)
-        for replicated in (True, False, False)
+        SimpleNamespace(layer_communicator=_communicator(), replicated=value)
+        for value in (True, False)
     ]
     _install(layers, requires_local_reduction=lambda layer: layer.replicated)
-    replicated, plain = (layer.layer_communicator for layer in layers[:2])
-
-    def exit_fusion(communicator):
-        return next(
-            filter(None, (fused(_DECODE) for fused in communicator._ffn_exit_fusions)),
-            None,
-        )
-
-    with patch.object(
-        LayerCommunicator,
-        "should_fuse_mlp_allreduce_with_next_layer",
-        return_value=False,
-    ):
-        assert exit_fusion(replicated) is None
-        assert exit_fusion(plain) is FfnExitFusion.NEXT_INPUT
-    # Consuming what a predecessor skipped stays independently eligible.
-    assert (
-        replicated.fusions._can_consume_post_moe_all_reduce(replicated, _DECODE, 8)
-        is True
-    )
+    replicated, plain = [layer.layer_communicator for layer in layers]
+    assert replicated.fusions.requires_local_reduction
+    assert not plain.fusions.requires_local_reduction
+    # The restriction belongs to the producer; incoming sums can still fuse.
+    assert replicated.fusions._can_consume_post_moe_all_reduce(replicated, _DECODE, 8)
 
 
 def test_a_service_nested_under_a_wrapper_is_prepared():
@@ -546,6 +541,60 @@ def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
             _flashinfer_accepts(
                 preset, hidden_size=hidden_size, top_k=routed_top_k, tp_size=tp_size
             )
+
+
+class TestDeferredLoraAllReduce(unittest.TestCase):
+    def test_installed_cutedsl_provider_restores_deferred_sum(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.layers.communicator import layer as exits
+        from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
+
+        group = object()
+        fb = SimpleNamespace(
+            input_ids=torch.zeros(2), residual_stream=SimpleNamespace(residual=None)
+        )
+        provider = CuteDSLFusion()
+        boundary = SimpleNamespace(fusions=provider)
+        for eligible, a2a in ((True, False), (False, False), (True, True)):
+            with (
+                patch.object(exits, "_ffn_has_tokens", return_value=True),
+                patch.object(
+                    exits, "post_experts_sum_is_one_all_reduce", return_value=False
+                ),
+                patch.object(
+                    exits, "get_lora", return_value=SimpleNamespace(enable_lora=True)
+                ),
+                patch.object(
+                    exits,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        comm=SimpleNamespace(enable_quant_communications=False)
+                    ),
+                ),
+                patch.object(
+                    exits,
+                    "get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: not a2a),
+                ),
+                patch.object(
+                    exits, "get_parallel", return_value=SimpleNamespace(tp_group=group)
+                ),
+                patch.object(exits, "post_experts_reduction_group", return_value=group),
+                patch.object(
+                    exits, "apply_flashinfer_allreduce_fusion", return_value=False
+                ),
+                patch.object(
+                    provider, "can_defer_all_reduce", return_value=eligible
+                ) as gate,
+            ):
+                # Avoid platform-specific Aiter details: no residual cannot fuse.
+                with patch.object(exits, "_use_aiter", False, create=True):
+                    result = exits._can_defer_ffn_reduction(fb, boundary)
+                self.assertEqual(result, eligible and not a2a)
+                if a2a:
+                    gate.assert_not_called()
 
 
 if __name__ == "__main__":

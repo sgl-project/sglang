@@ -49,6 +49,7 @@ from sglang.srt.layers.communicator.ops import (
     _read_input,
     move_rows,
     tp_reduce_scatter,
+    tp_slice,
 )
 from sglang.srt.layers.communicator.residual import (
     LayerResidual,
@@ -551,6 +552,7 @@ class StageEntry(msgspec.Struct, frozen=True):
     capture_move: Optional[Callable] = None
     capture_move_allocates: bool = False
     capture_preserves_residual: Optional[Callable] = None
+    input_sum: Optional[SumGroup] = None
 
 
 class BoundarySteps(msgspec.Struct, frozen=True):
@@ -724,6 +726,20 @@ def _bind_consumer(
         cp_moves=cp_moves,
         enters_stack=enters_stack,
     )
+    completed_step = None
+    if edge.produced.always_leaves:
+        completed_step, _, _ = _select_input_steps(
+            msgspec.structs.replace(edge.produced, always_leaves=False),
+            residual=edge.residual,
+            residual_to=edge.residual_to,
+            need=edge.need,
+            adds_plainly=adds_plainly,
+            fusions=(),
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            residual_joins_sum=False,
+            cp_moves=cp_moves,
+            enters_stack=enters_stack,
+        )
     # A written stream entering the first physical layer must not run enter
     # again (e.g. MHC expansion). Both alternatives are bound at construction.
     written_step = None
@@ -747,7 +763,8 @@ def _bind_consumer(
             step=step,
             adds_plainly=adds_plainly,
             carried_fusions=carried_fusions if plain else (),
-            owes_by_construction=edge.produced.always_leaves,
+            expected_sum=edge.produced.group if edge.produced.always_leaves else None,
+            completed_step=completed_step,
             written_step=written_step,
         ),
         input_move=input_move,
@@ -826,12 +843,18 @@ def _select_boundary_steps(
             handoff=attention_handoff,
             capture_move=into_attention.capture_move,
             capture_move_allocates=into_attention.capture_move_allocates,
+            input_sum=edges.into_attention.produced.group
+            if edges.into_attention.produced.always_leaves
+            else None,
         ),
         ffn=StageEntry(
             prepare=into_ffn.prepare,
             input_rows=into_ffn.input_rows,
             input_move=into_ffn.input_move,
             fused=into_ffn.fused,
+            input_sum=edges.into_ffn.produced.group
+            if edges.into_ffn.produced.always_leaves
+            else None,
         ),
         ffn_output=edges.out_of_ffn.produced,
         ffn_output_move=out_of_ffn.output_move,
@@ -895,17 +918,19 @@ def _select_input_steps(
         if residual == residual_to:
             # The residual stays on each rank's slice while the stage takes the
             # rows around it (MHC on an input-scattered batch).
-            if gathered or owes is not SumGroup.ATTN_TP:
+            if gathered or owes not in (None, SumGroup.ATTN_TP):
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
             return (
-                partial(_mlp_input_on_residual_shard, read=read),
+                partial(
+                    _mlp_input_on_residual_shard, read=read, reduces=owes is not None
+                ),
                 (),
                 None,
             )
         # A reduce-scatter completes the TP sum onto each rank's slice, which
         # the stage takes: its group is the TP group without attention DP or CP.
         if (
-            owes is not SumGroup.TP
+            owes not in (None, SumGroup.TP)
             or residual.sharded
             or TokenAxis.ATTN_TP_SCATTER not in need.gathers_itself
             or residual_to.sharded != {TokenAxis.ATTN_TP_SCATTER}
@@ -914,7 +939,7 @@ def _select_input_steps(
         return (
             partial(
                 _read_input,
-                layer_input=tp_reduce_scatter,
+                layer_input=tp_reduce_scatter if owes is not None else tp_slice,
                 enters_stack=enters_stack,
                 read=read,
             ),
@@ -974,7 +999,17 @@ def _select_input_steps(
     if not gathered:
         if owes is None:
             if gathers_residual:
-                raise NotImplementedError(f"{produced=} {residual=} {need=}")
+                return (
+                    partial(
+                        _mlp_input_without_dp,
+                        gathers_residual=True,
+                        fusions=(),
+                        group=None,
+                        read=read,
+                    ),
+                    (),
+                    None,
+                )
             return (
                 partial(
                     _read_input,

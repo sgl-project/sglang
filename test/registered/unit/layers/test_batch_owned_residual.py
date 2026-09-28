@@ -73,6 +73,9 @@ class TestBatchOwnedResidual(CustomTestCase):
 
     def test_pp_receive_attaches_and_export_releases_the_same_stream(self):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator._batch_steps = lambda _: SimpleNamespace(
+            attention=SimpleNamespace(input_sum=None), ffn=None
+        )
         fb = SimpleNamespace(residual_stream=None)
         hidden = torch.full((2, 4), 2.0)
         residual = torch.ones(2, 4)

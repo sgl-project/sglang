@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.communicator import ADD
+from sglang.srt.layers.communicator.layout import SumGroup
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
@@ -84,9 +85,11 @@ class TestNemotronMTPReduction(CustomTestCase):
                     )
                     stream = residual_batch.start(batch)
                     stream.write(residual)
-                    partial = stream.leave(partial, ADD)
+                    partial = stream.leave(
+                        partial, ADD, declared_sum=SumGroup.ATTN_TP if tp > 1 else None
+                    )
                     hidden, output_residual = layer(
-                        inputs_embeds=torch.zeros_like(partial),
+                        inputs_embeds=torch.zeros_like(residual),
                         hidden_states=partial,
                         residual=stream,
                         forward_batch=batch,

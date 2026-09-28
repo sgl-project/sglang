@@ -244,6 +244,7 @@ def test_communicator_publishes_layout_at_each_transition(
     )
     selected = SimpleNamespace(
         attention=SimpleNamespace(
+            input_sum=None,
             prepare=partial(
                 _consumer_step,
                 step=partial(
@@ -260,6 +261,7 @@ def test_communicator_publishes_layout_at_each_transition(
             handoff=lambda hidden_states, *args: hidden_states,
         ),
         ffn=SimpleNamespace(
+            input_sum=None,
             prepare=lambda hidden_states, residual, *args, **kwargs: (
                 hidden_states,
                 residual,

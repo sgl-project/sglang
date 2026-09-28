@@ -38,7 +38,7 @@ def dense_layer(*, reduce_scatter):
             ffn_output=SimpleNamespace(update=comm.ADD)
         ),
         _declared_ffn_sum=lambda steps, skipped: None,
-        _leave_ffn_output=lambda h, r, stream, update, declared_sum=None: (h, r),
+        _leave_ffn_output=lambda h, r, stream, update, declared_sum: (h, r),
         # A dense layer never leaves its sum to the next layer.
         _select_ffn_completion=lambda fb: comm.FfnCompletion(
             defer_moe_finalize=False,
