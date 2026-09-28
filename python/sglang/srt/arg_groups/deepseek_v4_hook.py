@@ -172,12 +172,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     )
 
     cfg = resolving_view(server_args)
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+    hf_config = model_config_of(server_args).hf_config
+    if hf_config.model_type != "deepseek_v41":
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if hf_config.vision_n_layers > 0 and cfg.enable_prefill_cp:
+        _validate_deepseek_v41_vision_prefill_cp(server_args)
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -188,7 +191,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", cfg.enable_dp_attention),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            # Prefill CP declares attn_cp_size and DP attention only later.
+            ("context parallelism", cfg.attn_cp_size > 1 or cfg.enable_prefill_cp),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -287,3 +291,39 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+
+
+def _validate_deepseek_v41_vision_prefill_cp(server_args: ServerArgs) -> None:
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+
+    cfg = resolving_view(server_args)
+    if cfg.cp_strategy != "interleave":
+        raise ValueError(
+            "DeepSeek-V4.1 vision with prefill CP requires --cp-strategy "
+            f"interleave; got {cfg.cp_strategy!r}."
+        )
+    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        locked = getattr(server_args, "_cuda_graph_config_locked", set())
+        if (Phase.PREFILL, "backend") in locked:
+            raise ValueError(
+                "DeepSeek-V4.1 vision with prefill CP runs eager prefill; remove "
+                "the explicit prefill CUDA graph backend."
+            )
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_features",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        logger.warning(
+            "Disabling the prefill CUDA graph for DeepSeek-V4.1 vision with prefill CP."
+        )
+    if (
+        str(cfg.speculative_algorithm).upper() == "DSPARK"
+        and cfg.enable_decoder_swa_bounded_replay
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 vision with prefill CP does not support DSpark together "
+            "with --enable-decoder-swa-bounded-replay yet."
+        )
