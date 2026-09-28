@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -329,6 +330,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         req.set_extend_range(len(prefix), len(tokens))
         req.kv.cache_protected_len = len(req.prefix_indices)
         req.kv.kv_committed_len = len(prefix)
+        req.kv.kv_allocated_len = len(prefix)
         req.prefix_indices, req.extra_key = prefix, None
         req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
 
@@ -627,7 +629,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
             self.assertEqual(req.discard_output_reason.status_code, 503)
             self.assertTrue(req.skip_radix_cache_insert)
-            consumer.cache_finished_req(req, is_insert=False, owned_kv_len=4)
+            release_kv_cache(req, consumer, is_insert=False)
+            self.assertFalse(req.kv.holds_kv)
+            self.assertTrue(req.kv.is_kv_released)
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
             unpublished = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
