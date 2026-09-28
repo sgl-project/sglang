@@ -198,6 +198,10 @@ Mooncake loads configuration in the following priority order:
 2. If not, Mooncake checks whether the environment variable `DEFAULT_MOONCAKE_CONFIG_PATH_ENV` is set, and loads the JSON config file from that path.
 3. If neither of the above is provided, Mooncake falls back to environment variables.
 
+For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend`, omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
+
+When loading from a JSON config file, `local_hostname` follows the same per-process precedence: `MOONCAKE_LOCAL_HOSTNAME`, then `LOCAL_HOSTNAME`, then the value in the JSON file, then `"localhost"`.
+
 **Using extra-config of sglang arguments to configure Mooncake**
 
 ```bash
@@ -260,7 +264,7 @@ When `tenant_id` is set, SGLang forwards it to `MooncakeDistributedStore.setup(.
 
 You can configure it through `tenant_id` in `--hicache-storage-backend-extra-config`, `tenant_id` in the JSON config file, or `MOONCAKE_TENANT_ID`.
 
-> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` requires **mooncake-transfer-engine >= 0.3.12**, which added `tenant_id` to `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client. If you use `--enable_multi_tenants=true`, register the composed tenant name produced by KV-cache dtype isolation (for example `dtype_bfloat16` or `tenant-a_dtype_fp8_e4m3`).
+> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` requires **mooncake-transfer-engine >= 0.3.12**, which added `tenant_id` to `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client. If you use `--enable_multi_tenants=true`, register the composed tenant name produced by KV-cache dtype isolation (for example `dtype_bfloat16` or `tenant-a_dtype_float8_e4m3fn`).
 
 **SSD Offload (`enable_ssd_offload`):**
 
@@ -319,12 +323,14 @@ python -m sglang.launch_server \
 
 **KV Cache Dtype Isolation:**
 
-HiCache keys do not include `--kv-cache-dtype`. Sharing one Mooncake store between a `bfloat16` instance and an `fp8_e4m3` instance would otherwise collide on the same object keys. SGLang isolates them through Mooncake `tenant_id`:
+SGLang appends the resolved KV-cache dtype to the Mooncake tenant, keeping different cache formats in separate namespaces:
 
 - Default tenant + `bfloat16` → `dtype_bfloat16`
-- Explicit tenant `tenant-a` + `fp8_e4m3` → `tenant-a_dtype_fp8_e4m3`
+- Explicit tenant `tenant-a` + `float8_e4m3fn` → `tenant-a_dtype_float8_e4m3fn`
 
-This requires **mooncake-transfer-engine >= 0.3.12**. Older packages fail at `setup()` with an upgrade hint. `extra_backend_tag` and `model_name` still prefix object keys via `config_prefix` and are independent of dtype isolation.
+The suffix uses the logical torch dtype, so `--kv-cache-dtype fp8_e4m3` resolves to `float8_e4m3fn` on CUDA, even when buffers store FP8 bytes as `uint8`. `auto` uses the resolved cache dtype, including checkpoint quantization settings. `extra_backend_tag` and `model_name` continue to prefix object keys independently.
+
+Enable `--enable_multi_tenants=true` on the Mooncake master and register the composed tenant names in its quota policy. Without this, Mooncake uses the default namespace and dtype isolation is not enforced. Older clients that reject `tenant_id` fail at startup with an upgrade hint.
 
 ```bash
 python -m sglang.launch_server \
@@ -375,7 +381,7 @@ mooncake_master --eviction_high_watermark_ratio=0.95
 mooncake_client --global_segment_size=4GB
 ```
 
-Dummy `setup_dummy()` does not pass `tenant_id`. For dtype isolation, start `mooncake_client` with the matching composed tenant, e.g. `--tenant_id=dtype_fp8_e4m3`.
+Dummy `setup_dummy()` does not pass `tenant_id`. For dtype isolation, start `mooncake_client` with the matching composed tenant, e.g. `--tenant_id=dtype_float8_e4m3fn`.
 
 **Parameter Explanation:**
 

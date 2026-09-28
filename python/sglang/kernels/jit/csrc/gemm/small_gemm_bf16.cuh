@@ -1,0 +1,249 @@
+/// \file small_gemm_bf16.cuh
+/// \brief Small bf16 GEMMs for two fixed shapes, `out[m, n] = sum_k a[m, k] * b[n, k]`
+/// with N = 128, K = 512 (one warp per output column) and N = 32, K = 5120 (one CTA
+/// per output column).
+///
+/// The thread-to-K mapping and reduction order are those of tiny_gemm's N-variant,
+/// so results are row-invariant across M and bitwise equal to tiny_gemm where both
+/// apply; cuBLAS uses a different reduction order.
+
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/gemm/dot_product.cuh>
+
+#include <tvm/ffi/container/tensor.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+namespace sglang {
+
+struct SmallGemmParams {
+  bf16_t* __restrict__ out;
+  const bf16_t* __restrict__ a;
+  const bf16_t* __restrict__ b;
+  int64_t stride_a;  // row stride of `a`, in elements
+  uint32_t m;        // batch size
+};
+
+template <uint32_t M_SPLIT_>
+struct N128K512Trait {
+  static constexpr uint32_t N = 128;
+  static constexpr uint32_t K = 512;
+  static constexpr uint32_t kMaxMSplit = 8;
+  static constexpr uint32_t M_SPLIT = M_SPLIT_;  // rows of `a` one warp handles
+  static_assert(M_SPLIT >= 1 && M_SPLIT <= kMaxMSplit, "M_SPLIT must be in [1, 8]");
+  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(bf16_t);
+  static constexpr uint32_t kNumVecs = K / (kVecSize * device::kWarpThreads);
+  static_assert(K % (kVecSize * device::kWarpThreads) == 0, "K must be a whole number of warp-wide vectors");
+  using vec_t = device::AlignedVector<bf16x2_t, kVecSize / 2>;
+  static constexpr uint32_t kBlockSize = 128;
+  static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
+  static_assert(N % kNumWarps == 0, "every warp of a block owns one output column");
+  static constexpr uint32_t kGridX = N / kNumWarps;
+};
+
+template <typename T, bool kUsePDL>
+__global__ __launch_bounds__(T::kBlockSize, 1) void n128k512_kernel(const SmallGemmParams params) {
+  using namespace device;
+  constexpr uint32_t kNumVecs = T::kNumVecs;
+  constexpr uint32_t M_SPLIT = T::M_SPLIT;
+  constexpr uint32_t K = T::K;
+  constexpr uint32_t N = T::N;
+  using vec_t = typename T::vec_t;
+
+  const uint32_t M = params.m;
+  const uint32_t warp_id = threadIdx.x / kWarpThreads;
+  const uint32_t n = blockIdx.x * T::kNumWarps + warp_id;
+  const uint32_t m_start = blockIdx.y * M_SPLIT;
+  const auto gmem = tile::Memory<vec_t>::warp();
+
+  // The weight row does not depend on the previous kernel: load it before the PDL wait.
+  vec_t b[kNumVecs];
+#pragma unroll
+  for (uint32_t j = 0; j < kNumVecs; ++j) {
+    b[j] = gmem.load(params.b + n * K, j);
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+
+  // Clamp padded loads to the last valid row to keep vector loads branch-free;
+  // only stores are guarded.
+  vec_t a[M_SPLIT][kNumVecs];
+#pragma unroll
+  for (uint32_t i = 0; i < M_SPLIT; ++i) {
+    const uint32_t m = min(m_start + i, M - 1);
+#pragma unroll
+    for (uint32_t j = 0; j < kNumVecs; ++j) {
+      a[i][j] = gmem.load(params.a + m * params.stride_a, j);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t i = 0; i < M_SPLIT; ++i) {
+    float acc = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < kNumVecs; ++j) {
+      dot_product_vec(a[i][j], b[j], acc);
+    }
+    acc = warp::reduce_sum(acc);
+    const uint32_t m = m_start + i;
+    if (m < M) {
+      params.out[m * N + n] = cast<bf16_t>(acc);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <uint32_t M_SPLIT_>
+struct N32K5120Trait {
+  static constexpr uint32_t N = 32;
+  static constexpr uint32_t K = 5120;
+  static constexpr uint32_t kMaxMSplit = 8;
+  static constexpr uint32_t M_SPLIT = M_SPLIT_;  // rows of `a` one CTA handles
+  static_assert(M_SPLIT >= 1 && M_SPLIT <= kMaxMSplit, "M_SPLIT must be in [1, 8]");
+  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(bf16_t);
+  // Ten warps preserve tiny_gemm's mapping: thread t owns [16t, 16t + 16).
+  static constexpr uint32_t kBlockSize = 320;
+  static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
+  static constexpr uint32_t kNumVecs = K / (kVecSize * kBlockSize);  // vectors per thread
+  static_assert(K % (kVecSize * kBlockSize) == 0, "K must be a whole number of CTA-wide vectors");
+  static_assert(kBlockSize % device::kWarpThreads == 0, "the reduction needs whole warps");
+  static_assert(M_SPLIT <= kBlockSize, "one thread finishes one row");
+  using vec_t = device::AlignedVector<bf16x2_t, kVecSize / 2>;
+  static constexpr uint32_t kGridX = N;  // one CTA per output column
+};
+
+template <typename T, bool kUsePDL>
+__global__ __launch_bounds__(T::kBlockSize, 1) void n32k5120_kernel(const SmallGemmParams params) {
+  using namespace device;
+  constexpr uint32_t kNumVecs = T::kNumVecs;
+  constexpr uint32_t kNumWarps = T::kNumWarps;
+  constexpr uint32_t M_SPLIT = T::M_SPLIT;
+  constexpr uint32_t K = T::K;
+  constexpr uint32_t N = T::N;
+  using vec_t = typename T::vec_t;
+
+  const uint32_t M = params.m;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t warp_id = tx / kWarpThreads;
+  const uint32_t n = blockIdx.x;
+  const uint32_t m_start = blockIdx.y * M_SPLIT;
+  const auto gmem = tile::Memory<vec_t>::cta(T::kBlockSize);
+
+  // The weight column does not depend on the previous kernel: load it before the PDL wait.
+  vec_t b[kNumVecs];
+#pragma unroll
+  for (uint32_t j = 0; j < kNumVecs; ++j) {
+    b[j] = gmem.load(params.b + n * K, j);
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+
+  // Clamp padded loads to the last valid row to keep vector loads branch-free;
+  // only stores are guarded.
+  vec_t a[M_SPLIT][kNumVecs];
+#pragma unroll
+  for (uint32_t i = 0; i < M_SPLIT; ++i) {
+    const uint32_t m = min(m_start + i, M - 1);
+#pragma unroll
+    for (uint32_t j = 0; j < kNumVecs; ++j) {
+      a[i][j] = gmem.load(params.a + m * params.stride_a, j);
+    }
+  }
+
+  __shared__ float s_acc[kNumWarps][M_SPLIT];
+#pragma unroll
+  for (uint32_t i = 0; i < M_SPLIT; ++i) {
+    float acc = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < kNumVecs; ++j) {
+      dot_product_vec(a[i][j], b[j], acc);
+    }
+    acc = warp::reduce_sum(acc);
+    if (tx % kWarpThreads == 0) s_acc[warp_id][i] = acc;
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+
+  // One thread per row sums the warps in a fixed order, so a row's result does
+  // not depend on which rows share its CTA.
+  if (tx < M_SPLIT) {
+    float acc = s_acc[0][tx];
+#pragma unroll
+    for (uint32_t w = 1; w < kNumWarps; ++w) {
+      acc += s_acc[w][tx];
+    }
+    const uint32_t m = m_start + tx;
+    if (m < M) {
+      params.out[m * N + n] = cast<bf16_t>(acc);
+    }
+  }
+}
+
+// Which kernel serves a trait family; the launcher below is shared.
+template <typename T, bool kUsePDL>
+struct SmallGemmLaunch;
+
+template <uint32_t M_SPLIT, bool kUsePDL>
+struct SmallGemmLaunch<N128K512Trait<M_SPLIT>, kUsePDL> {
+  static constexpr void (*kFn)(SmallGemmParams) = n128k512_kernel<N128K512Trait<M_SPLIT>, kUsePDL>;
+};
+
+template <uint32_t M_SPLIT, bool kUsePDL>
+struct SmallGemmLaunch<N32K5120Trait<M_SPLIT>, kUsePDL> {
+  static constexpr void (*kFn)(SmallGemmParams) = n32k5120_kernel<N32K5120Trait<M_SPLIT>, kUsePDL>;
+};
+
+template <template <uint32_t> class Trait, bool kUsePDL>
+struct SmallGemmKernel {
+  using Trait1 = Trait<1>;
+  static constexpr uint32_t kMaxMSplit = Trait1::kMaxMSplit;
+  using KernelFn = void (*)(SmallGemmParams);
+
+  template <std::size_t... I>
+  static constexpr auto make_table(std::index_sequence<I...>) {
+    return std::array<KernelFn, kMaxMSplit + 1>{nullptr, SmallGemmLaunch<Trait<I + 1>, kUsePDL>::kFn...};
+  }
+  static constexpr auto kTable = make_table(std::make_index_sequence<kMaxMSplit>{});
+
+  static void run(const tvm::ffi::TensorView a, const tvm::ffi::TensorView b, const tvm::ffi::TensorView out) {
+    using namespace host;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M, Trait1::K}).with_strides({-1, 1}).with_dtype<bf16_t>().with_device(device).verify(a);
+    TensorMatcher({Trait1::N, Trait1::K}).with_dtype<bf16_t>().with_device(device).verify(b);
+    TensorMatcher({M, Trait1::N}).with_dtype<bf16_t>().with_device(device).verify(out);
+    const auto m = static_cast<uint32_t>(M.unwrap());
+    if (m == 0) return;
+    // Rows are loaded as whole vectors, so a row-sliced view must keep its row starts vector-aligned.
+    CHECK_HOST(a.stride(0) % Trait1::kVecSize == 0)
+        << "a rows must stay aligned to the vector width, got stride " << a.stride(0);
+    // Spread the rows evenly over as few y-blocks as kMaxMSplit rows each allow.
+    const uint32_t grid_y = div_ceil(m, kMaxMSplit);
+    const uint32_t m_split = div_ceil(m, grid_y);
+    const auto params = SmallGemmParams{
+        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .a = static_cast<const bf16_t*>(a.data_ptr()),
+        .b = static_cast<const bf16_t*>(b.data_ptr()),
+        .stride_a = static_cast<int64_t>(a.stride(0)),
+        .m = m,
+    };
+    LaunchKernel(dim3(Trait1::kGridX, grid_y), dim3(Trait1::kBlockSize), device.unwrap())
+        .enable_pdl(kUsePDL)(kTable[m_split], params);
+  }
+};
+
+}  // namespace sglang

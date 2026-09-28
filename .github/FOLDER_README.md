@@ -12,8 +12,8 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci` |
-| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-extra-ci` |
+| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-extra-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group` |
 
 `/rerun-test` and `/rerun-group` are gated on the commenter alone: either

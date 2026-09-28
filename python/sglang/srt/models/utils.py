@@ -30,15 +30,15 @@ from sglang.kernels.ops.layernorm.norm import (
     fused_inplace_qknorm,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -296,13 +297,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
-        and not is_cp_v2_active(forward_batch)
+        and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (
-        _is_hip
-        and not get_parallel().enable_prefill_context_parallel
-        and getattr(forward_batch, "dcp_kv_mask", None) is None
-    )
+    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
 
 
 def create_fused_set_kv_buffer_arg(
@@ -453,6 +450,30 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     return x.reshape(-1, head_dim)
 
 
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_cpu")
+
+
+def can_use_fused_qk_norm_cpu(
+    q: torch.Tensor, k: torch.Tensor, head_dim: int, q_eps: float, k_eps: float
+) -> bool:
+    return (
+        _is_cpu
+        and q_eps == k_eps
+        and q.dim() == 2
+        and k.dim() == 2
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        # q/k are usually strided views into qkv; only the head rows must be dense
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and q.size(-1) % head_dim == 0
+        and k.size(-1) % head_dim == 0
+        and _has_cpu_fused_qk_norm()
+    )
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -482,6 +503,12 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    if allow_inplace and can_use_fused_qk_norm_cpu(q, k, head_dim, q_eps, k_eps):
+        torch.ops.sgl_kernel.fused_qk_norm_cpu(
+            q, k, q_norm.weight, k_norm.weight, q_eps
+        )
+        return q, k
 
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends

@@ -1,279 +1,156 @@
-"""Unit tests for Mooncake KV-cache dtype isolation via tenant_id."""
+"""CPU regressions for dtype namespaces and Mooncake setup compatibility."""
 
-import types
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageConfig,
-    format_kv_cache_dtype,
+from sglang.srt.managers import cache_controller
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    MooncakeBaseStore,
+    MooncakeStore,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _fake_mooncake_modules(fake_store_cls):
-    mooncake = types.ModuleType("mooncake")
-    mooncake_store = types.ModuleType("mooncake.store")
-    mooncake_store.MooncakeDistributedStore = fake_store_cls
-
-    class ReplicateConfig:
-        pass
-
-    mooncake_store.ReplicateConfig = ReplicateConfig
-    return {
-        "mooncake": mooncake,
-        "mooncake.store": mooncake_store,
-    }
-
-
-def _fake_metrics_module():
-    metrics = types.ModuleType("sglang.srt.observability.metrics_collector")
-
-    class StorageMetrics:
-        def __init__(self):
-            self.prefetch_pgs = []
-            self.backup_pgs = []
-            self.prefetch_bandwidth = []
-            self.backup_bandwidth = []
-
-    metrics.StorageMetrics = StorageMetrics
-    return {"sglang.srt.observability.metrics_collector": metrics}
-
-
-def _fake_host_pool_modules():
-    pool_host = types.ModuleType("sglang.srt.mem_cache.pool_host")
-
-    class HostKVCache:
-        pass
-
-    class HostTensorAllocator:
-        pass
-
-    pool_host.HostKVCache = HostKVCache
-    pool_host.HostTensorAllocator = HostTensorAllocator
-
-    pool_host_mla = types.ModuleType("sglang.srt.mem_cache.pool_host.mla")
-
-    class MLATokenToKVPoolHost:
-        pass
-
-    pool_host_mla.MLATokenToKVPoolHost = MLATokenToKVPoolHost
-    return {
-        "sglang.srt.mem_cache.pool_host": pool_host,
-        "sglang.srt.mem_cache.pool_host.mla": pool_host_mla,
-    }
-
-
-def _import_stubs(fake_store_cls):
-    return {
-        **_fake_mooncake_modules(fake_store_cls),
-        **_fake_host_pool_modules(),
-        **_fake_metrics_module(),
-    }
-
-
-def _fake_store_class():
-    class FakeMooncakeDistributedStore:
-        instances = []
-
-        def __init__(self):
-            self.setup_calls = []
-            self.batch_put_calls = []
-            self.existing_keys = set()
-            self.objects = {}
-            type(self).instances.append(self)
-
-        def setup(self, *args, **kwargs):
-            self.setup_calls.append((args, kwargs))
-            return 0
-
-        def register_buffer(self, *args, **kwargs):
-            return 0
-
-        def put(self, key, value, *args):
-            self.objects[key] = value
-            return 0
-
-        def is_exist(self, key):
-            return 1 if key in self.objects or key in self.existing_keys else 0
-
-        def get(self, key):
-            return self.objects.get(key)
-
-        def batch_is_exist(self, keys):
-            return [1 if key in self.existing_keys else 0 for key in keys]
-
-        def batch_put_from(self, keys, ptrs, sizes, *args):
-            self.batch_put_calls.append({"keys": list(keys), "args": args})
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
-
-    return FakeMooncakeDistributedStore
-
-
-class OldMooncakeDistributedStore(_fake_store_class()):
-    instances = []
-
-    def setup(self, *args, **kwargs):
-        if "tenant_id" in kwargs:
-            raise TypeError("tenant_id is an invalid keyword argument")
-        return super().setup(*args, **kwargs)
-
-
-class FakeHostKVCache:
-    def __init__(self):
-        self.kv_buffer = torch.empty((1024,), dtype=torch.uint8)
-        self.layout = "page_first"
-        self.page_size = 1
-
-    def get_ksize_per_token(self):
-        return 1
-
-    def get_page_buffer_meta(self, indices):
-        page_count = len(indices) // self.page_size
-        return (
-            [1000 + i for i in range(page_count * 2)],
-            [8] * (page_count * 2),
+class TestMooncakeKvCacheDtype(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.client.setup.return_value = 0
+        self.client.batch_is_exist.return_value = [1, 1]
+        self.config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name=None,
+            extra_config={
+                "master_server_address": "127.0.0.1:50051",
+                "check_server": False,
+                "global_segment_size": 1024 * 1024,
+            },
         )
-
-
-def _make_config(
-    *,
-    extra_backend_tag=None,
-    kv_cache_dtype=None,
-    tenant_id=None,
-):
-    extra_config = {
-        "master_server_address": "127.0.0.1:50051",
-        "check_server": False,
-        "global_segment_size": 1024 * 1024,
-    }
-    if extra_backend_tag is not None:
-        extra_config["extra_backend_tag"] = extra_backend_tag
-    if tenant_id is not None:
-        extra_config["tenant_id"] = tenant_id
-
-    return HiCacheStorageConfig(
-        tp_rank=0,
-        tp_size=1,
-        pp_rank=0,
-        pp_size=1,
-        attn_cp_rank=0,
-        attn_cp_size=1,
-        is_mla_model=False,
-        enable_storage_metrics=False,
-        is_page_first_layout=True,
-        model_name=None,
-        extra_config=extra_config,
-        kv_cache_dtype=kv_cache_dtype,
-    )
-
-
-def _make_store(**kwargs):
-    fake_store_cls = _fake_store_class()
-    cfg = _make_config(**kwargs)
-    with patch.dict(
-        "sys.modules",
-        _import_stubs(fake_store_cls),
-    ):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        store = MooncakeStore(cfg)
-    store.register_mem_pool_host(FakeHostKVCache())
-    return store, fake_store_cls.instances[-1]
-
-
-def _assert_old_mooncake_rejects_tenant(test_case, **cfg_kwargs):
-    OldMooncakeDistributedStore.instances = []
-    cfg = _make_config(**cfg_kwargs)
-    with patch.dict("sys.modules", _import_stubs(OldMooncakeDistributedStore)):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
-
-        with test_case.assertRaisesRegex(
-            RuntimeError, "mooncake-transfer-engine>=0.3.12"
+        for patcher in (
+            patch.object(
+                MooncakeBaseStore,
+                "_import_mooncake_store",
+                return_value=lambda: self.client,
+            ),
+            patch.object(
+                MooncakeBaseStore,
+                "_import_mooncake_group_semantics",
+                return_value=(None, False),
+            ),
+            patch.object(MooncakeStore, "warmup"),
         ):
-            MooncakeStore(cfg)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
+    def test_dtype_namespaces_preserve_object_keys(self):
+        for tenant in ("default", "tenant-a"):
+            for dtype in (None, "bfloat16", "float16", "float8_e4m3fn", "float8_e5m2"):
+                with self.subTest(tenant=tenant, dtype=dtype):
+                    self.config.kv_cache_dtype = dtype
+                    self.config.extra_config["tenant_id"] = tenant
+                    store = MooncakeStore(self.config)
+                    expected = tenant
+                    if dtype:
+                        expected = (
+                            f"dtype_{dtype}"
+                            if tenant == "default"
+                            else f"{tenant}_dtype_{dtype}"
+                        )
+                    self.assertEqual(
+                        self.client.setup.call_args.kwargs.get("tenant_id", "default"),
+                        expected,
+                    )
+                    self.assertEqual(store.batch_exists(["page0"]), 1)
+                    self.client.batch_is_exist.assert_called_with(
+                        ["page0_0_k", "page0_0_v"]
+                    )
 
-class TestFormatKvCacheDtype(CustomTestCase):
-    def test_formats_torch_dtype(self):
-        self.assertEqual(format_kv_cache_dtype(torch.bfloat16), "bfloat16")
-        self.assertEqual(format_kv_cache_dtype(torch.float8_e4m3fn), "float8_e4m3fn")
-
-    def test_formats_string_and_none(self):
-        self.assertEqual(format_kv_cache_dtype("torch.bfloat16"), "bfloat16")
-        self.assertEqual(format_kv_cache_dtype("  fp8_e4m3  "), "fp8_e4m3")
-        self.assertIsNone(format_kv_cache_dtype(None))
-        self.assertIsNone(format_kv_cache_dtype("   "))
-
-
-class TestMooncakeKvCacheDtypeIsolation(CustomTestCase):
-    def test_missing_dtype_keeps_legacy_keys(self):
-        store, fake_store = _make_store()
-        result = store.batch_set_v1(["page0"], torch.tensor([0]))
-        self.assertEqual(result, [True])
-        self.assertEqual(
-            fake_store.batch_put_calls[0]["keys"],
-            ["page0_0_k", "page0_0_v"],
-        )
-
-    def test_dtype_is_isolated_by_tenant_id(self):
-        store_bf16, fake_bf16 = _make_store(kv_cache_dtype="bfloat16")
-        store_fp8, fake_fp8 = _make_store(kv_cache_dtype="fp8_e4m3")
-
-        self.assertEqual(fake_bf16.setup_calls[0][1]["tenant_id"], "dtype_bfloat16")
-        self.assertEqual(fake_fp8.setup_calls[0][1]["tenant_id"], "dtype_fp8_e4m3")
-
-        store_bf16.batch_set_v1(["page0"], torch.tensor([0]))
-        store_fp8.batch_set_v1(["page0"], torch.tensor([0]))
-        self.assertEqual(
-            fake_bf16.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
-        )
-        self.assertEqual(
-            fake_fp8.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
-        )
-
-    def test_user_tag_is_independent_of_dtype_tenant(self):
-        store, fake_store = _make_store(
-            extra_backend_tag="prod", kv_cache_dtype="bfloat16"
-        )
-        self.assertEqual(fake_store.setup_calls[0][1]["tenant_id"], "dtype_bfloat16")
-        store.batch_set_v1(["page0"], torch.tensor([0]))
-        self.assertEqual(
-            fake_store.batch_put_calls[0]["keys"],
-            ["prod_page0_0_k", "prod_page0_0_v"],
-        )
-
-    def test_batch_exists_uses_unprefixed_keys_under_tenant(self):
-        store, fake_store = _make_store(kv_cache_dtype="bfloat16")
-        fake_store.existing_keys.update(["page0_0_k", "page0_0_v"])
+    def test_model_and_backend_tag_still_prefix_keys(self):
+        self.config.model_name = "org/model"
+        self.config.kv_cache_dtype = "bfloat16"
+        self.config.extra_config["extra_backend_tag"] = "prod"
+        store = MooncakeStore(self.config)
         self.assertEqual(store.batch_exists(["page0"]), 1)
-
-    def test_explicit_tenant_appends_dtype(self):
-        store, fake_store = _make_store(
-            tenant_id="tenant-a",
-            kv_cache_dtype="bfloat16",
+        self.client.batch_is_exist.assert_called_once_with(
+            ["prod_org-model_page0_0_k", "prod_org-model_page0_0_v"]
         )
         self.assertEqual(
-            fake_store.setup_calls[0][1]["tenant_id"],
-            "tenant-a_dtype_bfloat16",
-        )
-        store.batch_set_v1(["page0"], torch.tensor([0]))
-        self.assertEqual(
-            fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
+            self.client.setup.call_args.kwargs["tenant_id"], "dtype_bfloat16"
         )
 
-    def test_dtype_isolation_requires_mooncake_tenant_id(self):
-        _assert_old_mooncake_rejects_tenant(self, kv_cache_dtype="bfloat16")
+    def test_unsupported_tenant_fails_without_retry(self):
+        self.config.kv_cache_dtype = "bfloat16"
+        self.client.setup.side_effect = TypeError(
+            "tenant_id is an invalid keyword argument"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, r"mooncake-transfer-engine>=0\.3\.12"
+        ):
+            MooncakeStore(self.config)
+        self.client.setup.assert_called_once()
+
+    def test_ssd_fallback_preserves_tenant(self):
+        self.config.kv_cache_dtype = "bfloat16"
+        self.config.extra_config["enable_ssd_offload"] = True
+        self.client.setup.side_effect = [
+            TypeError("unexpected keyword argument 'enable_ssd_offload'"),
+            0,
+        ]
+        MooncakeStore(self.config)
+        self.assertEqual(self.client.setup.call_count, 2)
+        self.assertEqual(
+            self.client.setup.call_args.kwargs, {"tenant_id": "dtype_bfloat16"}
+        )
+
+    def test_unrelated_setup_type_error_is_preserved(self):
+        self.client.setup.side_effect = TypeError("invalid buffer size")
+        with self.assertRaisesRegex(TypeError, "invalid buffer size"):
+            MooncakeStore(self.config)
+        self.client.setup.assert_called_once()
+
+    def test_controller_uses_logical_dtype_for_byte_backed_pools(self):
+        controller = cache_controller.HiCacheController.__new__(
+            cache_controller.HiCacheController
+        )
+        # Covers both a byte-backed host pool and a hybrid facade with no dtype.
+        controller.enable_storage_metrics = False
+        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+        parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        with (
+            patch.object(cache_controller, "get_parallel", return_value=parallel),
+            patch.object(
+                cache_controller, "is_dp_attention_enabled", return_value=False
+            ),
+        ):
+            for host_pool in (
+                SimpleNamespace(layout="page_first", dtype=torch.uint8),
+                SimpleNamespace(layout="page_first"),
+            ):
+                controller.mem_pool_host = host_pool
+                for dtype, expected in (
+                    (torch.bfloat16, "bfloat16"),
+                    (torch.float8_e4m3fn, "float8_e4m3fn"),
+                    (torch.float8_e5m2, "float8_e5m2"),
+                ):
+                    with self.subTest(host_pool=host_pool, dtype=dtype):
+                        controller.mem_pool_device = SimpleNamespace(
+                            dtype=dtype, store_dtype=torch.uint8
+                        )
+                        config = controller._generate_storage_config()
+                        self.assertEqual(config.kv_cache_dtype, expected)
 
 
 if __name__ == "__main__":

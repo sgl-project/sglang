@@ -443,12 +443,17 @@ Tool[0] get_weather({"city": "Beijing", "unit": "fahrenheit"})
 
 #### 5.1.1 GSM8K
 
-- Benchmark Method: 5-shot CoT on 200 questions, evaluated via SGLang native backend
+- Benchmark Method: GSM8K on 200 questions using sgl-eval
 - Benchmark Command:
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 200 --parallel 64
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - Test Results:
 
@@ -458,11 +463,13 @@ TODO — replace with real GSM8K accuracy after benchmark run on Hy3-preview (BF
 
 #### 5.1.2 MMLU
 
-- Benchmark Method: 5-shot, all 57 subjects
+- Benchmark Method: zero-shot Chat API evaluation via sgl-eval, all 57 subjects
 - Benchmark Command:
 
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py --nsub 60 --parallel 64
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
 
 - Test Results:

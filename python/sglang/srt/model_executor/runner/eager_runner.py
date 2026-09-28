@@ -28,7 +28,7 @@ from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
     get_cp_strategy,
-    is_cp_v2_active,
+    is_cp_active,
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
@@ -59,7 +59,6 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -82,7 +81,7 @@ if TYPE_CHECKING:
 
 
 class EagerRunner(BaseRunner):
-    def __init__(self, model_runner: ModelRunner) -> None:
+    def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
@@ -150,10 +149,10 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        if run_warmup:
+            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
@@ -281,8 +280,8 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
-        if cp_v2_active:
+        cp_active = is_cp_active(forward_batch)
+        if cp_active:
             prepare_cp_forward(forward_batch)
 
         # Target verify can arrive with ``forward_metadata_ready`` set by an
@@ -293,10 +292,10 @@ class EagerRunner(BaseRunner):
         # directly from the live ``spec_info`` tensors.
         if (
             forward_batch.needs_forward_metadata_init()
-            or cp_v2_active
+            or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
+            if model_runner.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -330,7 +329,7 @@ class EagerRunner(BaseRunner):
                 torch.get_device_module(model_runner.device),
             )
 
-        if not cp_v2_active:
+        if not cp_active:
             forward_batch.attn_cp_metadata = None
 
         category = (
@@ -344,7 +343,7 @@ class EagerRunner(BaseRunner):
                 _is_hip
                 and pcg_runner is not None
                 and not isinstance(pcg_runner, EagerRunner)
-                and not cp_v2_active
+                and not cp_active
             ):
                 # HIP PCG eager fallback: enter the PCG context so Dynamo guards
                 # and PCG-specific MoE/attention paths stay consistent.
@@ -366,8 +365,8 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_v2_active:
-                ret = self._execute_extend_cp_v2(forward_batch, kwargs)
+            elif cp_active:
+                ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
@@ -377,7 +376,7 @@ class EagerRunner(BaseRunner):
                 )
         return ret
 
-    def _execute_extend_cp_v2(
+    def _execute_extend_cp(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         """CP extend: shard inputs at the model boundary, run the body on the

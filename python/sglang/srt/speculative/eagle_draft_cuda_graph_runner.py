@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -9,6 +10,7 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    deployment_attn_dp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -41,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -112,8 +115,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.ps.tp_size
-        self.attn_dp_size = model_runner.ps.attn_dp_size
+        self.tp_size = model_runner.tp_size
+        self.attn_dp_size = deployment_attn_dp_size()
         self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
@@ -139,6 +142,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []  # disables patch_model torch.compile wrapping
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -211,6 +215,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
+            # Real per-request top_k, for the same reason temperatures are
+            # carried: the draft proposal cannot tell a greedy request from a
+            # T=1 one by temperature alone, because SamplingParams rewrites
+            # temperature 0 to temperature=1.0 with top_k=1.
+            # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
+            # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
+            # greedy, for the padded rows and for a run that never copies in.
+            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -342,6 +354,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
@@ -414,7 +427,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             is_any_greedy=False,
@@ -583,6 +596,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.topk_index,
             forward_batch.req_pool_indices,
         ]
+        if self.model_runner.model_config.model_is_mrope:
+            buffers.mrope_positions.zero_()
+            if forward_batch.mrope_positions is not None:
+                copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
+                copy_srcs.append(forward_batch.mrope_positions)
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
             copy_dsts.append(buffers.rids_int[:raw_bs])
             copy_srcs.append(forward_batch.rids_int)
@@ -621,6 +639,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -667,7 +686,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
         # each speculative step).  The glue-graph optimisation is not applied
         # here — see __init__ comment for why.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        self.draft_attn_backend.init_forward_metadata_out_graph(
+            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
+        )
         self.raw_bs = raw_bs
         self.bs = bs
 

@@ -149,6 +149,11 @@ impl UnifiedLRUList {
         self.add_node_(Self::cell_of_(node_id));
     }
 
+    /// Insert beside an existing member without refreshing its recency.
+    pub fn insert_after(&mut self, prev_node_id: NodeIdx_, node_id: NodeIdx_) {
+        self.add_node_after_(Self::cell_of_(prev_node_id), Self::cell_of_(node_id));
+    }
+
     /// Remove a member node, resetting its cell; panics if not a member.
     pub fn remove_node(&mut self, node_id: NodeIdx_) {
         self.remove_node_(Self::cell_of_(node_id));

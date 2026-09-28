@@ -115,6 +115,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    expected_load_ms: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
     # Peak of the warmup calibration probe (the default workload's full shape
@@ -127,6 +128,11 @@ class ScenarioConfig:
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
+    # Per-case override for the wall-clock tolerances (e2e, denoise and stage
+    # timings) when a case's runtime is dominated by shared-runner host I/O
+    # rather than by the code under test. Memory guards keep the profile
+    # tolerance -- they are what such a case actually protects.
+    timing_tolerance: float | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
@@ -141,6 +147,7 @@ class ScenarioConfig:
             expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
             expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            expected_load_ms=optional_float("expected_load_ms"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
             warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
@@ -148,6 +155,7 @@ class ScenarioConfig:
             runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            timing_tolerance=optional_float("timing_tolerance"),
         )
 
 
@@ -165,6 +173,15 @@ class BaselineConfig:
         """Load baseline configuration from JSON file."""
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
+
+        # runner pools with the same gpu can have different host-side latency
+        runner_name = os.environ.get("RUNNER_NAME", "")
+        for prefix, overrides in data.get("runner_overrides", {}).items():
+            if runner_name.startswith(prefix):
+                for name, metrics in overrides.items():
+                    data["scenarios"][name].update(metrics)
+                print(f"--- Performance Runner Baseline: {prefix} ---")
+                break
 
         # Get tolerance profile, defaulting to 'pr_test'
         profile_name = "pr_test"
@@ -314,9 +331,11 @@ class DiffusionTestCase:
     run_perf_check: bool = True
     # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    perf_warmup_requests: int = 0
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
+    expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
@@ -326,12 +345,19 @@ class DiffusionTestCase:
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
             raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        if self.perf_warmup_requests < 0:
+            raise ValueError(f"{self.id}: perf_warmup_requests must be non-negative")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
             )
+        if (
+            self.perf_warmup_requests
+            and self.sampling_params.realtime_num_chunks is not None
+        ):
+            raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
 
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
@@ -461,6 +487,8 @@ class PerformanceSummary:
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+    denoising_stages: set[str] = field(default_factory=set)
+    load_time_ms: float | None = None
 
     @staticmethod
     def from_req_perf_record(
@@ -482,10 +510,13 @@ class PerformanceSummary:
 
         # convert from list to dict
         stage_metrics = {}
+        denoising_stages = set()
         for item in record.stages:
             if isinstance(item, dict) and "name" in item:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
+                if item.get("is_denoising", item["name"] == "DenoisingStage"):
+                    denoising_stages.add(item["name"])
 
         load_peak_vram_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
@@ -521,6 +552,7 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            denoising_stages=denoising_stages,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
             warmup_peak_vram_mb=warmup_peak_vram_mb,

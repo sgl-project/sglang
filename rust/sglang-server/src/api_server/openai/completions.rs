@@ -56,7 +56,7 @@ pub(super) struct SubmittedChoice {
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
     /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`, and native unknown finish types are preserved rather than lost.
+    /// `abort`; unrecognized scheduler finish types are preserved as well.
     finish_reason_override: Option<String>,
 }
 
@@ -306,11 +306,9 @@ fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
-    let input_ids = ids
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PromptSpec::TokenIds(input_ids))
+    Ok(PromptSpec::TokenIds(
+        ids.iter().map(|&id| i64::from(id)).collect(),
+    ))
 }
 
 fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
@@ -445,7 +443,7 @@ fn completion_choice(
             Matched::Token(id) => serde_json::json!(id),
             Matched::Str(value) => serde_json::json!(value),
             // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
+            // multi-token list. Preserve the original token IDs.
             Matched::Tokens(ids) => serde_json::json!(ids),
         });
     (
