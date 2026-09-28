@@ -66,6 +66,22 @@ const EVENT_CHANNEL_BUFFER: usize = 1024;
 /// snapshot is not arriving in time anyway.
 const PENDING_BATCH_LIMIT: usize = 1024;
 
+/// Sequence number of the FIRST batch a publisher ever emits.
+///
+/// SGLang's `ZmqEventPublisher` numbers batches from `itertools.count()`, and it
+/// is constructed once per scheduler process, alongside an empty radix cache. A
+/// `Pending` rank whose first held batch carries this number has therefore
+/// received its publisher's stream from the beginning: no block exists on that
+/// engine that the held batches do not describe, so no sibling can hand over
+/// anything the rank lacks, and the rank is resolved on the spot rather than
+/// swept for. See `resolve_from_origin`.
+///
+/// Only an exact match counts. A first batch at 1 means batch 0 was missed —
+/// ZMQ's slow-joiner window drops whatever is published before the SUB
+/// filter reaches the publisher — and that batch may have stored blocks, so
+/// the rank keeps today's sweep.
+const STREAM_ORIGIN_SEQ: i64 = 0;
+
 /// Delay between peer-sweep attempts while no usable peer has been found.
 ///
 /// Short relative to the bootstrap deadline that bounds the whole sweep, so a
@@ -317,7 +333,7 @@ pub struct KvEventIndex {
     /// any batch whose `seq` is not strictly greater than the previously
     /// applied one. Cleared on `remove_worker` because a re-added worker
     /// may legitimately have a fresh publisher whose sequence numbers
-    /// restart from 1.
+    /// restart from 0.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     /// Worker-sourced `page_size` shared with the cache-aware-zmq policy.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
@@ -552,19 +568,26 @@ async fn bootstrap_coordinator(
             index.bootstrap_deps()
         };
         let deadline = deps.deadline();
-        let ranks: Vec<KvWorkerId> = pending.obligations.iter().map(|(r, _)| r.clone()).collect();
+        // What this sweep speaks for, before late joiners are merged in below.
+        let swept: HashSet<(KvWorkerId, u64)> = pending.obligations.iter().cloned().collect();
 
         // ONE sweep, awaited here rather than spawned — that is what makes this
         // single-flight. Obligations discovered while it runs pile up in the
         // channel and are merged below, so they ride this same snapshot.
         let started = Instant::now();
         info!(
-            ranks = ranks.len(),
+            ranks = swept.len(),
             peers = deps.peers.len(),
             deadline_ms = deadline.as_millis(),
             "kv-bootstrap: sweeping sibling replicas for a tree snapshot",
         );
-        let result = sweep_until_deadline(&deps, &ranks, deadline, pending.freshness_floor).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &pending.obligations,
+            deadline,
+            pending.freshness_floor,
+        )
+        .await;
         let joined = drain_ready(&mut rx, &mut pending);
         if joined > 0 || !pending.deferred.is_empty() {
             debug!(
@@ -602,6 +625,18 @@ async fn bootstrap_coordinator(
                 // than they need would force the peer into avoidable rebuilds.
                 pending.deferred.push(ObligationBatch {
                     obligations: retry,
+                    holding_since: pending.freshness_floor,
+                    late_join: LateJoin::Permitted,
+                });
+            }
+        }
+        if let SweepResult::RanksResolved = result {
+            let unswept = take_unswept(&mut pending.obligations, &swept);
+            if !unswept.is_empty() {
+                // Carry the floor: these were admitted as riders on it, so a
+                // sweep asking with it is what they had already accepted.
+                pending.deferred.push(ObligationBatch {
+                    obligations: unswept,
                     holding_since: pending.freshness_floor,
                     late_join: LateJoin::Permitted,
                 });
@@ -1321,8 +1356,9 @@ impl KvEventIndex {
     ///
     /// Runs detached: `/readyz` is gated by the tracker, not by awaiting this,
     /// so a slow peer delays readiness only up to the bootstrap deadline. Every
-    /// exit path sends exactly one [`PumpControl`] message, which is what
-    /// guarantees the held-back batches are eventually released.
+    /// exit path that leaves ranks `Pending` sends exactly one [`PumpControl`]
+    /// message, which is what guarantees the held-back batches are eventually
+    /// released (see `deliver_bootstrap`).
     fn spawn_bootstrap(&self, batch: ObligationBatch) {
         let deps = self.bootstrap_deps();
         tokio::spawn(async move {
@@ -1331,9 +1367,8 @@ impl KvEventIndex {
                 holding_since,
                 late_join: _,
             } = batch;
-            let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
             let deadline = deps.deadline();
-            let result = sweep_until_deadline(&deps, &ranks, deadline, holding_since).await;
+            let result = sweep_until_deadline(&deps, &obligations, deadline, holding_since).await;
             deliver_bootstrap(&deps, obligations, result, deadline).await;
         });
     }
@@ -1505,6 +1540,11 @@ enum SweepResult {
         peers_tried: usize,
         last_reason: Option<String>,
     },
+    /// Every obligation the sweep was run for left `Pending` on its own
+    /// incarnation without this sweep's snapshot — resolved from its stream's
+    /// origin (`resolve_from_origin`), forgotten, or superseded. Nothing is
+    /// owed to them, so delivery sends no control message.
+    RanksResolved,
 }
 
 impl SweepResult {
@@ -1516,6 +1556,7 @@ impl SweepResult {
             Self::NoPeers => SweepOutcome::NoPeers,
             Self::FleetCold { .. } => SweepOutcome::FleetCold,
             Self::TimedOut { .. } => SweepOutcome::TimedOut,
+            Self::RanksResolved => SweepOutcome::RanksResolved,
         }
     }
 }
@@ -1535,9 +1576,15 @@ impl SweepResult {
 /// `freshness_floor` is the instant every fetch demands the peer's export beat:
 /// re-derived per attempt, so a sweep that runs for minutes keeps asking for the
 /// same coverage rather than drifting into accepting older state.
+///
+/// Each pass sweeps only the obligations still `Pending` on the incarnation they
+/// were registered under. A rank can leave `Pending` while the sweep runs — the
+/// pump resolves it from its stream's origin, or the worker is removed — and a
+/// rank nobody is waiting on must neither keep the sweep alive nor decide which
+/// peer's snapshot is "covering".
 async fn sweep_until_deadline(
     deps: &BootstrapDeps,
-    ranks: &[KvWorkerId],
+    obligations: &[(KvWorkerId, u64)],
     deadline: Duration,
     freshness_floor: Instant,
 ) -> SweepResult {
@@ -1554,8 +1601,14 @@ async fn sweep_until_deadline(
     let last_reason: Mutex<Option<String>> = Mutex::new(None);
     let attempt = async {
         let mut state = SweepState::new();
+        let mut active: Vec<(KvWorkerId, u64)> = obligations.to_vec();
         loop {
-            match sweep_peers(&ctx, ranks, &mut state, &last_reason).await {
+            active.retain(|(rank, epoch)| still_pending(&deps.bootstrap, rank, *epoch));
+            if active.is_empty() {
+                return Some(SweepResult::RanksResolved);
+            }
+            let ranks: Vec<KvWorkerId> = active.iter().map(|(r, _)| r.clone()).collect();
+            match sweep_peers(&ctx, &ranks, &mut state, &last_reason).await {
                 SweepPass::Found(vetted) => return Some(SweepResult::Found(vetted)),
                 SweepPass::FleetCold { peers_tried } => {
                     return Some(SweepResult::FleetCold { peers_tried })
@@ -1582,9 +1635,36 @@ async fn sweep_until_deadline(
     }
 }
 
+/// Whether the obligation `(rank, epoch)` still has a rank waiting on it: the
+/// rank is registered under that incarnation and has not left `Pending`.
+fn still_pending(bootstrap: &BootstrapTracker, rank: &KvWorkerId, epoch: u64) -> bool {
+    bootstrap.epoch_of(rank) == Some(epoch)
+        && bootstrap.state_of(rank) == Some(BootstrapState::Pending)
+}
+
+/// Split off the obligations a [`SweepResult::RanksResolved`] sweep never spoke
+/// for: those merged in after it started (`swept` is the set it started with).
+///
+/// They must not share its delivery — it carries no message, so a late joiner
+/// folded into it would stay `Pending` with nothing left to release it — and
+/// they have had no look of their own, so each gets a sweep rather than being
+/// abandoned. No retry cap applies: a batch re-queued here starts the next sweep
+/// and is swept by it, so it cannot come back through this path.
+fn take_unswept(
+    obligations: &mut Vec<(KvWorkerId, u64)>,
+    swept: &HashSet<(KvWorkerId, u64)>,
+) -> Vec<(KvWorkerId, u64)> {
+    let (kept, unswept) = std::mem::take(obligations)
+        .into_iter()
+        .partition(|ob| swept.contains(ob));
+    *obligations = kept;
+    unswept
+}
+
 /// Turn a sweep result into the single [`PumpControl`] message its obligations
-/// are owed. Every exit path sends exactly one, which is what releases the ranks
-/// from `Pending`.
+/// are owed. Every exit path that leaves ranks `Pending` sends exactly one, which
+/// is what releases them; [`SweepResult::RanksResolved`] sends none, because its
+/// ranks have already left `Pending`.
 async fn deliver_bootstrap(
     deps: &BootstrapDeps,
     obligations: Vec<(KvWorkerId, u64)>,
@@ -1594,6 +1674,13 @@ async fn deliver_bootstrap(
     let n = obligations.len();
     deps.bootstrap.record_sweep_result(result.outcome());
     let msg = match result {
+        SweepResult::RanksResolved => {
+            debug!(
+                ranks = n,
+                "kv-bootstrap: every rank left Pending before a peer snapshot was needed",
+            );
+            return;
+        }
         SweepResult::Found(vetted) => PumpControl::ApplySnapshot {
             obligations,
             vetted: Box::new(vetted),
@@ -2034,7 +2121,7 @@ fn spawn_mode_recheck(
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
 /// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=1 (after sending END_SEQ) is not filtered.
+/// restarting from seq=0 (after sending END_SEQ) is not filtered.
 ///
 /// Also the sole writer of tree state, including snapshot grafts arriving as
 /// [`PumpControl`]; see the single-writer property in [`super::tree`].
@@ -2295,7 +2382,7 @@ async fn pump_loop(
                 engine_load.set(&worker.url, worker.dp_rank, load, Instant::now());
             }
             WorkerEvent::PublisherReset { worker } => {
-                // A fresh publisher restarts sequencing at 1, so any pending
+                // A fresh publisher restarts sequencing at 0, so any pending
                 // splice proof is about a stream that no longer exists and
                 // would misfire against the new numbering.
                 awaiting_splice_proof.remove(&worker);
@@ -2340,8 +2427,17 @@ async fn pump_loop(
                 // stale `BlockStored` from the peer could resurrect a block this
                 // rank has already evicted.
                 if bootstrap.state_of(&worker) == Some(BootstrapState::Pending) {
-                    let queue = held.entry(worker.clone()).or_default();
-                    if queue.len() >= PENDING_BATCH_LIMIT {
+                    let first_of_hold = held.get(&worker).is_none_or(VecDeque::is_empty);
+                    if first_of_hold && seq == STREAM_ORIGIN_SEQ {
+                        // Nothing to wait on a peer for: this stream starts at
+                        // its publisher's origin.
+                        resolve_from_origin(&pump_state, &mut held, &worker);
+                    } else {
+                        let queue = held.entry(worker.clone()).or_default();
+                        if queue.len() < PENDING_BATCH_LIMIT {
+                            queue.push_back((seq, batch));
+                            continue;
+                        }
                         // Dropping from the middle of the stream would leave a
                         // hole the snapshot cannot be spliced across, so give up
                         // on bootstrapping this rank and let it run live.
@@ -2352,9 +2448,6 @@ async fn pump_loop(
                              abandoning bootstrap for this rank",
                         );
                         fail_rank(&pump_state, &mut held, &worker, true, RankOutcome::Overflow);
-                    } else {
-                        queue.push_back((seq, batch));
-                        continue;
                     }
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
@@ -2502,6 +2595,48 @@ fn fail_rank(
     for (seq, batch) in queue {
         apply_batch(tree, cursors, st.tally, rank, seq, &batch);
     }
+}
+
+/// Resolve a `Pending` rank whose first held batch is its publisher's first
+/// batch ever ([`STREAM_ORIGIN_SEQ`]), without a snapshot.
+///
+/// # Why this is safe
+///
+/// A peer snapshot exists to supply blocks the engine stored BEFORE this
+/// replica subscribed. A stream received from its origin has no such blocks:
+/// the publisher is born with the scheduler, next to an empty radix cache, so
+/// every block the engine holds was announced by a batch this rank is about to
+/// apply. The resulting tree is exactly what a replica subscribed from engine
+/// start holds, and is exposed to the same ZMQ drop risk as any live stream,
+/// no more. Waiting instead is pure cost: every sibling that also watched the
+/// engine start is itself holding this rank's batches, so no snapshot anywhere
+/// covers it, and the sweep burns the whole bootstrap deadline — holding
+/// `/readyz` on a booting replica — to learn nothing.
+///
+/// Clears the rank's tree state and cursor first. A rank on its first
+/// incarnation has neither; one back in `Pending` for a gap retry does
+/// (`fail_rank` replays its queue), and batch 0 means that engine process has
+/// since restarted without a graceful `END_SEQ`, so the old state describes a
+/// cache that no longer exists and its cursor would filter the new stream.
+///
+/// Leaves the caller to apply the triggering batch, and any in-flight sweep to
+/// notice the rank left `Pending` (see [`sweep_until_deadline`]); a snapshot that
+/// lands later is discarded by `apply_snapshot`'s `Pending` gate.
+fn resolve_from_origin(
+    st: &PumpState<'_>,
+    held: &mut HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>>,
+    rank: &KvWorkerId,
+) {
+    held.remove(rank);
+    st.tree.clear_worker(rank);
+    st.cursors.lock().remove(rank);
+    st.bootstrap.set(rank, BootstrapState::Recovered);
+    st.bootstrap.record_rank_outcome(RankOutcome::FromOrigin);
+    info!(
+        worker = ?rank,
+        "kv-bootstrap: rank's event stream starts at its publisher's origin; \
+         its history is complete without a peer snapshot",
+    );
 }
 
 /// Ask the fleet whether `rank`'s publisher has moved past `watermark`, and post
@@ -3531,7 +3666,12 @@ mod tests {
         // fast instead, and reaching it IS the regression.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("a cold fleet settles immediately, not at the deadline");
@@ -3557,8 +3697,13 @@ mod tests {
             &["http://w1:30000"],
         );
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { peers_tried: 2, .. }),
             "an unanswered peer keeps the sweep waiting until the deadline",
@@ -3574,8 +3719,13 @@ mod tests {
             serve_snapshot_recording_queries(warm_snapshot("http://w2:30000", 64)).await;
         let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { peers_tried: 1, .. }),
             "a warm peer keeps the sweep waiting even when it covers nothing we need",
@@ -3596,7 +3746,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("an incompatible fleet settles immediately, not at the deadline");
@@ -3623,8 +3778,13 @@ mod tests {
         let deps = sweep_deps(vec!["http://127.0.0.1:1".into()], 64, &["http://w1:30000"]);
         deps.peers.replace(vec![]);
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { .. }),
             "an empty candidate set is no information, not a cold fleet",
@@ -3640,7 +3800,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("a confirmed-empty discovery settles immediately");
@@ -3665,7 +3830,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("the warm answer ends the sweep on its refetch pass");
@@ -3795,7 +3965,12 @@ mod tests {
         let ranks = vec![worker_id("http://w1:30000", 0)];
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            sweep_until_deadline(&deps, &ranks, Duration::from_secs(3600), Instant::now()),
+            sweep_until_deadline(
+                &deps,
+                &deps.bootstrap.register(&ranks),
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
         )
         .await
         .expect("the peer settles on its second answer, well inside the deadline");
@@ -3867,8 +4042,13 @@ mod tests {
             ctrl_tx,
         };
         let ranks = vec![worker_id("http://w1:30000", 0)];
-        let result =
-            sweep_until_deadline(&deps, &ranks, Duration::from_millis(500), Instant::now()).await;
+        let result = sweep_until_deadline(
+            &deps,
+            &deps.bootstrap.register(&ranks),
+            Duration::from_millis(500),
+            Instant::now(),
+        )
+        .await;
         assert!(
             matches!(result, SweepResult::TimedOut { .. }),
             "a mid-pass membership swap must veto the verdict, length unchanged or not",
@@ -3909,6 +4089,109 @@ mod tests {
             "the verdict must be tallied exactly once; got {:?}",
             bootstrap.sweep_result_counts(),
         );
+    }
+
+    /// The other half of the fresh-engine fix: once the pump resolves a rank
+    /// from its stream's origin, the sweep launched for it must stop. Here the
+    /// only peer is warm but will never cover the rank, which used to keep the
+    /// sweep alive until the deadline.
+    #[tokio::test]
+    async fn sweep_stops_once_every_rank_has_left_pending() {
+        let (warm, _q) =
+            serve_snapshot_recording_queries(warm_snapshot("http://w2:30000", 64)).await;
+        let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
+        let rank = worker_id("http://w1:30000", 0);
+        let obligations = deps.bootstrap.register(std::slice::from_ref(&rank));
+        let tracker = Arc::clone(&deps.bootstrap);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tracker.set(&rank, BootstrapState::Recovered);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sweep_until_deadline(
+                &deps,
+                &obligations,
+                Duration::from_secs(3600),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("a sweep with nobody left waiting must end, not run to the deadline");
+        assert!(matches!(result, SweepResult::RanksResolved));
+    }
+
+    /// Obligations nobody is waiting on — resolved already, or superseded by a
+    /// re-registration — cost no fetch at all.
+    #[tokio::test]
+    async fn sweep_fetches_nothing_for_obligations_nobody_waits_on() {
+        let (warm, q) =
+            serve_snapshot_recording_queries(warm_snapshot("http://w1:30000", 64)).await;
+        let deps = sweep_deps(vec![warm], 64, &["http://w1:30000", "http://w2:30000"]);
+        let resolved = worker_id("http://w1:30000", 0);
+        let superseded = worker_id("http://w2:30000", 0);
+        let obligations = deps
+            .bootstrap
+            .register(&[resolved.clone(), superseded.clone()]);
+        deps.bootstrap.set(&resolved, BootstrapState::Recovered);
+        deps.bootstrap.forget(std::slice::from_ref(&superseded));
+        deps.bootstrap.register(std::slice::from_ref(&superseded));
+        // The stale incarnation's obligation is still the one handed over.
+        assert_ne!(deps.bootstrap.epoch_of(&superseded), Some(obligations[1].1));
+
+        let result =
+            sweep_until_deadline(&deps, &obligations, Duration::from_secs(5), Instant::now()).await;
+        assert!(matches!(result, SweepResult::RanksResolved));
+        assert!(
+            q.lock().expect("queries lock").is_empty(),
+            "no fetch for ranks nobody is waiting on",
+        );
+    }
+
+    /// `RanksResolved` owes its ranks nothing: they already left `Pending`. It
+    /// is still tallied, so the sweep counter sums to the sweeps run.
+    #[tokio::test]
+    async fn deliver_bootstrap_sends_nothing_for_resolved_ranks() {
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(8);
+        let bootstrap = Arc::new(BootstrapTracker::new(Duration::from_secs(3600)));
+        let deps = BootstrapDeps {
+            http: reqwest::Client::new(),
+            peers: Arc::new(PeerRegistry::new()),
+            bootstrap: Arc::clone(&bootstrap),
+            live_workers: Arc::new(Mutex::new(HashSet::new())),
+            oracle: BlockSizeOracle::new(),
+            ctrl_tx,
+        };
+        deliver_bootstrap(
+            &deps,
+            vec![(worker_id("http://w1:30000", 0), 1)],
+            SweepResult::RanksResolved,
+            Duration::from_secs(5),
+        )
+        .await;
+        drop(deps);
+        assert!(
+            ctrl_rx.recv().await.is_none(),
+            "no control message for ranks that already left Pending",
+        );
+        assert!(bootstrap
+            .sweep_result_counts()
+            .contains(&("ranks_resolved", 1)));
+    }
+
+    /// A late joiner merged into a sweep that ended `RanksResolved` was never
+    /// swept, and that result carries no message — so it must be split off for a
+    /// sweep of its own. Identity is the (rank, incarnation) pair: a rank
+    /// re-registered mid-sweep is a different obligation from the one swept.
+    #[test]
+    fn take_unswept_splits_off_exactly_the_late_joiners() {
+        let a = worker_id("http://a:30000", 0);
+        let b = worker_id("http://b:30000", 0);
+        let swept: HashSet<(KvWorkerId, u64)> = [(a.clone(), 1)].into_iter().collect();
+        let mut obligations = vec![(a.clone(), 1), (b.clone(), 2), (a.clone(), 3)];
+        let unswept = take_unswept(&mut obligations, &swept);
+        assert_eq!(obligations, vec![(a.clone(), 1)]);
+        assert_eq!(unswept, vec![(b, 2), (a, 3)]);
     }
 
     /// Serve a sequence of canned bodies on the real snapshot path: hit N
@@ -4222,6 +4505,126 @@ mod tests {
             "a held batch must not be applied",
         );
         assert!(h.cursors.lock().is_empty(), "no cursor for a held rank");
+    }
+
+    /// The fresh-engine incident: a rank whose first batch is its publisher's
+    /// first batch ever has nothing a sibling could supply, so it must resolve
+    /// on that batch instead of holding for a snapshot no peer will ever have.
+    /// A snapshot that lands afterwards must not be grafted over the complete
+    /// stream.
+    #[tokio::test]
+    async fn pump_resolves_a_rank_whose_stream_starts_at_the_origin() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        for (seq, parent, hashes) in [(0, None, vec![10, 20]), (1, Some(20), vec![30])] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![stored(parent, hashes)]),
+            })
+            .await
+            .unwrap();
+        }
+        // Wait for the pump to reach the batches before the control message:
+        // the pump polls control first, so sending both at once would race.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.cursors.lock().get(&id).copied() != Some(1) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an origin stream is applied, not held");
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
+        assert!(tracker.settled(), "the rank no longer holds readiness");
+        let m = h.tree.match_prefix(None, &[10, 20, 30]);
+        assert_eq!(m.matched_blocks, 3, "both batches applied in order");
+        assert!(m.workers.contains(&id));
+        assert_eq!(
+            h.tree.match_prefix(None, &[100, 200]).matched_blocks,
+            0,
+            "a late snapshot must not be grafted under a complete stream",
+        );
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
+        assert_eq!(rank_count(&tracker, "from_origin"), 1);
+    }
+
+    /// The conservative side of the origin rule. A first batch past the origin
+    /// means batch 0 was missed, and a batch landing at the origin behind
+    /// others is a restart mid-hold whose prefix belongs to a dead stream:
+    /// neither proves the history complete, so both keep holding for a sweep.
+    #[tokio::test]
+    async fn pump_keeps_holding_unless_the_hold_begins_at_the_origin() {
+        let past = worker_id("http://w1", 0);
+        let restarted = worker_id("http://w2", 0);
+        let ranks = [past.clone(), restarted.clone()];
+        let tracker = pending_tracker(&ranks);
+        let h = spawn_pump_with_bootstrap(&ranks, tracker.clone());
+
+        for (worker, seq) in [(&past, 1), (&restarted, 7), (&restarted, 0)] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: worker.clone(),
+                seq,
+                batch: batch(vec![stored(None, vec![seq + 10])]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        for rank in &ranks {
+            assert_eq!(tracker.state_of(rank), Some(BootstrapState::Pending));
+        }
+        assert!(h.cursors.lock().is_empty(), "nothing applied");
+        assert_eq!(rank_count(&tracker, "from_origin"), 0);
+    }
+
+    /// A rank back in `Pending` for a gap retry carries tree state and a cursor
+    /// from its previous stream. Batch 0 means that engine restarted, so the old
+    /// state describes a cache that is gone — and its cursor would filter every
+    /// batch of the new stream.
+    #[tokio::test]
+    async fn pump_origin_resolution_discards_an_earlier_streams_state() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+        h.tree
+            .insert_tiered(&id, None, &[900], Tiers::for_store(None));
+        h.cursors.lock().insert(id.clone(), 50);
+
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![stored(None, vec![10])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
+        assert_eq!(
+            h.tree.match_prefix(None, &[900]).matched_blocks,
+            0,
+            "state from the dead stream must go",
+        );
+        assert_eq!(h.tree.match_prefix(None, &[10]).matched_blocks, 1);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(0));
     }
 
     /// The splice: snapshot grafts, cursor seeds, then held deltas replay on
