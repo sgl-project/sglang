@@ -82,13 +82,8 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
-# Default cap on MLX's buffer cache (recycled GPU buffers) when
-# SGLANG_MLX_CACHE_LIMIT_GB is unset: this fraction of Metal's recommended
-# working set, and never less than the floor. MLX's own default lets the cache
-# grow to its memory limit (roughly all physical RAM), and the runner pins MLX
-# allocations with ``set_wired_limit``, so an uncapped cache wires up the machine
-# under sustained load. The cache only needs to hold one forward pass's transient
-# working set; scaling with device memory tracks the model sizes a machine runs.
+# Buffer-cache cap when SGLANG_MLX_CACHE_LIMIT_GB is unset: MLX's own default
+# is the memory limit, and the runner wires MLX allocations.
 DEFAULT_CACHE_LIMIT_FRACTION = 0.10
 MIN_DEFAULT_CACHE_LIMIT_BYTES = 1024**3
 
@@ -220,10 +215,7 @@ class MlxModelRunner:
         # modules directly.
         self._quantization: str | None = quantization
 
-        # Cap the buffer cache (recycled GPU buffers). MLX never returns freed
-        # buffers to the OS, so without a cap the process footprint ratchets up
-        # to the worst transient — which is model load/quantization itself, so
-        # the cap must be in place before it.
+        # Before model load: that is the largest transient the cache retains.
         self._apply_cache_limit()
 
         self._load_model()
