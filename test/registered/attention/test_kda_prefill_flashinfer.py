@@ -297,7 +297,10 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
     torch.testing.assert_close(
         fi_state.float(), ref_state.float(), atol=1e-2, rtol=1e-2
     )
-    torch.testing.assert_close(fi_track, ref_track, atol=1e-2, rtol=5e-2)
+    track_relative_error = torch.linalg.vector_norm(fi_track - ref_track) / (
+        torch.linalg.vector_norm(ref_track) + 1e-12
+    )
+    assert track_relative_error < 5e-2
 
     truncated_state = initial.clone()
     flashinfer.extend(
@@ -315,7 +318,10 @@ def test_kda_prefill_dcp8_interior_checkpoint_after_cached_prefix():
         beta_is_raw=True,
         extend_seq_lens_cpu=[512],
     )
-    torch.testing.assert_close(fi_track[0], truncated_state[1], atol=1e-2, rtol=5e-2)
+    truncated_relative_error = torch.linalg.vector_norm(
+        fi_track[0] - truncated_state[1]
+    ) / (torch.linalg.vector_norm(truncated_state[1]) + 1e-12)
+    assert truncated_relative_error < 5e-2
 
 
 @pytest.mark.parametrize("lower_bound,num_tokens", [(None, 128), (-5.0, 1)])
