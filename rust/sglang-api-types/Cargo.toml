@@ -1,0 +1,20 @@
+[package]
+name = "sglang-api-types"
+description = "Generated SGLang API types: prost structs, schema-driven serde, tonic services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No [package.metadata.sglang]: not a Python extension; wheel builds skip it.
+
+[lib]
+name = "sglang_api_types"
+crate-type = ["rlib"]
+
+[dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }

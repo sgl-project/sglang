@@ -1,0 +1,19 @@
+[package]
+name = "sglang-api-codegen"
+description = "Generator: proto/sglang -> sglang-api-types/src/generated (prost structs + schema-driven serde + tonic services)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No [package.metadata.sglang]: not a Python extension; wheel builds skip it.
+
+[[bin]]
+name = "sglang-api-codegen"
+path = "src/main.rs"
+
+[dependencies]
+prost = { workspace = true }
+prost-build = "0.14"
+prost-reflect = "0.16"
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"

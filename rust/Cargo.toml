@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "../proto",
+    "sglang-api-codegen",
+    "sglang-api-types",
     "sglang-grpc",
     "sglang-mm",
     "sglang-renderer",
@@ -39,11 +41,13 @@ socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "=0.12.3", features = ["gzip", "transport"] }
+tonic-build = "=0.12.3"
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tonic = { version = "=0.12.3", features = ["gzip", "transport"] }
-tonic-build = "=0.12.3"
 uuid = { version = "1", features = ["v4"] }
 
 # Profiles only take effect at the workspace root; per-member profile sections

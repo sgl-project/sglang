@@ -1,0 +1,96 @@
+// The API face of SamplingParams — the ground truth for
+// rust/sglang-server/src/message/sampling.rs's 25 API fields (its 5
+// normalize-internal fields and the msgpack scheduler encoding are IPC, not
+// API, and stay hand-written there). Unknown JSON keys are DENIED: parity with
+// Python's `SamplingParams(**kwargs)` TypeError.
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+message SamplingParams {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+
+  // Defaulted fields are `optional`: proto3 gives plain scalars no presence,
+  // so an unset double would arrive as 0 instead of its schema default (the
+  // top_p=0 bug the first live gRPC call found). JSON deserialization bakes
+  // the default on absent/null; protobuf arrival reads it through the
+  // generated *_or_default accessors.
+
+  // JSON: absent = 128, explicit null = no limit (Python `Optional[int] =
+  // 128`). Protobuf has no null: unset = 128 (apply_absent_defaults at the
+  // gRPC entry); no limit needs an explicit large value.
+  optional int64 max_new_tokens = 1 [
+    (sglang.json.v1.field_json).null_is_none = true,
+    (sglang.json.v1.field_json).default_i64 = 128
+  ];
+  StringOrList stop = 2;
+  Int64List stop_token_ids = 3;
+  StringOrList stop_regex = 4;
+  optional double temperature = 5 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 1.0
+  ];
+  optional double top_p = 6 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 1.0
+  ];
+  // Default 1 << 30 (TOP_K_ALL): "consider the whole vocabulary".
+  optional int64 top_k = 7 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_i64 = 1073741824
+  ];
+  optional double min_p = 8 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 0.0
+  ];
+  optional double frequency_penalty = 9 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 0.0
+  ];
+  optional double presence_penalty = 10 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 0.0
+  ];
+  optional double repetition_penalty = 11 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_f64 = 1.0
+  ];
+  optional int64 min_new_tokens = 12 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_i64 = 0
+  ];
+  optional int64 n = 13 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_i64 = 1
+  ];
+  optional string json_schema = 14;
+  optional string regex = 15;
+  optional string ebnf = 16;
+  optional string structural_tag = 17;
+  optional bool ignore_eos = 18 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  optional bool skip_special_tokens = 19 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional bool spaces_between_special_tokens = 20 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional bool no_stop_trim = 21 [
+    (sglang.json.v1.field_json).null_resets_default = true,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  optional int64 stream_interval = 22;
+  // Token id (numeric-string key, Python parity) -> bias.
+  map<string, double> logit_bias = 23 [(sglang.json.v1.field_json).int_key_map = true];
+  optional int64 sampling_seed = 24;
+  // Opaque JSON forwarded to a custom logit processor; never inspected here.
+  optional string custom_params = 25 [(sglang.json.v1.field_json).raw_json = true];
+}
