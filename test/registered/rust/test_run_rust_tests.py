@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 BUILD_AND_RUN_TIMEOUT_S = 900
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
-register_cpu_ci(est_time=240, suite="base-a-test-cpu")
+register_cpu_ci(est_time=153, suite="base-a-test-cpu")
 
 
 # Exported by _pr-test-stage-cpu.yml as the negation of the check-changes
@@ -40,8 +40,7 @@ class TestCargoWorkspace(CustomTestCase):
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
         )
 
-    def setUp(self):
-        super().setUp()
+    def test_cargo_test_workspace(self):
         # Not skipUnless: cargo is a hard dependency of the editable install
         # (setuptools-rust builds sglang-grpc), so a missing toolchain is a
         # broken environment, and a silently-skipped CI test is worthless.
@@ -55,14 +54,10 @@ class TestCargoWorkspace(CustomTestCase):
             f"rust workspace manifest not found at {RUST_WORKSPACE}",
         )
 
-    def test_cargo_test_workspace(self):
-        self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
-
-    def test_cargo_test_renderer_http_feature(self):
-        # `--workspace` builds sglang-renderer without its non-default `http`
-        # feature, which gates the HTTP frontend and its tests.
+        # `--workspace` alone builds sglang-renderer without its non-default
+        # `http` feature, which gates the HTTP frontend and its tests.
         self._run_cargo(
-            ["test", "-p", "sglang-renderer", "--features", "http"],
+            ["test", "--workspace", "--features", "sglang-renderer/http"],
             cwd=RUST_WORKSPACE,
         )
 
