@@ -66,30 +66,17 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     }
 
 
-def prewarm_dsv4_aicpu(model_config, device) -> None:
+def prewarm_dsv4_aicpu(attn_backend, device) -> None:
     # Run after the first HCCL collective and before MemFabric maps Host memory.
     # Otherwise custom AiCPU startup can fail in halMemBindSibling.
-    cu_seqlens = torch.tensor([0, 6], dtype=torch.int32, device=device)
-    kv_lengths = torch.tensor([6], dtype=torch.int32, device=device)
-    window = model_config.sliding_window_size
-    metadata_op, _ = _sparse_attn_ops()
-    metadata_op(
-        batch_size=1,
-        num_heads_q=model_config.num_attention_heads // get_parallel().attn_tp_size,
-        num_heads_kv=1,
-        head_dim=model_config.head_dim,
-        has_ori_kv=True,
-        has_cmp_kv=False,
-        cu_seqlens_q=cu_seqlens,
-        seqused_kv=kv_lengths,
-        cmp_ratio=1,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-        ori_win_left=(window if window is not None else 128) - 1,
-        ori_win_right=0,
-        layout_q="TND",
-        layout_kv="PA_ND",
-        **_sparse_attn_kv_quant_kwargs(),
+    # A single-token request initializes metadata without accessing KV pages.
+    attn_backend._kernel_metadata_from_parts(
+        bs=1,
+        actual_seq_lengths_q_pa=torch.arange(2, dtype=torch.int32, device=device),
+        actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32, device=device),
+        block_tables=None,
+        max_seqlen_q=1,
+        is_nextn=False,
     )
     torch.npu.synchronize(device)
 

@@ -762,7 +762,7 @@ class Scheduler(
             )
 
             prewarm_dsv4_aicpu(
-                self.tp_worker.model_runner.model_config, self.tp_group.device
+                self.tp_worker.model_runner.attn_backend, self.tp_group.device
             )
 
     def init_zbal_on_npu(self):
