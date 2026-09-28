@@ -72,7 +72,7 @@ class _SparsePrefillTable(_SparseTable):
 
     compress_lens: torch.Tensor  # [rows] int32
     page_table: torch.Tensor  # [rows, index pages] int32
-    request_ids: torch.Tensor  # [rows] int32
+    request_ids: torch.Tensor  # [rows] int32 row-pair ids, see _row_pair_ids
     q_dtype: torch.dtype
     page_size: int  # index-K pool page size (slots)
     rows_per_request: List[int]  # rows of each request, in row order
@@ -364,6 +364,20 @@ def _build_prefill_table(
     )
 
 
+def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch.Tensor:
+    """[rows] int32: one id per consecutive row pair of a request, never across two.
+    DeepGEMM's schedule walks back over equal ids to a row's request start once per
+    row, quadratic in a request's rows; per-pair ids bound the walk to one step."""
+    counts = torch.tensor(rows_per_request, dtype=torch.int64, device=device)
+    rows = sum(rows_per_request)
+    row = torch.arange(rows, device=device)
+    request = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=device), counts, output_size=rows
+    )
+    first_row = torch.cumsum(counts, 0) - counts
+    return (row - ((row - first_row[request]) & 1)).to(torch.int32)
+
+
 # TODO(dark): support fusion of publish + topk of publish layer
 def publish_prefill_table(
     *,
@@ -404,17 +418,12 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
-    request_ids = torch.repeat_interleave(
-        torch.arange(len(data.rows_per_request), dtype=torch.int32, device=device),
-        torch.tensor(data.rows_per_request, dtype=torch.int64, device=device),
-        output_size=rows,
-    )
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,
         page_table=index_page_table,
         page_size=index_page_size,
-        request_ids=request_ids,
+        request_ids=_row_pair_ids(data.rows_per_request, device=device),
         rows_per_request=data.rows_per_request,
         q_dtype=data.q_fp4.dtype,
         valid_lens=valid_lens,
