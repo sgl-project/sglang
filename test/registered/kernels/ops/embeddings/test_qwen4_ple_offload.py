@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
@@ -83,6 +84,63 @@ def _make_source_embedding(
     )
 
 
+def _make_nvfp4_source_embedding(
+    *,
+    embedding_dim=160,
+    vocab_start=0,
+    vocab_end=8,
+    org_vocab_size=8,
+    tp_size=1,
+    global_scale=0.5,
+):
+    """A QAD package's PLE table: U8-packed e2m1 codes, e4m3 16-lane block
+    scales, one fp32 global scale, declared by `ple_embedding_dtype=nvfp4`."""
+    source = _make_source_embedding(
+        dtype=torch.uint8,
+        embedding_dim=embedding_dim,
+        vocab_start=vocab_start,
+        vocab_end=vocab_end,
+        org_vocab_size=org_vocab_size,
+        tp_size=tp_size,
+    )
+    rows = vocab_end - vocab_start
+    source.weight = nn.Parameter(
+        torch.zeros((rows, embedding_dim // 2), dtype=torch.uint8, device="cuda"),
+        requires_grad=False,
+    )
+    source.weight_scale = torch.zeros(
+        (rows, embedding_dim // 16), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    source.weight_scale_2 = torch.tensor(
+        global_scale, dtype=torch.float32, device="cuda"
+    )
+    source._ple_nvfp4 = True
+    return source
+
+
+def _load_nvfp4_rows(offloaded, codes, scales, *, pinned=True):
+    """Fill the packed host tables in place; the gather only ever reads
+    local (`tp_vocab_end - tp_vocab_start`) rows of them."""
+    pointer = offloaded.weight.data_ptr()
+    offloaded.weight.copy_(codes)
+    offloaded.weight_scale.copy_(scales)
+    assert offloaded.weight.data_ptr() == pointer
+    assert offloaded.weight.is_pinned() == pinned
+    assert offloaded.weight_scale.is_pinned() == pinned
+
+
+def _random_nvfp4_rows(rows, embedding_dim, *, seed=0):
+    """Codes covering every e2m1 code, and per-16-lane powers of two: exact in
+    fp32, so kernel and reference must agree bit for bit."""
+    torch.manual_seed(seed)
+    codes = torch.randint(
+        0, 256, (rows, embedding_dim // 2), dtype=torch.uint8, device="cuda"
+    )
+    exponents = torch.arange(-8, -8 + embedding_dim // 16, dtype=torch.float32)
+    scales = (2.0**exponents).repeat(rows, 1).to(torch.float8_e4m3fn).cuda()
+    return codes, scales
+
+
 def _load_rows(offloaded, rows, *, pinned=True):
     pointer = offloaded.weight.data_ptr()
     offloaded.weight_loader(offloaded.weight, rows)
@@ -139,6 +197,53 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
     expected = torch.zeros_like(output)
     expected[0, 2] = rows[4]
     expected[1, 0] = rows[7]
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("embedding_dim", [16, 160])
+def test_qwen4_ple_pinned_gather_nvfp4(embedding_dim):
+    source = _make_nvfp4_source_embedding(embedding_dim=embedding_dim)
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    codes, scales = _random_nvfp4_rows(8, embedding_dim)
+    _load_nvfp4_rows(offloaded, codes, scales)
+
+    ids = torch.tensor([[0, 7, 3], [4, 1, 6]], device="cuda")
+    actual = offloaded(ids)
+
+    decoded = dequantize_nvfp4(codes, scales, offloaded.weight_scale_2)
+    expected = decoded[ids.flatten()].reshape(*ids.shape, embedding_dim)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_qwen4_ple_pinned_gather_nvfp4_shard_boundaries():
+    embedding_dim = 16
+    source = _make_nvfp4_source_embedding(
+        embedding_dim=embedding_dim,
+        vocab_start=4,
+        vocab_end=8,
+        org_vocab_size=8,
+        tp_size=2,
+    )
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    codes, scales = _random_nvfp4_rows(4, embedding_dim)
+    _load_nvfp4_rows(offloaded, codes, scales)
+
+    ids = torch.tensor([[-1, 3, 4], [7, 8, 100]], device="cuda")
+    output = torch.full(
+        (*ids.shape, embedding_dim),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    actual = offloaded.gather(ids, out=output)
+
+    decoded = dequantize_nvfp4(codes, scales, offloaded.weight_scale_2)
+    expected = torch.zeros_like(output)
+    expected[0, 2] = decoded[0]  # global 4 -> local 0
+    expected[1, 0] = decoded[3]  # global 7 -> local 3
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

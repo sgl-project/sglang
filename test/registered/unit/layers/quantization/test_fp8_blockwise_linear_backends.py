@@ -267,6 +267,39 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
             )
             is_backend_supported.assert_called_once_with("cute-dsl", 107)
 
+    def test_small_shape_dequantizes_to_bf16(self):
+        """No MXFP8 dense kernel serves n < 128 or k < 128, so those layers are
+        dequantized to bf16 at load time and run as a plain bf16 GEMM. Deliberately
+        not SM-gated: this path is a bf16 F.linear, independent of the MXFP8
+        kernels' SM100/103 support."""
+        for n, k in [(24, 640), (640, 96)]:
+            with self.subTest(shape=(n, k)):
+                torch.manual_seed(7)
+                layer, w_dequant = self._build_layer(n, k)
+                layer.quant_method.process_weights_after_loading(layer)
+
+                self.assertTrue(getattr(layer, "dequantized_bf16", False))
+                self.assertEqual(layer.weight.dtype, torch.bfloat16)
+                self.assertIsNone(layer.weight_scale_inv)
+                self.assertTrue(torch.equal(layer.weight, w_dequant.to(torch.bfloat16)))
+
+                x = torch.randn((8, k), device="cuda", dtype=torch.bfloat16) / 10
+                out, _ = layer(x)
+                assert_output_close(
+                    self, out, x.float() @ w_dequant.T, rtol=5e-2, atol=1e-1
+                )
+
+    def test_large_shape_keeps_mxfp8_weight(self):
+        """The complement of the case above: a shape both dense kernels serve
+        keeps its MXFP8 weight and ue8m0 block scales."""
+        torch.manual_seed(7)
+        layer, _ = self._build_layer(256, 256)
+        layer.quant_method.process_weights_after_loading(layer)
+
+        self.assertFalse(getattr(layer, "dequantized_bf16", False))
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        self.assertIsNotNone(layer.weight_scale_inv)
+
 
 def _build_block32_layer(n: int, k: int, keep_plain_weight_layout: bool = False):
     quant_config = Fp8Config(

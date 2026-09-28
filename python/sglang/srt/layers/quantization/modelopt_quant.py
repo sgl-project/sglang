@@ -1014,6 +1014,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
             candidates.append("model." + prefix[len("model.language_model.") :])
+        elif prefix.startswith("visual."):
+            # QAD checkpoints key the vision tower `model.visual.*` while some
+            # VL models (bailing_mm_v3 et al.) pass `visual.*` to get_quant_method.
+            candidates.append("model." + prefix)
+        elif prefix.startswith("model.visual."):
+            # QAD packages key the vision tower either way; the loader resolves
+            # `model.visual.*` scale names through this candidate.
+            candidates.append(prefix[len("model.") :])
         elif prefix.startswith("model."):
             # VL models such as Qwen4-Exp name the text stack `model.layers.*`
             # while ModelOpt keys it `model.language_model.layers.*`.
