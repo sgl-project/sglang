@@ -85,8 +85,10 @@ class TestNixlAbortNotification(
         manager._staging_outstanding = defaultdict(int)
         manager.transfer_infos = {ROOM: {}}
         manager.exceptions = {}
-        # No handle was posted, so the worker settles and notifies decode.
+        # A handle that never settles may still be writing, so the chunk stays
+        # counted and the room is poisoned instead of notified.
         manager.conclude_failure = MagicMock()
+        manager._await_handles = MagicMock(return_value=(False, True))
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
         queue = SimpleNamespace(
             get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
@@ -114,6 +116,40 @@ class TestNixlAbortNotification(
         claimed = manager._handle_abort_notification(self._abort_message())
 
         self.assertTrue(claimed)
+        self.assertEqual(
+            manager._sent,
+            [(ROOM, AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION))],
+        )
+        self.assertEqual(manager._deferred_ack_targets, {})
+
+    def test_settled_worker_failure_uncounts_chunk_and_acks(self):
+        # Every handle settled, so the writes are over: decode is told via
+        # conclude_failure, and its ABORT, which lands while the chunk is
+        # still counted, must be ACKed once the worker uncounts the chunk.
+        manager = _manager()
+        manager.enable_staging = False
+        manager._staging_ctx = None
+        manager._staging_outstanding = defaultdict(int)
+        manager.transfer_infos = {ROOM: {}}
+        manager.exceptions = {}
+        manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
+
+        def notify_decode(**kwargs):
+            manager.check_status = lambda room: manager.request_status[room]
+            self._dispatch_abort(manager)
+
+        manager.conclude_failure = MagicMock(side_effect=notify_decode)
+        queue = SimpleNamespace(
+            get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
+        )
+
+        with patch("sglang.srt.disaggregation.nixl.conn.logger.exception"):
+            with self.assertRaises(KeyboardInterrupt):
+                manager.transfer_worker(queue)
+
+        manager.conclude_failure.assert_called_once()
+        self.assertEqual(manager._staging_outstanding[ROOM], 0)
+        self.assertNotIn(ROOM, manager._deferred_ack_poisoned_rooms)
         self.assertEqual(
             manager._sent,
             [(ROOM, AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION))],

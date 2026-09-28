@@ -1474,6 +1474,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
+                # Clear with the decrement: the failure path below reads this
+                # flag, so a raise after this point must not uncount twice.
+                kv_chunk.staging_counted = False
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
@@ -1524,15 +1527,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notify, _ = self._await_handles(handles, failure_seen=True)
                 if notify:
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
+                    # Every handle settled => the writes are done, but the
+                    # normal-path decrement was never reached, so without this
+                    # the room's abort ack could never fire.
+                    if kv_chunk.staging_counted:
+                        kv_chunk.staging_counted = False
+                        self._staging_outstanding[room] -= 1
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
                     # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
-                # This chunk stays counted in _staging_outstanding, so no drain
-                # ACK can follow; discard the target and fall back to the timeout.
-                self.poison_deferred_ack_room(room)
+                    # This chunk stays counted in _staging_outstanding, so no
+                    # drain ACK can follow; discard the target and fall back to
+                    # the timeout.
+                    self.poison_deferred_ack_room(room)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []

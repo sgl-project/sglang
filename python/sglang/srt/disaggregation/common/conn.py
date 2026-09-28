@@ -2134,19 +2134,32 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        self.ensure_abort_notified()
+
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
+        Unlike abort(), does not overwrite the recorded root cause -- callable
+        for an already-Failed room whose failure decode did not initiate."""
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
-            self._send_abort_notification()
+            self._send_abort_notification(force_arm=force_arm)
             self.abort_notified = True
 
-    def _send_abort_notification(self):
+    def _send_abort_notification(self, *, force_arm: bool = False):
         # Both abort() and the waiting timeout reach here. Once metadata is
         # published (init_time set) prefill may be writing, so arm the ACK
         # tracker before the ABORT goes out and an immediate ACK can land.
-        if self.kv_mgr.enable_deferred_decode_kv_release and self.init_time is not None:
+        # Prealloc-queue receivers (init_time None) never enter the
+        # deferred-release flow that would clean the tracker up, so they stay
+        # unarmed -- except on a partial publish, where init_time is still None
+        # but earlier ranks already hold destinations; those callers defer and
+        # pass force_arm.
+        if self.kv_mgr.enable_deferred_decode_kv_release and (
+            force_arm or self.init_time is not None
+        ):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
             )

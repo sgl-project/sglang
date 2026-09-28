@@ -335,7 +335,12 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    // `peer_selector` names sibling routers, not the workers streamed here.
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        peer_selector: _,
+    } = cfg;
 
     let client = Client::try_default()
         .await
