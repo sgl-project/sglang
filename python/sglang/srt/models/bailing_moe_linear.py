@@ -17,7 +17,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -813,7 +813,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             # A NextN draft is a one-layer model.
             num_layers=1 if is_nextn else config.num_hidden_layers,
@@ -828,7 +828,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             else None
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=False,
