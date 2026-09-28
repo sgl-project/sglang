@@ -1,9 +1,4 @@
-"""Unit tests for pool_configurator.py -- CPU only, no GPU required.
-
-Tests the end-to-end computation: available_bytes -> MemoryPoolConfig,
-verifying tokens are correct, constraints are respected, and memory
-invariants hold (tokens * per_token_cost <= available_bytes).
-"""
+"""CPU-only tests for pool_configurator.py: available_bytes -> MemoryPoolConfig."""
 
 import contextlib
 import unittest
@@ -25,12 +20,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 @contextlib.contextmanager
 def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
-    """Mock GPU-dependent functions for CPU-only testing.
-
-    swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
-    SWA evictions) to a small value so the chunk-cap formula stays hand-computable;
-    only SWAChunkCapPoolConfigurator reads it.
-    """
+    """Mock GPU-dependent state; swa_eviction_interval is kept small so the
+    chunk-cap formula stays hand-computable."""
     from sglang.srt.environ import envs
 
     with (
@@ -51,11 +42,8 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
 
 def _publish_config(testcase, **fields):
-    """Publish the configuration a runner double describes.
-
-    Installed per call and restored on the calling case's cleanup, so a failed
-    case cannot leave a partial publish for a later file in a monolithic run.
-    """
+    """Restored on the case's cleanup, so a failed case cannot leak a partial
+    publish into a later file of a monolithic run."""
     from sglang.srt.runtime_context import get_context
 
     override = get_context().override_server_args(**fields)
@@ -141,9 +129,8 @@ def _make_model_runner(
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
-    # The configurator reads the published bags, so the fixture publishes the
-    # configuration it describes. The instance stays for the whole-object
-    # hand-offs the configurator still does.
+    # The configurator reads the published bags; mr.server_args still backs its
+    # whole-object hand-offs.
     _publish_config(
         testcase,
         max_total_tokens=None,
@@ -679,14 +666,11 @@ class TestHybridSWAConfigurator(CustomTestCase):
             cfg = create_memory_pool_configurator(mr)
             config = cfg.calculate_pool_sizes(available, page_size=1)
 
-        # disagg decode drops the prefill term: per req = 4 + 1 + 4 + 1 = 10 (as above).
+        # disagg decode drops the prefill term: per req = 4 + 1 + 4 + 1 = 10.
         self.assertEqual(config.swa_max_total_num_tokens, 100)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
     def test_chunk_cache_cap_prefill_holds_window_plus_chunk(self):
-        # Non-decode (prefill) engine: each request keeps its decode footprint, while
-        # in-flight chunked-prefill tokens are a global batch budget -- two chunks
-        # under overlap.
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -1091,7 +1075,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
-        """HybridSWA carried no draft term, so the draft pool fell outside the budget."""
+        """The HybridSWA budget must charge the DFLASH draft pool."""
         available = 10_000_000
 
         def _tokens(draft_kv_per_token):
@@ -1157,14 +1141,13 @@ class TestSWAPoolFloor(CustomTestCase):
 
     def _dsv4_sizes(self, max_tokens, page_size, unified=False):
         """Exercise the DSV4 size arithmetic without a full V4 model fixture:
-        _compute_dsv4_sizes reads only these six attributes."""
+        _compute_dsv4_sizes reads only these attributes."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 128
-        cfg.swa_page_size = page_size
-        cfg.c4_ring_size = 8
+        cfg.ring_sizes = {4: 8}
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
         cfg.operator_swa_ratio = None
@@ -1173,9 +1156,8 @@ class TestSWAPoolFloor(CustomTestCase):
         return cfg._compute_dsv4_sizes(max_tokens, page_size)
 
     def test_dsv4_rejects_single_page_pool(self):
-        # DeepSeek-V4-Flash defaults: page_size=256, swa_full_tokens_ratio=0.1.
-        # int(4096 * 0.1) page-aligns down to 256 -- exactly one page, below the
-        # 128 + 256 floor.
+        # DeepSeek-V4-Flash defaults (page 256, ratio 0.1): int(4096 * 0.1) aligns
+        # down to one page, below the 128 + 256 floor.
         with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
             self._dsv4_sizes(max_tokens=4096, page_size=256)
 
@@ -1188,8 +1170,7 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.c4_state_pool_size, 3072 // 256 * 8)
 
     def test_dsv4_token_cap_never_grows_total_footprint(self):
-        """Regression: the token-cap path subtracts no fixed-pool bias, so
-        capping the budget-derived token count must still shrink the total."""
+        """Capping the budget-derived token count must not grow the total footprint."""
         cfg = self._dsv4_configurator_for_budget()
         page_size = 128
         budget = 256 * (1 << 30)
@@ -1216,12 +1197,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.attn_head_dim = 192
         cfg.indexer_head_dim = 128
         cfg.num_layers_total = 61
-        cfg.num_layers_ca4 = 61
-        cfg.num_layers_ca128 = 61
-        cfg.c4_ring_size = 8
-        cfg.c128_ring_size = 128
-        cfg.num_layers_c2_source = 0
-        cfg.c2_ring_size = 2
+        # Every layer owns both a c4 and a c128 store: an upper bound, not a model.
+        cfg.stage_owner_layers = {4: list(range(61)), 128: list(range(61))}
+        cfg.ring_sizes = {4: 8, 128: 128}
         cfg._swa_ring_size = 128
         cfg._spec_infl = 1.0
         cfg.context_len = 65536
@@ -1229,7 +1207,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.requested_max_running_requests_per_worker = None
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 4096
-        cfg.swa_page_size = 128
+        cfg.page_size = 128
         cfg.c4_shrink_factor = 1
         cfg.online_c128_mtp_max_draft_tokens = 0
         cfg.disaggregation_mode = None
@@ -1266,16 +1244,53 @@ class TestSWAPoolFloor(CustomTestCase):
 
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.attn_head_dim = 512
-        cfg.num_layers_c2_source = 2
-        cfg.c2_ring_size = 2
+        cfg.stage_owner_layers = {2: [2, 8], 1: [20]}
+        cfg.ring_sizes = {2: 2}
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
         slots = 10 + 1
         # size + ring + 1 rows, padded to the ratio (2); 2 * head_dim fp32 per row.
         rows = (slots * 2 + 2 + 1 + 1) // 2 * 2
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), rows * 2 * 512 * 4 * 2)
-        cfg.num_layers_c2_source = 0
+        cfg.stage_owner_layers = {1: [20]}
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), 0)
+
+    def test_dsv4_owner_layers_follow_the_pool_rule(self):
+        """The configurator budgets the layers the pool allocates: every ratio-4
+        / 128 layer, only the kv_source layers of ratios 1 / 2, all PP-local."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            collect_sources_by_ratio,
+        )
+
+        ratios = [0, 0, 2, 2, 1, 1, 4, 128, 4, 2]
+        owners = collect_sources_by_ratio(ratios, [2, 4, 9], range(0, 8))
+        self.assertEqual(owners, {4: [6], 128: [7], 1: [4], 2: [2]})
+        owners = collect_sources_by_ratio(ratios, [2, 4, 9], range(8, 10))
+        self.assertEqual(owners, {4: [8], 2: [9]})
+
+    def test_dsv4_paged_kv_budget(self):
+        from sglang.srt.environ import envs
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified = False
+        cfg.encoder_replay = False
+        cfg.page_size = 256
+        cfg.kv_bytes = 584
+        cfg.attn_head_dim = 512
+        cfg.num_layers_total = 3
+        cfg.stage_owner_layers = {4: [1], 128: [2]}
+        cfg.indexer_bytes_per_token = 132
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        with (
+            envs.SGLANG_DSV4_KV_LAYOUT.override("v4"),
+            envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override("float32"),
+        ):
+            cfg.bytes_per_swa_token = cfg._get_bytes_per_swa_token()
+            self.assertEqual(cfg.bytes_per_swa_token, 3 * 585 + 320)
+            self.assertEqual(
+                cfg._get_bytes_per_full_token(),
+                0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
+            )
 
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1321,6 +1336,22 @@ class TestSWAPoolFloor(CustomTestCase):
             + planner._get_swa_fixed_bytes(),
             budget,
         )
+
+    def test_dsv4_trtllm_kv_bytes(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=1, page_size=256)
+        _publish_config(self, dsv4_attn_backend="trtllm", page_size=256)
+        kvc.kv_cache_dtype_str = "fp8_e4m3"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.index_head_dim = 128
+        cfg.compress_ratios = [0]
+        cfg.window_size = 128
+        cfg.hf_config.kv_source_layer_ids = []
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.kv_bytes, 512)
+        self.assertEqual(planner.bytes_per_swa_token, 512)
 
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
