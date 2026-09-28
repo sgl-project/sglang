@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    record_foreign_defaults,
     resolving_view,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -19,11 +20,13 @@ from sglang.srt.utils.common import is_host_cpu_arm64
 logger = logging.getLogger(__name__)
 
 
-def handle_hardware_runtime_validation():
-    # This is intentionally independent of `server_args.device`: setting
-    # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
-    # the environment cannot honor that request. With the flag unset,
-    # use_mlx() remains lazy and does not import MLX.
+def handle_hardware_runtime_validation(server_args: Any):
+    # `server_args` is accepted, not read: every resolution-hook step takes
+    # it, uniformly, so `run_hook` never has to special-case an arity. The
+    # check below is intentionally independent of `server_args.device`:
+    # setting SGLANG_USE_MLX opts into the MLX backend and must fail
+    # immediately if the environment cannot honor that request. With the
+    # flag unset, use_mlx() remains lazy and does not import MLX.
     use_mlx()
 
 
@@ -84,6 +87,29 @@ def handle_nccl_pre_warm(server_args: Any):
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
 
 
+def handle_platform_defaults(server_args: Any):
+    """An out-of-tree platform's defaults, declared like every rule beside it.
+
+    `Platform.apply_server_args_defaults` is a plugin interface: the platform is
+    handed a configuration and assigns the fields it wants defaulted. In-tree
+    platforms do not implement it -- the base is a no-op and nothing overrides
+    it -- so this captures nothing here and exists for the platforms that live
+    outside this tree.
+
+    Ordering: it must precede `handle_gpu_memory_settings`, whose symm-mem
+    prealloc default keys off `enable_symm_mem`.
+    """
+    # `current_platform` is the plugin object; `get_platform()` is the facts
+    # view over it and carries neither the name nor the hook.
+    from sglang.srt.platforms import current_platform
+
+    record_foreign_defaults(
+        server_args,
+        f"platform:{current_platform.device_name}",
+        current_platform.apply_server_args_defaults,
+    )
+
+
 def handle_symm_mem_device_support(server_args: Any):
     cfg = resolving_view(server_args)
     # The symm-mem allocator compiles a CUDA plugin and links -lnccl, so off
@@ -101,6 +127,12 @@ def handle_symm_mem_device_support(server_args: Any):
 def handle_xpu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "xpu":
+        if cfg.sampling_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                sampling_backend="intel_xpu",
+            )
         # Decode graph is opt-in on XPU: unless the user explicitly set
         # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
         # disabled so the default startup doesn't require graph capture.

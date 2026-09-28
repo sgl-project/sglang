@@ -40,6 +40,7 @@
     },
     "scenarios": {
         "flux_2_klein_base_image_t2i": {
+            "expected_load_ms": 30018.87,
             "stages_ms": {
                 "DecodingStage": 18.19,
                 "DenoisingStage": 17612.9,
@@ -67,6 +68,7 @@
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
+            "expected_load_ms": 46026.44,
             "stages_ms": {
                 "DecodingStage": 495.01,
                 "DenoisingStage": 21452.59,
@@ -93,6 +95,7 @@
             "estimated_full_test_time_s": 160.9
         },
         "turbo_wan2_1_t2v_1.3b": {
+            "expected_load_ms": 43084.93,
             "stages_ms": {
                 "InputValidationStage": 0.11,
                 "TextEncodingStage": 634.42,
@@ -120,6 +123,7 @@
             "estimated_full_test_time_s": 200.3
         },
         "zimage_image_t2i": {
+            "expected_load_ms": 43930.51,
             "stages_ms": {
                 "DecodingStage": 7.11,
                 "DenoisingStage": 2178.8,
@@ -146,6 +150,7 @@
             "estimated_full_test_time_s": 329.8
         },
         "flux_image_t2i_layerwise_cpu_offload_5090": {
+            "expected_load_ms": 47725.91,
             "stages_ms": {
                 "InputValidationStage": 0.11,
                 "TextEncodingStage": 204.63,
@@ -194,6 +199,7 @@
             "estimated_full_test_time_s": 90.0
         },
         "minimax_h3_t2va_consumer_budget_1gpu_5090": {
+            "expected_load_ms": 47708.93,
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "MiniMaxH3PartitionAdmissionStage": 0.03,
@@ -223,7 +229,8 @@
             "runtime_peak_allocated_mb": 11483.0,
             "load_peak_host_anon_mb": 32768.0,
             "runtime_peak_host_anon_mb": 32768.0,
-            "estimated_full_test_time_s": 283.0
+            "estimated_full_test_time_s": 283.0,
+            "timing_tolerance": 0.9
         }
     }
 }

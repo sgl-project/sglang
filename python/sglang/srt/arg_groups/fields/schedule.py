@@ -1,19 +1,13 @@
-"""Config fields of the ``schedule`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``schedule`` bag, which is what ``get_schedule()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``schedule`` namespace."""
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     List,
     Optional,
 )
+
+import msgspec
 
 from sglang.srt.arg_groups.arg_utils import (
     A,
@@ -22,8 +16,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.utils.common import human_readable_int
 
 
-@dataclasses.dataclass
-class Schedule:
+class Schedule(msgspec.Struct):
     """Namespace ``schedule``."""
 
     _NS_PATH = "schedule"
@@ -61,9 +54,12 @@ class Schedule:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
     prefill_decode_interval: A[
-        int,
-        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
-    ] = 0
+        Optional[int],
+        Arg(
+            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+            resolvable=True,
+        ),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -95,6 +91,8 @@ class Schedule:
                 "lof",
                 "priority",
                 "routing-key",
+                "hrrn",
+                "shortest-prefill-first",
             ],
         ),
     ] = "fcfs"
@@ -156,6 +154,23 @@ class Schedule:
             ),
             resolvable=True,
             fallback=0.8,
+        ),
+    ] = None
+    # Recorded by the cache hook; the effective field answers the fallback when unset.
+    _swa_full_tokens_ratio_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
         ),
     ] = None
     disable_hybrid_swa_memory: A[

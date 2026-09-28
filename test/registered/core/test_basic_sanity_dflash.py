@@ -9,7 +9,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -28,7 +28,7 @@ class TestBasicSanityDFlash(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
-    GSM8KMixin,
+    MMLUSanityMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_DFLASH
@@ -39,9 +39,7 @@ class TestBasicSanityDFlash(
     fwd_occupancy_acc_length_threshold: float = 2.0
 
     model = DEFAULT_TARGET_MODEL_DFLASH
-    gsm8k_num_questions = 1400
-    gsm8k_accuracy_thres = 0.74
-    gsm8k_accept_length_thres = 2.8
+    mmlu_accept_length_thres = 2.8
 
     attention_backend = "triton"
     draft_attention_backend = "triton"
@@ -63,12 +61,12 @@ class TestBasicSanityDFlash(
                 "DFLASH",
                 "--speculative-draft-model-path",
                 DEFAULT_DRAFT_MODEL_DFLASH,
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
                 "--enable-metrics",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )

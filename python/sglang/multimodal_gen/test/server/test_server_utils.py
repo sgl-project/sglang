@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -24,12 +26,12 @@ from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.process import kill_process_tree
 from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_init_payload,
@@ -187,6 +189,7 @@ class ServerContext:
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
+    load_time_ms: float | None = None
 
     def log_tail(self, lines: int = 200) -> str:
         """Return recent server output for failure diagnostics."""
@@ -422,6 +425,9 @@ class ServerManager:
         # regardless of log-level configuration.
         print(f"[server-test] Running command: {cmd_str}", flush=True)
 
+        load_started_ns = time.monotonic_ns()
+        load_finished_ns = None
+        load_ready = threading.Event()
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -437,9 +443,17 @@ class ServerManager:
 
             def _log_pipe(pipe: Any, file: Any) -> None:
                 """Read from pipe and write to file and stdout."""
+                nonlocal load_finished_ns
                 try:
                     with pipe:
                         for line in iter(pipe.readline, ""):
+                            match = re.search(
+                                r"\[server-load\] workers_ready_monotonic_ns=(\d+)",
+                                line,
+                            )
+                            if match and load_finished_ns is None:
+                                load_finished_ns = int(match.group(1))
+                                load_ready.set()
                             sys.stdout.write(line)
                             sys.stdout.flush()
                             file.write(line)
@@ -474,6 +488,10 @@ class ServerManager:
         )
         try:
             self._wait_for_ready(process, stdout_path)
+            # health includes warmup; the worker marker's clock excludes it
+            load_ready.wait(timeout=5)
+            if load_finished_ns is not None:
+                context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
         except BaseException:
             context.cleanup()
             raise
@@ -713,7 +731,7 @@ class PerformanceValidator:
         if self.is_baseline_generation_mode:
             return summary
 
-        self._validate_e2e(summary)
+        self.validate_e2e(summary)
         self._validate_denoise_agg(summary)
         self._validate_denoise_steps(summary)
         self._validate_stages(summary)
@@ -726,14 +744,50 @@ class PerformanceValidator:
     ) -> PerformanceSummary:
         return PerformanceSummary.from_req_perf_record(perf_record, self.step_fractions)
 
-    def _validate_e2e(self, summary: PerformanceSummary) -> None:
+    def _timing_tol(self, profile_tolerance: float) -> float:
+        """Tolerance for a wall-clock check, honoring a per-case override.
+
+        A case whose runtime is dominated by shared-runner host I/O cannot be
+        guarded at the profile tolerance; ``timing_tolerance`` in its baseline
+        entry widens only the wall-clock checks, never the memory ones.
+        """
+        override = self.scenario.timing_tolerance
+        if override is None:
+            return profile_tolerance
+        return max(profile_tolerance, override)
+
+    def validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
-        assert summary.e2e_ms > 0, "E2E duration missing"
+        assert math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0, (
+            "E2E duration missing or invalid"
+        )
+        expected = self.scenario.expected_e2e_ms
+        assert math.isfinite(expected) and expected > 0, (
+            "E2E baseline missing or invalid"
+        )
         self._assert_le(
             "E2E Latency",
             summary.e2e_ms,
             self.scenario.expected_e2e_ms,
-            self.tolerances.e2e,
+            self._timing_tol(self.tolerances.e2e),
+        )
+
+    def validate_load(self, summary: PerformanceSummary) -> None:
+        load_ms = summary.load_time_ms
+        expected_load_ms = self.scenario.expected_load_ms
+        assert load_ms is not None and math.isfinite(load_ms) and load_ms > 0, (
+            "Load duration missing or invalid"
+        )
+        assert (
+            expected_load_ms is not None
+            and math.isfinite(expected_load_ms)
+            and expected_load_ms > 0
+        ), "Load baseline missing or invalid"
+        self._assert_le(
+            "Load Latency (excluding warmup)",
+            load_ms,
+            expected_load_ms,
+            self._timing_tol(self.tolerances.e2e),
         )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
@@ -744,13 +798,13 @@ class PerformanceValidator:
             "Average Denoise Step",
             summary.avg_denoise_ms,
             self.scenario.expected_avg_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
         self._assert_le(
             "Median Denoise Step",
             summary.median_denoise_ms,
             self.scenario.expected_median_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
 
     def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
@@ -766,7 +820,7 @@ class PerformanceValidator:
                     f"Denoise Step {idx}",
                     actual,
                     expected,
-                    FIRST_DENOISE_STEP_TOLERANCE,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
                     min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
@@ -775,7 +829,7 @@ class PerformanceValidator:
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
+                self._timing_tol(self.tolerances.denoise_step),
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -787,9 +841,9 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-            tolerance = (
+            tolerance = self._timing_tol(
                 self.tolerances.denoise_stage
-                if stage == "DenoisingStage"
+                if stage in summary.denoising_stages
                 else self.tolerances.non_denoise_stage
             )
             if stage.endswith("DecodingStage"):
@@ -822,7 +876,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                     f"Denoise Step {idx}",
                     actual,
                     expected,
-                    FIRST_DENOISE_STEP_TOLERANCE,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
                     min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
@@ -833,7 +887,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
+                self._timing_tol(self.tolerances.denoise_step),
                 min_abs_tolerance=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
             )
 
@@ -863,7 +917,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 "Average Frame Time",
                 summary.avg_frame_time_ms,
                 expected_frame_time,
-                self.tolerances.denoise_stage,
+                self._timing_tol(self.tolerances.denoise_stage),
             )
 
 
@@ -1467,9 +1521,9 @@ def get_generate_fn(
             size=sampling_params.output_size,
             seconds=video_seconds,
             extra_body={
-                "reference_url": sampling_params.image_path,
                 "fps": sampling_params.fps,
                 "num_frames": sampling_params.num_frames,
+                **extra_body,
             },
         )
 
@@ -1529,7 +1583,9 @@ def get_generate_fn(
                 require_chunk_stats=True,
             )
         )
-        record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_perf_stats(
+            case_id, realtime_output.chunk_stats, realtime_output.e2e_ms
+        )
         record_realtime_key_frames(case_id, realtime_output.frames)
         fps = int(sampling_params.fps or 24)
         video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)

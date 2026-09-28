@@ -306,7 +306,7 @@ class MiniMaxH3AdalnHostTier:
     def _skip_for_pressure(self, group_key) -> None:
         if self.stats is not None:
             self.stats.host_pressure_skips += 1
-        logger.info(
+        logger.debug(
             "MiniMax H3 AdaLN host tier: group of %d plan(s) skipped under "
             "memory pressure; it will recompute on its next occurrence",
             len(group_key),
@@ -651,7 +651,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self._slots.update(pending_slots)
         self.rebuilds += 1
         self.stats.built_plans += len(missing)
-        logger.info(
+        logger.debug(
             "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
             len(missing),
             len(self._slots),
@@ -727,7 +727,7 @@ class MiniMaxH3AdalnCache(nn.Module):
             self.plan_lengths[assignments[key]] = timesteps.numel()
         self._slots.update(assignments)
         self.stats.host_hit_plans += len(missing)
-        logger.info(
+        logger.debug(
             "MiniMax H3 AdaLN: %d plan(s) from the host cache, %d/%d resident",
             len(missing),
             len(self._slots),

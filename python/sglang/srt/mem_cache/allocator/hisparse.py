@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import weakref
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -11,6 +14,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
@@ -19,7 +25,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseDSATokenToKVPool,
+        kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):
@@ -346,6 +352,27 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.logical_attn_allocator.translate_swa_indices_for_transfer(
+            kv_indices
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Use this wrapper's capacity, which also includes the compressed pool.
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -355,8 +382,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        # C4 needs no reclaim here: full_available_size prices it into the budget.
+        return self.logical_attn_allocator.reclaim_for_prealloc(
+            tree_cache, full_tokens, swa_tokens
+        )
+
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
+
+    def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
+        self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
 
     def free_full(self, free_indices: torch.Tensor):
         if free_indices.numel() == 0:

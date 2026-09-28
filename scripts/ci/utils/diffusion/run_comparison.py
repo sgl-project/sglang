@@ -394,22 +394,41 @@ def _build_sglang_payload(case: dict) -> dict:
     return payload
 
 
-def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> dict | None:
-    """Read a perf dump JSON written by the server.
+def _read_perf_dump(perf_dump_path: str, timeout: float = 30.0) -> dict | None:
+    """Read a perf dump JSON written by the server, or None with a reason logged.
 
-    The server writes the file asynchronously after the HTTP response,
-    so we poll briefly.
+    The server writes the file after the HTTP response, so poll briefly. When
+    the poll gives up, say which of the three things went wrong -- the file
+    never appeared, it never parsed, or it parsed without total_duration_ms --
+    because "did not write performance data" covered all three and made the
+    intermittent nightly failures undiagnosable from the log alone.
     """
     deadline = time.time() + timeout
+    last_reason = "file never appeared"
     while time.time() < deadline:
         try:
             with open(perf_dump_path) as f:
                 data = json.load(f)
             if data.get("total_duration_ms") is not None:
                 return data
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+            last_reason = f"parsed but has no total_duration_ms (keys: {sorted(data)})"
+        except FileNotFoundError:
+            last_reason = "file never appeared"
+        except json.JSONDecodeError as exc:
+            last_reason = f"never parsed as JSON ({exc})"
         time.sleep(0.5)
+
+    directory = os.path.dirname(perf_dump_path) or "."
+    try:
+        siblings = sorted(f for f in os.listdir(directory) if f.startswith("perf_"))[
+            -8:
+        ]
+    except OSError as exc:
+        siblings = [f"<unreadable: {exc}>"]
+    print(
+        f"  WARNING: no server perf dump after {timeout:.0f}s — {last_reason}."
+        f" {directory} holds: {siblings}"
+    )
     return None
 
 
@@ -840,6 +859,7 @@ def run_single(
 
         latency_samples: list[float] = []
         perf_dumps: list[dict] = []
+        missing_perf_dumps = 0
         for sample_index in range(measurement_repeats):
             perf_dump_path = None
             if framework == "sglang":
@@ -862,22 +882,33 @@ def run_single(
             latency_samples.append(round(latency, 3))
 
             if perf_dump_path:
+                # The measurement is the client-side latency recorded above; the
+                # server dump is supplementary stage telemetry, and the dashboard
+                # already renders rows whose server_latency_s is absent. Losing it
+                # should not discard a good measurement or fail the nightly.
                 perf_dump = _read_perf_dump(perf_dump_path)
                 if perf_dump is None:
-                    raise RuntimeError(
-                        f"Server did not write performance data to {perf_dump_path}"
+                    missing_perf_dumps += 1
+                else:
+                    perf_dumps.append(perf_dump)
+                    print(
+                        "  Server-side latency: "
+                        f"{perf_dump['total_duration_ms'] / 1000.0:.2f}s"
                     )
-                perf_dumps.append(perf_dump)
-                print(
-                    "  Server-side latency: "
-                    f"{perf_dump['total_duration_ms'] / 1000.0:.2f}s"
-                )
 
         result["latency_samples_s"] = latency_samples
         result["measurement_count"] = len(latency_samples)
         result["latency_s"] = round(statistics.median(latency_samples), 3)
         if perf_dumps:
             result.update(_summarize_perf_dumps(perf_dumps))
+        if missing_perf_dumps:
+            # Surfaced in the artifact so an intermittent dump race stays visible
+            # instead of silently thinning the server-side medians.
+            result["missing_perf_dumps"] = missing_perf_dumps
+            print(
+                f"  NOTE: {missing_perf_dumps}/{measurement_repeats} server perf "
+                "dump(s) unreadable; client-side latency is unaffected"
+            )
 
     except Exception as e:
         result["error"] = server_error.get("message", str(e))

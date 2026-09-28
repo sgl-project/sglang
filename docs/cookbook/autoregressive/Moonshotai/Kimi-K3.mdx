@@ -30,7 +30,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest                                  # NVIDIA (CUDA)
-docker pull lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903     # AMD MI350X / MI355X (ROCm)
+docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916     # AMD MI350X / MI355X (ROCm)
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -40,14 +40,16 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 <Tab title="NPU">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3   # Ascend A3 Series
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070   # Ascend 950PR/DT Series
 ```
 
 For host and platform setup, see the
 [NPU installation guide](../../../docs/hardware-platforms/ascend-npus/getting-started/installation) and the
 [quick start guide](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start).
 
-**Weights (NPU):** [Kimi-K3-W4A8](https://www.modelscope.cn/models/sgl-npu/Kimi-K3-W4A8) (W4A8, 1.49 TB) ·
+**Weights (NPU):** [Kimi-K3](https://modelscope.cn/models/moonshotai/Kimi-K3) (950PR/DT Series, MXFP4) ·
+[Kimi-K3-W4A8](https://www.modelscope.cn/models/sgl-npu/Kimi-K3-W4A8) (A3 Series, W4A8, 1.49 TB) ·
 [Kimi-K3-DSpark](https://www.modelscope.cn/models/RadixArk/Kimi-K3-DSpark) (DSPARK draft, 4.5 GB)
 
 </Tab>
@@ -56,22 +58,22 @@ For host and platform setup, see the
 
 </Accordion>
 
-Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8, Atlas 800I A3 4×8 — 32 cards / 64 dies), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8, Ascend A3 Series 4×8 — 32 cards / 64 dies, Ascend 950PR/DT Series 4×8), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
 
 **PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies, both chunked at 16k. On the 8-GPU platforms (B300 1×8, GB300 2×4), `Default` is TP8 and `Long-Context` is `--pp-size 8 --tp-size 1`. On the 16-GPU platforms (B200 2×8, GB200 4×4), both are `--pp-size 16 --tp-size 1` and differ only in `--mem-fraction-static` (0.85 vs 0.90) — deep PP is the throughput shape there, not just the long-context one (see [Deep PP](#deep-pp-for-prefill)).
 
 **Strategy** — the operating point within that shape:
 
 - **Low-Latency** — no DCP, so the MLA KV stays TP-replicated. For chat. B200 splits its two nodes into PP2 × TP8; every other platform is flat TP.
-- **Balanced** — the accuracy-preserving default: PP2 × DCPEP8 on B200 (the two pipeline stages and DCP8 split KV and KDA state), TP16/DCP16 on GB200, TP8/DCP8 on B300/GB300, TP8 ROCm/AITER on MI35x.
+- **Balanced** — the accuracy-preserving default: PP2 × DCPEP8 on B200 (the two pipeline stages and DCP8 split KV and KDA state), TP16/DCP16 on GB200, TP8/DCP8 on B300/GB300, TP8/DCP8 ROCm/AITER on MI35x.
 - **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). The cell itself is Balanced, except on H100 (plus `extra_buffer_lazy`) and H200 (widens to 4×8 TP32/EP32 at `--mem-fraction-static 0.90`).
 
 `Long-Context` appears only under the `Prefill` PD mode; for long-context unified serving on B200, start from High-Throughput and raise `--context-length`.
 
-**Spec Decode** — layers onto the strategy without changing it, on every platform except B200. DSPARK proposes 7 draft tokens per step (tune in the Playground) and requires `pp_size == 1`, so on B200 it also drops the pipeline and re-lays the same 16 GPUs flat: PP2 × TP8 → TP16, PP2 × DCPEP8 → DCPEP16. DFLASH has no published draft checkpoint. The win is largest on short interactive traffic and fades as the prompt grows.
+**Spec Decode** — layers onto the strategy without changing it, on every platform except B200. DSPARK proposes 7 draft tokens per step (tune in the Playground) and requires `pp_size == 1`, so on B200 it also drops the pipeline and re-lays the same 16 GPUs flat: PP2 × TP8 → TP16, PP2 × DCPEP8 → DCPEP16. DFLASH uses the [Kimi-K3-DFlash](https://huggingface.co/modal-labs/Kimi-K3-DFlash) draft at block size 8; it doesn't support pipeline parallelism or DP attention yet, so it is unavailable on the pipelined B200 Unified recipes. It has only been validated on Blackwell, so the Hopper and AMD recipes don't offer it yet. The win is largest on short interactive traffic and fades as the prompt grows.
 
 <Note>
-`--mamba-full-memory-ratio` is the one sizing flag, computed live: set your average request length in the [Mamba ratio calculator](#mamba-ratio-calculator); everything else follows the panels, and the result is pinned into the command. (The Atlas 800I A3 uses `--max-mamba-cache-size` instead.)
+`--mamba-full-memory-ratio` is the one sizing flag, computed live: set your average request length in the [Mamba ratio calculator](#mamba-ratio-calculator); everything else follows the panels, and the result is pinned into the command. (The Ascend NPU recipes don't use the calculator and set no ratio at all — the Ascend path sizes both pools itself: the A3 Series pins `--max-mamba-cache-size` instead, and the A5 recipe serves with the radix cache off.)
 </Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -90,6 +92,22 @@ import { KimiK3MambaRatioCalculator } from "/src/snippets/_kimi_k3_mamba_ratio_c
   clamps admission below that (101 / 68 / 91 / 60 concurrent requests for MXFP4 NOSPEC / MXFP4 DSPARK /
   NVFP4 NOSPEC / NVFP4 DSPARK), which is why no point past concurrency 64 is published for Balanced.
 </Note>
+
+### AMD AITER with DCP8
+
+The MI350X/MI355X unified Balanced recipe uses TP8/DCP8 with AITER prefill and
+decode attention. DCP shards the target MLA KV cache; RadixArk DSPARK's draft KV
+remains replicated. The pinned `v0.5.19-rocm720-mi35x-20260916` image records
+SGLang revision `e7f7447333`, which includes
+[AITER DCP support (#34432)](https://github.com/sgl-project/sglang/pull/34432) and
+the [DCP KV-free fix (#38941)](https://github.com/sgl-project/sglang/pull/38941).
+No source overlay is required for DCP.
+
+Keep `SGLANG_K3_KDA_FUSED_BACKEND` unset with this image. The separate fused-KDA
+opt-in requires the [deferred-gate fix (#39066)](https://github.com/sgl-project/sglang/pull/39066),
+which is not included in this image. This updated recipe remains **Final
+Verification In Progress**; the recorded speed numbers use their original
+configurations and do not validate the new image or DCP8 recipe.
 
 ### Mamba ratio calculator
 
@@ -146,7 +164,7 @@ not been re-measured on any cell — re-measure before you rely on one.
 
 ## 2. Configuration Tips
 
-**Memory: two pools, one flag.** K3 splits static memory into a worst-case-reserved **KDA state pool** (it sets the concurrency ceiling) and a paged **MLA KV pool**, divided by `--mamba-full-memory-ratio`. The command panel pins that flag to the [calculator](#mamba-ratio-calculator)'s output — set your average request length there; every other calculator input follows the panels. (On the Atlas 800I A3: `--max-mamba-cache-size`, no calculator.) After boot, read back `max_total_num_tokens` (the KV side) and the admitted-request cap (the state side).
+**Memory: two pools, one flag.** K3 splits static memory into a worst-case-reserved **KDA state pool** (it sets the concurrency ceiling) and a paged **MLA KV pool**, divided by `--mamba-full-memory-ratio`. The command panel pins that flag to the [calculator](#mamba-ratio-calculator)'s output — set your average request length there; every other calculator input follows the panels. (On the Ascend NPU recipes there is no calculator and no ratio flag: the Ascend path sizes both pools itself — the A3 Series pins `--max-mamba-cache-size`, and the A5 recipe runs the radix cache off.) After boot, read back `max_total_num_tokens` (the KV side) and the admitted-request cap (the state side).
 
 Capacity levers, all in the Playground. Each trades precision or cache behavior for capacity — re-verify accuracy on your workload:
 
@@ -178,10 +196,11 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
-| Atlas 800I A3 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
+| MI350X/MI355X 1×8 | TP8/DCP8 ROCm/AITER (Unified Balanced) | AITER A8W4 FlyDSL MoE, AITER prefill/decode attention with sharded target MLA KV, graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
+| Ascend A3 Series 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
+| Ascend 950PR/DT Series 4×8 | TP32/dp1 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; shared experts / dense MLP shard over attention-TP (`--shared-experts-tp-size 4`); radix cache off; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
 
-**DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
+**Blackwell DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 
 - DCP is the only axis that shards the TP-replicated MLA KV; Low-Latency skips it.
 - Leave `--dcp-comm-backend` unset (fabric-resolved: `fi_a2a` on GB200/GB300, `a2a` on B200/B300).
@@ -239,7 +258,7 @@ Pending update...
 
 ### 3.2 Tool Calling
 
-Enable the `kimi_k3` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Because K3 is a thinking model, the follow-up turn may put text in `reasoning_content` as well as `content` — print both. (Not yet supported on the Atlas 800I A3.)
+Enable the `kimi_k3` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Because K3 is a thinking model, the follow-up turn may put text in `reasoning_content` as well as `content` — print both. (Not yet supported on the Ascend NPU recipes — A3 and A5.)
 
 <Accordion title="Tool Calling Example (Python)">
 
@@ -283,7 +302,8 @@ Pending update...
 
 K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **HiCache** card in the [Playground above](#playground) for long multi-turn workloads.
 
-- On the DCP recipes (Blackwell Balanced / High-Throughput, in both the `Unified` and `Decode` roles), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 with Spec Decode off keeps DCP. Only DCP goes: the MLA KV reverts to TP-replicated, but the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP while B200 Unified keeps its `--pp-size 2` / `--ep-size`.
+- On the DCP recipes (Blackwell Balanced / High-Throughput, `Unified` and `Decode` roles), **L1+L2 keeps DCP**, with Spec Decode off or on DSPARK. On B200 the DSPARK pipeline collapse scales it too (PP2 × DCPEP8 → DCPEP16).
+- **L3 drops the DCP flags** on those recipes (storage keys are not dcp_rank-aware yet; the command hints call it out, and per-request KV capacity shrinks). Only DCP goes: the MLA KV reverts to TP-replicated while the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP and B200 Unified keeps its `--pp-size 2` / `--ep-size`.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
 
 <a id="pd-disaggregation" />

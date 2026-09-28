@@ -37,7 +37,7 @@ class TestQwen35(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--mamba-scheduler-strategy=extra_buffer",
+            "--mamba-radix-cache-strategy=extra_buffer",
         ]
 
         variants = [
