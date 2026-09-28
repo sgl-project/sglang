@@ -7,9 +7,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::sweep::{deliver_bootstrap, sweep_until_deadline, SweepResult};
+use super::sweep::{deliver_bootstrap, still_pending, sweep_recording_settled, SweepResult};
 use super::{KvEventIndex, LateJoin, ObligationBatch};
-use crate::state::kv_events::bootstrap::{BootstrapState, BootstrapTracker};
+use crate::state::kv_events::bootstrap::BootstrapTracker;
 use crate::state::kv_events::tree::KvWorkerId;
 
 /// Obligations taken off the queue for one sweep, with the freshness every one
@@ -71,11 +71,8 @@ impl PendingSweep {
         // Keyed by epoch alone: the tracker mints epochs from one counter, and
         // the `epoch_of` check ties each surviving epoch to exactly one rank.
         let mut seen: HashSet<u64> = HashSet::with_capacity(self.obligations.len());
-        self.obligations.retain(|(rank, epoch)| {
-            tracker.epoch_of(rank) == Some(*epoch)
-                && tracker.state_of(rank) == Some(BootstrapState::Pending)
-                && seen.insert(*epoch)
-        });
+        self.obligations
+            .retain(|(rank, epoch)| still_pending(tracker, rank, *epoch) && seen.insert(*epoch));
     }
 }
 
@@ -143,6 +140,7 @@ pub(super) async fn bootstrap_coordinator(
             continue;
         }
         let deadline = deps.deadline();
+        let mut settled = Vec::new();
 
         // ONE sweep, awaited here rather than spawned — that is what makes this
         // single-flight. Obligations discovered while it runs pile up in the
@@ -159,11 +157,12 @@ pub(super) async fn bootstrap_coordinator(
         // pulling multi-megabyte bodies from siblings for up to the deadline.
         let result = tokio::select! {
             _ = cancel.cancelled() => return,
-            result = sweep_until_deadline(
+            result = sweep_recording_settled(
                 &deps,
                 &pending.obligations,
                 deadline,
                 pending.freshness_floor,
+                &mut settled,
             ) => result,
         };
         let joined = drain_ready(&mut rx, &mut pending);
@@ -178,7 +177,11 @@ pub(super) async fn bootstrap_coordinator(
             );
         }
         // Late arrivals can repeat a rank already here, and anything can have
-        // resolved or been removed while the sweep ran.
+        // resolved or been removed while the sweep ran. A rank the sweep settled
+        // cold is owed nothing either, but can still read `Pending` until the
+        // pump drains that release, so it is dropped by obligation, not by
+        // state — otherwise it would buy a coverage retry, or a sweep of its own.
+        pending.obligations.retain(|ob| !settled.contains(ob));
         pending.retain_graftable(&deps.bootstrap);
 
         // The sweep's coverage check (`covers_any`) only spoke for the ranks it
@@ -206,6 +209,20 @@ pub(super) async fn bootstrap_coordinator(
                     late_join: LateJoin::Permitted,
                 });
             }
+        }
+
+        // A sweep that ends `RanksResolved` owes its own ranks nothing and sends
+        // nothing: every one left `Pending` on its incarnation, or was settled and
+        // dropped above. What remains was merged in after the sweep started and
+        // was never swept. Folded into that delivery it would stay `Pending` with
+        // nothing left to release it, so it gets a sweep of its own, asking for
+        // the newest instant it began holding, as a coverage retry does.
+        if matches!(result, SweepResult::RanksResolved) && !pending.obligations.is_empty() {
+            pending.deferred.push(ObligationBatch {
+                obligations: std::mem::take(&mut pending.obligations),
+                holding_since: pending.newest_holding,
+                late_join: LateJoin::Permitted,
+            });
         }
 
         // Re-queue via the index rather than a sender this task owns: a
@@ -286,6 +303,7 @@ mod tests {
 
     use super::super::test_support::*;
     use super::*;
+    use crate::state::kv_events::bootstrap::BootstrapState;
 
     fn obligation(n: u32) -> ObligationBatch {
         discovery_batch(n, Instant::now())
@@ -514,5 +532,147 @@ mod tests {
             take_pending(&mut rx, &cancel).await.is_none(),
             "closed channel stops the coordinator",
         );
+    }
+
+    /// A rank that joins a sweep whose own ranks all resolve without it — here
+    /// from their stream's origin — must still get a sweep. `RanksResolved`
+    /// sends no control message, so folded into that delivery the late joiner
+    /// would sit `Pending`, holding its batches and `/readyz`, forever.
+    #[tokio::test]
+    async fn a_rank_that_joins_a_sweep_ending_ranks_resolved_gets_its_own() {
+        use std::sync::Arc;
+
+        use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
+        use crate::state::kv_events::bootstrap::{PeerSnapshot, WireWorker, SNAPSHOT_FORMAT};
+        use crate::state::kv_events::tree::SnapshotNode;
+
+        let (first, late, carrier) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+            worker_id("http://w3:30000", 0),
+        );
+        // Warm, silent on `first` (so its sweep keeps looking), and naming
+        // `late` as a rank it holds nothing for (so a sweep for it settles).
+        let body = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 64,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![WireWorker::from(&carrier)],
+            cursors: vec![(0, 5)],
+            nodes: vec![SnapshotNode {
+                parent: None,
+                block_hash: 111,
+                workers: vec![0],
+                tiers: vec![],
+            }],
+            empty_ranks: vec![WireWorker::from(&late)],
+        };
+        let (peer, _q) = serve_snapshot_sequence(vec![body]).await;
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        oracle.set_bigram(false);
+        let tracker = Arc::new(BootstrapTracker::new(Duration::from_secs(3600)));
+        let index =
+            KvEventIndex::new_with_bootstrap(reqwest::Client::new(), oracle, Arc::clone(&tracker));
+        index.peers().replace(vec![peer]);
+        for w in [&first, &late, &carrier] {
+            index.live_workers.lock().insert(w.clone());
+        }
+        let ob = tracker.register(&[first.clone(), late.clone()]);
+        let batch = |obligations| ObligationBatch {
+            obligations,
+            holding_since: Instant::now(),
+            late_join: LateJoin::Permitted,
+        };
+
+        index.enqueue_bootstrap(batch(vec![ob[0].clone()]));
+        // Let the coordinator start the sweep, then queue the late joiner.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        index.enqueue_bootstrap(batch(vec![ob[1].clone()]));
+        tracker.set(&first, BootstrapState::Recovered);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while tracker.state_of(&late) == Some(BootstrapState::Pending) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the late joiner was swept and settled, not stranded Pending");
+        assert_eq!(tracker.state_of(&late), Some(BootstrapState::Failed));
+        index.shutdown().await;
+    }
+
+    /// A rank the sweep settles cold mid-sweep can still read `Pending` when the
+    /// coordinator looks, because the pump has not drained that release yet. It
+    /// was swept, so it is owed nothing: it must not be re-queued as though it
+    /// had joined late, which would run (or at least tally) a second sweep.
+    #[tokio::test]
+    async fn a_rank_settled_cold_mid_sweep_is_not_swept_again() {
+        use std::sync::Arc;
+
+        use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
+        use crate::state::kv_events::bootstrap::{PeerSnapshot, WireWorker, SNAPSHOT_FORMAT};
+        use crate::state::kv_events::tree::SnapshotNode;
+
+        let (rank, carrier) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+        );
+        let body = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 64,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![WireWorker::from(&carrier)],
+            cursors: vec![(0, 5)],
+            nodes: vec![SnapshotNode {
+                parent: None,
+                block_hash: 111,
+                workers: vec![0],
+                tiers: vec![],
+            }],
+            empty_ranks: vec![WireWorker::from(&rank)],
+        };
+        let (peer, queries) = serve_snapshot_sequence(vec![body]).await;
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        oracle.set_bigram(false);
+        let tracker = Arc::new(BootstrapTracker::new(Duration::from_secs(3600)));
+        let index =
+            KvEventIndex::new_with_bootstrap(reqwest::Client::new(), oracle, Arc::clone(&tracker));
+        index.peers().replace(vec![peer]);
+        for w in [&rank, &carrier] {
+            index.live_workers.lock().insert(w.clone());
+        }
+        let obligations = tracker.register(std::slice::from_ref(&rank));
+        index.enqueue_bootstrap(ObligationBatch {
+            obligations,
+            holding_since: Instant::now(),
+            late_join: LateJoin::Permitted,
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while tracker.state_of(&rank) == Some(BootstrapState::Pending) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the rank settles cold");
+        // Room for a wrongly re-queued batch to reach the coordinator.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(tracker.state_of(&rank), Some(BootstrapState::Failed));
+        assert!(
+            tracker
+                .sweep_result_counts()
+                .contains(&("ranks_resolved", 1)),
+            "one sweep, tallied once: {:?}",
+            tracker.sweep_result_counts(),
+        );
+        assert_eq!(queries.lock().expect("queries lock").len(), 1, "one fetch");
+        index.shutdown().await;
     }
 }

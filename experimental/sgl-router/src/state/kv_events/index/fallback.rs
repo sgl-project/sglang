@@ -322,6 +322,84 @@ mod tests {
         );
     }
 
+    /// A rank back in `Pending` for a gap retry still holds its first attempt's
+    /// batches. Its engine then restarts in place and batch 0 is lost, so the
+    /// new stream shows up at 3 — a regression only against that held queue.
+    /// Holding it instead would let the retry's peer, which also missed the
+    /// restart, graft an old-numbering cursor that filters the new stream as
+    /// already reflected: old-stream state served warm.
+    #[tokio::test]
+    async fn pump_restart_during_a_gap_retry_is_caught_against_the_held_queue() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 7,
+            batch: batch(vec![stored(None, vec![500])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Watermark 5 against held seq 7: a gap, so the rank is re-queued.
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        let retry = h.bootstrap_rx.recv().await.expect("gapped rank re-queued");
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
+
+        // Restarted in place, batch 0 lost: the new stream arrives at 3.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 3,
+            batch: batch(vec![stored(None, vec![1003])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A peer that also missed the restart still reports the old stream.
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: retry.obligations,
+                vetted: Box::new(vetted_for(&id, 7)),
+            })
+            .await
+            .unwrap();
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 4,
+            batch: batch(vec![stored(None, vec![1004])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        for dead in [500, 100, 200] {
+            assert_eq!(
+                h.tree.match_prefix(None, &[dead]).matched_blocks,
+                0,
+                "block {dead} belongs to the dead stream or the stale snapshot",
+            );
+        }
+        for live in [1003, 1004] {
+            assert!(
+                h.tree.match_prefix(None, &[live]).workers().contains(&id),
+                "new-stream block {live} must be applied, not filtered",
+            );
+        }
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(4));
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(rank_count(&tracker, "warm"), 0, "never tallied warm");
+        assert_eq!(rank_count(&tracker, "publisher_reset"), 1);
+    }
+
     /// A retry that fails must not cost the rank the deltas it held before it:
     /// abandoning replays every batch the rank has received, both attempts'.
     #[tokio::test]

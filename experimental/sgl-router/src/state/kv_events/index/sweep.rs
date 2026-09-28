@@ -187,6 +187,30 @@ pub(super) async fn sweep_until_deadline(
     deadline: Duration,
     freshness_floor: Instant,
 ) -> SweepResult {
+    sweep_recording_settled(
+        deps,
+        obligations,
+        deadline,
+        freshness_floor,
+        &mut Vec::new(),
+    )
+    .await
+}
+
+/// [`sweep_until_deadline`], also appending to `settled` every obligation it
+/// released cold mid-sweep (see `settle_ranks_cold`).
+///
+/// For the coordinator, which decides after the sweep which obligations are
+/// still owed a look: the pump may not have drained a mid-sweep release yet, so
+/// a settled rank can still read `Pending` then, and only this list tells it
+/// apart from one the sweep never resolved.
+pub(super) async fn sweep_recording_settled(
+    deps: &BootstrapDeps,
+    obligations: &[(KvWorkerId, u64)],
+    deadline: Duration,
+    freshness_floor: Instant,
+    settled: &mut Vec<(KvWorkerId, u64)>,
+) -> SweepResult {
     let ctx = SweepCtx {
         http: &deps.http,
         peers: &deps.peers,
@@ -213,7 +237,7 @@ pub(super) async fn sweep_until_deadline(
                     return Some(SweepResult::FleetCold { peers_tried })
                 }
                 SweepPass::NothingToRecover { ranks, peers_tried } => {
-                    settle_ranks_cold(deps, &mut active, &ranks, peers_tried).await;
+                    settled.extend(settle_ranks_cold(deps, &mut active, &ranks, peers_tried).await);
                     if active.is_empty() {
                         return Some(SweepResult::RanksResolved);
                     }
@@ -250,12 +274,14 @@ pub(super) async fn sweep_until_deadline(
 /// since. The final delivery for this sweep still names these obligations; by
 /// then they are not `Pending`, which every pump handler already treats as a
 /// no-op.
+///
+/// Returns the obligations it released.
 async fn settle_ranks_cold(
     deps: &BootstrapDeps,
     active: &mut Vec<(KvWorkerId, u64)>,
     ranks: &[KvWorkerId],
     peers_tried: usize,
-) {
+) -> Vec<(KvWorkerId, u64)> {
     let (settled, rest): (Vec<_>, Vec<_>) = std::mem::take(active)
         .into_iter()
         .partition(|(r, _)| ranks.contains(r));
@@ -270,13 +296,14 @@ async fn settle_ranks_cold(
     if deps
         .ctrl_tx
         .send(PumpControl::AbandonBootstrap {
-            obligations: settled,
+            obligations: settled.clone(),
         })
         .await
         .is_err()
     {
         warn!("kv-bootstrap: pump is gone; per-rank cold settle discarded");
     }
+    settled
 }
 
 /// Whether the obligation `(rank, epoch)` still has a rank waiting on it: the
