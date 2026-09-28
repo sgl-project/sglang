@@ -297,8 +297,9 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
         scales = torch.rand((2, 2), device=device, generator=gen) + 0.25
         q, q_scale = per_token_group_quant_fp8(x, 32, column_major_scales=False)
         bias = torch.randn((35,), dtype=torch.bfloat16, device=device, generator=gen)
-        dequant_x = q.float() * q_scale.repeat_interleave(32, 1)
-        dequant_w = weight.float() * scales.repeat_interleave(32, 0)[
+        # Use an FP64 oracle, independent of the process's FP32/TF32 setting.
+        dequant_x = q.double() * q_scale.double().repeat_interleave(32, 1)
+        dequant_w = weight.double() * scales.double().repeat_interleave(32, 0)[
             :35
         ].repeat_interleave(32, 1)
         reference = (dequant_x @ dequant_w.T).to(torch.bfloat16) + bias
