@@ -15,11 +15,10 @@ import os
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -27,9 +26,11 @@ from sglang.srt.managers.utils import (
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
+    MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
+    settle_shm_buffers,
 )
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmEncodedResult, MmSpec, Server
+    from sglang.srt.rust_extensions._server import MmSpec, Server
 
 logger = logging.getLogger(__name__)
 
@@ -189,9 +190,22 @@ class RustServer:
 
         return instance
 
-    def _wrap_mm_result(self, entry: MmEncodedResult) -> MultimodalProcessorOutput:
+    def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
+        """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
+        ShmBuffer}``) into the scheduler's ``MultimodalProcessorOutput``. Model
+        packages with an external processor override this for their own
+        item layout; the buffer names are the contract (see ``wrap_encoded``).
+        A wrapper only translates: it may build ``ShmPointerMMData`` stubs from
+        a ``ShmBuffer``'s name, and the segment stays valid for every TP rank
+        because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
-        return RustMmProcessor.wrap_encoded(self.mm_spec, entry)
+        return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def mm_transport_stats(self) -> Dict[str, int]:
+        """Snapshot of the zero-copy accounting at the multimodal hand-off
+        (see :class:`~sglang.srt.rust_server.multimodal.MmTransportStats`);
+        surfaced on ``/server_info`` as ``rust_mm_transport``."""
+        return MM_TRANSPORT_STATS.snapshot()
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -204,56 +218,78 @@ class RustServer:
         request objects. The scheduler's request receiver calls this instead of
         polling the zmq socket when `rust_server_mode` is set.
 
-        The transfer is **columnar**: `recv_requests` returns an `IngressBatch`
-        of scalar msgpack `headers` (with `input_ids` omitted) plus one
-        concatenated raw int64 `data` buffer and per-request `lengths`, so the
-        large `input_ids` lists never go through msgpack. Each header is `msgpack_decode`d (yielding
-        the same `TokenizedGenerateReqInput` / control objects the zmq path
-        produces, so the IPC schema is tracked automatically) and its `input_ids`
-        slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
-        never waits: the ring drain is `try_recv` (returns the instant the ring
-        is dry, capped at `max_recv`) and the rest is one memcpy per header
-        plus one for the concatenated ids — same contract as `zmq.NOBLOCK`.
-        Parking for work is :meth:`wait_request`, which does release the GIL.
+        Each request arrives as a scalar msgpack `header` (with `input_ids`
+        and `token_ids_logprob` left nil) plus its named **buffers** -- the one
+        data plane every non-scalar payload uses. An inline buffer is a shaped
+        numpy array that owns the Rust vector (nothing was copied to get here);
+        a shm buffer is a `ShmBuffer` naming the segment to map after the TP
+        broadcast. The header is `msgpack_decode`d (yielding the same
+        `TokenizedGenerateReqInput` / control objects the zmq path produces, so
+        the IPC schema is tracked automatically) and each buffer is attached
+        under its name: `input_ids` as the `array("q")` the scheduler expects
+        (the one copy left, forced by that type), `token_ids_logprob` as a
+        list, and the `mm.*` set through :meth:`_wrap_mm_result`.
+        `recv_requests` never waits: the ring drain is `try_recv` (returns the
+        instant the ring is dry, capped at `max_recv`) -- same contract as
+        `zmq.NOBLOCK`. Parking for work is :meth:`wait_request`, which does
+        release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        batch = self.server.recv_requests(limit)
-        # Bind once: each attribute access converts the rust vec to a fresh list.
-        headers, data, lengths = batch.headers, batch.data, batch.lengths
-        if not headers:
-            return []
-
-        ids_view = memoryview(data)
         out = []
-        pos = 0  # byte offset into ids_buf
-        for header, n in zip(headers, lengths):
-            nbytes = n * 8
+        for req in self.server.recv_requests(limit):
+            buffers = dict(req.buffers)
+            # Rust holds the unlink duty for every shm segment until this loop
+            # settles the request: released to the stubs on admission, unlinked
+            # on rejection. The wrapper never decides this (see `_wrap_mm_result`).
             try:
-                obj = msgpack_decode_explained(header)
-            except MsgpackDecodeError as e:
-                # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
-                logger.warning(
-                    "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
-                )
-                if e.rid is not None:
-                    self.server.push_error(e.rid, f"invalid request: {e.reason}")
-                pos += nbytes
+                obj = self._admit(req.header, buffers)
+            except Exception:
+                settle_shm_buffers(buffers, admitted=False)
                 continue
-            if n:  # generate request: attach its int64 ids slice as array("q")
-                ids = array("q")
-                ids.frombytes(ids_view[pos : pos + nbytes])
-                obj.input_ids = ids
-                pos += nbytes
-            if self._multimodal_enabled and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers were parked in the Rust result store before the
-                # ring push; wrapping them into tensors is the only Python step
-                # of the Rust path. `None` for a text-only request on a
-                # multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = self._wrap_mm_result(mm_result)
+            settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
         return out
+
+    def _admit(self, header: bytes, buffers: dict):
+        """Decode and attach one drained request, or report the rejection to
+        its client and raise."""
+        try:
+            obj = msgpack_decode_explained(header)
+        except MsgpackDecodeError as e:
+            # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
+            logger.warning(
+                "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
+            )
+            if e.rid is not None:
+                self.server.push_error(e.rid, f"invalid request: {e.reason}")
+            raise
+        try:
+            self._attach_buffers(obj, buffers)
+        except Exception as e:
+            logger.warning(
+                "rust ingress: rejecting request %s: %s: %s",
+                obj.rid,
+                type(e).__name__,
+                e,
+            )
+            self.server.push_error(obj.rid, f"invalid request: {e}")
+            raise
+        return obj
+
+    def _attach_buffers(self, obj, buffers: dict) -> None:
+        """Attach one drained request's named buffers to its decoded header."""
+        ids = buffers.get("input_ids")
+        if ids is not None:  # generate request
+            obj.input_ids = array("q")
+            obj.input_ids.frombytes(memoryview(ids).cast("B"))
+        token_ids_logprob = buffers.get("token_ids_logprob")
+        if token_ids_logprob is not None:
+            obj.token_ids_logprob = token_ids_logprob.tolist()
+        if self._multimodal_enabled and "mm.meta" in buffers:
+            # Wrapping the worker's buffers into tensors is the only Python
+            # step of the Rust path; a text-only request on a multimodal
+            # model carries no `mm.*` buffers.
+            obj.mm_inputs = self._wrap_mm_result(buffers)
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
@@ -297,9 +333,11 @@ class RustServer:
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones).
-          - ``data``: the raw little-endian numeric buffer — every column is a
-            4-byte element (``f32`` values, ``i32`` indices), concatenated in the
-            order the Rust ``for_each_chunk`` reads them.
+          - ``data``: the raw little-endian numeric buffer: the token ids
+            first, as the 8-byte ``array("q")`` bytes the scheduler already
+            holds, then every logprob / hidden column as 4-byte elements
+            (``f32`` values, ``i32`` indices), concatenated in the order the
+            Rust ``for_each_chunk`` reads them.
 
         Logprobs are columnar: output families are per-step deltas, input
         (prefill) families ride once on the first chunk. Ragged families (top-k,
@@ -327,18 +365,20 @@ class RustServer:
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
         # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("i")` (never None) so `map(len)` and a bare
-        # `chain.from_iterable` stay in C.
+        # always `array("q")` slices of `Req.output_ids` (never None), so both
+        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
+        # no per-element repack. Measured at 256 single-token requests: 10 us,
+        # against 18 us for `array("i", chain.from_iterable(...))`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
         tok_lens = list(map(len, output_ids))
-        flat_ids = array("i", chain.from_iterable(output_ids))
+        flat_ids = b"".join(map(array.tobytes, output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
-        data_cols = [flat_ids.tobytes()]
+        data_cols = [flat_ids]
 
         if has_extra:
             # The `extras` tuple is the SINGLE source of the extras column

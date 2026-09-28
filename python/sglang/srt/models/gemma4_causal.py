@@ -25,10 +25,12 @@ from transformers import (
 )
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
-    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+)
+from sglang.kernels.ops.moe.gemma4_routing import (
+    gemma4_fused_routing,
     gemma_routing_post_topk,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm

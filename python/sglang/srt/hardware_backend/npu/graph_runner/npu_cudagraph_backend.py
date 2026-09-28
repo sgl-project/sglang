@@ -178,8 +178,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
-        update_future.result()
         graph.replay()
+        update_future.result()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
