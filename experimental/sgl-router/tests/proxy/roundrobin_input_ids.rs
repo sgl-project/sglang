@@ -272,30 +272,6 @@ async fn disabled_forwarding_does_not_count_routing_render_failures_as_offload_e
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Even under round-robin, a tool request omits `input_ids` (the safe predicate
-/// is policy-independent too).
-#[tokio::test]
-async fn round_robin_tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids under any policy; got {body}"
-    );
-}
-
 /// One forwarding outcome books per dispatched chat request.
 #[tokio::test]
 async fn input_ids_forwarding_metric_books_outcome_per_request() {
@@ -305,9 +281,12 @@ async fn input_ids_forwarding_metric_books_outcome_per_request() {
     let mut image = chat.clone();
     image["messages"][0]["content"] =
         json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]);
+    let mut caller_ids = chat.clone();
+    caller_ids["input_ids"] = json!([1, 2]);
     for (cfg, request, outcome) in [
         (config(), &chat, "forwarded"),
-        (config(), &tools, "ineligible"),
+        (config(), &tools, "forwarded"),
+        (config(), &caller_ids, "ineligible"),
         (config(), &image, "ineligible_multimodal"),
         (
             without_forwarding(config(), PolicyKind::RoundRobin),
@@ -334,10 +313,7 @@ async fn input_ids_forwarding_metric_books_outcome_per_request() {
 
 /// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
-/// offload was expected but the encoder failed. A tool request on the same model
-/// is an *expected* omission (its ids are still engine-equivalent; the
-/// safe-predicate withholds forwarding for other reasons), so it must not emit
-/// the error counter either.
+/// offload was expected but the encoder failed.
 #[tokio::test]
 async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     let mock = MockWorker::start(vec![]).await;
@@ -371,11 +347,10 @@ async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     );
     assert!(
         !m.contains("sgl_router_ingress_tokenize_errors_total{"),
-        "healthy forwards (and expected omissions) must not emit the error counter; got:\n{m}",
+        "healthy forwards must not emit the error counter; got:\n{m}",
     );
 }
 
-/// History that dynamo-render rewrites stays intact for engine-side tokenization.
 #[tokio::test]
 async fn reasoning_history_preserves_messages_without_forwarding_ids() {
     let (_dir, cfg) = template_config(json!({
