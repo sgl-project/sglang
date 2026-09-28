@@ -5,7 +5,14 @@ use std::time::Duration;
 use async_stream::stream;
 use futures::{StreamExt, future::BoxFuture};
 
-use super::{GenerateTransport, TokenStream, internal};
+use sglang_frontend::{GenerateTransport, TokenStream};
+
+fn internal(message: impl Into<String>) -> ResponseError {
+    ResponseError {
+        kind: crate::ResponseErrorKind::Internal,
+        message: message.into(),
+    }
+}
 use crate::{GenerateRequest, ResponseError};
 use protocol::{engine_error_message, normalize_engine_output, parse_engine_frame};
 
@@ -204,7 +211,7 @@ fn event_end(bytes: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_utils::tiny_tokenizer;
+    use crate::test_utils::tiny_tokenizer;
     use crate::{GenerationOptions, TokenIds, TokenIdsRequest};
     use axum::{
         Json, Router,
@@ -347,9 +354,9 @@ mod tests {
             },
             metadata: Default::default(),
         };
-        let service = crate::engine::GenerationService::new(
+        let service = sglang_frontend::GenerationService::new(
             Arc::new(client),
-            crate::engine::TokenDecoder::new(tokenizer.clone()),
+            sglang_frontend::TokenDecoder::new(tokenizer.clone()),
         );
         let mut events = service.generate(request.into()).await.unwrap();
         let output = events.next().await.unwrap().unwrap();

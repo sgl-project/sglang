@@ -36,13 +36,17 @@ pub(crate) enum OperationResponse<U, C> {
     Stream(futures::stream::BoxStream<'static, Result<C, ResponseError>>),
 }
 
-pub(crate) struct OpenAIService {
+pub struct OpenAIService {
     pub(crate) renderer: std::sync::Arc<crate::RendererService>,
     generation: crate::engine::GenerationService,
 }
 
 impl OpenAIService {
-    pub(crate) fn new(
+    pub fn renderer(&self) -> &std::sync::Arc<crate::RendererService> {
+        &self.renderer
+    }
+
+    pub fn new(
         renderer: std::sync::Arc<crate::RendererService>,
         generation: crate::engine::GenerationService,
     ) -> Self {

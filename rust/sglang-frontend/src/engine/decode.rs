@@ -10,7 +10,7 @@ use super::{GenerationFinishReason, GenerationStream, MatchedStop, TokenStream};
 use futures::StreamExt;
 
 /// Shared tokenizer handle for prompt and generated-output decoding.
-pub(crate) struct TokenDecoder {
+pub struct TokenDecoder {
     tokenizer: dynamo_tokenizers::Tokenizer,
 }
 
@@ -21,7 +21,7 @@ pub(super) struct DecodeState {
 }
 
 impl TokenDecoder {
-    pub(crate) fn new(tokenizer: dynamo_tokenizers::Tokenizer) -> Self {
+    pub fn new(tokenizer: dynamo_tokenizers::Tokenizer) -> Self {
         Self { tokenizer }
     }
 

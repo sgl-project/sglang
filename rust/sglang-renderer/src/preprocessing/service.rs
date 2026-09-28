@@ -79,7 +79,7 @@ impl RendererService {
             .await
     }
 
-    pub(crate) async fn prepare_text_request_groups(
+    pub async fn prepare_text_request_groups(
         &self,
         groups: Vec<TextRequestGroup>,
     ) -> Result<Vec<GenerateRequest>, RendererError> {

@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
 
-use crate::engine::{GenerationService, HttpGenerateClient, TokenDecoder};
-use crate::frontend::http::{hosted_routes, render_only_routes, standalone_routes};
-use crate::openai::OpenAIService;
+use crate::engine::HttpGenerateClient;
+use crate::routes::{hosted_routes, render_only_routes, standalone_routes};
+use sglang_frontend::{GenerationService, OpenAIService, TokenDecoder};
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {
     pub http_addr: SocketAddr,
-    pub http_workers: usize,
     pub tokenizer_workers: usize,
     pub queue_capacity: usize,
     /// Optional SGLang engine origin. When absent, inference routes are not mounted.

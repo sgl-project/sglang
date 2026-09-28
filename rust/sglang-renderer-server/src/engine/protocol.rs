@@ -1,12 +1,12 @@
 //! SGLang engine frame parsing and normalization into generation deltas.
 
 use super::internal;
-use crate::engine::TokenDelta;
 use crate::{
     GenerationFinishReason, GenerationOutputExtras, MatchedStop, PositionLogprobs, ResponseError,
     TokenIds, TokenLogprob,
 };
 use serde::Deserialize;
+use sglang_frontend::TokenDelta;
 
 type WireLogprob = (Option<f32>, i32, Option<String>);
 type WireTopLogprobs = Vec<Option<Vec<WireLogprob>>>;
@@ -275,7 +275,7 @@ pub(super) fn engine_error_message(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_utils::position;
+    use crate::test_utils::position;
 
     #[test]
     fn engine_frame_maps_tokens_usage_finish_and_logprobs() {

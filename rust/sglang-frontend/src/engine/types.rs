@@ -56,7 +56,7 @@ pub type GenerationStream = BoxStream<'static, Result<GenerationOutput, Response
 /// Completion counts are deltas; prompt counts describe the complete prompt.
 /// A successful stream includes a terminal finish reason.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct TokenDelta {
+pub struct TokenDelta {
     pub token_ids: TokenIds,
     pub finish_reason: Option<GenerationFinishReason>,
     pub prompt_tokens: u32,

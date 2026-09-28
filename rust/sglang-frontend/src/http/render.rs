@@ -4,13 +4,12 @@ use super::{
     ChatCompletionRequest, CompletionRequest,
     error::{json_rejection_response, response_error},
 };
-use crate::{RendererService, engine::HttpGenerateClient};
+use crate::RendererService;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::post,
 };
 use std::sync::Arc;
 
@@ -19,38 +18,6 @@ pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
         .route("/v1/chat/completions/render", post(render_chat))
         .route("/v1/completions/render", post(render_completions))
         .with_state(renderer)
-}
-
-pub(super) fn health_route() -> Router<()> {
-    Router::new().route("/health", get(health))
-}
-
-pub(super) fn engine_health_route(generate_client: HttpGenerateClient) -> Router<()> {
-    Router::new()
-        .route("/health", get(engine_health))
-        .with_state(generate_client)
-}
-
-pub(super) fn readiness_route() -> Router<()> {
-    Router::new().route("/_sglang_renderer/ready", get(readiness))
-}
-
-async fn health() -> StatusCode {
-    StatusCode::OK
-}
-
-async fn engine_health(State(generate_client): State<HttpGenerateClient>) -> StatusCode {
-    match generate_client.health_status().await {
-        Ok(status) => status,
-        Err(error) => {
-            tracing::warn!(message = %error.message, "engine health check failed");
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-    }
-}
-
-async fn readiness() -> impl IntoResponse {
-    (StatusCode::NO_CONTENT, [("x-sglang-renderer", "ready")])
 }
 
 async fn render_chat(
@@ -87,6 +54,7 @@ mod tests {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
+        http::StatusCode,
     };
     use tower::ServiceExt;
 

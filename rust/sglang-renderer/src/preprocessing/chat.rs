@@ -40,7 +40,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub(crate) const fn disables_thinking(&self) -> bool {
+    pub const fn disables_thinking(&self) -> bool {
         matches!(self, Self::None)
     }
 
