@@ -917,11 +917,11 @@ def build_engram_projection(
         tp_size=tp_size,
     )
     logger.info(
-        "Engram projection TP enabled: %s rank=%d/%d local_weight=%s gather_output=True",
+        "Engram projection TP enabled: %s rank=%d/%d local_projection_shape=%s gather_output=True",
         prefix,
         tp_rank,
         tp_size,
-        tuple(layer.weight.shape),
+        (output_size // tp_size, input_size),
     )
     return layer
 
