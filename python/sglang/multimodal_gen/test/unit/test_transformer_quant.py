@@ -714,10 +714,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
     @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config."
+        "_comfy_kitchen_available",
+        return_value=True,
+    )
+    @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
-    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self, _load):
+    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(
+        self, _load, _available
+    ):
         marker = json.dumps(
             {
                 "format": "int8_tensorwise",

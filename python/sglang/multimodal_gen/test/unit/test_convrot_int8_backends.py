@@ -359,11 +359,10 @@ def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
     )
     lora = wrap_with_lora_layer(layer, lora_rank=16, lora_alpha=16, snapshot_base=True)
     layers = {"transformer_blocks.0.attn.to_q": lora}
-    # LoRAPipeline is abstract; the decision only needs its two static helpers.
-    stand_in = SimpleNamespace(
-        _has_quantized_base_weights=LoRAPipeline._has_quantized_base_weights,
-        _uses_dtensor_weights=LoRAPipeline._uses_dtensor_weights,
-    )
+    # The rotated, per-channel scaled INT8 matrix cannot take a merged delta.
+    assert lora.can_merge_base_weight is False
+    # LoRAPipeline is abstract; the decision only needs its static helper.
+    stand_in = SimpleNamespace(_uses_dtensor_weights=LoRAPipeline._uses_dtensor_weights)
 
     def decide(module_name, layers, mode):
         return LoRAPipeline._should_merge_lora_for_layers(
@@ -371,7 +370,7 @@ def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
         )
 
     assert decide("transformer_blocks.0.attn.to_q", layers, "auto") is False
-    with pytest.raises(ValueError, match="lora-merge-mode dynamic"):
+    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
         decide("transformer_blocks.0.attn.to_q", layers, "merge")
 
     gen = torch.Generator(device="cuda").manual_seed(4)
