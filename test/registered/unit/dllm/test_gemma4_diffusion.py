@@ -95,6 +95,7 @@ class TestGemma4RenoiseLogitsOutput(unittest.TestCase):
         algorithm.mask_id = 99
         algorithm.fdfo = fdfo
         algorithm.vocab_size = 3
+        algorithm.max_denoising_steps = 1
         algorithm.prepare_inputs = lambda model_runner, forward_batch, states: None
 
         state = {
@@ -113,11 +114,14 @@ class TestGemma4RenoiseLogitsOutput(unittest.TestCase):
             input_ids=torch.tensor([99, 99]),
         )
 
-        result = algorithm.run(
-            model_runner,
-            forward_batch,
-            algo_states=[state] if fdfo else None,
-        )
+        if fdfo:
+            result = algorithm._run_fdfo(
+                model_runner,
+                forward_batch,
+                algo_states=[state],
+            )
+        else:
+            result = algorithm._run_sync(model_runner, forward_batch)
 
         self.assertIs(result[0], logits_output)
         self.assertEqual(forward_batch.input_ids.tolist(), [1, 2])

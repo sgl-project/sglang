@@ -144,7 +144,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pack the dLLM maximum value, logsumexp, and exactly representable token ID into one FP32 TP collective. Vocabulary IDs above <code>2^24</code> automatically use separate typed collectives.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pack the dLLM maximum value, max-shifted exponential sum, and exactly representable token ID into one FP32 TP collective. Vocabulary IDs above <code>2^24</code> automatically use separate typed collectives.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
