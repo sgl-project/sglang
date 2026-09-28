@@ -7,10 +7,6 @@ from typing import Any, Callable
 import torch
 import zmq
 
-from sglang.srt.distributed.parallel_state import (
-    get_world_group,
-    get_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
@@ -34,19 +30,18 @@ class ExpertBackupClient:
         self,
         *,
         model_config,
-        moe_ep_size: int,
-        moe_ep_rank: int,
         get_model: Callable[[], Any],
     ):
         context = zmq.Context(2)
-        self.engine_num = get_parallel().nnodes
-        self.engine_rank = get_parallel().node_rank
+        parallel = get_parallel()
+        self.engine_num = parallel.nnodes
+        self.engine_rank = parallel.node_rank
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
         self._get_model = get_model
-        self.moe_ep_size = moe_ep_size
+        self.moe_ep_size = parallel.moe_ep_size
         self.model_config = model_config
-        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_rank = parallel.moe_ep_rank
         self.dram_map_list = [None] * self.engine_num
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None
@@ -54,23 +49,23 @@ class ExpertBackupClient:
         self.buffer_size = 0
         self.use_backup = False
         local_ip = get_local_ip_auto()
-        all_ips = [None] * get_world_size()
+        all_ips = [None] * get_parallel().launch_world_size
         torch.distributed.all_gather_object(
-            all_ips, local_ip, group=get_world_group().cpu_group
+            all_ips, local_ip, group=get_parallel().world_group.cpu_group
         )
         logger.info(f"all_ips: {all_ips}")
 
         for i in range(self.engine_num):
             self.recv_list[i] = context.socket(zmq.SUB)
             self.recv_list[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // get_parallel().nnodes]}:{PORT_BASE + i * 2 + 1}"
+                f"tcp://{all_ips[i * get_parallel().launch_world_size // get_parallel().nnodes]}:{PORT_BASE + i * 2 + 1}"
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
             # Synchronization channel to notify the manager when this client is ready.
             self.ready_sockets[i] = context.socket(zmq.PUSH)
             self.ready_sockets[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // get_parallel().nnodes]}:{PORT_BASE + i * 2}"
+                f"tcp://{all_ips[i * get_parallel().launch_world_size // get_parallel().nnodes]}:{PORT_BASE + i * 2}"
             )
             sock_send(self.ready_sockets[i], UpdateExpertBackupReq())
 

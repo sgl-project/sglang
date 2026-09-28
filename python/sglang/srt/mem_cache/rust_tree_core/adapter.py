@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -72,9 +73,7 @@ def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
     token_ids = key.raw_token_ids()
-    assert isinstance(token_ids, array) and token_ids.typecode == "q", (
-        f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
-    )
+    assert_int64_array(token_ids, "tree key token ids")
     return token_ids
 
 
@@ -147,22 +146,30 @@ def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
         node_id=result.node_id,
-        swa_uuid_for_lock=result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
         skipped_lock_components=tuple(
             ComponentType(ct) for ct in result.skipped_lock_components
         ),
+        component_lock_uuids={
+            ComponentType(ct): uuid for ct, uuid in result.component_lock_uuids.items()
+        },
+        component_host_lock_uuids={
+            ComponentType(ct): uuid
+            for ct, uuid in result.component_host_lock_uuids.items()
+        },
     )
 
 
 def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
-    """Build the binding's params from the module that owns the core's binding
-    (the inspection build is a distinct extension module with its own types)."""
+    """Use the owning module's type for both production and inspection bindings."""
     return bindings_module.DecLockRefParamsBinding(
         node_id=params.node_id,
-        swa_uuid_for_lock=params.swa_uuid_for_lock,
-        swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
         skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
+        component_lock_uuids={
+            int(ct): uuid for ct, uuid in params.component_lock_uuids.items()
+        },
+        component_host_lock_uuids={
+            int(ct): uuid for ct, uuid in params.component_host_lock_uuids.items()
+        },
     )
 
 
@@ -405,6 +412,26 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        raise NotImplementedError(
+            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list:
+        raise NotImplementedError(
+            "attach_swa_window: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
     def inc_lock_ref(
         self,
         node_id: NodeId,
@@ -556,6 +583,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _match_result_from_binding(result)
 
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        return self._binding.match_full_device_prefix(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            )
+        )
+
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        self._binding.inc_full_pin(node_id)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        self._binding.dec_full_pin(node_id)
+
     @property
     def empty_match_result(self) -> MatchResult:
         return self._empty_match_result
@@ -585,7 +627,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
-                swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
@@ -747,6 +789,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         transfers = self._binding.build_hicache_transfers(
@@ -757,6 +800,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # TODO: Forward token ids when Rust Mamba prefetch consumes them.
             None,
             prefetch_tokens,
+            staging_tokens,
             last_hash,
         )
         if transfers is None:

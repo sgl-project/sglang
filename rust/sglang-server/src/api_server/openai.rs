@@ -1,7 +1,7 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. Native [`ChunkEvent`] values remain the one
+//! request and response primitives. Scheduler [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};

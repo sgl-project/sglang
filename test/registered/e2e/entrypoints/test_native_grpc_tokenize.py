@@ -20,10 +20,14 @@ from tokenizers import (
 from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.rust_extensions import load_rust_extension
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, find_available_port
+from sglang.test.test_utils import (
+    CustomTestCase,
+    find_available_port,
+    published_topology,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -63,34 +67,44 @@ class TestNativeGrpcTokenize(CustomTestCase):
 
     @contextmanager
     def _server(self, *, dllm_enabled=True, tokenizer_mode="auto"):
-        manager = TokenizerManager.__new__(TokenizerManager)
-        manager.tokenizer = self.tokenizer
-        manager.server_args = SimpleNamespace(
+        with published_topology(
+            role="tokenizer",
             tokenizer_path=self.tokenizer_path,
             tokenizer_mode=tokenizer_mode,
-            dllm_algorithm="joint_threshold" if dllm_enabled else None,
-        )
-        manager.model_config = SimpleNamespace(context_len=128)
-        with patch(
-            "sglang.srt.managers.tokenizer_manager.get_dllm_model_params",
-            return_value={"mask_id": self.mask_id},
-        ):
-            manager._init_dllm_prompt_handling()
-        manager.context_len = 128
-        manager.num_reserved_tokens = 0
-        manager.allow_auto_truncate = False
-        manager.validate_total_tokens = False
-        manager.is_generation = True
-        handle = RuntimeHandle.__new__(RuntimeHandle)
-        handle.tokenizer_manager = manager
-        port = find_available_port(30000)
-        server = self.native_grpc.start_server("127.0.0.1", port, handle)
-        try:
-            with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
-                grpc.channel_ready_future(channel).result(timeout=10)
-                yield self.services.SglangServiceStub(channel), handle, manager
-        finally:
-            server.shutdown()
+            dllm_algorithm="JointThreshold" if dllm_enabled else None,
+        ) as server_args:
+            manager = TokenizerManager.__new__(TokenizerManager)
+            manager.tokenizer = self.tokenizer
+            manager.server_args = server_args
+            manager.model_config = SimpleNamespace(
+                context_len=128, hf_config=SimpleNamespace()
+            )
+            manager.model_path = server_args.model_path
+            manager.served_model_name = server_args.served_model_name
+            manager.gracefully_exit = False
+            manager.server_status = ServerStatus.Up
+            manager.is_pause = False
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.get_dllm_model_params",
+                return_value={"mask_id": self.mask_id},
+            ):
+                manager._init_dllm_prompt_handling()
+            manager.context_len = 128
+            manager.num_reserved_tokens = 0
+            manager.allow_auto_truncate = False
+            manager.validate_total_tokens = False
+            manager.is_generation = True
+            handle = RuntimeHandle.__new__(RuntimeHandle)
+            handle.tokenizer_manager = manager
+            handle.scheduler_info = {}
+            port = find_available_port(30000)
+            server = self.native_grpc.start_server("127.0.0.1", port, handle)
+            try:
+                with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+                    grpc.channel_ready_future(channel).result(timeout=10)
+                    yield self.services.SglangServiceStub(channel), handle, manager
+            finally:
+                server.shutdown()
 
     def test_tokenize_returns_normalized_reusable_ids(self):
         """Native tokenization must not return mask IDs rejected by generation."""

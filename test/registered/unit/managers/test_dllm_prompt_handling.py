@@ -7,7 +7,7 @@ from tokenizers import AddedToken, Tokenizer, decoders
 from tokenizers.models import BPE, WordLevel
 from transformers import PreTrainedTokenizerFast
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import maybe_stub_sgl_kernel, published_topology
 
 maybe_stub_sgl_kernel()
 
@@ -124,7 +124,10 @@ class TestDllmPromptHandling(unittest.TestCase):
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False
         manager.is_generation = True
-        manager._validate_one_request(SimpleNamespace(sampling_params={}), input_ids)
+        with published_topology(role="tokenizer"):
+            manager._validate_one_request(
+                SimpleNamespace(sampling_params={}), input_ids
+            )
 
     def test_normalization_preserves_added_tokens_and_adjacent_mask_context(self):
         tokenizer = _make_contextual_tokenizer()
@@ -177,13 +180,22 @@ class TestDllmPromptHandling(unittest.TestCase):
         self.assertFalse(tokenizer.added_tokens_decoder[mask_id].special)
         self.assertFalse(tokenizer.split_special_tokens)
 
-    def test_non_dllm_prompt_handling_is_a_noop(self):
-        manager = _make_manager(dllm_algorithm=None, tokenizer=object())
+    def test_prompt_handling_without_reserved_mask_is_a_noop(self):
+        for algorithm, architecture in (
+            (None, "LLaDA2MoeModelLM"),
+            ("Gemma4Renoise", "DiffusionGemmaForBlockDiffusion"),
+        ):
+            with self.subTest(algorithm=algorithm):
+                manager = _make_manager(dllm_algorithm=algorithm, tokenizer=object())
+                manager.model_config.hf_config.architectures = [architecture]
 
-        manager._init_dllm_prompt_handling()
-        input_ids = [1, MASK_ID, 2]
+                manager._init_dllm_prompt_handling()
+                input_ids = [1, MASK_ID, 2]
 
-        self.assertIs(manager.normalize_dllm_prompt_token_ids(input_ids), input_ids)
+                self.assertIsNone(manager.dllm_mask_id)
+                self.assertIs(
+                    manager.normalize_dllm_prompt_token_ids(input_ids), input_ids
+                )
 
     def test_direct_input_ids_reject_reserved_mask_without_tokenizer(self):
         manager = _make_manager(tokenizer=None)
