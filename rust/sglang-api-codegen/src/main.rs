@@ -1,10 +1,12 @@
-//! The generator: `proto/sglang/` -> `sglang-api-types/src/generated/`.
+//! The generator: `proto/sglang/` -> `sglang-api-types/src/generated/` (Rust)
+//! and `python/sglang/api/v1/types.py` (Python).
 //!
 //! Pass 1 (prost-build + tonic-prost-build) emits the prost structs and tonic
 //! service code, plus a `FileDescriptorSet` with the `sglang.json.v1` options
-//! intact. Pass 2 (`emit`) reads those options through prost-reflect and
-//! emits the serde implementations — proto3's canonical JSON mapping is NOT
-//! used; the options are the JSON contract.
+//! intact. Pass 2 reads those options through prost-reflect and emits, from
+//! one model (`model`), the Rust serde implementations (`emit`) and the Python
+//! interface definition (`emit_py`) — proto3's canonical JSON mapping is NOT
+//! used; the options are the JSON contract, and both languages implement it.
 //!
 //! Regeneration is manual. From anywhere in the `rust/` workspace:
 //!
@@ -15,12 +17,13 @@
 //! `proto/sglang/api/v1/service.proto` is the single root: every API must be
 //! defined (or imported) there, and protoc's import closure supplies the rest
 //! of the package — a file the service does not reach is not part of the API
-//! and gets no generated code. The output under
-//! `sglang-api-types/src/generated/` is checked in, so commit it together
+//! and gets no generated code. The output (`sglang-api-types/src/generated/`
+//! and `python/sglang/api/v1/types.py`) is checked in, so commit it together
 //! with the .proto change. The vendored protoc (pinned by Cargo.lock) is used
 //! unless `PROTOC` is set, so the output is byte-stable across machines.
 
 mod emit;
+mod emit_py;
 mod model;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +33,8 @@ fn main() {
     let proto_root = manifest_dir.join("../../proto");
     let out_dir = manifest_dir.join("../sglang-api-types/src/generated");
     std::fs::create_dir_all(&out_dir).expect("create generated dir");
+    let py_out = manifest_dir.join("../../python/sglang/api/v1/types.py");
+    std::fs::create_dir_all(py_out.parent().expect("py out dir")).expect("create py dir");
 
     // Vendored protoc first (same policy as sglang-grpc/build.rs): the
     // checked-in output must not depend on whichever protoc a machine has.
@@ -76,12 +81,17 @@ fn main() {
     let serde_src = emit::emit_serde(&bytes, "sglang.api.v1");
     std::fs::write(out_dir.join("sglang.api.v1.serde.rs"), serde_src).expect("write serde");
 
+    // Pass 2 (Python): the same model rendered as dataclasses + codecs.
+    let py_src = emit_py::emit_python(&bytes, "sglang.api.v1");
+    std::fs::write(&py_out, py_src).expect("write python types");
+
     // The options package itself needs no Rust types (it exists for the
     // generator); drop pass-1 output for it if prost emitted one.
     let _ = std::fs::remove_file(out_dir.join("sglang.json.v1.rs"));
 
     rustfmt(&out_dir);
     println!("generated into {}", out_dir.display());
+    println!("generated {}", py_out.display());
 }
 
 /// Move the tonic `pub mod sglang_api_client/_server` blocks from the prost
