@@ -21,6 +21,10 @@ _O_TMPFILE = getattr(os, "O_TMPFILE", 0)
 # EINVAL (rejected FS or buffer) and EFAULT (unpinnable buffer) condemn O_DIRECT;
 # anything else (ENOSPC, EMFILE, EIO) is transient and must not disable it for good.
 _DIRECT_IO_UNUSABLE_ERRNOS = frozenset({errno.EFAULT, errno.EINVAL})
+# Buffered I/O is the last fallback, so these fail startup; others (ENOSPC, EIO)
+# may clear up and only warn.
+_BUFFERED_IO_FATAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+_BUFFERED_PROBE_BYTES = 4096
 
 # "active" is deliberately absent: it selects the plugin, so listing it would make
 # promotion flag every valid config.
@@ -377,19 +381,18 @@ class NixlFileManager:
                 return error
         return None
 
-    def _open_probe_file(self, base: str) -> int:
+    def _open_probe_file(self, base: str, direct: bool = True) -> int:
+        direct_flag = _O_DIRECT if direct else 0
         # The probe must leave nothing behind even on SIGKILL: the L3 cleaner only
         # walks bucket dirs, so a stray probe file in a base dir is never reclaimed.
         if _O_TMPFILE:
             try:
-                return os.open(base, os.O_WRONLY | _O_TMPFILE | _O_DIRECT, 0o644)
+                return os.open(base, os.O_WRONLY | _O_TMPFILE | direct_flag, 0o644)
             except OSError:
                 # Not every filesystem implements O_TMPFILE.
                 pass
-        path = os.path.join(
-            base, f".direct_io_probe.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_DIRECT, 0o644)
+        path = os.path.join(base, f".io_probe.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | direct_flag, 0o644)
         try:
             # Unlink right away to mirror O_TMPFILE; the fd stays writable.
             os.unlink(path)
@@ -397,6 +400,40 @@ class NixlFileManager:
             os.close(fd)
             raise
         return fd
+
+    def check_buffered_io(self) -> None:
+        """Raise if a base or bucket directory cannot take a buffered tier-3 write."""
+        for base in self.base_dirs:
+            self._check_buffered_write(base)
+            for bucket_dir in self._bucket_dirs(base):
+                # Data files live in bucket dirs, which may predate this process.
+                if not os.access(bucket_dir, os.W_OK | os.X_OK):
+                    raise RuntimeError(
+                        f"NIXL tier-3 bucket directory {bucket_dir} is not writable "
+                        "by this process; fix its ownership or permissions."
+                    )
+
+    def _check_buffered_write(self, base: str) -> None:
+        fd = None
+        try:
+            fd = self._open_probe_file(base, direct=False)
+            os.pwrite(fd, bytes(_BUFFERED_PROBE_BYTES), 0)
+        except OSError as e:
+            if e.errno in _BUFFERED_IO_FATAL_ERRNOS:
+                raise RuntimeError(
+                    f"NIXL tier-3 storage directory {base} cannot take a buffered "
+                    f"write: {e.strerror} (errno {e.errno})."
+                ) from e
+            logger.warning(
+                "NixlFileManager: buffered write probe under %s failed with %s "
+                "(errno %s); continuing, but tier-3 writes there may fail.",
+                base,
+                e.strerror,
+                e.errno,
+            )
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _direct_io_dir_error(self, base: str, addr: int, size: int) -> Optional[str]:
         fd = None
@@ -465,11 +502,15 @@ class NixlFileManager:
         fail due to a missing parent directory.
         """
         for base in self.base_dirs:
-            for i in range(_BUCKET_MASK + 1):
-                os.makedirs(
-                    os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}"),
-                    exist_ok=True,
-                )
+            for bucket_dir in self._bucket_dirs(base):
+                os.makedirs(bucket_dir, exist_ok=True)
+
+    @staticmethod
+    def _bucket_dirs(base: str) -> list[str]:
+        return [
+            os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}")
+            for i in range(_BUCKET_MASK + 1)
+        ]
 
     def iter_all_base_dirs(self) -> list[str]:
         """Return base directories that may contain NIXL FILE cache entries."""

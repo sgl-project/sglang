@@ -101,6 +101,10 @@ class HiCacheNixl(HiCacheStorage):
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )
+        # Runs even with O_DIRECT on: that probe keeps O_DIRECT on EACCES, and
+        # buffered I/O is its fallback, so an unwritable directory must fail here.
+        if self.file_manager is not None:
+            self.file_manager.check_buffered_io()
 
         tp_rank, tp_size, model_name = (
             storage_config.tp_rank,
