@@ -332,6 +332,30 @@ The host-memory availability estimate alone cannot establish which limit was
 hit. For HiCache, repeat on the same runner with a smaller `--hicache-size` to
 separate large-pool pressure from other causes.
 
+If the GLM-5 weights are not available, run the model-free allocator probe in
+the same NPU environment. It needs `torch` and `torch_npu`, but not the model,
+SGLang server, GSM8K dataset, or EvalScope:
+
+```bash
+set -o pipefail
+python3 scripts/ci/npu/pinned_host_probe.py --iterations 2000 \
+  | tee /tmp/pinned-host-baseline.jsonl
+python3 scripts/ci/npu/pinned_host_probe.py --workers 4 --hold-gb 0.5 \
+  --copy-from-npu --iterations 2000 \
+  | tee /tmp/pinned-host-pressure.jsonl
+```
+
+`--hold-gb` is decimal GB **per worker**; the second command requests 2 GB
+across four processes. Start with zero held memory and increase it gradually.
+Each JSONL record includes the worker, NPU device, process and cgroup memory,
+and Host allocator statistics. A failure in the first command implicates the
+basic pinned Host allocation path. A failure only as workers or held memory
+increase points toward aggregate Host pressure, allocator caching, or a
+per-process/driver limit. A successful probe does **not** rule out the GLM
+failure: the model and CI runner may consume much more memory. The closest
+reproduction is still the existing community CI runner with its cached model,
+using `SGLANG_NPU_PINNED_HOST_DEBUG=1` to compare all ranks and Ascend plog.
+
 To run the GLM-5 top64 pruned GSM8K case outside CI, set
 `SGLANG_GLM5_TOP64_MODEL_PATH` to the local model directory. Its optional
 `SGLANG_GLM5_GSM8K_DATASET_DIR` is an EvalScope dataset cache directory (not
