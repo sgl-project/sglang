@@ -27,6 +27,7 @@ def _synchronize_device_stream(device: torch.device) -> None:
     assembly paths to ensure non-blocking device copies have finished before the
     embedding buffers are read/staged.
     """
+    device = torch.device(device)
     if device.type == "npu":
         torch.npu.current_stream(device).synchronize()
     else:
