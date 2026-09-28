@@ -2,13 +2,21 @@
 
 import sys
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.communicator import (
+    ADD,
+    NORM_QUANT_READ,
+    LayerCommunicator,
+    Layout,
+    TokenAxis,
+)
+from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -27,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import COMMUNICATOR_MODULES
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -197,22 +206,23 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
         )
 
 
-@pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])
+@pytest.mark.parametrize("gathered_over_dp", [True, False])
 @pytest.mark.parametrize("num_tokens", [0, 2])
 @pytest.mark.parametrize("publish_lora_layout", [False, True])
 def test_communicator_publishes_layout_at_each_transition(
-    monkeypatch, mlp_mode, num_tokens, publish_lora_layout
+    monkeypatch, gathered_over_dp, num_tokens, publish_lora_layout
 ):
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_parallel",
-        lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
-    )
+    for module in COMMUNICATOR_MODULES:
+        if hasattr(module, "get_parallel"):
+            monkeypatch.setattr(
+                module,
+                "get_parallel",
+                lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
+            )
     # Start from TP_GLOBAL so an unpublished transition is distinguishable.
     initial = LoRABatchLayout.TP_GLOBAL
     expected_mlp = (
-        LoRABatchLayout.TP_GLOBAL
-        if mlp_mode is ScatterMode.FULL
-        else LoRABatchLayout.DP_LOCAL
+        LoRABatchLayout.TP_GLOBAL if gathered_over_dp else LoRABatchLayout.DP_LOCAL
     )
     expected_attn = LoRABatchLayout.DP_LOCAL
     if not publish_lora_layout:
@@ -220,22 +230,41 @@ def test_communicator_publishes_layout_at_each_transition(
         expected_mlp = expected_attn = initial
     communicator = LayerCommunicator.__new__(LayerCommunicator)
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
+    communicator.layer_facts = SimpleNamespace(is_first_layer=False)
     communicator._context = SimpleNamespace()
-    communicator._sp_region = False
+    communicator._sp_steps = None
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None
-    communicator._communicate_simple_fn = lambda **kwargs: kwargs["hidden_states"]
-    communicator._mlp_input = lambda hidden_states, residual, *args: (
-        hidden_states,
-        residual,
+    gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
+    # The rows of the steps the batch runs decide, not the ordinary steps'.
+    communicator._steps = SimpleNamespace(
+        ffn=SimpleNamespace(input_rows=local if gathered_over_dp else gathered)
     )
-    communicator._attn_input_fusions = ()
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_attn_tp_context",
-        lambda: SimpleNamespace(input_scattered=False),
+    selected = SimpleNamespace(
+        attention=SimpleNamespace(
+            prepare=partial(
+                _consumer_step,
+                step=partial(
+                    _read_input,
+                    layer_input=None,
+                    enters_stack=False,
+                    read=NORM_QUANT_READ,
+                    update=ADD,
+                ),
+                carried_fusions=(),
+            ),
+            input_move=lambda hidden_states, **kwargs: hidden_states,
+            handoff=lambda hidden_states, *args: hidden_states,
+        ),
+        ffn=SimpleNamespace(
+            prepare=lambda hidden_states, residual, *args: (hidden_states, residual),
+            input_rows=gathered if gathered_over_dp else local,
+            input_move=None,
+            handoff=None,
+        ),
     )
+    communicator._batch_steps = lambda forward_batch: selected
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):

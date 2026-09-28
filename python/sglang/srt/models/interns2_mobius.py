@@ -10,7 +10,7 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -476,7 +476,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
 
         layer_prefix = prefix.removesuffix(".linear_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -492,7 +492,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
@@ -609,7 +609,7 @@ class InternS2MobiusAttentionDecoderLayer(
 
         layer_prefix = prefix.removesuffix(".self_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -626,7 +626,7 @@ class InternS2MobiusAttentionDecoderLayer(
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
