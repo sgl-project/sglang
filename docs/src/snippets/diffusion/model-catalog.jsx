@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
       name: "Ming-Image",
       modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
       cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
