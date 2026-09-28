@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from prometheus_client import CollectorRegistry
 
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
@@ -13,6 +14,8 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -54,6 +57,37 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     return pipeline
 
 
+def test_worker_metrics_count_individual_adapters_in_multi_lora():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    pipeline.loaded_adapter_alphas["second"] = None
+    pipeline.lora_adapters["second"] = pipeline.lora_adapters["adapter"]
+    registry = CollectorRegistry()
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.pipeline = pipeline
+    worker.metrics = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
+    with patch(_RANK_PATCH, return_value=0):
+        worker.set_lora(
+            ["adapter", "second"],
+            [None, None],
+            target="transformer",
+            strength=[0.5, 0.5],
+            merge_mode="merge",
+        )
+    assert (
+        registry.get_sample_value(
+            "sglang:diffusion_lora_active_adapters",
+            {"role": "monolithic", "replica": "0"},
+        )
+        == 2
+    )
+    assert pipeline.get_lora_status()["active"]["transformer"][0]["nicknames"] == [
+        "adapter",
+        "second",
+    ]
+
+
 def test_merge_cache_only_accepts_cpu_backed_weights():
     pipeline = _make_pipeline(_make_layer())
     cpu_cache = pipeline._merge_cache_for(
@@ -82,6 +116,7 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     assert not _use_owned_base_snapshot(False, "cpu")
     assert not _use_owned_base_snapshot(False, "meta")
     assert _use_owned_base_snapshot(False, "cuda")
+    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
     assert _use_owned_base_snapshot(True, "cpu")
 
     cpu_layer = wrap_with_lora_layer(
@@ -289,3 +324,21 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+def test_view_merge_unmerges_by_inverse_without_owned_clone():
+    torch.manual_seed(0)
+    base = torch.nn.Linear(4, 4, bias=False)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    assert layer is not None
+    assert layer._base_is_view
+    A = torch.randn(2, 4)
+    B = torch.randn(4, 2)
+    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
+    assert layer.merged
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.base_layer.weight, original + 0.5 * (B @ A))
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(layer.base_layer.weight, original)
+    assert not layer.merged

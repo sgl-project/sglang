@@ -73,7 +73,11 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
     parallel = get_parallel()
     original_tp_group = parallel.tp_group
     expected_tp = parallel.attn_tp_size if dp_enabled else parallel.tp_size
-    context = draft_tp_context(parallel.attn_tp_group) if dp_enabled else nullcontext()
+    context = (
+        draft_tp_context(parallel.attn_tp_group, owns_attention=True)
+        if dp_enabled
+        else nullcontext()
+    )
     with (
         context,
         envs.SGLANG_ENABLE_EMBED_REPLICATION.override(replicate),
@@ -146,11 +150,7 @@ def _run_vocab_worker(rank, world_size, init_path):
                 # shared-memory object-broadcast transport.
                 envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.override(False),
             ):
-                initialize_model_parallel(
-                    tensor_model_parallel_size=world_size,
-                    attention_data_parallel_size=dp_size,
-                    backend="gloo",
-                )
+                initialize_model_parallel(backend="gloo")
                 try:
                     for replicate in (False, True):
                         _check_vocab_case(

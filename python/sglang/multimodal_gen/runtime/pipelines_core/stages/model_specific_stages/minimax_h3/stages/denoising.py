@@ -482,6 +482,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
             desired_mode = None
+        elif batch.sampling_params.enable_spectrum:
+            # Spectrum skips the block stack; Cache-DiT wraps those blocks.
+            desired_mode = None
         elif quality == "high":
             desired_mode = "high"
         else:
@@ -749,6 +752,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 server_args=server_args,
                 device=device,
             )
+            if build_vsa_h3_step_metadata is None:
+                from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+                    prepare_hybrid_attention_metadata,
+                )
+
+                build_vsa_h3_step_metadata = prepare_hybrid_attention_metadata(
+                    model=model,
+                    packed=packed,
+                    latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                    server_args=server_args,
+                    device=device,
+                )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],

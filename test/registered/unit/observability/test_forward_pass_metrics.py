@@ -1,4 +1,4 @@
-from sglang.srt.runtime_context import get_context, get_observability
+from sglang.srt.runtime_context import get_context, get_observability, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -6,26 +6,19 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
+from functools import partial
 from unittest.mock import patch
 
+import prometheus_client
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
-from sglang.test.test_utils import CustomTestCase
-
-
-def _make_ps(**overrides) -> ParallelState:
-    """Build a ParallelState with reasonable defaults for tests; override fields via kwargs."""
-    defaults = dict(
-        dp_rank=None,
-        moe_dp_rank=None,
-    )
-    defaults.update(overrides)
-    return ParallelState.trivial(**defaults)
+from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
 class _FakeReq:
@@ -75,11 +68,25 @@ class _DummyPublisherThread:
 
 
 def _publish_server_args(test, **fields):
-    """Publish a config for the reporter under test and return the instance."""
+    """Install reporter configuration and rank overrides, with test cleanup."""
     fields.setdefault("decode_log_interval", 40)
     override = get_context().override_server_args(**fields)
     server_args = override.install()
     test.addCleanup(override.restore)
+    enter_scope(
+        test,
+        get_parallel().override(
+            tp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            moe_ep_rank=0,
+            attn_dp_rank=0,
+            dp_rank=0,
+            moe_ep_size=1,
+            moe_dp_size=1,
+            moe_tp_size=1,
+        ),
+    )
     return server_args
 
 
@@ -93,8 +100,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
             enable_mfu_metrics=False,
             enable_forward_pass_metrics=False,
         )
-    if not hasattr(scheduler, "ps"):
-        scheduler.ps = ParallelState.trivial()
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
@@ -116,9 +121,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
-        tp_rank=0,
-        pp_rank=0,
-        dp_rank=0,
         metrics_collector_context=context,
         metrics_collector=None,
     )
@@ -291,7 +293,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=2, pp_rank=0, pp_size=1)
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1, dp_rank=2))
         scheduler.enable_kv_cache_events = False
 
         with patch(
@@ -328,7 +330,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=0, pp_rank=0, pp_size=2)
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=2))
         scheduler.enable_kv_cache_events = False
 
         with patch(
@@ -340,7 +342,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
 
-class TestIdleMetrics(unittest.TestCase):
+class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
@@ -364,6 +366,61 @@ class TestIdleMetrics(unittest.TestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_host_receive_metrics_survive_queue_drain(self):
+        registry = prometheus_client.CollectorRegistry()
+        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
+        sample_labels = {key: str(value) for key, value in labels.items()}
+        with patch.multiple(
+            prometheus_client,
+            **{
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
+                for kind in ("Counter", "Gauge", "Histogram", "Summary")
+            },
+        ):
+            collector = SchedulerMetricsCollector(
+                labels=labels, server_args=self.scheduler.server_args
+            )
+        self.reporter.metrics_collector = collector
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        self.scheduler.enable_priority_scheduling = True
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        host_reqs = [
+            types.SimpleNamespace(host_staged=True, priority=priority)
+            for priority in (1, 2)
+        ]
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)]
+        )
+        for _ in host_reqs:
+            collector.increment_decode_host_receive_reqs()
+
+        with get_context().override_server_args(
+            disaggregation_decode_host_receive_threshold=0.8
+        ):
+            for waiting in (True, False):
+                for req in host_reqs:
+                    req.host_staged = waiting
+                with patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                    return_value=collector.last_log_time + 31,
+                ):
+                    self.reporter._maybe_log_idle_metrics()
+                for priority, expected in (("", 2), ("1", 1), ("2", 1)):
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:num_decode_host_receive_queue_reqs",
+                            {**sample_labels, "priority": priority},
+                        ),
+                        expected if waiting else 0,
+                    )
+                self.assertEqual(
+                    registry.get_sample_value(
+                        "sglang:num_decode_host_receive_reqs_total", sample_labels
+                    ),
+                    2,
+                )
 
     def test_idle_clears_cached_forward_occupancy_immediately(self):
         self.reporter.current_scheduler_metrics_enabled = True

@@ -75,6 +75,7 @@ def _make_attention(head_dim, *, dtype=torch.float32, neox=True, scaling=1.0):
             **rope_kwargs, scaling_factors=[scaling]
         )
     attn.attn = _CaptureAttention()
+    attn.v_scale = None
     attn.attention_sink_bias = None
     attn.use_table_qk_norm_rope = False
     return attn

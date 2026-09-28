@@ -22,10 +22,15 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_index_translator import KVReadTables
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -45,6 +50,7 @@ from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
@@ -144,6 +150,10 @@ class FlashAttentionBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    # Set from the pool type in __init__; the class default keeps the extend
+    # metadata guard readable on instances built with __new__ (test stubs).
+    _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
     supports_full_cuda_graph_chunked_prefix = True
@@ -193,7 +203,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.kv_index_translator = model_runner.kv_index_translator
         self.skip_prefill = skip_prefill
-        self.attn_cp_size = model_runner.ps.attn_cp_size
+        self.attn_cp_size = model_runner.attn_cp_size
         self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -203,6 +213,12 @@ class FlashAttentionBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        # begin_shard_extend builds the owner-major gather plan from host-side
+        # prefix/final lengths. Normal FA3 metadata is device-only, so opt the
+        # sharded variant back into FutureMap's CPU mirror publication.
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
 
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -315,12 +331,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
+        attention_tp_size = get_parallel().attn_tp_size
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.ps.tp_size
+            // attention_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.ps.tp_size
+            attention_tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
@@ -401,6 +418,12 @@ class FlashAttentionBackend(AttentionBackend):
             num_splits=self.num_splits,
         )
 
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        if self.use_mla and self.fa_impl_ver != 3:
+            raise ValueError(
+                "Elastic EP CUDA graph recapture with MLA requires FlashAttention 3."
+            )
+
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
 
@@ -450,6 +473,20 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc if mapping is not None else None
             ),
         )
+
+    @property
+    def supports_draft_extend_metadata_staging(self) -> bool:
+        return (
+            self.topk == 1
+            and not self.kv_index_translator.is_translating
+            and self.draft_extend_metadata_captured_in_graph()
+        )
+
+    def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
+        self.forward_metadata.max_seq_len_k = self.max_context_len
+        self.forward_metadata_spec_decode_expand = None
+        self.init_forward_metadata_in_graph(forward_batch)
 
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
         # The in-graph SWA translation needs the raw mapping tensor; v2p-table
@@ -659,8 +696,26 @@ class FlashAttentionBackend(AttentionBackend):
         m.cu_seqlens_q[1:].copy_(
             torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
         )
+        translating = self.kv_index_translator.is_translating
         max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
-        if max_seq_len_k > 0:
+        if translating:
+            # Unified pool: the block table is a TRANSLATED page table, built
+            # straight into these capture-stable buffers from the LIVE v2p, so
+            # a page relocated by compaction since capture is picked up. Same
+            # substitution the eager extend branch makes in its `_unified_read`
+            # fixup; `build_index_table` emits page-granular kernel-facing ids
+            # directly, so there is no `// page_size` to undo.
+            self.kv_index_translator.build_index_table(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                into=KVReadTables(
+                    full=m.page_table,
+                    sliding_window=(
+                        m.swa_page_table if self.use_sliding_window_kv_pool else None
+                    ),
+                ),
+            )
+        elif max_seq_len_k > 0:
             # Build the block table like the eager extend branch: take every
             # page_size-th token slot from req_to_token and divide by page_size.
             # Identity for page_size == 1 (strided is 0..max_seq_len_k-1, //1).
@@ -686,11 +741,21 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc.shape[0],
                 "full-CG prefill SWA write-location buffer",
             )
-            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            # Under the unified pool `out_cache_loc` was rebound to FULL-side
+            # KERNEL-FACING ids at ForwardBatch construction, so the full->swa
+            # map cannot be re-run on it -- those values index far past the swa
+            # v2p table (a device-side "index out of bounds" assert). Phase 2 of
+            # the write contract derives the swa loc from them instead.
+            swa_write_loc = (
+                self.kv_index_translator.sliding_window_write_loc_for(
+                    forward_batch.out_cache_loc
+                )
+                if translating
+                else self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
@@ -1110,6 +1175,23 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.out_cache_loc
                     )
                 )
+
+        # Logical-page KV sharding: capture the batch's gather plan and swap the
+        # page table to scratch rows. During a sharded extend, attention reads
+        # the assembled [prefix | chunk] scratch, never the striped pool rows;
+        # the plan capture also kicks the first layer's prefix gather.
+        #
+        # Runs after KVIndexTranslator and before the `// page_size` reduction.
+        # The unified-memory UnifiedKVPool and page-interleaved pools are
+        # alternatives, so at most one translation fires.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+        ):
+            metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                metadata.page_table
+            ).to(torch.int32)
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1 and not _unified_read:
@@ -1852,7 +1934,12 @@ class FlashAttentionBackend(AttentionBackend):
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        if is_swa_layer and layer.attn_type == AttentionType.ENCODER_ONLY:
+            window_size = (layer.sliding_window_size, layer.sliding_window_size)
+        elif is_swa_layer:
+            window_size = (layer.sliding_window_size, 0)
+        else:
+            window_size = (-1, -1)
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -2074,7 +2161,6 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
-
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,

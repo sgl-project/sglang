@@ -452,6 +452,33 @@ MODELS = {
         ],
         "force_eager": True,
     },
+    # OpenVDN paper workload: 1344x768, 14.375 s (latent_t 102), t2va, 9 grid points = 8 NFE
+    "vdn-h3": {
+        "path": "OpenVDN/vdn-minimax-h3",
+        "prompt": (
+            "A curious raccoon peers through a vibrant field of yellow "
+            "sunflowers, its eyes wide with interest."
+        ),
+        "seed": 1000,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 14.375,
+            },
+            "num_inference_steps": 9,
+        },
+        "extra_args": [
+            "--num-gpus=8",
+            "--quantization=fp8",
+            "--performance-mode=speed",
+            "--enable-torch-compile=false",
+            "--warmup-steps=2",
+        ],
+        "force_eager": True,
+    },
     # Source-tracked extras from current registry / GPU test coverage.
     "longcat-image": {
         "path": "meituan-longcat/LongCat-Image",

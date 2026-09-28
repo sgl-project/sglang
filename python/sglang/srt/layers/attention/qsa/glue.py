@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from sglang.srt.layers.attention.qsa.config import (
-    QSA_VARIANT_COMPRESSED,
-    parse_qsa_profile,
-)
+from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
 
 def build_qsa_indexer(
@@ -22,27 +19,14 @@ def build_qsa_indexer(
         raise ValueError(
             "build_qsa_indexer requires a config with a QSA indexer schema"
         )
-    if profile.variant == QSA_VARIANT_COMPRESSED:
-        # The compressed indexer reuses the layer's own Qwen4-Exp RoPE
-        # (mrope); there is intentionally no plain-rope path for it here.
-        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
-        return QSAIndexer(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-            rotary_emb=rotary_emb,
-        )
-    # Tokenwise (Qwen3Next-DSA): the Lightning Indexer owns its plain
-    # per-token RoPE; a shared layer rotary is neither needed nor accepted.
-    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
-
-    return QwenDSAIndexer(
+    return QSAIndexer(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
+        rotary_emb=rotary_emb,
     )
 
 

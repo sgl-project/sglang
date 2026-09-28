@@ -328,6 +328,21 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 > **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
 
+### Weight Update Session
+
+`update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. The update calls only write checkpoint-format values; `end_weight_update` runs every quantized layer's `process_weights_after_loading` once, turning them into kernel layout (Marlin repack, MXFP8 shuffles, ...), and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). `begin_weight_update` first restores the few schemes whose kernel layout changes parameter shapes (today compressed-tensors W4A16 MoE on Marlin) so the checkpoint-format values fit. One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket. A call outside a session, a second `begin_weight_update`, or an `end_weight_update` without one is rejected with `success: false` (HTTP 400) and leaves the weights untouched.
+
+**Endpoints:** `POST /begin_weight_update`, `POST /end_weight_update`
+
+`begin_weight_update` accepts `selector`: `"target"`, `"draft"`, or `"all"` (default). Under speculative decoding the same selector on the update endpoints picks which model runners receive the weights; `end_weight_update` finalizes the runners the session opened.
+
+```python
+engine.begin_weight_update()
+for bucket in buckets:
+    engine.update_weights_from_tensor(bucket)
+engine.end_weight_update()
+```
+
 ### Update Weights from Tensor
 
 **When to use:**
@@ -394,7 +409,7 @@ This strategy requires the training process and rollout engine to share access t
 
 **Note:** The serialized tensor payloads must be created with `MultiprocessingSerializer.serialize(...)` and should be base64-safe strings.
 
-**Python Engine API:** `engine.update_weights_from_tensor(named_tensors, load_format=None, flush_cache=True)`
+**Python Engine API:** `engine.update_weights_from_tensor(named_tensors, load_format=None, flush_cache=True)`, inside `begin_weight_update()` / `end_weight_update()`.
 
 ### Update Weights from Distributed Group
 
@@ -575,7 +590,9 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 **Python Engine APIs:**
 
 - `engine.init_weights_update_group(...)`
+- `engine.begin_weight_update(selector="all")`
 - `engine.update_weights_from_distributed(names, dtypes, shapes, ...)`
+- `engine.end_weight_update()`
 - `engine.destroy_weights_update_group(group_name)`
 
 ### Per-Token Weight Version Attribution

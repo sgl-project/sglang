@@ -33,6 +33,7 @@ class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):
     """NemotronH (Mamba2) + extra_buffer: cache-hit logprobs match cold recompute."""
 
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
 
     # Decode-seeded reuse is the regression trigger (the graphed decode
     # track-save); the broken path fails at KL ~1.5, so 0.005 discriminates
