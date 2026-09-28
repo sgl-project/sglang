@@ -820,9 +820,12 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     down_output = None if direct else empty((m if m <= 8 else routes, h), torch.float32)
     out = empty((m, h))
     _router_linear[16 * router_splits + m * (h // (32 * quant_groups)) + int(grouped),](x, router, logits, xq, xs, groups, h, x.stride(0), m, router_splits, router_block, 16, grouped, quant_vector, quant_groups, NATIVE=m == 2, num_warps=1)
-    if m == 16:
-        _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 1, router_splits, False, True, routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
-        _stream_paired_down[16 * (m // 2), h // (64 * 16)](aq, aqs, w2, w2_scale, ids, weights, out, h, intermediate, 64, 4, TILE_GROUP=16, num_warps=4, enable_fp_fusion=False)
+    if m in (1, 16):
+        _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 1, router_splits, m == 1, m == 16, routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
+        if m == 1:
+            _static_single_down[m, h // 16](aq, aqs, w2, w2_scale, ids, weights, out, h, intermediate, 16, 1, num_warps=1, enable_fp_fusion=False)
+        else:
+            _stream_paired_down[16 * (m // 2), h // (64 * 16)](aq, aqs, w2, w2_scale, ids, weights, out, h, intermediate, 64, 4, TILE_GROUP=16, num_warps=4, enable_fp_fusion=False)
         return out
     if m in (4, 8):
         _select_fused_up[m + routes * (intermediate // 32),](logits, correction_bias, ids, weights, xq, xs, w13, w13_scale, aq, aqs, m, h, intermediate, 32, 2, router_splits, m == 4, False, routed_scaling_factor, num_warps=2, enable_fp_fusion=False)
