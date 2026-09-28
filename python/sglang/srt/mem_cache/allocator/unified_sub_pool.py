@@ -993,10 +993,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Virtual token ids -> physical token ids, which under the token-major
-        views ARE the kernel-facing ids:
+        """Virtual token ids -> physical token ids, the ids kernels index the
+        per-layer views with:
 
-            kernel_id(t) = v2p[t // ps] * ps + t % ps
+            physical(t) = v2p[t // ps] * ps + t % ps
 
         Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
         `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
@@ -1039,11 +1039,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc (`out_cache_loc`) -> kernel-facing id.
+        """Widened virtual WRITE loc (`out_cache_loc`) -> physical id.
 
         Reads arrive already DCP-collapsed, but `out_cache_loc` does not: it still
         carries the owner rule in `loc % dcp_size`. Ids this rank does not own go
-        to kernel id 0, the padding sink every write kernel skips.
+        to id 0, the padding sink every write kernel skips.
         """
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1

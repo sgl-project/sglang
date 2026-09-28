@@ -198,9 +198,9 @@ TRANSLATE_TOKEN_IDS_BLOCK = 512
 
 @triton.jit
 def translate_token_ids_kernel(
-    loc_ptr,  # in:  [N] int64 — WIDENED virtual token ids
+    loc_ptr,  # in:  [N] or strided (rows, cols), int32/int64 — virtual token ids, widened under DCP
     v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
-    out_ptr,  # out: [N] int64 — physical token ids
+    out_ptr,  # out: shaped like loc, int64 — physical token ids
     N,  # runtime: live element count
     W,  # runtime: lanes to write; [N, W) get 0
     num_v_pages,  # runtime: rows of v2p; a page at or past it is unmapped
@@ -264,10 +264,10 @@ def translate_token_ids_kernel(
 
 
 def _row_col_strides(t: torch.Tensor) -> Tuple[int, int]:
-    """Element strides of `t` seen as ``(rows, cols)``; 0-d and 1-D are one row."""
+    """Element strides of a 1-D or 2-D `t` seen as ``(rows, cols)``; 1-D is one row."""
     if t.dim() == 2:
         return t.stride(0), t.stride(1)
-    return 0, (t.stride(0) if t.dim() == 1 else 1)
+    return 0, t.stride(0)
 
 
 def translate_token_ids(
@@ -280,7 +280,7 @@ def translate_token_ids(
     out: Optional[torch.Tensor] = None,
     out_width: Optional[int] = None,
 ) -> torch.Tensor:
-    """One launch for the whole write-loc conversion; see the kernel.
+    """Virtual token ids -> physical token ids in one launch; see the kernel.
 
     ``out`` is written in place when given (a captured graph records the
     gather against a fixed ``data_ptr``), else a fresh int64 tensor is
