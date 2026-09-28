@@ -1,4 +1,8 @@
-"""Fail-closed adapter for AITER's gfx950 Kimi-K3 fused KDA decode."""
+"""Fail-closed adapter for AITER's gfx950 Kimi-K3 fused KDA decode.
+
+Recurrence stays FP32. A BF16 SSM pool is loaded with extf and stored with
+round-nearest truncf.
+"""
 
 from __future__ import annotations
 
@@ -75,7 +79,7 @@ def covered(
         and conv_state.dtype == torch.bfloat16
         and state.ndim == 4
         and state.shape[1:] == (_HEADS, _DIM, _DIM)
-        and state.dtype == torch.float32
+        and state.dtype in (torch.float32, torch.bfloat16)
         and state.stride()[-3:] == (_DIM * _DIM, _DIM, 1)
         and state_indices.shape == (batch,)
         and state_indices.dtype == torch.int32
@@ -146,21 +150,35 @@ def warmup(
         return
 
     device = f_b_weight.device
-    run(
-        f_a=torch.zeros(1, _DIM, dtype=torch.bfloat16, device=device),
-        f_b_weight=f_b_weight,
-        mixed_qkv=torch.zeros(1, _CHANNELS, dtype=torch.bfloat16, device=device),
-        conv_weight=conv_weight,
-        conv_state=torch.zeros(1, _CHANNELS, 3, dtype=torch.bfloat16, device=device),
-        raw_beta=torch.zeros(1, 1, _HEADS, dtype=torch.bfloat16, device=device),
-        A_log=A_log,
-        dt_bias=dt_bias,
-        lower_bound=lower_bound,
-        state=torch.zeros(1, _HEADS, _DIM, _DIM, dtype=torch.float32, device=device),
-        state_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        output_gate=torch.zeros(1, _HEADS, _DIM, dtype=torch.bfloat16, device=device),
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
+    # BS=2 uses a separate binary. Compile both, for both SSM dtypes, before
+    # HIP graph capture.
+    for ssm_dtype in (torch.float32, torch.bfloat16):
+        for batch in (1, 2):
+            run(
+                f_a=torch.zeros(batch, _DIM, dtype=torch.bfloat16, device=device),
+                f_b_weight=f_b_weight,
+                mixed_qkv=torch.zeros(
+                    batch, _CHANNELS, dtype=torch.bfloat16, device=device
+                ),
+                conv_weight=conv_weight,
+                conv_state=torch.zeros(
+                    batch, _CHANNELS, 3, dtype=torch.bfloat16, device=device
+                ),
+                raw_beta=torch.zeros(
+                    1, batch, _HEADS, dtype=torch.bfloat16, device=device
+                ),
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                state=torch.zeros(
+                    batch, _HEADS, _DIM, _DIM, dtype=ssm_dtype, device=device
+                ),
+                state_indices=torch.zeros(batch, dtype=torch.int32, device=device),
+                output_gate=torch.zeros(
+                    batch, _HEADS, _DIM, dtype=torch.bfloat16, device=device
+                ),
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
     torch.cuda.synchronize(device)
     _WARMED.add(key)

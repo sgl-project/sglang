@@ -20,6 +20,11 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--trials", type=int, default=21)
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
+    parser.add_argument(
+        "--state-dtype",
+        choices=("float32", "bfloat16"),
+        default="float32",
+    )
     args = parser.parse_args()
 
     test = runpy.run_path(
@@ -28,7 +33,10 @@ def main() -> None:
             / "ops/attention/kda_flydsl/test_kimi_k3_kda_decode.py"
         )
     )
-    f_a, f_b_weight, inputs = test["_make_fb_inputs"](args.batch)
+    state_dtype = torch.float32 if args.state_dtype == "float32" else torch.bfloat16
+    f_a, f_b_weight, inputs = test["_make_fb_inputs"](
+        args.batch, state_dtype=state_dtype
+    )
     out = torch.empty((1, args.batch, 12, 128), dtype=torch.bfloat16, device="cuda")
     kwargs = dict(
         f_a=f_a,
@@ -76,7 +84,7 @@ def main() -> None:
         samples.append(start.elapsed_time(end) * 1000 / args.iters)
 
     print(
-        f"batch={args.batch} mode={args.mode} "
+        f"batch={args.batch} mode={args.mode} state={args.state_dtype} "
         f"p50_us={statistics.median(samples):.4f} "
         f"mean_us={statistics.mean(samples):.4f} "
         f"p10_us={sorted(samples)[max(0, args.trials // 10 - 1)]:.4f} "
