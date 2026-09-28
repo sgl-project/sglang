@@ -16,7 +16,6 @@ pub use request::{
 };
 pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
-pub(crate) use sampling::SamplingParamsOverrides;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
 #[cfg(test)]

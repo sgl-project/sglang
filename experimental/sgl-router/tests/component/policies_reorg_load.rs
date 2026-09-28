@@ -5,12 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_reported_load::{
-    EngineReportedLoadTable, EngineReportedWorkerLoad, LoadStat,
-};
+use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
 use sgl_router::workers::Worker;
 
 const URL: &str = "http://engine";
@@ -43,21 +41,16 @@ fn engine() -> Arc<Worker> {
 #[derive(Debug)]
 struct ObserveAdmission {
     table: Arc<EngineReportedLoadTable>,
-    observations: Mutex<Vec<Option<EngineReportedWorkerLoad>>>,
+    observations: Mutex<Vec<EngineMetrics>>,
 }
 
 impl EngineAdmission for ObserveAdmission {
-    fn check(
-        &self,
-        engine: &Worker,
-        _: &PickRequest<'_>,
-        load: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, metrics: &EngineMetrics) -> Result<Decision, PickError> {
         assert_eq!(engine.url, URL);
         // A new report arriving after selection must not change the observation
         // supplied to admission. The next pick should read the new report.
         report(&self.table, 0, 99, Instant::now());
-        self.observations.lock().unwrap().push(load.cloned());
+        self.observations.lock().unwrap().push(*metrics);
         Ok(Decision::Allow)
     }
 }
@@ -95,17 +88,16 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
     }
     let observations = admission.observations.lock().unwrap();
     assert_eq!(observations.len(), 2);
+    // Basic reports carry request counts but no KV or pending-prefill tokens.
     assert_eq!(
         observations[0],
-        Some(EngineReportedWorkerLoad {
-            num_running_reqs: 4,
-            num_waiting_reqs: 4,
-            num_tokens: 60,
-            max_total_num_tokens: 200,
-            captured_at: first_at,
-        })
+        EngineMetrics {
+            running_requests: Some(4),
+            waiting_requests: Some(4),
+            ..EngineMetrics::default()
+        }
     );
-    assert_eq!(observations[1].as_ref().unwrap().num_running_reqs, 102);
+    assert_eq!(observations[1].running_requests, Some(102));
 }
 
 #[tokio::test]
@@ -133,6 +125,10 @@ async fn missing_stale_and_incomplete_reports_reach_admission_as_unknown() {
             .pick(&[engine()], &PickRequest::new(&model, Stage::Plain, 10))
             .await
             .unwrap();
-        assert_eq!(*admission.observations.lock().unwrap(), [None], "{case}");
+        assert_eq!(
+            *admission.observations.lock().unwrap(),
+            [EngineMetrics::default()],
+            "{case}"
+        );
     }
 }

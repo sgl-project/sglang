@@ -49,6 +49,10 @@ impl Config {
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
+            self.proxy.stream_idle_timeout_secs > 0,
+            "stream_idle_timeout_secs must be greater than zero"
+        );
+        ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
             "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
              past the ceiling a value is a typo rather than a drain. A long but \
@@ -232,6 +236,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
