@@ -806,6 +806,13 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
+    elif arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ) or model_type in ("minimax_m3", "minimax_m3_vl"):
+        reasoning_parser, tool_call_parser = "minimax-m3", "minimax-m3"
+    elif arch == "MiniMaxM2ForCausalLM" or model_type == "minimax_m2":
+        reasoning_parser, tool_call_parser = "minimax", "minimax-m2"
     else:
         return {}
 

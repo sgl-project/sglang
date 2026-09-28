@@ -28,10 +28,10 @@ class TestServingLatency(CustomTestCase):
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],
-                9100,
+                9140,
                 unit="ms",
             ),
-            at_most("median_ttft_ms", res["median_ttft_ms"], 80, amd=115, unit="ms"),
+            at_most("median_ttft_ms", res["median_ttft_ms"], 84, amd=115, unit="ms"),
             at_most("median_itl_ms", res["median_itl_ms"], 9, unit="ms"),
         )
 

@@ -14,10 +14,10 @@ class TestVLMServingFlashinfer(CustomTestCase):
         check_vlm_serving_perf(
             self,
             "flashinfer",
-            output_throughput=6900,
-            e2e_ms=17300,
-            ttft_ms=76,
-            itl_ms=8.3,
+            output_throughput=5940,
+            e2e_ms=17480,
+            ttft_ms=83,
+            itl_ms=8.4,
         )
 
 

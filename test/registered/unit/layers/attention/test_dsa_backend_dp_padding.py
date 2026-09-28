@@ -24,7 +24,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
                 return_value=MoeA2ABackend.NONE,
             ),
             patch(
-                "sglang.srt.layers.dp_attention.get_attention_dp_size",
+                "sglang.srt.layers.dp_attention.dp_gather_width",
                 return_value=4,
             ),
         ):
@@ -111,6 +111,9 @@ class TestDSABackendDPPadding(unittest.TestCase):
         )
         backend._pad_trtllm_sparse_page_table = MethodType(
             DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
+        )
+        backend._multi_ctas_kv_counter_for = MethodType(
+            DeepseekSparseAttnBackend._multi_ctas_kv_counter_for, backend
         )
 
         layer = SimpleNamespace(

@@ -225,6 +225,23 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(out["encoder_hidden_states"].shape, (1, 512, 3584))
         self.assertEqual(out["txt_ids"].shape, (512, 3))
 
+    def test_longcat_edit_keeps_vl_prefix_and_image_grid(self):
+        kwargs = {
+            "hidden_states": torch.zeros(1, 8374, 64),
+            "encoder_hidden_states": torch.zeros(1, 859, 64),
+            "encoder_hidden_states_mask": [torch.ones(1, 859, dtype=torch.bool)],
+            "txt_ids": torch.zeros(859, 3),
+            "img_ids": torch.zeros(8374, 3),
+        }
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.longcat_model
+            )
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape[1], 859)
+        self.assertEqual(out["txt_ids"].shape, (859, 3))
+        self.assertEqual(out["img_ids"].shape, (8374, 3))
+
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
             mask = torch.zeros(1, 64, dtype=torch.bool)
@@ -473,6 +490,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def test_image_generation_models_are_registered_as_bcg_supported(self):
         for model_id in (
             "meituan-longcat/longcat-image",
+            "meituan-longcat/longcat-image-edit-turbo",
             "qwen/qwen-image",
             "qwen/qwen-image-2512",
             "tongyi-mai/z-image",
@@ -484,6 +502,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         for config_name in (
             "GlmImagePipelineConfig",
             "LongCatImagePipelineConfig",
+            "LongCatImageEditPipelineConfig",
             "QwenImagePipelineConfig",
             "ZImagePipelineConfig",
         ):

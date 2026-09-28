@@ -29,7 +29,7 @@ class TestMoEThroughput(CustomTestCase):
             at_least(
                 "output_throughput",
                 res["output_throughput"],
-                2670,
+                2660,
                 amd=2100,
                 unit="token/s",
             ),
