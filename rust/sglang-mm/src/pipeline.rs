@@ -74,10 +74,10 @@ pub struct ProcessedItem {
 /// The tokens one media item occupies in the expanded prompt.
 pub enum TokenPattern {
     /// N copies of one placeholder id (qwen-style).
-    Repeat { id: i32, n: usize },
+    Repeat { id: i64, n: usize },
     /// An explicit id sequence — tile markers, row separators, wrapper
     /// tokens (minicpm/internvl-style structured expansions).
-    Explicit(Vec<i32>),
+    Explicit(Vec<i64>),
 }
 
 /// One span of the expanded prompt.
@@ -132,7 +132,7 @@ pub trait MmFamilyProcessor: Send + Sync {
     /// Describe how the prompt expands around the processed items (in
     /// prompt order). Sees the full original prompt and all items, so
     /// structured schemes (tile markers, separators) are expressible.
-    fn layout(&self, input_ids: &[i32], items: &[Geometry]) -> Result<TokenLayout, String>;
+    fn layout(&self, input_ids: &[i64], items: &[Geometry]) -> Result<TokenLayout, String>;
 
     /// Positions for the expanded prompt. Families without a custom scheme
     /// keep the default.
