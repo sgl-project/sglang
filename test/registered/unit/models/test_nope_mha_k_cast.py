@@ -81,3 +81,36 @@ def test_nope_mha_k_cast_rocm(backend, zero_width_k_pe):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
+    """A hybrid KDA/DSA wrapper holds no metadata; the FP8 prefix read crashed on it."""
+    page_table = torch.tensor([3, 5, 8])
+    child = SimpleNamespace(
+        forward_metadata=SimpleNamespace(page_table_1_flattened=page_table)
+    )
+    outer = SimpleNamespace(
+        full_attn_backend=child, forward_metadata=None, kv_index_translator=None
+    )
+    read_indices = []
+
+    def get_mla_kv_buffer(layer, indices, dtype):
+        read_indices.append(indices)
+        return torch.zeros(len(indices), 1, 4), torch.zeros(len(indices), 1, 2)
+
+    fake_pool = SimpleNamespace(get_mla_kv_buffer=get_mla_kv_buffer)
+    with (
+        mock.patch.object(forward_mha, "_use_aiter_gfx95", True),
+        mock.patch.object(forward_mha, "get_attn_backend", return_value=outer),
+        mock.patch.object(forward_mha, "get_token_to_kv_pool", return_value=fake_pool),
+        mock.patch.object(
+            forward_mha,
+            "filter_dcp_local_kv_indices",
+            side_effect=lambda kv_indices: kv_indices,
+        ),
+    ):
+        forward_mha.DeepseekMHAForwardMixin._get_mla_kv_buffer_from_fp8_for_dsa(
+            SimpleNamespace(attn_mha=object()), SimpleNamespace(forward_mode=None)
+        )
+
+    assert len(read_indices) == 1 and torch.equal(read_indices[0], page_table)

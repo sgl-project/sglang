@@ -128,7 +128,7 @@ Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill 
 
 ### Multimodal memory
 
-All strategies enable multimodal serving. On MI355X, text, image, and an image-bearing follow-up were qualified; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+All strategies enable multimodal serving. Image and video input need a Transformers build that ships `Glm5NextProcessor` (the MI355X checks used commit `e4052f55`, which also requires `tokenizers>=0.23.1`). With the pinned `transformers==5.12.1`, the server loads only the tokenizer and silently answers image requests from the text alone. On MI355X, text, image, and an image-bearing follow-up were qualified with that build; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
