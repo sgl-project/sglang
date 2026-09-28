@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from transformers import PersimmonConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -201,7 +200,7 @@ class PersimmonModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(

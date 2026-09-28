@@ -73,13 +73,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W4A8 variant for reduced resource usage and higher throughput.
-It (535.91GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 node (8 cards, 16 dies) or two A2 nodes.
+It (535.91GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -95,7 +95,7 @@ Both **stable releases** and **daily builds** are available. The following comma
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -130,7 +130,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -172,22 +172,22 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Kimi K2.6 Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#single-node-pd-mixed).
+[Kimi K2.6 Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#single-node-pd-mixed).
 
 ### Multi-node online deployment
 
-Multi-node deployment distributes the model across multiple Atlas 800I A3 nodes using tensor parallelism while keeping
+Multi-node deployment distributes the model across multiple Ascend A3 Series nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
 node can provide. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Kimi-K2.6 Best Practice — Multi-node On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#multi-node-pd-mixed).
+[Kimi-K2.6 Best Practice — Multi-node On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#multi-node-pd-mixed).
 
 ### Multi-node PD disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
 throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Kimi-K2.6 Best Practice — PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#pd-disaggregation).
+[Kimi-K2.6 Best Practice — PD Disaggregation On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#pd-disaggregation).
 
 ## Functional verification
 

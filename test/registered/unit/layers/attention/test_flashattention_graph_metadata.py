@@ -24,6 +24,17 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.token_to_kv_pool = SimpleNamespace(
             translate_loc_from_full_to_swa=lambda locations: locations
         )
+        # The metadata builder reads `is_translating` to choose between the
+        # translated block table and the strided one this test covers, so the
+        # source has to be real; the stub pools disable translation, which is
+        # the static-pool view the assertions below are written against.
+        backend.kv_index_translator = KVIndexTranslator(
+            req_to_token=backend.req_to_token,
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=backend.page_size,
+            device="cpu",
+        )
         forward_batch = SimpleNamespace(
             batch_size=1,
             seq_lens=torch.zeros(1, dtype=torch.int64),

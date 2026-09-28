@@ -25,12 +25,12 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
 
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        override = get_context().override_server_args(enable_dp_attention=True)
+        override = get_context().override_server_args(
+            enable_dp_attention=True, dp_size=DP_SIZE, tp_size=DP_SIZE
+        )
         override.install()
         self.addCleanup(override.restore)
         self.delayer = PrefillDelayer(
-            dp_size=DP_SIZE,
-            attn_tp_size=1,
             cpu_group=MagicMock(),
             max_delay_passes=100,
             token_usage_low_watermark=None,
@@ -49,7 +49,9 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
             )
 
         executor = PrefillDelayerSinglePassExecutor(self.delayer, token_usage=0.9)
-        with patch("torch.distributed.all_gather_into_tensor", fake_all_gather):
+        with patch(
+            "sglang.srt.managers.prefill_delayer.all_gather_single", fake_all_gather
+        ):
             executor.negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 prefill_in_flight=prefill_in_flight,
