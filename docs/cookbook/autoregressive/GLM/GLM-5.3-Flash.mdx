@@ -20,6 +20,16 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
+<Warning>
+  The `rocm/sgl-dev:v0.5.20-rocm724-mi35x-20260928` image does not include
+  [ROCm/aiter#5735](https://github.com/ROCm/aiter/pull/5735). If you serve
+  GLM-5.3-Flash on MI355X with an SGLang build that includes
+  [PR #41161](https://github.com/sgl-project/sglang/pull/41161), add
+  `--disable-shared-experts-fusion`. AMD recipes remain excluded from the
+  deployment panel until the image includes the required AITER dispatch
+  configuration.
+</Warning>
+
 Choose your hardware, then choose the operating point that matches your workload:
 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
