@@ -49,6 +49,10 @@ impl Config {
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
+            self.proxy.stream_idle_timeout_secs > 0,
+            "stream_idle_timeout_secs must be greater than zero"
+        );
+        ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
             "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
              past the ceiling a value is a typo rather than a drain. A long but \
@@ -56,6 +60,18 @@ impl Config {
              can check it against the pod's real budget",
             self.server.shutdown_drain_secs,
         );
+        if let Some(cache) = self.model.cache_aware.as_ref() {
+            let ms = cache.bootstrap_timeout_ms;
+            ensure!(
+                ms > 0,
+                "--kv-bootstrap-timeout-ms must be greater than zero; to boot cold, \
+                 leave --kv-peer-selector unset"
+            );
+            ensure!(
+                ms <= MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+                "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms ceiling"
+            );
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 ensure!(
@@ -232,6 +248,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
