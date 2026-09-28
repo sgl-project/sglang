@@ -823,3 +823,61 @@ class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
                 txt_seq_lens,
             )
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.flux import (
+        Flux2KleinBaseSamplingParams,
+        Flux2KleinSamplingParams,
+        Flux2SamplingParams,
+        FluxSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-dev",
+        ],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2SamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
+    )

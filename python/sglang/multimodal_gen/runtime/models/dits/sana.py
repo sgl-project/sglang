@@ -156,11 +156,13 @@ def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     ).to(x.dtype)
 
 
-def _use_sana_bcg_fast_path(x: torch.Tensor) -> bool:
+def _use_sana_bcg_fast_path(x: torch.Tensor, *, allow_eager: bool = False) -> bool:
     if torch.compiler.is_compiling() or not x.is_cuda:
         return False
-    return torch.cuda.is_current_stream_capturing() or (
-        torch.cuda.current_stream() != torch.cuda.default_stream()
+    return (
+        (allow_eager and not torch.is_grad_enabled())
+        or torch.cuda.is_current_stream_capturing()
+        or (torch.cuda.current_stream() != torch.cuda.default_stream())
     )
 
 
@@ -176,8 +178,10 @@ def _conv2d_without_bias(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def sana_conv_bias_silu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+def sana_conv_bias_silu(
+    conv: nn.Conv2d, x: torch.Tensor, *, allow_eager: bool = False
+) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x, allow_eager=allow_eager):
         return F.silu(_mps_safe_conv2d(conv, x))
 
     raw = _conv2d_without_bias(conv, x)
@@ -204,8 +208,10 @@ def sana_conv_bias_silu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def sana_conv_bias_glu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+def sana_conv_bias_glu(
+    conv: nn.Conv2d, x: torch.Tensor, *, allow_eager: bool = False
+) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x, allow_eager=allow_eager):
         hidden_states = _mps_safe_conv2d(conv, x)
         hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
         return hidden_states * F.silu(gate)

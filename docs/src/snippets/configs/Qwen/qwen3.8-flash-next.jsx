@@ -8,8 +8,9 @@
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
-// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
-// runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
+// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node).
+// Both RadixArk and NVIDIA NVFP4 recipes use TP1. The AMD cells run TP8.
+// That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box with the N-gram table
@@ -44,7 +45,7 @@ export const config = {
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
-  // one has recipes for the DGX Spark pair and the single RTX PRO 6000.
+  // one has recipes for B200/B300/GB300, DGX Spark and the single RTX PRO 6000.
   quantizations: [
     { id: "bf16",       label: "BF16"         },
     { id: "fp8",        label: "FP8"          },
@@ -200,8 +201,11 @@ export const config = {
     "dgx-spark": "lmsysorg/sglang:dev-qwen38-next-local",
     rtx6000: "lmsysorg/sglang:dev-qwen38-next-local",
     b200:   "lmsysorg/sglang:qwen38flashnext",
+    "b200|nvfp4-nvda": "lmsysorg/sglang:latest",
     b300:   "lmsysorg/sglang:qwen38flashnext",
+    "b300|nvfp4-nvda": "lmsysorg/sglang:latest",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
+    "gb300|nvfp4-nvda": "lmsysorg/sglang:latest",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
     mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
   },
@@ -711,6 +715,116 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

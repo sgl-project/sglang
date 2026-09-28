@@ -998,7 +998,8 @@
               {
                 "group": "Specialized Models",
                 "pages": [
-                  "docs/supported-models/reward_models"
+                  "docs/supported-models/reward_models",
+                  "docs/supported-models/decision_models"
                 ]
               },
               {
@@ -1521,6 +1522,12 @@
                     ]
                   },
                   {
+                    "group": "CircleStone",
+                    "pages": [
+                      "cookbook/diffusion/CircleStone/Anima"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "tag": "NEW",
                     "pages": [
@@ -1532,6 +1539,12 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
+                    ]
+                  },
+                  {
+                    "group": "Ming-Image",
+                    "pages": [
+                      "cookbook/diffusion/inclusionAI/Ming-Image"
                     ]
                   },
                   {
@@ -1641,6 +1654,7 @@
                 "pages": [
                   "docs/sglang-diffusion/api/cli",
                   "docs/sglang-diffusion/api/openai_api",
+                  "docs/sglang-diffusion/comfyui",
                   "docs/sglang-diffusion/realtime_models",
                   "docs/sglang-diffusion/models_with_ar",
                   "docs/sglang-diffusion/models_with_pe",

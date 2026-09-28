@@ -78,7 +78,7 @@ python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 1
 
 ## Output
 
-Generates JSON config files saved to `python/sglang/srt/layers/quantization/configs/`:
+Generates JSON config files saved to `python/sglang/kernels/ops/gemm/configs/`:
 ```
 N={N},K={K},device_name={DEVICE},dtype=fp8_w8a8,block_shape=[128,128].json
 ```

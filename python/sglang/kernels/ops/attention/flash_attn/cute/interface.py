@@ -107,6 +107,15 @@ def _get_device_num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _tmem_load_red_max_enabled() -> bool:
+    """Whether the SM100 forward kernel takes the softmax row max from the sm_103
+    tcgen05.ld.red TMEM load (on by default; ignored on other architectures).
+
+    SGLANG_FA4_TMEM_LOAD_RED_MAX=0 falls back to the FMNMX reduction.
+    """
+    return os.environ.get("SGLANG_FA4_TMEM_LOAD_RED_MAX", "1") != "0"
+
+
 def _validate_head_dims(
     head_dim: int, head_dim_v: int, compute_capability: int, alignment: int
 ) -> None:
@@ -1235,6 +1244,7 @@ def _flash_attn_fwd(
             return out, lse
 
     batch_invariant = is_batch_invariant()
+    tmem_load_red_max = _tmem_load_red_max_enabled()
     compile_key = (
         dtype,
         head_dim,
@@ -1297,6 +1307,7 @@ def _flash_attn_fwd(
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
         batch_invariant,
+        tmem_load_red_max,
         fa_logging.get_fa_log_level(),
     )
 
@@ -1521,6 +1532,7 @@ def _flash_attn_fwd(
                             q_sf_interleaved=q_sf_interleaved,
                             kv_sf_interleaved=kv_sf_interleaved,
                             batch_invariant=batch_invariant,
+                            tmem_load_red_max=tmem_load_red_max,
                         )
                     ),
                 )

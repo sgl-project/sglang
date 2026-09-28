@@ -113,6 +113,7 @@ jobs:
           TEST_COMMAND: ${{ inputs.test_command }}
           TEST_ROOT: partition-source
           MODE: ${{ inputs.mode }}
+          RUNS_ON: ${{ inputs.runs_on }}
         run: python3 scripts/ci/partition_rerun_tests.py
 
   rerun-test-cuda:
@@ -207,6 +208,7 @@ jobs:
             cmds+=("$cmd")
           done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
+          failed=()
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
             i=$((idx + 1))
@@ -224,7 +226,9 @@ jobs:
             if grep -qE 'register_cuda_ci\(.*stage[[:space:]]*=[[:space:]]*"base-a"' "test/$test_file" 2>/dev/null; then
               async_assert=false
             fi
-            (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f) || exit 1
+            if ! (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f); then
+              failed+=("$cmd")
+            fi
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -232,6 +236,15 @@ jobs:
             echo ""
           done
           total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           echo "All $total test(s) passed in ${total_elapsed}s"
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -295,6 +308,7 @@ jobs:
             cmds+=("$cmd")
           done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
+          failed=()
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
             i=$((idx + 1))
@@ -304,7 +318,9 @@ jobs:
             echo "Begin ($i/$total): python3 -m pytest $cmd -x"
             echo "."
             file_start=$SECONDS
-            python3 -m pytest $cmd -x || exit 1
+            if ! python3 -m pytest $cmd -x; then
+              failed+=("$cmd")
+            fi
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -312,6 +328,15 @@ jobs:
             echo ""
           done
           total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           echo "All $total test(s) passed in ${total_elapsed}s"
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -404,6 +429,7 @@ jobs:
             cmds+=("$cmd")
           done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
+          failed=()
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
             i=$((idx + 1))
@@ -413,7 +439,9 @@ jobs:
             echo "Begin ($i/$total): python3 $cmd"
             echo "."
             file_start=$SECONDS
-            python3 $cmd -f || exit 1
+            if ! python3 $cmd -f; then
+              failed+=("$cmd")
+            fi
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -421,6 +449,15 @@ jobs:
             echo ""
           done
           total_elapsed=$(( SECONDS - suite_start ))
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "${#failed[@]}/$total test(s) failed in ${total_elapsed}s:"
+            printf '  %s\n' "${failed[@]}"
+            {
+              echo "### Failed tests (partition ${{ matrix.partition }})"
+              printf -- '- `%s`\n' "${failed[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           echo "All $total test(s) passed in ${total_elapsed}s"
 
   write-back-result:

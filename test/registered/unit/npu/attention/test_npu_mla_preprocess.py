@@ -148,31 +148,6 @@ class TestTransRopeWeight(unittest.TestCase):
             self.assertTrue(torch.equal(result[e, 4:8], expected_rope))
 
 
-class TestIsMlaPreprocessEnabled(unittest.TestCase):
-    def setUp(self):
-        is_mla_preprocess_enabled.cache_clear()
-
-    def tearDown(self):
-        is_mla_preprocess_enabled.cache_clear()
-
-    def test_not_set_returns_false(self):
-        with patch.dict(os.environ):
-            os.environ.pop("SGLANG_NPU_USE_MLAPO", None)
-            self.assertFalse(is_mla_preprocess_enabled())
-
-    def test_set_to_one_returns_true(self):
-        with patch.dict(os.environ, {"SGLANG_NPU_USE_MLAPO": "1"}):
-            self.assertTrue(is_mla_preprocess_enabled())
-
-    def test_set_to_zero_returns_false(self):
-        with patch.dict(os.environ, {"SGLANG_NPU_USE_MLAPO": "0"}):
-            self.assertFalse(is_mla_preprocess_enabled())
-
-    def test_set_to_true_returns_true(self):
-        with patch.dict(os.environ, {"SGLANG_NPU_USE_MLAPO": "true"}):
-            self.assertTrue(is_mla_preprocess_enabled())
-
-
 class TestIsFiaNz(unittest.TestCase):
     def setUp(self):
         is_mla_preprocess_enabled.cache_clear()

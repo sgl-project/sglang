@@ -97,7 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
-    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260920",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },

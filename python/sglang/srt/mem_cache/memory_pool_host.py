@@ -63,6 +63,8 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
+    shared_allocation_domain = None
+
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
             raise ValueError(
@@ -150,6 +152,26 @@ class LogicalHostPool:
     ):
         pass
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        pass
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -172,6 +194,9 @@ class LogicalHostPool:
         pass
 
     def get_page_buffer_meta(self, indices):
+        return None
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
         return None
 
     def get_ksize_per_token(self):

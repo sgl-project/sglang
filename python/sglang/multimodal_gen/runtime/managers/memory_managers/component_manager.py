@@ -249,10 +249,18 @@ class ComponentResidencyManager:
         no declared ``ComponentUse`` would otherwise be accepted but never
         moved to the device before a forward pass.
         """
-        if not isinstance(self.server_args, ServerArgs):
+        if (
+            not isinstance(self.server_args, ServerArgs)
+            or not self.server_args.component_residency
+        ):
             return
 
-        declared_components = {use.component_name for use in self._ordered_uses}
+        # sequential multi-output execution runs subsets of the full pipeline
+        declared_components = {
+            use.component_name
+            for name, stage in self.pipeline._stage_name_mapping.items()
+            for use in stage.component_uses(self.server_args, name)
+        }
         unmanaged_components = sorted(
             component_name
             for component_name, module in self.pipeline.modules.items()

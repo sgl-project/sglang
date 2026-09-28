@@ -277,11 +277,19 @@ def _find_missing_required_paths(
     return missing
 
 
+# Smaller files are copied, not linked: materializers rewrite configs in place,
+# and a write through a link rewrites the Hugging Face cache blob behind it.
+_OVERLAY_LINK_MIN_BYTES = 64 * 1024 * 1024
+
+
 def _link_or_copy_file(src: str, dst: str) -> None:
     src = os.path.realpath(src)
     _ensure_dir(os.path.dirname(dst))
     if os.path.lexists(dst):
         os.remove(dst)
+    if os.path.getsize(src) < _OVERLAY_LINK_MIN_BYTES:
+        shutil.copy2(src, dst)
+        return
     try:
         os.link(src, dst)
         return

@@ -969,6 +969,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.shift_factor = (
             torch.tensor(
                 config.arch_config.latents_mean
+                if config.arch_config.latents_mean is not None
+                else [config.arch_config.shift_factor or 0.0] * latent_channels
             )
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)

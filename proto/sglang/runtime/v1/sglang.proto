@@ -1,6 +1,8 @@
 syntax = "proto3";
 package sglang.runtime.v1;
 
+import "google/protobuf/struct.proto";
+
 service SglangService {
   // SGLang-native RPCs (typed proto)
   rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
@@ -104,6 +106,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
+  optional KVHintsEnvelope kv_hints = 18;
 }
 
 message TextGenerateResponse {
@@ -131,6 +134,22 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional KVHintsEnvelope kv_hints = 17;
+}
+
+// Versioned KV-hint envelope forwarded from a trusted orchestrator.
+message KVHintsEnvelope {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KVHintAction actions = 3;
+}
+
+message KVHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  // Action-specific; validated by the component implementing action_type.
+  google.protobuf.Struct payload = 4;
 }
 
 message GenerateResponse {

@@ -70,6 +70,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_slot_in,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -672,8 +673,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
         if global_num_tokens is not None:
-            dp_rank = get_parallel().attn_dp_rank
-            return int(global_num_tokens[dp_rank if len(global_num_tokens) > 1 else 0])
+            return int(global_num_tokens[dp_slot_in(global_num_tokens)])
 
         return sum(
             max(int(seq_len) - int(start_len), 1)
@@ -1191,6 +1191,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
+            padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:

@@ -5,6 +5,7 @@ The rank-local KV-length and page-table plumbing lives on
 backend and for both subclasses that inherit it.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLADecodeMetadata,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +30,10 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
 DCP_RANK = 2
+
+
+class _RealVerifyPath(Exception):
+    """Raised by the stubs the real verify path reaches first."""
 
 
 def _make_backend(backend_cls, bs: int):
@@ -97,6 +103,63 @@ class _DCPMetadataTests:
         # Plain decode keeps both views in the capture-stable buffers.
         torch.testing.assert_close(metadata.global_seq_lens_k, seq_lens)
         torch.testing.assert_close(metadata.seq_lens_k, expected_local)
+
+    def _verify_extend(self, *, dcp_enabled: bool, in_autotune: bool):
+        heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
+        backend = object.__new__(self.backend_cls)
+        backend.data_type = backend.q_data_type = torch.bfloat16
+        backend._decode_kernel_loc = None
+
+        def real_path(*args, **kwargs):
+            raise _RealVerifyPath
+
+        backend.token_to_kv_pool = SimpleNamespace(set_mla_kv_buffer=real_path)
+        backend._run_decode_kernel = real_path
+        layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY, out_cache_loc=None
+        )
+        k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
+        k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
+        parallel = SimpleNamespace(dcp_enabled=dcp_enabled)
+        autotune = (
+            autotune_dummy_run_mode(run_lm_head=False)
+            if in_autotune
+            else contextlib.nullcontext()
+        )
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            autotune,
+        ):
+            return backend.forward_extend(
+                torch.zeros(
+                    (n, heads, v_head_dim), dtype=torch.bfloat16, device="cuda"
+                ),
+                k,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=True,
+                q_rope=torch.zeros((n, heads, 64), dtype=torch.bfloat16, device="cuda"),
+                k_rope=k_rope,
+            )
+
+    def test_autotune_verify_under_dcp_skips_the_kernel(self):
+        """A speculative autotune dummy verify under DCP must not run the kernel;
+        a FlashInfer kernel would start its own tuning, which can hang ranks."""
+        out, lse = self._verify_extend(dcp_enabled=True, in_autotune=True)
+        n = 3 * NUM_DRAFT_TOKENS
+        self.assertEqual((out.shape, out.dtype), ((n, 4 * 512), torch.bfloat16))
+        self.assertEqual((lse.shape, lse.dtype), ((n, 4), torch.float32))
+        self.assertFalse(out.any() or lse.any())
+
+    def test_real_verify_under_dcp_takes_the_real_path(self):
+        with self.assertRaises(_RealVerifyPath):
+            self._verify_extend(dcp_enabled=True, in_autotune=False)
+
+    def test_autotune_verify_without_dcp_takes_the_real_path(self):
+        with self.assertRaises(_RealVerifyPath):
+            self._verify_extend(dcp_enabled=False, in_autotune=True)
 
 
 class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):

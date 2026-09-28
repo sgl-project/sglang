@@ -36,7 +36,7 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         side produced, and a short chunk resumes against the wrong exponents."""
         row_mask = torch.tensor([True, False, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(_chunk(4), row_mask)
+        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(4), row_mask=row_mask)
 
         self.assertEqual(len(filtered[0][0]), 4)
         for t, tensor in enumerate(filtered[0][0]):
@@ -46,7 +46,7 @@ class TestSWACpuCopyFilter(unittest.TestCase):
     def test_unquantized_chunk_is_unchanged(self):
         row_mask = torch.tensor([False, True, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(_chunk(2), row_mask)
+        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(2), row_mask=row_mask)
 
         self.assertEqual(len(filtered[0][0]), 2)
         self.assertEqual(filtered[0][0][0].shape[0], 2)
@@ -55,12 +55,47 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         original = _chunk(4)
 
         self.assertIs(
-            _pool()._filter_swa_cpu_copy(original, torch.tensor([True] * ROWS)),
+            _pool()._filter_swa_cpu_copy(
+                swa_kv_cpu=original, row_mask=torch.tensor([True] * ROWS)
+            ),
             original,
         )
 
 
 class TestUnifiedSWATransfers(CustomTestCase):
+    def test_offload_uses_physical_swa_pages(self):
+        from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+            DecodeKVCacheOffloadManager,
+        )
+
+        for tombstone_tokens in (0, 4, 12):
+            with self.subTest(tombstone_tokens=tombstone_tokens):
+                bundle = _swa_factory(page_size=4)
+                allocator = bundle.token_to_kv_pool_allocator
+                indices = allocator.alloc(12)
+                allocator.free_swa(indices[:tombstone_tokens])
+                raw = bundle.unified_memory_pool._raw
+                raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
+                manager = object.__new__(DecodeKVCacheOffloadManager)
+                manager.token_to_kv_pool_allocator = allocator
+                manager.kv_cache = bundle.token_to_kv_pool
+                full, transfers = manager._resolve_offload_transfers(indices)
+                self.assertTrue(torch.equal(full, indices))
+                if tombstone_tokens == len(indices):
+                    self.assertEqual(transfers, [])
+                    continue
+                expected_pages = allocator.swa_v2p_page_table[
+                    indices[tombstone_tokens::4] // 4
+                ]
+                pages = transfers[0].device_indices[::4] // (
+                    4 * manager.kv_cache.swa_kv_pool.kernel_page_blocks
+                )
+                buffer = manager.kv_cache.swa_kv_pool.get_page_envelope_buffer()
+                self.assertTrue(
+                    torch.equal(buffer[pages].clone(), buffer[expected_pages])
+                )
+                self.assertTrue(torch.equal(pages, expected_pages))
+
     def test_cpu_copy_round_trip_with_request_index_and_swa_tombstone(self):
         bundle = _swa_factory(page_size=4)
         allocator = bundle.token_to_kv_pool_allocator

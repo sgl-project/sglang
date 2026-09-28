@@ -167,6 +167,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = partial(
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # replays read capture-time state from the pool, so a pause must back it up
+                enable_cpu_backup=True,
             )
         else:
             graph_ctx = self._device_module.graph
@@ -209,6 +211,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        for graph in self._graphs.values():
+            graph.reset()
         self._graphs.clear()
         self._outputs.clear()
         self._output_buffer = None

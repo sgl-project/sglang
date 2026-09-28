@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
@@ -83,28 +83,20 @@ def match_len(cache, token_ids) -> int:
 def register(cache, token_ids, session_id, generation=None):
     if generation is None:
         generation = cache.ensure_session_generation(session_id)
+    leaf = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).last_device_node
     cache.session_refs.register_session_ref(
         SimpleNamespace(
             session_id=session_id,
             session_generation=generation,
             session=None,
-            last_node=cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-            ).last_device_node,
             origin_input_ids=array("q", token_ids),
             output_ids=array("q"),
             extra_key=None,
-        )
+        ),
+        leaf=leaf,
     )
-
-
-class TestRadixCacheSessionRemoval(CustomTestCase):
-    def test_plain_radix_cache_does_not_enable_session_references(self):
-        cache = RadixCache(make_params(enable_session=True))
-
-        self.assertFalse(hasattr(cache, "enable_session_radix_cache"))
-        self.assertFalse(hasattr(cache, "register_session_ref"))
-        self.assertFalse(hasattr(cache, "open_radix_session"))
 
 
 class TestSessionUnifiedRadixCache(CustomTestCase):

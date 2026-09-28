@@ -29,6 +29,144 @@ DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
+@pytest.fixture
+def make_xqa_backend(monkeypatch):
+    def parent_init(self, *args):
+        self.kv_cache_quant_method = SimpleNamespace(
+            resolve_attention_access=lambda *args: SimpleNamespace(
+                kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
+            )
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
+    )
+    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
+    )
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "make_persistent_multi_ctas_kv_counter_buffer",
+        lambda *a, **k: None,
+    )
+
+    def make(draft_len, is_xqa=True):
+        monkeypatch.setattr(
+            trtllm_mha_backend,
+            "get_spec",
+            lambda: SimpleNamespace(
+                speculative_eagle_topk=1, speculative_num_draft_tokens=draft_len
+            ),
+        )
+        monkeypatch.setattr(
+            trtllm_mha_backend,
+            "get_platform",
+            lambda: SimpleNamespace(is_sm90=is_xqa, is_sm120=False),
+        )
+        runner = SimpleNamespace(
+            prefill_attention_backend_str="trtllm_mha",
+            decode_attention_backend_str="trtllm_mha",
+            model_config=SimpleNamespace(
+                context_len=128, hidden_size=8, num_attention_heads=2
+            ),
+            kv_cache_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            page_size=32,
+            req_to_token_pool=SimpleNamespace(size=4, req_to_token=None),
+            device="cpu",
+            max_running_requests=4,
+            model=SimpleNamespace(modules=lambda: []),
+        )
+        return TRTLLMHAAttnBackend(runner)
+
+    return make
+
+
+@pytest.mark.parametrize("draft_len", [1, 8, 16, 17, 31, 32, 33, 63, 64, 65])
+def test_xqa_causal_mask_packing(make_xqa_backend, draft_len):
+    mask = make_xqa_backend(draft_len)._xqa_spec_dec_mask
+    assert mask.dtype == torch.uint16
+    assert mask.shape == (5, draft_len, (draft_len + 31) // 32 * 2)
+    assert mask.is_contiguous()
+    positions = torch.arange(mask.shape[2] * 16)
+    unpacked = (mask.to(torch.int64)[..., positions // 16] >> (positions % 16)) & 1
+    expected = positions[None, :] <= torch.arange(draft_len)[:, None]
+    torch.testing.assert_close(unpacked.bool(), expected.expand(mask.shape[0], -1, -1))
+
+
+@pytest.mark.parametrize("draft_len,is_xqa", [(None, True), (8, False)])
+def test_xqa_mask_not_allocated_when_unused(make_xqa_backend, draft_len, is_xqa):
+    assert make_xqa_backend(draft_len, is_xqa)._xqa_spec_dec_mask is None
+
+
+@pytest.mark.parametrize("splits", [1, 2, 8])
+@pytest.mark.parametrize(
+    "is_xqa,mode,width,masked",
+    [
+        (True, ForwardMode.TARGET_VERIFY, 8, True),
+        (False, ForwardMode.TARGET_VERIFY, 8, False),
+        (True, ForwardMode.TARGET_VERIFY, 1, False),
+        (True, ForwardMode.DRAFT_EXTEND_V2, 1, False),
+    ],
+)
+def test_xqa_verify_mask_forwarding(
+    make_xqa_backend, monkeypatch, splits, is_xqa, mode, width, masked
+):
+    backend = make_xqa_backend(width, is_xqa)
+    backend.decode_seq_len_splits = splits
+    bs = 5
+    seq_lens = torch.tensor([30, 10, 50, 20, 40], dtype=torch.int32)
+    page_table = torch.arange(bs, dtype=torch.int32)[:, None]
+    backend.forward_metadata = SimpleNamespace(
+        is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
+    )
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    backend._should_use_fused_fp8_path = lambda *a: False
+    backend._reshape_paged_kv_cache = lambda *a: (None, None)
+    backend._get_bmm_scales = lambda *a: (1.0, 1.0)
+    backend._get_layer_page_table = lambda *a: page_table
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    calls = []
+
+    def decode(**kwargs):
+        calls.append(kwargs)
+        group_bs = kwargs["seq_lens"].numel()
+        mask = kwargs.get("mask")
+        if masked:
+            assert mask.shape == (group_bs, width, 2)
+            assert mask.data_ptr() == backend._xqa_spec_dec_mask.data_ptr()
+        else:
+            assert mask is None
+        return kwargs["query"] + 1
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode)
+        ),
+        raising=False,
+    )
+    q = (
+        torch.arange(bs * width * 8, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(-1, 2, 4)
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=4,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    fb = SimpleNamespace(out_cache_loc=None, forward_mode=mode, batch_size=bs)
+    out = backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+    torch.testing.assert_close(out, (q + 1).view(-1, 8))
+    assert len(calls) == min(splits, bs)
+
+
 @pytest.mark.parametrize(
     "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
     [

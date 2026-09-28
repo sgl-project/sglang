@@ -160,6 +160,11 @@ def _linear_attention_with_output_impl(
     real_num_tokens = min(
         forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
     )
+    if real_num_tokens == 0:
+        # A fully masked batch (an idle DP rank) needs no attention or state
+        # update, and GDN prefill kernels reject an empty varlen batch.
+        output.zero_()
+        return
 
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for

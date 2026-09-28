@@ -134,7 +134,7 @@ print("Answer:", msg.content)
 
 </Accordion>
 
-On the request, `reasoning_effort` accepts the tiers `low`, `high`, `xhigh` and `max`, or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
+On the request, `reasoning_effort` accepts the tiers `low` (50), `high` (75), `xhigh` (75), and `max` (100), or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high` (75), and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
 
 ### 3.2 Tool Calling
 

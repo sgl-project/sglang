@@ -1,7 +1,4 @@
-"""Config-time override declarations for qwen4_exp.
-
-Architectures: Qwen4ExpForConditionalGeneration.
-"""
+"""Config-time override declarations for qwen4_exp."""
 
 import logging
 from typing import Any, Dict

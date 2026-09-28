@@ -200,7 +200,7 @@ class SchedulerDllmMixin:
 
         req.kv.kv_committed_len = context_len
         req.kv.kv_allocated_len = context_len
-        assert req.kv.swa_evicted_seqlen <= context_len
+        assert req.kv.max_evicted_seqlen <= context_len
         req.set_extend_range(context_len, context_len)
         self.stash_chunked_request(req)
 

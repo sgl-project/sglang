@@ -73,6 +73,28 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
+def _jit_main_k_norm_rope_q_flashmla_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+):
+    """ROCm only: the K kernel above with the in-place query rope in the same launch."""
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+    )
+    return load_jit(
+        make_name("main_k_norm_rope_q_flashmla"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward_with_q", f"FusedKNormRopeFlashMLAKernel<{args}>::forward_with_q"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -278,6 +300,7 @@ def fused_k_norm_rope_flashmla(
     kvcache: torch.Tensor,
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
+    q: Optional[torch.Tensor] = None,
 ) -> None:
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
     cache at ``out_loc``."""
@@ -287,8 +310,17 @@ def fused_k_norm_rope_flashmla(
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
         assert layout is KVLayout.V4, "the V4.1 KV layouts are CUDA (sm100) only"
+        assert q is None, "the XPU K kernel does not rope q"
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
+        )
+    elif q is not None:
+        assert _is_hip, "only the ROCm K launch ropes q"
+        module = _jit_main_k_norm_rope_q_flashmla_module(
+            kv.dtype, head_dim, rope_dim, page_size, layout
+        )
+        module.forward_with_q(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, q
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(

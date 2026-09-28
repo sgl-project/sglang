@@ -432,6 +432,13 @@ class SpecInput(ABC):
             SpecInputType.UNO_VERIFY,
         }
 
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        return None
+
 
 def spec_scale_global_num_tokens(
     spec_info: SpecInput,

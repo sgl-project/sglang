@@ -35,42 +35,61 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
-/// Result of `inc_lock_ref`, handed back to the matching `dec_lock_ref`.
-///
-/// The receipt a release needs is per-component lock evidence: the SWA
-/// segment boundary uuid (None means the segment reached the root) and
-/// whether the single-node Mamba lock was taken (the decode hold opts
-/// out). Locks count every node in their contiguous segment, so no
-/// per-node skip state exists. Receipt fields default to nothing-acquired;
-/// `inc_lock_ref` stamps what it actually took.
+/// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
 #[derive(Default)]
 pub struct IncLockRefResult {
     /// Tokens newly protected (moved out of evictable) by this lock.
     pub delta: Option<usize>,
     /// The node the lock was taken on; a release replays the receipt there only.
     pub node_id: Option<NodeId>,
-    /// SWA lock-window uuid minted/reused by the device lock walk.
-    pub swa_uuid_for_lock: Option<i64>,
-    /// SWA lock-window uuid minted/reused by the host lock walk.
-    pub swa_uuid_for_host_lock: Option<i64>,
     /// Components the acquire left untaken; the release skips them too.
     pub skipped_lock_components: ComponentSet,
+    /// A recorded None means the segment reaches the root; absence means no receipt.
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
 }
 
-/// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
-/// a lost receipt under-releases (a leak sanity checks report) instead of
-/// releasing a lock another holder owns.
+impl IncLockRefResult {
+    pub fn set_lock_uuid(&mut self, component: u8, uuid: Option<i64>, lock_host: bool) {
+        let uuids = if lock_host {
+            &mut self.component_host_lock_uuids
+        } else {
+            &mut self.component_lock_uuids
+        };
+        uuids.insert(component, uuid);
+    }
+
+    pub fn to_dec_params(&self) -> DecLockRefParams {
+        DecLockRefParams {
+            node_id: self.node_id,
+            skipped_lock_components: self.skipped_lock_components,
+            component_lock_uuids: self.component_lock_uuids.clone(),
+            component_host_lock_uuids: self.component_host_lock_uuids.clone(),
+        }
+    }
+}
+
+/// Receipt required by `dec_lock_ref`.
 #[derive(Default)]
 pub struct DecLockRefParams {
     /// The node the matching acquire locked; None only for receipts that did
     /// not come from this core (a mispaired anchor is a protocol violation).
     pub node_id: Option<NodeId>,
-    /// SWA lock-window uuid the device unlock stops at, from the matching acquire.
-    pub swa_uuid_for_lock: Option<i64>,
-    /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
-    pub swa_uuid_for_host_lock: Option<i64>,
     /// Components the matching acquire left untaken.
     pub skipped_lock_components: ComponentSet,
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
+}
+
+impl DecLockRefParams {
+    pub fn get_lock_uuid(&self, component: u8, lock_host: bool) -> Option<i64> {
+        let uuids = if lock_host {
+            &self.component_host_lock_uuids
+        } else {
+            &self.component_lock_uuids
+        };
+        uuids[&component]
+    }
 }
 
 /// Result of `dec_lock_ref`.
@@ -962,13 +981,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return Ok(());
         };
-        swa.release_window_lock(
-            self,
-            node_idx,
-            params.swa_uuid_for_lock,
-            device_frees,
-            host_frees,
-        );
+        swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
 
         // Drop strictly-lower-priority locks co-located on the node, skipping
         // any the paired inc never took.

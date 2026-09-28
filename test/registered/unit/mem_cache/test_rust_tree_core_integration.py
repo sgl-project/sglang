@@ -745,8 +745,9 @@ def test_insert_value_none_materializes_the_token_ids():
     assert matched.device_indices.tolist() == [1, 2, 3]
 
 
-def test_empty_match_result_is_root_anchored():
-    core = _tree_core()
+@pytest.mark.parametrize("swa", [False, True])
+def test_empty_match_result_is_root_anchored(swa):
+    core = _swa_tree_core() if swa else _tree_core()
     empty = core.empty_match_result
     assert empty.device_indices.numel() == 0
     assert empty.host_hit_length == 0
@@ -754,6 +755,12 @@ def test_empty_match_result_is_root_anchored():
     assert empty.best_match_node == probe.best_match_node
     assert empty.last_device_node == probe.last_device_node
     assert empty.last_host_node == probe.last_host_node
+    core.dec_lock_ref(empty.best_match_node, DecLockRefParams())
+    core.dec_host_lock_ref(empty.best_match_node, DecLockRefParams())
+    released = core.dec_swa_lock_only(empty.best_match_node, DecLockRefParams())
+    assert not released.device_frees
+    assert not released.host_frees
+    core.sanity_check([], [])
 
 
 def test_set_hicache_enabled_marks_the_tree():
@@ -893,14 +900,46 @@ def test_insert_host_reports_a_dropped_write_through_suffix():
     assert result.host_insert_dropped
 
 
-def test_host_lock_refs_round_trip():
-    core = _tree_core()
+@pytest.mark.parametrize(
+    "swa, missing_receipt", [(False, False), (True, False), (True, True)]
+)
+def test_host_lock_refs_round_trip(swa, missing_receipt):
+    core = _swa_tree_core() if swa else _tree_core()
     core.set_hicache_enabled()
     _insert(core, [1], [10])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
-    core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
+    component_transfers = {}
+    if swa:
+        core.has_swa_host_pool = True
+        core.set_component_device_value(
+            leaf, ComponentType.SWA, torch.tensor([20], dtype=torch.int64)
+        )
+        component_transfers[ComponentType.SWA] = [
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=torch.tensor([200], dtype=torch.int64),
+            )
+        ]
+    core.commit_backup(
+        leaf, torch.tensor([100], dtype=torch.int64), component_transfers
+    )
+    device_lock = core.inc_lock_ref(leaf)
     host_lock = core.inc_host_lock_ref(leaf)
-    core.dec_host_lock_ref(leaf, host_lock.to_dec_params())
+    assert not host_lock.component_lock_uuids
+    assert not device_lock.component_host_lock_uuids
+    if swa:
+        assert host_lock.component_host_lock_uuids == {ComponentType.SWA: None}
+    params = host_lock.to_dec_params()
+    if missing_receipt:
+        params.component_host_lock_uuids.clear()
+        with pytest.raises(BaseException, match="no entry found for key") as error:
+            core.dec_host_lock_ref(leaf, params)
+        assert error.type.__name__ == "PanicException"
+        return  # A Rust ownership violation poisons the core.
+    core.dec_host_lock_ref(leaf, params)
+    if swa:
+        assert core.swa_protected_size() == 1
+    core.dec_lock_ref(leaf, device_lock.to_dec_params())
     core.sanity_check([], [])
 
 
@@ -1498,7 +1537,7 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
         InsertParams(
             key=_key([1, 2, 3, 4]),
             value=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
-            swa_evicted_seqlen=2,
+            component_evicted_seqlens={ComponentType.SWA: 2},
         ),
     )
     free_tail, rebuild, free_duplicates = result.cache_actions
@@ -1943,24 +1982,37 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
         )
     node = first.cache_actions[-1].node_id
     result = core.inc_lock_ref(node)
-    assert result.swa_uuid_for_lock is not None
-    assert result.swa_uuid_for_host_lock is None
+    assert result.component_lock_uuids[ComponentType.SWA] is not None
+    assert not result.component_host_lock_uuids
     # The locked window is protected SWA accounting, visible through the binding.
     assert core.swa_protected_size() == 2
     assert core.swa_evictable_size() == 1
     core.dec_lock_ref(
         node,
-        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
+        result.to_dec_params(),
     )
     # The uuid-bounded release returned the window to evictable.
     assert core.swa_protected_size() == 0
     assert core.swa_evictable_size() == 3
     # A repeat acquire reuses the stamped uuid.
     again = core.inc_lock_ref(node)
-    assert again.swa_uuid_for_lock == result.swa_uuid_for_lock
+    assert (
+        again.component_lock_uuids[ComponentType.SWA]
+        == result.component_lock_uuids[ComponentType.SWA]
+    )
+    skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.SWA,))
+    assert ComponentType.SWA not in skipped.component_lock_uuids
+    core.dec_lock_ref(node, skipped.to_dec_params())
+    assert core.swa_protected_size() == 2
+    core.dec_lock_ref(node, again.to_dec_params())
+    core.sanity_check([], [])
 
 
-def test_swa_tombstones_cross_the_binding_and_release_balanced():
+@pytest.mark.parametrize("swa_only", [False, True])
+@pytest.mark.parametrize("missing_receipt", [False, True])
+def test_swa_tombstones_cross_the_binding_and_release_balanced(
+    swa_only, missing_receipt
+):
     core = _swa_tree_core(window=8)
     _insert(core, [1, 2], [10, 11])
     second = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
@@ -1971,13 +2023,23 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced():
         leaf, ComponentType.SWA, torch.tensor([52, 53], dtype=torch.int64)
     )
     result = core.inc_lock_ref(leaf)
-    assert result.swa_uuid_for_lock is None
+    assert result.component_lock_uuids[ComponentType.SWA] is None
     assert core.swa_protected_size() == 2
-    core.dec_lock_ref(
-        leaf,
-        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
-    )
+    release = core.dec_swa_lock_only if swa_only else core.dec_lock_ref
+    if missing_receipt:
+        missing = DecLockRefParams(node_id=leaf)
+        if swa_only:
+            # Early release always walks SWA, even if the receipt marks it skipped.
+            missing.skipped_lock_components = (ComponentType.SWA,)
+        with pytest.raises(BaseException, match="no entry found for key") as error:
+            release(leaf, missing)
+        assert error.type.__name__ == "PanicException"
+        return  # A Rust ownership violation poisons the core.
+    release(leaf, result.to_dec_params())
     assert core.swa_protected_size() == 0
+    if swa_only:
+        core.dec_lock_ref(leaf, DecLockRefParams(node_id=leaf), skip_swa=True)
+    core.sanity_check([], [])
 
 
 def test_dec_swa_lock_only_frees_flow_after_the_full_release():
@@ -1989,7 +2051,7 @@ def test_dec_swa_lock_only_frees_flow_after_the_full_release():
     )
     result = core.inc_lock_ref(node)
     # A non-None boundary: the window fills at the locked node itself.
-    assert result.swa_uuid_for_lock is not None
+    assert result.component_lock_uuids[ComponentType.SWA] is not None
     # The FULL lock releases first (skip_swa), then the early window release
     # finds a fully unlocked device leaf and evicts it in place.
     core.dec_lock_ref(node, result.to_dec_params(), skip_swa=True)

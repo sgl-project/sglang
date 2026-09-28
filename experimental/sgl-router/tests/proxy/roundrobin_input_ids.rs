@@ -54,6 +54,7 @@ fn config() -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -293,6 +294,42 @@ async fn round_robin_tool_request_omits_input_ids() {
         body.get("input_ids").is_none(),
         "tool requests must not forward input_ids under any policy; got {body}"
     );
+}
+
+/// One forwarding outcome books per dispatched chat request.
+#[tokio::test]
+async fn input_ids_forwarding_metric_books_outcome_per_request() {
+    let chat = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let mut tools = chat.clone();
+    tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+    let mut image = chat.clone();
+    image["messages"][0]["content"] =
+        json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]);
+    for (cfg, request, outcome) in [
+        (config(), &chat, "forwarded"),
+        (config(), &tools, "ineligible"),
+        (config(), &image, "ineligible_multimodal"),
+        (
+            without_forwarding(config(), PolicyKind::RoundRobin),
+            &chat,
+            "disabled",
+        ),
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let expected = format!(
+            r#"sgl_router_input_ids_forwarding_total{{model_id="{MODEL}",outcome="{outcome}"}} 1"#
+        );
+        let rendered = ctx.metrics.render();
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected}; got:\n{rendered}"
+        );
+    }
 }
 
 /// A successful plain-chat forward on a chat-formatter model must NOT emit

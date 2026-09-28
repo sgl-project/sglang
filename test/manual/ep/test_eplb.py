@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import sglang as sgl
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -96,7 +96,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 
@@ -123,8 +123,6 @@ class TestStaticEPLB(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
-                # TODO pr-chain: enable later
-                # enable_expert_distribution_metrics=True,
             )
             engine_kwargs.update(get_a2a_backend_kwargs())
 

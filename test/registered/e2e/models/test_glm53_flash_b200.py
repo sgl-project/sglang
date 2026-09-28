@@ -108,6 +108,8 @@ class TestGLM53FlashB200HighThroughput(
         "--enable-dp-attention",
         "--dp-size",
         "4",
+        "--cuda-graph-backend-prefill",
+        "breakable",
     ]
 
 

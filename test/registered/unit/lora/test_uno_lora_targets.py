@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -230,6 +231,26 @@ class TestUnoLoRATargets(CustomTestCase):
             target_modules={"qkv_proj"},
         )
         manager.init_lora_modules.assert_not_called()
+
+    def test_manager_rejects_uno_with_dp_attention(self):
+        with (
+            get_context().override_server_args(
+                enable_dp_attention=True, enable_lora_overlap_loading=False
+            ) as args,
+            get_parallel().override(attn_tp_size=1),
+            self.assertRaisesRegex(
+                ValueError, "uno_cublas.*does not support DP attention"
+            ),
+        ):
+            LoRAManager(
+                base_model=torch.nn.Linear(2, 2),
+                base_hf_config=SimpleNamespace(),
+                max_loras_per_batch=2,
+                load_config=None,
+                dtype=torch.float32,
+                server_args=args,
+                lora_backend="uno_cublas",
+            )
 
 
 if __name__ == "__main__":

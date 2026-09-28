@@ -78,3 +78,19 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
         latent_shape = self.vae_config.arch_config.latent_shape
         shape = (batch_size, *latent_shape)
         return shape
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan3d import (
+        Hunyuan3DSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D2PipelineConfig,
+        hf_model_paths=[
+            "tencent/Hunyuan3D-2",
+        ],
+        model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )

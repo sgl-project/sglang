@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
@@ -82,6 +83,20 @@
 //!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
+//!
+//! `sgl_router_input_ids_forwarding_total` records one outcome per dispatched
+//! `/v1/chat/completions` request, so `outcome!="forwarded"` over the sum is
+//! the share the engine tokenized itself:
+//!
+//! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
+//! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
+//!   or no chat formatter).
+//! - `ineligible_multimodal` — the chat carries image, video, or audio content
+//!   parts, which only the engine's multimodal processor can tokenize.
+//! - `ineligible` — the forwarding guard excluded some other request shape
+//!   (tools, non-string content, caller `input_ids`, template controls, ...).
+//! - `tokenize_failed` — eligible, but ingress rendering failed (the same
+//!   requests `sgl_router_ingress_tokenize_errors_total` counts).
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -371,6 +386,29 @@ impl CacheAwareDecision {
     }
 }
 
+/// Whether a dispatched chat request carried router-rendered `input_ids` to
+/// the engine, and why not otherwise. See the module doc for each label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputIdsForwarding {
+    Forwarded,
+    Disabled,
+    Ineligible,
+    IneligibleMultimodal,
+    TokenizeFailed,
+}
+
+impl InputIdsForwarding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Disabled => "disabled",
+            Self::Ineligible => "ineligible",
+            Self::IneligibleMultimodal => "ineligible_multimodal",
+            Self::TokenizeFailed => "tokenize_failed",
+        }
+    }
+}
+
 impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -430,6 +468,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -498,6 +537,12 @@ struct PolicyDecisionKey {
 struct CacheAwareDecisionKey {
     model_id: String,
     decision: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct InputIdsForwardingKey {
+    model_id: String,
+    outcome: &'static str,
 }
 
 #[derive(Debug)]
@@ -823,6 +868,22 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
+    /// — exactly one call per dispatched chat request.
+    pub fn record_input_ids_forwarding(&self, model_id: &str, outcome: InputIdsForwarding) {
+        let key = InputIdsForwardingKey {
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let mut guard = self.input_ids_forwarding_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1285,6 +1346,27 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // input_ids_forwarding_total
+        out.push_str(
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).\n",
+        );
+        out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
+        let guard = self.input_ids_forwarding_total.lock();
+        let mut entries: Vec<(&InputIdsForwardingKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.outcome,
                 value,
             ));
         }
@@ -1833,6 +1915,22 @@ mod tests {
             out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
             "expected other=1; got:\n{out}",
         );
+    }
+
+    #[test]
+    fn input_ids_forwarding_counter_labels_outcome() {
+        let reg = MetricsRegistry::new();
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Ineligible);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_input_ids_forwarding_total counter"));
+        for series in [
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="forwarded"} 2"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="ineligible"} 1"#,
+        ] {
+            assert!(out.contains(series), "missing {series}; got:\n{out}");
+        }
     }
 
     #[test]

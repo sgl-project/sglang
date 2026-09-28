@@ -195,6 +195,7 @@ class TestDecSwaLockSkip(unittest.TestCase):
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
         tree_core = SimpleNamespace(
+            root_node=object(),
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
@@ -203,7 +204,11 @@ class TestDecSwaLockSkip(unittest.TestCase):
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            DecLockRefParams(skipped_lock_components=skipped_lock_components),
+            DecLockRefParams(
+                node_id=node.id,
+                skipped_lock_components=skipped_lock_components,
+                component_lock_uuids={ComponentType.SWA: None},
+            ),
         )
         return full, mamba
 

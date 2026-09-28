@@ -143,7 +143,7 @@ def test_mhc_fused_post_pre_matches_unfused(
 
 def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.communicator_mhc import MHCState
+    from sglang.srt.layers.communicator import MHCState
     from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.models.glm5_next import Glm5NextDecoderLayer
 

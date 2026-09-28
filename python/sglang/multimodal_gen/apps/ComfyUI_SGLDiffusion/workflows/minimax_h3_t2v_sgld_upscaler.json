@@ -1,0 +1,241 @@
+{
+  "6": {
+    "class_type": "SGLDUNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_bf16.safetensors",
+      "weight_dtype": "default",
+      "sgld_options": ["52", 0]
+    }
+  },
+  "7": {
+    "class_type": "SGLDLoraLoader",
+    "inputs": {
+      "model": ["6", 0],
+      "lora_name": "minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors",
+      "strength_model": 1.0,
+      "nickname": "lightx2v",
+      "target": "all"
+    }
+  },
+  "52": {
+    "class_type": "SGLDOptions",
+    "inputs": {
+      "model_type": "minimax_h3",
+      "enable_torch_compile": false,
+      "num_gpus": 1,
+      "tp_size": -1,
+      "sp_degree": -1,
+      "ulysses_degree": -1,
+      "ring_degree": -1,
+      "dp_size": 1,
+      "dp_degree": 1,
+      "enable_cfg_parallel": false,
+      "attention_backend": "",
+      "dit_layerwise_offload": false,
+      "enable_cache_dit": false,
+      "quantization": "",
+      "transformer_weights_path": ""
+    }
+  },
+  "13": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "11": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    }
+  },
+  "24": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "104": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "clip": ["13", 0],
+      "vae": ["11", 0],
+      "prompt": "Vaporwave title sequence look: pink and blue gradient palette, VHS tracking artifacts, Greek statue motifs, chrome palm trees, RGB chromatic aberration, lo-fi retro atmosphere, mood languid and nostalgic.\n\nTimeline:\n[0s-1s] VHS static opens the frame, the title \"COMFYUI\" appears with RGB split and a slight horizontal jitter.\n[1s-2.5s] Hard cut, a Greek plaster bust close-up, pink-purple gradient sky, a pixelated sun.\n[2.5s-4s] Clean \"STARRING\" credits appear, \"LATENT\" and \"CONTROLNET\" each shown exactly once.\n[4s-5s] Final card \"DIRECTED BY COMFYUI\" holds, one VHS tracking glitch settling into stability.\n\nHard cuts only, transitions landing with tape jumps, no push-ins, no dissolves.\n\nAudio: lo-fi vaporwave score, slow drum machine with soft bass, VHS tape-noise sample joins at 2.5s, melody fading for the last 1s.\n\nAll text must be clearly legible, do not misspell English, no Chinese characters, do not repeat names or job titles, no soft dissolves, no subtitle bars.",
+      "width": 768,
+      "height": 448,
+      "length": 39
+    }
+  },
+  "17": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "res_multistep"
+    }
+  },
+  "9": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["7", 0],
+      "scheduler": "simple",
+      "steps": 4,
+      "denoise": 1.0
+    }
+  },
+  "15": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 7703
+    }
+  },
+  "16": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["7", 0],
+      "conditioning": ["104", 0]
+    }
+  },
+  "14": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["15", 0],
+      "guider": ["16", 0],
+      "sampler": ["17", 0],
+      "sigmas": ["9", 0],
+      "latent_image": ["104", 1]
+    }
+  },
+  "93": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["14", 0],
+      "vae": ["11", 0]
+    }
+  },
+  "23": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["14", 0],
+      "vae": ["24", 0]
+    }
+  },
+  "94": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["93", 0],
+      "audio": ["23", 0],
+      "fps": 24,
+      "bit_depth": 8
+    }
+  },
+  "95": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["94", 0],
+      "filename_prefix": "video/MiniMax_H3_sgld_t2v_upscaler_low",
+      "format": "auto",
+      "codec": "auto"
+    }
+  },
+  "201": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": ["14", 0]
+    }
+  },
+  "202": {
+    "class_type": "MinimaxH3LatentUpscaler3D",
+    "inputs": {
+      "latent": ["201", 0],
+      "model_name": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+      "mode": "scale by multiplier",
+      "mode.scale": 2.0,
+      "align": 32,
+      "device": "cuda",
+      "precision": "fp16"
+    }
+  },
+  "203": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": ["202", 0],
+      "audio_latent": ["201", 1]
+    }
+  },
+  "204": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "clip": ["13", 0],
+      "vae": ["11", 0],
+      "prompt": "Vaporwave title sequence look: pink and blue gradient palette, VHS tracking artifacts, Greek statue motifs, chrome palm trees, RGB chromatic aberration, lo-fi retro atmosphere, mood languid and nostalgic.\n\nTimeline:\n[0s-1s] VHS static opens the frame, the title \"COMFYUI\" appears with RGB split and a slight horizontal jitter.\n[1s-2.5s] Hard cut, a Greek plaster bust close-up, pink-purple gradient sky, a pixelated sun.\n[2.5s-4s] Clean \"STARRING\" credits appear, \"LATENT\" and \"CONTROLNET\" each shown exactly once.\n[4s-5s] Final card \"DIRECTED BY COMFYUI\" holds, one VHS tracking glitch settling into stability.\n\nHard cuts only, transitions landing with tape jumps, no push-ins, no dissolves.\n\nAudio: lo-fi vaporwave score, slow drum machine with soft bass, VHS tape-noise sample joins at 2.5s, melody fading for the last 1s.\n\nAll text must be clearly legible, do not misspell English, no Chinese characters, do not repeat names or job titles, no soft dissolves, no subtitle bars.",
+      "width": 1536,
+      "height": 896,
+      "length": 39
+    }
+  },
+  "209": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["7", 0],
+      "scheduler": "simple",
+      "steps": 4,
+      "denoise": 0.45
+    }
+  },
+  "215": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 7704
+    }
+  },
+  "216": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["7", 0],
+      "conditioning": ["204", 0]
+    }
+  },
+  "214": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["215", 0],
+      "guider": ["216", 0],
+      "sampler": ["17", 0],
+      "sigmas": ["209", 0],
+      "latent_image": ["203", 0]
+    }
+  },
+  "10": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["214", 0],
+      "vae": ["11", 0]
+    }
+  },
+  "96": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["214", 0],
+      "vae": ["24", 0]
+    }
+  },
+  "91": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["10", 0],
+      "audio": ["96", 0],
+      "fps": 24,
+      "bit_depth": 8
+    }
+  },
+  "92": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["91", 0],
+      "filename_prefix": "video/MiniMax_H3_sgld_t2v_upscaler",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}

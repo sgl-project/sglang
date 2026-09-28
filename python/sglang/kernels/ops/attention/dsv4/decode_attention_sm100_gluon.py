@@ -6,11 +6,27 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     TensorMemoryLayout,
     allocate_tensor_memory,
     fence_async_shared,
-    get_tmem_reg_layout,
     mbarrier,
     tcgen05_commit,
     tcgen05_mma,
 )
+
+try:
+    # Triton 3.7.1 API
+    from triton.experimental.gluon.language.nvidia.blackwell import get_tmem_reg_layout
+except ImportError:
+    # Triton 3.8 moved this onto the descriptor type (triton-lang/triton#9594)
+    # TODO(tmorris): After we update to triton 3.8 (torch 2.15), use new API directly
+    # instead of this compatibility wrapper.
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        tensor_memory_descriptor_type,
+    )
+    from triton.runtime.jit import constexpr_function
+
+    @constexpr_function
+    def get_tmem_reg_layout(element_ty, shape, layout, num_warps):
+        ty = tensor_memory_descriptor_type(element_ty, shape, layout, shape)
+        return ty.get_reg_layout(num_warps=num_warps)
 
 
 @gluon.jit

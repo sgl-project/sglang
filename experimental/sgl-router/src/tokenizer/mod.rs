@@ -68,6 +68,7 @@ impl TokenizerRegistry {
         me.inner.insert(m.id.clone(), t);
         match ChatFormatter::load(&m.id, &m.tokenizer_path) {
             Ok(Some(formatter)) => {
+                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
@@ -83,9 +84,9 @@ impl TokenizerRegistry {
                  routing tokenization remains available");
         } else if me.has_chat_formatter(&m.id) {
             tracing::warn!(model = %m.id,
-                "router-generated input_ids forwarding enabled: requires matching worker model \
-                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
-                 and default SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
+                "router-generated input_ids forwarding enabled: requires the workers' model files, \
+                 --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, and \
+                 SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
                  (including --tool-call-parser deepseekv32), content-format detection, and \
                  conversation-template stop strings are not replicated. Use \
                  --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
@@ -181,6 +182,7 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {

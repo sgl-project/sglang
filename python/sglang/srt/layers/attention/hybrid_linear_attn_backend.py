@@ -157,11 +157,11 @@ class MambaAttnBackendBase(AttentionBackend):
         logical_num_tokens = None
         track_mask_indices = None
 
+        # Padded rows carry req-pool row 0, which maps to the reserved mamba
+        # padding slot 0 in both the static and the unified pool.
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
-        # Translate virtual->physical BEFORE the padding sentinel below, so the
-        # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
@@ -182,11 +182,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_mask is not None
                 and forward_batch.mamba_track_mask.any()
             )
-        _real_bs = forward_batch._original_batch_size
-        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
-            mamba_cache_indices = mamba_cache_indices.clone()
-            mamba_cache_indices[_real_bs:] = -1
-
         replayssm_write_pos = None
         replayssm_force_flush = None
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -209,8 +204,8 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             if write_pos_buf is not None:
                 slots = mamba_cache_indices.to(torch.long)
-                # Padded rows carry slot == -1; clamp the gather in-bounds (kernel
-                # zeroes padded rows via state_idx < 0).
+                # Padded rows point at the reserved padding slot 0; the clamp keeps
+                # a -1 sentinel in bounds (the kernel zeroes rows with state_idx < 0).
                 safe_slots = slots.clamp(min=0)
                 replayssm_write_pos = write_pos_buf[safe_slots].clone()
                 L = mamba_pool.linear_replayssm_cache_len
@@ -227,7 +222,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 # Advance only valid slots, scattered over unique slots (dup-index
-                # race; padded rows clamp to 0); a forced flush -> next write_pos 0.
+                # race; padded rows share slot 0); a forced flush -> next write_pos 0.
                 valid_mask = slots >= 0
                 valid_slots = slots[valid_mask]
                 if valid_slots.numel() > 0:

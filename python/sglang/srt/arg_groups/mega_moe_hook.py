@@ -36,11 +36,15 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
+    if not (
+        (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
+        or platform.is_hip
+    ):
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory."
+            "kernels over CUDA symmetric memory. On ROCm, set "
+            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
         )
 
 
@@ -97,6 +101,8 @@ def mega_moe_decode_tokens_per_rank(cfg) -> int:
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
+        return
+    if get_platform().is_hip:
         return
 
     max_tokens_per_rank = (

@@ -51,6 +51,12 @@ for case in cases:
     if "repeat" in case:
         data["messages"][0]["content"] *= case["repeat"]
     request = ChatCompletionRequest(**data)
+    # _convert_to_internal_request runs before _encode_messages and promotes
+    # the request kwarg over the top-level effort.
+    if request.chat_template_kwargs:
+        effort = request.chat_template_kwargs.pop("reasoning_effort", None)
+        if effort is not None:
+            request.reasoning_effort = effort
     messages = [message.model_dump() for message in request.messages]
     for message in messages:
         normalize_assistant_tool_call_arguments(message, strict=False)

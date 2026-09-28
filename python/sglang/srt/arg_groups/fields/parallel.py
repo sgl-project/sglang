@@ -1,11 +1,4 @@
-"""Config fields of the ``parallel`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``parallel`` bag, which is what ``get_parallel()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``parallel`` namespace."""
 
 from __future__ import annotations
 

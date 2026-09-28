@@ -586,6 +586,12 @@ RUN git clone ${AITER_REPO} \
     git revert --no-edit --no-commit e708f6c15; \
  fi
 
+# ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
+# tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
+COPY --from=local_src \
+     /src/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
+     /sgl-workspace/aiter/hsa/gfx950/mla_v4/
+
 # The pinned AITER revision uses std::optional in topk_per_row_kernels.cu without
 # including <optional>: ROCm/aiter#4702 removed the torch headers that previously
 # supplied it transitively. ROCm 7.0 therefore fails module_top_k_per_row, while

@@ -1,19 +1,25 @@
-"""DP-attention helpers for the Nemotron-H model."""
+"""Layer-communication helpers for the Nemotron-H model."""
 
-import torch
-from torch import nn
+from typing import Optional
 
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE
 from sglang.srt.layers.communicator import (
+    NORM_QUANT_READ,
     LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-    apply_flashinfer_allreduce_fusion,
+    LayerFacts,
+    LayerStage,
+    Layout,
+    StageDecl,
+    StageInput,
+    StageKind,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+    stage_edges,
+    token_axis_sizes,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 ATTN_LAYERS = (MAMBA, ATTENTION)
 
@@ -22,86 +28,96 @@ def is_attn_layer(layer_type: str) -> bool:
     return layer_type in ATTN_LAYERS
 
 
-def get_real_num_tokens(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
-) -> int:
-    """Number of real (non DP-padding) rows in ``hidden_states``."""
-    real_tokens = hidden_states.shape[0]
-    if forward_batch.global_num_token_non_padded_cpu is not None:
-        real_tokens = min(
-            real_tokens, int(forward_batch.global_num_token_non_padded_cpu)
-        )
-    if (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_mixed()
-        and forward_batch.extend_seq_lens_cpu is not None
-    ):
-        real_tokens = min(real_tokens, int(sum(forward_batch.extend_seq_lens_cpu)))
-    return real_tokens
+def _stage_kind(pattern: str, layer_idx: int) -> Optional[StageKind]:
+    """Which stage of a decoder layer the stage at ``layer_idx`` stands for: a
+    Mamba or attention mixer the attention, an MLP or MoE the FFN; None past
+    either end."""
+    if not 0 <= layer_idx < len(pattern):
+        return None
+    return StageKind.ATTENTION if is_attn_layer(pattern[layer_idx]) else StageKind.FFN
 
 
-def pad_to_original_num_tokens(
-    output: torch.Tensor, original_num_tokens: int
-) -> torch.Tensor:
-    if output.shape[0] == original_num_tokens:
-        return output
-    padded = output.new_empty((original_num_tokens, *output.shape[1:]))
-    padded[: output.shape[0]] = output
-    return padded
-
-
-def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
-    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
-    mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
-    middle_residual_mode = (
-        ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL
+def _stage_decl(pattern: str, layer_idx: int) -> StageDecl:
+    """What the stage at ``layer_idx`` declares. A mixer reads its input as
+    an attention does, computes on the attention's rows and leaves its
+    attention-TP sum to an FFN stage after it, or, when a fused kernel takes
+    it, to a mixer after it. An FFN computes on the TP group's rows, a MoE
+    dispatched by an a2a backend on this rank's own, and may leave its sum to a
+    mixer after it."""
+    axis_sizes = token_axis_sizes()
+    attention = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
     )
-    return LayerScatterModes(
-        layer_input_mode=ScatterMode.TP_ATTN_FULL,
-        attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=mlp_mode,
-        middle_residual_mode=middle_residual_mode,
-        layer_output_mode=ScatterMode.TP_ATTN_FULL,
+    following = _stage_kind(pattern, layer_idx + 1)
+    if is_attn_layer(pattern[layer_idx]):
+        owes = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
+        return StageDecl(
+            StageInput(attention, read=NORM_QUANT_READ),
+            StageOutput(
+                attention,
+                group=SumGroup.ATTN_TP if owes else None,
+                always_leaves=owes and following is StageKind.FFN,
+                leaves_for_next_layer=owes and following is StageKind.ATTENTION,
+            ),
+        )
+    sparse = pattern[layer_idx] == MOE
+    if sparse and not get_moe_a2a_backend().is_none():
+        local = Layout.sharded_over(
+            TokenAxis.ATTN_DP,
+            TokenAxis.ATTN_CP,
+            TokenAxis.ATTN_TP_SCATTER,
+            axis_sizes=axis_sizes,
+        )
+        return StageDecl(StageInput(local), StageOutput(local))
+    full = Layout.sharded_over(axis_sizes=axis_sizes)
+    return StageDecl(
+        StageInput(full),
+        StageOutput(
+            full,
+            group=SumGroup.MOE_OUTPUT if sparse else SumGroup.TP,
+            leaves_for_next_layer=following is StageKind.ATTENTION,
+            leaves_for_reduce_scatter=True,
+            leaves_for_reduce_scatterv=True,
+        ),
+    )
+
+
+def layer_stage(pattern: str, layer_idx: int) -> LayerStage:
+    """The layer's stage and its two boundaries, from its own declaration and
+    the previous stage's."""
+    rows = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=token_axis_sizes()
+    )
+    return LayerStage(
+        kind=_stage_kind(pattern, layer_idx),
+        edges=stage_edges(
+            previous=(
+                _stage_decl(pattern, layer_idx - 1).output if layer_idx > 0 else None
+            ),
+            stage=_stage_decl(pattern, layer_idx),
+            rows=rows,
+        ),
+        enters_stack=layer_idx == 0,
     )
 
 
 def make_layer_communicator(
-    layer_norm: RMSNorm,
-    *,
-    for_attn: bool,
-    allow_reduce_scatter: bool = False,
-    is_sparse: bool = False,
-    is_last_layer: bool = False,
+    layer_norm: RMSNorm, *, pattern: str, layer_idx: int
 ) -> LayerCommunicator:
+    """The communicator of a layer that is one stage: only its own norm, and
+    boundaries built from the stages next to it in the pattern."""
+    stage = layer_stage(pattern, layer_idx)
+    for_attn = stage.kind is StageKind.ATTENTION
     return LayerCommunicator(
-        layer_scatter_modes=_build_layer_scatter_modes(is_sparse),
-        input_layernorm=layer_norm if for_attn else nn.Identity(),
-        post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
+        layer_facts=LayerFacts(
+            is_layer_sparse=pattern[layer_idx] == MOE,
+            is_last_layer=layer_idx == len(pattern) - 1,
+        ),
+        input_layernorm=layer_norm if for_attn else None,
+        post_attention_layernorm=None if for_attn else layer_norm,
+        # With attention TP > 1, the default gather adds the residual to one
+        # rank's partial in bf16 before the cross-rank sum.
         force_layernorm_before_dp_gather=True,
-        allow_reduce_scatter=allow_reduce_scatter,
-        is_last_layer=is_last_layer,
+        allow_reduce_scatter=not for_attn,
+        stage=stage,
     )
-
-
-def input_norm_maybe_fuse_allreduce(
-    norm: RMSNorm,
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if residual is not None and getattr(
-        hidden_states, "_sglang_needs_allreduce_fusion", False
-    ):
-        if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
-            norm, "forward_with_allreduce_fusion"
-        ):
-            return norm.forward_with_allreduce_fusion(
-                hidden_states, residual, use_attn_tp_group=False
-            )
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        return norm(hidden_states, residual)
-
-    if residual is None:
-        residual = hidden_states
-        hidden_states = norm(hidden_states)
-        return hidden_states, residual
-    return norm(hidden_states, residual)

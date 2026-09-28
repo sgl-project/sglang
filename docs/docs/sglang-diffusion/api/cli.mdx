@@ -115,6 +115,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
+- `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
 

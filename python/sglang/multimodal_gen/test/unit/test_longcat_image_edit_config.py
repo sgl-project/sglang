@@ -11,6 +11,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
     _calculate_edit_dimensions,
 )
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageEditSamplingParams,
+    LongCatImageEditTurboSamplingParams,
+)
 
 
 @pytest.fixture
@@ -35,6 +39,38 @@ def test_edit_dimensions_match_diffusers_formula():
         ref_h = ref_h if ref_h % 16 == 0 else (ref_h // 16 + 1) * 16
         assert (got_w, got_h) == (int(ref_w), int(ref_h))
         assert got_w % 16 == 0 and got_h % 16 == 0
+
+
+@pytest.mark.parametrize(
+    "params_cls", [LongCatImageEditSamplingParams, LongCatImageEditTurboSamplingParams]
+)
+@pytest.mark.parametrize("size", [(1264, 848), (848, 1264), (1024, 1024)])
+def test_explicit_warmup_image_preserves_edit_grids(params_cls, size):
+    import base64
+    import io
+
+    from PIL import Image
+
+    params = params_cls()
+    req = _make_batch(width=size[0], height=size[1], image_path=["placeholder.png"])
+    server_args = _make_batch(warmup_resolutions=[f"{size[0]}x{size[1]}"])
+    params.prepare_synthetic_warmup_request_for_queue(req, server_args)
+    image = Image.open(io.BytesIO(base64.b64decode(req.image_path[0].split(",", 1)[1])))
+    assert image.size == size
+    config = LongCatImageEditPipelineConfig()
+    assert config.calculate_condition_image_size(image, *image.size) == size
+    ids = config._edit_img_ids(
+        _make_batch(width=size[0], height=size[1]), 859, torch.device("cpu")
+    )
+    assert ids.shape == (2 * (size[0] // 16) * (size[1] // 16), 3)
+
+
+def test_default_warmup_keeps_existing_placeholder():
+    req = _make_batch(width=512, height=512, image_path=["placeholder.png"])
+    LongCatImageEditSamplingParams().prepare_synthetic_warmup_request_for_queue(
+        req, _make_batch(warmup_resolutions=None)
+    )
+    assert req.image_path == ["placeholder.png"]
 
 
 def test_edit_config_task_type_and_generator(edit_config):

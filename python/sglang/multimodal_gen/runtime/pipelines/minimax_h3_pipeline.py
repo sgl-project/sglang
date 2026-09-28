@@ -190,6 +190,15 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         )
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+            MiniMaxH3ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3ComfyUIStepStage(transformer=self.get_module("transformer"))
+        )
+
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
     """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).

@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 
+from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
     ServeBackend,
@@ -186,6 +187,9 @@ def serve(args, extra_argv):
             _print_general_help(registry)
         else:
             registry.get(backend_name).backend.run(request)
+        # Printed here rather than as a backend parser's epilog so it appears
+        # exactly once, after whichever backend help ran.
+        print(f"\n{COOKBOOK_EPILOG}")
         return
 
     from sglang.srt.plugins import load_plugins

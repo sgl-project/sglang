@@ -1,10 +1,4 @@
-"""Enumerated choices shared by the config field declarations.
-
-These lived in ``server_args.py`` beside the fields that name them. The fields
-moved to ``arg_groups/fields/``, and ``server_args`` imports the field modules,
-so the lists cannot stay there without a cycle. ``server_args`` re-exports them
-for the handful of modules that import them from their old home.
-"""
+"""Shared config choices, re-exported by server_args for plugin compatibility."""
 
 LOAD_FORMAT_CHOICES = [
     "auto",

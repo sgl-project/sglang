@@ -120,6 +120,9 @@ class Glm4MoeLiteModelNextN(nn.Module):
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
 
+        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 hidden_states, _ = self.shared_head.norm(hidden_states, residual)

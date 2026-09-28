@@ -219,6 +219,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
         )
 
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        if (
+            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3")
+            or cfg.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "DP spec/prefill coordination requires single-layer EAGLE or EAGLE3"
+            )
+
     if cfg.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
         if cfg.speculative_adaptive:

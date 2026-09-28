@@ -116,3 +116,19 @@ class SanaVideoPipelineConfig(PipelineConfig):
 
     def gather_latents_for_sp(self, latents, batch=None):
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SanaVideoSamplingParams,
+        pipeline_config_cls=SanaVideoPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
+        ],
+    )

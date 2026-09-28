@@ -266,9 +266,6 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
-
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
         active: List[DecodeRequest] = []

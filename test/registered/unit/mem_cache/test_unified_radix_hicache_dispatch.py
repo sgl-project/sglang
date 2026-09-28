@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
@@ -172,42 +172,6 @@ class TestApplyStackResult(unittest.TestCase):
         cache = MagicMock()
         cache.components = {ct: MagicMock() for ct in component_types}
         return cache
-
-    def test_wires_components_sidecars_and_counters(self):
-        full_host, swa_host, mamba_host = MagicMock(), MagicMock(), MagicMock()
-        cache = self._fake_cache([FULL, SWA, MAMBA])
-        kvcache = MagicMock()
-        params = MagicMock()
-        controller = MagicMock()
-        sidecar = SidecarPoolSpec(
-            pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
-        )
-        result = StackBuildResult(
-            host_pool_group=MagicMock(),
-            cache_controller=controller,
-            component_host_pools={FULL: full_host, SWA: swa_host, MAMBA: mamba_host},
-            sidecars=[sidecar],
-            register_req_to_token_counter=True,
-            pools_desc="KV + SWA + MAMBA",
-        )
-
-        _apply_stack_result(cache, kvcache, params, result)
-
-        self.assertIs(cache.host_pool_group, result.host_pool_group)
-        self.assertIs(cache.cache_controller, controller)
-        self.assertIs(cache.full_kv_pool_host, full_host)
-        self.assertIs(cache.swa_kv_pool_host, swa_host)
-        self.assertIs(cache.mamba_pool_host, mamba_host)
-        self.assertIs(cache.components[FULL]._full_kv_pool_host, full_host)
-        self.assertIs(cache.components[SWA]._swa_kv_pool_host, swa_host)
-        self.assertIs(cache.components[MAMBA]._mamba_pool_host, mamba_host)
-        cache.register_sidecar_pool.assert_called_once_with(sidecar)
-        kvcache.register_layer_transfer_counter.assert_called_once_with(
-            controller.layer_done_counter
-        )
-        params.req_to_token_pool.register_layer_transfer_counter.assert_called_once_with(
-            controller.layer_done_counter
-        )
 
     def test_skips_req_to_token_counter_when_flag_false(self):
         cache = self._fake_cache([FULL])

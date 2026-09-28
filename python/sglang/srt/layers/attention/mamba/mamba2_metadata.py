@@ -196,7 +196,6 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
-        num_decodes: Optional[int] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
@@ -215,7 +214,7 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_end_locs=forward_metadata.track_ssm_end_locs,
             track_ssm_recompute_dst=forward_metadata.track_ssm_recompute_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
-            num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
+            num_decodes=len(seq_lens),
             num_prefills=0,
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
@@ -236,15 +235,11 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
-            num_decodes = getattr(forward_batch, "_original_batch_size", None)
-            if num_decodes is None:
-                num_decodes = len(forward_batch.seq_lens)
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
-                num_decodes=num_decodes,
             )
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         if extend_seq_lens_cpu is None:
@@ -255,10 +250,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
-        batch_size = getattr(forward_batch, "_original_batch_size", None)
-        if batch_size is None:
-            batch_size = len(forward_batch.seq_lens)
-        num_decodes = max(0, batch_size - num_prefills)
+        num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0

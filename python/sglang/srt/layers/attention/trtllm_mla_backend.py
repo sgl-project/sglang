@@ -1240,12 +1240,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _dummy_dcp_decode_for_autotune(
         self, q: torch.Tensor, layer: RadixAttention
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Skip decode during FlashInfer MoE autotune dummy forwards.
+        """Skip DCP decode / target-verify during FlashInfer autotune dummy forwards.
 
         That pass discards attention/logits. Under DCP the synthetic
         full-head metadata can overflow the trtllm-gen workspace (and on
-        multi-node GB300 has also produced NVLink errors). Real requests
-        and CUDA-graph capture must not take this path.
+        multi-node GB300 has also produced NVLink errors), and the FlashInfer
+        kernels (trtllm-gen, cute-dsl) start their own tuning, whose synthetic
+        inputs can OOM on some ranks only and hang the cross-rank reduction.
+        Real requests and CUDA-graph capture must not take this path.
         """
         output = torch.zeros(
             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1476,6 +1478,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # A speculative runner's autotune dummy forward is TARGET_VERIFY-shaped,
+        # so it never reaches forward_decode's guard.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and get_parallel().dcp_enabled
+            and get_in_autotune_dummy_run()
+        ):
+            return self._dummy_dcp_decode_for_autotune(q, layer)
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
         # draft-extend must never honor it: `forward_prefill_metadata` is a

@@ -5,6 +5,10 @@ description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI reg
 
 # Writing SGLang CI / UT Tests
 
+Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
+operator namespace, logical grouping, lazy registry metadata, and test placement.
+The implementation tutorial below does not replace that API contract.
+
 This skill covers **how to write and register tests**. For CI pipeline internals (stage ordering, fail-fast, gating, partitioning, debugging CI failures), see the [CI workflow guide](../ci-workflow-guide/SKILL.md). Whether a case is worth adding at all is decided by [`unit-test-admission`](../../rules/unit-test-admission.md) — read it before writing the case, not after.
 
 ## Core Rules

@@ -21,7 +21,7 @@ on:
         required: true
         type: string
         description: image for pods
-        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3"
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3"
       install_sglang_deps:
         required: false
         type: boolean
@@ -31,7 +31,7 @@ on:
         required: false
         type: string
         default: 'a3'
-        description: device type for dependency installation (a3 or 910b)
+        description: device type for dependency installation (a3 or 950)
       transformers_version:
         required: false
         type: string
