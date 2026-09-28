@@ -57,6 +57,26 @@ def get_flashinfer_include_paths() -> List[str]:
     return include_paths
 
 
+@register_dependency("flashinfer_nv_internal")
+def get_flashinfer_nv_internal_include_paths() -> List[str]:
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is None:
+        raise RuntimeError(
+            "Cannot find flashinfer package. Please install flashinfer to get "
+            "the required NVFP4 headers for JIT compilation."
+        )
+
+    internal_root = flashinfer_root / "data" / "csrc" / "nv_internal"
+    candidates = [internal_root, internal_root / "include"]
+    for path in candidates:
+        if not path.exists():
+            raise RuntimeError(
+                f"Required FlashInfer NVFP4 header path {path} was not found. "
+                "Please install a FlashInfer build with nv_internal headers."
+            )
+    return [str(path) for path in candidates]
+
+
 def get_mathdx_root() -> Optional[pathlib.Path]:
     """Locate the NVIDIA Math-DX install (cuBLASDx headers).
 

@@ -14,7 +14,7 @@ class TestChunkedFeatureHybridSWA(ChunkedTestBase):
     feature_args = [
         "--mem-fraction-static",
         "0.70",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
     ]
 
 

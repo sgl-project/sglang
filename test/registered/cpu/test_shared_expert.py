@@ -20,7 +20,7 @@ from sglang.test.cpu_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
 
 torch.manual_seed(1234)
 

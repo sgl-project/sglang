@@ -278,9 +278,10 @@ def _seeded_rng(seed: int, *, device: str | torch.device):
 
 
 @contextmanager
-def _single_rank_graph_capture():
-    stream = torch.cuda.Stream()
-    yield SimpleNamespace(stream=stream)
+def _single_rank_graph_capture(stream=None):
+    # Mirrors `graph_capture(stream=None)`: capture runs on the caller's stream
+    # when it leases one, so the shim stays valid for both call shapes.
+    yield SimpleNamespace(stream=stream if stream is not None else torch.cuda.Stream())
 
 
 def _reset_cuda_graph_test_buffers() -> None:
@@ -605,9 +606,9 @@ class _DenseEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -644,9 +645,9 @@ class _FrozenKVMTPDenseDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1033,9 +1034,9 @@ class _MLAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1291,9 +1292,9 @@ class _DSV4EagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1602,9 +1603,9 @@ class _DSAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:

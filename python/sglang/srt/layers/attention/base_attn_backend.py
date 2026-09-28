@@ -79,6 +79,12 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    # The runner's KVIndexTranslator; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    kv_index_translator = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -123,6 +129,8 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    supports_draft_extend_metadata_staging: bool = False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
@@ -145,12 +153,29 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Backends may keep MIXED prefill eager under DP attention when replaying
+    # the EXTEND graph is a known serving-performance regression.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""
         if fm.is_decode() or fm.is_target_verify():
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        """Snapshot late prefill reads before a PRE_REPLAY event is published.
+
+        Runners call this only after the actual eager/replay query geometry is
+        known. Backends that retain scheduler-shared reads into the model
+        forward keep the default no-op and must not declare PRE_REPLAY.
+        """
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
@@ -176,6 +201,9 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        return
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,

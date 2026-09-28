@@ -1,0 +1,35 @@
+{
+  "ttft_slo_policy": "disabled",
+  "tps_slo_policy": "disabled",
+  "buckets": [
+    {
+      "id": "short",
+      "stage": "prefill",
+      "rank": 0,
+      "worker_ids": [
+        "http://127.0.0.1:31000",
+        "http://127.0.0.1:31001",
+        "http://127.0.0.1:31002",
+        "http://127.0.0.1:31003"
+      ],
+      "min_extend_tokens": 0,
+      "max_extend_tokens": 2048,
+      "max_context_tokens": 32768,
+      "max_pending_prefill_tokens": 65536
+    },
+    {
+      "id": "long",
+      "stage": "prefill",
+      "rank": 1,
+      "worker_ids": [
+        "http://127.0.0.1:31004",
+        "http://127.0.0.1:31005",
+        "http://127.0.0.1:31006",
+        "http://127.0.0.1:31007"
+      ],
+      "min_extend_tokens": 2049,
+      "max_context_tokens": 32768,
+      "max_pending_prefill_tokens": 65536
+    }
+  ]
+}

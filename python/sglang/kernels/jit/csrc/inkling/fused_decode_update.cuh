@@ -149,7 +149,7 @@ struct FusedDecodeUpdateKernel {
     W1s.set_value(W - 1);
 
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(x);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({T}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({T}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(weight);

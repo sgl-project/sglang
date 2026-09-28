@@ -1,5 +1,6 @@
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
@@ -13,6 +14,7 @@ class DllmConfig:
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
+        requires_separate_context_encoding: bool = False,
         delete_token_id: int | None = None,
         split_token_id: int | None = None,
     ):
@@ -22,14 +24,19 @@ class DllmConfig:
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
+        self.requires_separate_context_encoding = requires_separate_context_encoding
         self.delete_token_id = delete_token_id
         self.split_token_id = split_token_id
+
+    def validate_request(self, req) -> str | None:
+        from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+        return get_algorithm_cls(self.algorithm).validate_request(req)
 
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
     ):
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
         if cfg.dllm_algorithm is None:
@@ -47,15 +54,39 @@ class DllmConfig:
             },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DiffusionGemmaForBlockDiffusion": {
+                "block_size": getattr(model_config.hf_config, "canvas_length", 256),
+                "mask_id": -1,
+                "algorithm": "Gemma4Renoise",
+            },
         }
 
-        arch = model_config.hf_config.architectures[0]
+        architectures = getattr(model_config.hf_config, "architectures", None) or []
+        if not architectures:
+            raise RuntimeError("The model config does not declare an architecture")
+        arch = architectures[0]
         if arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+
+        from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+        algorithm_cls = get_algorithm_cls(cfg.dllm_algorithm)
+        required_algorithm = params.get("algorithm")
+        if required_algorithm is not None and required_algorithm != cfg.dllm_algorithm:
+            raise ValueError(
+                f"{arch} requires the {required_algorithm} diffusion algorithm"
+            )
+        if (
+            algorithm_cls.supported_architectures
+            and arch not in algorithm_cls.supported_architectures
+        ):
+            raise ValueError(
+                f"{cfg.dllm_algorithm} does not support model architecture {arch}"
+            )
 
         delete_token_id = None
         split_token_id = None
@@ -115,7 +146,10 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(cfg.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
+                algorithm_config = yaml.safe_load(f) or {}
+
+            if not isinstance(algorithm_config, dict):
+                raise ValueError("The dLLM algorithm config must be a YAML mapping")
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
@@ -127,6 +161,9 @@ class DllmConfig:
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=cfg.dllm_fdfo,
+            requires_separate_context_encoding=(
+                algorithm_cls.requires_separate_context_encoding
+            ),
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
         )

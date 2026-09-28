@@ -50,7 +50,13 @@ import torch.distributed as dist
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_exec,
+    get_parallel,
+    publish,
+    spawn_world_rank,
+)
 
 from .protocol import (
     CacheConfig,
@@ -173,17 +179,15 @@ class WeightCacheDaemon:
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
-        self.ready_path = get_ready_path(
-            compute_global_rank(self.tp_size, pp_rank, tp_rank)
-        )
+        device_uuid = current_platform.get_device_uuid(gpu_id)
+        self.socket_path = get_socket_path(device_uuid)
+        self.ready_path = get_ready_path(device_uuid)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
@@ -228,21 +232,16 @@ class WeightCacheDaemon:
                 moe_a2a_backend=self.moe_a2a_backend,
             )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=self.pp_size,
-            expert_model_parallel_size=self.ep_size,
-            attention_data_parallel_size=(
-                self.dp_size if self.enable_dp_attention else 1
-            ),
-            attention_context_model_parallel_size=self.attn_cp_size,
-            moe_data_model_parallel_size=self.moe_dp_size,
-        )
+        initialize_model_parallel()
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
-        from sglang.srt.layers.dp_attention import initialize_dp_attention
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention,
+        )
 
-        initialize_dp_attention(server_args, model_config)
+        initialize_dp_attention(server_args)
+        init_dp_gathered_buffer(model_config)
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
@@ -279,7 +278,16 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        publish(server_args, role="weight_cache_daemon")
+        publish(
+            server_args,
+            role="weight_cache_daemon",
+            ranks=SpawnRanks(
+                world_rank=spawn_world_rank(
+                    server_args, tp_rank=self.tp_rank, pp_rank=self.pp_rank
+                ),
+                gpu_id=self.gpu_id,
+            ),
+        )
 
         from sglang.srt.layers.moe import initialize_moe_config
 
@@ -316,6 +324,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -345,6 +354,9 @@ class WeightCacheDaemon:
             revision=self.revision or "",
             **compute_env_stamp(),
         )
+
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -376,6 +388,10 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
+        self.preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+        )
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -457,6 +473,23 @@ class WeightCacheDaemon:
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine."""
+        if not get_exec().moe.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
+        )
+
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
         # Do NOT unlink an existing socket here: stale-file cleanup is the launch
@@ -478,7 +511,7 @@ class WeightCacheDaemon:
             f.write(f"config={self.config.to_dict()}\n")
 
         logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] " f"Listening on {self.socket_path}"
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Listening on {self.socket_path}"
         )
 
         self._running = True
@@ -564,6 +597,7 @@ class WeightCacheDaemon:
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
+                preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
 
         elif req.get("type") == "ping":
@@ -708,8 +742,17 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=cfg.base_gpu_id,
+                gpu_id_step=cfg.gpu_id_step,
+            )
+            cleanup_stale_daemon_files(
+                current_platform.get_device_uuid(gpu_id), force=force
+            )
 
     procs = []
     for pp_rank in pp_rank_range:
@@ -741,8 +784,15 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
+            gpu_id = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=cfg.base_gpu_id,
+                gpu_id_step=cfg.gpu_id_step,
+            )
+            ready_path = get_ready_path(current_platform.get_device_uuid(gpu_id))
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
                 if time.time() - start_time > timeout:
@@ -836,7 +886,7 @@ if __name__ == "__main__":
             else daemon_args.gpu_id
         )
         cleanup_stale_daemon_files(
-            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
+            current_platform.get_device_uuid(gpu_id),
             force=daemon_args.force,
         )
         run_weight_cache_daemon(

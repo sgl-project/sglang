@@ -192,7 +192,7 @@ Notes on launch behavior:
 
 - **Default endpoint** is `127.0.0.1:30000` (`--host` / `--port` override).
 - **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
-- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default realtime request uses `guidance_scale=1.0`, while CFG parallel requires active cond/uncond branches.
+- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default request uses `guidance_scale=1.0`, so the extra CFG ranks only recompute the same branch.
 - **FSDP.** Use `--use-fsdp-inference` only when you specifically need weight sharding for memory. For the low-latency realtime profile, prefer keeping components resident and using SP first.
 - **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No explicit `--warmup-mode` setting is needed.
 
@@ -351,7 +351,7 @@ Header fields:
 **Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`). `application/x-raw-rgb-delta-gzip` is the zlib-compressed **per-frame XOR delta** against the preceding frame (each frame in the batch is XOR'd against the previous one; sent by default). `realtime_output_format: "raw"` forces uncompressed RGB; `"webp"` / `"jpeg"` send preview-encoded frames.
 
 <Note>
-delta-gzip must be restored **frame-by-frame**: decompress the payload, then for each frame XOR it against the already-restored previous frame (the first frame of a batch references the last frame of the previous batch). See `restore_delta_gzip_raw_rgb_payload` in `runtime/utils/realtime_video.py`. The `"raw"` format below avoids this.
+delta-gzip must be restored **frame-by-frame**: decompress the payload, then for each frame XOR it against the already-restored previous frame (the first frame of a batch references the last frame of the previous batch). See `restore_delta_gzip_raw_rgb_payload` in `runtime/realtime/video.py`. The `"raw"` format below avoids this.
 </Note>
 
 ### Minimal client example
@@ -487,3 +487,9 @@ At WebSocket `init` the realtime adapter fills SANA-WM defaults that differ from
 <Note>
 `guidance_scale` applies to the dense path (§4) only; the distilled streaming path uses `streaming_cfg_scale` (default `1.0`, i.e. no CFG) so a `guidance_scale` override never accidentally enables CFG on the streaming stage. `denoising_step_list = (1000, 960, 889, 727, 0)` is the official 4-step streaming schedule (it must end in 0).
 </Note>
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

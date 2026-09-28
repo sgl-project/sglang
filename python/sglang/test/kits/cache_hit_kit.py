@@ -3,6 +3,7 @@ import json
 import time
 
 import aiohttp
+import numpy as np
 import requests
 
 from sglang.benchmark.datasets.random import sample_random_requests
@@ -10,6 +11,40 @@ from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
+
+def get_openai_chat_output_delta(delta):
+    """Return text emitted by an OpenAI-compatible chat streaming delta."""
+    if not delta:
+        return ""
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    return reasoning + (delta.get("content") or "")
+
+
+def calculate_tpot(latency, ttft, completion_tokens):
+    """Calculate request-level time per output token when inputs are valid."""
+    if ttft <= 0 or completion_tokens <= 1 or latency < ttft:
+        return None
+    return (latency - ttft) / (completion_tokens - 1)
+
+
+def calculate_tpot_statistics(tpots):
+    """Aggregate TPOT samples using the same NumPy definitions as bench_serving."""
+    if not tpots:
+        return {
+            "average_tpot": 0.0,
+            "p90_tpot": 0.0,
+            "p99_tpot": 0.0,
+            "median_tpot": 0.0,
+            "max_tpot": 0.0,
+        }
+    return {
+        "average_tpot": float(np.mean(tpots)),
+        "p90_tpot": float(np.percentile(tpots, 90)),
+        "p99_tpot": float(np.percentile(tpots, 99)),
+        "median_tpot": float(np.median(tpots)),
+        "max_tpot": float(np.max(tpots)),
+    }
 
 
 async def async_request_sglang_generate(
@@ -75,7 +110,10 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
+                    output.generated_len = len(all_output_ids)
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
+                    )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -130,9 +168,10 @@ async def async_request_openai_chat_completions(
                             # Streaming token chunks
                             if data.get("choices"):
                                 raw_delta = data["choices"][0].get("delta")
-                                text = raw_delta.get("content", "") if raw_delta else ""
-                                if text:
-                                    generated_text += text
+                                output_delta = get_openai_chat_output_delta(raw_delta)
+                                if output_delta:
+                                    content = raw_delta.get("content") or ""
+                                    generated_text += content
                                     timestamp = time.perf_counter()
 
                                     if ttft == 0.0:
@@ -161,6 +200,9 @@ async def async_request_openai_chat_completions(
                     output.cached_tokens = cached_tokens
                     output.generated_len = (
                         completion_tokens if completion_tokens else len(output.itl) + 1
+                    )
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
                     )
                 else:
                     output.error = response.reason or ""

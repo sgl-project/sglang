@@ -108,9 +108,9 @@ def mamba_v2_sharded_weight_loader(
                 weight_full_dim_list.append(
                     int(full_dim / full_dim_sum * loaded_weight.size(0))
                 )
-            assert sum(weight_full_dim_list) == loaded_weight.size(
-                0
-            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            assert sum(weight_full_dim_list) == loaded_weight.size(0), (
+                f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            )
             if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
                 logger.warning(
                     f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
@@ -177,7 +177,9 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -209,6 +211,7 @@ class MambaMixer2(torch.nn.Module):
         activation: str = "silu",
         use_rms_norm: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -237,9 +240,9 @@ class MambaMixer2(torch.nn.Module):
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
 
-        assert (
-            num_heads % self.tp_size == 0
-        ), "Tensor parallel world size must divide num heads."
+        assert num_heads % self.tp_size == 0, (
+            "Tensor parallel world size must divide num heads."
+        )
 
         assert (n_groups % self.tp_size) == 0 or n_groups == 1, (
             "If tensor parallel world size does not divide num_groups, "
@@ -419,6 +422,9 @@ class MambaMixer2(torch.nn.Module):
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        # By default a layer communicator reduces the output under DP attention.
+        if reduce_results is None:
+            reduce_results = not is_dp_attention_enabled()
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -427,7 +433,8 @@ class MambaMixer2(torch.nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            reduce_results=not is_dp_attention_enabled(),
+            reduce_results=reduce_results,
+            use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
@@ -459,6 +466,7 @@ class MambaMixer2(torch.nn.Module):
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
         intermediate_states = None
+        track_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -542,6 +550,9 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Rows past the batch's tokens are DP padding; keep them finite.
+        if num_actual_tokens < preallocated_ssm_out.shape[0]:
+            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,
@@ -598,7 +609,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, local_num_heads, self.head_dim
                 ),
@@ -617,7 +628,9 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
-                return_intermediate_states=True,
+                return_track_states=True,
+                track_seq_idx=metadata.track_ssm_seq_idx,
+                track_end_locs=metadata.track_ssm_end_locs,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -637,12 +650,12 @@ class MambaMixer2(torch.nn.Module):
 
             # 2. Convolution sequence transformation
             if is_target_verify:
-                assert (
-                    use_triton_causal_conv
-                ), "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
-                assert isinstance(
-                    layer_cache, MambaPool.SpeculativeState
-                ), "layer_cache must be SpeculativeState for speculative decoding"
+                assert use_triton_causal_conv, (
+                    "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
+                )
+                assert isinstance(layer_cache, MambaPool.SpeculativeState), (
+                    "layer_cache must be SpeculativeState for speculative decoding"
+                )
                 draft_token_num = metadata.draft_token_num
                 self.intermediate_state_indices = torch.arange(
                     num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
@@ -761,7 +774,7 @@ class MambaMixer2(torch.nn.Module):
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 
-        return mixer_out, intermediate_states
+        return mixer_out, intermediate_states, track_states
 
     @property
     def mamba_type(self) -> str:

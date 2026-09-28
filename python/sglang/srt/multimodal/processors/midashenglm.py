@@ -48,7 +48,13 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             self.FEATURE_NAMES.append("input_values")
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        **kwargs,
     ):
         """Override to use correct audio parameter name for MiDashengLM processor."""
         if images:
@@ -62,7 +68,9 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             if self.audio_config:
                 kwargs["audio_kwargs"].update(self.audio_config)
 
-        processor = self._processor
+        # Take the worker pool's per-thread clone when it hands one over; falling
+        # back to self._processor would put every worker on one shared object.
+        processor, _ = self._resolve_processor(processor)
         result = processor.__call__(
             text=[input_text],
             padding=True,
