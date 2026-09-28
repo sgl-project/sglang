@@ -391,6 +391,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         _host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
+        _staging_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         Ok(match phase {
@@ -424,6 +425,25 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 }])
             }
             CacheTransferPhase::BackupStorage | CacheTransferPhase::Prefetch => None,
+        })
+    }
+
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let keys = node
+            .hash_value
+            .as_ref()
+            .filter(|hashes| !hashes.is_empty())?;
+        let device_indices = node.try_device_value(FULL)?;
+        Some(PoolTransfer {
+            name: PoolName::Kv,
+            device_indices: Some(device_indices.to_kind(Kind::Int64)),
+            keys: Some(keys.clone()),
+            ..Default::default()
         })
     }
 

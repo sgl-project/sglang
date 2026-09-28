@@ -6,6 +6,7 @@ from torch import nn
 
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.domino_utils import validate_domino_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -124,6 +125,94 @@ class TestDFlashDominoWeights(CustomTestCase):
         model = _projector_model(projector_type="domnio")
         with self.assertRaisesRegex(ValueError, "projector_type"):
             model.load_weights([("prefix_gru.weight_ih_l0", torch.empty(12, 8))])
+
+
+class TestDFlashDominoRuntimeValidation(CustomTestCase):
+    def _modules(self, dtype=torch.bfloat16):
+        embedding = nn.Embedding(31, 8, dtype=dtype)
+        lm_head = nn.Linear(8, 31, bias=False, dtype=dtype)
+        prefix_gru = nn.GRU(8, 4, batch_first=True, bias=False, dtype=dtype)
+        embed_proj = nn.Sequential(
+            nn.Linear(12, 5, bias=False, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(5, 31, bias=False, dtype=dtype),
+        )
+        return embedding, lm_head, prefix_gru, embed_proj
+
+    def _tp2_modules(self):
+        embedding, lm_head, prefix_gru, embed_proj = self._modules()
+        embedding = nn.Embedding(16, 8, dtype=torch.bfloat16)
+        lm_head = nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+        shard = SimpleNamespace(
+            num_added_elements=0,
+            org_vocab_start_index=0,
+            org_vocab_end_index=16,
+            num_org_elements=16,
+            num_org_elements_padded=16,
+        )
+        for module in (embedding, lm_head):
+            module.shard_indices = shard
+            module.org_vocab_size = 31
+            module.tp_size = 2
+            module.num_added_embeddings = 0
+        return embedding, lm_head, prefix_gru, embed_proj
+
+    def _validate(self, **overrides):
+        embedding, lm_head, prefix_gru, embed_proj = overrides.pop(
+            "modules", self._modules()
+        )
+        args = {
+            "device": torch.device("cuda"),
+            "tp_size": 1,
+            "tp_rank": 0,
+            "target_vocab_size": 31,
+            "draft_vocab_size": 31,
+            "hidden_size": 8,
+            "target_embedding": embedding,
+            "lm_head": lm_head,
+            "prefix_gru": prefix_gru,
+            "embed_proj": embed_proj,
+        }
+        args.update(overrides)
+        validate_domino_runtime(**args)
+
+    def test_tp_requires_vocab_shard_metadata(self):
+        with self.assertRaisesRegex(ValueError, "lm_head shard metadata"):
+            self._validate(tp_size=2)
+
+    def test_tp2_vocab_shards_supported(self):
+        self._validate(tp_size=2, modules=self._tp2_modules())
+
+    def test_tp2_incomplete_lm_head_shard_fails(self):
+        modules = self._tp2_modules()
+        modules[1].shard_indices = SimpleNamespace(
+            num_added_elements=0,
+            num_org_elements_padded=16,
+        )
+        with self.assertRaisesRegex(ValueError, "shard metadata is missing"):
+            self._validate(tp_size=2, modules=modules)
+
+    def test_tp_vocab_shard_must_match_rank(self):
+        modules = self._tp2_modules()
+        modules[1].shard_indices.org_vocab_start_index = 1
+        modules[1].shard_indices.org_vocab_end_index = 17
+        with self.assertRaisesRegex(ValueError, "does not match its TP rank"):
+            self._validate(tp_size=2, modules=modules)
+
+    def test_tp1_requires_complete_vocab_shard(self):
+        modules = self._modules()
+        modules[1].shard_indices = SimpleNamespace(
+            num_added_elements=0,
+            org_vocab_start_index=0,
+            org_vocab_end_index=30,
+            num_org_elements=30,
+            num_org_elements_padded=31,
+        )
+        modules[1].org_vocab_size = 31
+        modules[1].tp_size = 1
+        modules[1].num_added_embeddings = 0
+        with self.assertRaisesRegex(ValueError, "does not match its TP rank"):
+            self._validate(modules=modules)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       image_tag:
-        description: "Base image tag to patch (e.g. dev, dev-cu13, dev-cu12)"
+        description: "Base image tag to patch (e.g. dev, dev-cu13)"
         required: true
       output_tag:
         description: "Tag to publish as. Overwrites it if it already exists."
