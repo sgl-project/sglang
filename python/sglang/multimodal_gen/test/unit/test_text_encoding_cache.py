@@ -580,6 +580,56 @@ def get_negative_embedding_twice(stage, server_args, first_req, second_req=None)
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("capacity", [0, 1, 4096])
+@torch.no_grad()
+def test_lingbot_cache_miss_prepares_offloaded_encoder(capacity, monkeypatch):
+    device = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.managers.memory_managers."
+        "component_residency_strategies.get_local_torch_device",
+        lambda: device,
+    )
+    executor, stage, encoder, args = make_group_executor(
+        partial(LingBotVideoTextEncodingStage, transformer=torch.nn.Linear(1, 1)),
+        "cpu",
+        capacity,
+    )
+    encoder.embedding = torch.nn.Embedding(8, 2)
+
+    def encode(input_ids, **kwargs):
+        encoder.calls += 1
+        states = encoder.embedding(input_ids)
+        return BaseEncoderOutput(last_hidden_state=states, hidden_states=(states,))
+
+    encoder.forward = encode
+    stage._crop_start = 0
+    stage._build_prompt_inputs = lambda prompt: BatchEncoding(
+        {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}
+    )
+    manager = executor.component_residency_manager
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock(wraps=strategy.prepare_for_use)
+    manager.strategy_for = Mock(return_value=strategy)
+    stage.set_component_residency_manager(manager)
+    cache = ConditioningCache(capacity)
+    results = []
+    for _ in range(2):
+        batch = make_req()
+        manager.begin_request([stage], batch, args)
+        manager.before_stage(stage, 0, batch, args)
+        manager.begin_stage()
+        with cache.scope():
+            results.append(stage._encode_prompt("hello", device, torch.float32))
+        manager.end_stage()
+        manager.finish_request()
+        assert encoder.embedding.weight.device.type == "cpu"
+        assert results[-1][0].device == device
+    expected_calls = 1 if capacity == 4096 else 2
+    assert encoder.calls == strategy.prepare_for_use.call_count == expected_calls
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+
+
 def test_negative_text_encoding_has_no_separate_gpu_cache():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
