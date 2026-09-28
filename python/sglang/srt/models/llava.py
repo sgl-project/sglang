@@ -650,7 +650,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     def dtype(self):
         return self.torch_dtype
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
         else:

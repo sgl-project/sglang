@@ -127,8 +127,19 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     seq_lens_sum=int(seq_lens.sum()),
                 )
 
+                static_batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=4,
+                    input_ids=torch.arange(16),
+                    req_pool_indices=static_slots,
+                    seq_lens=static_lens,
+                    seq_lens_cpu=static_lens,
+                    out_cache_loc=torch.arange(16),
+                    seq_lens_sum=int(static_lens.sum()),
+                )
+
                 runner._prepare_forward_metadata_for_replay(
-                    batch, batch, shape_key=ShapeKey(size=16)
+                    batch, static_batch, shape_key=ShapeKey(size=16)
                 )
 
                 attn_backend.init_forward_metadata_out_graph.assert_called_once()
@@ -136,6 +147,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 self.assertIsInstance(padded, ForwardBatch)
                 self.assertIsNot(padded, batch)
                 self.assertEqual(padded.batch_size, 4)
+                self.assertIs(padded.input_ids, static_batch.input_ids)
                 torch.testing.assert_close(padded.seq_lens_cpu, static_lens)
                 torch.testing.assert_close(padded.req_pool_indices, static_slots)
                 if has_mirror:
@@ -147,6 +159,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 else:
                     self.assertIsNone(padded.req_pool_indices_cpu)
                 self.assertEqual(batch.batch_size, batch_size)
+                self.assertEqual(batch.input_ids.numel(), batch_size)
                 torch.testing.assert_close(batch.seq_lens_cpu, seq_lens)
                 attn_backend.init_forward_metadata.assert_not_called()
 

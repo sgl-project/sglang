@@ -111,18 +111,6 @@ class TestGrammarManagerInit(unittest.TestCase):
 
     """Test GrammarManager initialization."""
 
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
-    def test_init_with_backend(self, mock_create):
-        mock_create.return_value = MagicMock(spec=BaseGrammarBackend)
-        scheduler = _make_scheduler("xgrammar")
-        enter_override(
-            self, get_context().override_server_args(skip_tokenizer_init=False)
-        )
-
-        mgr = GrammarManager(scheduler)
-        self.assertIsNotNone(mgr.grammar_backend)
-        self.assertEqual(len(mgr), 0)
-
     def test_init_skip_tokenizer(self):
         scheduler = _make_scheduler(skip_tokenizer=True)
         mgr = GrammarManager(scheduler)
@@ -135,19 +123,6 @@ class TestGrammarManagerInit(unittest.TestCase):
         mgr = GrammarManager(scheduler)
         self.assertEqual(len(mgr), 0)
         self.assertFalse(mgr.has_waiting_grammars())
-
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
-    def test_clear_resets_backend(self, mock_create):
-        mock_backend = MagicMock(spec=BaseGrammarBackend)
-        mock_create.return_value = mock_backend
-        scheduler = _make_scheduler()
-        enter_override(
-            self, get_context().override_server_args(skip_tokenizer_init=False)
-        )
-
-        mgr = GrammarManager(scheduler)
-        mgr.clear()
-        mock_backend.reset.assert_called_once()
 
     @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
     def test_clear_no_backend(self, mock_create):

@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 
 device_module = get_device_module()
 
@@ -72,7 +73,6 @@ class HiSparseTokenStats(NamedTuple):
 def resolve_shared_index_layers(
     *,
     hf_text_config,
-    pp_size: int,
     is_speculative: bool,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
@@ -91,7 +91,7 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1 or is_speculative:
+    if get_parallel().pp_size != 1 or is_speculative:
         logger.warning(
             "HiSparse shared-index prefetch is unsupported under pipeline "
             "parallelism / speculative decoding; falling back to synchronous "
