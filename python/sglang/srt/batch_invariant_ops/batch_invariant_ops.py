@@ -224,7 +224,16 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
     }
-    # print(a.device, b.device, c.device)
+    # The three-stage FP16 tile exceeds the 99-KiB shared-memory budget
+    # of Ada and consumer Blackwell GPUs. Pipeline depth does not change
+    # the per-output reduction order or depend on the request batch size.
+    if a.dtype == torch.float16 and a.is_cuda and torch.version.hip is None:
+        capacity = torch.cuda.get_device_properties(
+            a.device
+        ).shared_memory_per_block_optin
+        if capacity < 128 * 1024:
+            configs[a.dtype]["num_stages"] = 2
+
     matmul_kernel_persistent[grid](
         a,
         b,
