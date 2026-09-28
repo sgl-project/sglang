@@ -707,6 +707,10 @@ class HiSparseCoordinator:
             self,
             num_draft_tokens=num_draft_tokens,
         )
+        if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            self.token_to_kv_pool_allocator.configure_spec_scratch(
+                self.spec_swap.scratch_capacity
+            )
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
         )
@@ -806,10 +810,6 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
-
-    @property
-    def spec_scratch_capacity(self) -> int:
-        return self.spec_swap.scratch_capacity
 
     def allocate_spec_scratch(self, req_pool_indices: List[int]) -> None:
         for req_pool_idx in req_pool_indices:

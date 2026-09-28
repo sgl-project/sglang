@@ -637,7 +637,6 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        new_request_token_reserve: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -745,10 +744,6 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
-        # Fixed physical KV workspace that is allocated once when a new request
-        # receives its request-pool slot.  HiSparse speculative decode uses this
-        # for its graph-stable scratch region; zero keeps all other paths intact.
-        self.new_request_token_reserve = new_request_token_reserve
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -849,17 +844,10 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
-    def _new_request_reserve_for_req(self, req: Req) -> int:
-        # A few focused lifecycle tests construct PrefillAdder with
-        # object.__new__ and stub only the state exercised by that path. Keep
-        # the optional HiSparse reservation backward-compatible for those
-        # callers: an absent field has the same meaning as the default value.
-        reserve = getattr(self, "new_request_token_reserve", 0)
-        if reserve == 0:
-            return 0
-        if req.kv.req_pool_idx is None:
-            return reserve
-        return 0
+    def _request_slot_reserve_for_req(self, req: Req) -> int:
+        return self.token_to_kv_pool_allocator.request_slot_reserve(
+            has_req_pool_slot=req.kv.req_pool_idx is not None
+        )
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -892,7 +880,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
-        new_request_reserve: int = 0,
+        request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         compute_charge: Optional[int] = None,
     ):
@@ -919,7 +907,7 @@ class PrefillAdder:
             # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
                 mamba_gap_reserve
-                + new_request_reserve
+                + request_slot_reserve
                 + self.per_req_token_overhead
                 - self.page_size
             ),
@@ -1040,7 +1028,6 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            new_request_reserve=self._new_request_reserve_for_req(req),
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
@@ -1124,7 +1111,6 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            new_request_reserve=self._new_request_reserve_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -1197,7 +1183,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            new_request_reserve=self._new_request_reserve_for_req(req),
+            request_slot_reserve=self._request_slot_reserve_for_req(req),
             is_chunked_continuation=True,
             compute_charge=req.extend_range.length if self.exact_chunk_fill else None,
         )
@@ -1231,7 +1217,7 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
-        paged_input += self._new_request_reserve_for_req(req)
+        paged_input += self._request_slot_reserve_for_req(req)
         fits = self.memory_budget.can_allocate_prefill(
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
@@ -1334,7 +1320,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                new_request_reserve=self._new_request_reserve_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(req),
                 compute_charge=(
                     req.extend_range.length if self.exact_chunk_fill else None
                 ),
@@ -1365,7 +1351,7 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                new_request_reserve=self._new_request_reserve_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(req),
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
@@ -1397,8 +1383,8 @@ class PrefillAdder:
         # this returns 0, so the debit sites below reuse the value.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
         total_tokens += mamba_gap_reserve
-        new_request_reserve = self._new_request_reserve_for_req(req)
-        total_tokens += new_request_reserve
+        request_slot_reserve = self._request_slot_reserve_for_req(req)
+        total_tokens += request_slot_reserve
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
@@ -1488,7 +1474,7 @@ class PrefillAdder:
 
             # Successful materialization has no remaining admission gates.
             self._commit_prefill_admission(
-                req, admission, mamba_gap_reserve, new_request_reserve
+                req, admission, mamba_gap_reserve, request_slot_reserve
             )
 
         # This verdict controls the next candidate, not the committed request.
@@ -1582,7 +1568,7 @@ class PrefillAdder:
         req: Req,
         admission: _PrefillAdmission,
         mamba_gap_reserve: int,
-        new_request_reserve: int,
+        request_slot_reserve: int,
     ) -> None:
         assert len(req.prefix_indices) == admission.prefix_len
         req.set_extend_range(
@@ -1598,7 +1584,7 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=mamba_gap_reserve,
-            new_request_reserve=new_request_reserve,
+            request_slot_reserve=request_slot_reserve,
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )
@@ -1637,7 +1623,7 @@ class PrefillAdder:
             len(req.full_untruncated_fill_ids)
             - len(req.prefix_indices)
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            + self._new_request_reserve_for_req(req)
+            + self._request_slot_reserve_for_req(req)
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

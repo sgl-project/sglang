@@ -381,8 +381,9 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # HiSparse speculative decode owns fixed per-request physical scratch.  The
-    # PrefillAdder already charged it to this admission; allocate it as soon as
-    # request-pool slots exist so later scheduling observes the real free space.
+    # The allocator's request-slot admission hook already charged it; allocate
+    # it as soon as request-pool slots exist so later scheduling observes the
+    # real free space.
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 

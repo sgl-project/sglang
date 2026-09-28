@@ -3926,11 +3926,6 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            new_request_token_reserve=(
-                self.hisparse_coordinator.spec_scratch_capacity
-                if self.hisparse_coordinator is not None
-                else 0
-            ),
         )
 
         if self.chunked_req is not None:

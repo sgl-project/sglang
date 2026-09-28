@@ -86,6 +86,7 @@ class TestPrefillAdder(CustomTestCase):
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
         allocator.swa_req_ring = False
+        allocator.request_slot_reserve.return_value = 0
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             PrefillBudget(allocator, tree_cache, **kwargs)
         )
@@ -277,9 +278,10 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_new_request_workspace_is_charged_to_admission(self):
         self.mock_token_allocator.available_size.return_value = 1100
-        adder = self.create_adder(
-            self.create_running_batch(), new_request_token_reserve=1024
+        self.mock_token_allocator.request_slot_reserve.side_effect = (
+            lambda *, has_req_pool_slot: 0 if has_req_pool_slot else 1024
         )
+        adder = self.create_adder(self.create_running_batch())
         req = self.create_shared_req("spec-workspace", max_new_tokens=0)
         req.full_untruncated_fill_ids = list(range(100))
         req.kv = SimpleNamespace(req_pool_idx=None)
@@ -292,9 +294,7 @@ class TestPrefillAdder(CustomTestCase):
 
         # A continuation already owns the fixed workspace and must not pay for
         # it again on each chunk.
-        continuation_adder = self.create_adder(
-            self.create_running_batch(), new_request_token_reserve=1024
-        )
+        continuation_adder = self.create_adder(self.create_running_batch())
         req.kv.req_pool_idx = 3
         self.assertNotEqual(
             continuation_adder.add_one_req(
