@@ -119,17 +119,17 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         # Preserve the DP startup log; ports use node-local offsets.
-        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
+        dp_rank = get_parallel().attn_dp_rank if get_parallel().dp_size > 1 else None
         if get_exec().moe.is_ep_scale_joiner:
             # The joining TP group is entirely local to this node.
-            tp_size_per_node = scheduler.ps.tp_size
+            tp_size_per_node = get_parallel().tp_size
         else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
-            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
-        dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
+            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
+            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
+        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
         # Count DP leaders within this node's TP range. The first leader must
         # use the base port even when a DP group spans multiple nodes.
-        local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
+        local_dp_rank = (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
         listen_port = get_serving().port + local_dp_rank
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
@@ -179,7 +179,7 @@ class RustServer:
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
         dp_note = (
-            "" if dp_rank is None else f" (DP rank {dp_rank}/{scheduler.ps.dp_size})"
+            "" if dp_rank is None else f" (DP rank {dp_rank}/{get_parallel().dp_size})"
         )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",

@@ -18,10 +18,10 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::kv_events::{BlockSizeOracle, HashTree};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
@@ -166,5 +166,76 @@ async fn multimodal_request_omits_input_ids() {
     assert!(
         body.get("input_ids").is_none(),
         "multimodal requests must not forward input_ids; got {body}"
+    );
+}
+
+/// Caller-supplied `input_ids` are never re-rendered or replaced: a flat u32
+/// array (empty included) drives routing, anything else yields no routing
+/// tokens, and the body reaches the engine byte-for-byte for validation.
+#[tokio::test]
+async fn caller_input_ids_are_used_for_routing_and_preserved() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    for (ids, expected) in [
+        (json!([7, 8]), Some(vec![7, 8])),
+        (json!([]), Some(vec![])),
+        (json!([7, -1]), None),
+        (json!("bad"), None),
+    ] {
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "input_ids": ids,
+        });
+        let tokens = sgl_router::policies::request_tokens_for(
+            &ctx.tokenizers,
+            &ModelId(MODEL.into()),
+            &request,
+        );
+        assert!(!tokens.as_ref().is_some_and(|t| t.rendered_from_chat));
+        assert_eq!(tokens.map(|t| t.ids), expected, "input_ids: {ids}");
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let mut forwarded = captured(&mock);
+        let rid = forwarded
+            .as_object_mut()
+            .expect("a forwarded chat body is an object")
+            .remove("rid");
+        assert!(
+            rid.as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(crate::common::is_engine_shaped_rid),
+            "plain mode must mint an abort rid; got {rid:?}",
+        );
+        assert_eq!(forwarded, request, "body must be forwarded untouched");
+    }
+    // Bypasses are not rendering failures.
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
+}
+
+/// `input_ids: null` is the same as absent: the router renders and forwards.
+#[tokio::test]
+async fn null_input_ids_keep_normal_rendering() {
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(mock.url.clone());
+    let status = send(
+        ctx,
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there friend"}],
+            "input_ids": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = captured(&mock);
+    assert!(
+        body["input_ids"].as_array().is_some_and(|a| !a.is_empty()),
+        "null input_ids must not suppress rendering; got {body}"
     );
 }

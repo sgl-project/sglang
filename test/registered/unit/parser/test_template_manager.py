@@ -67,6 +67,22 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
         )
         return force, config, parser
 
+    def test_gigachat35_gcml_template_wins_over_generic_think_tags(self):
+        """The GCML marker must map both parsers to gigachat35; the template also
+        carries <think>, so the rule has to outrank the generic deepseek-r1
+        think-tags fallback."""
+        template = """
+        {{- 'assistant<|role_sep|>\\n<think>' -}}
+        <｜GCML｜tool_calls>
+        """
+        vocab = ["<think>", "</think>", "<|role_sep|>\n"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "gigachat35")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "gigachat35",
+        )
+
     def test_qwen3_template_not_misclassified_as_glm45(self):
         template = """
         {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}
@@ -1109,6 +1125,37 @@ class TestResolveAutoParsers(CustomTestCase):
 
                 self.assertEqual(_declared(args, "reasoning_parser"), "ling3")
                 self.assertEqual(_declared(args, "tool_call_parser"), "ling3")
+
+    def test_minimax_architectures_and_model_types_use_minimax_parsers(self):
+        cases = (
+            (["MiniMaxM3SparseForCausalLM"], "", "minimax-m3", "minimax-m3"),
+            (
+                ["MiniMaxM3SparseForConditionalGeneration"],
+                "",
+                "minimax-m3",
+                "minimax-m3",
+            ),
+            (None, "minimax_m3_vl", "minimax-m3", "minimax-m3"),
+            (["MiniMaxM2ForCausalLM"], "", "minimax", "minimax-m2"),
+            (None, "minimax_m2", "minimax", "minimax-m2"),
+        )
+        for architectures, model_type, reasoning, tool_call in cases:
+            with self.subTest(architectures=architectures, model_type=model_type):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer([])
+                config = SimpleNamespace(
+                    architectures=architectures, model_type=model_type
+                )
+
+                with _patch_hf_transformers_utils(
+                    Mock(return_value=tokenizer), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")

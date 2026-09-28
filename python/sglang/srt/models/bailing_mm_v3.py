@@ -14,6 +14,7 @@
 """SGLang implementation of Bailing/Ling 3 VL image and video inference."""
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -22,7 +23,6 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
@@ -40,7 +40,7 @@ from sglang.srt.models.bailing_moe_v3 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.norm_query_embeds = getattr(config, "norm_query_embeds", False)
@@ -129,7 +129,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def _materialize_items(self, items: List[MultimodalDataItem]) -> torch.Tensor:
