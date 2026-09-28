@@ -2856,6 +2856,8 @@ class DeepseekV4AttnBackend(
             get_platform().is_sm90
             and 0 < x.shape[0] <= 64
             and layer.compressor.norm.weight.shape == (512,)
+            and layer.compressor.norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and layer.compressor.norm.weight.is_contiguous()
         )
         pooled, group_pos, slots = c2_decode_pool(
             kv,

@@ -14,9 +14,41 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 
 namespace sglang {
+
+/// \brief Round a pooled fragment before RMS statistics on both C2 paths.
+template <std::size_t kVecSize>
+SGL_DEVICE void round_c2_norm_input(device::AlignedVector<float, kVecSize>& values) {
+  using namespace device;
+#pragma unroll
+  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+    const auto rounded = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{values[2 * i], values[2 * i + 1]}));
+    values[2 * i] = rounded.x;
+    values[2 * i + 1] = rounded.y;
+  }
+}
+
+/// \brief Apply FP32 RMS scaling and weights, then publish BF16 latent values.
+template <std::size_t kVecSize>
+SGL_DEVICE auto finish_c2_norm(
+    const device::AlignedVector<float, kVecSize>& values,
+    const device::AlignedVector<float, kVecSize>& weights,
+    float norm_factor) {
+  using namespace device;
+  AlignedVector<bf16x2_t, kVecSize / 2> output;
+#pragma unroll
+  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+    const auto x = values[2 * i] * norm_factor * weights[2 * i];
+    const auto y = values[2 * i + 1] * norm_factor * weights[2 * i + 1];
+    output[i] = cast<bf16x2_t>(fp32x2_t{x, y});
+  }
+  return output;
+}
 
 /// \brief Ratio-2 decode compressor: pair-pool, RMSNorm and the main-KV write.
 ///
@@ -144,15 +176,14 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   }
 
   // `finish` casts to bf16 before the norm, so the sum of squares must see the rounded values.
+  round_c2_norm_input(staged);
   float local_sqrsum = 0.0f;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    const auto packed = fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]};
-    const auto [x, y] = cast<fp32x2_t>(cast<bf16x2_t>(packed));
+    const auto x = staged[i * 2 + 0];
+    const auto y = staged[i * 2 + 1];
     local_sqrsum += x * x;
     local_sqrsum += y * y;
-    staged[i * 2 + 0] = x;
-    staged[i * 2 + 1] = y;
   }
   const auto warp_sum = warp::reduce_sum(local_sqrsum);
   s_warp_sum[tx / kWarpThreads] = warp_sum;
@@ -166,13 +197,14 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   constexpr float kInvScale = 1.0f / static_cast<float>(kHeadDim);
   const auto norm_factor = math::rsqrt(sqrsum * kInvScale + params.eps);
 
+  fp32_vec_t norm_weights;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     const auto [wx, wy] = cast<fp32x2_t>(weight[i]);
-    const auto x = staged[i * 2 + 0] * norm_factor * wx;
-    const auto y = staged[i * 2 + 1] * norm_factor * wy;
-    out[i] = cast<bf16x2_t>(fp32x2_t{x, y});
+    norm_weights[i * 2 + 0] = wx;
+    norm_weights[i * 2 + 1] = wy;
   }
+  out = finish_c2_norm(staged, norm_weights, norm_factor);
   // The pre-RoPE latent, for the index-K branch's `wk` projection. Published
   // before the trigger because that GEMM is the successor that reads it.
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
@@ -389,6 +421,254 @@ struct FlashCompress2Kernel {
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }
+  }
+};
+
+/// \brief Separate projections and strided state for the pool/norm-only C2 path.
+struct Compress2PoolNormParams {
+  const float* __restrict__ kv;
+  const float* __restrict__ score;
+  float* __restrict__ state_kv;
+  float* __restrict__ state_score;
+  int64_t state_kv_stride;
+  int64_t state_score_stride;
+  const void* __restrict__ positions;
+  const void* __restrict__ raw_out_loc;
+  const void* __restrict__ out_loc;
+  const int64_t* __restrict__ req;
+  const void* __restrict__ norm_weight;
+  bf16_t* __restrict__ pooled;
+  void* __restrict__ group_pos;
+  void* __restrict__ slots;
+  int64_t pad_row;
+  int64_t ring_size;
+  int64_t ring_mask;
+  float eps;
+};
+
+/// \brief Position offset, with no integer division for the production power-of-two rings.
+SGL_DEVICE int64_t c2_ring_offset(int64_t position, int64_t ring_size, int64_t ring_mask) {
+  if (ring_mask >= 0) return position & ring_mask;
+  return position % ring_size;
+}
+
+/// \brief Preserve the Torch pair-softmax rounding instead of the full-fusion fast formula.
+SGL_DEVICE float c2_pool_pair_exact(float old_kv, float new_kv, float old_score, float new_score) {
+  const auto maximum = fmaxf(old_score, new_score);
+  const auto e0 = expf(__fsub_rn(old_score, maximum));
+  const auto e1 = expf(__fsub_rn(new_score, maximum));
+  const auto denominator = __fadd_rn(e0, e1);
+  const auto t0 = __fadd_rn(__fmul_rn(old_kv, __fdiv_rn(e0, denominator)), 0.0f);
+  const auto t1 = __fadd_rn(__fmul_rn(new_kv, __fdiv_rn(e1, denominator)), 0.0f);
+  return __fadd_rn(t0, t1);
+}
+
+/// \brief Pool and normalize without instantiating the SM100 RoPE/FP4/cache-store path.
+template <int64_t kHeadDim, typename WeightT, typename PosT, typename RawLocT, typename OutLocT, bool kUsePDL>
+__global__ __launch_bounds__(128) void c2_pool_norm_kernel(const Compress2PoolNormParams params) {
+  using namespace device;
+  constexpr uint32_t kThreads = 128;
+  constexpr uint32_t kValues = kHeadDim / kThreads;
+  static_assert(kHeadDim == 512 && kValues == 4);
+
+  const auto row = static_cast<int64_t>(blockIdx.x);
+  const auto tx = threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
+  const auto pos = static_cast<const PosT*>(params.positions)[row];
+  const auto raw_loc = static_cast<const RawLocT*>(params.raw_out_loc)[row];
+  const auto out_loc = static_cast<const OutLocT*>(params.out_loc)[row];
+  const auto req = params.req[row];
+  const bool odd = pos % 2 == 1;
+  int64_t read_row;
+  int64_t write_row;
+  if (params.ring_size != 0) {
+    read_row = (raw_loc == 0 || pos == 0)
+                   ? params.pad_row
+                   : req * params.ring_size + c2_ring_offset(pos - 1, params.ring_size, params.ring_mask);
+    write_row = req * params.ring_size + c2_ring_offset(pos, params.ring_size, params.ring_mask);
+  } else {
+    read_row = raw_loc == 0 ? params.pad_row : req;
+    write_row = read_row;
+  }
+
+  AlignedVector<float, kValues> staged, weights;
+  // The reference RMSNorm's allocated BF16 input/output select a coalesced
+  // Triton layout with four adjacent columns per thread, for both weight dtypes.
+#pragma unroll
+  for (uint32_t i = 0; i < kValues; ++i) {
+    const auto column = tx * kValues + i;
+    const auto kv = params.kv[row * kHeadDim + column];
+    const auto score = params.score[row * kHeadDim + column];
+    const auto old_kv = params.state_kv[read_row * params.state_kv_stride + column];
+    const auto old_score = params.state_score[read_row * params.state_score_stride + column];
+    if (params.ring_size != 0) {
+      if (raw_loc != 0) {
+        params.state_kv[write_row * params.state_kv_stride + column] = kv;
+        params.state_score[write_row * params.state_score_stride + column] = score;
+      }
+    } else {
+      params.state_kv[write_row * params.state_kv_stride + column] = odd ? old_kv : kv;
+      params.state_score[write_row * params.state_score_stride + column] = odd ? old_score : score;
+    }
+    staged[i] = c2_pool_pair_exact(old_kv, kv, old_score, score);
+    weights[i] = cast<float>(static_cast<const WeightT*>(params.norm_weight)[column]);
+  }
+  round_c2_norm_input(staged);
+
+  // Match the four-warp Triton reduction, including the per-thread element order.
+  float sqrsum = __fmul_rn(staged[0], staged[0]);
+#pragma unroll
+  for (uint32_t i = 1; i < kValues; ++i) {
+    sqrsum = __fadd_rn(sqrsum, __fmul_rn(staged[i], staged[i]));
+  }
+#pragma unroll
+  for (uint32_t distance = 16; distance != 0; distance /= 2) {
+    sqrsum = __fadd_rn(sqrsum, __shfl_xor_sync(0xffffffffu, sqrsum, distance));
+  }
+  __shared__ float warp_sums[4];
+  const auto lane = get_lane_id();
+  if (lane == 0) warp_sums[tx / kWarpThreads] = sqrsum;
+  __syncthreads();
+  sqrsum = __fadd_rn(__fadd_rn(warp_sums[0], warp_sums[2]), __fadd_rn(warp_sums[1], warp_sums[3]));
+  float mean_square;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(mean_square) : "f"(sqrsum), "f"(static_cast<float>(kHeadDim)));
+  const auto variance = __fadd_rn(mean_square, params.eps);
+  float norm_factor;
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(norm_factor) : "f"(variance));
+  const auto output = finish_c2_norm(staged, weights, norm_factor);
+#pragma unroll
+  for (uint32_t i = 0; i < kValues / 2; ++i) {
+    const auto packed = output[i];
+    const auto& values = unpack(packed);
+    params.pooled[row * kHeadDim + tx * kValues + 2 * i] = values[0];
+    params.pooled[row * kHeadDim + tx * kValues + 2 * i + 1] = values[1];
+  }
+  if (tx == 0) {
+    static_cast<PosT*>(params.group_pos)[row] = odd ? pos - 1 : pos;
+    static_cast<OutLocT*>(params.slots)[row] = out_loc >= 0 ? out_loc : 0;
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+/// \brief C2 pool/norm entry point with the separate-projection Hopper contract.
+template <int64_t kHeadDim, typename WeightT, bool kUsePDL>
+struct Compress2PoolNormKernel {
+  static_assert(kHeadDim == 512);
+  static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, float>);
+
+  template <typename PosT, typename RawLocT, typename OutLocT>
+  static constexpr auto kernel = c2_pool_norm_kernel<kHeadDim, WeightT, PosT, RawLocT, OutLocT, kUsePDL>;
+
+  template <typename PosT>
+  static auto select(bool raw_i32, bool out_i32) {
+    if (raw_i32) return out_i32 ? kernel<PosT, int32_t, int32_t> : kernel<PosT, int32_t, int64_t>;
+    return out_i32 ? kernel<PosT, int64_t, int32_t> : kernel<PosT, int64_t, int64_t>;
+  }
+
+  static void
+  run(const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView score,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView raw_out_loc,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView state_kv,
+      const tvm::ffi::TensorView state_score,
+      const int64_t pad_row,
+      const int64_t ring_size,
+      const tvm::ffi::TensorView norm_weight,
+      const float eps,
+      const tvm::ffi::TensorView pooled,
+      const tvm::ffi::TensorView group_pos,
+      const tvm::ffi::TensorView slots) {
+    using namespace host;
+    auto N = SymbolicSize{"num_tokens"};
+    auto R = SymbolicSize{"state_rows"};
+    auto state_kv_stride = SymbolicSize{"state_kv_stride"};
+    auto state_score_stride = SymbolicSize{"state_score_stride"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({N, kHeadDim})
+        .with_dtype<float>()
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(alignof(float))
+        .verify(kv)
+        .verify(score);
+    TensorMatcher({R, kHeadDim})
+        .with_strides({state_kv_stride, 1})
+        .with_dtype<float>()
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(alignof(float))
+        .verify(state_kv);
+    TensorMatcher({R, kHeadDim})
+        .with_strides({state_score_stride, 1})
+        .with_dtype<float>()
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(alignof(float))
+        .verify(state_score);
+    TensorMatcher({kHeadDim})
+        .with_device<kDLGPU>(device_)
+        .with_dtype<WeightT>()
+        .ensure_alignment(alignof(WeightT))
+        .verify(norm_weight);
+    TensorMatcher({N, kHeadDim})
+        .with_dtype<bf16_t>()
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(alignof(bf16_t))
+        .verify(pooled);
+    auto pos_dtype = SymbolicDType{};
+    auto raw_dtype = SymbolicDType{};
+    auto out_dtype = SymbolicDType{};
+    TensorMatcher({N})
+        .with_dtype<int32_t, int64_t>(pos_dtype)
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(dtype_bytes(positions.dtype()))
+        .verify(positions)
+        .verify(group_pos);
+    TensorMatcher({N})
+        .with_dtype<int32_t, int64_t>(raw_dtype)
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(dtype_bytes(raw_out_loc.dtype()))
+        .verify(raw_out_loc);
+    TensorMatcher({N})
+        .with_dtype<int32_t, int64_t>(out_dtype)
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(dtype_bytes(out_loc.dtype()))
+        .verify(out_loc)
+        .verify(slots);
+    TensorMatcher({N})
+        .with_dtype<int64_t>()
+        .with_device<kDLGPU>(device_)
+        .ensure_alignment(alignof(int64_t))
+        .verify(req);
+    CHECK_HOST(state_kv_stride.unwrap() >= kHeadDim && state_score_stride.unwrap() >= kHeadDim);
+    CHECK_HOST(pad_row >= 0 && pad_row < R.unwrap() && ring_size >= 0);
+    CHECK_HOST(N.unwrap() <= std::numeric_limits<int32_t>::max());
+    if (N.unwrap() == 0) return;
+    const auto params = Compress2PoolNormParams{
+        .kv = static_cast<const float*>(kv.data_ptr()),
+        .score = static_cast<const float*>(score.data_ptr()),
+        .state_kv = static_cast<float*>(state_kv.data_ptr()),
+        .state_score = static_cast<float*>(state_score.data_ptr()),
+        .state_kv_stride = state_kv_stride.unwrap(),
+        .state_score_stride = state_score_stride.unwrap(),
+        .positions = positions.data_ptr(),
+        .raw_out_loc = raw_out_loc.data_ptr(),
+        .out_loc = out_loc.data_ptr(),
+        .req = static_cast<const int64_t*>(req.data_ptr()),
+        .norm_weight = norm_weight.data_ptr(),
+        .pooled = static_cast<bf16_t*>(pooled.data_ptr()),
+        .group_pos = group_pos.data_ptr(),
+        .slots = slots.data_ptr(),
+        .pad_row = pad_row,
+        .ring_size = ring_size,
+        .ring_mask = std::has_single_bit(static_cast<uint64_t>(ring_size)) ? ring_size - 1 : -1,
+        .eps = eps,
+    };
+    const auto raw_i32 = raw_dtype.is_type<int32_t>();
+    const auto out_i32 = out_dtype.is_type<int32_t>();
+    const auto k = pos_dtype.is_type<int32_t>() ? select<int32_t>(raw_i32, out_i32) : select<int64_t>(raw_i32, out_i32);
+    LaunchKernel(static_cast<uint32_t>(N.unwrap()), 128, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
   }
 };
 

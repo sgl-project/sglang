@@ -184,3 +184,57 @@ def c2_decode_norm_rope_store(
         draft_len,
     )
     return out
+
+
+@cache_once
+def _jit_c2_pool_norm_module(head_dim: int, weight_dtype: torch.dtype) -> Module:
+    if head_dim != 512 or weight_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("C2 pool/norm requires head_dim=512 and BF16/FP32 weights")
+    args = make_cpp_args(head_dim, weight_dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("c2_pool_norm"),
+        *args,
+        cuda_files=["deepseek_v4/c2.cuh"],
+        cuda_wrappers=[("pool_norm", f"Compress2PoolNormKernel<{args}>::run")],
+        extra_cuda_cflags=["--fmad=false"],
+    )
+
+
+def _c2_decode_pool_norm(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    pos: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    out_loc: torch.Tensor,
+    req: torch.Tensor,
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+    pad_row: int,
+    *,
+    ring_size: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """C2 pool/norm without the SM100 RoPE/FP4 cache-store epilogue."""
+    pooled = torch.empty_like(kv, dtype=torch.bfloat16)
+    group_pos = torch.empty_like(pos)
+    slots = torch.empty(kv.shape[0], dtype=out_loc.dtype, device=out_loc.device)
+    module = _jit_c2_pool_norm_module(kv.shape[-1], norm_weight.dtype)
+    module.pool_norm(
+        kv,
+        score,
+        pos,
+        raw_out_loc,
+        out_loc,
+        req,
+        state_kv,
+        state_score,
+        pad_row,
+        ring_size,
+        norm_weight,
+        norm_eps,
+        pooled,
+        group_pos,
+        slots,
+    )
+    return pooled, group_pos, slots
