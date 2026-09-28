@@ -303,3 +303,31 @@ Docker images for Ascend NPU are available in two types:
   if you need the latest features or bug fixes that have not yet been included in a stable release.
 
 If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
+
+## 9. Diagnosing pinned Host memory allocation failures (207001)
+
+When a traceback ends in `CachingHostAllocator` / `aclrtMallocHostWithCfg`, the
+failed request is for pinned **Host** memory, not NPU device memory. To collect
+per-process evidence while running the same NPU test or server command, enable:
+
+```bash
+export SGLANG_NPU_PINNED_HOST_DEBUG=1
+```
+
+The flag is off by default. It records a before/after snapshot for large
+HiCache Host pool allocations and samples the smaller `async_d2h` and
+`prepare_mlp_sync_batch` allocations once every 30 seconds per call site.
+Failures are always logged. Each record includes the PID, rank environment
+identifiers when set, requested
+bytes (when known), allocator active and reserved bytes, process RSS, physical
+`MemAvailable`, and cgroup v2 `memory.current` / `memory.max` when available.
+The flag only adds diagnostics; it does not change the allocation or copy path.
+
+Compare the records from **all ranks**, not only the rank that reports the
+error. A large gap between `pinned_reserved_bytes` and `pinned_active_bytes`
+points to cached blocks retained by the allocator. High active bytes point to
+live Host tensors. If both are low when the driver rejects an allocation,
+inspect other processes, NUMA memory, and Ascend plog for driver-side limits.
+The host-memory availability estimate alone cannot establish which limit was
+hit. For HiCache, repeat on the same runner with a smaller `--hicache-size` to
+separate large-pool pressure from other causes.

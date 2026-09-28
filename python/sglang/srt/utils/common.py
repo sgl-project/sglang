@@ -108,6 +108,10 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
+from sglang.srt.utils.npu_pinned_host_diagnostics import (
+    npu_pinned_host_debug_enabled,
+    trace_npu_pinned_host_allocation,
+)
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -563,7 +567,15 @@ def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     """Enqueue a CUDA-to-pinned-host copy on the current stream."""
     if not tensor.is_cuda:
         return tensor.to("cpu", non_blocking=True)
-    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    if tensor.device.type == "npu" and npu_pinned_host_debug_enabled():
+        with trace_npu_pinned_host_allocation(
+            "async_d2h",
+            requested_bytes=tensor.numel() * tensor.element_size(),
+            details={"shape": tuple(tensor.shape), "dtype": str(tensor.dtype)},
+        ):
+            host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    else:
+        host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
     tensor.record_stream(torch.cuda.current_stream(tensor.device))
     return host
