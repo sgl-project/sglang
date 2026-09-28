@@ -1963,16 +1963,14 @@ class KVCache(abc.ABC):
     requires_physical_write_loc = False
 
     def _check_physical_write_loc(self, loc_info, where: str) -> None:
-        if not self.requires_physical_write_loc:
-            return
-        if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
-            return
-        assert write_loc_is_physical(loc_info), (
-            f"{where}: write loc is not marked physical. Hand the pool "
-            "KVWriteLoc.for_batch(forward_batch) after "
-            "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, physical=True) "
-            "for ids translated separately."
-        )
+        # A flag read, no device sync: cheap enough to run on every write.
+        if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
+            raise ValueError(
+                f"{where}: write loc is not marked physical. Hand the pool "
+                "KVWriteLoc.for_batch(forward_batch) after "
+                "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, "
+                "physical=True) for ids translated separately."
+            )
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:

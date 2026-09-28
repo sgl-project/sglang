@@ -17,8 +17,7 @@ Under the token-major views a virtual id is in range and, by value, the same
 kind of integer as a physical one, so a unified pool cannot tell a skipped
 rebind from a translated loc by looking at it. `rebind_write_loc` marks the
 batch's loc physical, producers carry the mark in `KVWriteLoc`, composites
-forward it, and the unified write doors refuse a loc without it (under
-SGLANG_ENABLE_ASYNC_ASSERT).
+forward it, and the unified write doors refuse a loc without it.
 
     python -m pytest test/registered/unit/mem_cache/test_physical_write_loc.py -v
 """
@@ -31,7 +30,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
@@ -167,22 +165,13 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         layer = SimpleNamespace(layer_id=0)
         loc = torch.tensor([3, 4], dtype=torch.int64, device=_DEV)
         k, v = self._kv()
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
-            with self.assertRaisesRegex(AssertionError, "not marked physical"):
-                pool.set_kv_buffer(layer, loc, k, v)
-            with self.assertRaisesRegex(AssertionError, "not marked physical"):
-                pool.set_kv_buffer(layer, KVWriteLoc(loc), k, v)
-            pool.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+        with self.assertRaisesRegex(ValueError, "not marked physical"):
+            pool.set_kv_buffer(layer, loc, k, v)
+        with self.assertRaisesRegex(ValueError, "not marked physical"):
+            pool.set_kv_buffer(layer, KVWriteLoc(loc), k, v)
+        pool.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
         self.assertTrue(torch.all(pool.k_buffer[0][3] == 1))
         self.assertTrue(torch.all(pool.v_buffer[0][4] == 2))
-
-    def test_check_is_gated_by_the_async_assert_env(self):
-        pool = _unified_mha_pool()
-        loc = torch.tensor([3], dtype=torch.int64, device=_DEV)
-        k, v = self._kv(1)
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False):
-            pool.set_kv_buffer(SimpleNamespace(layer_id=1), loc, k, v)
-        self.assertTrue(torch.all(pool.k_buffer[1][3] == 1))
 
     def test_plain_pool_ignores_the_mark(self):
         pool = MHATokenToKVPool(
@@ -197,8 +186,7 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         )
         loc = torch.tensor([2], dtype=torch.int64, device=_DEV)
         k, v = self._kv(1)
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
-            pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, k, v)
+        pool.set_kv_buffer(SimpleNamespace(layer_id=0), loc, k, v)
         self.assertTrue(torch.all(pool.k_buffer[0][2] == 1))
 
     def test_swa_composite_forwards_the_mark(self):
@@ -224,12 +212,11 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         pool = b.token_to_kv_pool
         loc = torch.tensor([2, 3], dtype=torch.int64, device=_DEV)
         k, v = self._kv()
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
-            for layer_id in (0, 1):  # a full layer and a swa layer
-                layer = SimpleNamespace(layer_id=layer_id)
-                with self.assertRaisesRegex(AssertionError, "not marked physical"):
-                    pool.set_kv_buffer(layer, KVWriteLoc(loc, loc), k, v)
-                pool.set_kv_buffer(layer, KVWriteLoc(loc, loc, physical=True), k, v)
+        for layer_id in (0, 1):  # a full layer and a swa layer
+            layer = SimpleNamespace(layer_id=layer_id)
+            with self.assertRaisesRegex(ValueError, "not marked physical"):
+                pool.set_kv_buffer(layer, KVWriteLoc(loc, loc), k, v)
+            pool.set_kv_buffer(layer, KVWriteLoc(loc, loc, physical=True), k, v)
 
 
 # --------------------------------------------------------------------------
