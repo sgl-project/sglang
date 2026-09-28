@@ -1575,6 +1575,9 @@ class Envs:
     # into the paged-decode epilogue (decode/verify). No-op when
     # SGLANG_OPT_FP8_WO_A_FUSED_INVROPE is in effect (its quant already rotates).
     SGLANG_OPT_DSV4_DECODE_FUSED_INVROPE = EnvBool(False)
+    # With the fold above and the ROCm fp8 wo_a GEMM: the same epilogue also emits
+    # the wo_a mxfp8 activation (fp8 o + e8m0 scales), dropping the quant kernel.
+    SGLANG_OPT_DSV4_DECODE_FUSED_WO_A_QUANT = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
     # Emits MXFP8 when wo_b supports it, otherwise BF16.

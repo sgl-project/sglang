@@ -174,15 +174,18 @@ def apply_wo_a_fp8_mxscale(
     o: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    o_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """fp8 ``wo_a``: quantize [T, G, D] then batched-GEMM against [G, R, D].
 
     ``weight_scale`` is the uint8 e8m0 [G, R/128, D/128] tensor produced at load
     time by ``wo_a_weight_scale_to_e8m0``. Returns bf16 [T, G, R].
+    With ``o_scale`` ([T, G, D/128] uint8 e8m0), ``o`` is already quantized fp8.
     """
-    o_fp8, o_scale = quant_wo_a_act_mxfp8(o)
+    if o_scale is None:
+        o, o_scale = quant_wo_a_act_mxfp8(o)
     return _batched_gemm_a8w8_mxscale(
-        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
+        o, weight, o_scale, weight_scale, dtype=torch.bfloat16
     )
 
 

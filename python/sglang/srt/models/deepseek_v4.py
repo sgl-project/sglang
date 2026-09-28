@@ -2332,6 +2332,14 @@ class MQALayer(MqaAttentionBase):
             and not wo_a_rotates
             and unified_decode_fuses_inv_rope(forward_batch.forward_mode)
         )
+        # ...and also already mxfp8-quantized for the aiter wo_a GEMM below.
+        attn_quantized = (
+            attn_rotated
+            and self.wo_a_fp8
+            and _wo_a_fp8_mxscale is not None
+            and envs.SGLANG_OPT_DSV4_DECODE_FUSED_WO_A_QUANT.get()
+        )
+        o_scale = None
         if unified:
             # only the HIP radix backend takes these two; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2346,6 +2354,13 @@ class MQALayer(MqaAttentionBase):
                 rope_kwargs["inv_rope_freqs"] = torch.view_as_real(
                     self.freqs_cis
                 ).flatten(-2)
+            if attn_quantized:
+                # e8m0 scales of the [T, G, D] wo_a activation: [T, G, D/128]
+                o_scale = x.new_empty(
+                    (x.shape[0], self.n_local_heads * self.head_dim // 128),
+                    dtype=torch.uint8,
+                ).view(x.shape[0], self.n_local_groups, -1)
+                rope_kwargs["out_scale"] = o_scale
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -2467,6 +2482,7 @@ class MQALayer(MqaAttentionBase):
                     o,
                     self.wo_a.weight.view(G, self.o_lora_rank, D),
                     self.wo_a.weight_scale_inv.data,
+                    o_scale=o_scale,
                 )
             elif self.wo_a_fp8:
                 import deep_gemm
