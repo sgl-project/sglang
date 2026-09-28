@@ -15,21 +15,22 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
         .wait()
 }
 
-/// Events into the TokenizerManager request loop. API server + tokenizer pool
-/// share this one inbox, keeping the loop a single consumer (no `select`).
+/// Events into the TokenizerManager request loop. API server, tokenizer pool
+/// and MM pool share this one inbox, keeping the loop a single consumer (no
+/// `select`). Both pools take the whole `Request`, advance its FSM, and hand
+/// it back; `drive` re-dispatches on the state.
 pub enum TmEvent {
     /// A freshly received request from the API server.
     Intake(Request),
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled)
-    /// on success, or `Failed` on a tokenize error. `drive` handles both.
+    /// or `Encoding` (multimodal prompt) on success, `Failed` on a tokenize
+    /// error.
     Tokenized(Request),
-    /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
-    /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
-    /// result store (`Server.take_mm_result`), not this event.
-    MmEncoded { rid: Rid, input_ids: Vec<i32> },
-    /// An MM worker rejected a request parked in `Encoding` (bad media URL,
-    /// unsupported modality, preprocess error, …).
-    MmFailed { rid: Rid, message: String },
+    /// A request back from the MM pool: `PreSendValidating` with the final
+    /// placeholder-expanded `input_ids` and the feature buffers (inline or
+    /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
+    /// preprocess error, ...).
+    Encoded(Request),
 }
 
 /// The source of the abort request. Both variants do the same work in

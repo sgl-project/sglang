@@ -30,7 +30,7 @@ const READINESS_READY: u8 = 1;
 const READINESS_DRAINING: u8 = 2;
 
 /// Routing implementation used by the standard chat-completions endpoint.
-/// Reorg configuration is installed explicitly until its CLI factory is available.
+/// `--chat-routing reorg` builds resolvers with the selected reorg policy.
 #[derive(Debug, Default)]
 pub enum ChatRouting {
     #[default]
@@ -196,6 +196,7 @@ impl AppContext {
                     fused: None,
                     eligibility: None,
                     sampling_overrides: Default::default(),
+                    default_chat_template_kwargs: Default::default(),
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
