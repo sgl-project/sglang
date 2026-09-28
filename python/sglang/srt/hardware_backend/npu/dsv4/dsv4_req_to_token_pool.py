@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -89,6 +90,14 @@ class DSV4ReqToTokenTablesMixin:
         Prefix matching can happen before a request slot is allocated, so the
         page ids are temporarily carried by ``Req`` and installed by ``alloc``.
         """
+        if envs.SGLANG_DEBUG_MTE_TRACE.get():
+            import time
+
+            print(
+                f"[mte.radix] t={time.time():.3f} install_prefix "
+                f"npages={page_ids.numel()} holds_kv={req.kv.holds_kv}",
+                flush=True,
+            )
         if not req.kv.holds_kv:
             req.c128_prefix_page_ids = page_ids
             return
