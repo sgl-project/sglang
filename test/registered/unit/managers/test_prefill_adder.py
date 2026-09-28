@@ -25,8 +25,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
-    SWAPrefillBudget,
     SharedSWAPrefillBudget,
+    SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
