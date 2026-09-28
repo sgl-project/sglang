@@ -196,6 +196,7 @@ class TestDisaggregationWire(unittest.TestCase):
                                 dst_state_layer_ids=[layer_ids, layer_ids],
                                 dst_attn_tp_size=1,
                                 dst_aux_ptrs=[0x6000],
+                                dst_aux_item_lens=[8],
                             )
                         )
                         queue.put(
@@ -380,8 +381,110 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
         self.assertEqual(info.dst_kv_item_lens, [])
+        self.assertIsNone(info.dst_aux_item_lens)
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertIsNone(info.dst_aux_item_lens)
+        info = KVArgsRegisterInfo.from_zmq(
+            msg + [b"", struct.pack("Q", 128), struct.pack("Q", 4096)]
+        )
+        self.assertEqual(info.dst_aux_item_lens, [4096])
+
+    def test_aux_buffer_validation_checks_each_buffer_stride(self):
+        manager = object.__new__(CommonKVManager)
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0x1000, 0x2000], aux_item_lens=[64, 128]
+        )
+        manager.validate_aux_buffers([0x3000, 0x4000], [64, 128])
+        for local_lens, dst_ptrs, dst_lens in (
+            ([64, 128], [0x3000, 0x4000], [64, 64]),
+            ([64, 128], [0x3000, 0x4000], [64, 256]),
+            ([64, 128], [0x3000, 0x4000], [128, 64]),
+            ([64, 128], [0x3000], [64]),
+            ([64, 128], [0x3000, 0x4000], [64]),
+            ([64, 128], [0x3000, 0x4000], []),
+            ([64], [0x3000, 0x4000], [64]),
+            ([64, 128], [0x3000, 0x4000], None),
+        ):
+            with self.subTest(local_lens=local_lens, dst_lens=dst_lens):
+                manager.kv_args.aux_item_lens = local_lens
+                with self.assertRaisesRegex(
+                    ValueError, "metadata buffer layout mismatch"
+                ):
+                    manager.validate_aux_buffers(dst_ptrs, dst_lens)
+
+    def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0x1000], aux_item_lens=[64], kv_data_ptrs=[0x2000]
+        )
+        manager.enable_trace = manager.enable_staging = False
+        manager.enable_deferred_decode_kv_release = False
+        manager.bootstrap_port = 1234
+        manager.failure_lock = manager.session_lock = threading.Lock()
+        manager.failure_records = {}
+        manager.failed_sessions = set()
+        manager._staging_outstanding = defaultdict(int)
+        manager.req_to_decode_prefix_len = {}
+        manager.request_status = {room: KVPoll.WaitingForInput for room in (21, 22)}
+        manager.transfer_infos = {
+            room: {
+                str(room): TransferInfo(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=5555,
+                    mooncake_session_id=str(room),
+                    dst_kv_indices=np.array([], dtype=np.int32),
+                    dst_aux_index=0,
+                    dst_state_indices=[],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+            for room in (21, 22)
+        }
+        manager.decode_kv_args_table = {
+            str(room): SimpleNamespace(
+                dst_aux_ptrs=[0x3000],
+                dst_aux_item_lens=[32 if room == 21 else 64],
+                requires_dcp_relayout=False,
+            )
+            for room in (21, 22)
+        }
+        manager._prefill_unique_rank = Mock(return_value=0)
+        manager._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
+        manager.send_kv_status_message = Mock()
+        manager.send_aux = Mock(return_value=0)
+        chunks = [
+            TransferKVChunk(
+                room=room,
+                prefill_kv_indices=np.array([], dtype=np.int32),
+                index_slice=slice(0, 0),
+                is_last_chunk=True,
+                chunk_id=0,
+                prefill_aux_index=0,
+                state_indices=None,
+            )
+            for room in (21, 22)
+        ]
+
+        manager.transfer_worker(
+            SimpleNamespace(get=Mock(side_effect=[*chunks, None])), None
+        )
+
+        self.assertEqual(manager.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", manager.failure_records[21])
+        self.assertEqual(manager.request_status[22], KVPoll.Success)
+        manager.send_aux.assert_called_once()
+        self.assertEqual(manager.send_aux.call_args.args[0].room, 22)
+        self.assertEqual(
+            [
+                call.kwargs["status"]
+                for call in manager.send_kv_status_message.call_args_list
+            ],
+            [KVPoll.Failed, KVPoll.Success],
+        )
+        self.assertEqual(dict(manager._staging_outstanding), {})
 
     def test_int_lists_roundtrip(self):
         cases = [
