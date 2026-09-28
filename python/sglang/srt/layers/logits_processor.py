@@ -374,7 +374,7 @@ class LogitsMetadata:
         if forward_batch.forward_mode.is_draft_extend_v2():
             draft_extend_select_index = forward_batch.spec_info.select_index
         else:
-            draft_extend_select_index = None
+            draft_extend_select_index = forward_batch.mixed_logits_select_index
 
         return cls(
             forward_mode=forward_mode,
@@ -634,6 +634,8 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            # Verify-merged mixed step: explicit row selection.
+            or logits_metadata.draft_extend_select_index is not None
         ):
             draft_extend_select_index = logits_metadata.draft_extend_select_index
             if draft_extend_select_index is not None:

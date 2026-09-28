@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
@@ -624,6 +625,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of forward passes categorized by CUDA graph.",
             labelnames=list(labels.keys()) + ["mode"],
         )
+        if envs.SGLANG_DSPARK_VERIFY_MERGED_MIXED.get():
+            self.mixed_verify_steps_total = Counter(
+                name="sglang:mixed_verify_steps_total",
+                documentation="Total number of verify-merged mixed steps (DSPARK).",
+                labelnames=labels.keys(),
+            )
 
         # =================================================================
         # LoRA pool metrics (only created when LoRA is enabled)
@@ -1282,6 +1289,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
         mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_mixed_verify_step(self) -> None:
+        self.mixed_verify_steps_total.labels(**self.labels).inc(1)
 
     def increment_eplb_balancedness(
         self, forward_mode: str, balancedness: float

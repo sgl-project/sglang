@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
@@ -917,6 +919,44 @@ class SchedulerBatchResultProcessor:
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
+
+    def process_batch_result_mixed(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        """Verify-merged mixed step: rows [0, n) are prefill rows (one sampled
+        token each), rows [n, bs) verify rows (accept_lens, stride W). Split the
+        batch and result positionally and run the prefill / decode processors."""
+        n = batch.num_prefill_rows
+        if get_observability().enable_metrics:
+            self.metrics_collector.increment_mixed_verify_step()
+
+        pre = copy.copy(batch)
+        pre.reqs = batch.reqs[:n]
+        pre.forward_mode = ForwardMode.EXTEND
+        pre.decoding_reqs = None
+        pre.num_prefill_rows = None
+        pre.extend_lens = batch.extend_lens[:n]
+        pre.prefix_lens = batch.prefix_lens[:n]
+        r_pre = copy.copy(result)
+        r_pre.next_token_ids = result.next_token_ids[:n]
+        r_pre.accept_lens = r_pre.block_accept_lens = r_pre.cap_lens = None
+        self.process_batch_result_prefill(pre, r_pre)
+
+        dec = copy.copy(batch)
+        dec.reqs = batch.reqs[n:]
+        dec.forward_mode = ForwardMode.DECODE
+        dec.decoding_reqs = None
+        dec.num_prefill_rows = None
+        r_dec = copy.copy(result)
+        r_dec.next_token_ids = result.next_token_ids[n:]
+        self.process_batch_result_decode(dec, r_dec)
+        # The scheduler's step stats read the decode-side counters.
+        result.num_correct_drafts = r_dec.num_correct_drafts
+        result.num_correct_drafts_per_req_cpu = r_dec.num_correct_drafts_per_req_cpu
+        result.num_block_accept_tokens = r_dec.num_block_accept_tokens
+        result.num_cap_tokens = r_dec.num_cap_tokens
 
     def process_batch_result_decode(
         self,

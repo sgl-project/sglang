@@ -1067,6 +1067,7 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    hoist_prefill_shared_reads: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1078,7 +1079,7 @@ class DeepseekV4AttnBackend(
             return SharedReadEnds.POST_REPLAY
         metadata = self.forward_metadata
         if (
-            fm == ForwardMode.EXTEND
+            fm in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and isinstance(metadata, DSV4Metadata)
             and metadata.prefill_shared_reads_snapshotted
         ):
@@ -1195,6 +1196,15 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        # Verify-merged mixed step + WAR fast path: breakable prefill replays also
+        # finish their scheduler-shared reads at replay prep (hoisted SWA slots).
+        from sglang.srt.arg_groups.validation_hook import verify_merged_mixed_enabled
+
+        self.hoist_prefill_shared_reads = (
+            not model_runner.is_draft_worker
+            and envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            and verify_merged_mixed_enabled(model_runner.server_args)
+        )
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -1404,6 +1414,10 @@ class DeepseekV4AttnBackend(
             if need_compress and self.has_c4
             else None
         )
+        mixed = (
+            forward_batch is not None
+            and forward_batch.mixed_num_prefill_tokens is not None
+        )
         if not need_compress:
             create = _create_dummy_paged_compress_data
         else:
@@ -1427,6 +1441,20 @@ class DeepseekV4AttnBackend(
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
+                        online_state_slot_offset=online_c128_state_slot_offset,
+                    )
+                if mixed:
+                    # The verify rows' host lengths are an upper bound; plan
+                    # from the exact device lengths.
+                    return create_paged_compressor_data(
+                        compress_ratio=compress_ratio,
+                        is_prefill=True,
+                        token_to_kv_pool=self.token_to_kv_pool,
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        seq_lens=seq_lens,
+                        extend_lens=extend_seq_lens,
+                        num_q_tokens=num_tokens,
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
                 return create_paged_compressor_data(
@@ -2346,9 +2374,12 @@ class DeepseekV4AttnBackend(
             return
         if isinstance(metadata, DSV4Metadata):
             metadata.prefill_shared_reads_snapshotted = False
+        mixed_t = getattr(forward_batch, "mixed_num_prefill_tokens", None)
         snapshot_shared_prefill_reads = (
             envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and (
+                forward_batch.forward_mode == ForwardMode.EXTEND or mixed_t is not None
+            )
             and self.model_runner.spec_algorithm.is_dflash_family()
             and not is_cp_active(forward_batch)
         )
@@ -2366,8 +2397,11 @@ class DeepseekV4AttnBackend(
             )
         )
         if use_sparse_prefill:
+            # A verify-merged mixed step runs sparse prefill on its prefill rows.
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
+                forward_batch,
+                metadata.core_attn_metadata,
+                num_qo_tokens=mixed_t or num_qo_tokens,
             )
         # Marked for dense prefill too: that path reads only core_attn_metadata,
         # which init_forward_metadata already snapshotted.
@@ -2385,10 +2419,13 @@ class DeepseekV4AttnBackend(
         # The chunk cache gathers the W-1 positions before the chunk; under the
         # tail those are late-layer window slots this prefill never wrote.
         assert self.forward_metadata.late_layer_tail is None
-        extend_seq_lens = forward_batch.extend_seq_lens
+        # Verify-merged mixed step: scope to the leading prefill rows.
+        rows = slice(forward_batch.mixed_num_prefill_rows)
+        extend_seq_lens = forward_batch.extend_seq_lens[rows]
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        seq_lens_cpu_list = seq_lens_cpu.tolist()
+        extend_seq_lens_cpu = extend_seq_lens_cpu[rows]
+        seq_lens_cpu_list = seq_lens_cpu[rows].tolist()
         total_swa = sum(
             min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
             for seq_len, extend_len in zip(
@@ -2412,11 +2449,11 @@ class DeepseekV4AttnBackend(
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens=forward_batch.seq_lens[rows].to(torch.int32),
             extend_seq_lens=extend_seq_lens.to(torch.int32),
             query_lens=query_lens,
             query_pos=query_pos,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_pool_indices=forward_batch.req_pool_indices[rows].to(torch.int32),
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
@@ -2549,6 +2586,18 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if (
+            self.hoist_prefill_shared_reads
+            and forward_batch.forward_mode.is_extend()
+            and self.token_to_kv_pool.request_window is None
+        ):
+            # The captured SWA stores read this per-graph buffer by address;
+            # replay prep refills it, so replay reads no shared mapping.
+            self.forward_metadata.core_attn_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                ).to(torch.int32)
+            )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
                 self._source_projection_buffers(
@@ -2606,6 +2655,17 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        swa_loc = capture_metadata.core_attn_metadata.swa_out_cache_loc
+        if self.hoist_prefill_shared_reads and swa_loc is not None:
+            # Translate the live slots; padded rows write the dummy slot 0.
+            live = forward_batch.out_cache_loc
+            swa_loc[: live.shape[0]].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(live)
+            )
+            swa_loc[live.shape[0] :].zero_()
+            self.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=live.shape[0]
+            )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -3379,6 +3439,7 @@ class DeepseekV4AttnBackend(
 
             # sparse_prefill_fwd does not support SM120. The tail stays dense: its
             # window floor lives in swa_page_indices, which the chunk cache ignores.
+            o_prefill = None
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not get_platform().is_sm120
@@ -3389,18 +3450,18 @@ class DeepseekV4AttnBackend(
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             ):
-                if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
-                    return self._forward_prefill_sparse_q8kv8(
-                        q=q,
-                        layer_id=layer_id,
-                        compress_ratio=compress_ratio,
-                        forward_batch=forward_batch,
-                        token_to_kv_pool=token_to_kv_pool,
-                        core_attn_metadata=core_attn_metadata,
-                        attn_sink=attn_sink,
-                    )
-                return self._forward_prefill_sparse(
-                    q=q,
+                # Verify-merged mixed step: the leading prefill rows take sparse
+                # prefill; the verify rows fall through to the in-place FP8 path
+                # below, as a target-verify step would.
+                mixed_t = forward_batch.mixed_num_prefill_tokens
+                split = mixed_t is not None and mixed_t < q.shape[0]
+                sparse_prefill = (
+                    self._forward_prefill_sparse_q8kv8
+                    if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+                    else self._forward_prefill_sparse
+                )
+                o_prefill = sparse_prefill(
+                    q=q[:mixed_t] if split else q,
                     layer_id=layer_id,
                     compress_ratio=compress_ratio,
                     forward_batch=forward_batch,
@@ -3408,6 +3469,14 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                 )
+                if not split:
+                    return o_prefill
+                q = q[mixed_t:]
+                swa_page_indices = swa_page_indices[mixed_t:]
+                swa_topk_lengths = swa_topk_lengths[mixed_t:]
+                if extra_indices is not None:
+                    extra_indices = extra_indices[mixed_t:]
+                    extra_topk_lengths = extra_topk_lengths[mixed_t:]
 
             if (
                 self.is_dsv41
@@ -3501,6 +3570,8 @@ class DeepseekV4AttnBackend(
                 )[0]
 
             o = o.squeeze(1)
+            if o_prefill is not None:
+                return torch.cat([o_prefill, o], dim=0)
             return o
 
         raise NotImplementedError("ragged attention")

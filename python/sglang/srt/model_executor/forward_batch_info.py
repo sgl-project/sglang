@@ -621,6 +621,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Verify-merged mixed step: logits rows to keep (each prefill row's last
+    # token + every verify position), and the leading prefill population
+    # (rows / tokens) for the attention split. None otherwise.
+    mixed_logits_select_index: Optional[torch.Tensor] = None
+    mixed_num_prefill_rows: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

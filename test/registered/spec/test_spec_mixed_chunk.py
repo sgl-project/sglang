@@ -9,10 +9,14 @@ spec seq_lens convention zeroed the tail's qo len - a hard crash on
 flashinfer, silent kv-span truncation elsewhere), unwritten relay rows
 read as tail inputs, and stale schedule-time tail state under overlap.
 Chunked prefill is set small so eval prompts span multiple chunks and
-mixing actually engages.
+mixing actually engages. The DSPARK cell also runs with
+SGLANG_DSPARK_VERIFY_MERGED_MIXED=1, where running requests draft and verify
+inside the mixed step instead.
 """
 
 import unittest
+
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported, kill_process_tree
@@ -32,7 +36,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=196, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=290, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3MixedChunk(
@@ -92,6 +96,7 @@ DSPARK_DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
 class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
     model = DSPARK_TARGET_MODEL
+    extra_args = ()
 
     gsm8k_num_questions = 200
     gsm8k_accuracy_thres = 0.80
@@ -126,6 +131,7 @@ class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
                 "--page-size",
                 "1",
                 "--cuda-graph-backend-prefill=disabled",
+                *cls.extra_args,
             ],
         )
 
@@ -133,6 +139,21 @@ class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
+
+
+class TestDSparkVerifyMergedMixedChunk(TestDSparkMixedChunk):
+    extra_args = ("--enable-metrics",)
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_DSPARK_VERIFY_MERGED_MIXED.override(True):
+            super().setUpClass()
+
+    def test_zz_verify_merged_steps_ran(self):
+        # Runs after the eval, whose concurrent requests mix prefill chunks
+        # with running (verifying) requests.
+        metrics = requests.get(f"{self.base_url}/metrics", timeout=30).text
+        self.assertRegex(metrics, r"sglang:mixed_verify_steps_total(\{[^}]*\})? [1-9]")
 
 
 if __name__ == "__main__":
