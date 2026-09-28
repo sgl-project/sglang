@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.parser.response_template import tool_close_token_ids
 from sglang.srt.runtime_context import (
     get_device,
     get_model,
@@ -155,6 +156,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             get_serving().disable_tokenizer_batch_decode
         )
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.tool_close_token_ids = tool_close_token_ids(
+            get_serving().tool_call_parser, self.tokenizer
+        )
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -212,6 +216,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 return output
             # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+                return output
+            if output[-1] in self.tool_close_token_ids:
                 return output
             assert len(output) > 0
             # NOTE: We can always assume the last token is the matched stop token

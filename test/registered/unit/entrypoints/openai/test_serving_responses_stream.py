@@ -19,6 +19,27 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{content}",
+                },
+            },
+        },
+    },
+}
+
+
 class NonHarmonyStreamTestCase(CustomTestCase):
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
@@ -142,6 +163,96 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             if payload.get("type") == "response.output_item.added"
         ]
         self.assertIn("function_call", added_kinds)
+
+    def test_truncated_response_template_call_is_incomplete_without_arguments(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "response_template"
+        serving.tokenizer_manager.tokenizer.response_template = RESPONSE_TEMPLATE
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        request._response_parser_prefix = "<assistant>"
+        chunk = engine_chunk('<call:get_weather>{"city":', finish=True)
+        chunk["meta_info"]["finish_reason"] = {"type": "length"}
+
+        events = StreamFixture(serving, request).run([chunk])
+        payloads = event_payloads(events)
+        deltas = "".join(
+            payload["delta"]
+            for payload in payloads
+            if payload["type"] == "response.function_call_arguments.delta"
+        )
+        terminal = payloads[-1]
+
+        self.assertEqual(deltas, "")
+        self.assertEqual(terminal["type"], "response.incomplete")
+        self.assertEqual(terminal["response"]["status"], "incomplete")
+        self.assertEqual(terminal["response"]["output"][0]["name"], "get_weather")
+        self.assertEqual(terminal["response"]["output"][0]["arguments"], "")
+        self.assertEqual(terminal["response"]["output"][0]["status"], "incomplete")
+
+    def test_required_native_parser_matches_full_response(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "hunyuan"
+        serving.tokenizer_manager.tokenizer.get_vocab.return_value = {"<tool_sep>": 1}
+        raw = (
+            "<tool_calls><tool_call>get_weather<tool_sep>"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "</tool_call></tool_calls>"
+        )
+        for choice in ("required", {"type": "function", "name": "get_weather"}):
+            with self.subTest(choice=choice):
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=False,
+                    tool_choice=choice,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                )
+                (full_item,) = serving._make_response_output_items(
+                    request,
+                    raw,
+                    serving.tokenizer_manager.tokenizer,
+                    require_reasoning=False,
+                )
+                events = StreamFixture(serving, request).run(
+                    [
+                        engine_chunk(raw[:i], i, finish=i == len(raw))
+                        for i in range(1, len(raw) + 1)
+                    ]
+                )
+                (stream_item,) = find_completed_event(events)["response"]["output"]
+                self.assertEqual(stream_item["type"], "function_call")
+                self.assertEqual(stream_item["name"], full_item.name)
+                self.assertEqual(stream_item["arguments"], full_item.arguments)
+                deltas = "".join(
+                    p["delta"]
+                    for p in event_payloads(events)
+                    if p["type"] == "response.function_call_arguments.delta"
+                )
+                self.assertEqual(deltas, full_item.arguments)
 
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (
