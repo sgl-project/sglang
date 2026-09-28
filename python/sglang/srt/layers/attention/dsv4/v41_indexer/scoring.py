@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 
 from .types import (
@@ -93,38 +94,42 @@ def get_index_k_cache(
     return k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
 
+def _index_q_and_weights(
+    *,
+    indexer: DeepseekV41Indexer,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
+    ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
+    rows, heads = x.shape[0], indexer.n_local_heads
+    q, _ = indexer.wq_b(q_lora)
+    q_fp4, q_sf, weights = index_q_rope_pack_weights(
+        q.view(rows, heads, indexer.index_head_dim),
+        torch.view_as_real(freqs_cis).flatten(-2),
+        positions,
+        indexer.head_weights_raw(x),
+        indexer.head_weight_scale,
+    )
+    return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
+
+
 def get_deep_gemm_decode_data(
     inputs: DecodeInputs, token_to_kv_pool: DeepSeekV4TokenToKVPool
 ) -> DeepGEMMDecodeData:
     indexer = inputs.indexer
-    x, q_lora, pos = inputs.x, inputs.q_lora, inputs.positions
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    if (
-        x.is_cuda
-        and torch.version.cuda is not None
-        and x.dtype == torch.bfloat16
-        and indexer.index_head_dim == 128
-    ):
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
-            index_q_rope_pack_weights,
-        )
-
-        q, _ = indexer.wq_b(q_lora)
-        q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
-        # The fused pack also computes head_weights(x).float(), same rounding.
-        q_fp4, q_sf, weights = index_q_rope_pack_weights(
-            q,
-            torch.view_as_real(inputs.freqs_cis).flatten(-2),
-            pos,
-            indexer.head_weights_raw(x),  # [bs, n_local] bf16, n32k5120
-            indexer.head_weight_scale,
-        )
-    else:
-        q = indexer.queries(q_lora, inputs.freqs_cis[pos])
-        q_fp4, q_sf = quantize_index_q(q)
-        weights = indexer.head_weights(x).float()  # [bs, n_local]
-    bs = q.shape[0]
+    q_fp4, q_sf, weights = _index_q_and_weights(
+        indexer=indexer,
+        x=inputs.x,
+        q_lora=inputs.q_lora,
+        freqs_cis=inputs.freqs_cis,
+        positions=inputs.positions,
+    )
+    bs = q_fp4.shape[0]
     q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
     q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
 
@@ -168,9 +173,13 @@ def get_deep_gemm_prefill_data(
     if not slot_chunks or num_tokens == 0:
         return None
     k_slots = torch.cat(slot_chunks)
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    q_fp4, q_sf = quantize_index_q(q)
-    weights = indexer.head_weights(inputs.x).float()
+    q_fp4, q_sf, weights = _index_q_and_weights(
+        indexer=indexer,
+        x=inputs.x,
+        q_lora=inputs.q_lora,
+        freqs_cis=inputs.freqs_cis,
+        positions=pos,
+    )
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     request_starts = torch.repeat_interleave(
         torch.tensor(starts, dtype=torch.int32, device=device),
