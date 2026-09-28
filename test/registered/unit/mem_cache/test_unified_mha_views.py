@@ -30,8 +30,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.page_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.layout.paged_view import paged_view
+from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,

@@ -17,12 +17,12 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import (
+from sglang.srt.mem_cache.layout.token_major import (
     ENTRY_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     build_dense_views,
-    build_page_major_mamba_views,
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -239,7 +239,7 @@ class TestMambaEnvelopeTransferAddressing(CustomTestCase):
             temporal_dtype=temporal_dtype,
         )
         raw = torch.zeros(max_slots * entry, dtype=torch.uint8)
-        conv_views, temporal_view = build_page_major_mamba_views(
+        conv_views, temporal_view = build_mamba_entry_views(
             raw,
             layer_num=layer_num,
             conv_state_shapes=conv_shapes,

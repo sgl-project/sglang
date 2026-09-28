@@ -36,12 +36,12 @@ from torch.profiler import record_function
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.page_major import (
+from sglang.srt.mem_cache.layout.token_major import (
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
     build_dense_views,
-    build_page_major_mamba_views,
+    build_mamba_entry_views,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -538,7 +538,7 @@ class UnifiedKVPool:
     def _build_mamba_views(
         self, spec: MambaSubPoolSpec, anchor_bytes: int, max_slots: int
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        return build_page_major_mamba_views(
+        return build_mamba_entry_views(
             self._raw,
             layer_num=spec.layer_num,
             conv_state_shapes=spec.conv_state_shapes,

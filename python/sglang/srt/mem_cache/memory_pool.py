@@ -60,8 +60,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 from sglang.srt.mem_cache.utils import (
@@ -587,7 +587,7 @@ class MambaPool:
                 # Page-granularity envelope layout (page_size==1 for state): all
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
-                # page_major.py). Only the standard CUDA Triton path is supported.
+                # token_major.py). Only the standard CUDA Triton path is supported.
                 assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
                     "envelope_layout mamba is only supported on the CUDA path"
                 )
@@ -602,7 +602,7 @@ class MambaPool:
                 self._raw = torch.zeros(
                     max_slots * entry_bytes, dtype=torch.uint8, device=device
                 )
-                conv_state, temporal_state = build_page_major_mamba_views(
+                conv_state, temporal_state = build_mamba_entry_views(
                     self._raw,
                     layer_num=num_mamba_layers,
                     conv_state_shapes=conv_state_shape,

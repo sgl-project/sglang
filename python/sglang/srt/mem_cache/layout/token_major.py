@@ -15,7 +15,7 @@ tensor with slot stride ``entry_bytes`` and storage offset
 ``anchor + part offset``, indexed by the PHYSICAL token id
 ``page * page_size + slot``. Parts may differ in row width (K vs V); only their
 offsets differ, never the stride. The Mamba state
-(``build_page_major_mamba_views``) uses the same per-slot entry at page size 1.
+(``build_mamba_entry_views``) uses the same per-slot entry at page size 1.
 
 These builders produce views into a raw ``uint8`` buffer; they hold no
 allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
@@ -173,7 +173,7 @@ def mamba_entry_bytes(
     return total
 
 
-def build_page_major_mamba_views(
+def build_mamba_entry_views(
     raw: torch.Tensor,
     *,
     layer_num: int,
