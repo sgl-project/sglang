@@ -27,6 +27,7 @@ from sglang.srt.parser.response_template import (
     validate_response_template_for_serving,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -156,7 +157,7 @@ def _collect_tool_stream(detector, chunks):
     return "".join(normal_parts), parsed_calls
 
 
-class TestResponseTemplateLoading(unittest.TestCase):
+class TestResponseTemplateLoading(CustomTestCase):
     def test_loads_response_template_from_tokenizer_config(self):
         tokenizer = SimpleNamespace(
             init_kwargs={"response_template": GEMMA4_RESPONSE_TEMPLATE}
@@ -218,7 +219,7 @@ class TestResponseTemplateLoading(unittest.TestCase):
         )
 
 
-class TestGemma4ResponseTemplateParity(unittest.TestCase):
+class TestGemma4ResponseTemplateParity(CustomTestCase):
     def test_non_streaming_reasoning_parity(self):
         for text in ("It will be sunny.", THINKING + "It will be sunny."):
             with self.subTest(text=text):
@@ -398,7 +399,7 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
                 )
 
 
-class TestResponseTemplateAdapters(unittest.TestCase):
+class TestResponseTemplateAdapters(CustomTestCase):
     def test_parser_prefix_request_state_is_private(self):
         requests = (
             ChatCompletionRequest(messages=[]),
