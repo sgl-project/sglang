@@ -330,6 +330,8 @@ pub struct ModelConfig {
     pub eligibility: Option<EligibilityConfig>,
     /// Fleet sampling defaults and conflict behavior. See [`SamplingOverrides`].
     pub sampling_overrides: SamplingOverrides,
+    /// Worker `--default-chat-template-kwargs`, applied when rendering.
+    pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
 }
 
 /// External KV Indexer client settings.
