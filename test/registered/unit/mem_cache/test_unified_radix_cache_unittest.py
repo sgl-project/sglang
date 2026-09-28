@@ -1480,6 +1480,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
     flush_pending_backups when SGLANG_HICACHE_BACKUP_NODES_PER_STEP > 0."""
 
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+    seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
 
     def _build(self, nodes_per_step, cfg=None):
         cfg = cfg or self.cfg
@@ -1505,95 +1506,12 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         cache.insert(
             InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
         )
-
-    def _leaf_for(self, cache, tokens):
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertNotEqual(match.last_device_node, cache.root_node_handle())
         return match.last_device_node
 
     def _full_lock(self, cache, node):
         return cache.tree_core.get_component_device_lock_ref(node, ComponentType.FULL)
-
-    def test_insert_queues_a_locked_node_and_flush_backs_it_up(self):
-        cache, allocator = self._build(nodes_per_step=8)
-        self._insert(cache, allocator, [1, 2, 3, 4])
-        node = self._leaf_for(cache, [1, 2, 3, 4])
-        self.assertEqual(list(cache.queued_backups), [node])
-        self.assertEqual(cache.ongoing_write_through, {})
-        self.assertFalse(cache.tree_core.is_backuped(node))
-        self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
-        self.assertEqual(self._full_lock(cache, node), 1)
-
-        cache.flush_pending_backups()
-        self.assertEqual(cache.queued_backups, {})
-        self.assertTrue(cache.tree_core.is_backuped(node))
-        self.assertEqual(list(cache.ongoing_write_through), [node])
-        self.assertEqual(cache.tree_core.get_write_through_pending_id(node), node)
-        self.assertEqual(self._full_lock(cache, node), 1)
-
-        cache.writing_check(write_back=True)
-        self.assertEqual(cache.ongoing_write_through, {})
-        self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
-        self.assertEqual(self._full_lock(cache, node), 0)
-        cache.sanity_check()
-
-    def test_per_step_cap_bounds_the_backups_one_flush_executes(self):
-        cache, allocator = self._build(nodes_per_step=2)
-        seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
-        for seq in seqs:
-            self._insert(cache, allocator, seq)
-        nodes = [self._leaf_for(cache, seq) for seq in seqs]
-        self.assertEqual(list(cache.queued_backups), nodes)
-
-        cache.flush_pending_backups()
-        self.assertEqual(list(cache.queued_backups), nodes[2:])
-        self.assertEqual(list(cache.ongoing_write_through), nodes[:2])
-
-        cache.flush_pending_backups()
-        self.assertEqual(cache.queued_backups, {})
-        cache.writing_check(write_back=True)
-        self.assertTrue(all(cache.tree_core.is_backuped(node) for node in nodes))
-        self.assertTrue(all(self._full_lock(cache, node) == 0 for node in nodes))
-        cache.sanity_check()
-
-    def test_split_of_a_queued_node_queues_the_new_parent_through_the_next_chain(self):
-        cache, allocator = self._build(nodes_per_step=8)
-        self._insert(cache, allocator, [1, 2, 3, 4])
-        node = self._leaf_for(cache, [1, 2, 3, 4])
-        # Split the queued node before its backup ran: [1, 2] becomes the parent,
-        # and the new leaf's BackupKV chain queues that parent ahead of the leaf.
-        self._insert(cache, allocator, [1, 2, 5, 6])
-        queued = list(cache.queued_backups)
-        self.assertEqual(queued[0], node)
-        self.assertEqual(
-            [_node_token_ids(cache, n) for n in queued], [[3, 4], [1, 2], [5, 6]]
-        )
-        self.assertFalse(cache.tree_core.is_backuped(queued[1]))
-
-        cache.flush_pending_backups()
-        cache.writing_check(write_back=True)
-        self.assertTrue(all(cache.tree_core.is_backuped(n) for n in queued))
-        self.assertTrue(
-            all(cache.tree_core.get_write_through_pending_id(n) is None for n in queued)
-        )
-        self.assertTrue(all(self._full_lock(cache, n) == 0 for n in queued))
-        self.assertEqual(cache.ongoing_write_through, {})
-        cache.sanity_check()
-
-    def test_host_alloc_failure_drops_the_queued_backup_and_releases_its_lock(self):
-        cache, allocator = self._build(nodes_per_step=8)
-        self._insert(cache, allocator, [1, 2, 3, 4])
-        node = self._leaf_for(cache, [1, 2, 3, 4])
-        with mock.patch.object(
-            cache.cache_controller.mem_pool_host, "alloc", return_value=None
-        ):
-            cache.flush_pending_backups()
-        self.assertEqual(cache.queued_backups, {})
-        self.assertEqual(cache.ongoing_write_through, {})
-        self.assertFalse(cache.tree_core.is_backuped(node))
-        self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
-        self.assertEqual(self._full_lock(cache, node), 0)
-        cache.sanity_check()
 
     def _host_alloc_calls(self, cache, failures=0):
         """Count KV host allocations; the first `failures` calls return None."""
@@ -1603,9 +1521,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
 
         def counted(*args, **kwargs):
             calls.append(args)
-            if len(calls) <= failures:
-                return None
-            return alloc(*args, **kwargs)
+            return None if len(calls) <= failures else alloc(*args, **kwargs)
 
         self.addCleanup(setattr, host_pool, "alloc", alloc)
         host_pool.alloc = counted
@@ -1621,31 +1537,74 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         self.assertEqual(cache.ongoing_write_through, {})
         cache.sanity_check()
 
-    def test_flush_backs_up_disjoint_queued_nodes_with_one_host_allocation(self):
+    def test_insert_queues_a_locked_node_and_flush_backs_it_up(self):
         cache, allocator = self._build(nodes_per_step=8)
-        seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
-        for seq in seqs:
-            self._insert(cache, allocator, seq)
-        nodes = [self._leaf_for(cache, seq) for seq in seqs]
+        node = self._insert(cache, allocator, [1, 2, 3, 4])
+        self.assertEqual(list(cache.queued_backups), [node])
+        self.assertEqual(cache.ongoing_write_through, {})
+        self.assertFalse(cache.tree_core.is_backuped(node))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
+        self.assertEqual(self._full_lock(cache, node), 1)
+
+        cache.flush_pending_backups()
+        self.assertEqual(cache.queued_backups, {})
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertEqual(list(cache.ongoing_write_through), [node])
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(node), node)
+        self.assertEqual(self._full_lock(cache, node), 1)
+        self._assert_all_backed_up(cache, [node])
+
+    def test_flush_batches_queued_nodes_up_to_the_per_step_cap(self):
+        cache, allocator = self._build(nodes_per_step=2)
+        nodes = [self._insert(cache, allocator, seq) for seq in self.seqs]
+        self.assertEqual(list(cache.queued_backups), nodes)
         calls = self._host_alloc_calls(cache)
 
+        # The cap admits two nodes, which share one host allocation and one ack.
         cache.flush_pending_backups()
         self.assertEqual(len(calls), 1)
-        self.assertEqual(cache.cache_controller.ack_write_queue[-1].node_ids, nodes)
-        self._assert_all_backed_up(cache, nodes)
-
-    def test_batch_allocation_failure_falls_back_to_node_by_node(self):
-        cache, allocator = self._build(nodes_per_step=8)
-        seqs = ([1, 2, 3, 4], [5, 6, 7, 8])
-        for seq in seqs:
-            self._insert(cache, allocator, seq)
-        nodes = [self._leaf_for(cache, seq) for seq in seqs]
-        # Only the merged allocation fails; the per-node retries succeed.
-        calls = self._host_alloc_calls(cache, failures=1)
+        self.assertEqual(list(cache.queued_backups), nodes[2:])
+        self.assertEqual(cache.cache_controller.ack_write_queue[-1].node_ids, nodes[:2])
 
         cache.flush_pending_backups()
-        self.assertEqual(len(calls), 1 + len(nodes))
+        self.assertEqual(cache.queued_backups, {})
         self._assert_all_backed_up(cache, nodes)
+
+    def test_split_of_a_queued_node_queues_the_new_parent_through_the_next_chain(self):
+        cache, allocator = self._build(nodes_per_step=8)
+        node = self._insert(cache, allocator, [1, 2, 3, 4])
+        # Split the queued node before its backup ran: [1, 2] becomes the parent,
+        # and the new leaf's BackupKV chain queues that parent ahead of the leaf.
+        self._insert(cache, allocator, [1, 2, 5, 6])
+        queued = list(cache.queued_backups)
+        self.assertEqual(queued[0], node)
+        self.assertEqual(
+            [_node_token_ids(cache, n) for n in queued], [[3, 4], [1, 2], [5, 6]]
+        )
+        self.assertFalse(cache.tree_core.is_backuped(queued[1]))
+
+        cache.flush_pending_backups()
+        self._assert_all_backed_up(cache, queued)
+
+    def test_failed_batch_allocation_retries_node_by_node(self):
+        # 1 failure: only the merged allocation fails and both retries succeed.
+        # 3 failures: the retries fail too, so both nodes drop and unlock.
+        for failures in (1, 3):
+            with self.subTest(failures=failures):
+                cache, allocator = self._build(nodes_per_step=8)
+                nodes = [self._insert(cache, allocator, seq) for seq in self.seqs[:2]]
+                calls = self._host_alloc_calls(cache, failures=failures)
+
+                cache.flush_pending_backups()
+                self.assertEqual(len(calls), 3)
+                if failures == 1:
+                    self._assert_all_backed_up(cache, nodes)
+                    continue
+                self.assertEqual(cache.queued_backups, {})
+                self.assertEqual(cache.ongoing_write_through, {})
+                self.assertFalse(any(cache.tree_core.is_backuped(n) for n in nodes))
+                self.assertTrue(all(self._full_lock(cache, n) == 0 for n in nodes))
+                cache.sanity_check()
 
     def test_child_in_the_swa_window_of_a_batched_parent_is_backed_up_after_it(self):
         # The child's SWA window reaches into the parent, so batching both would
@@ -1658,10 +1617,8 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
             max_context_len=64,
         )
         cache, allocator = self._build(nodes_per_step=8, cfg=cfg)
-        self._insert(cache, allocator, [1, 2, 3, 4])
-        parent = self._leaf_for(cache, [1, 2, 3, 4])
-        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
-        child = self._leaf_for(cache, [1, 2, 3, 4, 5, 6])
+        parent = self._insert(cache, allocator, [1, 2, 3, 4])
+        child = self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
         self.assertEqual(list(cache.queued_backups), [parent, child])
 
         cache.flush_pending_backups()
@@ -1673,8 +1630,7 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
 
     def test_default_cap_backs_up_at_insert_time(self):
         cache, allocator = self._build(nodes_per_step=0)
-        self._insert(cache, allocator, [1, 2, 3, 4])
-        node = self._leaf_for(cache, [1, 2, 3, 4])
+        node = self._insert(cache, allocator, [1, 2, 3, 4])
         self.assertEqual(cache.queued_backups, {})
         self.assertTrue(cache.tree_core.is_backuped(node))
         self.assertEqual(list(cache.ongoing_write_through), [node])

@@ -386,9 +386,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        # Write-through backups accepted at insert time (each node locked so it
-        # stays device-resident) and executed in batches by flush_pending_backups,
-        # at most the per-step cap per step; ancestors before children.
+        # Locked write-through nodes awaiting flush_pending_backups, ancestors first.
         self.queued_backups: dict[NodeId, Optional[DecLockRefParams]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
@@ -1632,24 +1630,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Back disjoint nodes up with one host allocation per pool and one D->H
         op, then commit and track each node. Returns the Full KV tokens written,
         or None when the host allocation failed (the nodes' locks stay held)."""
-        device_value = specs[0].device_value
-        comp_xfers = specs[0].comp_xfers
-        parts: dict[tuple[ComponentType, PoolName], list[PoolTransfer]] = {}
-        merged: dict[tuple[ComponentType, PoolName], PoolTransfer] = {}
-        if len(specs) > 1:
-            device_value = torch.cat([spec.device_value for spec in specs])
-            for spec in specs:
-                for component_type, transfers in spec.comp_xfers.items():
-                    for transfer in transfers:
-                        key = (component_type, transfer.name)
-                        parts.setdefault(key, []).append(transfer)
-            comp_xfers = {}
-            for key, transfers in parts.items():
-                merged[key] = PoolTransfer(
-                    name=key[1],
-                    device_indices=torch.cat([t.device_indices for t in transfers]),
-                )
-                comp_xfers.setdefault(key[0], []).append(merged[key])
+        device_value, comp_xfers, groups = self._merge_backup_transfers(specs)
         host_indices = self._execute_kv_backup(
             [spec.node_id for spec in specs],
             device_value,
@@ -1659,10 +1640,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if host_indices is None:
             return None
         # Hand each node its slice of every merged host allocation.
-        for key, transfers in parts.items():
+        for merged, transfers in groups:
             sizes = [len(t.device_indices) for t in transfers]
             for transfer, host_slice in zip(
-                transfers, merged[key].host_indices.split(sizes)
+                transfers, merged.host_indices.split(sizes)
             ):
                 transfer.host_indices = host_slice
         sizes = [len(spec.device_value) for spec in specs]
@@ -1675,6 +1656,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 spec.node_id, lock_params, publish_node_ids=spec.publish_node_ids
             )
         return len(host_indices)
+
+    @staticmethod
+    def _merge_backup_transfers(
+        specs: list[_NodeBackupSpec],
+    ) -> tuple[
+        torch.Tensor,
+        dict[ComponentType, list[PoolTransfer]],
+        list[tuple[PoolTransfer, list[PoolTransfer]]],
+    ]:
+        """Concatenate the nodes' transfers per (component, pool); each merged
+        transfer comes back paired with the per-node transfers it covers."""
+        if len(specs) == 1:
+            return specs[0].device_value, specs[0].comp_xfers, []
+        parts: dict[tuple[ComponentType, PoolName], list[PoolTransfer]] = {}
+        for spec in specs:
+            for component_type, transfers in spec.comp_xfers.items():
+                for transfer in transfers:
+                    parts.setdefault((component_type, transfer.name), []).append(
+                        transfer
+                    )
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        groups = []
+        for (component_type, name), transfers in parts.items():
+            merged = PoolTransfer(
+                name=name,
+                device_indices=torch.cat([t.device_indices for t in transfers]),
+            )
+            comp_xfers.setdefault(component_type, []).append(merged)
+            groups.append((merged, transfers))
+        device_value = torch.cat([spec.device_value for spec in specs])
+        return device_value, comp_xfers, groups
 
     @staticmethod
     def _backup_publish_node_ids(
