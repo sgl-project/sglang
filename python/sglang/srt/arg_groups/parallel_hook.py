@@ -285,17 +285,10 @@ def _disable_nccl_graph_buffer_registration(reason: str) -> None:
     deployment; disabling the registration removes the hang while dedicated
     all-to-all buffers alone do not.
 
-    A pausable graph pool breaks the registrations too: torch_memory_saver
-    resume maps new physical pages behind the pool's virtual addresses while
-    the registrations made at capture keep the released pages, so replayed
-    collectives move data through pages the rest of the graph no longer uses
-    and the TP group deadlocks once the ranks diverge. The custom all-reduce
-    likewise skips its IPC registration in this pool (`tms_cudagraph`).
-
-    DP attention replays its `dp_gather` / `dp_scatter` collectives over the
-    TP group inside the decode graphs; with registered buffers the TP group
-    stops on its GPUs within the first decode steps, without a CUDA or NCCL
-    error, while eager decode completes.
+    Registered buffers also hang the TP group when the graph pool is pausable
+    (torch_memory_saver resume maps new physical pages under the capture-time
+    registrations) and when DP attention replays its `dp_gather` /
+    `dp_scatter` inside the decode graphs.
 
     Must run before the schedulers create their NCCL communicators, which
     inherit this environment. An explicit setting wins.
