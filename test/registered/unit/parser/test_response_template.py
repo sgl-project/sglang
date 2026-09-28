@@ -74,6 +74,12 @@ TOOL_CALL = (
     '<|tool_call>call:get_weather{location:<|"|>New York<|"|>,days:3,'
     "details:{metric:true},hours:[1,2]}<tool_call|>"
 )
+TOOL_CALL_ARGUMENTS = {
+    "location": "New York",
+    "days": 3,
+    "details": {"metric": True},
+    "hours": [1, 2],
+}
 
 # Arguments parse even when the call is cut off before its closer.
 XML_TOOL_TEMPLATE = {
@@ -147,36 +153,21 @@ def _chunks(text, size):
 
 
 def _collect_tool_stream(detector, chunks):
-    normal_parts = []
+    results = [detector.parse_streaming_increment(chunk, [_tool()]) for chunk in chunks]
+    results.append(detector.finish([_tool()]))
     calls = {}
-    for chunk in chunks:
-        result = detector.parse_streaming_increment(chunk, [_tool()])
-        normal_parts.append(result.normal_text)
+    for result in results:
         for call in result.calls:
-            entry = calls.setdefault(
-                call.tool_index,
-                {"name": "", "parameters": ""},
-            )
+            entry = calls.setdefault(call.tool_index, {"name": "", "parameters": ""})
             if call.name:
                 entry["name"] = call.name
             if call.parameters:
                 entry["parameters"] += call.parameters
-    finished = detector.finish([_tool()])
-    normal_parts.append(finished.normal_text)
-    for call in finished.calls:
-        entry = calls.setdefault(
-            call.tool_index,
-            {"name": "", "parameters": ""},
-        )
-        if call.name:
-            entry["name"] = call.name
-        if call.parameters:
-            entry["parameters"] += call.parameters
     parsed_calls = [
         (call["name"], json.loads(call["parameters"]))
         for _, call in sorted(calls.items())
     ]
-    return "".join(normal_parts), parsed_calls
+    return "".join(result.normal_text for result in results), parsed_calls
 
 
 class TestResponseTemplateLoading(CustomTestCase):
@@ -255,26 +246,18 @@ class TestGemma4ResponseTemplateParity(CustomTestCase):
                 self.assertEqual(template.normal_text, existing.normal_text)
 
     def test_non_streaming_tool_call_parity(self):
-        text = "Some text before " + TOOL_CALL
-        existing = Gemma4ToolDetector().detect_and_parse(text, [_tool()])
-        template = ResponseTemplateToolDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-            prefix=PREFIX,
-        ).detect_and_parse(text, [_tool()])
+        for text in ("Some text before " + TOOL_CALL, TOOL_CALL + TOOL_CALL):
+            with self.subTest(text=text):
+                existing = Gemma4ToolDetector().detect_and_parse(text, [_tool()])
+                template = ResponseTemplateToolDetector(
+                    response_template=GEMMA4_RESPONSE_TEMPLATE,
+                    prefix=PREFIX,
+                ).detect_and_parse(text, [_tool()])
 
-        self.assertEqual(template.normal_text, existing.normal_text)
-        self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
-
-    def test_non_streaming_repeated_tool_call_parity(self):
-        text = TOOL_CALL + TOOL_CALL
-        existing = Gemma4ToolDetector().detect_and_parse(text, [_tool()])
-        template = ResponseTemplateToolDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-            prefix=PREFIX,
-        ).detect_and_parse(text, [_tool()])
-
-        self.assertEqual(template.normal_text, existing.normal_text)
-        self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
+                self.assertEqual(template.normal_text, existing.normal_text)
+                self.assertEqual(
+                    _call_values(template.calls), _call_values(existing.calls)
+                )
 
     def test_content_between_tool_calls_is_preserved(self):
         detector = ResponseTemplateToolDetector(
@@ -464,20 +447,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(reasoning_text, "I should check the weather.")
         self.assertEqual(normal_text, "")
-        self.assertEqual(
-            _call_values(calls),
-            [
-                (
-                    "get_weather",
-                    {
-                        "location": "New York",
-                        "days": 3,
-                        "details": {"metric": True},
-                        "hours": [1, 2],
-                    },
-                )
-            ],
-        )
+        self.assertEqual(_call_values(calls), [("get_weather", TOOL_CALL_ARGUMENTS)])
 
     def test_empty_thinking_prefill_routes_generated_content(self):
         detector = ResponseTemplateReasoningDetector(
@@ -929,18 +899,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(parsed.normal_text, "")
         self.assertEqual(
-            _call_values(parsed.calls),
-            [
-                (
-                    "get_weather",
-                    {
-                        "location": "New York",
-                        "days": 3,
-                        "details": {"metric": True},
-                        "hours": [1, 2],
-                    },
-                )
-            ],
+            _call_values(parsed.calls), [("get_weather", TOOL_CALL_ARGUMENTS)]
         )
 
     def test_streaming_call_opened_in_prefix_emits_name_then_arguments(self):
@@ -956,15 +915,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             [(call.tool_index, call.name) for call in parsed.calls],
             [(0, "get_weather"), (0, None)],
         )
-        self.assertEqual(
-            json.loads(parsed.calls[1].parameters),
-            {
-                "location": "New York",
-                "days": 3,
-                "details": {"metric": True},
-                "hours": [1, 2],
-            },
-        )
+        self.assertEqual(json.loads(parsed.calls[1].parameters), TOOL_CALL_ARGUMENTS)
 
     def test_call_without_closer_is_dropped(self):
         def parse(template, text):
