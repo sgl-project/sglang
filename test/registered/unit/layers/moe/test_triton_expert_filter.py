@@ -3,7 +3,7 @@ from typing import Optional
 import pytest
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton import _needs_expert_filter
+from sglang.srt.layers.moe.moe_runner.triton import _topk_ids_may_be_nonlocal
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -17,12 +17,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
         (8, 8, 7, True),
         (8, 4, 4, True),
         (None, 8, 8, True),
-        # No weight count, as the non-MXFP8 path passes: the config alone decides.
+        # No weight count: the config alone decides.
         (8, 8, None, False),
         (8, 4, None, True),
     ],
 )
-def test_needs_expert_filter(
+def test_topk_ids_may_be_nonlocal(
     num_experts: Optional[int],
     num_local_experts: int,
     num_weight_experts: Optional[int],
@@ -33,4 +33,4 @@ def test_needs_expert_filter(
         num_local_experts=num_local_experts,
     )
 
-    assert _needs_expert_filter(config, num_weight_experts) is expected
+    assert _topk_ids_may_be_nonlocal(config, num_weight_experts) is expected

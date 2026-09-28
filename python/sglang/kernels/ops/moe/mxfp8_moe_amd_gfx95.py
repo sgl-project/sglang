@@ -261,7 +261,7 @@ def fused_moe_mxfp8_native(
     limit: Optional[float],
     no_combine: bool = False,
     expert_map: Optional[torch.Tensor] = None,
-    filter_expert: bool = True,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
@@ -283,12 +283,12 @@ def fused_moe_mxfp8_native(
         topk_ids.masked_fill_(
             ~valid_global | (topk_ids < 0) | (topk_ids >= local_num_experts), -1
         )
-    elif filter_expert:
+    elif sanitize_topk_ids:
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
-        # No copy: from here on topk_ids is read, never written. Skipping the clamp
-        # needs every id inside [0, local_num_experts) — see _needs_expert_filter.
+        # May alias the caller's tensor; everything below reads topk_ids only.
+        # Skipping the clamp needs every id inside [0, local_num_experts).
         maybe_detect_oob(
             topk_ids,
             0,
@@ -298,7 +298,7 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32)
 
     # Only the branches above can drop a route to -1.
-    may_filter_routes = expert_map is not None or filter_expert
+    may_filter_routes = expert_map is not None or sanitize_topk_ids
 
     block_m = 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
@@ -400,7 +400,7 @@ def fused_experts_mxfp8(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     expert_map: Optional[torch.Tensor] = None,
-    filter_expert: bool = True,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
 
@@ -447,7 +447,7 @@ def fused_experts_mxfp8(
         limit=limit,
         no_combine=no_combine,
         expert_map=expert_map,
-        filter_expert=filter_expert,
+        sanitize_topk_ids=sanitize_topk_ids,
     )
 
     if no_combine:

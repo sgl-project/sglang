@@ -283,6 +283,54 @@ def test_mxfp8_native_moe_ep_expert_map_filters_non_local_routes():
     assert _relerr(got, ref) < 5e-2
 
 
+class _NanEmptyTorch:
+    """``torch`` with a NaN-filled floating-point ``empty``, so unwritten rows show."""
+
+    def __getattr__(self, name):
+        return getattr(torch, name)
+
+    @staticmethod
+    def empty(*args, **kwargs):
+        out = torch.empty(*args, **kwargs)
+        return out.fill_(float("nan")) if out.is_floating_point() else out
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "T,H,inter,E,top_k", [(8, 256, 512, 8, 2), (1, 512, 256, 16, 4)]
+)
+@pytest.mark.parametrize("no_combine", [False, True])
+@torch.inference_mode()
+def test_mxfp8_native_moe_unclamped_matches_clamped(
+    monkeypatch, T, H, inter, E, top_k, no_combine
+):
+    # Skipping the clamp also drops the grouped-GEMM zero-fill, which is only safe
+    # while every routed row is written; the NaN-filled torch.empty checks that.
+    import sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 as mxfp8_moe
+
+    torch.manual_seed(0)
+    alpha, beta, limit = 1.702, 1.0, 7.0
+    w13_bf16 = torch.randn(E, 2 * inter, H, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w2_bf16 = torch.randn(E, H, inter, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w13_fp8, w13_scale = _mxfp8_e4m3_quantize_torch(w13_bf16)
+    w2_fp8, w2_scale = _mxfp8_e4m3_quantize_torch(w2_bf16)
+
+    x = torch.randn(T, H, device=DEVICE, dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(T, E, device=DEVICE, dtype=torch.float32)
+    topk_weights, topk_ids = logits.softmax(dim=-1).topk(top_k, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
+    args = (x, w13_fp8, w13_scale, w2_fp8, w2_scale, topk_weights, topk_ids)
+    kwargs = dict(alpha=alpha, beta=beta, limit=limit, no_combine=no_combine)
+
+    clamped = mxfp8_moe.fused_moe_mxfp8_native(*args, sanitize_topk_ids=True, **kwargs)
+    monkeypatch.setattr(mxfp8_moe, "torch", _NanEmptyTorch())
+    unclamped = mxfp8_moe.fused_moe_mxfp8_native(
+        *args, sanitize_topk_ids=False, **kwargs
+    )
+
+    torch.testing.assert_close(unclamped, clamped, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
