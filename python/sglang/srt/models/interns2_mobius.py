@@ -10,7 +10,7 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerFacts
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -43,7 +43,7 @@ from sglang.srt.models.qwen3_5 import (
     _enable_qwen35_fused_ar_quant,
     _linear_accepts_fp8_tuple,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -423,20 +423,11 @@ class _InternS2MobiusDecoderMixin:
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        # Model-side all-reduce fusion is intentionally disabled for baseline.
-        with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self._forward_mobius_mlp(
                 hidden_states, forward_batch, meta_mlp
             )
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -485,7 +476,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
 
         layer_prefix = prefix.removesuffix(".linear_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -501,13 +492,13 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
+            allow_deferred_ffn_reduction=False,
         )
 
     def forward(
@@ -618,7 +609,7 @@ class InternS2MobiusAttentionDecoderLayer(
 
         layer_prefix = prefix.removesuffix(".self_attn")
         self._init_mobius_mlp(config, quant_config, layer_prefix)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
@@ -635,13 +626,13 @@ class InternS2MobiusAttentionDecoderLayer(
             _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
         )
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
+            allow_deferred_ffn_reduction=False,
         )
         self.alt_stream = alt_stream
 
