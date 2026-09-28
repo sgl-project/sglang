@@ -610,6 +610,8 @@ class _SharedPageEnvelopeHostBacking:
 class UnifiedPageEnvelopeHostPool(HostKVCache):
     """Host mirror that transfers complete unified-memory page envelopes."""
 
+    storage_format_tag = "unified-token-major"
+
     def __init__(
         self,
         device_pool,
