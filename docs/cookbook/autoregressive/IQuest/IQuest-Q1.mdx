@@ -1,0 +1,81 @@
+---
+title: IQuest Q1
+description: "Serve IQuest Q1 with FA3, reasoning and tool parsing, and an independent MTP draft checkpoint."
+---
+
+## Prerequisites
+
+The example below uses Linux, NVIDIA CUDA, and tensor parallelism 8. Install a CUDA build of SGLang that includes `IQuestQ1ForCausalLM` using the [installation guide](/docs/get-started/install). The optional `fastsafetensors` load format requires the `fastsafetensors` Python package.
+
+Set `MODEL_PATH` to your local target checkpoint directory. For speculative decoding, set `DRAFT_PATH` to a compatible, independently trained draft checkpoint directory. No Hugging Face token is required for local checkpoints.
+
+| Checkpoint | `model_type` | `architectures` |
+| --- | --- | --- |
+| Target | `iquest_q1` | `["IQuestQ1ForCausalLM"]` |
+| Draft | `iquest_q1_mtp` | `["IQuestQ1MTP"]` |
+
+The target directory contains its configuration, tokenizer, chat template, and weights. The draft directory contains its configuration, weights, and a weight index when sharded. Its embedding and output head come from the draft checkpoint, not from the target. The target and draft must agree on hidden size, vocabulary size, and target layer count. Preserve the draft's trained attention window, RoPE, and residual settings; do not copy the target configuration over them.
+
+## Launch the target
+
+```bash
+MODEL_PATH=/path/to/IQuest-Q1
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name iquest-q1 \
+  --host 127.0.0.1 \
+  --port 30021 \
+  --tp-size 8 \
+  --dtype bfloat16 \
+  --attention-backend fa3 \
+  --context-length 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 8 \
+  --enable-torch-compile \
+  --torch-compile-max-bs 8 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-prefill-cuda-graph \
+  --enable-metrics \
+  --enable-cache-report \
+  --random-seed 0 \
+  --reasoning-parser iquest_q1 \
+  --tool-call-parser iquest_q1 \
+  --load-format fastsafetensors
+```
+
+Radix Cache remains enabled. The context limit covers both input and output tokens. Increase it only within the checkpoint's supported context length and available KV-cache capacity. You can also set both parser arguments to `auto`; IQuest's template markers or target architecture identify the parsers.
+
+## Enable MTP
+
+Keep the target launch arguments and append the following, replacing the draft path:
+
+```bash
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 7 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-model-path /path/to/IQuest-Q1-MTP \
+  --speculative-draft-attention-backend fa3 \
+  --speculative-use-rejection-sampling
+```
+
+This reuses the single draft layer for seven sequential draft steps and verifies eight tokens per round, including the target token. It does not load eight distinct draft layers. For five draft steps, use `--speculative-num-steps 5` and `--speculative-num-draft-tokens 6`.
+
+Both target and draft require FA3. An omitted draft attention backend inherits FA3; an explicitly incompatible backend is rejected. Native MTP tensors bundled in a target checkpoint are ignored. Speculation still requires the independent draft path.
+
+## Send a request
+
+```bash
+curl http://127.0.0.1:30021/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "iquest-q1",
+    "messages": [{"role": "user", "content": "What is 6 times 7?"}],
+    "temperature": 0,
+    "max_tokens": 2048,
+    "stream": false
+  }'
+```
+
+The reasoning parser separates `reasoning_content` from the final answer. For function calls, supply OpenAI-compatible `tools`; `auto`, `required`, and a named function choice are supported. See [tool calling](/docs/advanced_features/tool_parser) and [sampling parameters](/docs/basic_usage/sampling_params).

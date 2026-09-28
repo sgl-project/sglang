@@ -2238,6 +2238,28 @@ class TestHiCacheArgs(CustomTestCase):
         handle_cache_compatibility(args)
 
 
+class TestIQuestQ1SpeculativeArgs(CustomTestCase):
+    def test_mtp_validation_skips_other_models_drafts(self):
+        from transformers import LlamaConfig
+
+        from sglang.srt.arg_groups.speculative_hook import _handle_iquest_q1_mtp_draft
+
+        with (
+            tempfile.TemporaryDirectory() as target_directory,
+            tempfile.TemporaryDirectory() as draft_directory,
+        ):
+            LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(
+                target_directory
+            )
+            args = ServerArgs(
+                model_path=target_directory,
+                speculative_algorithm="EAGLE",
+                speculative_draft_model_path=draft_directory,
+                device="cuda",
+            )
+            self.assertFalse(_handle_iquest_q1_mtp_draft(args))
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
