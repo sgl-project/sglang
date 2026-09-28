@@ -23,6 +23,7 @@ from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.supa import SupaSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -49,6 +50,16 @@ def _is_npu_available() -> bool:
 
 def _is_xpu_available() -> bool:
     return torch.xpu.is_available()
+
+
+def _is_supa_available() -> bool:
+    # Biren's `torch_br` plugin registers the `supa` PrivateUse1 backend.
+    if not hasattr(torch, "supa"):
+        try:
+            import torch_br  # noqa: F401
+        except ImportError:
+            return False
+    return hasattr(torch, "supa") and torch.supa.is_available()
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -143,6 +154,11 @@ def _resolve_platform() -> SRTPlatform:
         if _is_xpu_available():
             logger.debug("No platform plugin detected. Using XPU SRTPlatform defaults.")
             return XpuSRTPlatform()
+        if _is_supa_available():
+            logger.debug(
+                "No platform plugin detected. Using SUPA SRTPlatform defaults."
+            )
+            return SupaSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
