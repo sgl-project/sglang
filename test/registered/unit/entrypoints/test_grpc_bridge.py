@@ -4,7 +4,11 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    SignalHandler,
+    TokenizerManager,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -147,6 +151,38 @@ class TestEngineStateNotifications(CustomTestCase):
 
         self.assertEqual(self.notifications, 1)
         self.assertFalse(handle.health_check())
+
+
+class TestGrpcShutdown(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_from_rpc_thread_uses_sigterm_handler(self):
+        active_requests = {"in-flight": object()}
+        manager = SimpleNamespace(
+            gracefully_exit=False,
+            signal_handler_class=SignalHandler,
+            rid_to_state=active_requests,
+        )
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = manager
+        handle._event_loop = asyncio.get_running_loop()
+
+        # Rust calls the bridge from a different thread. Repeated calls must
+        # leave draining and cleanup to the existing shutdown watchdog.
+        await asyncio.to_thread(handle.shutdown)
+        await asyncio.to_thread(handle.shutdown)
+        await asyncio.sleep(0)
+
+        self.assertTrue(manager.gracefully_exit)
+        self.assertIs(manager.rid_to_state, active_requests)
+        self.assertIn("in-flight", active_requests)
+
+    async def test_shutdown_reports_closed_event_loop(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = SimpleNamespace(signal_handler_class=SignalHandler)
+        handle._event_loop = asyncio.new_event_loop()
+        handle._event_loop.close()
+
+        with self.assertRaises(RuntimeError):
+            handle.shutdown()
 
 
 if __name__ == "__main__":

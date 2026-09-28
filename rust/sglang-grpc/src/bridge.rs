@@ -295,6 +295,13 @@ impl PyBridge {
         })
     }
 
+    pub fn shutdown(&self) -> PyResult<()> {
+        Python::attach(|py| {
+            self.runtime_handle.call_method0(py, "shutdown")?;
+            Ok(())
+        })
+    }
+
     pub fn health_check(&self) -> PyResult<bool> {
         Python::attach(|py| {
             let result = self.runtime_handle.call_method0(py, "health_check")?;
