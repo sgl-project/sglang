@@ -24,6 +24,7 @@ from sglang.srt.parser.response_template import (
     configure_response_template_request,
     resolve_response_template,
     tool_close_token_ids,
+    tool_close_tokens,
     validate_response_template_for_serving,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,6 +94,26 @@ XML_TOOL_TEMPLATE = {
     },
 }
 XML_CALL_WITHOUT_CLOSER = "<call:get_weather><arg:location>Paris</arg><arg:days>3"
+
+# Every field is delimited, so the template itself gives no field to text
+# outside them.
+DELIMITED_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "thinking": {"open": "<think>", "close": "</think>"},
+        "content": {"open": "<answer>", "close": "</answer>"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+        },
+    },
+}
 
 
 def _tool(name: str = "get_weather") -> Tool:
@@ -409,13 +430,16 @@ class TestResponseTemplateAdapters(CustomTestCase):
         for request in requests:
             with self.subTest(request=type(request).__name__):
                 request._response_parser_prefix = PREFIX
+                request._response_parser_constrained = True
 
                 self.assertEqual(request._response_parser_prefix, PREFIX)
                 self.assertNotIn("response_parser_prefix", request.model_dump())
+                self.assertNotIn("response_parser_constrained", request.model_dump())
                 self.assertEqual(
                     request.model_copy()._response_parser_prefix,
                     PREFIX,
                 )
+                self.assertTrue(request.model_copy()._response_parser_constrained)
 
     def test_adapters_use_checkpoint_metadata(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
@@ -524,6 +548,40 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertFalse(sampling_params["skip_special_tokens"])
         self.assertFalse(sampling_params["spaces_between_special_tokens"])
         self.assertFalse(sampling_params["no_stop_trim"])
+
+    def test_output_constraint_keeps_text_outside_delimited_fields(self):
+        payload = '[{"name": "get_weather", "parameters": {"days": 3}}]'
+        output = "<think>Plan</think>" + payload
+        for constrained, content in ((False, ""), (True, payload)):
+            with self.subTest(constrained=constrained):
+                request = ChatCompletionRequest(messages=[])
+                request._response_parser_constrained = constrained
+                one_shot, streaming = (
+                    ReasoningParser(
+                        model_type="response_template",
+                        tokenizer=SimpleNamespace(response_template=DELIMITED_TEMPLATE),
+                        request=request,
+                        prefix="<assistant>",
+                    )
+                    for _ in range(2)
+                )
+                parts = [streaming.parse_stream_chunk(c) for c in _chunks(output, 5)]
+                parts.append(streaming.parse_stream_end())
+
+                self.assertEqual(one_shot.parse_non_stream(output), ("Plan", content))
+                self.assertEqual(
+                    (
+                        "".join(reasoning or "" for reasoning, _ in parts),
+                        "".join(normal or "" for _, normal in parts),
+                    ),
+                    ("Plan", content),
+                )
+                self.assertEqual(
+                    one_shot.parse_non_stream(
+                        "<think>Plan</think><answer>Sunny</answer>"
+                    ),
+                    ("Plan", "Sunny"),
+                )
 
     def test_reasoning_requires_explicit_enable_without_template_policy(self):
         detector = ResponseTemplateReasoningDetector(
@@ -962,6 +1020,9 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(
             tool_close_token_ids("response_template", tokenizer), frozenset({7})
+        )
+        self.assertEqual(
+            tool_close_tokens("response_template", tokenizer), {7: "<|call|>"}
         )
         self.assertEqual(tool_close_token_ids("qwen", tokenizer), frozenset())
         self.assertEqual(

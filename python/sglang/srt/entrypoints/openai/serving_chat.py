@@ -111,6 +111,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
     configure_response_template_request,
+    tool_close_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -126,6 +127,7 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+_OUTPUT_CONSTRAINT_PARAMS = ("json_schema", "regex", "ebnf", "structural_tag")
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -897,6 +899,10 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
+        if finish_reason_type is not None:
+            delta = self._drop_kept_tool_close(
+                delta, content["meta_info"].get("finish_reason"), request
+            )
 
         # Attach logprobs to the first chunk emitted this step (reasoning,
         # tool-call, or content) so they aren't dropped when a parser is active
@@ -1300,15 +1306,16 @@ class OpenAIServingChat(OpenAIServingBase):
             apply_header_overrides(adapted_request, raw_request.headers)
 
         if processed_messages.uses_response_template:
-            self._set_response_parser_prefix(request, adapted_request)
+            self._set_response_parser_context(request, adapted_request)
         return adapted_request, request
 
-    def _set_response_parser_prefix(
+    def _set_response_parser_context(
         self,
         request,
         adapted_request: GenerateReqInput,
     ) -> None:
-        """Give response-template parsers the rendered assistant prefill."""
+        """Give response-template parsers the rendered assistant prefill, and
+        whether a grammar constrains the output instead of the template."""
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1317,6 +1324,32 @@ class OpenAIServingChat(OpenAIServingBase):
                 spaces_between_special_tokens=False,
             )
         request._response_parser_prefix = prefix or ""
+        sampling_params = adapted_request.sampling_params or {}
+        request._response_parser_constrained = any(
+            sampling_params.get(name) for name in _OUTPUT_CONSTRAINT_PARAMS
+        )
+
+    def _drop_kept_tool_close(
+        self, text: str, finish_reason: dict[str, Any] | None, request
+    ) -> str:
+        """Trim a tool-call closer that detokenization kept as the matched stop.
+
+        The closer is kept so the tool parser can tell a finished call from a
+        cut-off one. Under an output grammar the model writes no native call, so
+        the closer is only the stop token and is dropped like any other."""
+        if (
+            not text
+            or not getattr(request, "_response_parser_constrained", False)
+            or getattr(request, "no_stop_trim", False)
+            or not isinstance(finish_reason, dict)
+        ):
+            return text
+        closer = tool_close_tokens(
+            self.tool_call_parser, self.tokenizer_manager.tokenizer
+        ).get(finish_reason.get("matched"))
+        if closer and text.endswith(closer):
+            return text[: -len(closer)]
+        return text
 
     def _requires_response_template_detokenization(
         self, request: ChatCompletionRequest
@@ -2388,6 +2421,7 @@ class OpenAIServingChat(OpenAIServingBase):
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+            text = self._drop_kept_tool_close(text, finish_reason, request)
 
             # Handle reasoning content
             reasoning_text = None

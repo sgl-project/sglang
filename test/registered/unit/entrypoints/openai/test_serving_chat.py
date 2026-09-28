@@ -84,6 +84,25 @@ _RESPONSE_TEMPLATE = {
         },
     },
 }
+# Every field is delimited, so the template gives no field to text outside them.
+_DELIMITED_RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "thinking": {"open": "<think>", "close": "</think>"},
+        "content": {"open": "<answer>", "close": "</answer>"},
+        "tool_calls": _RESPONSE_TEMPLATE["fields"]["tool_calls"],
+    },
+}
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        },
+    },
+}
 
 
 def _spec_result(index):
@@ -724,6 +743,152 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertFalse(request.skip_special_tokens)
         self.assertFalse(adapted.sampling_params["spaces_between_special_tokens"])
         self.tm.tokenizer.decode.assert_not_called()
+
+    def _use_delimited_response_template(self, reasoning_parser):
+        self.tm.tokenizer.response_template = _DELIMITED_RESPONSE_TEMPLATE
+        self.tm.tokenizer.encode.side_effect = lambda text, **_: (
+            [7] if text == "</call>" else [1, 2, 3]
+        )
+        self.tm.model_config.is_multimodal = True
+        self.chat.tool_call_parser = "response_template"
+        self.chat.reasoning_parser = reasoning_parser
+        self.chat._reasoning_detector = (
+            ResponseTemplateReasoningDetector(
+                response_template=_DELIMITED_RESPONSE_TEMPLATE
+            )
+            if reasoning_parser
+            else None
+        )
+
+    @staticmethod
+    def _stopped_on_token(text, token_id):
+        return {
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-stopped",
+                "prompt_tokens": 5,
+                "completion_tokens": 9,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": token_id},
+            },
+            "index": 0,
+        }
+
+    def _convert_rendered_as(self, prompt, request):
+        rendered = MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=[],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            return self.chat._convert_to_internal_request(request)
+
+    def test_response_template_parser_context_records_output_constraint(self):
+        self._use_delimited_response_template("response_template")
+        cases = {
+            "auto tool choice": ({"tools": [_WEATHER_TOOL]}, False),
+            "named tool": (
+                {
+                    "tools": [_WEATHER_TOOL],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {"name": "get_weather"},
+                    },
+                },
+                True,
+            ),
+            "response_format": ({"response_format": {"type": "json_object"}}, True),
+        }
+        for name, (fields, constrained) in cases.items():
+            with self.subTest(name):
+                _, request = self._convert_rendered_as(
+                    "<assistant>",
+                    ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Weather?"}],
+                        **fields,
+                    ),
+                )
+                self.assertEqual(request._response_parser_constrained, constrained)
+
+    def test_required_tool_json_is_parsed_under_delimited_template(self):
+        payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+        for reasoning_parser in (None, "response_template"):
+            self._use_delimited_response_template(reasoning_parser)
+            reasoning = "Check the forecast." if reasoning_parser else ""
+            # The JSON follows the reasoning and may end on the tool closer,
+            # which detokenization keeps for this tool parser.
+            text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
+            text += "</call>"
+            for stream in (False, True):
+                with self.subTest(reasoning_parser=reasoning_parser, stream=stream):
+                    adapted, request = self._convert_rendered_as(
+                        "<assistant>",
+                        ChatCompletionRequest(
+                            model="x",
+                            messages=[{"role": "user", "content": "Weather?"}],
+                            tools=[_WEATHER_TOOL],
+                            tool_choice="required",
+                            stream=stream,
+                        ),
+                    )
+                    self.assertTrue(request._response_parser_constrained)
+                    if stream:
+                        item = self._stopped_on_token(text, 7)
+
+                        async def generate(item=item):
+                            yield item
+
+                        self.tm.generate_request = Mock(return_value=generate())
+                        choices = [
+                            choice
+                            for chunk in self._parse_chunks(
+                                self._run_chat_stream(adapted, request)
+                            )
+                            for choice in chunk.get("choices", [])
+                        ]
+                        deltas = [choice.get("delta") or {} for choice in choices]
+                        calls = [
+                            call["function"]
+                            for delta in deltas
+                            for call in delta.get("tool_calls") or []
+                        ]
+                        name = "".join(call.get("name") or "" for call in calls)
+                        arguments = "".join(
+                            call.get("arguments") or "" for call in calls
+                        )
+                        got_reasoning = "".join(
+                            delta.get("reasoning_content") or "" for delta in deltas
+                        )
+                        content = "".join(
+                            delta.get("content") or "" for delta in deltas
+                        )
+                        finish_reasons = [
+                            choice["finish_reason"]
+                            for choice in choices
+                            if choice.get("finish_reason")
+                        ]
+                    else:
+                        choice = self.chat._build_chat_response(
+                            request, [self._stopped_on_token(text, 7)], 0
+                        ).choices[0]
+                        (call,) = choice.message.tool_calls
+                        name, arguments = call.function.name, call.function.arguments
+                        got_reasoning = choice.message.reasoning_content or ""
+                        content = choice.message.content or ""
+                        finish_reasons = [choice.finish_reason]
+
+                    self.assertEqual(name, "get_weather")
+                    self.assertEqual(json.loads(arguments), {"city": "Paris"})
+                    self.assertEqual(got_reasoning, reasoning)
+                    self.assertEqual(content, "")
+                    self.assertEqual(finish_reasons, ["tool_calls"])
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(

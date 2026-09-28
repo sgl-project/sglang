@@ -2341,8 +2341,11 @@ class ReasoningParser:
 
         if prefix is None:
             prefix = getattr(request, "_response_parser_prefix", "")
-        if prefix and issubclass(detector_class, ResponseTemplateReasoningDetector):
-            kwargs["prefix"] = prefix
+        if issubclass(detector_class, ResponseTemplateReasoningDetector):
+            if prefix:
+                kwargs["prefix"] = prefix
+            if getattr(request, "_response_parser_constrained", False):
+                kwargs["constrained_output"] = True
 
         self.detector = detector_class(**kwargs)
 

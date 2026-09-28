@@ -111,13 +111,19 @@ def _load_serving_template(
     return template, validate_response_template_for_serving(template)
 
 
-def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
+def _streaming_template(
+    template: dict[str, Any], *, constrained_output: bool = False
+) -> ResponseTemplate:
     result = copy.deepcopy(template)
     fields = result["fields"]
-    if _CONTENT_FIELD not in fields and all(
-        "open" in field or "open_pattern" in field for field in fields.values()
-    ):
-        fields[_CONTENT_FIELD] = {}
+    if all("open" in field or "open_pattern" in field for field in fields.values()):
+        # Text outside the delimited fields is content if the template has no
+        # content field; under an output grammar (JSON tool calls,
+        # response_format) it is the grammar's output, which no field delimits.
+        if _CONTENT_FIELD not in fields:
+            fields[_CONTENT_FIELD] = {}
+        elif constrained_output:
+            fields[_PASSTHROUGH_FIELD] = {}
     for field in fields.values():
         field["optional"] = True
     return load_response_template(result)
@@ -229,7 +235,10 @@ class ResponseTemplateStreamAdapter:
                 elif etype == "region_close" and not stream_reasoning:
                     reasoning_parts.append(self._pending_reasoning)
                     self._pending_reasoning = ""
-            elif field == _CONTENT_FIELD and etype == "region_chunk":
+            elif (
+                field in (_CONTENT_FIELD, _PASSTHROUGH_FIELD)
+                and etype == "region_chunk"
+            ):
                 normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
                 # Hand tool regions back verbatim so the tool detector can parse them.
@@ -316,6 +325,7 @@ class ResponseTemplateReasoningDetector:
         response_template: dict | None = None,
         prefix: str = "",
         force_nonempty_content: bool = False,
+        constrained_output: bool = False,
         **_kwargs,
     ):
         template, loaded = _load_serving_template(
@@ -338,7 +348,9 @@ class ResponseTemplateReasoningDetector:
             else self._default_think_end
         )
         self.think_start_self_label = ""
-        self._template = _streaming_template(template)
+        self._template = _streaming_template(
+            template, constrained_output=constrained_output
+        )
         self._prefix = prefix
         self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
 
@@ -593,10 +605,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         )
 
 
-def tool_close_token_ids(
+def tool_close_tokens(
     tool_call_parser: str | None, tokenizer: Any | None
-) -> frozenset[int]:
-    """Token ids of the tool-call closers of a response-template tool parser.
+) -> dict[int, str]:
+    """Single-token tool-call closers of a response-template tool parser, by id.
 
     Detokenization keeps these when they stop generation, so a tool call that
     reaches end of stream without its closer was cut off."""
@@ -608,13 +620,20 @@ def tool_close_token_ids(
         or detector_class is None
         or not issubclass(detector_class, ResponseTemplateToolDetector)
     ):
-        return frozenset()
+        return {}
     try:
         detector = detector_class(tokenizer=tokenizer)
     except ValueError:
-        return frozenset()
-    token_ids = (
-        tokenizer.encode(literal, add_special_tokens=False)
-        for literal in detector.tool_close_literals
-    )
-    return frozenset(ids[0] for ids in token_ids if len(ids) == 1)
+        return {}
+    closers = {}
+    for literal in detector.tool_close_literals:
+        ids = tokenizer.encode(literal, add_special_tokens=False)
+        if len(ids) == 1:
+            closers[ids[0]] = literal
+    return closers
+
+
+def tool_close_token_ids(
+    tool_call_parser: str | None, tokenizer: Any | None
+) -> frozenset[int]:
+    return frozenset(tool_close_tokens(tool_call_parser, tokenizer))

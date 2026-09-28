@@ -590,7 +590,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 processed_messages is not None
                 and processed_messages.uses_response_template
             ):
-                self._set_response_parser_prefix(request, adapted_request)
+                self._set_response_parser_context(request, adapted_request)
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
@@ -814,7 +814,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output = self._make_response_output_items(
                 request,
-                final_res["text"],
+                self._drop_kept_tool_close(
+                    final_res["text"],
+                    (
+                        meta_info.get("finish_reason")
+                        if isinstance(meta_info, dict)
+                        else None
+                    ),
+                    request,
+                ),
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
@@ -2323,6 +2331,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     delta = text[stream_offset:]
                     stream_offset = len(text)
+                if finish_reason is not None:
+                    delta = self._drop_kept_tool_close(delta, finish_reason, request)
                 if not delta and finish_reason is None:
                     continue
                 # finish_reason is sticky, so it would otherwise re-flush.

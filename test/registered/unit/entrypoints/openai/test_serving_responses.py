@@ -663,6 +663,119 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
         self.assertFalse(params["spaces_between_special_tokens"])
 
 
+class ResponseTemplateRequiredToolTestCase(CustomTestCase):
+    # Every field is delimited, so the template gives no field to the JSON.
+    TEMPLATE = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "thinking": {"open": "<think>", "close": "</think>"},
+            "content": {"open": "<answer>", "close": "</answer>"},
+            "tool_calls": {
+                "open_pattern": r"<call:(?P<name>\w+)>",
+                "close": "</call>",
+                "content": "json",
+                "repeats": True,
+                "transform": {
+                    "type": "function",
+                    "function": {"name": "{name}", "arguments": "{content}"},
+                },
+            },
+        },
+    }
+
+    @staticmethod
+    def _output():
+        # The JSON follows the reasoning and ends on the tool closer, which
+        # detokenization keeps for this tool parser.
+        return {
+            "text": (
+                "<think>Check the forecast.</think>"
+                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>'
+            ),
+            "meta_info": {
+                "prompt_tokens": 3,
+                "completion_tokens": 9,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": 7},
+            },
+        }
+
+    def _respond(self, stream):
+        serving = make_serving()
+        serving.default_chat_template_kwargs = None
+        serving.reasoning_parser = "response_template"
+        serving.tool_call_parser = "response_template"
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template=self.TEMPLATE
+        )
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = self.TEMPLATE
+        tokenizer.encode.side_effect = lambda literal, **_: (
+            [7] if literal == "</call>" else [1, 2, 3]
+        )
+        tokenizer.decode.return_value = "<assistant>"
+
+        async def fake_generate(
+            request_id, request_prompt, adapted_request, sampling_params, context, **_
+        ):
+            context.append_output(self._output())
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="Weather?",
+            tool_choice="required",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+            stream=stream,
+            store=False,
+        )
+        rendered = MessageProcessingResult(
+            prompt="<assistant>",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        async def respond():
+            response = await serving.create_responses(request)
+            if stream:
+                events = [event async for event in response]
+                return event_payloads(events)[-1]["response"]
+            return response.model_dump()
+
+        with patch.object(
+            serving, "_apply_conversation_template", return_value=rendered
+        ):
+            return asyncio.run(respond())
+
+    def test_required_tool_json_is_parsed_under_delimited_template(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(stream)
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "function_call"],
+                )
+                call = response["output"][1]
+                self.assertEqual(call["name"], "get_weather")
+                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+
+
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(

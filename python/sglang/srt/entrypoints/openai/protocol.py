@@ -850,6 +850,7 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 class ChatCompletionRequest(BaseModel):
     _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_constrained: bool = PrivateAttr(default=False)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1782,6 +1783,7 @@ class ResponsesRequest(BaseModel):
     """Request body for v1/responses endpoint."""
 
     _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_constrained: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
