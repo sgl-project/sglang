@@ -64,7 +64,9 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     )
 
     with (
-        get_parallel().override(moe_ep_size=4, moe_ep_rank=2),
+        get_parallel().override(
+            tp_size=4, attn_tp_size=4, moe_ep_size=4, moe_ep_rank=2
+        ),
         hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
     ):
         output = topk(

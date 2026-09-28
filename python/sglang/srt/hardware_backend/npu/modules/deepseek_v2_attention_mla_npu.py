@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -520,6 +521,8 @@ def forward_dsa_prepare_npu(
 
     if _use_dsa_dcp_partial_attention(forward_batch):
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
+    topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
     return (
         q_pe,
