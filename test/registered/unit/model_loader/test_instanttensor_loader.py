@@ -11,6 +11,8 @@ import torch
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,6 +66,9 @@ class TestInstantTensorLoader(CustomTestCase):
             )
         )
         patches.enter_context(
+            patch.object(weight_utils.current_platform, "device_type", "cuda")
+        )
+        self.current_device = patches.enter_context(
             patch.object(weight_utils.torch.cuda, "current_device", return_value=1)
         )
         self.get_device = patches.enter_context(
@@ -116,6 +121,46 @@ class TestInstantTensorLoader(CustomTestCase):
         self.assertEqual(config.model_loader_extra_config, options)
         self.get_device.assert_called_once_with(1)
         self.get_parallel.assert_not_called()
+
+    def test_iterator_accepts_cuda_and_rocm(self):
+        for platform in (CudaSRTPlatform(), RocmSRTPlatform()):
+            with (
+                self.subTest(platform=platform.device_name),
+                patch.object(weight_utils, "current_platform", platform),
+            ):
+                self.safe_open.reset_mock()
+                self.assertEqual(
+                    list(
+                        weight_utils.instanttensor_weights_iterator(
+                            ["model.safetensors"]
+                        )
+                    ),
+                    self.tensors,
+                )
+                self.safe_open.assert_called_once_with(
+                    ["model.safetensors"],
+                    framework="pt",
+                    device=torch.device("cuda:1"),
+                    process_group=None,
+                    copy=True,
+                )
+
+    def test_iterator_rejects_non_cuda_devices_before_import(self):
+        for device_type in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
+            with (
+                self.subTest(device_type=device_type),
+                patch.object(weight_utils.current_platform, "device_type", device_type),
+                patch.dict(sys.modules, {"instanttensor": None}),
+                self.assertRaisesRegex(
+                    ValueError, "InstantTensor requires a CUDA-compatible device"
+                ) as raised,
+            ):
+                list(weight_utils.instanttensor_weights_iterator(["model.safetensors"]))
+            self.assertIn(repr(device_type), str(raised.exception))
+        self.current_device.assert_not_called()
+        self.get_device.assert_not_called()
+        self.get_parallel.assert_not_called()
+        self.safe_open.assert_not_called()
 
     def test_backend_conversion(self):
         for backend, expected in [

@@ -1172,6 +1172,12 @@ def instanttensor_weights_iterator(
     extra_config: Optional[dict] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over Safetensors weights with InstantTensor."""
+    if current_platform.device_type != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {current_platform.device_type!r}."
+        )
+
     unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
     if unsupported_files:
         raise ValueError(
