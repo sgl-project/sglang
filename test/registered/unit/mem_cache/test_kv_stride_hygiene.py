@@ -31,7 +31,10 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.utils import canonicalize_stride
-from sglang.kernels.ops.kv_canary.verify import RealKvSource
+from sglang.kernels.ops.kv_canary.verify import (
+    RealKvSource,
+    _build_real_kv_source_abi,
+)
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import make_row_source
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +92,24 @@ class TestRealKvSourceStrides(unittest.TestCase):
             RealKvSource(
                 tensor=view, page_size=1, num_bytes_per_token=64, read_bytes=16
             )
+
+    def test_rejects_row_narrower_than_page_despite_wide_stride(self):
+        # The 96-byte stride would fit 80 bytes, but only 64 belong to the row;
+        # the rest is the next layer's data in a strided pool.
+        _, view = _strided_rows(8, 64, 96, torch.uint8)
+        with self.assertRaisesRegex(ValueError, "row is 64 bytes wide"):
+            RealKvSource(
+                tensor=view, page_size=1, num_bytes_per_token=80, read_bytes=16
+            )
+
+    def test_launch_abi_aliases_strided_rows(self):
+        _, view = _strided_rows(8, 64, 96, torch.uint8)
+        src = RealKvSource(
+            tensor=view, page_size=1, num_bytes_per_token=64, read_bytes=16
+        )
+        bufs, _ = _build_real_kv_source_abi(real_kv_sources=(src,), device="cpu")
+        self.assertEqual(bufs[0].data_ptr(), view.data_ptr())
+        self.assertEqual(bufs[0].stride(0), 96)
 
 
 class TestMakeRowSourceAliases(unittest.TestCase):

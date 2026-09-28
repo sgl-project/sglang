@@ -123,11 +123,14 @@ class RealKvSource:
                 f"strides={tuple(self.tensor.stride())}, dtype={self.tensor.dtype})"
             )
         # A row is addressed as page_size slots of num_bytes_per_token, unchecked at fold time;
-        # a narrower row hashes fewer bytes than asked and still reports the chain clean.
+        # a narrower row hashes fewer bytes than asked and still reports the chain clean. The
+        # check is on the row's own width, not its stride: on a strided view the bytes between
+        # the row's end and the next row belong to someone else.
+        row_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
         min_row_bytes = self.page_size * self.num_bytes_per_token
-        if row_stride_bytes < min_row_bytes:
+        if row_bytes < min_row_bytes:
             raise ValueError(
-                f"kv-canary: RealKvSource.tensor dim-1 is {row_stride_bytes} bytes but "
+                f"kv-canary: RealKvSource.tensor row is {row_bytes} bytes wide but "
                 f"page_size={self.page_size} x num_bytes_per_token={self.num_bytes_per_token} "
                 f"needs {min_row_bytes} (shape={tuple(self.tensor.shape)}, "
                 f"dtype={self.tensor.dtype})"
@@ -413,7 +416,13 @@ def _build_real_kv_source_abi(
     )
 
     for i, source in enumerate(real_kv_sources):
-        _assert_contiguous(source.tensor, f"real_kv_sources[{i}].tensor")
+        # Rows may sit a wider stride apart (a per-layer view into a larger entry); the
+        # kernels step rows by stride(0), so only the bytes within a row must be packed.
+        if source.tensor.stride(-1) != 1:
+            raise ValueError(
+                f"kv-canary: real_kv_sources[{i}].tensor rows must be packed "
+                f"(stride(-1) == 1), got strides {tuple(source.tensor.stride())}"
+            )
         source_u8 = source.tensor.view(torch.uint8)
         if source_u8.dim() != 2:
             raise ValueError(
