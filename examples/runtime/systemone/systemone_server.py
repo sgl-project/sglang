@@ -1,46 +1,12 @@
-"""Serve Jev's ``/v1/systemone`` typed-decision API from an SGLang ``/v1/score`` server.
+"""Serve Jev's ``/v1/systemone`` typed-decision API on top of SGLang's ``/v1/score``.
 
-TypeSafe's Jev API takes a ``state`` and a map of typed ``questions`` (``choice``,
-``score``, ``noul``) and returns one typed answer per question: a chosen option with a
-probability per option and a confidence, a probability-weighted score over ordered
-levels, or the probability that a yes/no statement is true. It writes no text.
+Each question becomes a chat prompt ending where the answer label starts; one
+``/v1/score`` call with ``label_token_ids`` returns the label distribution for
+every question of a request. See README.md for the mapping and limits.
 
-Any instruction-tuned model served by SGLang can answer the same shape of question
-with a single forward pass per question: build a prompt that ends where the answer
-label would start, and read the next-token distribution over the label tokens. That
-is exactly what ``/v1/score`` does with ``label_token_ids`` + ``apply_softmax``, and
-one ``/v1/score`` call scores every question of a request as one batch, so all
-questions are evaluated in parallel and in isolation against the same state, as in
-Jev.
-
-Usage::
-
-    # Terminal 1: any chat model
     python -m sglang.launch_server --model-path Qwen/Qwen2.5-0.5B-Instruct --port 30000
-
-    # Terminal 2: the proxy
     python systemone_server.py --upstream http://127.0.0.1:30000 \
         --model Qwen/Qwen2.5-0.5B-Instruct --port 8300
-
-    # Terminal 3: a Jev-shaped request
-    curl -s localhost:8300/v1/systemone -H 'content-type: application/json' -d '{
-      "state": "Help! My payouts have been failing for 3 days.",
-      "questions": {
-        "department": {"type": "choice", "instructions": "Which team should handle this?",
-                       "criteria": {"billing": "Payments, invoicing, refunds",
-                                    "technical": "Bugs, outages, integrations",
-                                    "sales": "Pricing, upgrades, new accounts"}},
-        "frustration": {"type": "score", "instructions": "How frustrated is the customer?",
-                        "criteria": ["Calm", "Frustrated", "Very angry"]},
-        "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"}
-      }
-    }'
-
-The request and response bodies follow https://docs.typesafe.ai/api. ``model`` in the
-request is accepted and ignored; the served model answers. Differences from the hosted
-model are listed in README.md (in short: the probabilities come from a generative
-model's next-token distribution, not from a model trained to be calibrated, so fit
-``--temperature`` on labelled data before trusting thresholds).
 """
 
 import argparse
@@ -60,11 +26,10 @@ NOUL_LABELS = ("Yes", "No")
 
 
 class SchemaError(ValueError):
-    """The request body does not follow the /v1/systemone schema."""
+    pass
 
 
 def as_text(value) -> str:
-    """Render a state / instructions / criteria value for the prompt."""
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2)
@@ -119,7 +84,6 @@ def parse_questions(body: dict) -> list[dict]:
 
 
 def question_prompt(state, q: dict) -> tuple[str, list[str]]:
-    """User-turn text for one question and the answer labels, in option order."""
     lines = ["State:", as_text(state), "", "Question:", as_text(q["instructions"])]
     if q["type"] == "choice":
         labels = list(string.ascii_uppercase[: len(q["criteria"])])
@@ -146,7 +110,7 @@ def question_prompt(state, q: dict) -> tuple[str, list[str]]:
 
 
 def confidence(probs: list[float]) -> float:
-    """Jev's published confidence: 0 for a uniform distribution, 1 for a certain one."""
+    """Confidence as TypeSafe defines it: 0 uniform, 1 certain."""
     n = len(probs)
     if n < 2:
         return 1.0
@@ -171,7 +135,6 @@ class SystemOne:
         self._label_ids: dict[str, int] = {}
 
     def label_token(self, label: str) -> int:
-        """First token of the label, as it appears at the start of the assistant turn."""
         if label not in self._label_ids:
             ids = self.tokenizer.encode(label, add_special_tokens=False)
             if not ids:

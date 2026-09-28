@@ -1,21 +1,10 @@
-# Typed decisions: Jev's `/v1/systemone` on an SGLang server
+# Jev's `/v1/systemone` on an SGLang server
 
-[TypeSafe's Jev API](https://docs.typesafe.ai/api) takes a `state` and a map of typed
-`questions` and returns one typed answer per question, with no generated text:
-
-| question `type` | answer |
-|---|---|
-| `choice` | the chosen option, a probability per option, `confidence` |
-| `score` | a probability-weighted position over ordered levels, a probability per level, `confidence` |
-| `noul` | the probability that a yes/no statement is true |
-
-`systemone_server.py` serves that API in front of any instruction-tuned model running
-on SGLang. Each question becomes a chat prompt that ends where the answer label would
-start, and the answer is read from the model's next-token distribution over the label
-tokens. That is what SGLang's `/v1/score` endpoint computes (`label_token_ids` +
-`apply_softmax`), and one `/v1/score` call scores all questions of a request as one
-batch, so every question is evaluated in parallel and in isolation against the same
-state, as in Jev.
+`systemone_server.py` serves [TypeSafe's Jev API](https://docs.typesafe.ai/api)
+(`choice` / `score` / `noul` questions about a `state`, answered with probabilities
+and a confidence, no generated text) in front of any chat model on SGLang. Each
+question becomes a prompt that ends where the answer label starts; one `/v1/score`
+call with `label_token_ids` returns the label distribution for every question.
 
 ## Run it
 
@@ -73,21 +62,15 @@ arrays are rendered as JSON in the prompt). Schema errors return HTTP 400 with a
 - **score**: levels are labelled the same way, in order. `score = Σ i · p_i` over level
   indices, and `legend` maps each index back to its description.
 - **noul**: the labels are `Yes` and `No`; `noul` is P(`Yes`).
-- **confidence** (choice and score) uses the formula TypeSafe publishes for its own
-  answers: `clamp((n · max(p) − 1) / (n − 1), 0, 1)` for `n` options, so a uniform
-  distribution scores 0 and a certain one scores 1.
-- `--temperature` scales the label logits before the softmax (SGLang's `/v1/score`
-  `temperature`). Fit it on a labelled sample before thresholding on probabilities.
+- **confidence** (choice and score): TypeSafe's published formula,
+  `clamp((n · max(p) − 1) / (n − 1), 0, 1)`; 0 for uniform, 1 for certain.
+- `--temperature` scales the label logits before the softmax; fit it on labelled data.
 
 ## Differences from the hosted model
 
-- The probabilities are a generative model's next-token distribution, not the output of
-  a model trained for calibrated decisions. Treat the numbers as uncalibrated until you
-  have checked them against labels.
-- Options are limited to 26 (one letter label each); Jev allows 255. Levels are limited
-  to 10, as in Jev.
-- Answer labels must tokenize to distinct leading tokens under the served model's
-  tokenizer; the proxy checks this and returns 400 if they do not.
-- `model` in the request is accepted and ignored; the served model answers, and its name
-  is returned.
-- Images and other non-text state are not supported.
+- Probabilities come from a generative model's next-token distribution, not a model
+  trained for calibrated decisions; check them against labels before thresholding.
+- At most 26 options (letter labels; Jev allows 255) and 10 levels (as in Jev).
+- Labels must tokenize to distinct leading tokens; otherwise 400.
+- `model` in the request is ignored; the served model answers.
+- Text state only.
