@@ -424,6 +424,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens_per_req=self.captured_req_width,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            allocate_input_embeds=(
+                self.dllm_uses_input_embeds
+                or (
+                    model_runner.spec_algorithm.is_dflash_family()
+                    and model_runner.is_draft_worker
+                )
+            ),
             ne_token_table=(
                 model_runner.ngram_embedding_manager.table
                 if self.use_ngram_embedding

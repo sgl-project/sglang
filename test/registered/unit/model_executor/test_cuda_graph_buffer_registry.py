@@ -27,9 +27,40 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     PaddingPolicy,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestDecodeInputStorage(unittest.TestCase):
+    def test_embeddings_are_optional_and_other_buffers_still_share(self):
+        with get_context().override_server_args(device="cpu"):
+            kwargs = dict(
+                device="cpu",
+                max_bs=3,
+                max_num_token=48,
+                hidden_size=64,
+                next_token_logits_buffer=torch.empty(48, 128),
+                dtype=torch.bfloat16,
+                dp_size=1,
+                pp_size=1,
+                is_encoder_decoder=False,
+                require_mlp_tp_gather=False,
+                seq_len_fill_value=1,
+                encoder_len_fill_value=0,
+                num_tokens_per_req=16,
+                cache_loc_dtype=torch.int64,
+                enable_mamba_track=False,
+            )
+            plain = DecodeInputBuffers.create(**kwargs, allocate_input_embeds=False)
+            embedded = DecodeInputBuffers.create(**kwargs)
+            plain.share_buffers()
+            embedded.share_buffers()
+            self.assertIsNone(plain.input_embeds)
+            self.assertEqual(embedded.input_embeds.shape, (48, 64))
+            self.assertEqual(plain.input_ids.data_ptr(), embedded.input_ids.data_ptr())
 
 
 @dataclasses.dataclass

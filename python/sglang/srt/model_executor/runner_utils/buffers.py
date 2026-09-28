@@ -104,7 +104,7 @@ def _allocate_pp_proxy_tensors(
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
-    input_embeds: torch.Tensor
+    input_embeds: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -148,10 +148,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        allocate_input_embeds: bool = True,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+            input_embeds = (
+                torch.zeros((max_num_token, hidden_size), dtype=dtype)
+                if allocate_input_embeds
+                else None
+            )
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
