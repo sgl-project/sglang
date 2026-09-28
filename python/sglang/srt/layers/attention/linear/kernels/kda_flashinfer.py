@@ -194,6 +194,37 @@ def _cuda_device_capability(device: torch.device) -> tuple:
 _flashinfer_prepared_bf16_available: Optional[bool] = None
 _flashinfer_prepare_bf16_kda_prefill = None
 _flashinfer_kda_prefill_plan_cache_cls = None
+
+
+def _prepared_qkv_layout_supported(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """True when the prepared BF16 export can read q/k/v without a repack.
+
+    Dense tensors always qualify.  Strided ``split(dim=-1)`` views qualify when
+    the per-token ``[H, D]`` payload is dense (``stride(-1) == 1``,
+    ``stride(-2) == D``), the three token strides agree and are multiples of 8
+    elements, and a leading batch axis (if longer than one) is the plain
+    product of tokens and token stride.
+    """
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return True
+    tensors = (q, k, v)
+    if any(t.ndim != 4 for t in tensors):
+        return False
+    heads_x_dim = q.shape[2] * q.shape[3]
+    token_strides = {t.stride(1) for t in tensors}
+    if len(token_strides) != 1:
+        return False
+    token_stride = token_strides.pop()
+    if token_stride < heads_x_dim or token_stride % 8 != 0:
+        return False
+    for t in tensors:
+        if t.stride(3) != 1 or t.stride(2) != t.shape[3]:
+            return False
+        if t.shape[0] > 1 and t.stride(0) != t.shape[1] * token_stride:
+            return False
+    return True
 # FP32 intermediate-state rows are exported per gate kind: index 0 = unbounded
 # softplus gate (lower_bound=None), index 1 = bounded gate.
 _flashinfer_kda_prefill_fp32_checkpoints = (False, False)
@@ -737,16 +768,18 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         _, prepare_bf16_kda_prefill = _get_flashinfer_prepared_bf16_prefill()
         # Upstream forward_extend runs one fused causal conv over the packed qkv
         # row and hands us ``split(dim=-1)`` views, i.e. [1, T, H, D] tensors whose
-        # token stride is the full qkv width.  The prepared export's TMA
-        # descriptors read dense operands (``q must be contiguous``), so repack
-        # strided inputs here; this is a no-op for already-dense tensors.  Cost
-        # when it fires: one T*H*D BF16 copy per strided operand.
-        if not q.is_contiguous():
-            q = q.contiguous()
-        if not k.is_contiguous():
-            k = k.contiguous()
-        if not v.is_contiguous():
-            v = v.contiguous()
+        # token stride is the full qkv width.  The prepared export reads such
+        # views in place when each token's [H, D] payload is dense and q, k and
+        # v share one token stride (a multiple of 8 elements); anything else is
+        # repacked here.  Cost when the repack fires: one T*H*D BF16 copy per
+        # strided operand.
+        if not _prepared_qkv_layout_supported(q, k, v):
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            if not v.is_contiguous():
+                v = v.contiguous()
         num_v_heads, head_v_dim, head_k_dim = v.shape[2], v.shape[3], q.shape[3]
         self._check_cake_fp32_state_contract(
             ssm_states,
