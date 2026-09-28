@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 # backend-specific: the zero-tail specialization only exists in the HIP TileLang kernels
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -72,6 +72,20 @@ def _torch_sparse_attention(q, kv, indices, scale, d_v):
     "the zero-tail TileLang specialization is compiled for gfx950",
 )
 class TestTileLangDSAZeroRope(CustomTestCase):
+    @staticmethod
+    def _bf16_inputs(tokens, heads=16, kv_len=2112, all_masked=False):
+        torch.manual_seed(7)
+        q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(kv_len, 1, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        indices = indices.remainder(kv_len).view(1, 1, 2112)
+        indices = indices.expand(tokens, -1, -1).clone()
+        indices[..., :64] = 3
+        indices[..., 2051:] = -1
+        if all_masked:
+            indices.fill_(-1)
+        return q, kv, indices
+
     def _assert_matches_torch(self, use_fp8, d_v, d_tail):
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
             FP8_DTYPE,
@@ -114,6 +128,70 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         for use_fp8 in (False, True):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
+
+    def test_glm53_h16_d512_zero_rope_matches_torch(self):
+        """Pin the GLM-5.3 TP4 sparse-attention head geometry and padded top-k."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=17)
+        scale = 1.0 / math.sqrt(256)
+        expected = _torch_sparse_attention(q, kv, indices, scale, d_v=512)
+        actual = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
+        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
+        repeated = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512).squeeze(0)
+        torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+    def test_glm53_all_masked_rows_are_finite_zeros(self):
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=1, all_masked=True)
+        actual = tilelang_sparse_fwd(q, kv, indices, 1.0 / math.sqrt(256), d_v=512)
+        self.assertTrue(torch.isfinite(actual).all())
+        self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+
+    def test_glm53_zero_rope_cuda_graph_replay(self):
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        q, kv, indices = self._bf16_inputs(tokens=17)
+        scale = 1.0 / math.sqrt(256)
+        eager = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = tilelang_sparse_fwd(q, kv, indices, scale, d_v=512)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+
+    def test_glm53_production_grids_are_finite(self):
+        """M=8192/16384 must retain the traced one-group partial dispatch."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.bfloat16)
+        base_indices = torch.arange(2112, device="cuda", dtype=torch.int32)
+        base_indices[2051:] = -1
+        for tokens in (8192, 16384):
+            with self.subTest(tokens=tokens):
+                q = torch.zeros(tokens, 16, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                actual = tilelang_sparse_fwd(
+                    q, kv, indices, 1.0 / math.sqrt(256), d_v=512
+                )
+                self.assertEqual(actual.shape, (1, tokens, 16, 512))
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+                del q, indices, actual
+                empty_gpu_cache()
 
 
 if __name__ == "__main__":
