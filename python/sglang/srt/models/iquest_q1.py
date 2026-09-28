@@ -160,9 +160,8 @@ class IQuestQ1RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Keep normalization and weight multiplication in FP32 until the final cast.
-        # The draft can pass FP32 residuals with BF16 weights; the tested fused CUDA
-        # RMSNorm rejects this combination and can round BF16 inputs differently.
+        # The draft passes FP32 residuals with BF16 weights, which the fused CUDA
+        # RMSNorm rejects; it also rounds BF16 inputs differently.
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -454,9 +453,8 @@ class IQuestQ1DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # These model-specific residual paths are intentionally different:
-        # layer 0 uses raw input and an FFN output norm; later layers use normalized
-        # input and no FFN output norm. The draft follows the layer-0 convention.
+        # Intentional: layer 0 adds the raw input and an FFN output norm, later layers
+        # add the normalized input without one; the MTP draft follows layer 0.
         if self.is_first_layer:
             norm_hidden_states = self.attention_norm(hidden_states)
             attn_output = self.self_attn(positions, norm_hidden_states, forward_batch)

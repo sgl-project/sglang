@@ -20,9 +20,8 @@ def torch_reference(query, sink_key, attn_output, lse, scale):
 class TestIQuestQ1LearnedSink(CustomTestCase):
     def test_matches_torch_across_layouts_and_dtypes(self):
         torch.manual_seed(17)
-        # (tokens, heads, kv_heads, head_dim): empty batch, row-tail masking,
-        # the model's GQA layout, MHA with a non-power-of-two head dim, the
-        # non-128 reduction path, and the 64-row tile used for long prefills.
+        # (tokens, heads, kv_heads, head_dim): empty batch, row-tail mask, model GQA,
+        # MHA with head_dim 80, the non-128 reduction path, the 64-row prefill tile.
         shapes = (
             (0, 6, 1, 128),
             (7, 6, 1, 128),
