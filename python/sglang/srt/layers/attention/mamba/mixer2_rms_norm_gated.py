@@ -47,9 +47,9 @@ class Mixer2RMSNormGated(BaseFusedOp):
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
             self.register_parameter("weight", None)
-        assert (
-            self.full_hidden_size % self.tp_size == 0
-        ), "Tensor parallel world size must divide hidden size."
+        assert self.full_hidden_size % self.tp_size == 0, (
+            "Tensor parallel world size must divide hidden size."
+        )
 
     def forward_native(
         self,

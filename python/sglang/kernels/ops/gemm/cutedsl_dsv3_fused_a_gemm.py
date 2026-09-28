@@ -338,9 +338,9 @@ def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Te
     assert mat_a.dtype == torch.bfloat16 and mat_b.dtype == torch.bfloat16
     assert K % 1024 == 0, f"K must be a multiple of 1024, got {K}"
     assert N % TILE_M == 0, f"N must be a multiple of {TILE_M}, got {N}"
-    assert (
-        tuple(mat_b.shape) == (K, N) and mat_b.stride(0) == 1
-    ), "mat_b must be [K, N] column-major"
+    assert tuple(mat_b.shape) == (K, N) and mat_b.stride(0) == 1, (
+        "mat_b must be [K, N] column-major"
+    )
     assert 1 <= M <= 16, "num_tokens must be in [1, 16]"
     assert mat_a.stride(1) == 1, "mat_a must be row-major [M, K]"
 

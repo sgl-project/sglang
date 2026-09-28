@@ -319,12 +319,14 @@ def test_topk_sigmoid_vs_ref(num_tokens, num_experts, topk, dtype, renormalize):
         ref_w.sort(dim=-1)[0],
         atol=1e-3,
         rtol=1e-3,
-    ), f"Weight mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk}, renorm={renormalize})"
+    ), (
+        f"Weight mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk}, renorm={renormalize})"
+    )
     # Exact index match is only reliable for float32 (fp16/bf16 tie-breaking may differ)
     if dtype == torch.float32:
-        assert torch.equal(
-            topk_i, ref_i
-        ), f"Index mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
+        assert torch.equal(topk_i, ref_i), (
+            f"Index mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -351,12 +353,12 @@ def test_topk_sigmoid_with_correction_bias(num_tokens, num_experts, topk, renorm
 
     ref_w, ref_i = topk_sigmoid_ref(gating, topk, renormalize, correction_bias=bias)
 
-    assert torch.allclose(
-        topk_w, ref_w, atol=1e-3, rtol=1e-3
-    ), f"Weight mismatch with bias (n_exp={num_experts}, topk={topk}, renorm={renormalize})"
-    assert torch.equal(
-        topk_i, ref_i
-    ), f"Index mismatch with bias (n_exp={num_experts}, topk={topk})"
+    assert torch.allclose(topk_w, ref_w, atol=1e-3, rtol=1e-3), (
+        f"Weight mismatch with bias (n_exp={num_experts}, topk={topk}, renorm={renormalize})"
+    )
+    assert torch.equal(topk_i, ref_i), (
+        f"Index mismatch with bias (n_exp={num_experts}, topk={topk})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +396,12 @@ def test_topk_sigmoid_with_fused_shared_experts(
         gating, topk + 1, renormalize, correction_bias=bias, num_fused_shared_experts=1
     )
 
-    assert torch.allclose(
-        topk_w, ref_w, atol=1e-3, rtol=1e-3
-    ), f"Weight mismatch with bias (n_exp={num_experts}, topk={topk}, renorm={renormalize})"
-    assert torch.equal(
-        topk_i, ref_i
-    ), f"Index mismatch with bias (n_exp={num_experts}, topk={topk})"
+    assert torch.allclose(topk_w, ref_w, atol=1e-3, rtol=1e-3), (
+        f"Weight mismatch with bias (n_exp={num_experts}, topk={topk}, renorm={renormalize})"
+    )
+    assert torch.equal(topk_i, ref_i), (
+        f"Index mismatch with bias (n_exp={num_experts}, topk={topk})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,12 +486,12 @@ def test_topk_sigmoid_vs_aot(num_tokens, num_experts, topk, dtype, renormalize):
     topk_i_aot = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
     topk_sigmoid_aot(topk_w_aot, topk_i_aot, gating, renormalize=renormalize)
 
-    assert torch.allclose(
-        topk_w_jit, topk_w_aot, atol=1e-3, rtol=1e-3
-    ), f"JIT vs AOT weight mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
-    assert torch.equal(
-        topk_i_jit, topk_i_aot
-    ), f"JIT vs AOT index mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
+    assert torch.allclose(topk_w_jit, topk_w_aot, atol=1e-3, rtol=1e-3), (
+        f"JIT vs AOT weight mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
+    )
+    assert torch.equal(topk_i_jit, topk_i_aot), (
+        f"JIT vs AOT index mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
+    )
 
 
 if __name__ == "__main__":

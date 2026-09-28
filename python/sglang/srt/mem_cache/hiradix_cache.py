@@ -80,7 +80,6 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
-
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
@@ -1209,9 +1208,9 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), f"This request holds the node from another tree"
+                assert node is self.root_node, (
+                    f"This request holds the node from another tree"
+                )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1422,9 +1421,9 @@ class HiRadixCache(RadixCache):
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
-            assert (
-                node.backuped
-            ), "No backup available on evicted nodes, should not happen"
+            assert node.backuped, (
+                "No backup available on evicted nodes, should not happen"
+            )
             nodes_to_load.insert(0, node)
             node = node.parent
         else:

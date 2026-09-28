@@ -292,5 +292,167 @@ def test_deepseek_v4_topk_transform(bs: int, c4_len: int) -> None:
     )
 
 
+def _make_scores(kind: str, bs: int, width: int, seed: int) -> torch.Tensor:
+    """Score distributions that stress the coarse stage of a histogram top-k.
+
+    Everything above uses ``torch.randn``, which spreads over enough exponents that
+    even a narrow coarse key separates it -- 127 populated buckets out of 256 on an
+    8-bit key. Real DSA indexer logits are far more concentrated than that. Captured
+    from a GLM-5.2 decode at 134,849 tokens of context, six consecutive indexer calls
+    populate 4 to 126 buckets, with the largest holding 6% to 88% of the row.
+
+    The three below bracket that regime, and each is calibrated to what it provokes on
+    an 8-bit fp16 coarse key: `banded` populates 4 buckets with 47% in the largest,
+    `narrow` collapses to a single bucket, and `subnormal` to two.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if kind == "diffuse":
+        return torch.randn(bs, width, generator=g, device="cuda", dtype=torch.float32)
+    if kind == "banded":
+        # The value range of the worst real capture, [54, 88].
+        return 54.0 + 34.0 * torch.rand(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    if kind == "narrow":
+        # A row whose spread is small next to its magnitude, which is what makes a
+        # truncating coarse key run out of buckets.
+        return 70.0 + torch.randn(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    if kind == "subnormal":
+        # Same shape as diffuse, scaled below fp16's smallest normal: a coarse key that
+        # rounds through fp16 cannot separate this row at all, an fp32 one is unaffected.
+        return 1e-16 * torch.randn(
+            bs, width, generator=g, device="cuda", dtype=torch.float32
+        )
+    raise ValueError(kind)
+
+
+def assert_exact(
+    score: torch.Tensor, indices: torch.Tensor, seq_len: int, k: int
+) -> None:
+    """The selected scores must be the top-k scores, as a multiset.
+
+    Stricter than ``assert_equal`` on purpose. Comparing index sets has to forgive
+    tie-breaking, and that forgiveness is what lets a kernel selecting from a silently
+    truncated candidate set pass: the indices it returns are all in range and all
+    distinct, they are simply not the largest.
+    """
+    for i in range(score.shape[0]):
+        want = torch.sort(
+            torch.topk(score[i, :seq_len], k).values, descending=True
+        ).values
+        got = torch.sort(score[i, :seq_len][indices[i].long()], descending=True).values
+        assert torch.equal(got, want), (
+            f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
+        )
+
+
+def assert_exact_rows(
+    score: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> None:
+    """Exact value-multiset check for variable windows and relative indices."""
+    for i in range(score.shape[0]):
+        length = int(lengths[i])
+        start = 0 if row_starts is None else int(row_starts[i])
+        row_indices = indices[i].long()
+        assert torch.all((row_indices >= 0) & (row_indices < length))
+        row = score[i, start : start + length]
+        want = torch.sort(torch.topk(row, k).values).values
+        got = torch.sort(row[row_indices]).values
+        assert torch.equal(got, want), (
+            f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
+        )
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or torch.cuda.device_count() < 2,
+    reason="requires a multi-GPU ROCm runner",
+)
+@torch.inference_mode()
+def test_topk_uses_score_device_and_rejects_mixed_devices() -> None:
+    current_device = torch.cuda.current_device()
+    score_device = (current_device + 1) % torch.cuda.device_count()
+    score = torch.randn(1, 16384, dtype=torch.float32, device=score_device)
+    lengths = torch.full((1,), 16384, dtype=torch.int32, device=score_device)
+
+    indices = fast_topk_v2(score, lengths, 2048)
+    assert_exact(score, indices, 16384, 2048)
+    assert torch.cuda.current_device() == current_device
+
+    with pytest.raises(RuntimeError, match="same device"):
+        fast_topk_v2(score, lengths.to(f"cuda:{current_device}"), 2048)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None,
+    reason="the CUDA kernel in csrc/elementwise/topk.cu shares this limitation; only "
+    "the ROCm one (csrc/elementwise/topk.hip) is exact on these distributions",
+)
+@pytest.mark.parametrize("kind", ["diffuse", "banded", "narrow", "subnormal"])
+@pytest.mark.parametrize("bs", [1, 4, 64])
+@pytest.mark.parametrize("seq_len", [16384, 65536, 100500])
+@torch.inference_mode()
+def test_topk_is_exact_for_indexer_distributions(
+    kind: str, bs: int, seq_len: int
+) -> None:
+    k = 2048
+    score = _make_scores(kind, bs, MAX_SEQ_LEN, seed=seq_len + bs)
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
+    assert_exact(score, fast_topk_v2(score, lengths, k), seq_len, k)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None,
+    reason="the cooperative top-k implementation is only built on ROCm",
+)
+@pytest.mark.parametrize("kind", ["banded", "narrow", "subnormal"])
+@pytest.mark.parametrize("force_one_block", [False, True])
+@torch.inference_mode()
+def test_topk_variants_are_exact_on_variable_windows(
+    kind: str, force_one_block: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cover both dispatches and all three APIs on adversarial score distributions."""
+    if force_one_block:
+        monkeypatch.setenv("SGL_DSA_TOPK_ROW_SPLIT", "0")
+    else:
+        monkeypatch.delenv("SGL_DSA_TOPK_ROW_SPLIT", raising=False)
+
+    bs, k = 4, 2048
+    score = _make_scores(kind, bs, MAX_SEQ_LEN, seed=1200 + force_one_block)
+    lengths = torch.tensor(
+        [65536, 70000, 90000, 100500], dtype=torch.int32, device="cuda"
+    )
+    row_starts = torch.tensor([0, 127, 511, 0], dtype=torch.int32, device="cuda")
+
+    raw = fast_topk_v2(score, lengths, k, row_starts=row_starts)
+    assert_exact_rows(score, raw, lengths, k, row_starts)
+
+    ragged_offsets = torch.tensor(
+        [17, 200000, 400000, 600000], dtype=torch.int32, device="cuda"
+    )
+    ragged = fast_topk_transform_ragged_fused(
+        score, lengths, ragged_offsets, k, row_starts=row_starts
+    )
+    assert_exact_rows(score, ragged - ragged_offsets[:, None], lengths, k, row_starts)
+
+    logical = torch.arange(MAX_SEQ_LEN, dtype=torch.int32, device="cuda")
+    multipliers = torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="cuda")
+    shifts = torch.tensor([19, 43, 71, 101], dtype=torch.int32, device="cuda")
+    page_table = (
+        logical[None, :] * multipliers[:, None] + shifts[:, None]
+    ) % MAX_SEQ_LEN
+    cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+    mapped = fast_topk_transform_fused(score, lengths, page_table, cu_seqlens_q, k)
+    inverse_page_table = torch.empty_like(page_table)
+    inverse_page_table.scatter_(1, page_table.long(), logical[None, :].expand(bs, -1))
+    mapped_raw = inverse_page_table.gather(1, mapped.long())
+    assert_exact_rows(score, mapped_raw, lengths, k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

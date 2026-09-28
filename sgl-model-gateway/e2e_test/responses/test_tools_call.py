@@ -168,9 +168,9 @@ class TestToolCallingCloud:
 
         # Check for function_call in output
         function_calls = [item for item in output if item.type == "function_call"]
-        assert (
-            len(function_calls) > 0
-        ), "Response should contain at least one function_call"
+        assert len(function_calls) > 0, (
+            "Response should contain at least one function_call"
+        )
 
         # Verify function_call structure
         function_call = function_calls[0]
@@ -285,30 +285,30 @@ class TestToolCallingCloud:
 
         event_types = [event.type for event in events]
         assert "response.created" in event_types, "Should have response.created event"
-        assert (
-            "response.completed" in event_types
-        ), "Should have response.completed event"
-        assert (
-            "response.output_item.added" in event_types
-        ), "Should have output_item.added events"
-        assert (
-            "response.mcp_list_tools.in_progress" in event_types
-        ), "Should have mcp_list_tools.in_progress event"
-        assert (
-            "response.mcp_list_tools.completed" in event_types
-        ), "Should have mcp_list_tools.completed event"
-        assert (
-            "response.mcp_call.in_progress" in event_types
-        ), "Should have mcp_call.in_progress event"
-        assert (
-            "response.mcp_call_arguments.delta" in event_types
-        ), "Should have mcp_call_arguments.delta event"
-        assert (
-            "response.mcp_call_arguments.done" in event_types
-        ), "Should have mcp_call_arguments.done event"
-        assert (
-            "response.mcp_call.completed" in event_types
-        ), "Should have mcp_call.completed event"
+        assert "response.completed" in event_types, (
+            "Should have response.completed event"
+        )
+        assert "response.output_item.added" in event_types, (
+            "Should have output_item.added events"
+        )
+        assert "response.mcp_list_tools.in_progress" in event_types, (
+            "Should have mcp_list_tools.in_progress event"
+        )
+        assert "response.mcp_list_tools.completed" in event_types, (
+            "Should have mcp_list_tools.completed event"
+        )
+        assert "response.mcp_call.in_progress" in event_types, (
+            "Should have mcp_call.in_progress event"
+        )
+        assert "response.mcp_call_arguments.delta" in event_types, (
+            "Should have mcp_call_arguments.delta event"
+        )
+        assert "response.mcp_call_arguments.done" in event_types, (
+            "Should have mcp_call_arguments.done event"
+        )
+        assert "response.mcp_call.completed" in event_types, (
+            "Should have mcp_call.completed event"
+        )
 
         completed_events = [e for e in events if e.type == "response.completed"]
         assert len(completed_events) == 1
@@ -336,18 +336,18 @@ class TestToolCallingCloud:
             assert mcp_call.output is not None
 
         # Strict validation for cloud backends - check for text output events
-        assert (
-            "response.content_part.added" in event_types
-        ), "Should have content_part.added event"
-        assert (
-            "response.output_text.delta" in event_types
-        ), "Should have output_text.delta events"
-        assert (
-            "response.output_text.done" in event_types
-        ), "Should have output_text.done event"
-        assert (
-            "response.content_part.done" in event_types
-        ), "Should have content_part.done event"
+        assert "response.content_part.added" in event_types, (
+            "Should have content_part.added event"
+        )
+        assert "response.output_text.delta" in event_types, (
+            "Should have output_text.delta events"
+        )
+        assert "response.output_text.done" in event_types, (
+            "Should have output_text.done event"
+        )
+        assert "response.content_part.done" in event_types, (
+            "Should have content_part.done event"
+        )
 
         assert "message" in final_output_types
 
@@ -400,9 +400,9 @@ class TestToolChoiceHarmony:
         assert len(output) > 0
 
         function_calls = [item for item in output if item.type == "function_call"]
-        assert (
-            len(function_calls) > 0
-        ), "Model should choose to call function with tool_choice='auto'"
+        assert len(function_calls) > 0, (
+            "Model should choose to call function with tool_choice='auto'"
+        )
 
     def test_tool_choice_required(self, setup_backend):
         """Test tool_choice="required" forces the model to call at least one tool."""
@@ -423,9 +423,9 @@ class TestToolChoiceHarmony:
 
         output = resp.output
         function_calls = [item for item in output if item.type == "function_call"]
-        assert (
-            len(function_calls) > 0
-        ), "tool_choice='required' must force at least one function call"
+        assert len(function_calls) > 0, (
+            "tool_choice='required' must force at least one function call"
+        )
 
     def test_tool_choice_specific_function(self, setup_backend):
         """Test tool_choice with specific function name forces that function to be called."""
@@ -447,9 +447,9 @@ class TestToolChoiceHarmony:
         output = resp.output
         function_calls = [item for item in output if item.type == "function_call"]
         assert len(function_calls) > 0, "Must call the specified function"
-        assert (
-            function_calls[0].name == "search_web"
-        ), "Must call the function specified in tool_choice"
+        assert function_calls[0].name == "search_web", (
+            "Must call the function specified in tool_choice"
+        )
 
     def test_tool_choice_streaming(self, setup_backend):
         """Test tool_choice parameter works correctly with streaming."""

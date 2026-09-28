@@ -10,7 +10,7 @@ from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _xml(name: str, arguments: list[tuple[str, str]]) -> str:
@@ -149,7 +149,7 @@ class TestSpark25DetectorDetectAndParse(CustomTestCase):
         self.assertFalse(self.detector.supports_structural_tag())
         self.assertTrue(self.detector.parses_required_natively())
         self.assertIs(
-            FunctionCallParser(self.tools, "spark").get_structure_constraint(
+            FunctionCallParser(self.tools, "spark25").get_structure_constraint(
                 "required"
             ),
             None,

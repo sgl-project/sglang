@@ -38,7 +38,7 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=131, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
@@ -350,7 +350,6 @@ def test_load_weights_from_remote_instance(
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
-
     def test_load_weights_from_remote_instance(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
