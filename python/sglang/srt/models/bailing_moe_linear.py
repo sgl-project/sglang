@@ -15,15 +15,15 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -820,7 +820,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             if config.attention_type == 1 and self.use_mla
             else None
         )
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -854,7 +854,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 1 shape= {hidden_states.shape}, {residual.shape}"
         # )
@@ -875,12 +875,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 2 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
         hidden_states = ffn_exit.finish(hidden_states)
         return hidden_states
@@ -983,7 +983,7 @@ class BailingMoELinearModel(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

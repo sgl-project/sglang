@@ -19,22 +19,22 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
+from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     SumGroup,
     TokenAxis,
 )
-from sglang.srt.layers.communicator import boundary as comm_boundary
-from sglang.srt.layers.communicator import construction as comm_layer
-from sglang.srt.layers.communicator import exit as comm_exit
-from sglang.srt.layers.communicator import layout as comm_layout
-from sglang.srt.layers.communicator import ops as transport_ops
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.adapters import branch
-from sglang.srt.layers.communicator.construction import BatchVariant
-from sglang.srt.layers.communicator.fusions.allreduce import complete_ffn_input
-from sglang.srt.layers.communicator.ops import (
+from sglang.srt.layers.layer_boundary import boundary as comm_boundary
+from sglang.srt.layers.layer_boundary import construction as comm_layer
+from sglang.srt.layers.layer_boundary import exit as comm_exit
+from sglang.srt.layers.layer_boundary import layout as comm_layout
+from sglang.srt.layers.layer_boundary import ops as transport_ops
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.adapters import branch
+from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.fusions.allreduce import complete_ffn_input
+from sglang.srt.layers.layer_boundary.ops import (
     gather_attention_tp,
     identity_output,
     output_on_residual_shard,
@@ -44,10 +44,10 @@ from sglang.srt.layers.communicator.ops import (
     take_back_cp_shard,
     update_and_gather,
 )
-from sglang.srt.layers.communicator.residual import mhc as mhc_module
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack
-from sglang.srt.layers.communicator.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
-from sglang.srt.layers.communicator.residual.stream import OwedOutput, ResidualStream
+from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
+from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READ, PLAIN_RESIDUAL
+from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import (

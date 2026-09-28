@@ -51,15 +51,15 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -431,7 +431,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.attn_stage, self.moe_stage = make_stages(
+        self.attn_boundary, self.moe_boundary = make_stages(
             (
                 declare_attn(),
                 self.input_layernorm[0],
@@ -446,21 +446,23 @@ class LongcatFlashDecoderLayer(nn.Module):
             else None,
             terminal=self.layer_id == config.num_hidden_layers - 1,
         )
-        self.first_ffn, self.second_attn, self.second_ffn = make_stages(
-            (
-                declare_ffn(),
-                self.post_attention_layernorm[0],
-            ),
-            (
-                declare_attn(),
-                self.input_layernorm[1],
-                {"qkv_latent_func": self.self_attn[1].prepare_qkv_latent},
-            ),
-            (
-                declare_ffn(),
-                self.post_attention_layernorm[1],
-            ),
-            prepared_from=self.moe_stage.declaration,
+        self.first_ffn_boundary, self.second_attn_boundary, self.second_ffn_boundary = (
+            make_stages(
+                (
+                    declare_ffn(),
+                    self.post_attention_layernorm[0],
+                ),
+                (
+                    declare_attn(),
+                    self.input_layernorm[1],
+                    {"qkv_latent_func": self.self_attn[1].prepare_qkv_latent},
+                ),
+                (
+                    declare_ffn(),
+                    self.post_attention_layernorm[1],
+                ),
+                prepared_from=self.moe_boundary.declaration,
+            )
         )
 
     def forward(
@@ -472,7 +474,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         prev_topk_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # first_attn
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             attn_out = self.self_attn[0](
                 positions=positions,
@@ -487,9 +489,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = attn_out
 
         # moe
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.moe_stage.prepare(hidden_states, forward_batch)
-        moe_hidden_states = self.moe_stage.branch_output(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.moe_boundary.prepare(hidden_states, forward_batch)
+        moe_hidden_states = self.moe_boundary.branch_output(
             self.mlp(hidden_states.clone()), forward_batch
         )
 
@@ -501,10 +503,10 @@ class LongcatFlashDecoderLayer(nn.Module):
             prev_topk_indices,
         )
 
-        hidden_states = self.moe_stage.merge_branch(
+        hidden_states = self.moe_boundary.merge_branch(
             moe_hidden_states,
             hidden_states,
-            self.second_ffn,
+            self.second_ffn_boundary,
             forward_batch,
         )
         return hidden_states, prev_topk_indices
@@ -518,15 +520,15 @@ class LongcatFlashDecoderLayer(nn.Module):
         prev_topk_indices,
     ):
         # first_mlp, on the input the MoE's boundary read
-        hidden_states = self.first_ffn.branch_input(
-            self.moe_stage, hidden_states, forward_batch
+        hidden_states = self.first_ffn_boundary.branch_input(
+            self.moe_boundary, hidden_states, forward_batch
         )
-        with self.first_ffn.exit(forward_batch) as ffn_exit:
+        with self.first_ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlps[0](hidden_states)
         hidden_states = ffn_exit.finish(hidden_states)
 
-        # second_attn
-        hidden_states = self.second_attn.prepare(hidden_states, forward_batch)
+        # second_attn_boundary
+        hidden_states = self.second_attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             attn_out = self.self_attn[1](
                 positions=positions,
@@ -541,9 +543,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = attn_out
 
         # second_mlp
-        hidden_states = self.second_attn.finish(hidden_states, forward_batch)
-        hidden_states = self.second_ffn.prepare(hidden_states, forward_batch)
-        with self.second_ffn.exit(forward_batch) as ffn_exit:
+        hidden_states = self.second_attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.second_ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.second_ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlps[1](hidden_states)
         hidden_states = ffn_exit.finish(hidden_states)
 
@@ -628,7 +630,7 @@ class LongcatFlashModel(nn.Module):
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
-                    self.layers[i].attn_stage.snapshot(hidden_states, forward_batch)
+                    self.layers[i].attn_boundary.snapshot(hidden_states, forward_batch)
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]

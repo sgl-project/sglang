@@ -25,7 +25,7 @@ import torch.nn as nn
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
@@ -99,7 +99,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

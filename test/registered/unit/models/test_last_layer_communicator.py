@@ -172,7 +172,7 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
 
         return make
 
-    from sglang.srt.layers.communicator import declare_attn, declare_ffn
+    from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
 
     patches = dict(
         declare_attn=declare_attn,

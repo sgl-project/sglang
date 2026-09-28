@@ -5,9 +5,9 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator.layout import SumGroup
-from sglang.srt.layers.communicator.residual.add_norm import ADD
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel

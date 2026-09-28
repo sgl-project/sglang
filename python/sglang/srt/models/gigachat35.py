@@ -23,9 +23,9 @@ from transformers import PretrainedConfig
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.srt.configs.gigachat35 import GigaChat35Config
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator.output import OutputTransform
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -441,7 +441,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             post_layernorm=self.post_self_attn_layernorm,
         )
         # The communicator chooses its fused steps from its norms when built.
-        self.attn_stage, self.ffn_stage = self._build_stages(
+        self.attn_boundary, self.ffn_boundary = self._build_stages(
             input_layernorm=attn_prepare_layernorm,
             post_attention_layernorm=mlp_prepare_layernorm,
             qkv_latent_func=qkv_latent_func,
@@ -471,7 +471,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         zero_allocator: BumpAllocator,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if self.use_linear_attn:
             hidden_states = self.self_attn(
@@ -485,18 +485,18 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
                 input_on_attention_tp_slices=(
-                    self.attn_stage.input_on_attention_tp_slices
+                    self.attn_boundary.input_on_attention_tp_slices
                 ),
             )
         get_attn_tp_context().clear_attn_inputs()
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         # Unlike deepseek_v2, no moe_output_buffer_ctx here: non-inplace MoE
         # runners then allocate their output per forward instead of recycling
         # the layer-input buffer. The default (inplace) runners are unaffected.
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states = ffn_exit.finish(hidden_states)
@@ -562,7 +562,7 @@ class GigaChat35Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

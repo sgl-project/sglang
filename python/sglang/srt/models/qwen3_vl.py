@@ -38,11 +38,11 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -1209,7 +1209,7 @@ class Qwen3LLMModel(Qwen3Model):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

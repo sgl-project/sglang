@@ -9,7 +9,7 @@ from unittest.mock import patch
 import test_declared_decoder_boundary as fixture
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     ProducerReduction,
     StageKind,
     declare_attn,
@@ -18,8 +18,8 @@ from sglang.srt.layers.communicator import (
     make_ffn_stage,
     make_stages,
 )
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.residual import batch
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,7 +29,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestIndependentStageConstruction(CustomTestCase):
     def test_active_variant_without_a_bound_path_never_falls_back(self):
-        from sglang.srt.layers.communicator import construction
+        from sglang.srt.layers.layer_boundary import construction
         from sglang.test.boundary_fixtures import stub_plan
 
         for variant in BatchVariant:

@@ -31,10 +31,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -376,7 +376,7 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     sum an FFN before it left."""
 
     def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
-        self.stage = make_stage_boundary(
+        self.boundary = make_stage_boundary(
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
@@ -386,8 +386,8 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         hidden_states,
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.stage.prepare(hidden_states, forward_batch)
-        with self.stage.exit(forward_batch) as ffn_exit:
+        hidden_states = self.boundary.prepare(hidden_states, forward_batch)
+        with self.boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mixer.forward(hidden_states)
         return ffn_exit.finish(hidden_states)
 
@@ -455,7 +455,7 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
     itself unless the fused kernel takes the sum into the next input norm."""
 
     def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
-        self.stage = make_stage_boundary(
+        self.boundary = make_stage_boundary(
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
@@ -465,11 +465,11 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
         hidden_states,
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.boundary.prepare(hidden_states, forward_batch)
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        with self.stage.exit(forward_batch) as mixer_exit:
+        with self.boundary.exit(forward_batch) as mixer_exit:
             hidden_states = self._forward_mixer(
                 hidden_states, forward_batch, mixer_exit.skips_reduction
             )
@@ -730,14 +730,14 @@ class NemotronHModel(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].stage.from_pp(
+            hidden_states = self.layers[self.start_layer].boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                hidden_states, snapshot = self.layers[i].stage.capture_output(
+                hidden_states, snapshot = self.layers[i].boundary.capture_output(
                     hidden_states, forward_batch
                 )
                 aux_hidden_states.append(snapshot)

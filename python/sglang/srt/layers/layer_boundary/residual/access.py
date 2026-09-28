@@ -18,12 +18,12 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
-from sglang.srt.layers.communicator.output import (
+from sglang.srt.layers.layer_boundary.output import (
     HandoffOutput,
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.residual.stream import OwedOutput, ResidualStream
+from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 

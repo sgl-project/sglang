@@ -13,20 +13,20 @@
 # ==============================================================================
 """Stage boundaries: layout transport, residual updates, reads, and fusion."""
 
-from sglang.srt.layers.communicator.adapters.attention import (
+from sglang.srt.layers.layer_boundary.adapters.attention import (
     AttentionInputs,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator.boundary import (
+from sglang.srt.layers.layer_boundary.boundary import (
     make_boundary,
     make_output_boundary,
     tbo_split_moves,
 )
-from sglang.srt.layers.communicator.construction import (
+from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     StageEdges,
 )
-from sglang.srt.layers.communicator.contracts import (
+from sglang.srt.layers.layer_boundary.contracts import (
     EdgeDecl,
     FusedMlpInput,
     HandoffRows,
@@ -38,15 +38,15 @@ from sglang.srt.layers.communicator.contracts import (
     StageOutput,
     StageSteps,
 )
-from sglang.srt.layers.communicator.exit import FfnCompletion, FfnExit, MixerExit
-from sglang.srt.layers.communicator.factories import (
+from sglang.srt.layers.layer_boundary.exit import FfnCompletion, FfnExit, MixerExit
+from sglang.srt.layers.layer_boundary.factories import (
     declare_attn,
     declare_ffn,
     make_attn_stage,
     make_ffn_stage,
     make_stages,
 )
-from sglang.srt.layers.communicator.layout import (
+from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
@@ -55,24 +55,24 @@ from sglang.srt.layers.communicator.layout import (
     sparse_moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.communicator.ops import (
+from sglang.srt.layers.layer_boundary.ops import (
     move_rows,
     tp_reduce_scatter,
 )
-from sglang.srt.layers.communicator.output import (
+from sglang.srt.layers.layer_boundary.output import (
     HandoffOutput,
     UnreducedOutput,
     reduce_output,
 )
-from sglang.srt.layers.communicator.residual import LayerResidual
-from sglang.srt.layers.communicator.residual.add_norm import (
+from sglang.srt.layers.layer_boundary.residual import LayerResidual
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     ADD,
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
     NORM_QUANT_READ,
     NORM_READ,
     PLAIN_RESIDUAL,
 )
-from sglang.srt.layers.communicator.residual.mhc import (
+from sglang.srt.layers.layer_boundary.residual.mhc import (
     MHCState,
 )
 

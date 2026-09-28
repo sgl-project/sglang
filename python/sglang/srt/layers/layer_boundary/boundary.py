@@ -19,14 +19,14 @@ from typing import Callable, Optional, Tuple
 
 import msgspec
 
-from sglang.srt.layers.communicator.contracts import (
+from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
     EdgeDecl,
     FusedMlpInput,
     StageInput,
     StageOutput,
 )
-from sglang.srt.layers.communicator.layout import (
+from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
@@ -35,7 +35,7 @@ from sglang.srt.layers.communicator.layout import (
     _sum_group,
     token_axis_sizes,
 )
-from sglang.srt.layers.communicator.ops import (
+from sglang.srt.layers.layer_boundary.ops import (
     gather_attention_tp,
     identity_output,
     move_rows,
@@ -49,7 +49,7 @@ from sglang.srt.layers.communicator.ops import (
     tp_slice,
     update_and_gather,
 )
-from sglang.srt.layers.communicator.prepare import (
+from sglang.srt.layers.layer_boundary.prepare import (
     _consumer_step,
     _dispatch_consumer,
     _mlp_input_dp_partial,

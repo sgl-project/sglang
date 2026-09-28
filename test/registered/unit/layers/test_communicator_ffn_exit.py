@@ -5,22 +5,22 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary import (
     Layout,
     StageOutput,
     SumGroup,
     UnreducedOutput,
 )
-from sglang.srt.layers.communicator import ops as transport_ops
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import ops as transport_ops
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary import (
     reduce_output,
 )
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.ops import identity_output
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
     finish_exit,

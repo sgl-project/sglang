@@ -10,12 +10,12 @@ from unittest.mock import MagicMock
 import msgspec
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import StageKind
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.fusions.allreduce import attention_fusions
-from sglang.srt.layers.communicator.ops import identity_output
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary import StageKind
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.fusions.allreduce import attention_fusions
+from sglang.srt.layers.layer_boundary.ops import identity_output
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -298,7 +298,7 @@ class TestPrepareAttnSteps(CustomTestCase):
 
 class TestFusedReadForms(CustomTestCase):
     def test_consumer_form_and_backend_policy_are_both_required(self):
-        from sglang.srt.layers.communicator.residual.add_norm import (
+        from sglang.srt.layers.layer_boundary.residual.add_norm import (
             Fp8Input,
             NormQuantRead,
         )

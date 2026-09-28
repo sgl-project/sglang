@@ -7,9 +7,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList, AuxHiddenStatePacker
-from sglang.srt.layers.communicator import StageKind
-from sglang.srt.layers.communicator.residual.access import norm_output
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary import StageKind
+from sglang.srt.layers.layer_boundary.residual.access import norm_output
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import prepare_attention, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,8 +35,8 @@ class TestAuxStorage(CustomTestCase):
             backend._copy_output_to_buffer(source, tuple(buffers), 2)
 
     def test_capture_move_owns_gather_but_not_slice(self):
-        from sglang.srt.layers.communicator.boundary import Boundary
-        from sglang.srt.layers.communicator.layout import Layout, TokenAxis
+        from sglang.srt.layers.layer_boundary.boundary import Boundary
+        from sglang.srt.layers.layer_boundary.layout import Layout, TokenAxis
         from sglang.test.communicator_patch import patch_communicator
 
         full = Layout(frozenset())
@@ -181,7 +181,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
         import test_declared_decoder_boundary as fixture
 
         from sglang.srt.layers import layernorm
-        from sglang.srt.layers.communicator import (
+        from sglang.srt.layers.layer_boundary import (
             ADD,
             FusedMlpInput,
             SumGroup,

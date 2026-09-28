@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     Layout,
     MixerExit,
     StageOutput,
@@ -14,7 +14,7 @@ from sglang.srt.layers.communicator import (
     TokenAxis,
     UnreducedOutput,
 )
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
 from sglang.srt.runtime_context import get_parallel
@@ -25,8 +25,8 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def layer_stage(pattern, index):
-    from sglang.srt.layers.communicator.construction import BatchVariant
-    from sglang.srt.layers.communicator.factories import _connections
+    from sglang.srt.layers.layer_boundary.construction import BatchVariant
+    from sglang.srt.layers.layer_boundary.factories import _connections
 
     previous = utils._declaration(pattern, index - 1) if index else None
     declaration = replace(

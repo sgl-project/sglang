@@ -19,9 +19,9 @@ import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
-from sglang.srt.layers.communicator.layout import SumGroup, _sum_group
-from sglang.srt.layers.communicator.output import HandoffOutput, UnreducedOutput
-from sglang.srt.layers.communicator.residual import StageUpdate
+from sglang.srt.layers.layer_boundary.layout import SumGroup, _sum_group
+from sglang.srt.layers.layer_boundary.output import HandoffOutput, UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual import StageUpdate
 
 
 class CarriedSum(msgspec.Struct, frozen=True):

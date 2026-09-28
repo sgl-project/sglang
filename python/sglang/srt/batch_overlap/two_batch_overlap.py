@@ -14,13 +14,13 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     Layout,
     tbo_split_moves,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.communicator.residual.access import finish_layer_stack
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.access import finish_layer_stack
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -959,7 +959,7 @@ def model_forward_stages(
     parts = _model_forward_tbo_split_inputs(
         **inputs,
         residual=residual,
-        layer_input_rows=layers[0].attn_stage.incoming_residual_rows,
+        layer_input_rows=layers[0].attn_boundary.incoming_residual_rows,
     )
     for part in parts:
         part["hidden_states"], child_stream = ResidualStream.arrive(

@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator import UnreducedOutput
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.communicator.residual.add_norm import ADD
-from sglang.srt.layers.communicator.residual.stream import OwedOutput
+from sglang.srt.layers.layer_boundary import UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

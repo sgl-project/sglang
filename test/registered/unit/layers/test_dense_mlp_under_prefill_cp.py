@@ -2,12 +2,12 @@ import unittest
 
 import test_declared_decoder_boundary as fixture
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     TokenAxis,
 )
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.ops import scatter_moe_cp_output
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.ops import scatter_moe_cp_output
 from sglang.test.boundary_fixtures import make_test_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

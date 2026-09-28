@@ -19,12 +19,12 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.layers.communicator.ops import move_rows
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.ops import move_rows
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.communicator.construction import StagePlan
+    from sglang.srt.layers.layer_boundary.construction import StagePlan
 
 
 def branch_input(

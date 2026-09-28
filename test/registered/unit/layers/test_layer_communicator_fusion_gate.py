@@ -6,17 +6,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers import layer_boundary as comm
+from sglang.srt.layers.layer_boundary import (
     Layout,
     StageOutput,
     SumGroup,
 )
-from sglang.srt.layers.communicator import ops as transport_ops
-from sglang.srt.layers.communicator import prepare as comm_ops
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.exit import OutputBoundary
-from sglang.srt.layers.communicator.ops import identity_output
+from sglang.srt.layers.layer_boundary import ops as transport_ops
+from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.exit import OutputBoundary
+from sglang.srt.layers.layer_boundary.ops import identity_output
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,

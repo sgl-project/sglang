@@ -14,14 +14,14 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.communicator.residual.add_norm import Fp8Input, NormQuantRead
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -428,9 +428,9 @@ class _InternS2MobiusDecoderMixin:
         forward_batch: ForwardBatch,
         meta_mlp: nn.ModuleList,
     ) -> torch.Tensor:
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self._forward_mobius_mlp(
                 hidden_states, forward_batch, meta_mlp
             )
@@ -489,7 +489,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
                     read=NormQuantRead(
@@ -518,7 +518,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs["forward_batch"]
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
@@ -621,7 +621,7 @@ class InternS2MobiusAttentionDecoderLayer(
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
                     read=NormQuantRead(
@@ -654,7 +654,7 @@ class InternS2MobiusAttentionDecoderLayer(
         **kwargs,
     ):
         del kwargs
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,

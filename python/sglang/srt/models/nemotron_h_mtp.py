@@ -18,8 +18,8 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor

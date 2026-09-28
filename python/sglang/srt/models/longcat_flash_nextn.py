@@ -41,15 +41,15 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -165,7 +165,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=False, next_sparse=False),
@@ -183,7 +183,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
-        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -192,10 +192,10 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.ffn_stage.postprocess(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.postprocess(hidden_states, forward_batch)
         return hidden_states
 
 

@@ -46,21 +46,21 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
 
 # Layers - Attention
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
-from sglang.srt.layers.communicator.residual.add_norm import Fp8Input, NormQuantRead
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
-from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary.residual.add_norm import Fp8Input, NormQuantRead
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
@@ -224,7 +224,7 @@ def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool
 def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
     """The CuTe DSL kernels a layer tries before its own, when they are on."""
     if _use_mnnvl_cutedsl_fusion(config, is_nextn):
-        from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
+        from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
     return None
@@ -1094,7 +1094,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
                     read=NormQuantRead(
@@ -1129,7 +1129,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs", None),
@@ -1144,10 +1144,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1300,7 +1300,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, is_nextn)
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(
                     read=NormQuantRead(
@@ -1533,7 +1533,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,
@@ -1549,9 +1549,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1716,7 +1716,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "layers: "
                     f"{unsupported_layers}"
                 )
-            from sglang.srt.layers.communicator.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                 install_cutedsl_fusion,
             )
 
@@ -1807,7 +1807,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

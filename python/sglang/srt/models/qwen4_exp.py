@@ -22,7 +22,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -38,6 +37,7 @@ from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
@@ -1320,8 +1320,8 @@ class Qwen4ExpLayerExtensionMixin:
         for attr_name in (
             "input_layernorm",
             "post_attention_layernorm",
-            "attn_stage",
-            "ffn_stage",
+            "attn_boundary",
+            "ffn_boundary",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)

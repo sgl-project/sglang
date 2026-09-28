@@ -18,7 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (

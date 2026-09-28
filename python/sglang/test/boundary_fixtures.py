@@ -2,15 +2,15 @@
 
 from types import SimpleNamespace
 
-from sglang.srt.layers.communicator.construction import StagePlan
-from sglang.srt.layers.communicator.factories import (
+from sglang.srt.layers.layer_boundary.construction import StagePlan
+from sglang.srt.layers.layer_boundary.factories import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.ops import identity_output
-from sglang.srt.layers.communicator.residual.add_norm import PLAIN_RESIDUAL
-from sglang.srt.layers.communicator.stage import StageCommunicator
+from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_RESIDUAL
+from sglang.srt.layers.layer_boundary.stage import StageBoundary
 
 
 def make_test_stages(
@@ -73,7 +73,7 @@ def stub_stage(plan, kind):
     """Keep the same concrete boundary when a test patches its methods."""
     stages = plan.__dict__.setdefault("_stub_stages", {})
     if kind not in stages:
-        stages[kind] = StageCommunicator(
+        stages[kind] = StageBoundary(
             plan,
             declaration=(declare_attn() if kind.name == "ATTENTION" else declare_ffn()),
         )
@@ -82,7 +82,7 @@ def stub_stage(plan, kind):
 
 def sp_region_steps():
     """Local SP rows with no owed sum, for tests of activation and exits."""
-    from sglang.srt.layers.communicator import (
+    from sglang.srt.layers.layer_boundary import (
         NORM_QUANT_READ,
         EdgeDecl,
         Layout,
@@ -93,7 +93,7 @@ def sp_region_steps():
         TokenAxis,
         make_boundary,
     )
-    from sglang.srt.layers.communicator.prepare import _hand_qkv_hook_its_input
+    from sglang.srt.layers.layer_boundary.prepare import _hand_qkv_hook_its_input
 
     rows = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
     output = StageOutput(rows)
@@ -120,8 +120,8 @@ def prepare_attention(stage, hidden, residual, forward_batch, *args, **call):
 
 
 def prepare_raw(stage, method, hidden, residual, forward_batch, *args, **call):
-    from sglang.srt.layers.communicator.residual.add_norm import ADD
-    from sglang.srt.layers.communicator.residual.stream import ResidualStream
+    from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
     if not isinstance(residual, ResidualStream):
         stream = ResidualStream(residual)
@@ -137,7 +137,7 @@ def prepare_raw(stage, method, hidden, residual, forward_batch, *args, **call):
 
 
 def finish_exit(scope, hidden, residual):
-    from sglang.srt.layers.communicator.residual.stream import ResidualStream
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
     if isinstance(residual, ResidualStream):
         scope._stream = residual
@@ -150,7 +150,7 @@ def finish_exit(scope, hidden, residual):
 
 
 def postprocess_output(boundary, hidden, residual, forward_batch):
-    from sglang.srt.layers.communicator.residual.stream import ResidualStream
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
     stream = (
         residual if isinstance(residual, ResidualStream) else ResidualStream(residual)

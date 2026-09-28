@@ -13,8 +13,8 @@
 # ==============================================================================
 """Residual access for one layer-stack invocation or TBO microbatch."""
 
-from sglang.srt.layers.communicator.residual import access
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.residual import access
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
@@ -60,7 +60,7 @@ def norm(
     # The terminal consumer now owns the pair. Do not keep layer buffers alive
     # through logits processing or the next forward on this batch.
     forward_batch.residual_stream = None
-    from sglang.srt.layers.communicator.output import HandoffOutput
+    from sglang.srt.layers.layer_boundary.output import HandoffOutput
 
     if isinstance(hidden_states, HandoffOutput):
         if residual is None:

@@ -67,23 +67,23 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.dcp.planner import (
+    prepare_decode_context_parallel_metadata,
+)
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     make_stages,
 )
-from sglang.srt.layers.communicator.adapters.context_parallel import (
+from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
     maybe_prefetch_next_full_attention_kv,
 )
-from sglang.srt.layers.communicator.residual import access as residual_access
-from sglang.srt.layers.communicator.residual import batch as residual_batch
-from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.dcp.planner import (
-    prepare_decode_context_parallel_metadata,
-)
-from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary.residual import access as residual_access
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1109,7 +1109,7 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
-            from sglang.srt.layers.communicator.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                 MoeFinalizeHandoff,
             )
 
@@ -2619,7 +2619,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        self.attn_stage, self.ffn_stage = self._build_stages(
+        self.attn_boundary, self.ffn_boundary = self._build_stages(
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
@@ -2642,10 +2642,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             and _use_mnnvl_cutedsl_fusion()
         ):
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
-            from sglang.srt.layers.communicator.fusions.cutedsl import CuteDSLFusion
+            from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
-        attn_stage, ffn_stage = make_stages(
+        attn_boundary, ffn_boundary = make_stages(
             (
                 declare_attn(),
                 input_layernorm,
@@ -2667,7 +2667,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else None,
             terminal=self._stage_terminal,
         )
-        return attn_stage, ffn_stage
+        return attn_boundary, ffn_boundary
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -2721,7 +2721,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states_orig = residual_access.buffer(hidden_states)
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             captured_last_layer_outputs=captured_last_layer_outputs,
@@ -2736,7 +2736,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
                 input_on_attention_tp_slices=(
-                    self.attn_stage.input_on_attention_tp_slices
+                    self.attn_boundary.input_on_attention_tp_slices
                 ),
                 prev_topk_indices=prev_topk_indices,
             )
@@ -2750,8 +2750,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
@@ -2769,7 +2769,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_stage.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -2788,7 +2788,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
-        state.hidden_states_after_comm_pre_attn = self.attn_stage.prepare(
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
             hidden_states, forward_batch
         )
         if get_moe_a2a_backend().is_mori():
@@ -2803,15 +2803,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        hidden_states = self.attn_stage.finish(
+        hidden_states = self.attn_boundary.finish(
             state.pop("hidden_states_after_attn"), state.forward_batch
         )
-        state.hidden_states_mlp_input = self.ffn_stage.prepare(
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
             hidden_states, state.forward_batch
         )
 
     def op_comm_postprocess_layer(self, state):
-        hidden_states = self.ffn_stage.postprocess(
+        hidden_states = self.ffn_boundary.postprocess(
             state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
@@ -2978,7 +2978,7 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
-        from sglang.srt.layers.communicator.fusions.cutedsl import (
+        from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
             install_cutedsl_fusion,
         )
 
@@ -3030,7 +3030,7 @@ class DeepseekV2Model(nn.Module):
             initial_topk_indices = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
             initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")

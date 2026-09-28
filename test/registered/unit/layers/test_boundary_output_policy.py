@@ -7,9 +7,9 @@ from unittest.mock import patch
 import test_declared_decoder_boundary as fixture
 import torch
 
-from sglang.srt.layers.communicator.contracts import BatchVariant
-from sglang.srt.layers.communicator.output import OutputTransform
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import finish_exit
@@ -29,8 +29,8 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
         )
 
     def test_npu_weight_cache_belongs_to_one_prepare_call(self):
-        from sglang.srt.layers.communicator import prepare as ops
-        from sglang.srt.layers.communicator.residual.stream import ResidualStream
+        from sglang.srt.layers.layer_boundary import prepare as ops
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
         layer = fixture.build(fixture.layer_case(0, 2), parallel)
@@ -61,7 +61,7 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
         self.assertEqual(events, ["reduce", "cache", "reduce"])
 
     def test_token_slice_reads_the_current_parallel_rank(self):
-        from sglang.srt.layers.communicator.ops import tp_slice
+        from sglang.srt.layers.layer_boundary.ops import tp_slice
 
         hidden = torch.arange(8).reshape(4, 2)
         for rank in (0, 1):

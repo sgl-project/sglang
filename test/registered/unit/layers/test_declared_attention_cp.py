@@ -15,10 +15,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
+from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.communicator.adapters import context_parallel as dsa_cp
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.adapters import context_parallel as dsa_cp
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator

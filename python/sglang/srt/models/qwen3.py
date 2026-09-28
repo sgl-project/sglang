@@ -6,12 +6,12 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
 )
-from sglang.srt.layers.communicator.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -376,7 +376,7 @@ class Qwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(sparse=False, next_sparse=False),
@@ -395,7 +395,7 @@ class Qwen3DecoderLayer(nn.Module):
         capture_output=None,
     ) -> torch.Tensor:
         # Self Attention
-        hidden_states = self.attn_stage.prepare(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             post_residual_addition=post_residual_addition,
@@ -409,8 +409,8 @@ class Qwen3DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_stage.prepare(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
             hidden_states,
             forward_batch,
             cache=(
@@ -424,7 +424,7 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        with self.ffn_stage.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
@@ -462,7 +462,7 @@ class Qwen3Model(Qwen2Model):
             )
             residual_batch.start(forward_batch)
         else:
-            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
         aux_hidden_states = AuxHiddenStateList()

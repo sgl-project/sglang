@@ -9,8 +9,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers.communicator import ADD, Layout, UnreducedOutput
-from sglang.srt.layers.communicator.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary import ADD, Layout, UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -78,7 +78,7 @@ class TestTboEntryReducesItsInput(CustomTestCase):
             merged = tbo.model_forward_stages(
                 layers=[
                     SimpleNamespace(
-                        attn_stage=SimpleNamespace(
+                        attn_boundary=SimpleNamespace(
                             incoming_residual_rows=Layout(frozenset())
                         )
                     )

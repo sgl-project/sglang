@@ -25,7 +25,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.communicator import (
+from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
     make_stages,
@@ -449,7 +449,7 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
 
-        self.attn_stage, self.ffn_stage = make_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
