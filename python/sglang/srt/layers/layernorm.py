@@ -822,6 +822,8 @@ class RMSNorm(BaseFusedOp):
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
+            if self.cast_x_before_out_mul:
+                x = x.to(orig_dtype).to(torch.float32)
             if self.fp32_residual:
                 residual = x.clone()
             else:
@@ -865,6 +867,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.cast_x_before_out_mul:
+            return self.forward_native(x, residual, post_residual_addition)
         if _is_cpu_amx_available:
             if residual is not None:
                 if post_residual_addition is not None:

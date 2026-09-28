@@ -2549,6 +2549,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if not self.block_quant and _is_cpu:
+            assert _is_cpu_amx_available, (
+                "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            )
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
         # The runner backend is global, so it is also true for a borrowed delegate,
         # which has no moe_runner_config and whose kernel ignores these params.
         if (
@@ -2907,11 +2913,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 CPUQuantMethod.FP8_W8A16,
-                layer.w13_weight_scale_inv,  # w1_scale
-                layer.w2_weight_scale_inv,  # w2_scale
+                (
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),  # w1_scale
+                (
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
-                self.quant_config.weight_block_size,  # block_size
+                self.weight_block_size if self.block_quant else None,  # block_size
                 None,  # w1 bias
                 None,  # w3 bias
                 None,  # alpha
