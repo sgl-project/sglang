@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -160,12 +161,12 @@ CASES = {
 
 def build(case, num_layers, layer_id, config=None, **kwargs):
     """Construct one decoder layer with its submodules stubbed. Returns the
-    LayerCommunicator kwargs, the LayerScatterModes.init_new kwargs, and the
+    LayerCommunicator kwargs, the LayerFacts.init_new kwargs, and the
     names of the stubbed submodules it built."""
     module_name, class_name, make_config, stubs, _ = CASES[case]
     module = import_model(module_name)
     communicator = MagicMock()
-    scatter_modes = MagicMock()
+    facts = MagicMock()
     built = []
 
     def recording_stub(name):
@@ -175,7 +176,7 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
 
         return make
 
-    patches = dict(LayerCommunicator=communicator, LayerScatterModes=scatter_modes)
+    patches = dict(LayerCommunicator=communicator, LayerFacts=facts)
     patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
@@ -184,7 +185,7 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
             config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    return communicator.call_args.kwargs, scatter_modes.init_new.call_args.kwargs, built
+    return communicator.call_args.kwargs, facts.init_new.call_args.kwargs, built
 
 
 def planned_as_last(case, num_layers, layer_id, **kwargs):
@@ -206,6 +207,17 @@ class TestLastLayerCommunicator(CustomTestCase):
                         planned_as_last(case, NUM_LAYERS, layer_id),
                         layer_id == NUM_LAYERS - 1,
                     )
+
+    def test_step3p5_dense_layers_never_defer_their_sum(self):
+        """A Step-3.5 dense layer's MLP all-reduces its own output unless
+        postprocess reduce-scatters it; its communicator is told it never leaves
+        the sum to the next layer. The MoE layers may."""
+        for layer_id in range(NUM_LAYERS):
+            with self.subTest(layer_id=layer_id):
+                passed, planned, _ = build("step3p5", NUM_LAYERS, layer_id)
+                self.assertIs(
+                    passed["allow_deferred_ffn_reduction"], planned["is_layer_sparse"]
+                )
 
     def test_draft_model_layer_is_last(self):
         """The single decoder layer of a NextN / MTP draft model is marked last,
@@ -256,15 +268,15 @@ class TestLastLayerCommunicator(CustomTestCase):
         self.assertTrue(planned["is_layer_sparse"])
 
 
-class TestLayerScatterModesLastLayer(CustomTestCase):
+class TestLayerFactsLastLayer(CustomTestCase):
     def test_the_plan_marks_the_last_layer(self):
         from sglang.srt.layers import communicator as comm
 
         with (
-            patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
-            patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=False),
-            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
-            patch.object(comm, "is_mla_cp_enabled", return_value=False),
+            patch_communicator("enable_moe_dense_fully_dp", return_value=False),
+            patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
+            patch_communicator("is_dsa_enable_prefill_cp", return_value=False),
+            patch_communicator("is_mla_cp_enabled", return_value=False),
         ):
             for num_layers, layer_id in (
                 (NUM_LAYERS, 0),
@@ -273,7 +285,7 @@ class TestLayerScatterModesLastLayer(CustomTestCase):
                 (1, 0),
             ):
                 with self.subTest(num_layers=num_layers, layer_id=layer_id):
-                    modes = comm.LayerScatterModes.init_new(
+                    modes = comm.LayerFacts.init_new(
                         layer_id=layer_id,
                         num_layers=num_layers,
                         is_layer_sparse=False,
