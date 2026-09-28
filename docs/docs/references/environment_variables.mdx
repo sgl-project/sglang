@@ -762,8 +762,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_PACKED_PREFILL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable packed BF16 sparse prefill for the DeepSeek-V4.1 target model on 148-SM B200 GPUs with 16 attention heads per GPU and no attention context parallelism. Other shapes use stock attention. Requires an sgl-kernel build with the FlashMLA packed prefill API.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use packed BF16 sparse prefill for the DeepSeek-V4.1 target model on 148-SM B200 GPUs with 16 attention heads per GPU and no attention context parallelism. Set to <code>0</code> to disable packing. Other shapes use stock attention. Requires an sgl-kernel build with the FlashMLA packed prefill API.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_PACKED_PREFILL_MIXED_MIN_ROWS</code></td>

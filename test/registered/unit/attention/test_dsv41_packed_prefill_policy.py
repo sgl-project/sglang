@@ -3,10 +3,18 @@
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.packed_prefill import PackedPrefillPolicy
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_default_enabled_and_opt_out(monkeypatch):
+    monkeypatch.delenv("SGLANG_DSV41_PACKED_PREFILL", raising=False)
+    assert envs.SGLANG_DSV41_PACKED_PREFILL.get()
+    monkeypatch.setenv("SGLANG_DSV41_PACKED_PREFILL", "0")
+    assert not envs.SGLANG_DSV41_PACKED_PREFILL.get()
 
 
 def tensors(rows, width):
