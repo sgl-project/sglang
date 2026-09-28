@@ -746,18 +746,18 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertFalse(adapted.sampling_params["spaces_between_special_tokens"])
         self.tm.tokenizer.decode.assert_not_called()
 
-    def _use_delimited_response_template(self, reasoning_parser):
-        self.tm.tokenizer.response_template = _DELIMITED_RESPONSE_TEMPLATE
+    def _use_delimited_response_template(
+        self, reasoning_parser, template=_DELIMITED_RESPONSE_TEMPLATE
+    ):
+        self.tm.tokenizer.response_template = template
         self.tm.tokenizer.encode.side_effect = lambda text, **_: (
-            [7] if text == "</call>" else [1, 2, 3]
+            [7] if text == "</call>" else [1, 2, 3] if text else []
         )
         self.tm.model_config.is_multimodal = True
         self.chat.tool_call_parser = "response_template"
         self.chat.reasoning_parser = reasoning_parser
         self.chat._reasoning_detector = (
-            ResponseTemplateReasoningDetector(
-                response_template=_DELIMITED_RESPONSE_TEMPLATE
-            )
+            ResponseTemplateReasoningDetector(response_template=template)
             if reasoning_parser
             else None
         )
@@ -798,12 +798,18 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_response_template_parser_context_records_grammar_start(self):
         named = {"type": "function", "function": {"name": "get_weather"}}
+        required = {"tools": [_WEATHER_TOOL], "tool_choice": "required"}
+        # A pattern closer has no think_end_token to encode, so the grammar
+        # backend does not wait for the reasoning to end.
+        pattern_closed = {
+            **_DELIMITED_RESPONSE_TEMPLATE,
+            "fields": {
+                **_DELIMITED_RESPONSE_TEMPLATE["fields"],
+                "thinking": {"open": "<think>", "close_pattern": "</think>"},
+            },
+        }
         cases = {
-            "auto tool choice": (
-                "response_template",
-                {"tools": [_WEATHER_TOOL]},
-                None,
-            ),
+            "auto tool choice": ("response_template", {"tools": [_WEATHER_TOOL]}, None),
             "named tool after reasoning": (
                 "response_template",
                 {"tools": [_WEATHER_TOOL], "tool_choice": named},
@@ -814,15 +820,17 @@ class ServingChatTestCase(unittest.TestCase):
                 {"response_format": {"type": "json_object"}},
                 GRAMMAR_AFTER_REASONING,
             ),
-            "required tool without reasoning": (
-                None,
-                {"tools": [_WEATHER_TOOL], "tool_choice": "required"},
+            "required tool without reasoning": (None, required, GRAMMAR_FROM_START),
+            "required tool, reasoning without an end token": (
+                "response_template",
+                required,
                 GRAMMAR_FROM_START,
+                pattern_closed,
             ),
         }
-        for name, (reasoning_parser, fields, grammar_start) in cases.items():
+        for name, (reasoning_parser, fields, grammar_start, *template) in cases.items():
             with self.subTest(name):
-                self._use_delimited_response_template(reasoning_parser)
+                self._use_delimited_response_template(reasoning_parser, *template)
                 _, request = self._convert_rendered_as(
                     "<assistant>",
                     ChatCompletionRequest(

@@ -1319,7 +1319,10 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> None:
         """Give response-template parsers the rendered assistant prefill, and
         where an output grammar takes over from the template: after the
-        reasoning when the grammar backend gates on it, else from the start."""
+        reasoning when the grammar backend gates on it, else from the start.
+
+        The scheduler gates the grammar only when the reasoning parser's
+        think_end_token encodes to token ids, so this checks the same."""
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1330,10 +1333,17 @@ class OpenAIServingChat(OpenAIServingBase):
         request._response_parser_prefix = prefix or ""
         sampling_params = adapted_request.sampling_params or {}
         if any(sampling_params.get(name) for name in _OUTPUT_CONSTRAINT_PARAMS):
+            reasoning_gated = (
+                adapted_request.require_reasoning
+                and self._reasoning_detector is not None
+                and bool(
+                    self._reasoning_detector.get_think_end_token_ids(
+                        self.tokenizer_manager.tokenizer
+                    )
+                )
+            )
             request._response_parser_grammar_start = (
-                GRAMMAR_AFTER_REASONING
-                if adapted_request.require_reasoning
-                else GRAMMAR_FROM_START
+                GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
             )
 
     def _drop_kept_tool_close(
