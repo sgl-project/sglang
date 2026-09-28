@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.c2_decode_pool import c2_decode_pool
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+    _jit_c2_pool_norm_module,
+)
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -15,7 +18,7 @@ DIM = 512
 EPS = 1e-6
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="The pair-pooling kernel uses CUDA libdevice arithmetic",
+    reason="The fused pair-pooling JIT kernel requires CUDA",
 )
 
 
@@ -178,6 +181,127 @@ def test_pool_norm_after_speculative_ring_rollback(start, accepted):
     assert_bitwise(fused_pos, group_pos)
     assert_bitwise(fused_slots, slots)
     assert_bitwise(state, baseline_state)
+
+
+def test_pool_norm_empty_batch_preserves_state():
+    """An empty decode must return typed empty outputs without launching a grid."""
+    state = torch.full((1, 2 * DIM), 7.0, device="cuda")
+    initial = state.clone()
+    kv = torch.empty(0, DIM, device="cuda")
+    pos = torch.empty(0, device="cuda", dtype=torch.int64)
+    loc = torch.empty(0, device="cuda", dtype=torch.int32)
+    weight = torch.ones(DIM, device="cuda")
+    latent, group_pos, slots = pool((kv, kv, pos, loc, loc, pos), state, 8, weight)
+    torch.cuda.synchronize()
+    assert latent.shape == (0, DIM) and latent.dtype == torch.bfloat16
+    assert group_pos.shape == (0,) and group_pos.dtype == pos.dtype
+    assert slots.shape == (0,) and slots.dtype == loc.dtype
+    assert_bitwise(state, initial)
+
+
+def test_pool_norm_without_ring_preserves_pending_state():
+    """The non-ring layout writes even positions, including its single spare row."""
+    torch.manual_seed(3)
+    kv = torch.randn(3, DIM, device="cuda")
+    score = torch.randn_like(kv)
+    initial = torch.randn(4, 2 * DIM, device="cuda")
+    req = torch.tensor([0, 1, 0], device="cuda", dtype=torch.int64)
+    pos = torch.tensor([3, 4, 6], device="cuda", dtype=torch.int64)
+    raw = torch.tensor([513, 515, 0], device="cuda", dtype=torch.int32)
+    out = torch.where(pos % 2 == 1, raw // 2, -1)
+    inputs = (kv, score, pos, raw, out, req)
+    weight = torch.rand(DIM, device="cuda") + 0.5
+    baseline_state, fused_state = initial.clone(), initial.clone()
+    pooled, group_pos, slots = pool(inputs, baseline_state, 0)
+    actual, fused_pos, fused_slots = pool(inputs, fused_state, 0, weight)
+    assert_bitwise(actual, rmsnorm_fp32(pooled.bfloat16(), weight, EPS))
+    assert_bitwise(fused_pos, group_pos)
+    assert_bitwise(fused_slots, slots)
+    expected_state = initial.clone()
+    expected_state[1, :DIM], expected_state[1, DIM:] = kv[1], score[1]
+    expected_state[-1, :DIM], expected_state[-1, DIM:] = kv[2], score[2]
+    assert_bitwise(baseline_state, expected_state)
+    assert_bitwise(fused_state, expected_state)
+
+
+@pytest.mark.parametrize(
+    "invalid,error",
+    [
+        ("score_shape", "shape"),
+        ("kv_dtype", "[Dd][Tt]ype"),
+        ("state_stride", "stride"),
+        ("weight_stride", "contiguous"),
+    ],
+)
+def test_pool_norm_cpp_rejects_invalid_tensor_contract(invalid, error):
+    """Call the FFI directly so C++ validation protects every caller before launch."""
+    kv = torch.zeros(2, DIM, device="cuda")
+    score = torch.zeros_like(kv)
+    state = torch.zeros(5, 2 * DIM, device="cuda")
+    state_kv, state_score = state[:, :DIM], state[:, DIM:]
+    pos = torch.tensor([1, 3], device="cuda", dtype=torch.int64)
+    req = torch.arange(2, device="cuda", dtype=torch.int64)
+    raw = torch.tensor([513, 515], device="cuda", dtype=torch.int32)
+    out = raw // 2
+    weight = torch.ones(DIM, device="cuda")
+    if invalid == "score_shape":
+        score = score[:1]
+    elif invalid == "kv_dtype":
+        kv = kv.bfloat16()
+    elif invalid == "state_stride":
+        state_kv = state[:, ::2]
+    else:
+        weight = torch.ones(2 * DIM, device="cuda")[::2]
+    latent = torch.empty(2, DIM, device="cuda", dtype=torch.bfloat16)
+    group_pos, slots = torch.empty_like(pos), torch.empty_like(out)
+    module = _jit_c2_pool_norm_module(DIM, torch.float32)
+    with pytest.raises(RuntimeError, match=error):
+        module.pool_norm(
+            kv,
+            score,
+            pos,
+            raw,
+            out,
+            req,
+            state_kv,
+            state_score,
+            state.shape[0] - 1,
+            2,
+            weight,
+            EPS,
+            latent,
+            group_pos,
+            slots,
+        )
+
+
+def test_pool_norm_cpp_rejects_cpu_tensors_for_empty_batch():
+    """Device validation must precede the empty-batch return, without a GPU launch."""
+    kv = torch.empty(0, DIM, dtype=torch.float32, device="cpu")
+    state = torch.zeros(1, 2 * DIM, dtype=torch.float32, device="cpu")
+    pos = torch.empty(0, dtype=torch.int64, device="cpu")
+    loc = torch.empty(0, dtype=torch.int32, device="cpu")
+    weight = torch.ones(DIM, dtype=torch.float32, device="cpu")
+    latent = torch.empty(0, DIM, dtype=torch.bfloat16, device="cpu")
+    module = _jit_c2_pool_norm_module(DIM, torch.float32)
+    with pytest.raises(RuntimeError, match="Device value .*not in the allowed options"):
+        module.pool_norm(
+            kv,
+            kv,
+            pos,
+            loc,
+            loc,
+            pos,
+            state[:, :DIM],
+            state[:, DIM:],
+            0,
+            8,
+            weight,
+            EPS,
+            latent,
+            torch.empty_like(pos),
+            torch.empty_like(loc),
+        )
 
 
 if __name__ == "__main__":

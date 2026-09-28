@@ -1,4 +1,4 @@
-"""Ratio-2 decode pair pooling and RMSNorm, excluding projections and KV stores."""
+"""Compare separate pool/RMSNorm with CUDA JIT fusion, excluding projections/stores."""
 
 import torch
 
@@ -39,7 +39,7 @@ def pool_norm(kv, score, pos, raw_out_loc, out_loc, req, state, weight, *, fused
 
 
 @marker.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64], [1, 16, 64])
-@marker.benchmark("impl", ["separate", "fused"])
+@marker.benchmark("impl", ["separate", "jit"])
 def benchmark(batch_size: int, impl: str):
     torch.manual_seed(42)
     kv = create_random(batch_size, HEAD_DIM, dtype=torch.float32)
@@ -55,7 +55,7 @@ def benchmark(batch_size: int, impl: str):
     return marker.do_bench(
         pool_norm,
         input_args=(kv, score, pos, raw_out_loc, out_loc, req, state, weight),
-        input_kwargs={"fused": impl == "fused"},
+        input_kwargs={"fused": impl == "jit"},
         graph_clone_args="all",
         # Only two rows per request are touched; the full ring size overcounts bytes.
         disable_log_bandwidth=True,
