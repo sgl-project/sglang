@@ -29,7 +29,7 @@ from sglang.test.test_utils import popen_launch_server, terminate_and_kill_proce
 MODEL = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 
 
-class TestDcpMooncake(unittest.TestCase):
+class MooncakeTestBase(unittest.TestCase):
     def setUp(self):
         from mooncake.store import MooncakeDistributedStore
 
@@ -267,6 +267,8 @@ class TestDcpMooncake(unittest.TestCase):
         (self.output / f"{self.tag}.json").write_text(json.dumps(report, indent=2))
         print("DCP_MOONCAKE=" + json.dumps(report), flush=True)
 
+
+class TestDcpMooncake(MooncakeTestBase):
     def test_two_engines_read_each_other(self):
         tokens_a, tokens_b = self.prompts
         keys = self.keys(tokens_a, 2, 2) + self.keys(tokens_b, 2, 2)
