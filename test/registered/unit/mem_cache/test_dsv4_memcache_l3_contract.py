@@ -805,3 +805,7 @@ def test_memory_pressure_preserves_complete_c128_groups(coarse):
         assert controller.prefetch_buffer.get_nowait() is operation
         assert operation.storage_hit_count == 1024
         cache.revoke_pending_prefetch.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
