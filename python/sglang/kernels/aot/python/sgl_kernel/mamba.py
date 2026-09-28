@@ -159,6 +159,7 @@ def chunk_kda_cpu(
         output_intermediate_states,
         track_state,
         track_chunk_idx,
+        scale=scale,
     )
     if output_intermediate_states:
         return output, h
