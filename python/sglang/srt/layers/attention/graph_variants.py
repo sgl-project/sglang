@@ -31,13 +31,15 @@ class DsaGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        # No host mirror (spec-v2 keeps its relay device-only): sparse is
-        # correct for every length, and reading the device scalar would sync
-        # per step.
-        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            # Plain decode maintains this host mirror without a D2H sync.
+            max_kv_len = int(seq_lens_cpu.max().item())
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+            # Fallback: a single scalar reduction d2h (cheap, per-step).
+            max_kv_len = int(forward_batch.seq_lens.max().item())
+        else:
+            # No length info: be safe and use the correct-for-all sparse graph.
             return DSA_SPARSE
-        # Plain decode maintains this host mirror without a D2H sync.
-        max_kv_len = int(seq_lens_cpu.max().item())
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 

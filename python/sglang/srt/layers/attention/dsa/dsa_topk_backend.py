@@ -14,9 +14,6 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
-# threshold == chunk size, so torch.topk scratch peaks at one chunk
-_TOPK_ROW_CHUNK = 4096
-
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,
@@ -283,20 +280,6 @@ def _topk_unfused(
     batch_size, max_score_len = score.shape
     topk_indices = score.new_full((batch_size, topk), -1, dtype=torch.int32)
     if batch_size == 0 or topk == 0 or max_score_len == 0:
-        return topk_indices
-
-    # rows are independent, so chunking only bounds torch.topk scratch on wide batches
-    if batch_size > _TOPK_ROW_CHUNK:
-        for start in range(0, batch_size, _TOPK_ROW_CHUNK):
-            end = min(start + _TOPK_ROW_CHUNK, batch_size)
-            topk_indices[start:end] = _topk_unfused(
-                score[start:end],
-                lengths[start:end],
-                topk,
-                row_starts[start:end] if row_starts is not None else None,
-                topk_op,
-                topk_op_kwargs,
-            )
         return topk_indices
 
     if row_starts is None:
