@@ -117,6 +117,45 @@ def free_swa_out_of_window_slots(
         req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
 
+def free_chunked_swa_before_plan(
+    req: Req,
+    *,
+    enable_overlap: bool,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    """Free a chunked prefill's out-of-window SWA slots before its next chunk is sized.
+
+    PrefillAdder sizes a continuing chunk from the SWA pool's free count, but
+    maybe_evict_swa frees these slots only later, in alloc_for_extend. At the pool
+    size compute_swa_request_cap gives (chunks in flight x chunk + window + slack),
+    every chunk after the second then alternates between the slack and
+    chunk - window tokens.
+
+    Under overlap the previous chunk may still be running and reads the window
+    before its start, so the bound is that chunk's start; without overlap it has
+    finished, and the bound is the prefix length. Both equal maybe_evict_swa's
+    bound when the previous chunk was a full one.
+    """
+    if not (tree_cache.supports_swa() and tree_cache.is_chunk_cache()):
+        return
+    if req.extend_range is None or not req.kv.holds_kv:
+        return
+    pre_len = req.extend_range.start if enable_overlap else len(req.prefix_indices)
+    token_to_kv_pool_allocator.free_group_begin()
+    free_swa_out_of_window_slots(
+        req,
+        pre_len,
+        sliding_window_size=tree_cache.sliding_window_size,
+        page_size=tree_cache.page_size,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        is_chunk_cache=True,
+    )
+    token_to_kv_pool_allocator.free_group_end()
+
+
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
     merged: list[tuple[int, int]] = []
