@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
 import msgspec
 import torch
 
+from sglang.srt.utils.common import async_h2d
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -22,11 +24,7 @@ def get_tail_row_indices(
     for n, t in zip(full_rows_per_request, tail_rows_per_request):
         rows.extend(range(start + n - t, start + n))
         start += n
-    device = torch.device(device)
-    if device.type != "cuda":
-        return torch.tensor(rows, dtype=torch.int64, device=device)
-    staged = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
-    return staged.to(device, non_blocking=True)
+    return async_h2d(rows, dtype=torch.int64, device=device)
 
 
 class CandidateMetadata:

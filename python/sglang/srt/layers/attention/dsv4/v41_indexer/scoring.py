@@ -4,6 +4,7 @@ a selection back into pool slots."""
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
@@ -12,6 +13,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.srt.utils.common import async_h2d
 
 from .types import DecodeInputs, PrefillInputs
 
@@ -152,51 +154,44 @@ def get_deep_gemm_prefill_data(
 ) -> Optional[DeepGEMMPrefillData]:
     """None when the chunk has no row or no visible compressed position."""
     ratio = inputs.compress_ratio
-    indexer = inputs.indexer
     pos = inputs.positions
-    seq_lens_cpu = inputs.seq_lens_cpu
     assert (
-        seq_lens_cpu is not None
+        inputs.seq_lens_cpu is not None
         and inputs.rows_per_request is not None
         and inputs.rows_per_request_device is not None
     ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
-    lc_per_req = [s // ratio for s in seq_lens_cpu]
-    req_pool_indices = inputs.req_pool_indices.to(torch.int64)
-    slot_chunks, starts, start = [], [], 0
-    for r, lc in enumerate(lc_per_req):
-        starts.append(start)
-        if lc == 0:
-            continue
-        j = torch.arange(lc, device=device)
-        slot_chunks.append(
-            req_to_token[req_pool_indices[r], j * ratio].to(torch.int64) // ratio
-        )
-        start += lc
+    lens_per_request = [s // ratio for s in inputs.seq_lens_cpu]
+    columns = sum(lens_per_request)
     num_tokens = pos.shape[0]
-    if not slot_chunks or num_tokens == 0:
+    if columns == 0 or num_tokens == 0:
         return None
-    k_slots = torch.cat(slot_chunks)
+    starts = list(itertools.accumulate(lens_per_request, initial=0))[:-1]
+    lens = async_h2d(lens_per_request, dtype=torch.int64, device=device)
+    starts_dev = async_h2d(starts, dtype=torch.int64, device=device)
+    request = torch.repeat_interleave(
+        torch.arange(len(lens_per_request), device=device), lens, output_size=columns
+    )
+    position = torch.arange(columns, device=device) - starts_dev[request]
+    pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
     q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=indexer,
+        indexer=inputs.indexer,
         x=inputs.x,
         q_lora=inputs.q_lora,
         freqs_cis=inputs.freqs_cis,
         positions=pos,
     )
-    compress_lens = ((pos + 1) // ratio).to(torch.int32)
-    request_starts = torch.repeat_interleave(
-        torch.tensor(starts, dtype=torch.int32, device=device),
-        inputs.rows_per_request_device.to(torch.int64),
-        output_size=num_tokens,
-    )
     return DeepGEMMPrefillData(
-        k_slots=k_slots,
-        request_starts=request_starts,
-        lens_per_request=lc_per_req,
+        k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
+        request_starts=torch.repeat_interleave(
+            starts_dev.to(torch.int32),
+            inputs.rows_per_request_device.to(torch.int64),
+            output_size=num_tokens,
+        ),
+        lens_per_request=lens_per_request,
         rows_per_request=inputs.rows_per_request,
-        compress_lens=compress_lens,
+        compress_lens=((pos + 1) // ratio).to(torch.int32),
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,

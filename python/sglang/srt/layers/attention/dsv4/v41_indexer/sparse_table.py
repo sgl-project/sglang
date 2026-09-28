@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.utils.common import async_h2d
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -368,7 +369,7 @@ def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch
     """[rows] int32: one id per consecutive row pair of a request, never across two.
     DeepGEMM's schedule walks back over equal ids to a row's request start once per
     row, quadratic in a request's rows; per-pair ids bound the walk to one step."""
-    counts = torch.tensor(rows_per_request, dtype=torch.int64, device=device)
+    counts = async_h2d(rows_per_request, dtype=torch.int64, device=device)
     rows = sum(rows_per_request)
     row = torch.arange(rows, device=device)
     request = torch.repeat_interleave(

@@ -121,6 +121,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -3182,7 +3183,7 @@ class DeepseekV4AttnBackend(
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
         if rows_per_request is not None:
-            rows_per_request_device = torch.tensor(
+            rows_per_request_device = async_h2d(
                 rows_per_request, dtype=torch.int32, device=x.device
             )
         elif tail is not None:
