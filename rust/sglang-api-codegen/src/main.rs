@@ -11,7 +11,7 @@
 //! Regeneration is manual. From anywhere in the `rust/` workspace:
 //!
 //! ```text
-//! cargo run -p sglang-api-codegen
+//! cargo gen-api
 //! ```
 //!
 //! `proto/sglang/api/v1/service.proto` is the single root: every API must be
