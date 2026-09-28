@@ -660,6 +660,10 @@ class Envs:
     # heads into the output buffer; the padded heads are left stale (the model reads
     # only the TP slice).
     SGLANG_DSV4_ATTN_OUTPUT_TP_LOCAL_COPY = EnvBool(False)
+    # DeepSeek-V4 C4 indexer under the breakable prefill graph: logits + top-k of all
+    # prefill rows in one ragged non-paged launch per layer, in an eager section;
+    # verify rows keep the paged kernel.
+    SGLANG_DSV4_INDEXER_EAGER_RAGGED = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
