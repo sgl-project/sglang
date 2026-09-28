@@ -30,7 +30,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     layer_input_buffer,
     reduce_output,
@@ -1148,7 +1148,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             # NextN wraps a single decoder layer whose checkpoint prefix is the
             # post-model layer id. Treat it as a one-layer model for scatter-mode
@@ -1160,7 +1160,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         )
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,

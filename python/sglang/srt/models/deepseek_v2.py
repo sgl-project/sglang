@@ -69,13 +69,12 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
-    DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -1114,6 +1113,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
+                reduce=post_experts_all_reduce,
             )
 
         all_reduce_done = False
@@ -2288,7 +2288,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        layer_scatter_modes: LayerScatterModes = None,
+        input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2297,7 +2297,7 @@ class DeepseekV2AttentionMLA(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=layer_scatter_modes,
+            input_on_attention_tp_slices=input_on_attention_tp_slices,
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
@@ -2309,7 +2309,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        layer_scatter_modes: LayerScatterModes = None,
+        input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2394,7 +2394,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
@@ -2403,7 +2403,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
@@ -2412,7 +2412,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
                 prev_topk_indices,
             )
         else:
@@ -2576,7 +2576,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -2632,24 +2632,24 @@ class DeepseekV2DecoderLayer(nn.Module):
     ):
         """The communicator for this layer's norms; it chooses its boundary
         steps from them at construction."""
-        if get_parallel().enable_prefill_cp:
-            communicator_cls = DSACPLayerCommunicator
-        elif not self.is_nextn and _use_mnnvl_cutedsl_fusion():
+        fusions = None
+        if (
+            not get_parallel().enable_prefill_cp
+            and not self.is_nextn
+            and _use_mnnvl_cutedsl_fusion()
+        ):
             # Dense layers too: selecting cutedsl turns the legacy fusion off.
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-                CuteDSLFusionLayerCommunicator,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
 
-            communicator_cls = CuteDSLFusionLayerCommunicator
-        else:
-            communicator_cls = LayerCommunicator
-        return communicator_cls(
-            layer_scatter_modes=self.layer_scatter_modes,
+            fusions = CuteDSLFusion()
+        return LayerCommunicator(
+            layer_facts=self.layer_facts,
             input_layernorm=input_layernorm,
             post_attention_layernorm=post_attention_layernorm,
             allow_reduce_scatter=True,
             qkv_latent_func=qkv_latent_func,
             allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
+            fusions=fusions,
         )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -2722,7 +2722,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
-                layer_scatter_modes=self.layer_scatter_modes,
+                input_on_attention_tp_slices=(
+                    self.layer_communicator.input_on_attention_tp_slices
+                ),
                 prev_topk_indices=prev_topk_indices,
             )
         if isinstance(hidden_states, tuple):
@@ -3123,9 +3125,6 @@ class DeepseekV2Model(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
