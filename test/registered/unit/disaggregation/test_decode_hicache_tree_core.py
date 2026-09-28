@@ -119,6 +119,15 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         tree_cache.get_prefix_hash_values.assert_not_called()
         tree_cache.prefetch_from_storage.assert_not_called()
 
+    def test_rank_divergent_load_events_issue_no_collective(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            torch.multiprocessing.spawn(
+                _run_local_restore_rank,
+                args=(str(Path(tmp) / "init"),),
+                nprocs=2,
+                join=True,
+            )
+
 
 def _run_local_restore_rank(rank: int, init_file: str) -> None:
     torch.distributed.init_process_group(
@@ -129,7 +138,6 @@ def _run_local_restore_rank(rank: int, init_file: str) -> None:
         timeout=timedelta(seconds=30),
     )
     try:
-        group = torch.distributed.group.WORLD
         event = SimpleNamespace(query=lambda: rank == 0)
         cache = object.__new__(UnifiedRadixCache)
         cache.__dict__.update(
@@ -145,9 +153,7 @@ def _run_local_restore_rank(rank: int, init_file: str) -> None:
             pp_rank=0,
             pp_size=1,
             attn_cp_group=None,
-            attn_tp_group=group,
-            tp_group=group,
-            tp_world_size=2,
+            attn_tp_group=torch.distributed.group.WORLD,
         )
         decode_req = SimpleNamespace(
             hicache_restore_status=HiCacheRestoreResult.PENDING,
@@ -159,28 +165,17 @@ def _run_local_restore_rank(rank: int, init_file: str) -> None:
             tree_cache=cache,
             _try_hicache_queue_load_back=Mock(return_value=False),
         )
+        pending = SimpleNamespace(**vars(decode_req))
+        pending.hicache_restored_node = None
 
-        DecodeHiCacheTransferMixin._process_hicache_local_restores(queue, [decode_req])
-
-        queued = torch.tensor(
-            [queue._try_hicache_queue_load_back.call_count], dtype=torch.uint8
+        DecodeHiCacheTransferMixin._process_hicache_local_restores(
+            queue, [decode_req, pending]
         )
-        gathered = [torch.zeros_like(queued) for _ in range(2)]
-        torch.distributed.all_gather(gathered, queued, group=group)
-        assert gathered[0].item() == gathered[1].item() == 0, gathered
+
+        queue._try_hicache_queue_load_back.assert_not_called()
+        torch.distributed.barrier()
     finally:
         torch.distributed.destroy_process_group()
-
-
-class TestDecodeHiCacheLocalRestoreRankConsensus(CustomTestCase):
-    def test_rank_divergent_load_events_issue_no_collective(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            torch.multiprocessing.spawn(
-                _run_local_restore_rank,
-                args=(str(Path(tmp) / "init"),),
-                nprocs=2,
-                join=True,
-            )
 
 
 if __name__ == "__main__":
