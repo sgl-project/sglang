@@ -91,13 +91,18 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
         """Initialize the ascend transfer instance."""
+        initialize_kwargs = {}
+        if nic:
+            # The nic argument exists only in memfabric_hybrid > v1.2.1
+            # (added with host rdma); older engines reject the keyword.
+            initialize_kwargs["nic"] = nic
         ret_value = self.engine.initialize(
             self.store_url,
             self.session_id,
             self.role,
             self.npu_id,
             trans_op_type,
-            nic=nic,
+            **initialize_kwargs,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
