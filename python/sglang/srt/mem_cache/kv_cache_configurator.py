@@ -544,12 +544,15 @@ class KVCacheConfigurator:
                     UnifiedMambaTokenToKVPoolAllocator,
                     UnifiedSWAAllocatorBase,
                 ),
+            ) or (
+                isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
+                and is_deepseek_dsa(self.model_config.hf_config)
             ):
                 draft_virtual_id_space = (
                     token_to_kv_pool_allocator.draft_virtual_id_space
                 )
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
-                    "unified allocator virtual space smaller than the token "
+                    "shared allocator virtual space smaller than the token "
                     f"budget: virtual_id_space={draft_virtual_id_space} < "
                     f"max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
@@ -620,7 +623,7 @@ class KVCacheConfigurator:
 
         if draft_virtual_id_space is not None:
             assert token_to_kv_pool.size >= draft_virtual_id_space, (
-                "draft token_to_kv_pool smaller than the shared unified "
+                "draft token_to_kv_pool smaller than the shared "
                 f"allocator's virtual-id space: pool size="
                 f"{token_to_kv_pool.size} < "
                 f"virtual_id_space={draft_virtual_id_space}; "
@@ -1627,7 +1630,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

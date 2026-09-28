@@ -74,6 +74,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     @property
+    def draft_virtual_id_space(self) -> int:
+        """Resident draft rows, excluding the pool-owned sentinel page.
+
+        Draft KV is indexed by logical target IDs, never by hot-slot residency.
+        DSATokenToKVPool adds the same page-sized sentinel as the logical pool.
+        """
+        return self._size_full
+
+    @property
     def size_full(self) -> int:
         return self._size_full
 

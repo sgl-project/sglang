@@ -854,6 +854,39 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_resident_draft_cost_covers_full_logical_span(self, _kv_dim):
+        """Both dense draft KV and index-K span the target logical capacity."""
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        for ratio in (1, 4):
+            with self.subTest(ratio=ratio):
+                mr = _make_model_runner(self, num_layers=8, use_mla_backend=True)
+                _configure_dsa_model(mr)
+                mr.spec_algorithm.is_eagle.return_value = True
+                mr.spec_algorithm.is_none.return_value = False
+                mr.spec_aux_config.eagle_draft_num_layers = 2
+                with (
+                    mock_cpu_env(kv_size=1),
+                    get_memory().override(enable_hisparse=True),
+                    patch(
+                        "sglang.srt.mem_cache.sparsity.parse_hisparse_config",
+                        return_value=SimpleNamespace(host_to_device_ratio=ratio),
+                    ),
+                ):
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(10_000_000, page_size=64)
+                # Target dense rows are sparse; both indexers and the entire
+                # resident draft use logical IDs, ratio times the target rows.
+                expected = 8 * (576 + 132 * ratio) + 2 * ratio * (576 + 132)
+                self.assertEqual(cfg._cell_size, expected)
+                self.assertLessEqual(config.max_total_num_tokens * expected, 10_000_000)
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000

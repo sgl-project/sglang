@@ -385,6 +385,13 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
+        if self.enable_hisparse and self.is_draft_worker:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            # DSA draft KV stays resident at logical target IDs. Only the target
+            # owns HiSparse hot slots, host backing, and residency transactions.
+            if is_deepseek_dsa(self.model_config.hf_config):
+                self.enable_hisparse = False
         self._sampling_observer: Optional[SamplingObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 

@@ -248,6 +248,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
+                    if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                        # The draft is resident over the target logical ID space.
+                        # Indexer cost above already includes this ratio; dense KV
+                        # must include it too, before deriving a token budget.
+                        draft_kv_size *= parse_hisparse_config().host_to_device_ratio
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
@@ -495,7 +502,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
-        if memory_config.enable_hisparse:
+        if memory_config.enable_hisparse and not kvc.is_draft_worker:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio

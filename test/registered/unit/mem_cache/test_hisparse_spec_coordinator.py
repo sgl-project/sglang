@@ -35,6 +35,16 @@ class Event:
 
 
 class TestCoordinator(unittest.TestCase):
+    def test_resident_draft_span_includes_high_logical_ids(self):
+        allocator = HiSparseTokenToKVPoolAllocator(
+            128, 64, torch.float32, "cpu", MagicMock(), False, 4
+        )
+        self.assertEqual(allocator.draft_virtual_id_space, 512)
+        # Pools add one sentinel page: the highest valid logical ID must fit.
+        highest_id = allocator.full_to_hisparse_device_index_mapping.numel() - 2
+        self.assertEqual(highest_id, allocator.draft_virtual_id_space + 64 - 1)
+        self.assertGreater(highest_id, allocator._size_hisparse + 64 - 1)
+
     def setUp(self):
         self.events = []
 
