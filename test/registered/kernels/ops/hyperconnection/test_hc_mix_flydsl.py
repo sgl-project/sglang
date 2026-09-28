@@ -26,6 +26,7 @@ def test_gated_residual_dispatch(monkeypatch):
     if torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx950":
         pytest.skip("Requires gfx950")
     from aiter.ops.flydsl.hc_mix import hc_mix
+
     from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 
     cfg = HyperConnectionConfig(hidden_size=2560, hc_lowrank=320)
@@ -42,7 +43,12 @@ def test_gated_residual_dispatch(monkeypatch):
         ):
             assert not flydsl_hc_mix_supported(x, d, u, 4, 2560)
         t = torch.nn.functional.silu(normed.float() @ d.float().T / 4).bfloat16()
-        ref = ((t.float() @ u.float().T).sigmoid() * normed.float()).view(4, 4, 2560).mean(1).bfloat16()
+        ref = (
+            ((t.float() @ u.float().T).sigmoid() * normed.float())
+            .view(4, 4, 2560)
+            .mean(1)
+            .bfloat16()
+        )
         torch.testing.assert_close(result, ref, atol=0.004, rtol=0.01)
         packed = layer._mix_flydsl_weights
         layer.mix(x)
@@ -57,6 +63,7 @@ def test_gated_residual_dispatch(monkeypatch):
 
 def test_inference_tensor_weight_cache():
     from sglang.srt.layers.hc_mix_flydsl import weight_cache_key
+
     with torch.inference_mode():
         w = torch.ones(4)
         assert weight_cache_key(w, w)[1] is None

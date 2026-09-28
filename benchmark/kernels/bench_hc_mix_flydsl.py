@@ -3,6 +3,7 @@
 Example: python benchmark/kernels/bench_hc_mix_flydsl.py --weights 64 --json /tmp/hc.json
 Packing, compilation and allocation are excluded from GPU replay timing.
 """
+
 import argparse
 import json
 import statistics
@@ -10,8 +11,8 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-
 from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
+
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix
 
 
@@ -38,7 +39,11 @@ def measure(fn, calls, repeats=9):
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end) * 1000 / calls)
-    return {"median_us": statistics.median(times), "min_us": min(times), "max_us": max(times)}
+    return {
+        "median_us": statistics.median(times),
+        "min_us": min(times),
+        "max_us": max(times),
+    }
 
 
 def main():
@@ -51,7 +56,12 @@ def main():
         parser.error("--weights must be positive")
     torch.manual_seed(123)
     compiled = torch.compile(eager)
-    results = {"device": str(torch.cuda.get_device_properties()), "torch": torch.__version__, "weight_sets": args.weights, "rows": {}}
+    results = {
+        "device": str(torch.cuda.get_device_properties()),
+        "torch": torch.__version__,
+        "weight_sets": args.weights,
+        "rows": {},
+    }
     for m in args.rows:
         data = []
         for _ in range(args.weights):
@@ -59,16 +69,24 @@ def main():
             d = torch.randn(320, 10240, device="cuda", dtype=x.dtype) * 0.02
             u = torch.randn(10240, 320, device="cuda", dtype=x.dtype) * 0.02
             data.append((x, d, u, *pack_hc_weights(d, u)))
+
         def fly(i):
             x, _, _, d, u = data[i % len(data)]
             return hc_mix(x, d, u)
+
         def triton(i):
             x, d, u, _, _ = data[i % len(data)]
             return fused_hc_mix(x, d, u, 4, 2560)
+
         def pytorch(i):
             return compiled(*data[i % len(data)][:3])
+
         row = {}
-        for name, fn in [("flydsl", fly), ("persistent_triton", triton), ("torch_compile", pytorch)]:
+        for name, fn in [
+            ("flydsl", fly),
+            ("persistent_triton", triton),
+            ("torch_compile", pytorch),
+        ]:
             row[name] = measure(fn, max(128, args.weights))
             print(m, name, row[name], flush=True)
         results["rows"][m] = row
