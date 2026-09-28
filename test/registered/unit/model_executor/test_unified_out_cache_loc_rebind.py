@@ -73,15 +73,13 @@ def _armed_source(v2p, swa_map):
     # The WRITE loc has its own translate because under DCP it arrives widened;
     # at dcp_size == 1 it is the read translate, so arm it with the same fake.
     src._translate_write_full = src._translate_full
-    # Phase 2 derives from kernel-facing values through p2v + the swa v2p; arm
-    # the inverse of the fake v2p (ps=1, both multipliers 1: kernel == physical,
-    # and the expected swa loc for virtual t is swa_map[t]).
+    # Phase 2 derives from physical values through p2v + the swa v2p; arm the
+    # inverse of the fake v2p (ps=1, so the expected swa loc for virtual t is
+    # swa_map[t]).
     p2v = torch.zeros(int(v2p.max()) + 1, dtype=torch.int64)
     p2v[v2p] = torch.arange(v2p.numel(), dtype=torch.int64)
     src._full_p2v_table = p2v
     src._swa_v2p_table = swa_map
-    src._full_page_multiplier = 1
-    src._swa_page_multiplier = 1
     return src
 
 
@@ -150,26 +148,6 @@ class TestPadComposesWithDerivation(CustomTestCase):
         # The TBO-child shape: a slice of the PADDED tensor derives pointwise.
         sub = src._swa_write_loc_unified(fb.out_cache_loc[1:5])
         self.assertTrue(torch.equal(sub, loc[1:5]))
-
-    def test_the_probe_separates_kernel_facing_from_virtual_ids(self):
-        """A skipped rebind is the failure mode this contract has no other
-        guard against: virtual ids stay inside the OOB probe's bounds (they are
-        `blocks_per_page` times SMALLER than a kernel-facing id), so the store lands on
-        the wrong slots and only the output is wrong. The kernel-facing probe
-        is what separates them -- the in-page offset of a kernel-facing id is always
-        below page_size, and a virtual id's is not unless it happens to fall in
-        the first block."""
-        for page_size, blocks in ((1, 8), (4, 6)):
-            with self.subTest(page_size=page_size, blocks=blocks):
-                stride = page_size * blocks
-                virt = torch.arange(1, 2 * stride, dtype=torch.int64)
-                kernel = (virt // page_size) * stride + virt % page_size
-                in_space = kernel % stride < page_size
-                self.assertTrue(bool(in_space.all()), "kernel-facing ids must pass")
-                # Virtual ids pass only in the first block; that is why the
-                # probe needs a batch, not one id, to be conclusive.
-                caught = ~(virt % stride < page_size)
-                self.assertTrue(bool(caught.any()), "virtual ids must be caught")
 
     def test_empty_loc_rebinds_to_empty(self):
         src = _armed_source(

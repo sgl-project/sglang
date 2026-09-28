@@ -474,6 +474,48 @@ def handle_cache_compatibility(server_args: Any) -> None:
             )
 
 
+# Backends whose speculative verify id rails are translation-audited for
+# the unified pool.
+_SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
+    {
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "flashmla",
+        "flashinfer",
+        "fa3",
+    }
+)
+
+
+def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+    """Refuse spec backends whose verify id rails are not translation-audited.
+
+    Checks the target's prefill/decode pair AND the draft worker's own
+    backend: the latter resolves from `--speculative-draft-attention-backend`
+    before inheriting the target's, so it can be unaudited on its own."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= allowed, (
+        f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
+        f"attention backends {sorted(allowed)} for both prefill "
+        f"and decode; got {sorted(backends)}. Other backends do "
+        "not translate speculative verify indices to the unified "
+        "pool's kernel-facing space yet."
+    )
+    draft_backend = resolving_view(server_args).speculative_draft_attention_backend
+    assert draft_backend is None or draft_backend in allowed, (
+        f"--enable-unified-memory + {algorithm} requires the draft worker on a "
+        f"spec-verify-audited backend {sorted(allowed)}; got "
+        f"--speculative-draft-attention-backend={draft_backend!r}. Leave it "
+        "unset to inherit the target's."
+    )
+
+
 def handle_unified_memory_pool(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
@@ -542,31 +584,55 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-SWA H2D/D2H transfers yet."
             )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV); other "
+        "speculative algorithms are not yet audited for the unified pool's "
+        "virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    assert cfg.speculative_eagle_topk in (None, 1), (
+        "--enable-unified-memory supports a linear draft chain only "
+        "(--speculative-eagle-topk in {None, 1}); tree verify relocates "
+        "accepted tokens one at a time inside the target pool, which the "
+        "unified pool's page-granular move_kv_cache cannot express. Got "
+        f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+    )
+    if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        _mc = model_config_of(server_args)
+        assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
+            "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
+            "fused inside the full-attention page envelope."
+        )
+        eagle_allowed = (
+            _SPEC_VERIFY_AUDITED_BACKENDS
+            if use_mla_backend(server_args)
+            else {"triton", "flashinfer", "fa3"}
+        )
+        eagle_backends = set(attention_backends_of(resolved_view(server_args)))
+        assert (
+            None not in eagle_backends
+            and eagle_backends
+            and eagle_backends <= eagle_allowed
+        ), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the "
+            f"spec-verify-audited attention backends {sorted(eagle_allowed)}, "
+            f"set explicitly (got {sorted(eagle_backends, key=str)}). The MLA "
+            "verify family does not apply to an MHA-shaped draft."
+        )
+        draft_allowed = (None,) + tuple(sorted(eagle_allowed))
+        assert cfg.speculative_draft_attention_backend in draft_allowed, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
+            f"worker on a spec-verify-audited backend {sorted(eagle_allowed)}; "
+            "got --speculative-draft-attention-backend="
+            f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
+            "to inherit the target's."
+        )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
-        )
+        _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
         "TBO's replay split hands each child a view without the pre-translate "
@@ -577,6 +643,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "--enable-unified-memory is not yet compatible with --enable-lmcache: "
         "the LMCache offload path indexes the device buffers with the ids it "
         "is handed, and under the unified pool those are VIRTUAL."
+    )
+    assert not (
+        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.disaggregation_decode_retraction_backup == "host_pool"
+    ), (
+        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
+        "host pools off the draft's device pool, and a draft fused into the "
+        "target's entries has no transfer surface of its own."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -656,7 +731,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
 
 
 def handle_page_major_kv_layout(server_args: Any):
-    # The unified pool stores state in the page-major envelope-strided layout, so
+    # The unified pool stores state in the page-major envelope layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
 
@@ -684,17 +759,18 @@ def handle_page_major_kv_layout(server_args: Any):
     assert unified_memory_supported_for_model(
         model_config, use_mla_backend=use_mla_backend(server_args)
     ), (
-        "--enable-unified-memory requires uniform K/V rows "
-        "(head_dim == v_head_dim); this model has "
+        "--enable-unified-memory does not yet admit asymmetric K/V rows "
+        "(head_dim != v_head_dim); this model has "
         f"head_dim={model_config.head_dim}, "
         f"v_head_dim={model_config.v_head_dim}, "
         f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
-        "pool's per-layer views require a uniform row width; run "
-        "this model without --enable-unified-memory."
+        f"swa_v_head_dim={model_config.swa_v_head_dim}. The token-major "
+        "views can hold them, but the backends' write and read paths are "
+        "not audited for it; run this model without --enable-unified-memory."
     )
     # Allow-list. Every backend below reads through the translator, so what
-    # gates one is only whether its kernels can address the per-layer views:
+    # gates one is only whether its kernels address the per-layer views by
+    # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
@@ -727,9 +803,8 @@ def handle_page_major_kv_layout(server_args: Any):
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
         f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the per-layer-view families; plain page-major keeps the "
-        "envelope-strided views only Triton reads). Pass a compatible "
-        "--attention-backend."
+        "allows the stride-aware per-layer-view families). Pass a "
+        "compatible --attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

@@ -400,6 +400,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner_list[
                     step
                 ].attn_backend = self.draft_extend_attn_backend_list[-1]
+            # Boot guard: every backend a draft forward reaches must carry
+            # its runner's translator or the index builders emit virtual ids.
+            translator = self.draft_runner_list[step].kv_index_translator
+            if translator.is_translating:
+                translator.bind_and_verify_backends(
+                    [self.draft_extend_attn_backend_list[-1]]
+                )
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
@@ -766,6 +773,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
+            # Both loc sources read req_to_token untranslated, so `locs` is the
+            # PRE-translate write loc the capture rail needs.
+            out_cache_loc_virtual=locs,
         )
         return True
 
