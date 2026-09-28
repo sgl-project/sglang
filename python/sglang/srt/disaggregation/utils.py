@@ -294,7 +294,7 @@ class ReqToMetadataIdxAllocator:
 
 
 class CustomizedInfoError(ValueError):
-    """A request's customized_info cannot fit or be encoded for PD transfer."""
+    pass
 
 
 class MetadataBuffers:
@@ -508,7 +508,6 @@ class MetadataBuffers:
                 if req.customized_info is None
                 else msgspec.msgpack.encode(
                     req.customized_info,
-                    # Do not carry the sender's GPU ordinal to the decode host.
                     enc_hook=lambda obj: enc_hook(
                         obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
                     ),

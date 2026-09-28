@@ -547,6 +547,23 @@ class CommonKVManager(BaseKVManager):
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
+    def validate_aux_buffers(
+        self, dst_aux_ptrs: List[int], dst_aux_item_lens: Optional[List[int]]
+    ) -> None:
+        src_ptrs = self.kv_args.aux_data_ptrs
+        src_item_lens = self.kv_args.aux_item_lens
+        if not (
+            len(src_ptrs) == len(src_item_lens) == len(dst_aux_ptrs)
+            and src_item_lens == dst_aux_item_lens
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: "
+                f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
+                f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
+                "Both servers must use matching builds, metadata options, and "
+                "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES."
+            )
+
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
         if current is None:
