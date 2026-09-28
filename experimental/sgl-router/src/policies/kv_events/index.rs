@@ -1596,7 +1596,9 @@ impl SweepResult {
 ///
 /// `freshness_floor` is the instant every fetch demands the peer's export beat:
 /// re-derived per attempt, so a sweep that runs for minutes keeps asking for the
-/// same coverage rather than drifting into accepting older state.
+/// same coverage rather than drifting into accepting older state. A peer that has
+/// already answered is asked for something newer still; see
+/// `SweepState::export_floor`.
 ///
 /// Each pass sweeps only the obligations still `Pending` on the incarnation they
 /// were registered under. A rank can leave `Pending` while the sweep runs — the
@@ -1845,6 +1847,8 @@ struct SweepState {
     /// identities, not [`KvWorkerId`]s, because this is evidence about a rank
     /// rather than a routing identity (see the provenance note on that type).
     holds_nothing: HashMap<String, HashSet<(String, u32)>>,
+    /// Per peer, when its latest body arrived; see [`Self::export_floor`].
+    received_at: HashMap<String, Instant>,
 }
 
 impl SweepState {
@@ -1854,7 +1858,37 @@ impl SweepState {
             cooldown: HashMap::new(),
             cold_witnessed: HashSet::new(),
             holds_nothing: HashMap::new(),
+            received_at: HashMap::new(),
         }
+    }
+
+    /// The instant a fetch from `peer` must demand an export newer than: the
+    /// sweep's `floor`, or the arrival of this peer's last body if later.
+    ///
+    /// WHY the second term: a producer reuses its cached export for any
+    /// requester whose `max_age` it meets (see `KvEventIndex::snapshot_entry`),
+    /// and a floor fixed at sweep start is met by that export for the whole
+    /// sweep. So a re-fetch after a useless answer — no coverage, empty,
+    /// nothing we know — got the same document back even after the peer had
+    /// since learned what we need, and the sweep could not see it until the
+    /// deadline. An export is always sampled before it is sent, so "newer than
+    /// its arrival here" excludes exactly the answer already seen, whatever the
+    /// transit latency, and forces the peer to take a fresh one.
+    ///
+    /// Only re-fetches ratchet, and only as often as cooldown lets this peer
+    /// be asked. The producer's single-flight is untouched: requesters still
+    /// share any build that started after the instant each demands, so a boot
+    /// herd still pays about one walk per build-duration of arrival spread.
+    fn export_floor(&self, peer: &str, floor: Instant) -> Instant {
+        self.received_at
+            .get(peer)
+            .map_or(floor, |&at| at.max(floor))
+    }
+
+    /// Record that `peer` answered with a body at `at`; see
+    /// [`Self::export_floor`].
+    fn note_received(&mut self, peer: &str, at: Instant) {
+        self.received_at.insert(peer.to_string(), at);
     }
 
     /// A peer that did not answer has unknown warmth: it cannot count toward
@@ -1985,12 +2019,17 @@ async fn sweep_peers(
         if state.cooling(peer) {
             continue;
         }
-        // Ask for an export that beats the floor. Derived per attempt, not once:
-        // the condition is "newer than the floor", and only the age it
+        // Ask for an export that beats the floor — and, once this peer has
+        // answered, that beats its last answer too (see
+        // `SweepState::export_floor`). Derived per attempt, not once: the
+        // condition is "newer than that instant", and only the age it
         // corresponds to moves as the sweep retries.
-        let max_age = freshness_floor.elapsed();
+        let max_age = state.export_floor(peer, *freshness_floor).elapsed();
         let snap = match fetch_snapshot(http, peer, Some(max_age)).await {
-            Ok(FetchAnswer::Body(s)) => s,
+            Ok(FetchAnswer::Body(s)) => {
+                state.note_received(peer, Instant::now());
+                s
+            }
             Ok(FetchAnswer::NoBody(status)) => {
                 // Reachable but no usable body — the status names which kind
                 // of wrong: 404 is an older router image that does not serve
@@ -3066,7 +3105,7 @@ fn apply_snapshot(
 mod tests {
     use super::*;
     use crate::policies::engine_load::LoadStat;
-    use crate::policies::kv_events::bootstrap::{CURSORS_ONLY_PARAM, SNAPSHOT_PATH};
+    use crate::policies::kv_events::bootstrap::{CURSORS_ONLY_PARAM, MAX_AGE_PARAM, SNAPSHOT_PATH};
     use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
@@ -3991,6 +4030,106 @@ mod tests {
         assert!(
             state.nothing_to_recover(&rank, &candidates),
             "a peer we can never consume has nothing for us",
+        );
+    }
+
+    /// Serve a REAL producer on the snapshot path, honouring `max_age_ms` the
+    /// way the route does — the ratchet is only observable against the
+    /// producer's own cache.
+    async fn serve_producer(index: Arc<KvEventIndex>) -> String {
+        let app = axum::Router::new().route(
+            SNAPSHOT_PATH,
+            axum::routing::get(move |q: axum::extract::Query<HashMap<String, String>>| {
+                let index = Arc::clone(&index);
+                async move {
+                    let max_age = q.get(MAX_AGE_PARAM).and_then(|v| v.parse().ok()).map_or(
+                        crate::policies::kv_events::bootstrap::PRODUCER_CACHE_TTL,
+                        Duration::from_millis,
+                    );
+                    index.peer_snapshot_body(max_age).await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The freshness ratchet: a peer that answered without covering our rank
+    /// and has SINCE learned it must be able to say so. Against a floor fixed
+    /// at sweep start, the producer kept replaying the export it built right
+    /// after that floor for the whole sweep, so later coverage never reached
+    /// the consumer before its deadline.
+    #[tokio::test]
+    async fn a_refetch_demands_an_export_newer_than_the_peers_last_answer() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).expect("first set establishes");
+        let producer =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let (ours, theirs) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+        );
+        for w in [&ours, &theirs] {
+            oracle.report_worker(&w.url, false);
+            producer.live_workers.lock().insert(w.clone());
+        }
+        producer.seed_stored_block_for_test(&theirs, 3, 222);
+        let peer = serve_producer(Arc::clone(&producer)).await;
+
+        let deps = sweep_deps(vec![peer], 64, &["http://w1:30000", "http://w2:30000"]);
+        // Far enough behind the first export that reusing it under the floor
+        // alone is not a matter of transit-latency luck.
+        let floor = Instant::now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ctx = SweepCtx {
+            http: &deps.http,
+            peers: &deps.peers,
+            bootstrap: &deps.bootstrap,
+            live_workers: &deps.live_workers,
+            oracle: &deps.oracle,
+            freshness_floor: floor,
+        };
+        let last_reason = Mutex::new(None);
+        let mut state = SweepState::new();
+        let ranks = vec![ours.clone()];
+
+        let first = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        assert!(
+            !matches!(first, SweepPass::Found(_)),
+            "the peer does not know our rank yet",
+        );
+        // The peer learns our rank after answering; its cache still holds the
+        // export it answered with, which does meet the sweep's floor.
+        producer.seed_stored_block_for_test(&ours, 5, 111);
+        state.cooldown.clear();
+        let second = sweep_peers(&ctx, &ranks, &mut state, &last_reason).await;
+        match second {
+            SweepPass::Found(vetted) => assert_eq!(vetted.cursor_for(&ours), Some(5)),
+            _ => panic!("the re-fetch must see a fresh export, not a replay of the last answer"),
+        }
+    }
+
+    #[test]
+    fn export_floor_is_the_later_of_the_sweep_floor_and_the_last_answer() {
+        let mut state = SweepState::new();
+        let floor = Instant::now();
+        let peer = "http://a:30000";
+        assert_eq!(state.export_floor(peer, floor), floor, "never answered");
+        let answered = floor + Duration::from_secs(1);
+        state.note_received(peer, answered);
+        assert_eq!(state.export_floor(peer, floor), answered);
+        assert_eq!(
+            state.export_floor("http://b:30000", floor),
+            floor,
+            "per peer: another peer's answer ratchets nothing here",
+        );
+        let later_floor = answered + Duration::from_secs(1);
+        assert_eq!(
+            state.export_floor(peer, later_floor),
+            later_floor,
+            "the ratchet never loosens the sweep's own floor",
         );
     }
 
