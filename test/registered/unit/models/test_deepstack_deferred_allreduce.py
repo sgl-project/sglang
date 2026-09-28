@@ -1,3 +1,5 @@
+from sglang.srt.layers.communicator.residual.add_norm import ADD
+
 """Deepstack visual embeddings are added to a decoder layer's output. When the
 layer left its FFN all-reduce to the next layer, that output is one rank's
 partial sum, and an embedding added to it is counted once per rank."""
@@ -9,7 +11,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
-from sglang.srt.layers.communicator.residual.add_norm import ADD
+from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,6 +56,20 @@ class DeferringLayer(nn.Module):
             else UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP)
         )
         return stream.leave(output, ADD), stream
+
+
+class DeferringStageLayer(DeferringLayer):
+    def forward(self, positions=None, hidden_states=None, forward_batch=None, **kwargs):
+        stream = residual_batch.current(forward_batch)
+        hidden_states, residual = stream.finish(hidden_states)
+        residual = hidden_states if residual is None else hidden_states + residual
+        stream.write(residual)
+        output = (
+            torch.ones_like(residual)
+            if self.is_last_layer
+            else UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP)
+        )
+        return stream.leave(output, ADD)
 
 
 class SumNorm(nn.Module):
@@ -158,9 +174,14 @@ class TestSplitPrefillCompletion(CustomTestCase):
                 with self.subTest(model=model_cls.__name__, tokens=tokens):
                     # Also leave the final output: the stack exit must handle it
                     # independently of the last layer's fusion decision.
+                    stage_api = model_cls in (
+                        Qwen3ForCausalLM,
+                        SarvamMoEForCausalLM,
+                    )
+                    layer_type = DeferringStageLayer if stage_api else DeferringLayer
                     wrapper = SimpleNamespace(
                         model=SimpleNamespace(
-                            layers=[DeferringLayer(False) for _ in range(NUM_LAYERS)],
+                            layers=[layer_type(False) for _ in range(NUM_LAYERS)],
                             config=SimpleNamespace(num_hidden_layers=NUM_LAYERS),
                             norm=SumNorm(),
                         ),

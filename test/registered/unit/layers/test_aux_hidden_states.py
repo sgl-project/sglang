@@ -1,3 +1,6 @@
+from sglang.srt.layers.communicator import StageKind
+from sglang.test.boundary_fixtures import stub_plan, stub_stage
+
 """Aux owns retained storage, including captures from reusable gather buffers."""
 
 import unittest
@@ -7,7 +10,6 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList, AuxHiddenStatePacker
-from sglang.srt.layers.communicator import LayerCommunicator as BoundaryPlan
 from sglang.srt.layers.communicator.residual.access import norm_output
 from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,28 +19,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestAuxStorage(CustomTestCase):
-    def test_constructed_layer_binds_read_only_residual_capture(self):
-        import test_declared_decoder_boundary as fixture
-
-        from sglang.srt.layers import communicator as comm
-        from sglang.srt.layers import layernorm
-        from sglang.test.communicator_patch import patch_communicator
-
-        parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
-        with (
-            fixture.planning(parallel),
-            patch_communicator("_use_aiter", False),
-            patch_communicator("apply_flashinfer_allreduce_fusion", return_value=True),
-        ):
-            layer = comm.LayerCommunicator(
-                layer_facts=fixture.layer_facts(1, 3),
-                input_layernorm=layernorm.RMSNorm(4),
-                post_attention_layernorm=layernorm.RMSNorm(4),
-            )
-            keeps = layer._steps.attention.capture_preserves_residual
-            self.assertIsNotNone(keeps)
-            self.assertTrue(keeps(torch.ones(2, 4), SimpleNamespace()))
-
     def test_breakable_graph_copies_aux_collector_into_plain_list(self):
         from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
             BreakableCudaGraphBackend,
@@ -111,19 +91,18 @@ class TestAuxStorage(CustomTestCase):
         self.assertIs(outputs[0], value)
 
     def boundary(self, stream, *, move=None):
-        boundary = BoundaryPlan.__new__(BoundaryPlan)
-        boundary.input_layernorm = None
-        boundary._context = None
-        boundary.prepare_attn = Mock(return_value=(stream.residual, stream))
-        boundary.attn = SimpleNamespace(
-            entry=lambda _: SimpleNamespace(
-                input_move=move,
-                capture_move=None,
-                capture_move_allocates=False,
-                capture_preserves_residual=None,
-            )
+        boundary = stub_plan()
+        boundary.norm = None
+        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
+            return_value=(stream.residual, stream)
         )
-        return boundary
+        stub_stage(boundary, StageKind.ATTENTION).entry = lambda _: SimpleNamespace(
+            input_move=move,
+            capture_move=None,
+            capture_move_allocates=False,
+            capture_preserves_residual=None,
+        )
+        return stub_stage(boundary, StageKind.ATTENTION)
 
     def test_packer_receives_borrowed_boundary_value_without_intermediate_clone(self):
         for callback in (False, True):
@@ -140,9 +119,7 @@ class TestAuxStorage(CustomTestCase):
                 with patch.object(
                     torch.Tensor, "clone", side_effect=AssertionError("extra clone")
                 ):
-                    stage.prepare_attn_and_capture_last_layer_outputs(
-                        value, stream, None, **kwargs
-                    )
+                    stage._prepare_attention(value, stream, None, **kwargs)
                 value.zero_()
                 torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))
 
@@ -153,7 +130,7 @@ class TestAuxStorage(CustomTestCase):
         move = Mock(return_value=gathered)
         stage = self.boundary(stream, move=move)
         outputs = AuxHiddenStateList()
-        stage.prepare_attn_and_capture_last_layer_outputs(source, stream, None, outputs)
+        stage._prepare_attention(source, stream, None, outputs)
         gathered.zero_()
         source.zero_()
         torch.testing.assert_close(outputs[0], torch.full((4, 3), 7.0))
@@ -190,11 +167,11 @@ class TestAuxStorage(CustomTestCase):
             stream.write(value)
             return value, stream
 
-        stage.prepare_attn = prepare
+        stage._prepare_input = prepare
         with patch.object(
             torch.Tensor, "clone", side_effect=AssertionError("extra clone")
         ):
-            stage.prepare_attn_and_capture_last_layer_outputs(
+            stage._prepare_attention(
                 hidden, stream, None, capture_output=outputs.capture
             )
         torch.testing.assert_close(outputs.finalize(), torch.full((2, 3), 4.0))

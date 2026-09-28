@@ -1,3 +1,6 @@
+from sglang.srt.layers.communicator import StageKind
+from sglang.test.boundary_fixtures import sp_region_steps, stub_plan, stub_stage
+
 """Unit tests for srt/layers/layernorm_sp (Megatron LayerNorm sequence parallelism).
 
 Covers the pure logic that gates SP -- the Qwen3 allowlist, the config guards, and
@@ -19,14 +22,8 @@ from sglang.srt.layers.communicator import (
     Layout,
     StageOutput,
     SumGroup,
-    TokenAxis,
 )
-from sglang.srt.layers.communicator import boundary as comm_boundary
 from sglang.srt.layers.communicator import ops as comm_ops
-from sglang.srt.layers.communicator import (
-    sequence_parallel_layer_sides,
-)
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -40,19 +37,6 @@ from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-
-
-def sp_region_steps():
-    """The steps a layer runs while a LayerNorm SP region is active."""
-    return comm_boundary._select_boundary_steps(
-        sequence_parallel_layer_sides(
-            axis_sizes={
-                TokenAxis.ATTN_DP: 1,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        )
-    )
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
@@ -174,19 +158,15 @@ class TestSpRegionSteps(CustomTestCase):
     shard: add + norm, no move, no collective."""
 
     def communicator(self, *, first_layer):
-        c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        c = stub_plan()
         c._sp_steps = sp_region_steps()
         c._input_scattered_steps = None
         c._cp_steps = None
-        c.layer_facts = SimpleNamespace(
-            is_first_layer=first_layer, is_layer_sparse=False
-        )
-        c.allow_reduce_scatter = False
+        c.is_first_layer = first_layer
+        c.is_sparse = False
         c._attn_input_fusions = ()
-        c.input_layernorm = _Norm()
-        c.post_attention_layernorm = _Norm()
+        c.norm = _Norm()
         c.qkv_latent_func = None
-        c._context = SimpleNamespace(cache=None)
         c._steps = self.ordinary_steps(MagicMock(side_effect=AssertionError("moved")))
         return c
 
@@ -219,17 +199,8 @@ class TestSpRegionSteps(CustomTestCase):
             ffn_sum_is_movable=True,
         )
 
-    def owned_input(self, hidden, residual, mode=ForwardMode.EXTEND, *, record=True):
-        batch = SimpleNamespace(forward_mode=mode, residual_stream=None)
-        stream = residual_batch.start(batch)
-        if residual is not None:
-            stream.write(residual)
-            if record:
-                hidden = stream.leave(hidden, comm.ADD)
-        return hidden, stream, batch
-
     def run_prepare_attn(self, communicator, mode, hidden, residual):
-        hidden, residual, batch = self.owned_input(hidden, residual, mode)
+        batch = SimpleNamespace(forward_mode=mode)
         with (
             get_flags().sp.override(enabled=True),
             get_forward().scoped(sp_active=False),
@@ -241,7 +212,9 @@ class TestSpRegionSteps(CustomTestCase):
                 layernorm_sp, "sp_entry_scatter", side_effect=lambda h: h[:1]
             ) as scatter,
         ):
-            out = communicator.prepare_attn(hidden, residual, batch)
+            out = stub_stage(communicator, StageKind.ATTENTION)._prepare_input(
+                hidden, residual, batch
+            )
             return out, get_forward().sp_active, scatter
 
     def test_the_first_layer_opens_the_region_on_prefill(self):
@@ -287,21 +260,20 @@ class TestSpRegionSteps(CustomTestCase):
                 "get_attn_tp_context",
                 return_value=SimpleNamespace(input_scattered=False),
             ):
-                h, r = communicator.prepare_attn(
-                    *self.owned_input(hidden, residual.clone())
+                h, r = stub_stage(communicator, StageKind.ATTENTION)._prepare_input(
+                    hidden,
+                    residual.clone(),
+                    SimpleNamespace(forward_mode=ForwardMode.EXTEND),
                 )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
-            h, r = communicator.prepare_mlp(
-                *self.owned_input(hidden, residual.clone(), record=False)
+            h, r = stub_stage(communicator, StageKind.FFN)._prepare_input(
+                hidden, residual.clone(), object()
             )
             torch.testing.assert_close(h, torch.full((1, 4), 8.0))
             torch.testing.assert_close(r.residual, torch.full((1, 4), 4.0))
-            batch = SimpleNamespace(residual_stream=None)
-            stream = residual_batch.start(batch)
-            stream.write(residual)
-            out = communicator.postprocess_layer(hidden, stream, batch)
+            out = communicator.output.postprocess_layer(hidden, residual, object())
             self.assertIs(out[0], hidden)
-            self.assertIs(out[1], stream)
+            self.assertIs(out[1], residual)
 
 
 if __name__ == "__main__":

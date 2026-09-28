@@ -58,25 +58,10 @@ def delegates_to_super(forward):
     )
 
 
-def declares_no_deferral(node):
-    """Builds its communicator with allow_deferred_ffn_reduction=False: its FFN
-    completes its own reduction."""
-    return any(
-        keyword.arg == "allow_deferred_ffn_reduction"
-        and isinstance(keyword.value, ast.Constant)
-        and keyword.value.value is False
-        for call in ast.walk(node)
-        if isinstance(call, ast.Call)
-        for keyword in call.keywords
-    )
-
-
 def defers(node):
     """Asks whether to leave the reduction to the next layer (directly or
     through ffn_exit), or wraps its output as unreduced itself."""
-    if declares_no_deferral(node):
-        return False
-    return any(any(calls(node, name)) for name in ("ffn_exit", UNREDUCED))
+    return any(any(calls(node, name)) for name in ("ffn_exit", "exit", UNREDUCED))
 
 
 class Census:
@@ -115,7 +100,13 @@ class Census:
                 and any(
                     isinstance(call, ast.Call)
                     and isinstance(call.func, ast.Name)
-                    and call.func.id in {"LayerCommunicator", "MHCLayerCommunicator"}
+                    and call.func.id
+                    in {
+                        "LayerCommunicator",
+                        "MHCLayerCommunicator",
+                        "make_decoder_stages",
+                        "make_stages",
+                    }
                     for call in ast.walk(node)
                 )
             )
@@ -129,7 +120,6 @@ class Census:
                 if name not in deferring
                 for _, node in defs
                 if set(base_names(node)) & deferring
-                and (self.include_complete or not declares_no_deferral(node))
                 and (
                     method(node, "forward") is None
                     or delegates_to_super(method(node, "forward"))
@@ -299,6 +289,19 @@ class TestLayerStackExit(CustomTestCase):
         for name, (forward, layers) in sorted(self.complete_census.subjects().items()):
             exits = list(calls(forward, EXIT)) + list(calls(forward, "take_output"))
             if not exits:
+                batch_exits = [
+                    call
+                    for call in ast.walk(forward)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "residual_batch"
+                    and call.func.attr in {"norm", "to_pp", "fold", "finish"}
+                ]
+                if batch_exits and all(
+                    not inside_loop(forward, call) for call in batch_exits
+                ):
+                    continue
                 if delegates_to_super(forward):
                     continue
                 if layers and all(
@@ -387,6 +390,13 @@ class TestLayerStackExit(CustomTestCase):
                     exits = list(calls(forward, EXIT)) + list(
                         calls(forward, "take_output")
                     )
+                    exits += [
+                        call
+                        for call in calls(forward, "norm")
+                        if isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "residual_batch"
+                    ]
                     self.assertEqual(len(exits), 1)
                     exit_call = exits[0]
                     self.assertFalse(inside_loop(forward, exit_call))
@@ -412,7 +422,11 @@ class TestLayerStackExit(CustomTestCase):
                     ]
                     self.assertEqual(len(final_segments) + len(early_returns), 1)
                     for call in ast.walk(forward):
-                        if isinstance(call, ast.Call) and is_final_norm(call):
+                        if (
+                            isinstance(call, ast.Call)
+                            and call is not exit_call
+                            and is_final_norm(call)
+                        ):
                             self.assertLess(exit_call.lineno, call.lineno)
                     checked += 1
         self.assertGreater(checked, 0)

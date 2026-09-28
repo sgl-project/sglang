@@ -21,6 +21,18 @@ import torch
 from sglang.srt.distributed import GroupCoordinator
 
 
+class OutputTransform(msgspec.Struct, frozen=True):
+    """An operation on the producer contribution, before residual addition.
+
+    Some existing implementations apply it to a partial before reduce-scatter
+    but to a complete value after all-reduce. These are explicit alternatives,
+    not an assumption that an arbitrary operation commutes with reduction.
+    """
+
+    apply: Callable[[torch.Tensor], torch.Tensor]
+    before_reduce_scatter: bool = False
+
+
 class UnreducedOutput(msgspec.Struct, frozen=True):
     """A layer output that still owes its sum, left for the next layer's input.
     Hand it to the next layer, or pass it through reduce_output() before reading

@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import ops as comm_ops
+from sglang.srt.layers.communicator.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
 from sglang.srt.models.bailing_moe_v3 import BailingMoELinearModel
@@ -16,6 +17,9 @@ from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteModel
 from sglang.srt.models.glm5_next import Glm5NextModel
 from sglang.srt.models.gpt_oss import GptOssModel
 from sglang.srt.models.laguna import LagunaModel
+from sglang.srt.models.llama4 import Llama4Model
+from sglang.srt.models.qwen3 import Qwen3Model
+from sglang.srt.models.qwen3_vl import Qwen3LLMModel
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +37,7 @@ MODELS = (
     LagunaModel,
     Qwen3MoeLLMModel,
 )
+CAPTURE_MODELS = (*MODELS, Llama4Model, Qwen3Model, Qwen3LLMModel)
 
 
 def all_reduce(hidden_states):
@@ -44,10 +49,13 @@ GROUP = SimpleNamespace(all_reduce=all_reduce)
 
 
 class DeferringLayer(nn.Module):
-    def __init__(self, defer, return_topk=False):
+    def __init__(self, defer, return_topk=False, stage_api=False):
         super().__init__()
         self.return_topk = return_topk
+        self.stage_api = stage_api
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+        self.layer_communicator.input_layernorm = None
+        self.attn_stage = self.layer_communicator.attn
         self.layer_communicator._steps = comm.BoundarySteps(
             attention=comm.StageEntry(
                 prepare=partial(
@@ -106,21 +114,27 @@ class DeferringLayer(nn.Module):
         **kwargs,
     ):
         stream = forward_batch.residual_stream
-        assert residual is stream
-        hidden_states, residual = stream.input(hidden_states)
+        if stream is not None:
+            residual = stream
+        if isinstance(residual, ResidualStream):
+            hidden_states, residual = residual.input(hidden_states)
         hidden_states = comm.reduce_output(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:
             # later norms mutate the residual; captured snapshots must stay intact
             residual.add_(hidden_states)
-        stream.write(residual)
         capture = kwargs.get("capture_output")
         if capture is not None:
             capture(residual.clone())
         with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             partial = torch.full_like(hidden_states, 0.5)
-        hidden_states, residual = ffn_exit.finish(partial, stream)
+        if stream is not None:
+            stream.write(residual)
+            residual = stream
+        hidden_states, residual = ffn_exit.finish(partial, residual)
+        if self.stage_api:
+            return (hidden_states, None) if self.return_topk else hidden_states
         if self.return_topk:
             return hidden_states, residual, None
         return hidden_states, residual
@@ -151,7 +165,17 @@ def build_model(model_cls, *, defer, capture):
         model.layers_to_capture = [0, 1, 2] if capture else []
     model.layers = nn.ModuleList(
         DeferringLayer(
-            defer and i < NUM_LAYERS - 1, return_topk=model_cls is Glm5NextModel
+            defer and i < NUM_LAYERS - 1,
+            return_topk=model_cls is Glm5NextModel,
+            stage_api=model_cls
+            in (
+                BailingMoEModel,
+                BailingMoELinearModel,
+                GptOssModel,
+                Llama4Model,
+                Qwen3Model,
+                Qwen3LLMModel,
+            ),
         )
         for i in range(NUM_LAYERS)
     )
@@ -184,7 +208,7 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
         )
-        for model_cls in MODELS:
+        for model_cls in CAPTURE_MODELS:
             for defer in (False, True):
                 for capture in (False, True):
                     with (

@@ -1,3 +1,5 @@
+from sglang.test.boundary_fixtures import make_test_stages
+
 """A MoE layer on the TP group under DSA (and MLA) prefill CP, rank by rank.
 
 Two CP ranks build the layer's communicator for real and run prepare_mlp and
@@ -60,13 +62,6 @@ class Flags:
 
 def group(name, ranks):
     return SimpleNamespace(name=name, ranks=list(ranks))
-
-
-def prepare_mlp(communicator, hidden, residual, forward_batch):
-    forward_batch.residual_stream = ResidualStream(residual)
-    return communicator.prepare_mlp(
-        hidden, forward_batch.residual_stream, forward_batch
-    )
 
 
 class TestAttentionCpBoundary(CustomTestCase):
@@ -166,27 +161,34 @@ class TestAttentionCpBoundary(CustomTestCase):
                 )
             yield SimpleNamespace(parallel=parallel, flags=flags)
 
-    def build(self, allow_reduce_scatter):
+    def build(self, use_reduce_scatter):
         # A MoE layer after a dense one; dense layers run on every rank here.
-        return comm.LayerCommunicator(
-            layer_facts=SimpleNamespace(
-                is_first_layer=False,
-                is_last_layer=False,
-                is_layer_sparse=True,
-                is_previous_layer_sparse=False,
-                is_next_layer_sparse=False,
+
+        with patch_communicator(
+            "get_exec",
+            lambda: SimpleNamespace(
+                comm=SimpleNamespace(
+                    boundary_reduction="rs+rsv" if use_reduce_scatter else "ar"
+                ),
+                overlap=SimpleNamespace(enable_two_batch_overlap=False),
             ),
-            input_layernorm=layernorm,
-            post_attention_layernorm=layernorm,
-            allow_reduce_scatter=allow_reduce_scatter,
-        )
+        ):
+            return make_test_stages(
+                first=False,
+                last=False,
+                sparse=True,
+                previous_sparse=False,
+                next_sparse=False,
+                attention_norm=layernorm,
+                ffn_norm=layernorm,
+            )
 
     def cp_extend(self):
         return SimpleNamespace(
             forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True)
         )
 
-    def run_ranks(self, allow_reduce_scatter):
+    def run_ranks(self, use_reduce_scatter):
         """Gather on each rank, run an FFN that leaves a partial sum or not,
         finish the exit and return what each rank got back and published."""
         handed = {}
@@ -208,20 +210,16 @@ class TestAttentionCpBoundary(CustomTestCase):
             with self.as_rank(
                 cp, dict(gather=record_gather(cp), reduce_scatter=unused)
             ):
-                prepare_mlp(
-                    self.build(allow_reduce_scatter),
-                    self.values[cp],
-                    self.residuals[cp],
-                    self.cp_extend(),
+                self.build(use_reduce_scatter).ffn._prepare_input(
+                    self.values[cp], self.residuals[cp], self.cp_extend()
                 )
         gathered, residuals = {}, {}
         for cp in range(CP_SIZE):
             with self.as_rank(cp, dict(gather=fill_gather, reduce_scatter=unused)):
-                gathered[cp], residuals[cp] = prepare_mlp(
-                    self.build(allow_reduce_scatter),
-                    self.values[cp],
-                    self.residuals[cp],
-                    self.cp_extend(),
+                gathered[cp], residuals[cp] = self.build(
+                    use_reduce_scatter
+                ).ffn._prepare_input(
+                    self.values[cp], self.residuals[cp], self.cp_extend()
                 )
         expected_rows = torch.cat(
             [self.values[cp] + self.residuals[cp] for cp in range(CP_SIZE)]
@@ -258,17 +256,19 @@ class TestAttentionCpBoundary(CustomTestCase):
                 with self.as_rank(
                     cp, dict(gather=fill_gather, reduce_scatter=reduce_scatter)
                 ) as rank:
-                    communicator = self.build(allow_reduce_scatter)
-                    batch = self.cp_extend()
-                    batch.residual_stream = ResidualStream(residuals[cp].residual)
-                    with communicator.ffn_exit(batch) as exit_:
+                    communicator = self.build(use_reduce_scatter)
+                    with communicator.ffn.plan.output.ffn_exit(
+                        self.cp_extend()
+                    ) as exit_:
                         published[cp] = rank.flags.mlp_reduce_scatter
                         output = ffn_output(cp, leaves=published[cp])
-                    back[cp], _ = exit_.finish(output, batch.residual_stream)
+                    back[cp], _ = exit_.finish(
+                        output, ResidualStream(residuals[cp].residual)
+                    )
         return published, back, reduced
 
     def test_the_reduce_scatter_completes_the_sum_the_moe_leaves(self):
-        published, back, reduced = self.run_ranks(allow_reduce_scatter=True)
+        published, back, reduced = self.run_ranks(use_reduce_scatter=True)
         self.assertEqual(published, {0: True, 1: True}, "the MoE leaves its sum")
         self.assertEqual(sorted(reduced), [0, 1], "every rank joins the reduce-scatter")
         for cp in range(CP_SIZE):
@@ -277,7 +277,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             )
 
     def test_a_complete_output_is_only_taken_back(self):
-        published, back, reduced = self.run_ranks(allow_reduce_scatter=False)
+        published, back, reduced = self.run_ranks(use_reduce_scatter=False)
         self.assertEqual(published, {0: False, 1: False}, "the MoE sums itself")
         self.assertEqual(reduced, {}, "nothing is summed again")
         for cp in range(CP_SIZE):
@@ -294,7 +294,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             0, dict(gather=unused, reduce_scatter=unused), moe_group=group("moe", [0])
         ):
             with self.assertRaises(NotImplementedError):
-                self.build(allow_reduce_scatter=True)
+                self.build(use_reduce_scatter=True)
 
 
 if __name__ == "__main__":

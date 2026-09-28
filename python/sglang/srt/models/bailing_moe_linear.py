@@ -16,8 +16,9 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerFacts,
+    declare_attn,
+    declare_ffn,
+    make_stages,
 )
 from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import (
@@ -814,26 +815,28 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.layer_facts = LayerFacts.init_new(
-            layer_id=layer_id,
-            # A NextN draft is a one-layer model.
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=is_moe_layer,
-            is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_layer_moe_layer,
-        )
-
         qkv_latent_func = (
             self.attention.prepare_qkv_latent
             if config.attention_type == 1 and self.use_mla
             else None
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_facts=self.layer_facts,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=False,
-            qkv_latent_func=qkv_latent_func,
+        self.attn_stage, self.ffn_stage = make_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": qkv_latent_func},
+            ),
+            (
+                declare_ffn(
+                    sparse=is_moe_layer,
+                    next_sparse=is_next_layer_moe_layer,
+                ),
+                self.post_attention_layernorm,
+            ),
+            previous=declare_ffn(sparse=is_previous_moe_layer, next_sparse=is_moe_layer)
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _is_layer_sparse(
@@ -848,13 +851,10 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+    ) -> torch.Tensor:
+        hidden_states = self.attn_stage.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 1 shape= {hidden_states.shape}, {residual.shape}"
         # )
@@ -875,16 +875,15 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 2 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_stage.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_stage.prepare(hidden_states, forward_batch)
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+        with self.ffn_stage.exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
-        return hidden_states, residual
+        hidden_states = ffn_exit.finish(hidden_states)
+        return hidden_states
 
     @staticmethod
     def shared_moe_coefficient_loader(
@@ -981,12 +980,12 @@ class BailingMoELinearModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = inputs_embeds
-            residual = residual_batch.start(forward_batch)
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = self.layers[
-                self.start_layer
-            ].layer_communicator.from_pp(pp_proxy_tensors, forward_batch)
+            hidden_states = self.layers[self.start_layer].attn_stage.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
@@ -999,30 +998,20 @@ class BailingMoELinearModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     hidden_states=hidden_states,
                     positions=positions,
                     forward_batch=forward_batch,
-                    residual=residual,
                     zero_allocator=zero_allocator,
                 )
-        last_layer = self.layers[self.end_layer - 1]
-        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
-            hidden_states,
-            residual,
-            forward_batch,
-            preserve_declared=not self.pp_group.is_last_rank,
-        )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.finish(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.norm(
+                    hidden_states, forward_batch, self.norm
+                )
             return hidden_states
 
 

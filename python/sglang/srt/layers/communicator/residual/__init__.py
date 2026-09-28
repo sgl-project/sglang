@@ -38,7 +38,7 @@ class StageUpdate(Protocol):
     def update(self, hidden_states, residual) -> torch.Tensor:
         """The residual with the output written into it."""
 
-    def residual_to_attn_tp_shard(self, residual, context) -> torch.Tensor:
+    def residual_to_attn_tp_shard(self, residual) -> torch.Tensor:
         """This attention-TP rank's slice of the residual, with whatever the
         update reads along with it."""
 

@@ -106,6 +106,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "boundary_reduction",
+                    "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
                     "disable_aiter_allreduce_fusion_in_prefill",
                     "disable_aiter_allreduce_fusion_in_decode",
@@ -119,6 +121,119 @@ class TestModelOverridableWhitelist(CustomTestCase):
                 }
             ),
         )
+
+
+class TestBoundaryReductionDefaults(CustomTestCase):
+    def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_spec,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        cases = [
+            (SimpleNamespace(architectures=[architecture]), default)
+            for architecture, default in (
+                ("Qwen3ForCausalLM", "ar"),
+                ("Qwen3Model", "ar"),
+                ("MossVLForConditionalGeneration", "ar"),
+                ("BailingMoELinearForCausalLM", "rsv"),
+                ("BailingMoeV2_5ForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLMNextN", "rsv"),
+                ("Step3VLForConditionalGeneration", "rsv"),
+                ("MiMoV2ForCausalLM", "rs+rsv"),
+                ("Qwen3MoeForCausalLM", "rs+rsv"),
+                ("OtherModel", "rs+rsv"),
+            )
+        ]
+        for key in ("text_config", "llm_config"):
+            for backbone, expected in (("qwen3", "ar"), ("qwen3_moe", "rs+rsv")):
+                cases.append(
+                    (
+                        SimpleNamespace(**{key: SimpleNamespace(model_type=backbone)}),
+                        expected,
+                    )
+                )
+        cases.append(
+            (
+                SimpleNamespace(
+                    get_text_config=lambda: SimpleNamespace(model_type="qwen3")
+                ),
+                "ar",
+            )
+        )
+        for config, default in cases:
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                with self.subTest(config=config, requested=requested):
+                    reset_context()
+                    try:
+                        args = ServerArgs(
+                            model_path="local-model", boundary_reduction=requested
+                        )
+                        args._model_config = SimpleNamespace(hf_config=config)
+                        with patch(
+                            "sglang.srt.arg_groups.pipeline.run_resolution_pipeline",
+                            side_effect=lambda record: run_post_process_pass(
+                                record, resolve_boundary_reduction
+                            ),
+                        ):
+                            publish(args, role="test")
+                        expected = default if requested == "auto" else requested
+                        self.assertEqual(get_exec().comm.boundary_reduction, expected)
+                        self.assertEqual(
+                            get_spec().speculative_boundary_reduction, expected
+                        )
+                        self.assertEqual(args.boundary_reduction, requested)
+                    finally:
+                        reset_context()
+
+    def test_independent_draft_and_mtp_resolution(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import (
+            resolving_view,
+            run_post_process_pass,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for same_model in (False, True):
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                args = ServerArgs(
+                    model_path="target",
+                    boundary_reduction=requested,
+                    speculative_algorithm="EAGLE",
+                    speculative_draft_model_path="target" if same_model else "draft",
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+                )
+                with patch(
+                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    return_value=SimpleNamespace(model_type="qwen3"),
+                ) as load:
+                    run_post_process_pass(args, resolve_boundary_reduction)
+                resolved = resolving_view(args)
+                self.assertEqual(
+                    resolved.boundary_reduction,
+                    "rs+rsv" if requested == "auto" else requested,
+                )
+                self.assertEqual(
+                    resolved.speculative_boundary_reduction,
+                    ("rs+rsv" if same_model else "ar")
+                    if requested == "auto"
+                    else requested,
+                )
+                self.assertEqual(
+                    load.call_count, int(requested == "auto" and not same_model)
+                )
 
 
 class TestDSparkCheckpointConfig(CustomTestCase):

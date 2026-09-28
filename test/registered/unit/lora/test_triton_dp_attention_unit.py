@@ -1,3 +1,6 @@
+from sglang.srt.layers.communicator import StageKind
+from sglang.test.boundary_fixtures import stub_plan, stub_stage
+
 """CPU-only metadata tests for explicit DP-attention LoRA routing."""
 
 import sys
@@ -12,12 +15,11 @@ import torch
 from sglang.srt.layers.communicator import (
     ADD,
     NORM_QUANT_READ,
-    LayerCommunicator,
     Layout,
     TokenAxis,
 )
+from sglang.srt.layers.communicator.boundary import StageEntry
 from sglang.srt.layers.communicator.ops import _consumer_step, _read_input
-from sglang.srt.layers.communicator.residual import batch as residual_batch
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
@@ -229,13 +231,11 @@ def test_communicator_publishes_layout_at_each_transition(
     if not publish_lora_layout:
         # Without LoRA under DP attention, the communicator leaves the flag alone.
         expected_mlp = expected_attn = initial
-    communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator = stub_plan()
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_facts = SimpleNamespace(is_first_layer=False)
-    communicator._context = SimpleNamespace()
+    communicator.is_first_layer = False
     communicator._sp_steps = None
-    communicator.post_attention_layernorm = None
-    communicator.input_layernorm = lambda x: x
+    communicator.norm = lambda x: x
     communicator.qkv_latent_func = None
     gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
     # The rows of the steps the batch runs decide, not the ordinary steps'.
@@ -243,8 +243,8 @@ def test_communicator_publishes_layout_at_each_transition(
         ffn=SimpleNamespace(input_rows=local if gathered_over_dp else gathered)
     )
     selected = SimpleNamespace(
-        attention=SimpleNamespace(
-            input_sum=None,
+        attention=StageEntry(
+            input_rows=local,
             prepare=partial(
                 _consumer_step,
                 step=partial(
@@ -260,8 +260,7 @@ def test_communicator_publishes_layout_at_each_transition(
             input_move=lambda hidden_states, **kwargs: hidden_states,
             handoff=lambda hidden_states, *args: hidden_states,
         ),
-        ffn=SimpleNamespace(
-            input_sum=None,
+        ffn=StageEntry(
             prepare=lambda hidden_states, residual, *args, **kwargs: (
                 hidden_states,
                 residual,
@@ -275,13 +274,11 @@ def test_communicator_publishes_layout_at_each_transition(
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
-            batch = SimpleNamespace(residual_stream=None)
-            stream = residual_batch.start(batch)
-            stream.write(hidden)
-            communicator.prepare_mlp(hidden, stream, batch)
+            stub_stage(communicator, StageKind.FFN)._prepare_input(hidden, hidden, None)
             assert get_forward().lora_batch_layout is expected_mlp
-            stream = residual_batch.start(batch)
-            communicator.prepare_attn(hidden, stream, batch)
+            stub_stage(communicator, StageKind.ATTENTION)._prepare_input(
+                hidden, None, None
+            )
             assert get_forward().lora_batch_layout is expected_attn
 
 

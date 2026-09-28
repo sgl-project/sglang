@@ -14,7 +14,6 @@
 """Token axes, layouts and process groups of what a layer hands across its
 boundaries, and the configuration and batch facts they depend on."""
 
-from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Dict, FrozenSet, List, Mapping, Optional
 
@@ -92,38 +91,6 @@ def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
         # The FFN runs on every DP rank's tokens, so every rank decides alike.
         return (getattr(forward_batch, "global_dp_buffer_len", None) or 0) > 0
     return _batch_size(forward_batch) > 0
-
-
-@dataclass
-class CommunicateContext:
-    attn_tp_rank: int
-    attn_tp_size: int
-    attn_dp_size: int
-    attn_cp_rank: int
-    attn_cp_size: int
-    tp_size: int
-    cache = None
-    tp_rank: int
-    force_layernorm_before_dp_gather: bool = False
-
-    @classmethod
-    def init_new(cls):
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-        attn_dp_size = get_parallel().attn_dp_size
-        attn_cp_size = get_parallel().attn_cp_size
-        attn_cp_rank = get_parallel().attn_cp_rank
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
-        return cls(
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_dp_size=attn_dp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=attn_cp_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
 
 
 def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:

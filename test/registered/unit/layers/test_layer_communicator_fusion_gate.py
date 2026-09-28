@@ -8,17 +8,12 @@ import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
-    LayerCommunicator,
     Layout,
     StageOutput,
     SumGroup,
-    TokenAxis,
 )
-from sglang.srt.layers.communicator import boundary as comm_boundary
 from sglang.srt.layers.communicator import ops as comm_ops
-from sglang.srt.layers.communicator import (
-    sequence_parallel_layer_sides,
-)
+from sglang.srt.layers.communicator.exit import OutputBoundary
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
@@ -26,24 +21,12 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.test.boundary_fixtures import sp_region_steps, stub_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-
-
-def sp_region_steps():
-    """The steps a layer runs while a LayerNorm SP region is active."""
-    return comm_boundary._select_boundary_steps(
-        sequence_parallel_layer_sides(
-            axis_sizes={
-                TokenAxis.ATTN_DP: 1,
-                TokenAxis.ATTN_CP: 1,
-                TokenAxis.ATTN_TP_SCATTER: 2,
-            }
-        )
-    )
 
 
 def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
@@ -83,7 +66,7 @@ def _steps(*, ffn_output=None, returns_over_dp=False, ffn_sum_is_movable=True):
 
 
 def _fake_communicator(ffn_sum_is_movable=True):
-    communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator = stub_plan()
     communicator._speculative_algo = None
     # An FFN gathered over MoE-CP or on each rank's own rows has no movable sum.
     communicator._steps = _steps(ffn_sum_is_movable=ffn_sum_is_movable)
@@ -91,7 +74,6 @@ def _fake_communicator(ffn_sum_is_movable=True):
     communicator._input_scattered_steps = None
     communicator._cp_steps = None
     communicator.is_last_layer = False
-    communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
 
 
@@ -331,9 +313,9 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
-            return LayerCommunicator._ffn_sum_can_move_to_next_layer(
-                _fake_communicator(ffn_sum_is_movable), forward_batch
-            )
+            return OutputBoundary(
+                _fake_communicator(ffn_sum_is_movable)
+            )._ffn_sum_can_move_to_next_layer(forward_batch)
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
         self.assertTrue(self._should_fuse(moe_ep_size=2, moe_tp_size=2))
@@ -487,7 +469,7 @@ class TestDeferFfnReduction(CustomTestCase):
                 return_value=tp_group_object if tp_group else object(),
             ),
         ):
-            return communicator._ffn_sum_moves_to_next_layer(
+            return communicator.output._ffn_sum_moves_to_next_layer(
                 forward_batch, mlp_reduce_scatter=reduce_scatter, dp_step=step
             )
 

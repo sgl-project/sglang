@@ -16,12 +16,6 @@ from sglang.srt.layers.communicator import (
     StageOutput,
     SumGroup,
     TokenAxis,
-)
-from sglang.srt.layers.communicator import boundary as comm_boundary
-from sglang.srt.layers.communicator import (
-    decoder_layer_edges,
-    decoder_layer_sides,
-    input_scattered_layer_sides,
     make_boundary,
     make_output_boundary,
 )
@@ -46,104 +40,6 @@ def sizes(*, dp=1, cp=1, tp=1):
 
 def rows(axis_sizes, *axes):
     return Layout.sharded_over(*axes, axis_sizes=axis_sizes)
-
-
-class TestDecoderLayerEdges(CustomTestCase):
-    """A decoder layer's three boundaries hand the residual on from one to the
-    next: each edge starts on the rows the one before it ends on."""
-
-    def test_each_edge_starts_where_the_one_before_ends(self):
-        for dp, tp, ffn_local, previous_local, last in itertools.product(
-            (1, 2), (1, 2), (False, True), (False, True), (False, True)
-        ):
-            with self.subTest(
-                dp=dp, tp=tp, ffn_local=ffn_local, previous_local=previous_local
-            ):
-                sides = decoder_layer_sides(
-                    axis_sizes=sizes(dp=dp, tp=tp),
-                    ffn_on_local_rows=ffn_local,
-                    previous_on_local_rows=previous_local,
-                    is_last_layer=last,
-                    attention_gathers_local_rows=False,
-                    ffn_group=SumGroup.TP,
-                    leaves_for_next_layer=True,
-                    leaves_for_reduce_scatter=True,
-                    leaves_for_reduce_scatterv=True,
-                )
-                edges = decoder_layer_edges(sides)
-                self.assertEqual(edges.into_attention.residual, sides.input_rows)
-                self.assertEqual(
-                    edges.into_attention.residual_to, edges.into_ffn.residual
-                )
-                self.assertEqual(edges.into_ffn.residual_to, edges.out_of_ffn.residual)
-                self.assertEqual(edges.out_of_ffn.residual_to, sides.output_rows)
-                self.assertEqual(edges.out_of_ffn.need.layout, sides.output_rows)
-                # Nothing owed by construction: a sum left for a batch comes
-                # with the value.
-                self.assertFalse(edges.into_attention.produced.always_leaves)
-
-    def test_an_input_owed_by_construction_is_completed_onto_the_slice(self):
-        axis_sizes = sizes(tp=2)
-        sides = input_scattered_layer_sides(
-            axis_sizes=axis_sizes, ffn_group=SumGroup.TP, hands_on_partial=True
-        )
-        edge = decoder_layer_edges(sides).into_attention
-        self.assertIs(edge.produced.group, SumGroup.TP)
-        self.assertTrue(edge.produced.always_leaves)
-        self.assertEqual(edge.residual_to, rows(axis_sizes, TokenAxis.ATTN_TP_SCATTER))
-        step = make_boundary(edge).prepare.keywords["step"]
-        self.assertIs(step.keywords["layer_input"], comm.tp_reduce_scatter)
-
-    def test_each_entry_keeps_the_move_after_its_read(self):
-        sides = decoder_layer_sides(
-            axis_sizes=sizes(dp=2, tp=2),
-            ffn_on_local_rows=False,
-            previous_on_local_rows=False,
-            is_last_layer=False,
-            attention_gathers_local_rows=False,
-            ffn_group=SumGroup.TP,
-            leaves_for_next_layer=True,
-            leaves_for_reduce_scatter=True,
-            leaves_for_reduce_scatterv=True,
-        )
-        edges = decoder_layer_edges(sides)
-        moves = {edges.into_attention: MagicMock(), edges.into_ffn: MagicMock()}
-        real = comm_boundary.make_boundary
-
-        def with_move(edge, **kwargs):
-            return msgspec.structs.replace(real(edge, **kwargs), input_move=moves[edge])
-
-        with patch.object(comm_boundary, "make_boundary", with_move):
-            steps = comm_boundary._select_boundary_steps(sides)
-        self.assertIs(steps.attention.input_move, moves[edges.into_attention])
-        self.assertIs(steps.ffn.input_move, moves[edges.into_ffn])
-
-
-class TestAMoeOnEachCpShard(CustomTestCase):
-    """A MoE whose data-parallel groups are the CP ranks computes each CP shard
-    on its own ranks: its input stays sharded over CP, and the attention output
-    reaches it without a gather."""
-
-    def test_the_ffn_rows_stay_sharded_over_cp(self):
-        axis_sizes = sizes(cp=2, tp=2)
-        sides = decoder_layer_sides(
-            axis_sizes=axis_sizes,
-            ffn_on_local_rows=False,
-            previous_on_local_rows=False,
-            is_last_layer=False,
-            attention_gathers_local_rows=False,
-            ffn_group=SumGroup.MOE_OUTPUT,
-            leaves_for_next_layer=False,
-            leaves_for_reduce_scatter=False,
-            leaves_for_reduce_scatterv=False,
-            ffn_shards_over_cp=True,
-        )
-        cp_rows = rows(axis_sizes, TokenAxis.ATTN_CP)
-        self.assertEqual(sides.ffn.input.layout, cp_rows)
-        self.assertEqual(sides.ffn.output.layout, cp_rows)
-        self.assertIs(sides.ffn.output.group, SumGroup.MOE_OUTPUT)
-        edges = decoder_layer_edges(sides)
-        self.assertEqual(edges.into_ffn.need.layout, edges.into_ffn.produced.layout)
 
 
 class TestTheConsumerHalfReadsOnlyItsOwnSide(CustomTestCase):
@@ -276,7 +172,6 @@ class TestNonAlternatingEdges(CustomTestCase):
                 torch.full((3, 4), 5.0),
                 None,
                 lambda hidden, residual: (hidden + residual, hidden + residual),
-                None,
             )
         all_reduce.assert_called_once()
         torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
@@ -292,7 +187,7 @@ class _WrittenIn:
     def update(self, hidden_states, residual):
         return 2 * hidden_states + residual
 
-    def residual_to_attn_tp_shard(self, residual, context):
+    def residual_to_attn_tp_shard(self, residual):
         return residual
 
     def residual_from_attn_tp_shards(self, residual):
@@ -360,7 +255,6 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
                     torch.full((2, 4), 3.0),
                     None,
                     norm,
-                    None,
                     update=update,
                 )
                 torch.testing.assert_close(hidden, torch.full((2, 4), expected))
@@ -421,12 +315,11 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
             residual,
             None,
             norm,
-            None,
         )
         group.all_reduce.assert_called_once()
         torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
         group.all_reduce.reset_mock()
-        hidden, _ = step(torch.full((3, 4), 2.0), residual, None, norm, None)
+        hidden, _ = step(torch.full((3, 4), 2.0), residual, None, norm)
         group.all_reduce.assert_not_called()
         torch.testing.assert_close(hidden, torch.full((3, 4), 7.0))
 
@@ -526,6 +419,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         self.assertIs(step.func, comm_ops._mlp_input_dp_partial)
         hidden, residual = torch.ones(2, 4), torch.full((2, 4), 3.0)
         with (
+            get_parallel().override(attn_tp_rank=0),
             patch.object(
                 comm_ops,
                 "_reduce_and_redistribute_output_to_dp",
@@ -533,9 +427,7 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
             ),
             patch.object(comm_ops, "dp_scatter", lambda *args: None),
         ):
-            out, out_residual = step(
-                hidden, residual, None, MagicMock(), SimpleNamespace(attn_tp_rank=0)
-            )
+            out, out_residual = step(hidden, residual, None, MagicMock())
         self.assertEqual(read.reads, 1)
         torch.testing.assert_close(out, torch.full((2, 4), 108.0))
         self.assertIs(out_residual, residual)
@@ -549,15 +441,15 @@ class TestTheConsumerRunsItsDeclaredRead(CustomTestCase):
         step, _ = self._ffn_input(read, residual_joins_sum=True)
         self.assertIs(step.func, comm_ops._mlp_input_residual_into_sum)
         hidden, residual = torch.ones(4, 4), torch.full((2, 4), 3.0)
-        with patch.object(
-            comm_ops, "tensor_model_parallel_all_reduce", lambda h: h * 2
+        with (
+            get_parallel().override(tp_size=2, tp_rank=0),
+            patch.object(comm_ops, "tensor_model_parallel_all_reduce", lambda h: h * 2),
         ):
             out, out_residual = step(
                 hidden,
                 residual,
                 None,
                 MagicMock(),
-                SimpleNamespace(tp_size=2, tp_rank=0),
             )
         self.assertEqual(read.reads, 1)
         expected = torch.tensor([8.0, 8.0, 2.0, 2.0])[:, None].expand(4, 4)

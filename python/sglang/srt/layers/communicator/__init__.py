@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Communication between a decoder layer's stages."""
+"""Stage boundaries: layout transport, residual updates, reads, and fusion."""
 
 from sglang.srt.layers.communicator.adapters.attention import (
     AttentionInputs,
@@ -19,7 +19,6 @@ from sglang.srt.layers.communicator.adapters.attention import (
 )
 from sglang.srt.layers.communicator.boundary import (
     BoundarySteps,
-    DecoderLayerSides,
     EdgeDecl,
     FusedMlpInput,
     LayerStage,
@@ -28,25 +27,25 @@ from sglang.srt.layers.communicator.boundary import (
     StageInput,
     StageKind,
     StageOutput,
-    decoder_layer_edges,
-    decoder_layer_sides,
-    input_scattered_layer_sides,
     make_boundary,
     make_output_boundary,
-    sequence_parallel_layer_sides,
     stage_edges,
     tbo_split_moves,
 )
-from sglang.srt.layers.communicator.layer import (
-    FfnCompletion,
-    FfnExit,
-    LayerCommunicator,
-    LayerFacts,
-    MHCLayerCommunicator,
-    MixerExit,
+from sglang.srt.layers.communicator.construction import (
+    BatchVariant,
+    StageEdges,
+    make_stage,
+)
+from sglang.srt.layers.communicator.exit import FfnCompletion, FfnExit, MixerExit
+from sglang.srt.layers.communicator.factories import (
+    declare_attn,
+    declare_ffn,
+    make_attn_stage,
+    make_ffn_stage,
+    make_stages,
 )
 from sglang.srt.layers.communicator.layout import (
-    CommunicateContext,
     Layout,
     SumGroup,
     TokenAxis,
@@ -79,25 +78,28 @@ from sglang.srt.layers.communicator.residual.mhc import (
 )
 
 __all__ = [
+    "LayerCommunicator",
+    "MHCLayerCommunicator",
+    "LayerFacts",
+    "declare_attn",
+    "declare_ffn",
+    "make_attn_stage",
+    "make_ffn_stage",
+    "make_stages",
     "ADD",
     "AttentionInputs",
     "BoundarySteps",
-    "CommunicateContext",
     "CommunicateSimpleFn",
     "CommunicateSummableTensorPairFn",
-    "DecoderLayerSides",
     "EdgeDecl",
     "FUSE_ALLREDUCE_MAX_BATCH_SIZE",
     "FfnCompletion",
     "FfnExit",
     "FusedMlpInput",
     "HandoffOutput",
-    "LayerCommunicator",
     "LayerResidual",
-    "LayerFacts",
     "LayerStage",
     "Layout",
-    "MHCLayerCommunicator",
     "MHCState",
     "MixerExit",
     "NORM_QUANT_READ",
@@ -111,20 +113,22 @@ __all__ = [
     "SumGroup",
     "TokenAxis",
     "UnreducedOutput",
-    "decoder_layer_edges",
-    "decoder_layer_sides",
     "enable_moe_dense_fully_dp",
     "get_attn_tp_context",
-    "input_scattered_layer_sides",
     "make_boundary",
     "make_output_boundary",
     "moe_cp_gathers_sparse_moe_input",
     "move_rows",
     "reduce_output",
-    "sequence_parallel_layer_sides",
     "sparse_moe_gathers_over_moe_cp",
     "stage_edges",
     "tbo_split_moves",
     "token_axis_sizes",
     "tp_reduce_scatter",
 ]
+
+from sglang.srt.layers.communicator.layer import (
+    LayerCommunicator,
+    LayerFacts,
+    MHCLayerCommunicator,
+)

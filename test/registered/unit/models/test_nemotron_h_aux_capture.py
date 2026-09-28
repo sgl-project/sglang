@@ -55,7 +55,7 @@ def _build(pattern, tp, capture):
         layer = cls.__new__(cls)
         nn.Module.__init__(layer)
         layer.norm = _Norm()
-        layer._init_layer_communicator(config, i)
+        layer._init_stage_boundary(config, i)
         layer.mixer = _Mixer(0.5 if kind in "M*" else 0.25, tp)
         if kind == "M":
             layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)

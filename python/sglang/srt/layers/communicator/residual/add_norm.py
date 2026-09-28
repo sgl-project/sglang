@@ -273,8 +273,8 @@ class Add:
         hidden_states += residual
         return hidden_states
 
-    def residual_to_attn_tp_shard(self, residual, context):
-        return _redistribute_to_attn_tp_shards(residual, context)
+    def residual_to_attn_tp_shard(self, residual):
+        return _redistribute_to_attn_tp_shards(residual)
 
     def residual_from_attn_tp_shards(self, residual):
         return _redistribute_from_attn_tp_shards(residual)

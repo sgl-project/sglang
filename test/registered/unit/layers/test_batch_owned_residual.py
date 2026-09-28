@@ -21,7 +21,7 @@ from sglang.srt.layers.communicator import (
     StageOutput,
     make_boundary,
 )
-from sglang.srt.layers.communicator.layer import StageCommunicator
+from sglang.srt.layers.communicator.legacy_stage import StageCommunicator
 from sglang.srt.layers.communicator.output import UnreducedOutput
 from sglang.srt.layers.communicator.residual import batch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -73,7 +73,7 @@ class TestBatchOwnedResidual(CustomTestCase):
 
     def test_pp_receive_attaches_and_export_releases_the_same_stream(self):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._batch_steps = lambda _: SimpleNamespace(
+        communicator._batch_steps = lambda fb: SimpleNamespace(
             attention=SimpleNamespace(input_sum=None), ffn=None
         )
         fb = SimpleNamespace(residual_stream=None)
@@ -174,15 +174,17 @@ class TestBatchOwnedResidual(CustomTestCase):
         class Layer:
             layer_communicator = LayerCommunicator.__new__(LayerCommunicator)
 
-            def __call__(self, positions, hidden, forward_batch, residual):
+            def __call__(self, positions, hidden, forward_batch, *legacy_residual):
                 stream = batch.current(forward_batch)
-                self_outer.assertIs(residual, stream)
+                if legacy_residual:
+                    self_outer.assertIs(legacy_residual[0], stream)
                 owner_ids.append(id(stream))
                 hidden, old = stream.finish(hidden)
                 stream.write(hidden if old is None else hidden + old)
-                return stream.leave(
+                result = stream.leave(
                     UnreducedOutput(torch.ones_like(hidden), group=group), ADD
-                ), stream
+                )
+                return (result, stream) if legacy_residual else result
 
         self_outer = self
         fb = SimpleNamespace(
@@ -214,6 +216,43 @@ class TestBatchOwnedResidual(CustomTestCase):
         self.assertEqual(group.all_reduce.call_count, 4)
         torch.testing.assert_close(result, torch.full((2, 4), 9.0))
 
+    def test_mtp_returns_written_normalized_output_and_releases_batch(self):
+        from sglang.srt.models.nemotron_h_mtp import NemotronHMultiTokenPredictor
+
+        def terminal_layer(*, inputs_embeds, hidden_states, forward_batch):
+            stream = batch.current(forward_batch)
+            stream.write(hidden_states)
+            hidden_states = stream.leave(torch.ones_like(hidden_states), ADD)
+            hidden_states = batch.fold(hidden_states, forward_batch)
+            normalized = hidden_states * 3
+            return batch.written(normalized, forward_batch)
+
+        predictor = SimpleNamespace(pattern_len=1, layers={"0": terminal_layer})
+        fb = SimpleNamespace(
+            residual_stream=None,
+            spec_info=SimpleNamespace(hidden_states=torch.ones(2, 4)),
+        )
+        result = NemotronHMultiTokenPredictor.forward(
+            predictor, None, None, fb, inputs_embeds=torch.zeros(2, 4)
+        )
+        torch.testing.assert_close(result, torch.full((2, 4), 6.0))
+        self.assertIsNone(fb.residual_stream)
+
+    def test_take_output_rejects_pending_or_mismatched_outputs(self):
+        fb = SimpleNamespace(residual_stream=None)
+        stream = batch.start(fb)
+        value = torch.ones(2, 4)
+        stream.write(value)
+        pending = stream.leave(value * 2, ADD)
+        with self.assertRaises(RuntimeError):
+            batch.take_output(pending, fb)
+        self.assertIs(batch.current(fb), stream)
+        stream.write(value)
+        with self.assertRaises(RuntimeError):
+            batch.take_output(value.clone(), fb)
+        self.assertIs(batch.take_output(value, fb), value)
+        self.assertIsNone(fb.residual_stream)
+
     def test_interleaved_stages_share_only_their_own_batch_stream(self):
         class Read:
             norms_plainly = False
@@ -236,23 +275,23 @@ class TestBatchOwnedResidual(CustomTestCase):
             StageEntry(boundary.prepare, rows), None, StageOutput(rows), None, False
         )
         stage = StageCommunicator(
-            SimpleNamespace(input_layernorm=None, _context=None),
+            SimpleNamespace(input_layernorm=None),
             "attention",
             "input_layernorm",
         )
         a, b = [SimpleNamespace(residual_stream=None) for _ in range(2)]
         sa, sb = batch.start(a), batch.start(b)
-        first, first_alias = stage.prepare(torch.ones(2, 4), sa, a, steps)
-        second, second_alias = stage.prepare(torch.full((2, 4), 10.0), sb, b, steps)
+        first, first_alias = stage._prepare(torch.ones(2, 4), sa, a, steps)
+        second, second_alias = stage._prepare(torch.full((2, 4), 10.0), sb, b, steps)
         self.assertIs(first_alias, batch.current(a))
         self.assertIs(second_alias, batch.current(b))
         first = sa.leave(first * 3, ADD)
         second = sb.leave(second * 5, ADD)
         torch.testing.assert_close(
-            stage.prepare(first, sa, a, steps)[0], torch.full((2, 4), 14.0)
+            stage._prepare(first, sa, a, steps)[0], torch.full((2, 4), 14.0)
         )
         torch.testing.assert_close(
-            stage.prepare(second, sb, b, steps)[0], torch.full((2, 4), 220.0)
+            stage._prepare(second, sb, b, steps)[0], torch.full((2, 4), 220.0)
         )
         self.assertIsNot(batch.current(a), batch.current(b))
         batch.start(a)
