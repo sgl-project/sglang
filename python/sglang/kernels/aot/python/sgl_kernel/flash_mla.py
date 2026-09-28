@@ -354,7 +354,7 @@ def flash_mla_packed_sparse_fwd(
 
     q is [tokens, 16, 512], kv is [history, 1, 512], indices is int32
     [tokens, 128 or 640], topk_length is int32 [tokens], and sink is float32
-    [16]. Only a 148-SM B200 is qualified. Callers own size-based dispatch.
+    [16]. 148-SM B200 and B300 GPUs are supported. Callers own size-based dispatch.
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error

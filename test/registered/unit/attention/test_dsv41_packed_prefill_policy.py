@@ -52,7 +52,15 @@ def test_configurable_threshold(policy):
 
 
 @pytest.mark.parametrize(
-    "shape", [(10, 0, 148), (10, 3, 148), (9, 0, 132), (10, 0, 132)]
+    "shape",
+    [
+        (10, 0, 148),
+        (10, 3, 148),
+        (9, 0, 132),
+        (10, 0, 132),
+        (10, 3, 160),
+        (12, 0, 148),
+    ],
 )
 def test_device_qualification(monkeypatch, shape):
     from types import SimpleNamespace
@@ -64,7 +72,7 @@ def test_device_qualification(monkeypatch, shape):
         lambda _: SimpleNamespace(major=major, minor=minor, multi_processor_count=sms),
     )
     policy = PackedPrefillPolicy("cuda:0")
-    assert policy.supported_gpu == (shape == (10, 0, 148))
+    assert policy.supported_gpu == (shape in ((10, 0, 148), (10, 3, 148)))
 
 
 def test_unsupported_inputs(policy):

@@ -1,4 +1,4 @@
-"""Metadata-only eligibility checks for B200 BF16 query packing."""
+"""Metadata-only eligibility checks for B200/B300 BF16 query packing."""
 
 import torch
 
@@ -15,7 +15,7 @@ class PackedPrefillPolicy:
             properties = torch.cuda.get_device_properties(self.device)
             self.supported_gpu = (
                 properties.major == 10
-                and properties.minor == 0
+                and properties.minor in (0, 3)
                 and properties.multi_processor_count == 148
             )
         self.mixed_min_rows = mixed_min_rows

@@ -2,8 +2,8 @@
 # FlashMLA includes the 16-head BF16 packed sparse prefill API.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/7d91eac5f7ca2a359accb43a3dba74b954e9b8a3.tar.gz
-    URL_HASH SHA256=24dc3d674bc8550de9b04afa160ca057218dc4e14c45a5cd7c5c2c0c0bbb1b30
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/c15b6ec867c2cbd69c558b11941ee34e0abe8a66.tar.gz
+    URL_HASH SHA256=2bc38de3b7419125ffce3089683c27a0a51cb103ae6623183ed9dc6b7bc6910f
 )
 FetchContent_Populate(repo-flashmla)
 

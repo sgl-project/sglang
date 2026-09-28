@@ -16,18 +16,18 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 
 @pytest.fixture(autouse=True)
-def require_packed_b200():
+def require_packed_blackwell():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     properties = torch.cuda.get_device_properties(0)
-    if (properties.major, properties.minor, properties.multi_processor_count) != (
-        10,
-        0,
-        148,
-    ):
-        pytest.skip("Packed prefill is qualified on 148-SM B200 only")
+    if (
+        properties.major,
+        properties.minor,
+        properties.multi_processor_count,
+    ) not in ((10, 0, 148), (10, 3, 148)):
+        pytest.skip("Packed prefill is qualified on 148-SM B200 and B300 GPUs")
     if not hasattr(torch.ops.sgl_kernel, "packed_sparse_prefill_output"):
-        pytest.fail("B200 test requires the FlashMLA packed prefill API")
+        pytest.fail("Blackwell test requires the FlashMLA packed prefill API")
 
 
 def inputs():
@@ -42,7 +42,8 @@ def inputs():
 
 
 @pytest.mark.parametrize(
-    "case", ["dtype", "stride", "empty_kv", "indices", "lengths", "sink", "device"]
+    "case",
+    ["dtype", "stride", "empty_kv", "indices", "lengths", "sink", "device"],
 )
 def test_invalid_inputs(case):
     args = inputs()
