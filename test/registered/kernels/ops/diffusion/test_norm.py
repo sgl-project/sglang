@@ -33,8 +33,14 @@ from einops import rearrange
 
 from sglang.kernels.ops.diffusion import (
     apply_group_norm_silu,
+    bias_residual_add,
+    can_use_bias_residual_add,
+    can_use_channel_rmsnorm_finish_silu,
+    can_use_channel_rmsnorm_silu_nhwc,
     can_use_group_norm_silu_4d,
     can_use_wan_rmsnorm_silu,
+    channel_rmsnorm_finish_silu,
+    channel_rmsnorm_silu_nhwc,
     group_norm_silu_4d,
     rmsnorm_scale,
     rmsnorm_tanh_residual,
@@ -43,7 +49,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -473,6 +479,201 @@ def test_validate_scale_shift_rejects_non_divisible_frames():
         validate_scale_shift(
             torch.empty((1, 4, 1, 256), device=DEVICE, dtype=torch.float16), 1, 10, 256
         )
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image 2.1 VAE -- bit-exact channel RMSNorm finish + SiLU (aten fp32 norm kept)
+# -------------------------------------------------------------------------
+
+
+def finish_silu_reference(x, gamma, scale):
+    normalized = F.normalize(x.float(), dim=1).to(x.dtype)
+    return F.silu(normalized * scale * gamma + 0.0)
+
+
+def finish_silu_fused(x, gamma, scale):
+    norm = x.float().norm(p=2, dim=1, keepdim=True)
+    return channel_rmsnorm_finish_silu(x, norm, gamma, scale)
+
+
+def assert_bits_equal(actual, expected):
+    assert actual.dtype is expected.dtype and actual.shape == expected.shape
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 1152, 1, 64, 64), (1, 144, 1, 256, 256), (2, 288, 32, 32), (1, 4, 1, 8, 8)],
+)
+@pytest.mark.parametrize("amplitude", [1e-3, 1.0, 100.0])
+@torch.no_grad()
+def test_channel_rmsnorm_finish_silu_matches_eager(shape, amplitude):
+    torch.manual_seed(0)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude
+    gamma_shape = (shape[1],) + (1,) * (len(shape) - 2)
+    gamma = (1 + 0.1 * torch.randn(gamma_shape, device="cuda")).to(torch.bfloat16)
+    scale = shape[1] ** 0.5
+    assert can_use_channel_rmsnorm_finish_silu(x, gamma)
+    assert_bits_equal(
+        finish_silu_fused(x, gamma, scale), finish_silu_reference(x, gamma, scale)
+    )
+
+
+@torch.no_grad()
+def test_channel_rmsnorm_finish_silu_keeps_eager_signs():
+    x = torch.zeros(1, 16, 1, 8, 8, device="cuda", dtype=torch.bfloat16)
+    x[0, :8] = -torch.rand(8, 1, 8, 8, device="cuda").to(torch.bfloat16)
+    gamma = -torch.ones(16, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert_bits_equal(
+        finish_silu_fused(x, gamma, 4.0), finish_silu_reference(x, gamma, 4.0)
+    )
+
+
+@torch.no_grad()
+def test_channel_rmsnorm_finish_silu_predicates():
+    x = torch.randn(1, 16, 1, 8, 8, device="cuda", dtype=torch.bfloat16)
+    gamma = torch.ones(16, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert can_use_channel_rmsnorm_finish_silu(x, gamma)
+    assert not can_use_channel_rmsnorm_finish_silu(x.float(), gamma.float())
+    assert not can_use_channel_rmsnorm_finish_silu(x.transpose(1, 2), gamma)
+    assert not can_use_channel_rmsnorm_finish_silu(x[..., :3], gamma)
+    assert not can_use_channel_rmsnorm_finish_silu(x, gamma.view(16))
+    assert not can_use_channel_rmsnorm_finish_silu(x, gamma.float())
+    assert not can_use_channel_rmsnorm_finish_silu(x.cpu(), gamma.cpu())
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image 2.1 VAE -- channels_last lane-group channel RMSNorm + SiLU (quality-gated)
+# -------------------------------------------------------------------------
+
+
+def nhwc_reference(x, gamma, scale):
+    normalized = F.normalize(x.float(), dim=1).to(x.dtype)
+    return F.silu(normalized * scale * gamma + 0.0)
+
+
+def channels_last(x):
+    fmt = torch.channels_last if x.ndim == 4 else torch.channels_last_3d
+    return x.contiguous(memory_format=fmt)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 1152, 1, 64, 64),  # 8-wide loads, 32 lanes per pixel
+        (1, 144, 1, 128, 128),  # 8-wide loads, 4 lanes per pixel, ragged last load
+        (2, 288, 32, 32),  # 8 lanes per pixel
+        (1, 6, 8, 8),  # 2-wide loads, one lane per pixel
+        (1, 20, 1, 8, 8),  # 4-wide loads
+        (1, 16, 1, 5, 5),  # pixel count not a multiple of the rows per warp
+    ],
+)
+@pytest.mark.parametrize("amplitude", [1e-3, 1.0, 100.0])
+@pytest.mark.parametrize("with_bias", [False, True])
+@torch.no_grad()
+def test_channel_rmsnorm_silu_nhwc_close_and_layout_preserved(
+    shape, amplitude, with_bias
+):
+    torch.manual_seed(0)
+    x = channels_last(
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude
+    )
+    gamma_shape = (shape[1],) + (1,) * (len(shape) - 2)
+    gamma = (1 + 0.1 * torch.randn(gamma_shape, device="cuda")).to(torch.bfloat16)
+    bias = None
+    x_ref = x
+    if with_bias:
+        bias = (0.1 * amplitude * torch.randn(gamma_shape, device="cuda")).to(x.dtype)
+        # the eager chain adds the conv bias in bf16 before the norm
+        x_ref = x + bias
+    scale = shape[1] ** 0.5
+    assert can_use_channel_rmsnorm_silu_nhwc(x, gamma, bias)
+    out = channel_rmsnorm_silu_nhwc(x, gamma, scale, bias)
+    assert out.stride() == x.stride()
+    expected = nhwc_reference(x_ref, gamma, scale)
+    # Only the reduction order differs from aten's: the norm may move by one
+    # ulp, which the four bf16 rounding steps of the tail can turn into two
+    # ulps of the output (2^-5 relative), and the vast majority of elements
+    # stay bit-identical.
+    torch.testing.assert_close(out, expected, atol=1e-6, rtol=2.0**-5)
+    assert (out.view(torch.int16) == expected.view(torch.int16)).float().mean() > 0.95
+
+
+@torch.no_grad()
+def test_channel_rmsnorm_silu_nhwc_predicates():
+    x = torch.randn(1, 16, 1, 8, 8, device="cuda", dtype=torch.bfloat16)
+    gamma = torch.ones(16, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_channel_rmsnorm_silu_nhwc(x, gamma)  # NCDHW contiguous
+    xl = channels_last(x)
+    assert can_use_channel_rmsnorm_silu_nhwc(xl, gamma)
+    odd = channels_last(torch.randn(1, 15, 8, 8, device="cuda", dtype=torch.bfloat16))
+    assert not can_use_channel_rmsnorm_silu_nhwc(
+        odd, torch.ones(15, 1, 1, device="cuda", dtype=torch.bfloat16)
+    )
+    assert not can_use_channel_rmsnorm_silu_nhwc(xl.float(), gamma.float())
+    assert not can_use_channel_rmsnorm_silu_nhwc(xl, gamma.view(16))
+    assert not can_use_channel_rmsnorm_silu_nhwc(xl, gamma, gamma.view(16))
+    assert not can_use_channel_rmsnorm_silu_nhwc(xl, gamma, gamma.float())
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image 2.1 VAE -- bit-exact conv bias + residual add (the residual block tail)
+# -------------------------------------------------------------------------
+
+
+def bias_residual_reference(y, bias, h):
+    return (y + bias.view(1, -1, *([1] * (y.ndim - 2)))) + h
+
+
+def to_layout(x, layout):
+    if layout == "nchw":
+        return x.contiguous()
+    fmt = torch.channels_last if x.ndim == 4 else torch.channels_last_3d
+    return x.contiguous(memory_format=fmt)
+
+
+@pytest.mark.parametrize(
+    "shape", [(1, 144, 1, 32, 32), (2, 288, 16, 16), (1, 8, 1, 8, 8), (1, 1152, 4, 4)]
+)
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+@pytest.mark.parametrize("amplitude", [1e-3, 1.0, 100.0])
+@torch.no_grad()
+def test_bias_residual_add_bit_exact_and_layout_preserved(shape, layout, amplitude):
+    torch.manual_seed(0)
+    y = to_layout(
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude, layout
+    )
+    h = to_layout(
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) * amplitude, layout
+    )
+    bias = (torch.randn(shape[1], device="cuda") * amplitude).to(torch.bfloat16)
+    assert can_use_bias_residual_add(y, bias, h)
+    out = bias_residual_add(y, bias, h)
+    assert out.stride() == y.stride()
+    assert torch.equal(out, bias_residual_reference(y, bias, h))
+
+
+@torch.no_grad()
+def test_bias_residual_add_predicates():
+    y = torch.randn(1, 16, 1, 8, 8, device="cuda", dtype=torch.bfloat16)
+    h = torch.randn_like(y)
+    bias = torch.randn(16, device="cuda", dtype=torch.bfloat16)
+    assert can_use_bias_residual_add(y, bias, h)
+    yl = y.contiguous(memory_format=torch.channels_last_3d)
+    assert not can_use_bias_residual_add(yl, bias, h)  # strides differ
+    assert can_use_bias_residual_add(
+        yl, bias, h.contiguous(memory_format=torch.channels_last_3d)
+    )
+    assert not can_use_bias_residual_add(y.float(), bias.float(), h.float())
+    assert not can_use_bias_residual_add(y, bias[:8], h)
+    odd = torch.randn(1, 6, 1, 8, 8, device="cuda", dtype=torch.bfloat16)
+    assert can_use_bias_residual_add(
+        odd, bias[:6], torch.randn_like(odd)
+    )  # spatial % 8 == 0
+    oddl = odd.contiguous(memory_format=torch.channels_last_3d)
+    assert not can_use_bias_residual_add(oddl, bias[:6], oddl.clone())  # C % 8 != 0
+    narrow = torch.randn(1, 16, 1, 3, 3, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_bias_residual_add(narrow, bias, torch.randn_like(narrow))
 
 
 if __name__ == "__main__":

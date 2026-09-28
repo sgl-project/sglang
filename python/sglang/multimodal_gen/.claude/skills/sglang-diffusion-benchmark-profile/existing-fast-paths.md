@@ -298,7 +298,7 @@ framework-specific optimization workflow.
   `bias_residual_add`, and `dup_up3d_add`'s bias input.
 - Locations: `norm/channel_rmsnorm_finish_silu_jit.py`,
   `norm/channel_rmsnorm_silu_nhwc_jit.py`,
-  `elementwise/bias_residual_add_jit.py` (with their `.cuh` files),
+  `norm/bias_residual_add_jit.py` (with their `.cuh` files),
   `layout/wan_causal_cache_triton.py`, `vaes/conv_fold.py`, and
   `runtime/models/vaes/qwen_image21_vae_cuda_opt.py` (mounted from
   `optimize_vae` in `platforms/cuda.py`).
