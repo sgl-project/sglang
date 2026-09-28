@@ -438,6 +438,44 @@ mod tests {
         assert_eq!(rank_count(&tracker, "warm"), 0);
     }
 
+    /// A probe answers for the graft it was launched about. Once a batch 0 has
+    /// replaced that graft with a restarted engine's stream, a verdict still in
+    /// flight — its witnesses counted in the dead numbering — must not demote
+    /// the new stream's state.
+    #[tokio::test]
+    async fn pump_drops_a_probe_verdict_about_a_graft_a_restart_replaced() {
+        let id = worker_id("http://w1", 0);
+        let (tracker, mut h) = graft_with_deferred_proof(&id, 5).await;
+        let epoch = tracker.epoch_of(&id).expect("registered");
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![stored(None, vec![1000])]),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.cursors.lock().get(&id).copied() != Some(0) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the restarted stream's batch 0 is applied");
+        h.ctrl_tx
+            .send(splice_verdict(&id, epoch, 5, SpliceVerdict::Advanced))
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
+        assert!(h.tree.match_prefix(None, &[1000]).workers().contains(&id));
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(0));
+        assert!(h.bootstrap_rx.try_recv().is_err(), "nothing re-queued");
+        assert_eq!(rank_count(&tracker, "from_origin"), 1);
+    }
+
     /// Silence with no witness of advancement is NOT evidence of a hole. Keeping
     /// the tree here is the whole reason the timeout probes instead of discarding:
     /// a quiet fleet would otherwise lose every warm tree on a timer.
