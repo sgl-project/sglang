@@ -31,12 +31,9 @@ class RandomWithSharedPrefixDataset(RandomDataset):
                 "random-ids-shared-prefix requires "
                 "--random-shared-prefix-len to be positive"
             )
+        if not getattr(args, "tokenize_prompt", False):
+            raise ValueError("random-ids-shared-prefix requires --tokenize-prompt")
         source = RandomDataset.from_args(args)
-        if source.return_text:
-            raise ValueError(
-                "RandomWithSharedPrefixDataset requires token-id prompts; use "
-                "an SGLang backend or --tokenize-prompt"
-            )
         return cls(
             input_len=source.input_len,
             output_len=source.output_len,

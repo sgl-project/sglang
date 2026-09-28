@@ -42,7 +42,7 @@ def test_from_args_builds_exact_random_id_dataset() -> None:
     dataset = RandomWithSharedPrefixDataset.from_args(
         Namespace(
             dataset_name="random-ids-shared-prefix",
-            tokenize_prompt=False,
+            tokenize_prompt=True,
             random_shared_prefix_len=3,
             random_input_len=8,
             random_output_len=2,
@@ -65,7 +65,7 @@ def test_generated_random_dataset_shares_prefix() -> None:
     np.random.seed(42)
     args = Namespace(
         dataset_name="random-ids-shared-prefix",
-        tokenize_prompt=False,
+        tokenize_prompt=True,
         random_shared_prefix_len=4,
         random_input_len=8,
         random_output_len=2,

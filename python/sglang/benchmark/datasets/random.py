@@ -17,21 +17,6 @@ from sglang.benchmark.datasets.common import (
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
 
 
-def _sends_token_ids(args: Namespace) -> bool:
-    """Whether prompts go out as token ids rather than text.
-
-    Text prompts are re-tokenized by the server and can differ from the
-    requested token sequence, so exact-id datasets send ids wherever the
-    backend accepts them. ``--tokenize-prompt`` forces ids explicitly.
-    """
-    if getattr(args, "tokenize_prompt", False):
-        return True
-    return getattr(args, "dataset_name", "") in (
-        "random-ids",
-        "random-ids-shared-prefix",
-    ) and getattr(args, "backend", "") in ("sglang", "sglang-native")
-
-
 @dataclass
 class RandomDataset(BaseDataset):
     input_len: int
@@ -50,7 +35,7 @@ class RandomDataset(BaseDataset):
             num_requests=args.num_prompts,
             range_ratio=args.random_range_ratio,
             dataset_path=args.dataset_path,
-            return_text=not _sends_token_ids(args),
+            return_text=not getattr(args, "tokenize_prompt", False),
             random_sample=(args.dataset_name == "random"),
         )
 
