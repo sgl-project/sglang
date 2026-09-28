@@ -123,9 +123,8 @@ class RealKvSource:
                 f"strides={tuple(self.tensor.stride())}, dtype={self.tensor.dtype})"
             )
         # A row is addressed as page_size slots of num_bytes_per_token, unchecked at fold time;
-        # a narrower row hashes fewer bytes than asked and still reports the chain clean. The
-        # check is on the row's own width, not its stride: on a strided view the bytes between
-        # the row's end and the next row belong to someone else.
+        # a narrower row hashes fewer bytes than asked and still reports the chain clean. Check the
+        # row's width, not its stride.
         row_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
         min_row_bytes = self.page_size * self.num_bytes_per_token
         if row_bytes < min_row_bytes:
@@ -416,8 +415,7 @@ def _build_real_kv_source_abi(
     )
 
     for i, source in enumerate(real_kv_sources):
-        # Rows may sit a wider stride apart (a per-layer view into a larger entry); the
-        # kernels step rows by stride(0), so only the bytes within a row must be packed.
+        # The kernels step rows by stride(0), so only the bytes within a row must be packed.
         if source.tensor.stride(-1) != 1:
             raise ValueError(
                 f"kv-canary: real_kv_sources[{i}].tensor rows must be packed "

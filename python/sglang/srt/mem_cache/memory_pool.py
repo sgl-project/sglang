@@ -2117,13 +2117,11 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
             return
 
-        # The tiled copy moves `data_strides[i]` bytes per slot, so it is only
-        # correct on dense slot rows; on a strided view it would copy past the
-        # row into the neighbouring slot.
+        # The tiled copy uses `data_strides[i]` as both slot stride and copy width.
         for buf in self._slot_move_pointer_buffers():
-            assert buf.stride(0) == math.prod(buf.shape[1:]), (
-                "the tiled KV copy needs dense slot rows (slot stride == row "
-                f"width); got shape {tuple(buf.shape)}, strides {buf.stride()}"
+            assert buf.is_contiguous(), (
+                "the tiled KV copy needs contiguous KV buffers; got shape "
+                f"{tuple(buf.shape)}, strides {buf.stride()}"
             )
 
         # Heuristics for KV copy tiling
@@ -2301,10 +2299,7 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
         self.data_strides = torch.tensor(
-            [
-                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
-                for x in slot_move_pointer_buffers
-            ],
+            [x.stride(0) * x.dtype.itemsize for x in slot_move_pointer_buffers],
             device=self.device,
         )
 
@@ -3237,10 +3232,7 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
-            [
-                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
-                for x in self.k_buffer + self.v_buffer
-            ],
+            [x.stride(0) * x.dtype.itemsize for x in self.k_buffer + self.v_buffer],
             device=self.device,
         )
 
@@ -3623,10 +3615,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
-            [
-                x.stride(0) * x.dtype.itemsize  # slot stride: views may be strided
-                for x in self.k_buffer + self.v_buffer
-            ],
+            [x.stride(0) * x.dtype.itemsize for x in self.k_buffer + self.v_buffer],
             device=self.device,
         )
         # This override replaces the base allocation, so the PD-transfer

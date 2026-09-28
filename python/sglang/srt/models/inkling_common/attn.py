@@ -149,9 +149,8 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
     )
 
 
-# Slot-stride alignment (elements) the fused prologue store needs per dtype:
-# its 8-element vector stores (kVecElems) for bf16, its 32-element scale
-# blocks (kMXFP8Block) for MXFP8.
+# Slot-stride alignment (elements) of the fused prologue store: kVecElems for
+# bf16, kMXFP8Block for MXFP8.
 _FUSED_KV_STORE_SLOT_ALIGN = {torch.bfloat16: 8, torch.float8_e4m3fn: 32}
 
 

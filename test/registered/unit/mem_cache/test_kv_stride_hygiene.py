@@ -160,11 +160,10 @@ class TestDataStridesFollowViews(unittest.TestCase):
         )
 
     def test_tiled_kv_copy_refuses_strided_views(self):
-        # The tiled copy moves one slot stride of bytes per slot: on these views
-        # that is a whole entry, which would spill into the neighbouring slot.
+        # One slot stride of bytes per slot is a whole entry on these views.
         pool = _strided_mha_pool()
         pool._init_data_ptrs_and_strides()
-        with self.assertRaisesRegex(AssertionError, "dense slot rows"):
+        with self.assertRaisesRegex(AssertionError, "contiguous KV buffers"):
             pool._init_kv_copy_and_warmup()
 
 
