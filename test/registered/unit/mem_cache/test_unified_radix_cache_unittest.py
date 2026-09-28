@@ -8890,9 +8890,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [[1, 2, 3, 4, 5, 0]], dtype=torch.int64
         )
         cache.token_to_kv_pool_allocator = mock.Mock()
-        cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.side_effect = (
-            lambda indices: indices + 10
-        )
         cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.side_effect = (
             lambda indices: indices + 100
         )
