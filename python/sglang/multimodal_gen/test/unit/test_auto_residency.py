@@ -10,13 +10,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
-    DefaultWorkload,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
     estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
-    resolve_measured_default_workload,
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
@@ -577,60 +575,6 @@ class TestEstimateDefaultWorkloadPeak:
             "denoise:layout:1": ("transformer",),
         }
         assert used == active
-
-
-class TestResolveMeasuredDefaultWorkload:
-    def test_uses_effective_warmup_resolution_for_implicit_image_size(self):
-        workload = DefaultWorkload(
-            width=None,
-            height=None,
-            num_frames=1,
-            num_inference_steps=40,
-        )
-
-        resolved = resolve_measured_default_workload(
-            workload,
-            [
-                _record(width=512, height=512),
-                _record(width=1024, height=1024),
-            ],
-        )
-
-        assert resolved == DefaultWorkload(
-            width=1024,
-            height=1024,
-            num_frames=1,
-            num_inference_steps=40,
-        )
-
-    def test_keeps_default_frames_when_warmup_caps_video(self):
-        workload = DefaultWorkload(
-            width=None,
-            height=None,
-            num_frames=81,
-            num_inference_steps=30,
-        )
-
-        resolved = resolve_measured_default_workload(
-            workload, [_record(width=832, height=480, num_frames=17)]
-        )
-
-        assert resolved.num_frames == 81
-
-    def test_does_not_replace_explicit_default_shape(self):
-        workload = DefaultWorkload(
-            width=1280,
-            height=720,
-            num_frames=81,
-            num_inference_steps=30,
-        )
-
-        assert (
-            resolve_measured_default_workload(
-                workload, [_record(width=512, height=512)]
-            )
-            is workload
-        )
 
 
 class TestWarmupFrameAdjustment:

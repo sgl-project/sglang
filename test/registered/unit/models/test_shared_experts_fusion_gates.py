@@ -61,7 +61,15 @@ class _FusionGateCase(CustomTestCase):
     def _reason(self, model_class, hf_config, quant_config=None, moe_ep_size=1):
         # The gates consult the live EP size; without a group installed the
         # canonical getter asserts, so every case states a topology.
-        with get_parallel().override(moe_ep_size=moe_ep_size):
+        with get_parallel().override(
+            tp_size=moe_ep_size,
+            attn_tp_size=moe_ep_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=moe_ep_size,
+            moe_dp_size=1,
+            moe_tp_size=1,
+        ):
             return model_class.shared_experts_fusion_disable_reason(
                 hf_config, quant_config
             )
@@ -315,7 +323,14 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             packed_modules_mapping={},
         )
 
-    def _reason_on_cuda(self, quant_config):
+    def _width_only_config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            moe_intermediate_size=1024,
+            moe_shared_expert_intermediate_size=1024,
+        )
+
+    def _reason_on_cuda(self, quant_config, config=None, model_class=None):
         bailing_moe_v3, _ = _import_bailing_modules()
 
         self._seed()
@@ -328,10 +343,60 @@ class TestBailingMoeV3Gate(_FusionGateCase):
             ),
         ):
             return self._reason(
-                bailing_moe_v3.BailingMoeV3ForCausalLM,
-                self._config(),
+                model_class or bailing_moe_v3.BailingMoeV3ForCausalLM,
+                config if config is not None else self._config(),
                 quant_config,
             )
+
+    def test_width_only_fp4_mixed_experts_cannot_fuse(self):
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        reason = self._reason_on_cuda(quant_config, self._width_only_config())
+        self.assertIn("different quant methods", reason)
+
+    def test_vl_wrapper_checks_the_width_on_its_text_config(self):
+        from sglang.srt.models.bailing_mm_v3 import (
+            BailingMoeV3VLForConditionalGeneration,
+        )
+
+        quant_config = SimpleNamespace(get_name=lambda: "fp8", is_fp4_experts=True)
+        config = SimpleNamespace(text_config=self._width_only_config())
+        reason = self._reason_on_cuda(
+            quant_config, config, BailingMoeV3VLForConditionalGeneration
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_only_bf16_experts_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._width_only_config()))
+
+    def test_num_shared_experts_only_config_still_fuses(self):
+        self.assertIsNone(self._reason_on_cuda(None, self._config()))
+
+    def test_width_only_int4_mixed_experts_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                [r"re:.*mlp\.shared_experts\.(gate|up|down)_proj.*"]
+            ),
+            self._width_only_config(),
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_width_controls_construction_count(self):
+        bailing_moe_v3, _ = _import_bailing_modules()
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._width_only_config()),
+            1,
+        )
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(self._config()), 1
+        )
+        legacy_multi_shared = self._config()
+        legacy_multi_shared.num_shared_experts = 2
+        self.assertEqual(
+            bailing_moe_v3._get_bailing_num_shared_experts(legacy_multi_shared), 2
+        )
+        no_shared = self._width_only_config()
+        no_shared.moe_shared_expert_intermediate_size = 0
+        self.assertEqual(bailing_moe_v3._get_bailing_num_shared_experts(no_shared), 0)
 
     def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
         reason = self._reason_on_cuda(

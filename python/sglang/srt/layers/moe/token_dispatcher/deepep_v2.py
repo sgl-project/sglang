@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
+    RoutewiseLayout,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
@@ -34,6 +35,7 @@ _EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
 _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
+
 
 try:
     from deep_ep import ElasticBuffer
@@ -55,7 +57,7 @@ if use_deepep_v2:
 class DeepEPv2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: Optional[torch.Tensor]
+    topk_ids: Optional[torch.Tensor]  # Receiver-local expert IDs, or -1.
     topk_weights: torch.Tensor
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
@@ -65,6 +67,7 @@ class DeepEPv2DispatchOutput(NamedTuple):
     masked_max_m: int = 0
     total_expanded: int = 0
     expert_alignment: int = 128
+    activation_scale_block_size: int = _SCALE_BLOCK_SIZE
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -74,6 +77,7 @@ class DeepEPv2DispatchOutput(NamedTuple):
 class DeepEPv2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_weights: Optional[torch.Tensor]
+    routewise_layout: Optional[RoutewiseLayout] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -121,12 +125,14 @@ def _get_allow_hybrid_mode() -> bool:
 
 
 def _quantize_for_deepep_v2_dispatch(
-    hidden_states: torch.Tensor, scale_format: DeepEPv2Fp8ScaleFormat
+    hidden_states: torch.Tensor,
+    scale_format: DeepEPv2Fp8ScaleFormat,
+    activation_scale_block_size: int = _SCALE_BLOCK_SIZE,
 ):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
         hidden_states,
-        _SCALE_BLOCK_SIZE,
+        activation_scale_block_size,
         column_major_scales=scale_format.tma_aligned,
         scale_tma_aligned=scale_format.tma_aligned,
         scale_ue8m0=scale_format.ue8m0,
@@ -227,6 +233,7 @@ class _DeepEPv2Impl:
         scale_format: DeepEPv2Fp8ScaleFormat,
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
+        activation_scale_block_size: int = _SCALE_BLOCK_SIZE,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -234,9 +241,9 @@ class _DeepEPv2Impl:
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.scale_format = scale_format
+        self.activation_scale_block_size = activation_scale_block_size
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
-        self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
 
@@ -267,10 +274,10 @@ class _DeepEPv2Impl:
                 f"DeepEP v2 hidden size mismatch: expected {self.hidden_size}, "
                 f"got {hidden_states.shape[1]}"
             )
-        if self.hidden_size % _SCALE_BLOCK_SIZE != 0:
+        if self.hidden_size % self.activation_scale_block_size != 0:
             raise ValueError(
                 "DeepEP v2 requires hidden_size multiple of "
-                f"{_SCALE_BLOCK_SIZE}, got {self.hidden_size}"
+                f"{self.activation_scale_block_size}, got {self.hidden_size}"
             )
         if topk_ids.shape[1] != self.router_topk:
             raise ValueError(
@@ -312,7 +319,7 @@ class _DeepEPv2Impl:
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
-                _SCALE_BLOCK_SIZE,
+                self.activation_scale_block_size,
                 column_major_scales=_ue8m0,
                 scale_tma_aligned=_ue8m0,
                 scale_ue8m0=_ue8m0,
@@ -320,7 +327,7 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf = _ue8m0
         else:
             dispatch_x = _quantize_for_deepep_v2_dispatch(
-                hidden_states, self.scale_format
+                hidden_states, self.scale_format, self.activation_scale_block_size
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
@@ -344,7 +351,6 @@ class _DeepEPv2Impl:
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
         )
-        self._handle = handle
         local_tokens = hidden_states.shape[0]
         if event.event is not None:
             event.current_stream_wait()
@@ -368,12 +374,20 @@ class _DeepEPv2Impl:
             if recv_hidden_states_scale is not None:
                 recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
+            # ElasticBuffer already converts global router IDs to receiver-local
+            # expert IDs; applying this rank's offset again would discard routes.
             local_topk_ids = recv_topk_idx
 
         expected_m = 0
         masked_max_m = 0
         total_expanded = 0
         if use_masked:
+            recv_capacity = recv_hidden_states.shape[0]
+            if recv_topk_weights.shape != (recv_capacity,):
+                raise ValueError(
+                    "DeepEP v2 expanded activations and router weights must "
+                    "have the same receive capacity"
+                )
             # expected_m is only a schedule hint; masked_m is the actual bound.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(
@@ -381,10 +395,12 @@ class _DeepEPv2Impl:
                 (local_tokens * ep_group_size * self.router_topk + self.num_experts)
                 // self.num_experts,
             )
-            # Account for the worst case where every rank targets one local expert.
+            # Every rank can send its full dispatch capacity to one expert.
             masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
-            total_expanded = recv_hidden_states.shape[0]
+            total_expanded = recv_capacity
 
+        # Publish ownership only after the returned metadata is validated.
+        self._handle = handle
         return DeepEPv2DispatchOutput(
             recv_hidden_states,
             recv_hidden_states_scale,
@@ -398,6 +414,7 @@ class _DeepEPv2Impl:
             masked_max_m,
             total_expanded,
             _EXPERT_ALIGNMENT,
+            activation_scale_block_size=self.activation_scale_block_size,
         )
 
     def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
@@ -407,6 +424,10 @@ class _DeepEPv2Impl:
             )
         # Release the single-use handle even when combine fails.
         try:
+            if combine_input.routewise_layout is not None:
+                raise ValueError(
+                    "DeepEP v2 combine requires model route finalization first"
+                )
             buffer = self._get_buffer()
             combined_x, _, event = buffer.combine(
                 combine_input.hidden_states,
@@ -433,6 +454,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         hidden_size: int,
         params_dtype: torch.dtype,
         use_fp8_dispatch: bool,
+        activation_scale_block_size: int = _SCALE_BLOCK_SIZE,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -454,6 +476,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             scale_format=scale_format,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch=use_fp8_dispatch,
+            activation_scale_block_size=activation_scale_block_size,
         )
 
     def dispatch(

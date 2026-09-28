@@ -1158,6 +1158,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler.profiler_manager = SimpleNamespace(
             _profile_batch_predicate=lambda batch: None
         )
