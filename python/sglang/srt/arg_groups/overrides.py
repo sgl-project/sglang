@@ -1412,8 +1412,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
+        # instead of sending it back to flashinfer_trtllm, whose MoE apply path
+        # imports flashinfer.
+        if is_gfx95_mxfp8 or (get_platform().is_hip and moe_runner_backend == "triton"):
             allowed.append("triton")
+        if is_gfx95_mxfp8:
             # the aiter MXFP8 MoE quant info is built only when aiter is enabled
             if envs.SGLANG_USE_AITER.get():
                 allowed.append("aiter")

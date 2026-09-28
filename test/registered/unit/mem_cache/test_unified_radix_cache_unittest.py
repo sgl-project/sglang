@@ -107,6 +107,7 @@ from sglang.srt.server_args import (
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -1731,7 +1732,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
 
-    def test_cache_finished_req_insert(self):
+    def test_insert_req(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1755,7 +1756,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1787,7 +1788,7 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(len(prompt_only.device_indices), prompt_aligned_len)
         cache.sanity_check()
 
-    def test_cache_finished_req_strips_thinking(self):
+    def test_insert_req_strips_thinking(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
@@ -1813,10 +1814,10 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        # cache_finished_req reads get_serving().strip_thinking_cache
+        # owned_kv_len reads get_serving().strip_thinking_cache
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
-            cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+            finish_req(cache, req, req.owned_kv_len())
             start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
@@ -1837,7 +1838,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-    def test_cache_finished_req_no_insert(self):
+    def test_release_without_insert(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 2)
@@ -1924,7 +1925,7 @@ class UnifiedRadixCacheSuite:
         req.kv.cache_protected_len = 0
         req.lock_receipt = DecLockRefParams()
         req.extra_key = None
-        req.kv.swa_evicted_seqlen = evicted_len
+        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
         cache.cache_unfinished_req(req)
 
@@ -2005,7 +2006,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_paged_cache_finished_unaligned_tail_freed(self):
+    def test_paged_insert_req_unaligned_tail_freed(self):
         if self.cfg.page_size == 1:
             self.skipTest("page_size > 1 only")
         if self.cfg.has_swa:
@@ -2034,7 +2035,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -2149,7 +2150,7 @@ class UnifiedRadixCacheSuite:
         req.kv.cache_protected_len = 0
         req.lock_receipt = DecLockRefParams()
         req.extra_key = None
-        req.kv.swa_evicted_seqlen = 0
+        req.kv.set_evicted_seqlen(ComponentType.SWA, 0)
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
@@ -2203,7 +2204,7 @@ class UnifiedRadixCacheSuite:
                 key=RadixKey(array("q", tokens)),
                 value=value,
                 prev_prefix_len=0,
-                swa_evicted_seqlen=len(tokens),
+                component_evicted_seqlens={ComponentType.SWA: len(tokens)},
             )
         )
 
@@ -2293,9 +2294,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-        cache.dec_lock_ref(
-            node_a, DecLockRefParams(swa_uuid_for_lock=None), skip_swa=True
-        )
+        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
         cache.sanity_check()
 
     def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
@@ -2603,9 +2602,7 @@ class UnifiedRadixCacheSuite:
             "SWA stays in LRU for drive_eviction to pick later",
         )
 
-        cache.dec_lock_ref(
-            node_a, DecLockRefParams(swa_uuid_for_lock=None), skip_swa=True
-        )
+        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
         self.assertTrue(cache.tree_core.is_device_leaf(node_a))
         cache.sanity_check()
 
@@ -2851,10 +2848,10 @@ class UnifiedRadixCacheSuite:
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
-            req.kv.swa_evicted_seqlen,
+            req.kv.get_evicted_seqlen(ComponentType.SWA),
             expected_evicted,
             f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.kv.swa_evicted_seqlen}",
+            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(ComponentType.SWA)}",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
@@ -2936,7 +2933,7 @@ class UnifiedRadixCacheSuite:
             cache.cache_unfinished_req(req)
 
         self.assertEqual(
-            req.kv.swa_evicted_seqlen,
+            req.kv.get_evicted_seqlen(ComponentType.SWA),
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )
@@ -4678,7 +4675,7 @@ class UnifiedRadixCacheSuite:
             InsertParams(
                 key=RadixKey(array("q", seq)),
                 value=value[: len(seq)],
-                swa_evicted_seqlen=live_from,
+                component_evicted_seqlens={ComponentType.SWA: live_from},
             )
         )
         masked = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -4806,7 +4803,7 @@ class UnifiedRadixCacheSuite:
             InsertParams(
                 key=RadixKey(array("q", sibling)),
                 value=value[: len(sibling)],
-                swa_evicted_seqlen=len(sibling),
+                component_evicted_seqlens={ComponentType.SWA: len(sibling)},
             )
         )
         live = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -4886,7 +4883,7 @@ class UnifiedRadixCacheSuite:
             InsertParams(
                 key=RadixKey(array("q", seq[:split_at])),
                 value=value[:split_at],
-                swa_evicted_seqlen=split_at,
+                component_evicted_seqlens={ComponentType.SWA: split_at},
             )
         )
 
@@ -6055,7 +6052,7 @@ class UnifiedRadixCacheSuite:
             InsertParams(
                 key=RadixKey(array("q", seq)),
                 value=value,
-                swa_evicted_seqlen=ps,
+                component_evicted_seqlens={ComponentType.SWA: ps},
             )
         )
         self.assertEqual(result.prefix_len, 0)
@@ -6096,7 +6093,7 @@ class UnifiedRadixCacheSuite:
                 InsertParams(
                     key=RadixKey(array("q", tokens)),
                     value=value,
-                    swa_evicted_seqlen=swa_ev,
+                    component_evicted_seqlens={ComponentType.SWA: swa_ev},
                 )
             )
             cache.writing_check()
@@ -6972,15 +6969,21 @@ class UnifiedRadixCacheSuite:
         swa = cache.components[ComponentType.SWA]
         req = mock.Mock(
             swa_branching_seqlen=8,
-            kv=mock.Mock(cache_protected_len=4, swa_evicted_seqlen=0),
+            kv=ReqKvInfo(
+                cache_protected_len=4,
+                component_evicted_seqlens={ComponentType.SWA: 3},
+            ),
         )
 
         for is_finished in (False, True):
-            params = InsertParams()
+            params = InsertParams(component_evicted_seqlens={ComponentType.MAMBA: 6})
             self.assertEqual(
                 swa.prepare_for_caching_req(req, params, 12, is_finished), 8
             )
-            self.assertEqual(params.swa_evicted_seqlen, 0)
+            self.assertEqual(
+                params.component_evicted_seqlens,
+                {ComponentType.SWA: 3, ComponentType.MAMBA: 6},
+            )
 
         self.assertIsNone(swa.prepare_for_caching_req(req, InsertParams(), 7, False))
         req.kv.cache_protected_len = 8
@@ -7045,7 +7048,7 @@ class UnifiedRadixCacheSuite:
             )
 
         expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
-        self.assertEqual(req.kv.swa_evicted_seqlen, expected_evicted)
+        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), expected_evicted)
 
         mapping = allocator.full_to_swa_index_mapping
         self.assertEqual(
@@ -8773,7 +8776,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req.kv.mamba_last_track_seqlen = len(tokens)
         return req
 
-    def _cache_finished(self, cache, allocator, req_to_token_pool, tokens):
+    def _finished_req(self, cache, allocator, req_to_token_pool, tokens):
         req = self._make_req(req_to_token_pool, tokens)
         kv_indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(kv_indices)
@@ -8782,7 +8785,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        finish_req(cache, req, req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -8792,14 +8795,14 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         ckpt_initial = ckpt_pool.available_size()
         tokens = [1, 2, 3, 4]
 
-        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self._finished_req(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), active_initial
         )
         self.assertEqual(ckpt_pool.available_size(), ckpt_initial - 1)
         self.assertEqual(cache.mamba_evictable_size(), 1)
 
-        self._cache_finished(cache, allocator, req_to_token_pool, tokens)
+        self._finished_req(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), active_initial
         )
@@ -9493,7 +9496,13 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         evicted = self._alloc(allocator, len(seq))
         # Window eviction already released the peers below the floor.
         allocator.free_swa(evicted)
-        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=len(seq)))
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=evicted,
+                component_evicted_seqlens={ComponentType.SWA: len(seq)},
+            )
+        )
         (leaf,) = _node_children(cache, cache.root_node_handle())
         lock_result = cache.inc_lock_ref(leaf) if lock_full else None
         try:
@@ -9501,7 +9510,6 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
                 InsertParams(
                     key=key,
                     value=self._alloc(allocator, len(seq)),
-                    swa_evicted_seqlen=0,
                     track_adopted_ranges=True,
                 )
             )
@@ -9527,11 +9535,17 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
         allocator.free_swa(evicted[:sw])
-        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=evicted,
+                component_evicted_seqlens={ComponentType.SWA: sw},
+            )
+        )
         value = self._alloc(allocator, len(seq))
         full_available = allocator.full_attn_allocator.available_size()
         swa_available = allocator.swa_attn_allocator.available_size()
-        cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=0))
+        cache.insert(InsertParams(key=key, value=value))
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -9553,17 +9567,19 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
         allocator.free_swa(evicted[:sw])
-        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
+        cache.insert(
+            InsertParams(
+                key=key,
+                value=evicted,
+                component_evicted_seqlens={ComponentType.SWA: sw},
+            )
+        )
         (prefix_node,) = _node_children(cache, cache.root_node_handle())
         (window_node,) = _node_children(cache, prefix_node)
         self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
 
         # Re-inserting fully in-window recovers the prefix span's SWA data.
-        cache.insert(
-            InsertParams(
-                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=0
-            )
-        )
+        cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
         self.assertIsNotNone(_device_value(cache, prefix_node, ComponentType.SWA))
 
         # SWA eviction takes the recovered span and keeps the window leaf.
@@ -9588,7 +9604,13 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         with mock.patch.object(
             cache, "_apply_cache_action", wraps=cache._apply_cache_action
         ) as spy:
-            cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=sw))
+            cache.insert(
+                InsertParams(
+                    key=key,
+                    value=value,
+                    component_evicted_seqlens={ComponentType.SWA: sw},
+                )
+            )
         actions = [c.args[0] for c in spy.call_args_list]
 
         full_only = [
@@ -9614,9 +9636,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
-        cache.dec_lock_ref(
-            node, DecLockRefParams(swa_uuid_for_lock=None), skip_swa=True
-        )
+        cache.dec_lock_ref(node, DecLockRefParams(), skip_swa=True)
         cache.sanity_check()
 
 
@@ -10283,10 +10303,10 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(
-            boundary - req.kv.swa_evicted_seqlen,
+            boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
             self.cfg.sliding_window_size,
             f"leaf ending at {boundary} keeps only "
-            f"{boundary - req.kv.swa_evicted_seqlen} live SWA tokens against a "
+            f"{boundary - req.kv.get_evicted_seqlen(ComponentType.SWA)} live SWA tokens against a "
             f"{self.cfg.sliding_window_size} window",
         )
         self.assertEqual(
@@ -10632,7 +10652,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             InsertParams(
                 key=RadixKey(array("q", seq)),
                 value=value,
-                swa_evicted_seqlen=swa_evicted,
+                component_evicted_seqlens={ComponentType.SWA: swa_evicted},
             )
         )
         leaf = self._deepest(cache)
@@ -10645,7 +10665,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         lock_a = cache.inc_lock_ref(leaf)
         # Count-everything: every segment node carries A's ref, tombstones
         # included, and the boundary uuid is always stamped.
-        self.assertIsNotNone(lock_a.swa_uuid_for_lock)
+        self.assertIsNotNone(lock_a.component_lock_uuids[ComponentType.SWA])
         self.assertEqual(lock_a.node_id, leaf)
         for n in segment:
             self.assertEqual(self._swa_ref(cache, n), 1)
@@ -10657,7 +10677,6 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             InsertParams(
                 key=RadixKey(array("q", seq)),
                 value=self._alloc(allocator, len(seq)),
-                swa_evicted_seqlen=0,
             )
         )
         cache.sanity_check()
@@ -10681,20 +10700,31 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             self.assertEqual(self._swa_ref(cache, n), 0)
         cache.sanity_check()
 
-    def test_release_without_receipt_fails_loud(self):
-        """A release missing its boundary uuid must die at the segment edge
-        (ref==0 assert) instead of silently walking to root stealing other
-        holders' locks — the F1 failure made loud."""
+    def test_root_release_needs_no_boundary(self):
+        cache, _, _ = build_fixture(self.cfg)
+        core = cache.tree_core
+        root = cache.root_node_handle()
+        core.dec_lock_ref(root, DecLockRefParams())
+        core.dec_host_lock_ref(root, DecLockRefParams())
+        released = core.dec_swa_lock_only(root, DecLockRefParams())
+        self.assertFalse(released.device_frees)
+        self.assertFalse(released.host_frees)
+        cache.sanity_check()
+
+    def test_release_with_incorrect_root_boundary_fails_loud(self):
+        """An incorrect root boundary must fail at the acquired segment's edge."""
         sw = self.cfg.sliding_window_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 3 * sw)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
         lock = cache.inc_lock_ref(leaf)
-        self.assertIsNotNone(lock.swa_uuid_for_lock)
+        self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
 
         self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(leaf, DecLockRefParams(swa_uuid_for_lock=None)),
+            lambda: cache.dec_lock_ref(
+                leaf, DecLockRefParams(component_lock_uuids={ComponentType.SWA: None})
+            ),
             "lock_ref=0",
         )
 
@@ -10857,7 +10887,7 @@ class TestSegmentLockFuzz(_InsertWalkSuite):
                     params = InsertParams(
                         key=RadixKey(array("q", seq)),
                         value=value,
-                        swa_evicted_seqlen=swa_evict,
+                        component_evicted_seqlens={ComponentType.SWA: swa_evict},
                     )
                     if self.cfg.has_mamba:
                         req = self._make_req(req_to_token_pool)
@@ -10888,7 +10918,10 @@ class TestSegmentLockFuzz(_InsertWalkSuite):
                     # Early SWA release of a random not-yet-released lock.
                     idx = rng.randrange(len(held))
                     node_id, receipt, released = held[idx]
-                    if released or receipt.swa_uuid_for_lock is None:
+                    if (
+                        released
+                        or receipt.component_lock_uuids[ComponentType.SWA] is None
+                    ):
                         continue
                     cache.dec_swa_lock_only(
                         node_id,
@@ -10957,7 +10990,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
         node = match.last_device_node
         lock = cache.inc_lock_ref(node)
-        self.assertIsNotNone(lock.swa_uuid_for_lock)
+        self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
         cache.dec_swa_lock_only(node, lock.to_dec_params())
         return node, lock
 
