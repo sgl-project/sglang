@@ -364,7 +364,6 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     down_warps = 4
     down_group = 1
     quant_groups = 32 if small_batch else 64
-    selector_schedule = [['amdgpu-sched-strategy', 'iterative-ilp']] if small_batch else []
     router_mn = 32
     router_splits = 24 if small_batch else 8
     pad = triton.cdiv(m, tile_rows) * tile_rows
@@ -393,7 +392,7 @@ def fused_moe(x, router, correction_bias, w13, w13_scale, w2, w2_scale, routed_s
     router_ctas = triton.cdiv(m, router_mn) * (256 // router_mn) * router_splits
     quant_ctas = triton.cdiv(m * (h // 32), quant_groups)
     _router_projection[router_ctas,](x, router, logits, counts, m, h, x.stride(0), router_mn, router_mn, router_k, router_splits, count_stride, num_warps=1, enable_fp_fusion=False)
-    _select_and_quantize[m + quant_ctas,](x, xq, xs, logits, correction_bias, weights, counts, sorted_routes, m, h, x.stride(0), router_splits, pad, count_stride, quant_groups, routed_scaling_factor, num_warps=1, enable_fp_fusion=False, llvm_fn_attrs=selector_schedule)
+    _select_and_quantize[m + quant_ctas,](x, xq, xs, logits, correction_bias, weights, counts, sorted_routes, m, h, x.stride(0), router_splits, pad, count_stride, quant_groups, routed_scaling_factor, num_warps=1, enable_fp_fusion=False)
     _expert_tiles[jobs_count * (2 * intermediate // up_n),](xq, xs, w13, w13_scale, sorted_routes, jobs, counts, aq, aqs, parts, out, m, 2 * intermediate, h, pad, 1, True, up_n, up_k, tile_rows, native, activation_rows, count_stride, num_warps=up_warps, enable_fp_fusion=False)
     _expert_tiles[jobs_count * (h // down_n),](aq, aqs, w2, w2_scale, sorted_routes, jobs, counts, aq, aqs, parts, out, m, h, intermediate, pad, down_group, False, down_n, 256, tile_rows, native, activation_rows, count_stride, num_warps=down_warps)
     reduce_block = 512 if small_batch else 128
