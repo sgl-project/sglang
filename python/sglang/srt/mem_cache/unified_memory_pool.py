@@ -568,12 +568,9 @@ class UnifiedKVPool:
 
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are token-major views
-    into a `UnifiedKVPool` (see `build_dense_views`).
-
-    Each view is a strided `(num_pages * ps, head_num, head_dim)` tensor whose
-    slot stride is the whole entry, indexed by the PHYSICAL token id; K and V
-    of every layer sit at fixed offsets inside that entry, so K and V rows may
-    differ in width. `move_kv_cache` relocates whole page envelopes.
+    into a `UnifiedKVPool`: `(num_pages * ps, head_num, head_dim)` with the whole
+    entry as slot stride, indexed by the physical token id. `move_kv_cache`
+    relocates whole page envelopes.
     """
 
     def __init__(
@@ -680,14 +677,10 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     """MLA KV pool whose per-layer `kv_buffer` entries are token-major views
-    into a `UnifiedKVPool` (see `build_dense_views`).
-
-    Every loc this pool receives through the KVCache API is a PHYSICAL token
-    id (`translate_kv_loc` of the virtual id). Each view is a strided
-    `(num_pages * ps, 1, kv_cache_dim)` tensor whose slot stride is the whole
-    entry, the layer offset folded into its storage_offset, so the stock
-    `MLATokenToKVPool` read/write methods work on the views unmodified.
-    `move_kv_cache` relocates whole page envelopes on the raw buffer.
+    into a `UnifiedKVPool`: `(num_pages * ps, 1, kv_cache_dim)` with the whole
+    entry as slot stride, indexed by the physical token id (`translate_kv_loc`
+    of the virtual id), so the stock `MLATokenToKVPool` read/write methods work
+    on them unmodified. `move_kv_cache` relocates whole page envelopes.
     """
 
     def __init__(

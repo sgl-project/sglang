@@ -608,12 +608,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 sorted(full_cg_backends),
                 sorted(backends),
             )
-    # trtllm_mha refills its cuda-graph page table out of graph, before the
-    # replay, from `cache_seqlens_int32` -- which only the recorded in-graph
-    # metadata kernel writes. The refill therefore translates the previous
-    # replay's lengths, and the kernel reads untranslated columns once a
-    # sequence grows past them. Refuse the combination until that refill
-    # derives its lengths from the batch.
+    # trtllm_mha refills its graph page table before replay from
+    # `cache_seqlens_int32`, which only the in-graph metadata kernel writes, so
+    # it uses the previous replay's lengths. Refuse until it uses the batch's.
     _, decode_backend = attention_backends_of(resolved_view(server_args))
     if decode_backend == "trtllm_mha":
         assert _cg_cfg is None or _cg_cfg.decode.backend == Backend.DISABLED, (

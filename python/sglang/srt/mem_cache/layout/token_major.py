@@ -1,25 +1,16 @@
-"""Page-granularity envelope (page-major, token-major within a page) cache views.
+"""Token-major cache views over one raw byte buffer.
 
-A pool of this layout keeps all layers of all slots in one contiguous byte
-buffer, split into pages of ``page_size`` slots. Within a page the slots follow
-one another, and one slot's ENTRY holds every part of that token -- K and V of
-every layer for MHA, the latent row of every layer for MLA -- at a fixed byte
-offset:
+Each token slot owns one ENTRY holding every layer's state at fixed offsets,
+and a page is ``page_size`` entries back to back:
 
-    page bytes  = [ entry(slot 0) | entry(slot 1) | ... | entry(slot ps-1) ]
     entry bytes = [ K_0 | V_0 | K_1 | V_1 | ... ]  (MHA)
                   [ lat_0 | lat_1 | ... ]           (MLA)
+    byte(t, part, l) = anchor + t * entry_bytes + part offset + l * layer stride
 
-Every per-layer view is therefore a flat ``(num_pages * page_size, *row_shape)``
-tensor with slot stride ``entry_bytes`` and storage offset
-``anchor + part offset``, indexed by the PHYSICAL token id
-``page * page_size + slot``. Parts may differ in row width (K vs V); only their
-offsets differ, never the stride. The Mamba state
-(``build_mamba_entry_views``) uses the same per-slot entry at page size 1.
-
-These builders produce views into a raw ``uint8`` buffer; they hold no
-allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
-region inside the raw buffer (0 for a standalone pool).
+so every per-layer view is ``(num_slots, *row_shape)`` with slot stride
+``entry_bytes``, indexed by the physical token id. The Mamba state
+(``build_mamba_entry_views``) uses the same per-slot entry. ``anchor_bytes``
+is the pool region's offset inside the raw buffer.
 """
 
 from typing import List, Sequence, Tuple
