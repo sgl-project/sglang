@@ -48,6 +48,8 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.response_template import (
+    GRAMMAR_AFTER_REASONING,
+    GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
 )
@@ -759,6 +761,10 @@ class ServingChatTestCase(unittest.TestCase):
             if reasoning_parser
             else None
         )
+        # Always-on reasoning: the output grammar starts after the reasoning.
+        self.template_manager.reasoning_config = (
+            ReasoningToggleConfig(special_case="always") if reasoning_parser else None
+        )
 
     @staticmethod
     def _stopped_on_token(text, token_id):
@@ -769,6 +775,7 @@ class ServingChatTestCase(unittest.TestCase):
                 "prompt_tokens": 5,
                 "completion_tokens": 9,
                 "cached_tokens": 0,
+                "weight_version": "default",
                 "finish_reason": {"type": "stop", "matched": token_id},
             },
             "index": 0,
@@ -789,24 +796,33 @@ class ServingChatTestCase(unittest.TestCase):
         ):
             return self.chat._convert_to_internal_request(request)
 
-    def test_response_template_parser_context_records_output_constraint(self):
-        self._use_delimited_response_template("response_template")
+    def test_response_template_parser_context_records_grammar_start(self):
+        named = {"type": "function", "function": {"name": "get_weather"}}
         cases = {
-            "auto tool choice": ({"tools": [_WEATHER_TOOL]}, False),
-            "named tool": (
-                {
-                    "tools": [_WEATHER_TOOL],
-                    "tool_choice": {
-                        "type": "function",
-                        "function": {"name": "get_weather"},
-                    },
-                },
-                True,
+            "auto tool choice": (
+                "response_template",
+                {"tools": [_WEATHER_TOOL]},
+                None,
             ),
-            "response_format": ({"response_format": {"type": "json_object"}}, True),
+            "named tool after reasoning": (
+                "response_template",
+                {"tools": [_WEATHER_TOOL], "tool_choice": named},
+                GRAMMAR_AFTER_REASONING,
+            ),
+            "response_format after reasoning": (
+                "response_template",
+                {"response_format": {"type": "json_object"}},
+                GRAMMAR_AFTER_REASONING,
+            ),
+            "required tool without reasoning": (
+                None,
+                {"tools": [_WEATHER_TOOL], "tool_choice": "required"},
+                GRAMMAR_FROM_START,
+            ),
         }
-        for name, (fields, constrained) in cases.items():
+        for name, (reasoning_parser, fields, grammar_start) in cases.items():
             with self.subTest(name):
+                self._use_delimited_response_template(reasoning_parser)
                 _, request = self._convert_rendered_as(
                     "<assistant>",
                     ChatCompletionRequest(
@@ -815,7 +831,7 @@ class ServingChatTestCase(unittest.TestCase):
                         **fields,
                     ),
                 )
-                self.assertEqual(request._response_parser_constrained, constrained)
+                self.assertEqual(request._response_parser_grammar_start, grammar_start)
 
     def test_required_tool_json_is_parsed_under_delimited_template(self):
         payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
@@ -838,7 +854,14 @@ class ServingChatTestCase(unittest.TestCase):
                             stream=stream,
                         ),
                     )
-                    self.assertTrue(request._response_parser_constrained)
+                    self.assertEqual(
+                        request._response_parser_grammar_start,
+                        (
+                            GRAMMAR_AFTER_REASONING
+                            if reasoning_parser
+                            else GRAMMAR_FROM_START
+                        ),
+                    )
                     if stream:
                         item = self._stopped_on_token(text, 7)
 

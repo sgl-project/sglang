@@ -19,6 +19,8 @@ from sglang.srt.function_call.gemma4_detector import (
 from sglang.srt.parser.reasoning_parser import Gemma4Detector as Gemma4ReasoningDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
+    GRAMMAR_AFTER_REASONING,
+    GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
     configure_response_template_request,
@@ -430,16 +432,19 @@ class TestResponseTemplateAdapters(CustomTestCase):
         for request in requests:
             with self.subTest(request=type(request).__name__):
                 request._response_parser_prefix = PREFIX
-                request._response_parser_constrained = True
+                request._response_parser_grammar_start = GRAMMAR_AFTER_REASONING
 
                 self.assertEqual(request._response_parser_prefix, PREFIX)
                 self.assertNotIn("response_parser_prefix", request.model_dump())
-                self.assertNotIn("response_parser_constrained", request.model_dump())
+                self.assertNotIn("response_parser_grammar_start", request.model_dump())
                 self.assertEqual(
                     request.model_copy()._response_parser_prefix,
                     PREFIX,
                 )
-                self.assertTrue(request.model_copy()._response_parser_constrained)
+                self.assertEqual(
+                    request.model_copy()._response_parser_grammar_start,
+                    GRAMMAR_AFTER_REASONING,
+                )
 
     def test_adapters_use_checkpoint_metadata(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
@@ -549,13 +554,28 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertFalse(sampling_params["spaces_between_special_tokens"])
         self.assertFalse(sampling_params["no_stop_trim"])
 
-    def test_output_constraint_keeps_text_outside_delimited_fields(self):
-        payload = '[{"name": "get_weather", "parameters": {"days": 3}}]'
-        output = "<think>Plan</think>" + payload
-        for constrained, content in ((False, ""), (True, payload)):
-            with self.subTest(constrained=constrained):
+    def test_output_grammar_output_is_passed_through_verbatim(self):
+        plain = '[{"name": "get_weather", "parameters": {"days": 3}}]'
+        # Template delimiters inside JSON strings belong to the JSON.
+        delimited = (
+            '[{"name": "get_weather", "parameters": '
+            '{"location": "<answer>Paris</answer>", "details": "<think>x</think>"}}]'
+        )
+        cases = (
+            # Without an output grammar the template frames the whole output,
+            # so text outside its fields has no field.
+            (None, "<think>Plan</think>" + plain, ("Plan", "")),
+            (
+                GRAMMAR_AFTER_REASONING,
+                "<think>Plan</think>" + delimited,
+                ("Plan", delimited),
+            ),
+            (GRAMMAR_FROM_START, delimited, ("", delimited)),
+        )
+        for grammar_start, output, expected in cases:
+            with self.subTest(grammar_start=grammar_start):
                 request = ChatCompletionRequest(messages=[])
-                request._response_parser_constrained = constrained
+                request._response_parser_grammar_start = grammar_start
                 one_shot, streaming = (
                     ReasoningParser(
                         model_type="response_template",
@@ -568,20 +588,24 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 parts = [streaming.parse_stream_chunk(c) for c in _chunks(output, 5)]
                 parts.append(streaming.parse_stream_end())
 
-                self.assertEqual(one_shot.parse_non_stream(output), ("Plan", content))
+                self.assertEqual(one_shot.parse_non_stream(output), expected)
                 self.assertEqual(
                     (
                         "".join(reasoning or "" for reasoning, _ in parts),
                         "".join(normal or "" for _, normal in parts),
                     ),
-                    ("Plan", content),
+                    expected,
                 )
-                self.assertEqual(
-                    one_shot.parse_non_stream(
-                        "<think>Plan</think><answer>Sunny</answer>"
-                    ),
-                    ("Plan", "Sunny"),
-                )
+
+        framed = ReasoningParser(
+            model_type="response_template",
+            tokenizer=SimpleNamespace(response_template=DELIMITED_TEMPLATE),
+            prefix="<assistant>",
+        )
+        self.assertEqual(
+            framed.parse_non_stream("<think>Plan</think><answer>Sunny</answer>"),
+            ("Plan", "Sunny"),
+        )
 
     def test_reasoning_requires_explicit_enable_without_template_policy(self):
         detector = ResponseTemplateReasoningDetector(

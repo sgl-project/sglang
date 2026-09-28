@@ -47,6 +47,10 @@ _PASSTHROUGH_FIELD = "normal"
 _SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
     {_THINKING_FIELD, _CONTENT_FIELD, _TOOL_FIELD}
 )
+# Where an output grammar (JSON tool calls, response_format) takes over from
+# the template, mirroring the reasoning gate of ReasonerGrammarBackend.
+GRAMMAR_AFTER_REASONING = "after_reasoning"
+GRAMMAR_FROM_START = "from_start"
 
 
 def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
@@ -111,22 +115,27 @@ def _load_serving_template(
     return template, validate_response_template_for_serving(template)
 
 
-def _streaming_template(
-    template: dict[str, Any], *, constrained_output: bool = False
-) -> ResponseTemplate:
+def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
     result = copy.deepcopy(template)
     fields = result["fields"]
-    if all("open" in field or "open_pattern" in field for field in fields.values()):
-        # Text outside the delimited fields is content if the template has no
-        # content field; under an output grammar (JSON tool calls,
-        # response_format) it is the grammar's output, which no field delimits.
-        if _CONTENT_FIELD not in fields:
-            fields[_CONTENT_FIELD] = {}
-        elif constrained_output:
-            fields[_PASSTHROUGH_FIELD] = {}
+    if _CONTENT_FIELD not in fields and all(
+        "open" in field or "open_pattern" in field for field in fields.values()
+    ):
+        fields[_CONTENT_FIELD] = {}
     for field in fields.values():
         field["optional"] = True
     return load_response_template(result)
+
+
+def _reasoning_only_template(template: dict[str, Any]) -> ResponseTemplate:
+    thinking = copy.deepcopy(template["fields"][_THINKING_FIELD])
+    thinking["optional"] = True
+    anchor_name = (
+        "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
+    )
+    return load_response_template(
+        {anchor_name: template[anchor_name], "fields": {_THINKING_FIELD: thinking}}
+    )
 
 
 def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
@@ -143,6 +152,10 @@ def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
     )
 
 
+def _passthrough_chunk(text: str) -> dict:
+    return {"type": "region_chunk", "field": _PASSTHROUGH_FIELD, "text": text}
+
+
 class _ReasoningResult:
     """Duck-types `reasoning_parser.StreamingParseResult`."""
 
@@ -154,7 +167,13 @@ class _ReasoningResult:
 class ResponseTemplateStreamAdapter:
     """Parse one response with a template and route its generic region events."""
 
-    def __init__(self, template: ResponseTemplate, *, prefix: str = ""):
+    def __init__(
+        self,
+        template: ResponseTemplate,
+        *,
+        prefix: str = "",
+        grammar_start: str | None = None,
+    ):
         self._template = template
         self._prefix = prefix
         self._parser: ResponseParser | None = None
@@ -166,6 +185,9 @@ class ResponseTemplateStreamAdapter:
         )
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
+        self._grammar_start = grammar_start
+        # Once an output grammar has taken over, text passes through unparsed.
+        self._verbatim = grammar_start == GRAMMAR_FROM_START
 
     def _start(self, tools: Sequence[Any] | None) -> list[dict]:
         """Create the parser and replay a tool region left open by the prefix."""
@@ -188,15 +210,37 @@ class ResponseTemplateStreamAdapter:
     def feed(self, text: str, tools: Sequence[Any] | None = None) -> list[dict]:
         if self._finalized:
             return []
+        if self._verbatim:
+            return [_passthrough_chunk(text)] if text else []
         events = self._start(tools)
-        return events + self._parser.feed(text)
+        return self._end_reasoning(events + self._parser.feed(text))
 
     def finalize(self, tools: Sequence[Any] | None = None) -> list[dict]:
         if self._finalized:
             return []
         events = self._start(tools)
         self._finalized = True
-        return events + self._parser.finalize()[1]
+        if self._verbatim:
+            return events
+        return self._end_reasoning(events + self._parser.finalize()[1])
+
+    def _end_reasoning(self, events: list[dict]) -> list[dict]:
+        """When the output grammar starts after reasoning, stop parsing at the
+        reasoning closer, as the grammar backend does; what follows is passed
+        through unchanged."""
+        if self._grammar_start != GRAMMAR_AFTER_REASONING:
+            return events
+        for index, event in enumerate(events):
+            if event.get("field") == _THINKING_FIELD and event["type"] in (
+                "region_close",
+                "region_malformed",
+            ):
+                self._verbatim = True
+                text = self._parser.input_text[event["end"] :]
+                return events[: index + 1] + (
+                    [_passthrough_chunk(text)] if text else []
+                )
+        return events
 
     def parse(self, text: str, tools: Sequence[Any] | None = None) -> list[dict]:
         return self.feed(text, tools) + self.finalize(tools)
@@ -325,7 +369,7 @@ class ResponseTemplateReasoningDetector:
         response_template: dict | None = None,
         prefix: str = "",
         force_nonempty_content: bool = False,
-        constrained_output: bool = False,
+        grammar_start: str | None = None,
         **_kwargs,
     ):
         template, loaded = _load_serving_template(
@@ -348,17 +392,26 @@ class ResponseTemplateReasoningDetector:
             else self._default_think_end
         )
         self.think_start_self_label = ""
-        self._template = _streaming_template(
-            template, constrained_output=constrained_output
-        )
+        if grammar_start == GRAMMAR_AFTER_REASONING and thinking is None:
+            grammar_start = GRAMMAR_FROM_START
+        self._grammar_start = grammar_start
+        if grammar_start == GRAMMAR_AFTER_REASONING:
+            self._template = _reasoning_only_template(template)
+        else:
+            self._template = _streaming_template(template)
         self._prefix = prefix
-        self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
+        self._adapter = self._new_adapter()
+
+    def _new_adapter(self) -> ResponseTemplateStreamAdapter:
+        return ResponseTemplateStreamAdapter(
+            self._template, prefix=self._prefix, grammar_start=self._grammar_start
+        )
 
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
     def detect_and_parse(self, text: str) -> _ReasoningResult:
-        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        adapter = self._new_adapter()
         result = adapter.route_reasoning_events(
             adapter.parse(text), stream_reasoning=True
         )

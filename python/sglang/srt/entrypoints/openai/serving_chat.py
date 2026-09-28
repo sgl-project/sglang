@@ -65,6 +65,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokensDetails,
     ResponseParserProtocol,
+    ResponsesRequest,
     SglExt,
     Tool,
     ToolCall,
@@ -108,6 +109,8 @@ from sglang.srt.parser.jinja_template_utils import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
+    GRAMMAR_AFTER_REASONING,
+    GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
     configure_response_template_request,
@@ -1311,11 +1314,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _set_response_parser_context(
         self,
-        request,
+        request: ChatCompletionRequest | ResponsesRequest,
         adapted_request: GenerateReqInput,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill, and
-        whether a grammar constrains the output instead of the template."""
+        where an output grammar takes over from the template: after the
+        reasoning when the grammar backend gates on it, else from the start."""
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1325,12 +1329,18 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         request._response_parser_prefix = prefix or ""
         sampling_params = adapted_request.sampling_params or {}
-        request._response_parser_constrained = any(
-            sampling_params.get(name) for name in _OUTPUT_CONSTRAINT_PARAMS
-        )
+        if any(sampling_params.get(name) for name in _OUTPUT_CONSTRAINT_PARAMS):
+            request._response_parser_grammar_start = (
+                GRAMMAR_AFTER_REASONING
+                if adapted_request.require_reasoning
+                else GRAMMAR_FROM_START
+            )
 
     def _drop_kept_tool_close(
-        self, text: str, finish_reason: dict[str, Any] | None, request
+        self,
+        text: str,
+        finish_reason: dict[str, Any] | None,
+        request: ChatCompletionRequest | ResponsesRequest,
     ) -> str:
         """Trim a tool-call closer that detokenization kept as the matched stop.
 
@@ -1339,8 +1349,8 @@ class OpenAIServingChat(OpenAIServingBase):
         the closer is only the stop token and is dropped like any other."""
         if (
             not text
-            or not getattr(request, "_response_parser_constrained", False)
-            or getattr(request, "no_stop_trim", False)
+            or request._response_parser_grammar_start is None
+            or (isinstance(request, ChatCompletionRequest) and request.no_stop_trim)
             or not isinstance(finish_reason, dict)
         ):
             return text
@@ -3121,6 +3131,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
+            if flush:
+                end = parser.finish(effective_tools)
+                normal_text = (normal_text or "") + end.normal_text
+                calls = list(calls) + end.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

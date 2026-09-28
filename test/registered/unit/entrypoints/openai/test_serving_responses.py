@@ -33,7 +33,10 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.parser.response_template import (
+    GRAMMAR_AFTER_REASONING,
+    ResponseTemplateReasoningDetector,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -708,6 +711,10 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         serving._reasoning_detector = ResponseTemplateReasoningDetector(
             response_template=self.TEMPLATE
         )
+        # Always-on reasoning: the output grammar starts after the reasoning.
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
         tokenizer = serving.tokenizer_manager.tokenizer
         tokenizer.response_template = self.TEMPLATE
         tokenizer.encode.side_effect = lambda literal, **_: (
@@ -759,13 +766,15 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         with patch.object(
             serving, "_apply_conversation_template", return_value=rendered
         ):
-            return asyncio.run(respond())
+            response = asyncio.run(respond())
+        return response, request._response_parser_grammar_start
 
     def test_required_tool_json_is_parsed_under_delimited_template(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
-                response = self._respond(stream)
+                response, grammar_start = self._respond(stream)
 
+                self.assertEqual(grammar_start, GRAMMAR_AFTER_REASONING)
                 self.assertEqual(response["status"], "completed")
                 self.assertEqual(
                     [item["type"] for item in response["output"]],

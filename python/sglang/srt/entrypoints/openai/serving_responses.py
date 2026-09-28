@@ -2424,6 +2424,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if isinstance(tool_parser, JsonArrayParser):
                     sp = tool_parser.parse_streaming_increment(delta, chat_tools)
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
+                    if flush:
+                        end = tool_parser.finish(chat_tools)
+                        normal_text += end.normal_text
+                        tool_calls = list(tool_calls) + end.calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                     if flush:

@@ -12,7 +12,10 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ResponsesRequest,
+)
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -2344,8 +2347,8 @@ class ReasoningParser:
         if issubclass(detector_class, ResponseTemplateReasoningDetector):
             if prefix:
                 kwargs["prefix"] = prefix
-            if getattr(request, "_response_parser_constrained", False):
-                kwargs["constrained_output"] = True
+            if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
+                kwargs["grammar_start"] = request._response_parser_grammar_start
 
         self.detector = detector_class(**kwargs)
 
