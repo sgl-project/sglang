@@ -169,6 +169,9 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "sana-video_2.0": "SanaVideo2Pipeline",
+    "sana-video2": "SanaVideo2Pipeline",
+    "sana_video2": "SanaVideo2Pipeline",
     "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
@@ -286,7 +289,7 @@ _configs_discovered: bool = False
 
 # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
 # SANA-Video (register before generic SANA to avoid detector overlap).
-_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video")
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video2", "sana_video")
 
 
 def _discover_and_register_configs() -> None:

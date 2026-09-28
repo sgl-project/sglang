@@ -227,6 +227,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
     },
     {
+      name: "SANA-Video 2.0",
+      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
+      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
+    },
+    {
       name: "LingBot Video MoE",
       modelIds: ["robbyant/lingbot-video-moe-30b-a3b"],
       note: "Resolved by the LingBot Video MoE family detector.",
