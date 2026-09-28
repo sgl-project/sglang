@@ -8,6 +8,7 @@ after its DONE barrier -- never from the bootstrap thread for an active room.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -24,8 +25,10 @@ def _prefill_mgr(cls=CommonKVManager, enabled=True):
     mgr = cls.__new__(cls)
     mgr.enable_deferred_decode_kv_release = enabled
     mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_fanout_snapshots = {}
     mgr._staging_outstanding = {}
     mgr.request_status = {}
+    mgr.transfer_infos = {}
     mgr._sent = []
     # Capture acks instead of opening a socket.
     mgr._send_abort_ack = lambda ip, port, room: mgr._sent.append((ip, port, room))
@@ -56,6 +59,73 @@ class TestDeferredAckTargets(CustomTestCase):
     def test_unregistered_room_is_noop(self):
         mgr = _prefill_mgr()
         mgr._maybe_ack_drained_abort(999)
+        self.assertEqual(mgr._sent, [])
+
+    def test_drain_ack_fans_out_to_every_room_peer(self):
+        """With prefill TP < decode TP the room has several decode peers but the
+        registry keeps only the last ABORT sender; the drain ack must reach every
+        peer (dummy pairings included) or the others hold until the timeout."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[7] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.1", dst_port=5000),
+            "sess1": SimpleNamespace(endpoint="10.0.0.2", dst_port=5001),
+            # Dummy pairing: the decode rank still counts this prefill's ack.
+            "sess2": SimpleNamespace(endpoint="10.0.0.3", dst_port=5002),
+        }
+        # Rank 1 registered last and overwrote rank 0's registration.
+        mgr.register_deferred_ack_target(7, "10.0.0.2", 5001)
+
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            sorted(mgr._sent),
+            [
+                ("10.0.0.1", 5000, 7),
+                ("10.0.0.2", 5001, 7),
+                ("10.0.0.3", 5002, 7),
+            ],
+        )
+
+        # pop() semantics survive the fan-out: a second drain acks nobody.
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(len(mgr._sent), 3)
+
+    def test_drain_ack_fanout_survives_mid_flight_teardown(self):
+        """The sender's clear() can pop transfer_infos while a chunk is still in
+        flight; the peers snapshotted when the ABORT registered must still be
+        acked when the worker finally drains, or they hold until the timeout."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[7] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.1", dst_port=5000),
+            "sess1": SimpleNamespace(endpoint="10.0.0.2", dst_port=5001),
+        }
+        mgr._staging_outstanding[7] = 1
+        mgr.register_deferred_ack_target(7, "10.0.0.2", 5001)
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(mgr._sent, [])  # still writing -> held
+
+        # Scheduler clears the sender mid-flight; the worker drains after.
+        mgr.transfer_infos.clear()
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            sorted(mgr._sent),
+            [("10.0.0.1", 5000, 7), ("10.0.0.2", 5001, 7)],
+        )
+        self.assertNotIn(7, mgr._deferred_ack_fanout_snapshots)
+
+    def test_drain_ack_after_teardown_falls_back_to_registered_target(self):
+        mgr = _prefill_mgr()
+        mgr.register_deferred_ack_target(9, "10.0.0.4", 5003)
+        mgr._maybe_ack_drained_abort(9)
+        self.assertEqual(mgr._sent, [("10.0.0.4", 5003, 9)])
+
+    def test_populated_room_without_registration_acks_nobody(self):
+        """A normal (non-aborted) drain must not fan out spurious acks."""
+        mgr = _prefill_mgr()
+        mgr.transfer_infos[12] = {
+            "sess0": SimpleNamespace(endpoint="10.0.0.5", dst_port=5004),
+        }
+        mgr._maybe_ack_drained_abort(12)
         self.assertEqual(mgr._sent, [])
 
     def test_prefill_unique_rank_matches_success_sync_formula(self):

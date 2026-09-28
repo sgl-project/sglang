@@ -25,9 +25,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -37,9 +34,10 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -50,7 +48,7 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -339,10 +337,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -368,10 +363,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -556,7 +548,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -596,13 +588,10 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
@@ -649,7 +638,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
+            input_on_attention_tp_slices=(
+                self.layer_communicator.input_on_attention_tp_slices
+            ),
         )
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -812,6 +803,7 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -830,12 +822,13 @@ class Glm4MoeLiteModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

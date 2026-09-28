@@ -1283,9 +1283,12 @@ class ModelConfig:
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
-        elif (
-            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
-            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
+            # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
+            # the MLA ones (V2.5 and V3) carry kv_lora_rank, V2 keeps its GQA
+            # shapes.
+            "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+            and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
         ):
             self.head_dim = self.hf_text_config.head_dim
             self.attention_arch = AttentionArch.MLA
@@ -2396,6 +2399,20 @@ _cross_encoding_pooler_archs = [
 
 def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
     return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
+
+
+# SequenceClassification models whose forward routes the head through
+# score_and_pool (per-position pooling); only these support setwise readout
+# (token_indices_to_pool). Keep in sync with callers of layers.pooler.score_and_pool.
+_score_and_pool_archs = [
+    "LlamaForSequenceClassification",
+    "Qwen2ForSequenceClassification",
+    "Qwen3ForSequenceClassification",
+]
+
+
+def is_score_and_pool_model(model_architectures: List[str]) -> bool:
+    return any(arch in _score_and_pool_archs for arch in model_architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
