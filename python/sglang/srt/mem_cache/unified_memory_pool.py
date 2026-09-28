@@ -37,6 +37,7 @@ from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.token_major import (
+    ROW_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
@@ -64,6 +65,19 @@ def _prod(iterable) -> int:
     for x in iterable:
         out *= int(x)
     return out
+
+
+def _check_row_alignment(sub_pool: str, **row_bytes: int) -> None:
+    """Entry parts are laid out in ROW_ALIGN_BYTES units; a model whose
+    per-rank rows are not cannot use the unified pool."""
+    for part, nbytes in row_bytes.items():
+        if nbytes % ROW_ALIGN_BYTES:
+            raise ValueError(
+                f"--enable-unified-memory needs every per-rank KV row to be a "
+                f"multiple of {ROW_ALIGN_BYTES} bytes; sub-pool {sub_pool!r} has a "
+                f"{nbytes}-byte {part} row. Run this model without "
+                "--enable-unified-memory."
+            )
 
 
 def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
@@ -158,6 +172,7 @@ class MHASubPoolSpec(SubPoolSpec):
     def layout(self) -> DenseEntryLayout:
         """Token-major entry ``[K_0 | V_0 | K_1 | V_1 | ...]`` per slot; a page
         is ``page_size`` such entries back to back."""
+        _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
         return DenseEntryLayout(
             entry_bytes=self.entry_bytes(),
@@ -219,6 +234,7 @@ class MLASubPoolSpec(SubPoolSpec):
         return align_entry_bytes(self.layer_num * self.row_bytes())
 
     def layout(self) -> DenseEntryLayout:
+        _check_row_alignment(self.name, latent=self.row_bytes())
         return DenseEntryLayout(
             entry_bytes=self.entry_bytes(),
             parts=(

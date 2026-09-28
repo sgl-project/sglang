@@ -160,10 +160,10 @@ class TestMHASpecSurface(unittest.TestCase):
         self.assertEqual(layout.part("v").row_bytes(), _H * 4 * _ITEM)
         self.assertEqual(layout.part("v").offset_bytes, _H * 8 * _ITEM)
 
-    def test_misaligned_rows_fail_loud(self):
-        """A row that is not a multiple of 16 B would break the vector stores
-        every write kernel issues, so the layout refuses it at construction."""
-        with self.assertRaises(AssertionError):
+    def test_misaligned_rows_are_refused(self):
+        """Entry parts are laid out in 16-byte units (the write kernels'
+        vector stores), so a model whose per-rank row is not cannot run."""
+        with self.assertRaisesRegex(ValueError, "24-byte K row"):
             _mha_spec(head_dim=6, v_head_dim=6).layout()
 
 

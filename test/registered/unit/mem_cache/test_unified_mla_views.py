@@ -116,6 +116,18 @@ class TestMLASubPoolSpec(unittest.TestCase):
                 grow_direction="down",
             )
 
+    def test_misaligned_latent_row_is_refused(self):
+        spec = MLASubPoolSpec(
+            name="full",
+            layer_num=_L,
+            kv_lora_rank=5,
+            qk_rope_head_dim=_ROPE,
+            store_dtype=_DTYPE,
+            grow_direction="down",
+        )
+        with self.assertRaisesRegex(ValueError, "14-byte latent row"):
+            spec.layout()
+
 
 class TestMLAViews(unittest.TestCase):
     def _make_raw(self, ps, num_pages, short=0):
