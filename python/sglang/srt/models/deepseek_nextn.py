@@ -144,9 +144,7 @@ class DeepseekModelNextN(nn.Module):
             buffer_size=2,
             dtype=torch.float32,
             device=(
-                input_embeds.device
-                if input_embeds is not None
-                else input_ids.device
+                input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
 
@@ -163,13 +161,9 @@ class DeepseekModelNextN(nn.Module):
             ):
                 assert input_embeds is not None
                 last_indices = (
-                    forward_batch.extend_start_loc
-                    + forward_batch.extend_seq_lens
-                    - 1
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
                 ).long()
-                input_embeds[last_indices] = self.embed_tokens(
-                    input_ids[last_indices]
-                )
+                input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if input_embeds is None:
                 input_embeds = self.embed_tokens(input_ids)
         hidden_states = input_embeds
