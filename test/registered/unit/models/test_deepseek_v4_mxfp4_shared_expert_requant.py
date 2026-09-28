@@ -64,11 +64,23 @@ class TestQuantizeBlockFp8WeightToMxfp4(CustomTestCase):
         self.assertEqual(as_u8[0, 0].item(), 0x01 | (0x0D << 4))
         # byte 1 = code(6.0) | code(1.5) << 4
         self.assertEqual(as_u8[0, 1].item(), 0x07 | (0x03 << 4))
-        # Zero padding is not asserted byte-exactly: the quantizer encodes 0.0
-        # as -0.0 (code 8), which the kernel decodes back to zero. Check the
-        # padding dequantizes to zero without pinning its sign bit.
+        # Zero padding dequantizes to zero; its sign bit is not part of the contract.
         deq = _dequant_mxfp4(packed, scales)
         self.assertTrue((deq[0, 4:] == 0).all())
+
+    def test_ties_round_to_even(self):
+        # FP8 sources land exactly on e2m1 midpoints; rounding them toward zero
+        # biases the whole matrix low, so ties must go to the even mantissa.
+        w = torch.zeros(1, 32, dtype=torch.bfloat16)
+        w[0, 0] = 6.0  # pins scale 2**0
+        ties = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+        expected = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
+        w[0, 1 : 1 + len(ties)] = torch.tensor(ties)
+        w[0, 8 : 8 + len(ties)] = -torch.tensor(ties)
+        packed, scales = self._requant(w)
+        deq = _dequant_mxfp4(packed, scales)
+        torch.testing.assert_close(deq[0, 1 : 1 + len(ties)], torch.tensor(expected))
+        torch.testing.assert_close(deq[0, 8 : 8 + len(ties)], -torch.tensor(expected))
 
     def test_roundtrip_error_is_mxfp4_sized(self):
         torch.manual_seed(0)

@@ -91,18 +91,6 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
 }
 
 
-class _MXFP4QuantizedData(MXFP4QuantizeUtil):
-    def __init__(
-        self,
-        original_shape: torch.Size,
-        original_dtype: torch.dtype,
-        quantized_data: torch.Tensor,
-    ):
-        self.original_shape = original_shape
-        self.original_dtype = original_dtype
-        self.quantized_data = quantized_data
-
-
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
 # Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
@@ -1719,18 +1707,32 @@ def quantize_block_fp8_weight_to_mxfp4(
         fp8_weight,
         fp8_scale.to(torch.float32),
         weight_block_size,
-        torch.bfloat16,
+        torch.float32,
     )
-    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
-        fp8_weight_dequant, block_size=mxfp4_block_size
+    *lead, k = fp8_weight_dequant.shape
+    x = fp8_weight_dequant.reshape(-1, mxfp4_block_size)
+
+    # Scale as in aiter dynamic_mxfp4_quant: round amax's mantissa at 1.75, then
+    # floor(log2) - 2 (e2m1 emax), saturating the few elements above 6 * scale.
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    amax = ((amax.view(torch.int32) + 0x200000) & 0x7F800000).view(torch.float32)
+    exp = (torch.floor(torch.log2(amax)) - 2).clamp(-127, 127)
+    y = (x.abs() / torch.exp2(exp)).clamp(max=6.0)
+
+    # Round to nearest, ties to even mantissa. The FP8 source puts many elements
+    # exactly on e2m1 midpoints; ties toward zero shrink each matrix by ~5%.
+    mag = torch.where(
+        y < 2.0,
+        torch.round(y * 2.0),
+        torch.where(y < 4.0, torch.round(y) + 2.0, torch.round(y * 0.5) + 4.0),
+    ).to(torch.uint8)
+    codes = mag | ((x < 0) & (mag != 0)).to(torch.uint8) << 3
+    codes = codes.reshape(*lead, k)
+    fp4_weight = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+    fp4_scale = (exp + 127).to(torch.uint8).reshape(*lead, k // mxfp4_block_size)
+    return fp4_weight.view(torch.int8), fp4_scale.contiguous().view(
+        torch.float8_e8m0fnu
     )
-    fp4_weight = fp4_weight.quantized_data
-    fp4_weight = fp4_weight.contiguous().view(torch.int8)
-    fp4_scale = fp4_scale.view(
-        *fp8_weight_dequant.shape[:-1],
-        fp8_weight_dequant.shape[-1] // mxfp4_block_size,
-    )
-    return fp4_weight, fp4_scale.contiguous().view(torch.float8_e8m0fnu)
 
 
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
