@@ -1765,15 +1765,16 @@ class KVWriteLoc:
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
 
-    ``id_space`` says if the kernel will accept locs: ``"kernel"`` implies
-    rebound by the translator, or physical by allocation, ``"virtual"``
-    otherwise. The kernel refuses a ``"virtual"`` loc.
+    ``physical`` marks the locs as physical token ids: the batch's write loc
+    after ``rebind_write_loc``, or ids a backend translated itself. A unified
+    pool's write door refuses a loc not marked physical; other pools do not
+    check.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
     full_loc: Optional[torch.Tensor] = None
-    id_space: str = "virtual"
+    physical: bool = False
 
     @classmethod
     def for_batch(
@@ -1784,13 +1785,15 @@ class KVWriteLoc:
         swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
     ) -> KVWriteLoc:
-        """A write loc derived from the batch's ``out_cache_loc`` (or a slice /
-        alias of it), carrying the batch's id space."""
+        """The batch's ``out_cache_loc`` as a write loc, marked physical once
+        ``rebind_write_loc`` has run. ``loc`` may narrow it, but must be
+        ``out_cache_loc`` or a view of it: the mark describes the batch's loc,
+        not any other tensor."""
         return cls(
             forward_batch.out_cache_loc if loc is None else loc,
             swa_loc,
             full_loc,
-            id_space=forward_batch.out_cache_loc_id_space,
+            physical=forward_batch.out_cache_loc_is_physical,
         )
 
     def __post_init__(self):
@@ -1810,9 +1813,9 @@ def unwrap_write_loc(loc_info):
     return loc_info, None, None
 
 
-def write_loc_id_space(loc_info) -> str:
-    """``id_space`` of a ``KVWriteLoc``; a bare loc declares nothing (virtual)."""
-    return loc_info.id_space if isinstance(loc_info, KVWriteLoc) else "virtual"
+def write_loc_is_physical(loc_info) -> bool:
+    """Whether ``loc_info`` is a ``KVWriteLoc`` marked physical; a bare loc is not."""
+    return isinstance(loc_info, KVWriteLoc) and loc_info.physical
 
 
 class KvBufferDesc:
@@ -1942,20 +1945,19 @@ class KVCache(abc.ABC):
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
 
-    # Unified pools reset this.
-    requires_translated_write_loc = False
+    # Unified pools set this: their write doors take physical ids only.
+    requires_physical_write_loc = False
 
-    def _check_write_loc_space(self, loc_info, where: str) -> None:
-        if not self.requires_translated_write_loc:
+    def _check_physical_write_loc(self, loc_info, where: str) -> None:
+        if not self.requires_physical_write_loc:
             return
         if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             return
-        space = write_loc_id_space(loc_info)
-        assert space == "kernel", (
-            f"{where}: write loc is {space!r}, not kernel-facing. Producers hand "
-            "the pool KVWriteLoc.for_batch(forward_batch, ...) after "
-            "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, "
-            "id_space='kernel') for ids they translated themselves."
+        assert write_loc_is_physical(loc_info), (
+            f"{where}: write loc is not marked physical. Hand the pool "
+            "KVWriteLoc.for_batch(forward_batch, ...) after "
+            "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, physical=True) "
+            "for ids translated separately."
         )
 
     @abc.abstractmethod
@@ -2651,7 +2653,7 @@ class MHATokenToKVPool(KVCache):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        self._check_write_loc_space(loc_info, "set_kv_buffer (MHA)")
+        self._check_physical_write_loc(loc_info, "set_kv_buffer (MHA)")
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -4259,7 +4261,7 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         write_loc = KVWriteLoc(
             full_loc if full_loc is not None else loc,
-            id_space=write_loc_id_space(loc_info),
+            physical=write_loc_is_physical(loc_info),
         )
         if not self.use_mla:
             self.full_kv_pool.set_kv_buffer(
@@ -4600,7 +4602,7 @@ class MLATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        self._check_write_loc_space(loc_info, "set_kv_buffer (MLA)")
+        self._check_physical_write_loc(loc_info, "set_kv_buffer (MLA)")
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
@@ -4680,7 +4682,7 @@ class MLATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        self._check_write_loc_space(loc_info, "set_mla_kv_buffer (MLA)")
+        self._check_physical_write_loc(loc_info, "set_mla_kv_buffer (MLA)")
         # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,

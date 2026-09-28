@@ -3,11 +3,11 @@
 filter_batch's completeness guard raises for any non-None ForwardBatch field
 missing from the child dict, so every field with a non-None default has to be
 handled explicitly: the plan marker defaults to False and crashed TBO
-cuda-graph capture until reset, and `out_cache_loc_id_space` defaults to
-"virtual" and breaks every split until carried. For the id space, carrying the
-PARENT's value matters as much as carrying it at all -- a child left at the
-default would mark an already-translated loc as untranslated, and the pool's
-write door would translate it twice. CPU-only.
+cuda-graph capture until reset, and `out_cache_loc_is_physical` defaults to
+False and breaks every split until carried. Carrying the PARENT's value matters
+as much as carrying it at all: a child left at the default would mark an
+already-translated loc unphysical, and a unified pool's write door would refuse
+it. CPU-only.
 """
 
 import unittest
@@ -76,15 +76,15 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
 
-    def test_a_rebound_parent_hands_its_id_space_to_the_child(self):
+    def test_a_rebound_parent_hands_its_mark_to_the_child(self):
         parent = _make_target_verify_batch(8)
-        parent.out_cache_loc_id_space = "kernel"
+        parent.out_cache_loc_is_physical = True
         child = _filter(parent, lo=0, hi=4)
-        self.assertEqual(child.out_cache_loc_id_space, "kernel")
+        self.assertTrue(child.out_cache_loc_is_physical)
 
-    def test_an_untranslated_parent_stays_virtual(self):
+    def test_an_untranslated_parent_stays_unmarked(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
-        self.assertEqual(child.out_cache_loc_id_space, "virtual")
+        self.assertFalse(child.out_cache_loc_is_physical)
         self.assertFalse(child.forward_metadata_ready)
         self.assertIsNone(child.forward_metadata_planned_bs)
         self.assertIsNone(child.forward_metadata_planned_num_tokens)

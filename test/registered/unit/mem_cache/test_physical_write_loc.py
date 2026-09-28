@@ -11,16 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The write-loc id-space marker.
+"""The write loc's physical mark.
 
 Under the token-major views a virtual id is in range and, by value, the same
-kind of integer as a physical one, so the unified pools cannot tell a skipped
-rebind from a translated loc. The marker is the contract that replaces that
-probe: `rebind_write_loc` marks the batch's loc kernel-facing, backends carry
-the mark through `KVWriteLoc.for_batch`, composites forward it, and the unified
-write doors refuse an unmarked loc (under SGLANG_ENABLE_ASYNC_ASSERT).
+kind of integer as a physical one, so a unified pool cannot tell a skipped
+rebind from a translated loc by looking at it. `rebind_write_loc` marks the
+batch's loc physical, backends carry the mark through `KVWriteLoc.for_batch`,
+composites forward it, and the unified write doors refuse an unmarked loc
+(under SGLANG_ENABLE_ASYNC_ASSERT).
 
-    python -m pytest test/registered/unit/mem_cache/test_write_loc_id_space.py -v
+    python -m pytest test/registered/unit/mem_cache/test_physical_write_loc.py -v
 """
 
 import ast
@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
-    write_loc_id_space,
+    write_loc_is_physical,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
@@ -72,7 +72,7 @@ def _translating_translator(v2p):
 
 
 def _batch(loc):
-    return SimpleNamespace(out_cache_loc=loc, out_cache_loc_id_space="virtual")
+    return SimpleNamespace(out_cache_loc=loc, out_cache_loc_is_physical=False)
 
 
 def _unified_mha_pool(ps=1):
@@ -105,44 +105,43 @@ def _unified_mha_pool(ps=1):
 
 
 class TestRebindMarksTheBatch(unittest.TestCase):
-    def test_non_translating_pool_marks_kernel_without_rebinding(self):
+    def test_non_translating_pool_marks_physical_without_rebinding(self):
         loc = torch.tensor([3, 5], dtype=torch.int64)
         fb = _batch(loc)
         _plain_translator().rebind_write_loc(fb)
         self.assertIs(fb.out_cache_loc, loc)  # physical by allocation: untouched
-        self.assertEqual(fb.out_cache_loc_id_space, "kernel")
+        self.assertTrue(fb.out_cache_loc_is_physical)
 
-    def test_translating_pool_rebinds_and_marks_kernel(self):
+    def test_translating_pool_rebinds_and_marks_physical(self):
         v2p = torch.tensor([7, 6, 5, 4], dtype=torch.int64)
         loc = torch.tensor([1, 2], dtype=torch.int64)
         fb = _batch(loc)
         _translating_translator(v2p).rebind_write_loc(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[loc]))
-        self.assertEqual(fb.out_cache_loc_id_space, "kernel")
+        self.assertTrue(fb.out_cache_loc_is_physical)
 
-    def test_no_loc_stays_virtual(self):
+    def test_no_loc_stays_unmarked(self):
         fb = _batch(None)
         _translating_translator(torch.arange(4)).rebind_write_loc(fb)
-        self.assertEqual(fb.out_cache_loc_id_space, "virtual")
+        self.assertFalse(fb.out_cache_loc_is_physical)
 
 
-class TestKVWriteLocCarriesTheSpace(unittest.TestCase):
-    def test_for_batch_copies_the_batch_space_and_default_loc(self):
+class TestKVWriteLocCarriesTheMark(unittest.TestCase):
+    def test_for_batch_copies_the_batch_mark_and_default_loc(self):
         fb = _batch(torch.tensor([1, 2]))
-        self.assertEqual(KVWriteLoc.for_batch(fb).id_space, "virtual")
-        fb.out_cache_loc_id_space = "kernel"
+        self.assertFalse(KVWriteLoc.for_batch(fb).physical)
+        fb.out_cache_loc_is_physical = True
         info = KVWriteLoc.for_batch(fb, swa_loc=torch.tensor([9, 9]))
         self.assertIs(info.loc, fb.out_cache_loc)
-        self.assertEqual(info.id_space, "kernel")
+        self.assertTrue(info.physical)
         sliced = KVWriteLoc.for_batch(fb, fb.out_cache_loc[:1])
-        self.assertEqual(sliced.id_space, "kernel")
+        self.assertTrue(sliced.physical)
 
-    def test_bare_and_default_are_virtual(self):
-        self.assertEqual(write_loc_id_space(torch.tensor([1])), "virtual")
-        self.assertEqual(write_loc_id_space(KVWriteLoc(torch.tensor([1]))), "virtual")
-        self.assertEqual(
-            write_loc_id_space(KVWriteLoc(torch.tensor([1]), id_space="kernel")),
-            "kernel",
+    def test_bare_and_default_are_not_physical(self):
+        self.assertFalse(write_loc_is_physical(torch.tensor([1])))
+        self.assertFalse(write_loc_is_physical(KVWriteLoc(torch.tensor([1]))))
+        self.assertTrue(
+            write_loc_is_physical(KVWriteLoc(torch.tensor([1]), physical=True))
         )
 
 
@@ -157,11 +156,11 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         loc = torch.tensor([3, 4], dtype=torch.int64, device=_DEV)
         k, v = self._kv()
         with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
-            with self.assertRaisesRegex(AssertionError, "not kernel-facing"):
+            with self.assertRaisesRegex(AssertionError, "not marked physical"):
                 pool.set_kv_buffer(layer, loc, k, v)
-            with self.assertRaisesRegex(AssertionError, "not kernel-facing"):
+            with self.assertRaisesRegex(AssertionError, "not marked physical"):
                 pool.set_kv_buffer(layer, KVWriteLoc(loc), k, v)
-            pool.set_kv_buffer(layer, KVWriteLoc(loc, id_space="kernel"), k, v)
+            pool.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
         self.assertTrue(torch.all(pool.k_buffer[0][3] == 1))
         self.assertTrue(torch.all(pool.v_buffer[0][4] == 2))
 
@@ -216,9 +215,9 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             for layer_id in (0, 1):  # a full layer and a swa layer
                 layer = SimpleNamespace(layer_id=layer_id)
-                with self.assertRaisesRegex(AssertionError, "not kernel-facing"):
+                with self.assertRaisesRegex(AssertionError, "not marked physical"):
                     pool.set_kv_buffer(layer, KVWriteLoc(loc, loc), k, v)
-                pool.set_kv_buffer(layer, KVWriteLoc(loc, loc, id_space="kernel"), k, v)
+                pool.set_kv_buffer(layer, KVWriteLoc(loc, loc, physical=True), k, v)
 
 
 _PRODUCER_DIRS = ("models", "layers/cp", "speculative")
@@ -227,10 +226,9 @@ _PRODUCER_DIRS = ("models", "layers/cp", "speculative")
 def _untagged_producers():
     """Model-layer write-door calls that declare no id space.
 
-    `write_loc_id_space` reads a bare loc as "virtual", so a producer that
-    hands the pool `forward_batch.out_cache_loc` or a `KVWriteLoc` without
-    `id_space` trips the unified door's check on a write whose values are
-    already kernel-facing.
+    A bare loc is not marked physical, so a producer that hands the pool
+    `forward_batch.out_cache_loc` or a `KVWriteLoc` without `physical` trips the
+    unified door's check on a write whose values are already physical.
     """
     root = pathlib.Path(__file__).resolve().parents[4] / "python/sglang/srt"
     bad, seen = [], 0
@@ -256,15 +254,15 @@ def _untagged_producers():
                     if ast.unparse(n.args[1]).endswith(".out_cache_loc"):
                         bad.append(f"{f.name}:{n.lineno} bare out_cache_loc")
                 if name == "KVWriteLoc" and not any(
-                    k.arg == "id_space" for k in n.keywords
+                    k.arg == "physical" for k in n.keywords
                 ):
-                    bad.append(f"{f.name}:{n.lineno} KVWriteLoc without id_space")
+                    bad.append(f"{f.name}:{n.lineno} KVWriteLoc without physical")
     assert seen > 100, seen
     return bad
 
 
-class TestWriteLocProducersDeclareIdSpace(unittest.TestCase):
-    def test_every_model_layer_producer_declares_an_id_space(self):
+class TestWriteLocProducersDeclarePhysical(unittest.TestCase):
+    def test_every_model_layer_producer_declares_physical(self):
         self.assertEqual(_untagged_producers(), [])
 
 

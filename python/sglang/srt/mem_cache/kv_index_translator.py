@@ -442,9 +442,9 @@ class KVIndexTranslator:
 
     def rebind_write_loc(self, forward_batch) -> None:
         """Phase 1 of the WRITE contract: translate the batch's write loc to
-        FULL-side kernel-facing ids exactly once, at ForwardBatch
-        construction, and mark the batch's loc kernel-facing. On non-unified
-        pools the allocation is already physical / kernel-facing.
+        FULL-side physical ids exactly once, at ForwardBatch construction, and
+        mark it physical. On non-unified pools the allocation is already
+        physical, so only the mark is set.
 
         REBIND, never mutate: the translate returns a FRESH tensor, so the
         ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
@@ -459,7 +459,7 @@ class KVIndexTranslator:
             forward_batch.out_cache_loc = self._translate_write_full(
                 forward_batch.out_cache_loc
             )
-        forward_batch.out_cache_loc_id_space = "kernel"
+        forward_batch.out_cache_loc_is_physical = True
 
     def fill_capture_write_loc(
         self,

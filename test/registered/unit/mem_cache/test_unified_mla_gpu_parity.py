@@ -47,10 +47,10 @@ def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
 
 
 def _marked(loc: torch.Tensor):
-    # The unified doors take a KVWriteLoc that declares its id space.
+    # The unified doors take a KVWriteLoc marked physical.
     from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-    return KVWriteLoc(loc, id_space="kernel")
+    return KVWriteLoc(loc, physical=True)
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):

@@ -119,7 +119,7 @@ class _DCPMetadataTests:
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc=None,
-            out_cache_loc_id_space="virtual",
+            out_cache_loc_is_physical=False,
         )
         k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
         k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
