@@ -5445,6 +5445,36 @@ mod tests {
         assert_eq!(rank_count(&tracker, "publisher_reset"), 1);
     }
 
+    /// The held tail, when there is one, is the later of the two received
+    /// seqs — batches are held only after the cursor's replay — so it is what a
+    /// regression is measured against. Measuring against the cursor would miss
+    /// a step back that stays above it.
+    #[tokio::test]
+    async fn pump_regression_is_measured_against_the_held_tail_first() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+        // The raw cursor a gap retry's replay leaves behind.
+        h.cursors.lock().insert(id.clone(), 50);
+        for seq in [55, 56, 52] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![stored(None, vec![seq + 1000])]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(rank_count(&tracker, "publisher_reset"), 1);
+        assert!(h.tree.match_prefix(None, &[1052]).workers.contains(&id));
+        assert_eq!(h.tree.match_prefix(None, &[1055]).matched_blocks, 0);
+    }
+
     /// A regression that does not land on batch 0 is still a restart, but the
     /// new stream's head was missed too, so nothing can be spliced: discard the
     /// dead prefix and run cold from here.
