@@ -98,6 +98,13 @@ _OWNER_SITES = {
         "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
     ): 1,
+    # L2-Only staging branch of _pre_alloc skips the device alloc helpers (the
+    # delta owns no HBM rows), so it settles the allocation watermark itself.
+    (
+        "disaggregation/decode.py",
+        "DecodePreallocQueue._pre_alloc",
+        "kv_allocated_len",
+    ): 1,
     ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     (
         "disaggregation/decode.py",
