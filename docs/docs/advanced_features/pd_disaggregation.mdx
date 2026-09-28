@@ -57,6 +57,16 @@ uv pip install mooncake-transfer-engine
 
 ### AWS EFA
 
+The SGLang CUDA images ship the AWS EFA userspace (libfabric, the EFA rdma-core libraries, and aws-ofi-nccl) under `/opt/amazon`, next to the system rdma-core used for IB/RoCE. At container start the entrypoint enables the EFA stack when an EFA NIC is visible, so NIXL (`LIBFABRIC` backend) and NCCL use EFA without extra setup. Set `NET_STACK=efa` or `NET_STACK=system` to override the detection. Pass the devices through when starting the container:
+
+```bash
+docker run --gpus all --network host --ipc host \
+  --device /dev/infiniband --device /dev/gdrdrv --ulimit memlock=-1 \
+  lmsysorg/sglang:latest ...
+```
+
+For Mooncake, build the image with `--build-arg MOONCAKE_EFA=1`, or replace the package in an existing image as shown below.
+
 On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
 
 The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:

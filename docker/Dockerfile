@@ -8,6 +8,7 @@ ARG SGL_KERNEL_VERSION=0.4.7
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
+ARG EFA_INSTALLER_VERSION=1.50.0
 ARG SGL_NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
@@ -133,6 +134,15 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
     && CUDA=/usr/local/cuda ./build-deb-packages.sh \
     && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
     && cd / && rm -rf /tmp/gdrcopy
+
+# AWS EFA userspace (libfabric, rdma-core libraries, aws-ofi-nccl) under
+# /opt/amazon. The system rdma-core stays in place for IB/RoCE; the entrypoint
+# enables the EFA stack only when an EFA NIC is visible (see NET_STACK in
+# docker/efa/efa-entrypoint.sh).
+COPY docker/efa/install_efa_userspace.sh docker/efa/efa-entrypoint.sh /tmp/efa/
+RUN bash /tmp/efa/install_efa_userspace.sh "${EFA_INSTALLER_VERSION}" \
+    && install -m 0755 /tmp/efa/efa-entrypoint.sh /usr/local/bin/efa-entrypoint.sh \
+    && rm -rf /tmp/efa
 
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
@@ -460,9 +470,16 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
 
-# Install Mooncake
+# Install Mooncake. MOONCAKE_EFA=1 installs the AWS EFA build instead; it
+# serves the same `mooncake` module but is built without Mooncake EP/PG.
+ARG MOONCAKE_EFA=0
+ARG MOONCAKE_EFA_VERSION=0.3.13.post1
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}
+    if [ "${MOONCAKE_EFA}" = "1" ]; then \
+        python3 -m pip install mooncake-transfer-engine-efa-cuda13==${MOONCAKE_EFA_VERSION}; \
+    else \
+        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
+    fi
 
 # Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -622,6 +639,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "/usr/local/bin/efa-entrypoint.sh"]
+
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_URL=
@@ -771,6 +790,11 @@ COPY --from=framework_final /usr/lib/*-linux-gnu/libgdrapi.so* /usr/lib/
 COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
+# AWS EFA userspace and network-stack entrypoint (see base stage)
+COPY --from=framework_final /opt/amazon /opt/amazon
+COPY --from=framework_final /etc/libibverbs.d /etc/libibverbs.d
+COPY --from=framework_final /usr/local/bin/efa-entrypoint.sh /usr/local/bin/efa-entrypoint.sh
+
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so \
     && ldconfig
@@ -791,6 +815,8 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "/usr/local/bin/efa-entrypoint.sh"]
 
 # Default command
 CMD ["/bin/bash"]
