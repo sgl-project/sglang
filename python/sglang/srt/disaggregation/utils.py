@@ -107,7 +107,7 @@ def poll_and_all_reduce_pp(
     ]
 
 
-def poll_and_all_reduce_pp2(
+def poll_and_all_reduce_prefill_pp(
     pollers: List[CommonKVSender],
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,

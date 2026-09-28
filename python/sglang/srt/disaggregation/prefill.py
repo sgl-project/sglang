@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_pp2,
+    poll_and_all_reduce_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -451,7 +451,7 @@ class PrefillBootstrapQueue:
             return []
 
         if self.pp_size > 1:
-            polls = poll_and_all_reduce_pp2(
+            polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
