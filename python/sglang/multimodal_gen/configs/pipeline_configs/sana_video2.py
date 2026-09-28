@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.pipeline_configs.sana_video import SanaVideoPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 
 
 @dataclass
@@ -33,6 +35,9 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
+    def supports_sequential_multi_output_inference(self):
+        return True
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         mean = vae.latents_mean.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
         std = vae.latents_std.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
@@ -40,7 +45,9 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
 
 
 def register():
-    from sglang.multimodal_gen.configs.sample.sana_video2 import SanaVideo2SamplingParams
+    from sglang.multimodal_gen.configs.sample.sana_video2 import (
+        SanaVideo2SamplingParams,
+    )
     from sglang.multimodal_gen.registry import register_configs
 
     register_configs(
@@ -48,6 +55,14 @@ def register():
         pipeline_config_cls=SanaVideo2PipelineConfig,
         hf_model_paths=["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
         model_detectors=[
-            lambda name: any(key in name.lower() for key in ("sana-video_2.0", "sana-video2", "sana_video2"))
+            lambda name: any(
+                key in name.lower()
+                for key in (
+                    "sana-video_2.0",
+                    "sana-video2",
+                    "sana_video2",
+                    "sanavideo2pipeline",
+                )
+            )
         ],
     )

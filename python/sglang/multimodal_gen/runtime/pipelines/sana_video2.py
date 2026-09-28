@@ -2,13 +2,20 @@
 """Native SANA-Video 2.0 loading and T2V/TI2V pipeline."""
 
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 import yaml
 
-from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import ComponentLoader
-from sglang.multimodal_gen.runtime.models.dits.sana_video2 import SanaVideo2Transformer3DModel
-from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import ComposedPipelineBase
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.models.dits.sana_video2 import (
+    SanaVideo2Transformer3DModel,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_video2 import (
     SanaVideo2DenoisingStage,
@@ -31,7 +38,9 @@ class SanaVideo2TransformerLoader(ComponentLoader):
             source = yaml.safe_load(file)
         checkpoint = torch.load(
             root / "checkpoints/SANA_Video_2.0_5B_720p.pth",
-            map_location="cpu", weights_only=True, mmap=True,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
         )["state_dict"]
         config = server_args.pipeline_config.dit_config
         model_fields = config.arch_config.__dataclass_fields__
@@ -57,8 +66,15 @@ class SanaVideo2TransformerLoader(ComponentLoader):
 class SanaVideo2Pipeline(ComposedPipelineBase):
     pipeline_name = "SanaVideo2Pipeline"
     is_video_pipeline = True
-    _required_config_modules = ["text_encoder", "tokenizer", "vae", "transformer"]
-    component_loaders = {"transformer": SanaVideo2TransformerLoader}
+    _required_config_modules: ClassVar[list[str]] = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+    ]
+    component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {
+        "transformer": SanaVideo2TransformerLoader
+    }
 
     def _load_config(self):
         self.model_path = maybe_download_model(
@@ -68,7 +84,9 @@ class SanaVideo2Pipeline(ComposedPipelineBase):
         )
         with (Path(self.model_path) / "config.yaml").open() as file:
             source = yaml.safe_load(file)
-        self.server_args.pipeline_config.prompt_instruction = "\n".join(source["text_encoder"]["chi_prompt"])
+        self.server_args.pipeline_config.prompt_instruction = "\n".join(
+            source["text_encoder"]["chi_prompt"]
+        )
         return {
             "_class_name": self.pipeline_name,
             "_diffusers_version": "0.37.0",
@@ -84,9 +102,13 @@ class SanaVideo2Pipeline(ComposedPipelineBase):
             if module_name == "transformer":
                 return self.model_path
             if module_name == "vae":
-                root = maybe_download_model("Efficient-Large-Model/LTX-2.3-Diffusers", allow_patterns=["vae/**"])
+                root = maybe_download_model(
+                    "Efficient-Large-Model/LTX-2.3-Diffusers", allow_patterns=["vae/**"]
+                )
                 return str(Path(root) / "vae")
-            path = server_args.component_paths.get("text_encoder", "Efficient-Large-Model/gemma-2-2b-it")
+            path = server_args.component_paths.get(
+                "text_encoder", "Efficient-Large-Model/gemma-2-2b-it"
+            )
         path = maybe_download_model(path)
         if module_name == "vae" and (Path(path) / "vae/config.json").is_file():
             path = str(Path(path) / "vae")
@@ -94,10 +116,14 @@ class SanaVideo2Pipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args):
         self.add_stage(InputValidationStage())
-        self.add_stage(SanaVideo2TextEncodingStage(
-            [self.get_module("text_encoder")], [self.get_module("tokenizer")],
-            server_args.pipeline_config.prompt_instruction,
-        ), "prompt_encoding_stage_primary")
+        self.add_stage(
+            SanaVideo2TextEncodingStage(
+                [self.get_module("text_encoder")],
+                [self.get_module("tokenizer")],
+                server_args.pipeline_config.prompt_instruction,
+            ),
+            "prompt_encoding_stage_primary",
+        )
         self.add_stage(SanaVideo2LatentPreparationStage(self.get_module("vae")))
         self.add_stage(SanaVideo2DenoisingStage(self.get_module("transformer")))
         self.add_standard_decoding_stage()

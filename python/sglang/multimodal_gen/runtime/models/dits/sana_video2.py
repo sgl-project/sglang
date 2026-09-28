@@ -7,6 +7,8 @@ import math
 from typing import ClassVar
 
 import torch
+from torch import nn
+from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
@@ -19,8 +21,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _RMSNorm,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from torch import nn
-from torch.nn import functional as F
 
 
 def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:

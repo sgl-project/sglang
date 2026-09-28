@@ -8,10 +8,16 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import ComponentUse
-from sglang.multimodal_gen.runtime.pipelines.sana_video import select_sana_video_prompt_window
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.pipelines.sana_video import (
+    select_sana_video_prompt_window,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import TextEncodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 
 
 def sample_flow_dpm(predict_noise, latents, steps, shift, callback=None):
@@ -39,7 +45,11 @@ def sample_flow_dpm(predict_noise, latents, steps, shift, callback=None):
             lambda_previous = torch.log(1 - previous_time) - torch.log(previous_time)
             ratio = (lambda_s - lambda_previous) / h
             derivative = (1.0 / ratio) * (prediction - previous_prediction)
-            x = t / s * x - alpha_t * phi * prediction - 0.5 * (alpha_t * phi) * derivative
+            x = (
+                t / s * x
+                - alpha_t * phi * prediction
+                - 0.5 * (alpha_t * phi) * derivative
+            )
         previous_time, previous_prediction = s, prediction
         if callback is not None:
             callback(index, times[index + 1], x)
@@ -54,16 +64,22 @@ def sample_ltx_euler(predict_flow, latents, steps, shift, callback=None):
     condition_mask = torch.zeros_like(latents, dtype=torch.float32)
     condition_mask[:, :, 0] = 1
     for index, time in enumerate(scheduler.timesteps):
-        timestep = torch.minimum(time.expand(latents.shape).float(), (1 - condition_mask) * 1000.0)
+        timestep = torch.minimum(
+            time.expand(latents.shape).float(), (1 - condition_mask) * 1000.0
+        )
         prediction = predict_flow(latents, timestep[:, :1, :, :1, :1])
         batch, channels = latents.shape[:2]
-        updated = scheduler.step(
-            -prediction.reshape(batch, channels, -1).transpose(1, 2),
-            time,
-            latents.reshape(batch, channels, -1).transpose(1, 2),
-            per_token_timesteps=timestep.reshape(batch, channels, -1)[:, 0],
-            return_dict=False,
-        )[0].transpose(1, 2).reshape(latents.shape)
+        updated = (
+            scheduler.step(
+                -prediction.reshape(batch, channels, -1).transpose(1, 2),
+                time,
+                latents.reshape(batch, channels, -1).transpose(1, 2),
+                per_token_timesteps=timestep.reshape(batch, channels, -1)[:, 0],
+                return_dict=False,
+            )[0]
+            .transpose(1, 2)
+            .reshape(latents.shape)
+        )
         denoise_mask = time / 1000 - 1e-6 < (1.0 - condition_mask)
         latents = torch.where(denoise_mask, updated, latents).to(latents.dtype)
         if callback is not None:
@@ -83,20 +99,44 @@ class SanaVideo2TextEncodingStage(TextEncodingStage):
         prompts = [batch.prompt] if isinstance(batch.prompt, str) else batch.prompt
         motion = batch.extra.get("motion_score", 10)
         suffix = (
-            f" motion score: {int(motion)}." if motion > 0
-            else "" if motion < 0
-            else " high motion" if batch.extra.get("high_motion", False)
+            f" motion score: {int(motion)}."
+            if motion > 0
+            else ""
+            if motion < 0
+            else " high motion"
+            if batch.extra.get("high_motion", False)
             else " low motion"
         )
         prompts = [self.instruction + prompt.strip() + suffix for prompt in prompts]
-        encoded_length = len(self.tokenizers[0].encode(self.instruction)) + length - 2 if self.instruction else length
-        outputs = list(self.encode_text(prompts, server_args, return_attention_mask=True, max_length=encoded_length))
+        encoded_length = (
+            len(self.tokenizers[0].encode(self.instruction)) + length - 2
+            if self.instruction
+            else length
+        )
+        outputs = list(
+            self.encode_text(
+                prompts,
+                server_args,
+                return_attention_mask=True,
+                max_length=encoded_length,
+            )
+        )
         for index in (0, 1, 3):
-            outputs[index] = [select_sana_video_prompt_window(value, length) for value in outputs[index]]
-        outputs[4] = [[int(value) for value in mask.sum(dim=1).tolist()] for mask in outputs[1]]
+            outputs[index] = [
+                select_sana_video_prompt_window(value, length)
+                for value in outputs[index]
+            ]
+        outputs[4] = [
+            [int(value) for value in mask.sum(dim=1).tolist()] for mask in outputs[1]
+        ]
         self._append_positive_text_outputs(batch, *outputs)
         if batch.do_classifier_free_guidance:
-            negative = self.encode_text(batch.negative_prompt, server_args, return_attention_mask=True, max_length=length)
+            negative = self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                return_attention_mask=True,
+                max_length=length,
+            )
             self._append_negative_text_outputs(batch, outputs[0], *negative)
         return batch
 
@@ -105,11 +145,15 @@ def prepare_image(image, height, width):
     image = image.convert("RGB")
     w, h = image.size
     scale = max(height / h, width / w)
-    resized = image.resize((round(w * scale), round(h * scale)), Image.Resampling.BICUBIC)
-    top = int(round((resized.height - height) / 2.0))
-    left = int(round((resized.width - width) / 2.0))
-    pixels = np.array(resized)[top:top + height, left:left + width].copy()
-    return torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255).sub_(0.5).div_(0.5)
+    resized = image.resize(
+        (round(w * scale), round(h * scale)), Image.Resampling.BICUBIC
+    )
+    top = round((resized.height - height) / 2.0)
+    left = round((resized.width - width) / 2.0)
+    pixels = np.array(resized)[top : top + height, left : left + width].copy()
+    return (
+        torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255).sub_(0.5).div_(0.5)
+    )
 
 
 class SanaVideo2LatentPreparationStage(PipelineStage):
@@ -128,24 +172,38 @@ class SanaVideo2LatentPreparationStage(PipelineStage):
         batch.num_frames = config.adjust_num_frames(batch.num_frames)
         device = batch.prompt_embeds[0].device
         batch_size = batch.prompt_embeds[0].shape[0]
-        shape = config.prepare_latent_shape(batch, batch_size, (batch.num_frames - 1) // 8 + 1)
+        shape = config.prepare_latent_shape(
+            batch, batch_size, (batch.num_frames - 1) // 8 + 1
+        )
         if batch.latents is None:
-            batch.latents = randn_tensor(shape, generator=batch.generator, device=device, dtype=torch.float32)
+            batch.latents = randn_tensor(
+                shape, generator=batch.generator, device=device, dtype=torch.float32
+            )
         else:
             if tuple(batch.latents.shape) != shape:
-                raise ValueError(f"Expected latents with shape {shape}, got {tuple(batch.latents.shape)}")
+                raise ValueError(
+                    f"Expected latents with shape {shape}, got {tuple(batch.latents.shape)}"
+                )
             batch.latents = batch.latents.to(device=device, dtype=torch.float32).clone()
         if batch.condition_image is not None:
-            images = batch.condition_image if isinstance(batch.condition_image, list) else [batch.condition_image]
+            images = (
+                batch.condition_image
+                if isinstance(batch.condition_image, list)
+                else [batch.condition_image]
+            )
             if len(images) == 1:
                 images = images * batch_size
             if len(images) != batch_size:
                 raise ValueError("TI2V requires one conditioning image per prompt")
             self.begin_declared_component_use(component_name="vae", module=self.vae)
-            pixels = torch.stack([prepare_image(image, batch.height, batch.width) for image in images])[:, :, None]
+            pixels = torch.stack(
+                [prepare_image(image, batch.height, batch.width) for image in images]
+            )[:, :, None]
             pixels = pixels.to(device=device, dtype=next(self.vae.parameters()).dtype)
             image_latents = self.vae.encode(pixels).latent_dist.mode()
-            scale, mean = config.get_decode_scale_and_shift(device, image_latents.dtype, self.vae)
+            scale, mean = config.get_decode_scale_and_shift(
+                device, image_latents.dtype, self.vae
+            )
             batch.latents[:, :, :1] = (image_latents - mean) * scale
         return batch
 
@@ -163,7 +221,9 @@ class SanaVideo2DenoisingStage(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch, server_args):
-        self.begin_declared_component_use(component_name="transformer", module=self.transformer)
+        self.begin_declared_component_use(
+            component_name="transformer", module=self.transformer
+        )
         cfg = batch.do_classifier_free_guidance
         embeds = batch.prompt_embeds[0]
         mask = batch.prompt_attention_mask[0]
@@ -193,11 +253,18 @@ class SanaVideo2DenoisingStage(PipelineStage):
                 prediction = uncond + batch.guidance_scale * (cond - uncond)
             return prediction
 
-        steps = max(2, batch.num_inference_steps) if batch.is_warmup else batch.num_inference_steps
+        steps = (
+            max(2, batch.num_inference_steps)
+            if batch.is_warmup
+            else batch.num_inference_steps
+        )
         sampler = sample_ltx_euler if is_ti2v else sample_flow_dpm
         with self.progress_bar(total=steps, batch=batch) as progress:
             batch.latents = sampler(
-                predict, batch.latents, steps, server_args.pipeline_config.flow_shift,
+                predict,
+                batch.latents,
+                steps,
+                server_args.pipeline_config.flow_shift,
                 callback=lambda *_: progress.update(),
             )
         return batch

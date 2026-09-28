@@ -456,8 +456,11 @@ def _get_config_info(
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
-    config = maybe_download_model_index(model_path)
-    pipeline_name = config.get("_class_name", "").lower()
+    pipeline_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_name is None:
+        config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "")
+    pipeline_name = pipeline_name.lower()
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
