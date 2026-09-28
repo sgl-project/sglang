@@ -47,8 +47,8 @@ _PASSTHROUGH_FIELD = "normal"
 _SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
     {_THINKING_FIELD, _CONTENT_FIELD, _TOOL_FIELD}
 )
-# Where an output grammar (JSON tool calls, response_format) takes over from
-# the template, mirroring the reasoning gate of ReasonerGrammarBackend.
+# Where JSON-schema output replaces the template's framing, following the
+# reasoning gate of ReasonerGrammarBackend.
 GRAMMAR_AFTER_REASONING = "after_reasoning"
 GRAMMAR_FROM_START = "from_start"
 
@@ -186,7 +186,7 @@ class ResponseTemplateStreamAdapter:
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
         self._grammar_start = grammar_start
-        # Once an output grammar has taken over, text passes through unparsed.
+        # Once JSON-schema output has started, text passes through unparsed.
         self._verbatim = grammar_start == GRAMMAR_FROM_START
 
     def _start(self, tools: Sequence[Any] | None) -> list[dict]:
@@ -225,9 +225,8 @@ class ResponseTemplateStreamAdapter:
         return self._end_reasoning(events + self._parser.finalize()[1])
 
     def _end_reasoning(self, events: list[dict]) -> list[dict]:
-        """When the output grammar starts after reasoning, stop parsing at the
-        reasoning closer, as the grammar backend does; what follows is passed
-        through unchanged."""
+        # Stop parsing at the reasoning closer, where the grammar backend starts
+        # the JSON schema, and pass the rest through unchanged.
         if self._grammar_start != GRAMMAR_AFTER_REASONING:
             return events
         for index, event in enumerate(events):

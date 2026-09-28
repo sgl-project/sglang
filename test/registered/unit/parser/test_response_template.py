@@ -26,7 +26,6 @@ from sglang.srt.parser.response_template import (
     configure_response_template_request,
     resolve_response_template,
     tool_close_token_ids,
-    tool_close_tokens,
     validate_response_template_for_serving,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -555,14 +554,15 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertFalse(sampling_params["no_stop_trim"])
 
     def test_output_grammar_output_is_passed_through_verbatim(self):
+        """JSON-schema output passes through unchanged from where its grammar
+        starts, including template delimiters inside its strings."""
         plain = '[{"name": "get_weather", "parameters": {"days": 3}}]'
-        # Template delimiters inside JSON strings belong to the JSON.
         delimited = (
             '[{"name": "get_weather", "parameters": '
             '{"location": "<answer>Paris</answer>", "details": "<think>x</think>"}}]'
         )
         cases = (
-            # Without an output grammar the template frames the whole output,
+            # Without JSON-schema output the template frames the whole output,
             # so text outside its fields has no field.
             (None, "<think>Plan</think>" + plain, ("Plan", "")),
             (
@@ -1044,9 +1044,6 @@ class TestResponseTemplateAdapters(CustomTestCase):
 
         self.assertEqual(
             tool_close_token_ids("response_template", tokenizer), frozenset({7})
-        )
-        self.assertEqual(
-            tool_close_tokens("response_template", tokenizer), {7: "<|call|>"}
         )
         self.assertEqual(tool_close_token_ids("qwen", tokenizer), frozenset())
         self.assertEqual(

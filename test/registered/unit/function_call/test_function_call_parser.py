@@ -4048,6 +4048,8 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(result.normal_text, "")
 
     def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
         text = (
             '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
             '{"name": "search", "parameters": {"query": "restaurants"}}]'

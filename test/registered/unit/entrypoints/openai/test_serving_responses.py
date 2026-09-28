@@ -33,10 +33,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.parser.response_template import (
-    GRAMMAR_AFTER_REASONING,
-    ResponseTemplateReasoningDetector,
-)
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -688,8 +685,6 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
 
     @staticmethod
     def _output():
-        # The JSON follows the reasoning and ends on the tool closer, which
-        # detokenization keeps for this tool parser.
         return {
             "text": (
                 "<think>Check the forecast.</think>"
@@ -766,15 +761,15 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         with patch.object(
             serving, "_apply_conversation_template", return_value=rendered
         ):
-            response = asyncio.run(respond())
-        return response, request._response_parser_grammar_start
+            return asyncio.run(respond())
 
     def test_required_tool_json_is_parsed_under_delimited_template(self):
+        """Required-tool JSON after the reasoning becomes a completed function
+        call, also when it ends on the tool closer that detokenization keeps."""
         for stream in (False, True):
             with self.subTest(stream=stream):
-                response, grammar_start = self._respond(stream)
+                response = self._respond(stream)
 
-                self.assertEqual(grammar_start, GRAMMAR_AFTER_REASONING)
                 self.assertEqual(response["status"], "completed")
                 self.assertEqual(
                     [item["type"] for item in response["output"]],

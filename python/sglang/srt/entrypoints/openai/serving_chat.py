@@ -130,7 +130,6 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
-_OUTPUT_CONSTRAINT_PARAMS = ("json_schema", "regex", "ebnf", "structural_tag")
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -1317,12 +1316,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest | ResponsesRequest,
         adapted_request: GenerateReqInput,
     ) -> None:
-        """Give response-template parsers the rendered assistant prefill, and
-        where an output grammar takes over from the template: after the
-        reasoning when the grammar backend gates on it, else from the start.
-
-        The scheduler gates the grammar only when the reasoning parser's
-        think_end_token encodes to token ids, so this checks the same."""
+        """Give response-template parsers the rendered assistant prefill."""
         prefix = adapted_request.text
         if not isinstance(prefix, str) and adapted_request.input_ids:
             prefix = self.tokenizer_manager.tokenizer.decode(
@@ -1331,8 +1325,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 spaces_between_special_tokens=False,
             )
         request._response_parser_prefix = prefix or ""
-        sampling_params = adapted_request.sampling_params or {}
-        if any(sampling_params.get(name) for name in _OUTPUT_CONSTRAINT_PARAMS):
+        # Structural tags, regex and EBNF can describe the template's own
+        # framing, so only JSON-schema output bypasses the template.
+        if (adapted_request.sampling_params or {}).get("json_schema"):
+            # The scheduler defers the grammar to the reasoning's end only when
+            # the reasoning parser's think_end_token encodes to token ids.
             reasoning_gated = (
                 adapted_request.require_reasoning
                 and self._reasoning_detector is not None
@@ -1352,11 +1349,8 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: dict[str, Any] | None,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> str:
-        """Trim a tool-call closer that detokenization kept as the matched stop.
-
-        The closer is kept so the tool parser can tell a finished call from a
-        cut-off one. Under an output grammar the model writes no native call, so
-        the closer is only the stop token and is dropped like any other."""
+        # Detokenization keeps a tool-call closer that stops generation; after
+        # JSON-schema output it ends no native call, so trim it like any stop.
         if (
             not text
             or request._response_parser_grammar_start is None

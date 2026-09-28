@@ -43,9 +43,8 @@ class JsonArrayParser(BaseFormatDetector):
         return super().parse_streaming_increment(new_text, tools)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        """Stream the arguments still owed when the stream ends: an increment
-        emits a call's name before its arguments, so a call that arrived whole
-        in the last chunk has only its name out."""
+        # An increment sends a call's name before its arguments, so drain the
+        # arguments of calls that arrived whole in the last chunk.
         normal_text, calls = "", []
         while True:
             result = self.parse_streaming_increment("", tools)

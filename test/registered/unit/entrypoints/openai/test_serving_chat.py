@@ -797,10 +797,10 @@ class ServingChatTestCase(unittest.TestCase):
             return self.chat._convert_to_internal_request(request)
 
     def test_response_template_parser_context_records_grammar_start(self):
+        """JSON-schema output starts after the reasoning only when the grammar
+        backend waits for it, which a pattern-only reasoning closer cannot."""
         named = {"type": "function", "function": {"name": "get_weather"}}
         required = {"tools": [_WEATHER_TOOL], "tool_choice": "required"}
-        # A pattern closer has no think_end_token to encode, so the grammar
-        # backend does not wait for the reasoning to end.
         pattern_closed = {
             **_DELIMITED_RESPONSE_TEMPLATE,
             "fields": {
@@ -842,12 +842,12 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertEqual(request._response_parser_grammar_start, grammar_start)
 
     def test_required_tool_json_is_parsed_under_delimited_template(self):
+        """Required-tool JSON after the reasoning becomes the call, also when it
+        ends on the tool closer that detokenization keeps."""
         payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
         for reasoning_parser in (None, "response_template"):
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
-            # The JSON follows the reasoning and may end on the tool closer,
-            # which detokenization keeps for this tool parser.
             text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
             text += "</call>"
             for stream in (False, True):
@@ -860,14 +860,6 @@ class ServingChatTestCase(unittest.TestCase):
                             tools=[_WEATHER_TOOL],
                             tool_choice="required",
                             stream=stream,
-                        ),
-                    )
-                    self.assertEqual(
-                        request._response_parser_grammar_start,
-                        (
-                            GRAMMAR_AFTER_REASONING
-                            if reasoning_parser
-                            else GRAMMAR_FROM_START
                         ),
                     )
                     if stream:
@@ -920,6 +912,53 @@ class ServingChatTestCase(unittest.TestCase):
                     self.assertEqual(got_reasoning, reasoning)
                     self.assertEqual(content, "")
                     self.assertEqual(finish_reasons, ["tool_calls"])
+
+    def test_native_output_under_other_constraints_is_parsed_by_the_template(self):
+        """A structural tag, regex or EBNF can spell the template's own framing,
+        so its content and a call ending on the kept tool closer still parse."""
+        native = '<answer>Sunny</answer><call:get_weather>{"city": "Paris"}</call>'
+        structural_tag = {
+            "type": "structural_tag",
+            "structures": [
+                {
+                    "begin": "<call:get_weather>",
+                    "schema": _WEATHER_TOOL["function"]["parameters"],
+                    "end": "</call>",
+                }
+            ],
+            "triggers": ["<call:"],
+        }
+        regex = "<answer>[^<]+</answer><call:get_weather>[^<]+</call>"
+        ebnf = 'root ::= "<answer>" [^<]+ "</answer><call:get_weather>" [^<]+ "</call>"'
+        constraints = {
+            "structural_tag": {"response_format": structural_tag},
+            "regex": {"regex": regex},
+            "ebnf": {"ebnf": ebnf},
+        }
+        self._use_delimited_response_template("response_template")
+        for name, fields in constraints.items():
+            with self.subTest(name):
+                _, request = self._convert_rendered_as(
+                    "<assistant>",
+                    ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Weather?"}],
+                        tools=[_WEATHER_TOOL],
+                        **fields,
+                    ),
+                )
+                output = self._stopped_on_token("<think>Plan</think>" + native, 7)
+                choice = self.chat._build_chat_response(request, [output], 0).choices[0]
+                (call,) = choice.message.tool_calls
+                self.assertEqual(
+                    (choice.message.reasoning_content, choice.message.content),
+                    ("Plan", "Sunny"),
+                )
+                self.assertEqual(
+                    (call.function.name, json.loads(call.function.arguments)),
+                    ("get_weather", {"city": "Paris"}),
+                )
+                self.assertEqual(choice.finish_reason, "tool_calls")
 
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
