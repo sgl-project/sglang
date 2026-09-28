@@ -26,6 +26,7 @@ from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_dcp_context,
     draft_pp_context,
     draft_tp_context,
     get_plan_stream,
@@ -76,7 +77,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # whose MoE gates run during construction; the scope routes their
         # fusion decision to the speculative leaf (it does not swap
         # runner_backend — the draft's forwards run outside that context).
-        with draft_pp_context(), draft_model_build_scope():
+        with draft_pp_context(), draft_dcp_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -128,6 +129,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
     def init_attention_backends(self):
         with (
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,
@@ -138,6 +140,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
     def init_cuda_graphs(self):
         with (
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,

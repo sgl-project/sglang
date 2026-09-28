@@ -104,6 +104,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_dcp_context,
     draft_pp_context,
     draft_tp_context,
     fast_sample,
@@ -276,6 +277,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with (
             ctx,
             draft_pp_context(),
+            draft_dcp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             draft_model_build_scope(),
@@ -338,6 +340,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,
@@ -351,6 +354,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner.tp_group,
                 owns_attention=self.draft_owns_attention,

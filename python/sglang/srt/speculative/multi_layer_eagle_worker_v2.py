@@ -81,6 +81,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_dcp_context,
     draft_pp_context,
     draft_tp_context,
     get_plan_stream,
@@ -162,6 +163,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Load draft model weights only.
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             speculative_moe_backend_context(),
             draft_model_build_scope(),
         ):
@@ -221,6 +223,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner_list[0].tp_group,
                 owns_attention=self.draft_owns_attention,
@@ -232,6 +235,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
+            draft_dcp_context(),
             self.draft_tp_context(
                 self.draft_runner_list[0].tp_group,
                 owns_attention=self.draft_owns_attention,
