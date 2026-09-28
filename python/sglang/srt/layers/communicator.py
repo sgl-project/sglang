@@ -75,8 +75,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
     get_spec,
@@ -520,6 +522,9 @@ def tp_reduce_scatter(
 
 
 class LayerCommunicator:
+    # Communicators built without __init__ (e.g. test doubles) publish no LoRA layout.
+    _publish_lora_layout: bool = False
+
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
@@ -551,6 +556,10 @@ class LayerCommunicator:
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
+        )
+        # LoRA kernels need the per-layer token layout only under DP attention.
+        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
+            get_lora().enable_lora
         )
 
         # Under LayerNorm SP the norm/residual run on the sequence shard with no
@@ -658,6 +667,23 @@ class LayerCommunicator:
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
 
+    def publish_attn_lora_layout(self) -> None:
+        """Attention consumes the DP-local token batch."""
+        if self._publish_lora_layout:
+            get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
+
+    def publish_mlp_lora_layout(self) -> None:
+        """The MLP consumes the TP-global batch only after a FULL DP gather."""
+        if self._publish_lora_layout:
+            get_forward().set(
+                "lora_batch_layout",
+                (
+                    LoRABatchLayout.TP_GLOBAL
+                    if self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
+                    else LoRABatchLayout.DP_LOCAL
+                ),
+            )
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -666,6 +692,8 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        self.publish_attn_lora_layout()
+
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
         # the next one.
@@ -868,6 +896,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        self.publish_mlp_lora_layout()
         if self._sp_variant is not None and get_forward().sp_active:
             return self._sp_variant.prepare_mlp(
                 hidden_states, residual, forward_batch, cache

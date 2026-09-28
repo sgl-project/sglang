@@ -232,6 +232,8 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         quant_format: str = "",
         post_residual_addition=None,
     ):
+        # The fused paths below return without reaching LayerCommunicator.prepare_attn.
+        self.publish_attn_lora_layout()
         if isinstance(hidden_states, Qwen35MoeFinalizeHandoff):
             if not self.should_use_finalize(forward_batch, hidden_states.m):
                 raise RuntimeError("received deferred MoE output on an ineligible path")
@@ -260,6 +262,8 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        # The fused path below returns without reaching LayerCommunicator.prepare_mlp.
+        self.publish_mlp_lora_layout()
         if cache is not None:
             self._context.cache = cache
         if self.should_use_all_reduce_rms_norm(

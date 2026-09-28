@@ -676,8 +676,8 @@ def _merged_experts_fused_moe_lora_add_impl(
     # hard-to-attribute CUDA IMA — fail loudly on the host instead.
     assert token_lora_mapping.shape[0] >= topk_ids.shape[0], (
         f"token_lora_mapping covers {token_lora_mapping.shape[0]} tokens but the MoE runs on "
-        f"{topk_ids.shape[0]} (DP-gathered?) tokens; mapping was sized before the dp gather "
-        f"length was known (see get_gathered_moe_num_tokens)"
+        f"{topk_ids.shape[0]} (DP-gathered?) tokens; under DP attention the mapping must "
+        f"come from the TP-global LoRA routing view (LoRABatchLayout.TP_GLOBAL)"
     )
     # Split-K atomic additions must accumulate before rounding to the activation dtype.
     intermediate = torch.zeros(
