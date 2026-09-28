@@ -637,7 +637,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = row_lens_gpu
+        locs = batch.encoder_lens + seq_lens_gpu
     else:
         locs = seq_lens_gpu.clone()
 
