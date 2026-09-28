@@ -467,6 +467,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
     param_names_mapping = {}
+    _supports_dpcache = True
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)
@@ -527,6 +528,37 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         start, end = rank * local_len, (rank + 1) * local_len
         images = self.img_in(hidden_states[:, start:end])
         temb = self.time_text_embed((timestep.to(images.dtype) / 1000), images.dtype)
+        images = self.dpcache_blocks(
+            lambda: self._forward_blocks(
+                images,
+                temb,
+                timestep,
+                encoder_hidden_states,
+                layouts,
+                condition_latents,
+                prefix_caches,
+                start,
+                end,
+            )
+        )
+        output = self.proj_out(self.norm_out(images, temb))
+        if sp > 1:
+            output = sequence_model_parallel_all_gather(output, dim=1)
+        return output
+
+    def _forward_blocks(
+        self,
+        images,
+        temb,
+        timestep,
+        encoder_hidden_states,
+        layouts,
+        condition_latents,
+        prefix_caches,
+        start,
+        end,
+    ):
+        """Run every transformer block; returns the final feature before norm_out."""
         modulation = self.prepare_modulation(temb)
         prefix_modulation = None
         if prefix_caches is None or any(not cache[0] for cache in prefix_caches):
@@ -564,10 +596,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
             )
-        output = self.proj_out(self.norm_out(images, temb))
-        if sp > 1:
-            output = sequence_model_parallel_all_gather(output, dim=1)
-        return output
+        return images
 
 
 EntryClass = QwenImage21Transformer2DModel

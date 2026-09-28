@@ -3,11 +3,11 @@ title: "Caching Acceleration"
 description: "Compare caching acceleration strategies for diffusion models."
 tag: "approx"
 ---
-SGLang provides three complementary caching strategies for Diffusion Transformer (DiT) models. All reduce denoising cost by skipping redundant computation, but they operate at different levels.
+SGLang provides four complementary caching strategies for Diffusion Transformer (DiT) models. All reduce denoising cost by skipping redundant computation, but they operate at different levels.
 
 ## Overview
 
-SGLang supports three complementary caching approaches:
+SGLang supports four complementary caching approaches:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -42,6 +42,12 @@ SGLang supports three complementary caching approaches:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timestep-level</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Forecast DiT features to skip selected denoising steps</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental, model-validated tuning</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DPCache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timestep-level</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Run full compute on calibrated key steps; predict the rest</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opted-in DiTs (currently Qwen-Image 2.1), when you can calibrate offline</td>
     </tr>
   </tbody>
 </table>
@@ -100,8 +106,20 @@ approximate and currently applies only to selected native implementation paths.
 See [Spectrum Acceleration](./spectrum) for supported model families,
 constraints, and request controls.
 
+## DPCache
+
+An offline dynamic program selects the key steps that run full computation. At
+the remaining steps, DPCache bypasses transformer computation and predicts the
+final transformer-block feature instead, while retaining every scheduler update.
+It is approximate, opt-in per request, and needs a schedule artifact you
+calibrate yourself; SGLang ships none.
+
+See [DPCache](./dpcache) for the supported configuration, the schedule format,
+and the calibration API.
+
 
 ## References
 
 - [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
 - [TeaCache Paper](https://arxiv.org/abs/2411.14324)
+- [DPCache Paper](https://arxiv.org/abs/2602.22654)

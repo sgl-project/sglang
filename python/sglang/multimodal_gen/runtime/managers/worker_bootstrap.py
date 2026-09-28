@@ -48,14 +48,26 @@ _PRE_ACTIVATION_MODULES = (
 _MAX_REPORTED_MODULES = 5
 
 
+def _is_namespace_package(module: object) -> bool:
+    # A namespace package runs no code. `python -m sglang.multimodal_gen.tools.x`
+    # imports sglang.multimodal_gen.tools, which has no __init__, in every child.
+    spec = getattr(module, "__spec__", None)
+    return (
+        spec is not None
+        and spec.origin is None
+        and spec.submodule_search_locations is not None
+    )
+
+
 def _warn_if_runtime_imported_early() -> None:
     """Name the modules that this child imported ahead of its own lifecycle."""
     early = sorted(
         name
-        for name in list(sys.modules)
+        for name, module in list(sys.modules.items())
         if name.startswith(_DIFFUSION_PREFIX)
         and name not in _RUNTIME_NAMESPACES
         and not name.startswith(_PRE_ACTIVATION_MODULES)
+        and not _is_namespace_package(module)
     )
     if not early:
         return
