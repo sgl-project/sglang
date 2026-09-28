@@ -29,7 +29,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    replicated_draft_pool_scale,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -108,7 +111,7 @@ def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
     draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
     if draft_layers is None or int(draft_layers) <= 0:
         return 0
-    return int(draft_layers) * get_parallel().attn_dcp_size
+    return int(draft_layers) * replicated_draft_pool_scale()
 
 
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
@@ -119,7 +122,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * get_parallel().attn_dcp_size
+    return int(cell_size) * replicated_draft_pool_scale()
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -259,7 +262,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # The draft pool is replicated, not sharded, across DCP ranks.
                     self._cell_size += (
                         draft_kv_size + draft_indexer_size
-                    ) * get_parallel().attn_dcp_size
+                    ) * replicated_draft_pool_scale()
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + eagle_draft_layers / int(num_layers))
@@ -282,7 +285,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
+                    * replicated_draft_pool_scale(),
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
@@ -683,10 +686,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_full_layers_num
                 )
                 # The draft pool spans the widened loc space: replicated per DCP rank.
-                dcp = get_parallel().attn_dcp_size
-                self._draft_full_layers_num *= dcp
-                self._draft_swa_layers_num *= dcp
-                self._draft_swa_full_layers_num *= dcp
+                scale = replicated_draft_pool_scale()
+                self._draft_full_layers_num *= scale
+                self._draft_swa_layers_num *= scale
+                self._draft_swa_full_layers_num *= scale
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 

@@ -14,6 +14,16 @@ def get_alloc_page_size() -> int:
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
+def replicated_draft_pool_scale() -> int:
+    """How much wider a replicated draft pool is than a per-rank target pool.
+
+    The draft takes --speculative-dcp-size of the target's stripe -- only 1
+    today, no stripe at all -- and indexes the allocator's virtual locs raw, so
+    one symbol sizes both its span and its byte budget.
+    """
+    return get_parallel().attn_dcp_size // get_spec().speculative_dcp_size
+
+
 def get_alloc_len_per_decode() -> int:
     """KV length one request may allocate in a single decode step.
 
