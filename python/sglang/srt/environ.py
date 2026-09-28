@@ -1564,6 +1564,10 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Query rows across the prefill batch, not historical context length.
+    SGLANG_DSV41_PACKED_PREFILL = EnvBool(False)
+    SGLANG_DSV41_PACKED_PREFILL_MIXED_MIN_ROWS = EnvInt(4096)
+    SGLANG_DSV41_PACKED_PREFILL_SWA_MIN_ROWS = EnvInt(512)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

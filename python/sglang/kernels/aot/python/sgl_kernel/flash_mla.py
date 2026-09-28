@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    from sgl_kernel import flashmla_ops  # noqa: F401; registers TORCH extension
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -340,3 +340,46 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length
     )
     return results
+
+
+def flash_mla_packed_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    sm_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """16-head BF16 prefill; output, max_logits and log2 LSE, excluding sink.
+
+    q is [tokens, 16, 512], kv is [history, 1, 512], indices is int32
+    [tokens, 128 or 640], topk_length is int32 [tokens], and sink is float32
+    [16]. Only a 148-SM B200 is qualified. Callers own size-based dispatch.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    return tuple(
+        torch.ops.sgl_kernel.packed_sparse_prefill_fwd.default(
+            q, kv, indices, topk_length, sm_scale, attn_sink
+        )
+    )
+
+
+def flash_mla_packed_sparse_output(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    sm_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """16-head BF16 prefill output without converting auxiliary statistics.
+
+    Input requirements match ``flash_mla_packed_sparse_fwd``. Native validation
+    applies to both entry points.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    return torch.ops.sgl_kernel.packed_sparse_prefill_output.default(
+        q, kv, indices, topk_length, sm_scale, attn_sink
+    )
