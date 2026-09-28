@@ -831,9 +831,19 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
 class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToKVPool):
     """DSA latent and indexer caches sharing one logical-page shard plan.
 
-    The indexer keeps its native page layout: all FP8 keys followed by all
-    FP32 scales in each uint8 page. Prefix gathers copy complete packed pages;
-    chunk stores stage every token and persist only the owning rank's tokens.
+    The buffers use different units along their first dimension:
+    - Latent KV: [num_tokens, 1, kv_cache_dim], one token per row.
+    - Indexer: [num_pages, page_size * (128 + 4)] in uint8, one page per row.
+      Each page packs all 128-element FP8 keys first, followed by one FP32
+      scale per token. With page_size=64, one indexer row contains 8448 bytes.
+
+    For example, local page 2 corresponds to latent rows 128..191 but indexer
+    row 2 when page_size=64. The ``_gather_send_rows`` hook therefore selects
+    ``_send_rows`` for latent KV and ``_send_pages`` for the indexer, letting
+    the shared gather compute rank offsets and block sizes in the correct
+    units while retaining the same page ownership order and scratch plan.
+    Prefix gathers copy complete packed indexer pages; chunk stores stage
+    every token and persist only the owning rank's tokens.
 
     ``get_index_k_continuous``, ``get_index_k_scale_continuous``, and
     ``get_index_k_scale_buffer`` accept logical page IDs during an active
