@@ -162,9 +162,4 @@ mkdir -p cann-custom-ops
 rm -rf cann-custom-ops
 
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-# The upstream metadata pins memfabric to single versions (memfabric-hybrid==1.1.4 and
-# memfabric-zbal==1.1.2; the latter publishes no cp312 wheel), while this script installs the
-# per-device versions above. Strip any memfabric pin so pip neither pulls a different build nor
-# fails on a version without a wheel for this Python. No-op once the pins are gone from the file.
-sed -i '/"memfabric-/d' python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]"
