@@ -60,14 +60,11 @@ def handle_moe_kernel_config(server_args: Any):
             cfg.tp_size,
         ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if view.quantization == "w4afp8":
-            if view.moe_a2a_backend not in ("none", "deepep"):
-                raise ValueError(
-                    "FlashInfer W4AFP8 supports A2A backends none or deepep only."
-                )
-            if view.moe_a2a_backend == "deepep":
-                if view.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
-                    raise ValueError("FlashInfer W4AFP8 DeepEP requires BF16 dispatch.")
+        if view.quantization == "w4afp8" and view.moe_a2a_backend != "none":
+            raise ValueError(
+                "FlashInfer W4AFP8 supports only --moe-a2a-backend none. "
+                "For DeepEP, use --moe-runner-backend cutlass."
+            )
 
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
@@ -301,13 +298,6 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "deepep":
-        if (
-            cfg.moe_runner_backend == "flashinfer_cutlass"
-            and cfg.enable_single_batch_overlap
-        ):
-            raise ValueError(
-                "FlashInfer CUTLASS DeepEP does not support single-batch overlap signals."
-            )
         if cfg.moe_runner_backend == "flashinfer_cutedsl":
             if cfg.deepep_mode == "auto":
                 declare_resolution(
