@@ -3741,15 +3741,17 @@ class TestBeamOverrides(CustomTestCase):
                         {},
                     )
 
-    def test_quantized_beam_defaults_to_trtllm_moe_on_blackwell(self):
-        """Quantized BeamMoE rejects auto, so auto must resolve to
-        flashinfer_trtllm; BF16 and explicit choices keep their backend."""
+    def test_nvfp4_beam_defaults_to_trtllm_moe_on_blackwell(self):
+        """Only NVFP4 needs TRTLLM; BF16, FP8 and explicit choices keep their backend."""
         from sglang.srt.arg_groups.model_overrides.beam import _beam_overrides
 
         bf16 = SimpleNamespace(architectures=["BeamForCausalLM"])
         nvfp4 = SimpleNamespace(
             architectures=["BeamForCausalLM"],
-            quantization_config={"quant_method": "compressed-tensors"},
+            quantization_config={
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+            },
         )
         trtllm = {"moe_runner_backend": "flashinfer_trtllm"}
         cases = [
@@ -3759,6 +3761,29 @@ class TestBeamOverrides(CustomTestCase):
             (nvfp4, {"moe_runner_backend": "flashinfer_cutlass"}, {}),
             (nvfp4, {"moe_a2a_backend": "deepep"}, {}),
         ]
+        for method in ("fp8", "w8a8_fp8", "modelopt_fp8"):
+            cases.extend(
+                [
+                    (_hf(method), {}, {}),
+                    (bf16, {"quantization": method}, {}),
+                    (nvfp4, {"quantization": method}, {}),
+                ]
+            )
+        for method in ("compressed-tensors", "compressed_tensors"):
+            for fmt, expected in (
+                ("float-quantized", {}),
+                ("nvfp4-pack-quantized", trtllm),
+            ):
+                hf_config = SimpleNamespace(
+                    quantization_config={"quant_method": method, "format": fmt}
+                )
+                cases.append((hf_config, {}, expected))
+                cases.append((hf_config, {"quantization": method}, expected))
+        for algo, expected in (("FP8", {}), ("NVFP4", trtllm)):
+            hf_config = SimpleNamespace(
+                quantization_config={"quant_method": "modelopt", "quant_algo": algo}
+            )
+            cases.append((hf_config, {}, expected))
         # Pin the attention backend so only the MoE decision is compared.
         pinned = {"attention_backend": "flashinfer"}
         with override_platform(is_sm100=True):

@@ -71,7 +71,7 @@ class TestBeamNvfp4(CustomTestCase):
             BeamForCausalLM(BeamConfig(), quant_config=modelopt_quant_config())
 
     def test_other_quantization_is_rejected(self):
-        quant = SimpleNamespace(get_name=lambda: "fp8", quant_format=None)
+        quant = SimpleNamespace(get_name=lambda: "awq", quant_format=None)
         with (
             get_context().override_server_args(attention_backend="trtllm_mha"),
             self.assertRaisesRegex(NotImplementedError, "W4A4 NVFP4"),
@@ -110,7 +110,7 @@ class TestBeamNvfp4(CustomTestCase):
 
     def test_nvfp4_routes_with_deepseek_grouping_and_one_scale(self):
         config = BeamConfig(hidden_size=16, num_experts=16, moe_intermediate_size=16)
-        quant = Mock()
+        quant = nvfp4_quant_config()
         factory = Mock(return_value=torch.nn.Identity())
         with (
             get_context().override_server_args(
@@ -170,7 +170,7 @@ class TestBeamNvfp4(CustomTestCase):
             ),
             self.assertRaisesRegex(ValueError, "flashinfer_trtllm for NVFP4"),
         ):
-            BeamMoE(config, 0, quant_config=Mock())
+            BeamMoE(config, 0, quant_config=nvfp4_quant_config())
 
 
 if __name__ == "__main__":

@@ -158,14 +158,15 @@ class BeamMoE(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
+        is_nvfp4 = quant_config is not None and is_serialized_w4a4_nvfp4(quant_config)
         supported_runner = (
             backend.is_flashinfer_trtllm()
-            if quant_config is not None
+            if is_nvfp4
             else backend.is_auto() or backend.is_triton()
         )
         if not supported_runner or not get_moe_a2a_backend().is_none():
             raise ValueError(
-                "Beam supports the auto or triton MoE runner for BF16 and "
+                "Beam supports the auto or triton MoE runner for BF16/FP8 and "
                 "flashinfer_trtllm for NVFP4, with no MoE all-to-all"
             )
         self.gate = ReplicatedLinear(
@@ -189,16 +190,12 @@ class BeamMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             # The TRTLLM NVFP4 runner routes inside the kernel (DeepSeek-V3
             # grouping) and applies the routed scale once there.
-            routed_scaling_factor=(
-                config.routed_scaling_factor if quant_config is not None else None
-            ),
+            routed_scaling_factor=(config.routed_scaling_factor if is_nvfp4 else None),
             # Routing materialized for one-token compile reaches the routed
             # kernel, which applies no routed scale; carry it in the weights.
-            apply_routed_scaling_factor_on_output=quant_config is not None,
+            apply_routed_scaling_factor_on_output=is_nvfp4,
             output_format=(
-                TopKOutputFormat.BYPASSED
-                if quant_config is not None
-                else TopKOutputFormat.STANDARD
+                TopKOutputFormat.BYPASSED if is_nvfp4 else TopKOutputFormat.STANDARD
             ),
         )
         # Keep normalized routing coefficients in FP32. The runner applies the
@@ -515,9 +512,17 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if quant_config is not None and not is_serialized_w4a4_nvfp4(quant_config):
+        if (
+            quant_config is not None
+            and not is_serialized_w4a4_nvfp4(quant_config)
+            and quant_config.get_name() not in ("fp8", "w8a8_fp8", "modelopt_fp8")
+            and not (
+                quant_config.get_name() == "compressed_tensors"
+                and getattr(quant_config, "quant_format", None) == "float-quantized"
+            )
+        ):
             raise NotImplementedError(
-                "Beam supports BF16 or serialized W4A4 NVFP4 weights from "
+                "Beam supports BF16, FP8, or serialized W4A4 NVFP4 weights from "
                 "compressed-tensors or ModelOpt"
             )
         if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
@@ -610,9 +615,8 @@ class BeamForCausalLM(nn.Module):
             ):
                 continue
             if (
-                name in ("model.norm.weight", "lm_head.weight")
-                and not self.model.pp_group.is_last_rank
-            ):
+                name == "model.norm.weight" or name.startswith("lm_head.")
+            ) and not self.model.pp_group.is_last_rank:
                 continue
             for source, target, shard_id in packed_projections:
                 if source in name:

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from compressed_tensors.quantization import preset_name_to_scheme
 
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.model_config import (
@@ -18,12 +19,19 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
     BeamForCausalLM,
     BeamModel,
     BeamMoE,
+    BeamUnquantizedFusedMoEMethod,
     apply_attention_gate,
     apply_ssmax,
     depth_scaled_residual,
@@ -70,6 +78,21 @@ def loader_model(params):
     )
     model.named_parameters = lambda: iter(params.items())
     return model
+
+
+def fp8_config(preset="FP8_DYNAMIC", ignore=()):
+    return CompressedTensorsConfig.from_config(
+        {
+            "format": "float-quantized",
+            "config_groups": {
+                preset: preset_name_to_scheme(
+                    preset, targets=["Linear", "lm_head"]
+                ).model_dump()
+            },
+            "ignore": list(ignore),
+            "packed_modules_mapping": BeamForCausalLM.packed_modules_mapping,
+        }
+    )
 
 
 class _LoadedExpert:
@@ -540,6 +563,217 @@ class TestBeamLoading(CustomTestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
+
+    def test_fp8_model_uses_shared_methods_and_loads_scales(self):
+        config = tiny_config(
+            vocab_size=64,
+            num_hidden_layers=2,
+            layer_types=["full_attention"] * 2,
+            mlp_layer_types=["dense", "sparse"],
+        )
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+        for quant in (
+            None,
+            Fp8Config(),
+            W8A8Fp8Config(),
+            Fp8Config(is_checkpoint_fp8_serialized=True),
+            Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static"),
+            W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
+            ModelOptFp8Config(
+                is_checkpoint_fp8_serialized=True,
+                packed_modules_mapping=BeamForCausalLM.packed_modules_mapping,
+            ),
+            fp8_config(),
+            fp8_config("FP8"),
+        ):
+            with (
+                self.subTest(quant=quant),
+                get_parallel().override(
+                    tp_rank=0,
+                    tp_size=1,
+                    attn_tp_rank=0,
+                    attn_tp_size=1,
+                    moe_tp_rank=0,
+                    moe_tp_size=1,
+                    moe_ep_rank=0,
+                    moe_ep_size=1,
+                    pp_group=SimpleNamespace(
+                        is_first_rank=True,
+                        is_last_rank=True,
+                        rank_in_group=0,
+                        world_size=1,
+                    ),
+                ),
+                # Exercise real allocation and loaders without executing CUDA kernels.
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            ):
+                model = BeamForCausalLM(config, quant_config=quant)
+                dense, sparse = model.model.layers
+                experts = sparse.mlp.experts
+                serialized = quant is not None and getattr(
+                    quant, "is_checkpoint_fp8_serialized", True
+                )
+                dtype = torch.float8_e4m3fn if serialized else torch.bfloat16
+                for layer in (dense, sparse):
+                    for proj in ("qkv_proj", "gate_proj", "o_proj"):
+                        self.assertEqual(
+                            getattr(layer.self_attn, proj).weight.dtype, dtype
+                        )
+                for param in (
+                    dense.mlp.gate_up_proj.weight,
+                    dense.mlp.down_proj.weight,
+                ):
+                    self.assertEqual(param.dtype, dtype)
+                # W8A8 quantizes experts as they load, so it allocates FP8 up front.
+                expert_dtype = (
+                    torch.float8_e4m3fn if isinstance(quant, W8A8Fp8Config) else dtype
+                )
+                self.assertEqual(experts.w13_weight.dtype, expert_dtype)
+                self.assertEqual(experts.w2_weight.dtype, expert_dtype)
+                self.assertEqual(model.model.embed_tokens.weight.dtype, torch.bfloat16)
+                self.assertEqual(sparse.mlp.gate.weight.dtype, torch.float32)
+                self.assertEqual(
+                    sparse.mlp.gate.e_score_correction_bias.dtype, torch.float32
+                )
+                self.assertEqual(
+                    experts.moe_runner_config.routed_scaling_factor,
+                    config.routed_scaling_factor,
+                )
+                self.assertEqual(
+                    sparse.mlp.topk.topk_config.output_format, TopKOutputFormat.STANDARD
+                )
+                self.assertIsNone(sparse.mlp.topk.topk_config.routed_scaling_factor)
+                self.assertFalse(
+                    sparse.mlp.topk.topk_config.apply_routed_scaling_factor_on_output
+                )
+                if quant is None:
+                    self.assertIsInstance(
+                        experts.quant_method, BeamUnquantizedFusedMoEMethod
+                    )
+                    self.assertIsNone(experts.quant_method._torch_compile_forward(1))
+                    continue
+                self.assertNotIsInstance(
+                    experts.quant_method, BeamUnquantizedFusedMoEMethod
+                )
+                if not serialized:
+                    continue
+                channelwise = isinstance(quant, W8A8Fp8Config) or (
+                    isinstance(quant, CompressedTensorsConfig)
+                    and "FP8_DYNAMIC" in quant.config["config_groups"]
+                )
+                weights = []
+                for name, width, value in (
+                    ("0.self_attn.q_proj", 384, 1),
+                    ("0.self_attn.k_proj", 64, 2),
+                    ("0.self_attn.v_proj", 64, 3),
+                    ("0.mlp.gate_proj", 32, 4),
+                    ("0.mlp.up_proj", 32, 5),
+                    ("1.mlp.experts.0.gate_proj", 32, 6),
+                    ("1.mlp.experts.0.up_proj", 32, 7),
+                ):
+                    prefix = f"model.layers.{name}"
+                    weights.append(
+                        (
+                            f"{prefix}.weight",
+                            torch.full((width, 24), value, dtype=dtype),
+                        )
+                    )
+                    weights.append(
+                        (
+                            f"{prefix}.weight_scale",
+                            torch.full(
+                                (width, 1) if channelwise else (1,),
+                                value / 16,
+                                dtype=torch.float32,
+                            ),
+                        )
+                    )
+                    if (
+                        getattr(dense.self_attn.qkv_proj, "input_scale", None)
+                        is not None
+                    ):
+                        weights.append((f"{prefix}.input_scale", torch.tensor([0.125])))
+                model.load_weights(weights)
+                for layer, expected in (
+                    (dense.self_attn.qkv_proj, [1] * 384 + [2] * 64 + [3] * 64),
+                    (dense.mlp.gate_up_proj, [4] * 32 + [5] * 32),
+                ):
+                    torch.testing.assert_close(
+                        layer.weight.float()[:, 0], torch.tensor(expected).float()
+                    )
+                    scales = expected if channelwise else list(dict.fromkeys(expected))
+                    torch.testing.assert_close(
+                        layer.weight_scale.flatten(), torch.tensor(scales).float() / 16
+                    )
+                torch.testing.assert_close(
+                    experts.w13_weight[0].float()[:, 0],
+                    torch.tensor([6] * 32 + [7] * 32).float(),
+                )
+                scales = [6] * 32 + [7] * 32 if channelwise else [6, 7]
+                torch.testing.assert_close(
+                    experts.w13_weight_scale[0].flatten(),
+                    torch.tensor(scales).float() / 16,
+                )
+                if getattr(experts, "w13_input_scale", None) is not None:
+                    self.assertEqual(experts.w13_input_scale[0].item(), 0.125)
+                if isinstance(quant, CompressedTensorsConfig):
+                    self.assertEqual(model.lm_head.weight.dtype, dtype)
+                    scales = torch.full_like(model.lm_head.weight_scale, 0.25)
+                    model.load_weights(
+                        [
+                            ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
+                            ("lm_head.weight_scale", scales),
+                        ]
+                    )
+                    torch.testing.assert_close(
+                        model.lm_head.weight.float(),
+                        torch.full((64, 24), 9.0, dtype=torch.float32),
+                    )
+                    torch.testing.assert_close(model.lm_head.weight_scale, scales)
+
+    def test_fp8_exclusions_use_unpacked_projection_names(self):
+        ignored = [
+            f"model.layers.0.{name}"
+            for name in (
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+            )
+        ]
+        with (
+            get_parallel().override(
+                tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1
+            ),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            layer = BeamDecoderLayer(
+                tiny_config(layer_types=["full_attention"] * 4),
+                0,
+                quant_config=fp8_config(ignore=ignored),
+                prefix="model.layers.0",
+            )
+        self.assertEqual(
+            layer.self_attn.qkv_proj.weight.dtype, torch.get_default_dtype()
+        )
+        self.assertEqual(layer.mlp.gate_up_proj.weight.dtype, torch.get_default_dtype())
+        self.assertEqual(layer.self_attn.gate_proj.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.mlp.down_proj.weight.dtype, torch.float8_e4m3fn)
+
+    def test_non_last_pipeline_stage_skips_lm_head_scales(self):
+        model = loader_model({})
+        model.model.pp_group.is_last_rank = False
+        self.assertEqual(
+            model.load_weights(
+                [
+                    (f"lm_head.{suffix}", torch.ones(1))
+                    for suffix in ("weight", "weight_scale", "input_scale")
+                ]
+            ),
+            set(),
+        )
 
     def test_attention_tp_shards_and_packed_projections(self):
         config = tiny_config()

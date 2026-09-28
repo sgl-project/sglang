@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import get_quantization_config
 
@@ -29,16 +30,21 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         logger.info("Use trtllm_mha as default attention backend for Beam")
         overrides["attention_backend"] = "trtllm_mha"
-    # BeamMoE runs NVFP4 experts only on flashinfer_trtllm; BF16 keeps auto.
-    is_quantized = (
-        cfg.quantization is not None or get_quantization_config(hf_config) is not None
+    # BeamMoE runs NVFP4 experts only on flashinfer_trtllm; BF16/FP8 keep auto.
+    quantization = cfg.quantization or get_quantization_config(hf_config)
+    quant_config = getattr(hf_config, "quantization_config", None) or {}
+    if quantization == "modelopt":
+        quantization = canonicalize_modelopt_quant_algo(quant_config.get("quant_algo"))
+    is_nvfp4 = quantization == "modelopt_fp4" or (
+        quantization in ("compressed-tensors", "compressed_tensors")
+        and quant_config.get("format") == "nvfp4-pack-quantized"
     )
     if (
-        is_quantized
+        is_nvfp4
         and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"
     ):
-        logger.info("Use flashinfer_trtllm as MoE runner backend for quantized Beam")
+        logger.info("Use flashinfer_trtllm as MoE runner backend for NVFP4 Beam")
         overrides["moe_runner_backend"] = "flashinfer_trtllm"
     return overrides
