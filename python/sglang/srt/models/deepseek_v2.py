@@ -23,14 +23,14 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.dsv4 import (
+from sglang.kernels.ops.moe.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -69,13 +69,12 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
-    LayerScatterModes,
+    LayerFacts,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
-    DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -191,6 +190,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     attention_backends,
     get_device,
     get_exec,
@@ -548,7 +548,7 @@ class MoEGate(nn.Module):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-            from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 
             logits = linear_bf16_fp32(hidden_states, self.weight)
 
@@ -1113,6 +1113,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=hidden_states.shape[0],
+                reduce=post_experts_all_reduce,
             )
 
         all_reduce_done = False
@@ -2287,7 +2288,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        layer_scatter_modes: LayerScatterModes = None,
+        input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2296,7 +2297,7 @@ class DeepseekV2AttentionMLA(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
-            layer_scatter_modes=layer_scatter_modes,
+            input_on_attention_tp_slices=input_on_attention_tp_slices,
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
@@ -2308,7 +2309,7 @@ class DeepseekV2AttentionMLA(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        layer_scatter_modes: LayerScatterModes = None,
+        input_on_attention_tp_slices: bool = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
@@ -2393,7 +2394,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
@@ -2402,7 +2403,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
@@ -2411,7 +2412,7 @@ class DeepseekV2AttentionMLA(
                 hidden_states,
                 forward_batch,
                 zero_allocator,
-                layer_scatter_modes,
+                input_on_attention_tp_slices,
                 prev_topk_indices,
             )
         else:
@@ -2575,7 +2576,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -2615,23 +2616,40 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        if get_parallel().enable_prefill_cp:
-            communicator_cls = DSACPLayerCommunicator
-        elif not is_nextn and _use_mnnvl_cutedsl_fusion():
-            # Dense layers too: selecting cutedsl turns the legacy fusion off.
-            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-                CuteDSLFusionLayerCommunicator,
-            )
-
-            communicator_cls = CuteDSLFusionLayerCommunicator
-        else:
-            communicator_cls = LayerCommunicator
-        self.layer_communicator = communicator_cls(
-            layer_scatter_modes=self.layer_scatter_modes,
+        self.layer_communicator = self._build_layer_communicator(
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        )
+
+    def _build_layer_communicator(
+        self,
+        *,
+        input_layernorm: nn.Module,
+        post_attention_layernorm: nn.Module,
+        qkv_latent_func: Optional[Callable],
+        allow_deferred_ffn_reduction: bool = True,
+    ):
+        """The communicator for this layer's norms; it chooses its boundary
+        steps from them at construction."""
+        fusions = None
+        if (
+            not get_parallel().enable_prefill_cp
+            and not self.is_nextn
+            and _use_mnnvl_cutedsl_fusion()
+        ):
+            # Dense layers too: selecting cutedsl turns the legacy fusion off.
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import CuteDSLFusion
+
+            fusions = CuteDSLFusion()
+        return LayerCommunicator(
+            layer_facts=self.layer_facts,
+            input_layernorm=input_layernorm,
+            post_attention_layernorm=post_attention_layernorm,
+            allow_reduce_scatter=True,
+            qkv_latent_func=qkv_latent_func,
+            allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
+            fusions=fusions,
         )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -2704,7 +2722,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
-                layer_scatter_modes=self.layer_scatter_modes,
+                input_on_attention_tp_slices=(
+                    self.layer_communicator.input_on_attention_tp_slices
+                ),
                 prev_topk_indices=prev_topk_indices,
             )
         if isinstance(hidden_states, tuple):
@@ -3105,9 +3125,6 @@ class DeepseekV2Model(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
@@ -3451,6 +3468,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
+        lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
         # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
         defer_moe_finalize=False,
     ):

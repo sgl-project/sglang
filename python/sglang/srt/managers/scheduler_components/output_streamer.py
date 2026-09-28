@@ -79,6 +79,8 @@ class SchedulerOutputStreamer:
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
+        elif self.server_args.enable_lmcache:
+            storage_backend_type = "LMCache"
         return storage_backend_type
 
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:

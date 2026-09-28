@@ -131,6 +131,8 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
+    supports_dp_attention_overlap_loading = False
+
     def __init__(
         self,
         base_hf_config: AutoConfig,

@@ -188,7 +188,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(
                 req_pool_idx=1,
                 cache_protected_len=2,
-                swa_evicted_seqlen=1,
             ),
             prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
             priority=3,

@@ -1744,7 +1744,9 @@ class UnifiedSWAKVPool(SWAKVPool):
             swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
             if swa_phys.numel() == 0:
                 return
-            swa_cpu = self._filter_swa_cpu_copy(kv_cache_cpu["swa"], row_mask)
+            swa_cpu = self._filter_swa_cpu_copy(
+                swa_kv_cpu=kv_cache_cpu["swa"], row_mask=row_mask
+            )
             self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
 
 
