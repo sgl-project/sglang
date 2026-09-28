@@ -422,6 +422,12 @@ def _fused_bmm_rope_cat_and_cache(
     the first half of this kernel's grid.
     """
     kv_cache_dtype = fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope.dtype
+    kv_pool = get_token_to_kv_pool()
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # This writer also bypasses set_mla_kv_buffer(). Verification reserves
+        # logical rows whose physical slots can be in a separate device page.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    out_cache_loc = out_cache_loc.contiguous()
     # Same weights and group size the fp8 branch of rocm_absorb_q_bmm passes to
     # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant;
     # that call takes q_nope as (B, QH, P) and transposes internally, while this
@@ -433,7 +439,7 @@ def _fused_bmm_rope_cat_and_cache(
         q_pe,
         k_nope,
         k_pe,
-        get_token_to_kv_pool().get_key_buffer(attn.attn_mqa.layer_id),
+        kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
         out_cache_loc,
         positions,
         attn.rotary_emb.cos_cache,
