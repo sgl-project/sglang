@@ -2089,13 +2089,16 @@ class KVCacheConfigurator:
         if self.kv_shard_rank is not None:
             # The striped pool subclasses the plain per-layer MHA pool; the
             # mxfp8 / NoOp / page-major variants have incompatible buffer
-            # layouts, and a quantized KV cache has no striped store path.
+            # layouts. Specialized quantization methods need packed-data and
+            # scale-aware sharded writes/gathers; ordinary CUDA FP8 uses the
+            # plain pool and has no specialized quant_method.
             assert pool_cls is MHATokenToKVPool, (
                 "--enable-kv-cache-sharding is incompatible with "
                 f"the {pool_cls.__name__} pool"
             )
             assert quant_method is None, (
-                "--enable-kv-cache-sharding is incompatible with a quantized KV cache"
+                "--enable-kv-cache-sharding does not support specialized KV-cache "
+                "quantization methods (e.g. FP4); ordinary CUDA FP8 is supported."
             )
             pool_cls = PageInterleaveMHATokenToKVPool
             pool_kwargs["shard_spec"] = self.kv_shard_spec
