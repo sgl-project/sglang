@@ -72,7 +72,8 @@ def test_fp8_chunk_pipeline_guard(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("group_size", "topk"), [(3, 1025), (6, FINAL_TOPK), (12, 1025)]
+    ("group_size", "topk"),
+    [(3, 1024), (6, FINAL_TOPK), (8, 1024), (12, 1024)],
 )
 def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
