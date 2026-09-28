@@ -29,7 +29,19 @@ def run_server(server_args):
     server_args.resolve_once()
     cfg = resolving_view(server_args)
 
-    if cfg.encoder_only:
+    if server_args.afd_execution_mode == "ffn":
+        server_args.check_server_args()
+        from sglang.srt.afd.config import (
+            AFDExecutionMode,
+            execution_mode_from_server_args,
+        )
+
+        if execution_mode_from_server_args(server_args) != AFDExecutionMode.FFN:
+            raise ValueError("AFD_FFN_EXECUTION_MODE_REQUIRED")
+        from sglang.srt.afd.ffn_server import launch_server
+
+        launch_server(server_args)
+    elif cfg.encoder_only:
         # For encoder disaggregation
         if cfg.smg_grpc_mode or cfg.grpc_mode:
             from sglang.srt.disaggregation.encoder.grpc_server import (

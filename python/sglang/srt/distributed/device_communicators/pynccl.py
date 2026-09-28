@@ -35,6 +35,7 @@ class PyNcclCommunicator:
         library_path: Optional[str] = None,
         is_symmetric_memory_enabled: bool = False,
         cta_policy: Optional[int] = None,
+        max_ctas: Optional[int] = None,
     ):
         """
         Args:
@@ -48,6 +49,10 @@ class PyNcclCommunicator:
             cta_policy: ncclConfig_t.CTAPolicy for this communicator, e.g.
                 NCCL_CTA_POLICY_ZERO; None keeps the NCCL default.
                 The global NCCL_CTA_POLICY environment variable overrides it.
+            max_ctas: pin this communicator's CTA budget, bounding how many SMs
+                its kernels take from compute sharing the device. None leaves
+                NCCL's own tuning alone. NCCL_MAX_NCHANNELS cannot express this:
+                it is latched process-wide at the first communicator init.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -114,7 +119,11 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            if is_symmetric_memory_enabled or cta_policy is not None:
+            if (
+                is_symmetric_memory_enabled
+                or cta_policy is not None
+                or max_ctas is not None
+            ):
                 config = ncclConfig_t.create()
                 if is_symmetric_memory_enabled:
                     # When symmetric memory is enabled, disable internal
@@ -123,7 +132,12 @@ class PyNcclCommunicator:
                 if cta_policy is not None:
                     config.CTAPolicy = cta_policy
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
-                    self.world_size, self.unique_id, self.rank, config
+                    self.world_size,
+                    self.unique_id,
+                    self.rank,
+                    config,
+                    min_ctas=max_ctas,
+                    max_ctas=max_ctas,
                 )
             else:
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
