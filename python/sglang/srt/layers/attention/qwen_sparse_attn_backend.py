@@ -32,11 +32,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.pa_decode_flydsl import (
     flydsl_qsa_pa_decode_supported,
-    relayout_paged_kv,
+    paged_cache_views,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
+    qwen_sparse_kv_extraction_paged_triton,
     qwen_sparse_valid_counts_triton,
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -1601,7 +1602,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
+        # Gathers straight into the kernel's vectorized-5D layout, so the views
+        # below cost nothing. The FlashInfer path uses the linear-destination
+        # gather instead, since its cache layout differs.
+        key_cache, value_cache = paged_cache_views(
+            packed_k[: batch * stride],
+            packed_v[: batch * stride],
+            batch * pages_per_row,
+            page,
+            num_kv_heads,
+            head_dim,
+        )
+        qwen_sparse_kv_extraction_paged_triton(
             k_buffer,
             v_buffer,
             self.req_to_token_pool.req_to_token,
@@ -1613,19 +1625,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             topk_indices,
             sequence_lens,
             cu_strided,
-            packed_k,
-            packed_v,
+            key_cache,
+            value_cache,
             batch,
             topk,
-            zero_fill_cols=stride,
-        )
-        key_cache, value_cache = relayout_paged_kv(
-            packed_k[: batch * stride],
-            packed_v[: batch * stride],
-            batch * pages_per_row,
             page,
-            num_kv_heads,
-            head_dim,
+            stride,
         )
         # Pinned so a captured graph and its replays agree; 0 means "ask once".
         splits = envs.SGLANG_AITER_QSA_PA_DECODE_SPLITS.get() or (

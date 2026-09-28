@@ -9,20 +9,18 @@ Hq=24 / Hkv=2 -- and splits KV across CTAs.
 
 It reads a paged cache rather than the packed varlen buffers, which is why
 ``qwen_sparse_attn_backend`` feeds it from the same page-aligned gather the
-FlashInfer path already uses: ``_compact_kv`` with ``zero_fill_cols=stride``
-plus the static arange block table.
+FlashInfer path already uses, sharing that path's static arange block table.
 
-Layout note: the gather produces a linear ``[token, head, dim]`` region per
-page, and the kernel wants the vectorized-5D form. ``relayout_paged_kv`` below
-does that as a permute + copy. Folding it into ``_compact_kv``'s destination
-index would remove the copy entirely (the gather already touches exactly these
-elements); it is kept separate here so the fast path can be validated end to end
-before the Triton kernel is changed.
+The gather is ``_compact_kv_paged``, which writes the vectorized-5D layout the
+kernel reads directly rather than a linear ``[token, head, dim]`` region a later
+permute has to rearrange. That means the scratch never needs re-laying:
+``paged_cache_views`` below only relabels it, at no cost. The permute it replaced
+was as expensive as the attention itself (9.3us against 10.8us at one row, 198us
+against 71us at 64).
 """
 
 from functools import lru_cache
 from importlib.util import find_spec
-from typing import Tuple
 
 import torch
 
@@ -79,34 +77,28 @@ def flydsl_qsa_pa_decode_supported(
     return flydsl_pa_decode_supported(q, probe_key, block_size=page_size)
 
 
-def relayout_paged_kv(
-    packed_k: torch.Tensor,
-    packed_v: torch.Tensor,
+def paged_cache_views(
+    scratch_k: torch.Tensor,
+    scratch_v: torch.Tensor,
     num_blocks: int,
     page_size: int,
     num_kv_heads: int,
     head_dim: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Re-lay page-aligned ``[token, head, dim]`` scratch as the 5D paged cache.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Label the gather scratch with the cache shapes the kernel asserts on.
 
     key   -> ``[num_blocks, num_kv_heads, head_dim // vec, page_size, vec]``
     value -> ``[num_blocks, num_kv_heads, page_size // vec, head_dim, vec]``
 
-    Both are permutes of the gathered data, but the kernel issues raw buffer
-    loads against them, so they must be materially contiguous.
+    Views, not copies: ``_compact_kv_paged`` has already written the scratch in
+    exactly this order, so nothing moves. The kernel addresses the cache flat and
+    only reads the shape to validate it.
     """
-    vec = _KV_VECTOR_BYTES // packed_k.element_size()
-    # Source is (block, slot, head, dim). Split the axis each target vectorizes
-    # over -- dim for K, slot for V -- and permute straight to the destination, so
-    # each cache costs exactly one copy rather than a transpose plus a regroup.
-    key_cache = (
-        packed_k.view(num_blocks, page_size, num_kv_heads, head_dim // vec, vec)
-        .permute(0, 2, 3, 1, 4)  # (block, head, dim//vec, slot, dim%vec)
-        .contiguous()
+    vec = _KV_VECTOR_BYTES // scratch_k.element_size()
+    key_cache = scratch_k.view(
+        num_blocks, num_kv_heads, head_dim // vec, page_size, vec
     )
-    value_cache = (
-        packed_v.view(num_blocks, page_size // vec, vec, num_kv_heads, head_dim)
-        .permute(0, 3, 1, 4, 2)  # (block, head, slot//vec, dim, slot%vec)
-        .contiguous()
+    value_cache = scratch_v.view(
+        num_blocks, num_kv_heads, page_size // vec, head_dim, vec
     )
     return key_cache, value_cache
