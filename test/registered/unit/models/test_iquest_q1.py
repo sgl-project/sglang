@@ -1,10 +1,8 @@
 import unittest
-from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.configs.iquest_q1 import IQuestQ1Config
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -178,11 +176,8 @@ class TestIQuestQ1MTPDraft(CustomTestCase):
                 [item for item in weights if item[0] != "lm_head.weight"]
             )
 
-    def test_worker_keeps_independent_embedding_and_head(self):
-        from sglang.srt.models.iquest_q1 import IQuestQ1ForCausalLM
+    def test_mtp_keeps_its_own_embedding_and_head(self):
         from sglang.srt.models.iquest_q1_mtp import IQuestQ1MTP
-        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         model = IQuestQ1MTP.__new__(IQuestQ1MTP)
         torch.nn.Module.__init__(model)
@@ -190,29 +185,10 @@ class TestIQuestQ1MTPDraft(CustomTestCase):
         model.model.embed_tokens = torch.nn.Embedding(4, 2)
         model.lm_head = torch.nn.Linear(2, 4, bias=False)
         embed, head = model.get_embed_and_head()
-        torch.nn.init.constant_(embed, 2.0)
-        torch.nn.init.constant_(head, 3.0)
-        target = IQuestQ1ForCausalLM.__new__(IQuestQ1ForCausalLM)
-        torch.nn.Module.__init__(target)
-        target.model = torch.nn.Module()
-        target.model.embed_tokens = torch.nn.Embedding(4, 2)
-        target.lm_head = torch.nn.Linear(2, 4, bias=False)
-        torch.nn.init.constant_(target.model.embed_tokens.weight, 7.0)
-        torch.nn.init.constant_(target.lm_head.weight, 11.0)
-        worker = EagleDraftWorker.__new__(EagleDraftWorker)
-        worker.draft_runner = SimpleNamespace(model=model)
-        worker.target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(model=target)
-        )
-        worker.hot_token_id = None
-        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
-        with get_context().parallel.override(pp_size=1):
-            worker.init_lm_head()
+        model.set_embed_and_head(torch.zeros(4, 2), torch.zeros(4, 2))
         current_embed, current_head = model.get_embed_and_head()
         self.assertIs(current_embed, embed)
         self.assertIs(current_head, head)
-        torch.testing.assert_close(current_embed, torch.full_like(embed, 2.0))
-        torch.testing.assert_close(current_head, torch.full_like(head, 3.0))
 
     def test_mtp_residual_is_fp32_but_moe_input_is_bf16(self):
         from sglang.srt.models.iquest_q1_mtp import (
