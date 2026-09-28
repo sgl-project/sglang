@@ -562,18 +562,58 @@ class _PackedAddedQKV(MergedColumnParallelLinear):
         return F.linear(x, self.weight, self.bias), None
 
 
-def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
-    torch.manual_seed(20260831)
-    dim = 64
-    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
-    packed = _PackedAddedQKV(dim)
+class _WrappedAddedQKV(nn.Module):
+    # Stands for a LoRA-wrapped projection: not a MergedColumnParallelLinear,
+    # so the lossless path must call it instead of slicing its weight.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.randn(3 * dim, dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(3 * dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.calls = 0
 
+    def forward(self, x):
+        self.calls += 1
+        return F.linear(x, self.weight, self.bias), None
+
+
+def _added_qkv_attention(packed):
     attention = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
     nn.Module.__init__(attention)
     attention.use_fused_added_qkv = True
     attention._unquantized_added_qkv_is_packed = True
     attention.to_added_qkv = packed
     mark_qwen_image_added_qkv_site(attention)
+    return attention
+
+
+def test_qwen_added_qkv_lossless_calls_a_wrapped_linear_as_is():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    wrapped = _WrappedAddedQKV(dim)
+    attention = _added_qkv_attention(wrapped)
+
+    actual = attention._get_added_qkv_projections(x)
+    expected = tuple(
+        tensor.contiguous()
+        for tensor in F.linear(x, wrapped.weight, wrapped.bias).chunk(3, dim=-1)
+    )
+    assert wrapped.calls == 1
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+
+
+def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    packed = _PackedAddedQKV(dim)
+    attention = _added_qkv_attention(packed)
 
     expected_lossless = _split_unquantized_merged_linear(packed, x)
     actual_lossless = attention._get_added_qkv_projections(x)
