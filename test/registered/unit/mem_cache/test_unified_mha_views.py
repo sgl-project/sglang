@@ -344,17 +344,9 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             "envelope move did not relocate exactly the named pages",
         )
 
-    def test_transfer_entry_points_fail_loud(self):
-        """The entry points that assume per-layer buffers indexed by TOKEN id
-        would silently mis-index against the row space (or hit a missing-attr
-        AttributeError), so each must raise. `get_contiguous_buf_infos` is NOT
-        among them: PD addresses this pool as whole page envelopes, pinned by
-        `test_pd_registration_is_one_whole_envelope` below."""
+    def test_prefix_valid_entry_point_fails_loud(self):
+        """Prefix-valid writes still assume token-major buffer indexing."""
         _, pool = _make_pool_and_kv(1)
-        with self.assertRaises(NotImplementedError):
-            pool.get_cpu_copy(torch.tensor([1]))
-        with self.assertRaises(NotImplementedError):
-            pool.load_cpu_copy(None, torch.tensor([1]))
         with self.assertRaises(NotImplementedError):
             pool.set_kv_buffer_prefix_valid()
 

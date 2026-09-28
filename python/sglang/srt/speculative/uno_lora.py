@@ -45,8 +45,8 @@ def init_uno_lora_manager(
         dtype=model_runner.dtype,
         server_args=model_runner.server_args,
         lora_backend="uno_cublas",  # fast path
-        tp_size=model_runner.ps.tp_size,
-        tp_rank=model_runner.ps.tp_rank,
+        tp_size=model_runner.tp_size,
+        tp_rank=model_runner.tp_rank,
         # Infer these from the one trained adapter.
         max_lora_rank=None,
         target_modules=None,

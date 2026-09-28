@@ -246,7 +246,7 @@ impl Worker {
         self.protocol
     }
 
-    pub fn active_load(&self) -> usize {
+    pub fn router_inflight_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
 
@@ -284,7 +284,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("protocol", &self.protocol)
-            .field("active_load", &self.active_load())
+            .field("router_inflight_load", &self.router_inflight_load())
             .finish()
     }
 }
@@ -304,15 +304,15 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
         });
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         let g = w.load_guard();
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         let g2 = w.load_guard();
-        assert_eq!(w.active_load(), 2);
+        assert_eq!(w.router_inflight_load(), 2);
         drop(g);
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         drop(g2);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -321,11 +321,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
     }
 
     #[test]
@@ -334,11 +334,11 @@ mod tests {
         let cutoff = Instant::now() - Duration::from_secs(1);
         let guard = w.timestamped_load_guard();
 
-        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.router_inflight_load(), 1);
         assert_eq!(w.slots_acquired_since(cutoff), 1);
 
         drop(guard);
-        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.router_inflight_load(), 0);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
     }
 
@@ -477,7 +477,7 @@ mod tests {
         let cutoff = Instant::now();
         let _g_new1 = w.timestamped_load_guard();
         let _g_new2 = w.timestamped_load_guard();
-        assert_eq!(w.active_load(), 3);
+        assert_eq!(w.router_inflight_load(), 3);
         assert_eq!(
             w.slots_acquired_since(cutoff),
             2,

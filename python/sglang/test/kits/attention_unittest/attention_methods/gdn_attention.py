@@ -10,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -31,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -179,6 +179,7 @@ class TinyGDNModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -226,7 +227,7 @@ class MockGDNModelRunner(ModelRunner):
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
         self.gpu_id = 0
-        self.ps = ParallelState.trivial()
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
