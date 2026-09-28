@@ -37,7 +37,6 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
-    draft_forward_guard,
     init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
@@ -71,7 +70,6 @@ __all__ = [
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
     "create_triton_kv_indices_for_dcp_triton",
-    "draft_forward_guard",
     "filter_dcp_local_kv_indices",
     "get_dcp_lens",
     "update_local_kv_lens_for_dcp",

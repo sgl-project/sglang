@@ -20,8 +20,6 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import contextlib
-
 from typing import Optional
 
 import torch
@@ -42,13 +40,6 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
-
-
-def draft_forward_guard(is_draft: bool):
-    """Run a draft forward with DCP disabled (the draft KV pool is not sharded)."""
-    if not is_draft:
-        return contextlib.nullcontext()
-    return get_parallel().override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0)
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:

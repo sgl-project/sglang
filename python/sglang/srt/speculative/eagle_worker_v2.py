@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
-from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -581,7 +580,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={before_mem:.2f} GB",
             )
             # Capture with DCP disabled to match draft replay.
-            with draft_forward_guard(True):
+            with draft_dcp_context():
                 self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                     self.target_worker.device
                 ](self)
@@ -687,7 +686,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
             # Capture must match replay: same rule as the draft-decode graph.
-            with draft_forward_guard(True):
+            with draft_dcp_context():
                 self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                     self.target_worker.device
                 ](self)
@@ -742,7 +741,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # This draft path runs outside ModelRunner.forward, so guard it here.
-        with canary_outside_ctx, draft_forward_guard(True):
+        with canary_outside_ctx, draft_dcp_context():
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -1208,7 +1207,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx, draft_forward_guard(True):
+        with canary_ctx, draft_dcp_context():
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch, select_index

@@ -8,7 +8,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
-from sglang.srt.layers.dcp import draft_forward_guard
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -28,6 +27,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    draft_dcp_context,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -198,7 +198,7 @@ def prepare_for_draft_extend(
     )
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         # Must match the DCP state of the forward that consumes this metadata.
-        with draft_forward_guard(True):
+        with draft_dcp_context():
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
