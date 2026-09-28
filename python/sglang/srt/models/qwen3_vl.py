@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -27,7 +28,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -359,7 +359,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -1307,7 +1307,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -1421,7 +1421,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

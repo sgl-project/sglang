@@ -3,7 +3,10 @@
 
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
+mod abort;
 pub mod sse;
+
+use abort::AbortOnDrop;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
@@ -16,6 +19,7 @@ use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
@@ -31,6 +35,70 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
     })
 }
 
+/// How an upstream HTTP response status should affect the worker's circuit
+/// breaker, at the dispatch sites (`forward_json_to` / `forward_streaming_to`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerOutcome {
+    /// The worker was responsive — a 2xx, or a 4xx it answered cleanly (a
+    /// client's bad request says nothing about worker health). The non-streaming
+    /// arm records success immediately; the streaming arm defers to the pump's
+    /// completion hook, which classifies [`sse::StreamEnd::reason`],
+    /// since a 2xx head can still be followed
+    /// by a body that never completes.
+    Success,
+    /// A real fault (5xx other than backpressure) → `record_failure`: count
+    /// toward opening.
+    Failure,
+    /// Backpressure or router-side stream expiry →
+    /// `record_backpressure`: never opens the breaker and, while Closed, leaves
+    /// an in-progress failure streak intact — but still resolves a half-open
+    /// probe so a recovered-but-busy worker isn't wedged shut.
+    Neutral,
+}
+
+/// Classify an upstream status for circuit-breaker accounting.
+///
+/// A backpressure status — `503 Service Unavailable` or `429 Too Many
+/// Requests` — is the worker signalling "responsive but at capacity", not a
+/// fault. Counting it as a breaker failure is actively harmful: a saturated
+/// worker trips the breaker on its own queue-full 503s, and with a single
+/// worker the router then sheds *every* request for the whole cool-down —
+/// including after the engine has drained and gone idle. So backpressure is
+/// [`Neutral`](BreakerOutcome::Neutral) (see [`CircuitBreaker::record_backpressure`]
+/// for its exact effect per breaker state). Genuine 5xx faults (500 / 502 /
+/// 504 / …) still count as failures, and transport errors / timeouts /
+/// mid-body drops are recorded as failures at the call sites — as are a
+/// malformed discovery URL (`parse_worker_url`) and a stream whose body dies
+/// after a 2xx head.
+///
+/// Tradeoff: because 503 never opens the breaker, a worker stuck returning 503
+/// indefinitely (a wedged engine, not transient load) is NOT detected here —
+/// HTTP status alone can't distinguish "busy" from "broken-and-saying-503", and
+/// counting it caused the worse fleet-wide false-shed above. Detecting a
+/// chronically-backpressuring worker is left to higher-level signals.
+fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => BreakerOutcome::Neutral,
+        s if s.is_server_error() => BreakerOutcome::Failure,
+        _ => BreakerOutcome::Success,
+    }
+}
+
+/// Router-side expiry says nothing about worker health. Preserve the existing
+/// treatment of completed streams and client disconnects; upstream faults,
+/// idle timeouts, and pump panics remain failures.
+fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
+    use sse::StreamEndReason;
+    match end.reason {
+        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => BreakerOutcome::Failure,
+    }
+}
+
 #[derive(Debug)]
 pub struct Proxy {
     /// The negotiating client: HTTP/1.1 in cleartext, and ALPN `h2, http/1.1`
@@ -44,6 +112,8 @@ pub struct Proxy {
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+    /// Maximum silence between streamed upstream chunks; `None` waits forever.
+    pub stream_idle_timeout: Option<Duration>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -77,7 +147,13 @@ impl Proxy {
             default_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
+            stream_idle_timeout: None,
         })
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
     }
 
     /// The forwarding client for `protocol`, taken from the selected worker's
@@ -120,15 +196,17 @@ impl Proxy {
         }
     }
 
-    /// Breaker-gated JSON POST: checks `breaker.allow()` first, records
-    /// success/failure based on response status, and returns
-    /// `ApiError::BreakerOpen` immediately when the breaker is Open.
+    /// Breaker-gated JSON POST: acquires a cancellation-safe permit first, classifies the
+    /// response status through [`breaker_outcome`] (success / failure /
+    /// backpressure), and returns `ApiError::BreakerOpen` immediately when the
+    /// breaker is Open.
     ///
     /// `worker_url` is the discovery-emitted worker URL string. It's parsed
     /// to [`reqwest::Url`] internally so we can use [`Url::join`] for clean
     /// path concatenation (no double-slash) and pass a typed URL to the
     /// split error variants (`UpstreamUnreachable` / `UpstreamTimeout` /
     /// `UpstreamStatus`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_json_to(
         &self,
         worker_url: &str,
@@ -137,12 +215,11 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
+        abort_rid: Option<&str>,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -156,6 +233,8 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .timeout(self.request_timeout);
+        let mut abort =
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
         let resp = req.send().await.map_err(|e| {
             breaker.record_failure();
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
@@ -170,21 +249,32 @@ impl Proxy {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                // Walk the full source chain (`{:#}`) like the connect-error
+                // handler in `classify_reqwest_error_for` — a mid-body drop's
+                // real cause (incomplete message, connection reset) lives in the
+                // wrapped source, not the outer reqwest error.
+                let cause = anyhow::Error::new(e);
                 tracing::warn!(
                     upstream = %url,
                     status = %status,
-                    error = ?e,
+                    error = %format_args!("{cause:#}"),
                     "upstream dropped connection mid-body",
                 );
                 breaker.record_failure();
                 return Err(ApiError::UpstreamStatus { status });
             }
         };
-        if status.is_server_error() {
-            breaker.record_failure();
-        } else {
-            breaker.record_success();
+        abort.disarm();
+        match breaker_outcome(status) {
+            BreakerOutcome::Failure => breaker.record_failure(),
+            BreakerOutcome::Success => breaker.record_success(),
+            // Backpressure (503/429): the engine is healthy but busy. This never
+            // opens the breaker and (in Closed) leaves the failure streak
+            // intact, but it DOES resolve a half-open probe so a recovered
+            // worker that answers a probe with 503 isn't wedged shut.
+            BreakerOutcome::Neutral => breaker.record_backpressure(),
         }
+        permit.disarm();
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -194,14 +284,15 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
-    /// success/failure, and returns `ApiError::BreakerOpen` when Open.
+    /// Breaker-gated streaming POST: acquires a cancellation-safe permit first, classifies
+    /// the response status through [`breaker_outcome`], and returns
+    /// `ApiError::BreakerOpen` when Open.
     ///
     /// `stream_guards` — when `Some`, the value is threaded into the SSE
     /// pump task and held for the entire body lifetime (headers → last byte
     /// / client disconnect).  The proxy does not inspect the boxed value; it
     /// relies entirely on `Drop` semantics, so callers typically pack
-    /// `(LoadGuard, ActiveLoadGuard)` here. This keeps both the per-worker
+    /// `(LoadGuard, RouterInflightLoadGuard)` here. This keeps both the per-worker
     /// `active_requests` counter and the per-request active-load entry alive
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
@@ -218,15 +309,15 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
+        abort_rid: Option<&str>,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
+        expiration: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -240,11 +331,16 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
+        let mut abort =
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
         let resp = req.send().await.map_err(|e| {
             breaker.record_failure();
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
+        if !status.is_success() {
+            abort.disarm();
+        }
         let upstream_ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -258,30 +354,45 @@ impl Proxy {
         };
         // Breaker recording is deferred to the pump's completion hook so
         // an upstream that returns 2xx headers and then drops mid-stream
-        // is recorded as a failure. For 5xx headers we record_failure
+        // is recorded as a failure. For a genuine 5xx fault we record_failure
         // up front and skip the pump hook (the body we surface is the
-        // error response — its stream completing is not a worker win).
+        // error response — its stream completing is not a worker win). For a
+        // backpressure status (503/429) we record_backpressure up front and
+        // skip the hook: a busy-but-healthy engine's queue-full responses can't
+        // open the breaker, but a half-open probe answered with 503 is still
+        // resolved rather than wedged (see `breaker_outcome` /
+        // `record_backpressure`).
         let caller_end_hook = if status.is_success() {
             on_stream_end
         } else {
             None
         };
         let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>> =
-            if status.is_server_error() {
-                breaker.record_failure();
-                None
-            } else {
-                let breaker_for_hook = Arc::clone(breaker);
-                Some(Box::new(move |end| {
-                    if end.transport_ok {
-                        breaker_for_hook.record_success();
-                    } else {
-                        breaker_for_hook.record_failure();
-                    }
-                    if let Some(hook) = caller_end_hook {
-                        hook(end);
-                    }
-                }))
+            match breaker_outcome(status) {
+                BreakerOutcome::Failure => {
+                    breaker.record_failure();
+                    None
+                }
+                BreakerOutcome::Neutral => {
+                    breaker.record_backpressure();
+                    None
+                }
+                BreakerOutcome::Success => {
+                    let breaker_for_hook = Arc::clone(breaker);
+                    Some(Box::new(move |end| {
+                        if end.reason == sse::StreamEndReason::Completed {
+                            abort.disarm();
+                        }
+                        match stream_breaker_outcome(end) {
+                            BreakerOutcome::Success => breaker_for_hook.record_success(),
+                            BreakerOutcome::Failure => breaker_for_hook.record_failure(),
+                            BreakerOutcome::Neutral => breaker_for_hook.record_backpressure(),
+                        }
+                        if let Some(hook) = caller_end_hook {
+                            hook(end);
+                        }
+                    }))
+                }
             };
         // Only record TTFT for successful streams; error-body chunks are not
         // generated tokens.
@@ -290,11 +401,16 @@ impl Proxy {
         } else {
             None
         };
+        permit.disarm();
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
             first_byte_hook,
+            sse::StreamLimits {
+                idle_timeout: self.stream_idle_timeout,
+                expiration,
+            },
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -310,7 +426,14 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::circuit_breaker::CircuitBreakerConfig;
+    use axum::routing::post;
+    use axum::Router;
+    use reqwest::StatusCode;
+    use std::num::NonZeroU32;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn new_returns_result_not_panic() {
@@ -336,5 +459,402 @@ mod tests {
             p.client_for(WireProtocol::Http1),
             p.admin_client()
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_forwards_release_half_open_probes() {
+        use futures::FutureExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let proxy = Proxy::new(Duration::from_secs(60)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let headers = HeaderMap::new();
+        assert!(proxy
+            .forward_json_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+                None,
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
+        assert!(proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
+    }
+
+    #[test]
+    fn breaker_outcome_treats_backpressure_as_neutral() {
+        // Backpressure: healthy but busy — must not touch the breaker.
+        assert_eq!(
+            breaker_outcome(StatusCode::SERVICE_UNAVAILABLE),
+            BreakerOutcome::Neutral,
+        );
+        assert_eq!(
+            breaker_outcome(StatusCode::TOO_MANY_REQUESTS),
+            BreakerOutcome::Neutral,
+        );
+        // Genuine faults: still failures.
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(breaker_outcome(s), BreakerOutcome::Failure, "{s}");
+        }
+        // Non-5xx (incl. 4xx client errors): treated as success.
+        for s in [
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_eq!(breaker_outcome(s), BreakerOutcome::Success, "{s}");
+        }
+    }
+
+    /// A fake upstream that answers every POST with a fixed status + tiny body.
+    async fn spawn_status_worker(status: u16) -> (String, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let code = StatusCode::from_u16(status).unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move { (code, "{\"error\":\"x\"}") }),
+        );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    async fn spawn_pending_stream_worker() -> (String, oneshot::Sender<()>) {
+        use futures::StreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Body::from_stream(
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"data: chunk\n\n",
+                    ))])
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        );
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), tx)
+    }
+
+    async fn pending_stream_body(
+        proxy: &Proxy,
+        url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        expiration: Option<CancellationToken>,
+    ) -> Body {
+        use http_body_util::BodyExt;
+
+        let response = proxy
+            .forward_streaming_to(
+                url,
+                WireProtocol::Http1,
+                breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                None,
+                None,
+                expiration,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_preserves_breaker_failure_streak() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        breaker.record_failure();
+        breaker.record_failure();
+        for _ in 0..6 {
+            let expiration = CancellationToken::new();
+            let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+            expiration.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("stale_request_timeout"));
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "expiry must not add a failure"
+            );
+        }
+        breaker.record_failure();
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "expiry must not reset prior failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_resolves_half_open_probe() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let expiration = CancellationToken::new();
+        let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+        assert_eq!(breaker.snapshot().state_code, 2);
+        assert!(!breaker.would_allow());
+        expiration.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_request_timeout"));
+        assert_eq!(breaker.snapshot().state_code, 0);
+        assert!(breaker.would_allow());
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_still_trips_breaker() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let mut proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        proxy.stream_idle_timeout = Some(Duration::from_millis(20));
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+        let body = pending_stream_body(&proxy, &url, &breaker, None).await;
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("idle timeout"));
+        assert_eq!(breaker.snapshot().state_code, 1);
+        assert!(!breaker.would_allow());
+    }
+
+    /// A saturated engine's own queue-full 503s must not trip the router's
+    /// circuit breaker. Dispatch far past any plausible failure threshold and
+    /// assert the breaker stays Closed and admitting.
+    #[tokio::test]
+    async fn engine_503_does_not_trip_breaker() {
+        let (url, _shutdown) = spawn_status_worker(503).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = CircuitBreaker::new();
+        let headers = HeaderMap::new();
+
+        for i in 0..50 {
+            let resp = proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                    None,
+                )
+                .await
+                .expect("dispatch should reach the worker (breaker must stay closed)");
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "iter {i}: client must still see the engine's 503",
+            );
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "iter {i}: 503 backpressure must leave the breaker Closed",
+            );
+        }
+        assert!(
+            breaker.would_allow(),
+            "breaker must keep admitting after a burst of engine 503s",
+        );
+    }
+
+    /// Contrast guard, so the backpressure carve-out cannot disable fault
+    /// detection: a genuine 5xx fault (500) MUST still open the breaker. Loops
+    /// on `would_allow()` rather than a fixed count so the test stays correct if
+    /// the default `CircuitBreakerConfig` threshold changes.
+    #[tokio::test]
+    async fn engine_500_still_trips_breaker() {
+        let (url, _shutdown) = spawn_status_worker(500).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = CircuitBreaker::new();
+        let headers = HeaderMap::new();
+
+        for _ in 0..50 {
+            if !breaker.would_allow() {
+                break;
+            }
+            let _ = proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                    None,
+                )
+                .await;
+        }
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "a run of 500s must open the breaker (fault detection still works)",
+        );
+    }
+
+    /// End-to-end wedge guard: a breaker that opened on real faults, then has
+    /// its half-open probe answered with a 503, must RECOVER — not stay shut
+    /// out forever. Exercises the `Neutral => record_backpressure` wiring in
+    /// `forward_json_to` through the half-open path.
+    #[tokio::test]
+    async fn engine_503_recovers_a_half_open_breaker() {
+        let (url, _shutdown) = spawn_status_worker(503).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        // threshold=1 so one prior fault opens it; a short cooldown so the probe
+        // is admitted quickly. The wait below is an order of magnitude longer
+        // than the cooldown rather than a thin margin, since this test needs a
+        // real socket and so cannot pause the clock.
+        let breaker = CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_millis(20),
+        });
+        let headers = HeaderMap::new();
+
+        // Simulate a prior genuine fault (e.g. a 500 / timeout) that tripped it.
+        breaker.record_failure();
+        assert_eq!(breaker.snapshot().state_code, 1, "breaker should be Open");
+
+        // Let the cooldown elapse so the next dispatch claims the half-open probe.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = proxy
+            .forward_json_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &headers,
+                Bytes::from_static(b"{}"),
+                None,
+            )
+            .await
+            .expect("the half-open probe must be admitted and reach the worker");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            breaker.snapshot().state_code,
+            0,
+            "a 503 answer to the probe must close the breaker, not wedge it half-open",
+        );
+        assert!(
+            breaker.would_allow(),
+            "worker must admit traffic again after recovering from the probe",
+        );
+    }
+
+    /// Streaming path parity: the engine's 503 on the streaming arm must also
+    /// leave the breaker untouched (no up-front failure, no completion hook).
+    #[tokio::test]
+    async fn engine_503_does_not_trip_breaker_streaming() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_status_worker(503).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        let headers = HeaderMap::new();
+
+        for i in 0..6 {
+            let resp = proxy
+                .forward_streaming_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("streaming dispatch should reach the worker");
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "iter {i}");
+            // Drain the body so the pump task runs to completion (would fire any
+            // completion hook). For a 503 there is none, but draining proves it.
+            let _ = resp.into_body().collect().await;
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "iter {i}: streaming 503 must leave the breaker Closed",
+            );
+        }
     }
 }

@@ -1,11 +1,11 @@
-"""Unit tests for the sgl-eval transport in ``sglang.test.sgl_eval``.
+"""Unit tests for the sgl-eval transport in ``sglang.test.sgl_eval_utils``.
 
 Hermetic: sgl-eval is replaced by fakes at the import boundary, so these run on
 CPU CI whether or not the optional dependency is installed. What they guard is
 the contract the AMD accuracy, disaggregation and perf tests now depend on:
 
-  1. ``api_base_url`` accepts the ``host="http://127.0.0.1"`` form those tests
-     pass. Building ``http://http://...`` instead would fail every one of them.
+  1. ``api_base_url`` accepts ``host`` with or without a scheme. Building
+     ``http://http://...`` from a scheme-qualified host would fail every caller.
   2. The metrics dict carries ``accuracy``, ``invalid``, ``latency`` and
      ``output_throughput``. Callers read those names directly, so dropping one
      surfaces as a KeyError rather than a score change.
@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.sgl_eval import api_base_url, run_sgl_eval
+from sglang.test.sgl_eval_utils import api_base_url, run_sgl_eval
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -104,6 +104,7 @@ class FakeSpec:
     name: str = "gsm8k"
     default_gen: FakeGenConfig = field(default_factory=FakeGenConfig)
     default_num_threads: int = 64
+    default_n_repeats: int = 1
     pred_schema: str = "schema"
     result: Optional[FakeRunResult] = None
     calls: List[Dict[str, Any]] = field(default_factory=list)
@@ -149,7 +150,7 @@ def _fake_sgl_eval_modules(spec):
 
 class TestApiBaseUrl(CustomTestCase):
     def test_url_forms(self):
-        # `host` carrying a scheme is the form every migrated AMD test passes.
+        # The migrated AMD tests pass a bare host; older callers still pass a scheme.
         cases = [
             (dict(base_url="http://127.0.0.1:30000"), "http://127.0.0.1:30000/v1"),
             (dict(base_url="http://127.0.0.1:30000/"), "http://127.0.0.1:30000/v1"),
@@ -178,7 +179,7 @@ class TestRunSglEval(CustomTestCase):
         args = SimpleNamespace(
             **{
                 "eval_name": spec.name,
-                "host": "http://127.0.0.1",
+                "host": "127.0.0.1",
                 "port": 8123,
                 "model": "test-model",
                 "num_examples": 2,
@@ -252,6 +253,12 @@ class TestRunSglEval(CustomTestCase):
         self._run(spec)
         self.assertEqual(spec.calls[0]["gen"].max_tokens, 2048)
 
+    def test_explicit_none_token_budget_is_uncapped_and_warns(self):
+        spec = self._passing_spec()
+        with self.assertWarnsRegex(UserWarning, "uncapped"):
+            self._run(spec, max_tokens=None)
+        self.assertIsNone(spec.calls[0]["gen"].max_tokens)
+
     def test_example_and_thread_counts_are_forwarded(self):
         spec = self._passing_spec()
         self._run(spec, num_examples=200, num_threads=128, repeat=3)
@@ -261,10 +268,12 @@ class TestRunSglEval(CustomTestCase):
         self.assertEqual(call["num_threads"], 128)
         self.assertEqual(call["n_repeats"], 3)
 
-    def test_thread_count_falls_back_to_the_eval_default(self):
+    def test_thread_and_repeat_counts_fall_back_to_the_eval_defaults(self):
         spec = self._passing_spec()
+        spec.default_n_repeats = 4
         self._run(spec, num_threads=None)
         self.assertEqual(spec.calls[0]["num_threads"], spec.default_num_threads)
+        self.assertEqual(spec.calls[0]["n_repeats"], 4)
 
     def test_incomplete_run_raises(self):
         spec = self._passing_spec()
@@ -328,7 +337,9 @@ class TestRunSglEval(CustomTestCase):
         results = {}
 
         def worker():
-            with patch("sglang.test.sgl_eval.ProcessPoolExecutor", StandInProcessPool):
+            with patch(
+                "sglang.test.sgl_eval_utils.ProcessPoolExecutor", StandInProcessPool
+            ):
                 results["metrics"] = self._run(spec)
 
         thread = threading.Thread(target=worker)

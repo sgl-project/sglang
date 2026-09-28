@@ -12,14 +12,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import (
     SanaWMArchConfig,
     SanaWMConfig,
 )
-from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _CACHE_TYPE_STATE,
     _SLOT_CAM_K,
@@ -35,7 +33,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _slice_rope_to_current_chunk,
     process_camera_conditions_ucpe,
 )
-from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 HEAD_DIM = 112
 H, W = 2, 3
@@ -236,23 +233,6 @@ def test_forward_long_gdn_reduces_to_dense_with_camera():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture
-def _global_args():
-    prev = _sa_mod._global_server_args
-    set_global_server_args(
-        SimpleNamespace(
-            comfyui_mode=False,
-            enable_cfg_parallel=False,
-            enable_torch_compile=False,
-            attention_backend=None,
-        )
-    )
-    try:
-        yield
-    finally:
-        set_global_server_args(prev)
-
-
 class _ZeroCross(torch.nn.Module):
     def forward(self, x, y, mask=None):
         return torch.zeros_like(x)
@@ -284,7 +264,7 @@ def _block():
     return b
 
 
-def test_block_forward_long_reduces_to_dense(_global_args):
+def test_block_forward_long_reduces_to_dense():
     block = _block()
     x = _x()
     y = torch.randn(AB, 4, AC, dtype=torch.float64)
@@ -349,7 +329,7 @@ def _model_inputs():
     )
 
 
-def test_model_forward_long_single_chunk_reduces_to_dense(_global_args):
+def test_model_forward_long_single_chunk_reduces_to_dense():
     m = _tiny_model()
     inp = _model_inputs()
     with torch.no_grad():
@@ -364,7 +344,7 @@ def test_model_forward_long_single_chunk_reduces_to_dense(_global_args):
     assert cache[0][_SLOT_FFN_TCONV] is not None
 
 
-def test_model_forward_long_two_chunks_runs_and_windows(_global_args):
+def test_model_forward_long_two_chunks_runs_and_windows():
     m = _tiny_model()
     inp = _model_inputs()
     split = 2

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.sgl_eval import run_sgl_eval as run_gsm8k_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -90,7 +90,7 @@ class TestDeepseekV32TC(CustomTestCase):
             num_examples=1400,
             num_threads=1400,
             max_tokens=2048,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)

@@ -99,7 +99,7 @@ class TestKimiK27CodeMXFP4AiterMlaEvalMI35x(unittest.TestCase):
         """Test Kimi-K2.7-Code-MXFP4 with sgl-eval GSM8K chat benchmark."""
         from types import SimpleNamespace
 
-        from sglang.test.sgl_eval import run_sgl_eval as run_gsm8k_eval
+        from sglang.test.sgl_eval_utils import run_sgl_eval as run_gsm8k_eval
 
         all_results = []
         summary = "### Kimi-K2.7-Code-MXFP4 aiter MLA (MI35x)\n\n"
@@ -136,7 +136,7 @@ class TestKimiK27CodeMXFP4AiterMlaEvalMI35x(unittest.TestCase):
                             num_examples=self.num_questions,
                             num_threads=self.num_questions,
                             max_tokens=2048,
-                            host="http://127.0.0.1",
+                            host="127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )
                         metrics = run_gsm8k_eval(args)

@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.sgl_eval import run_sgl_eval as run_gsm8k_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -197,7 +197,7 @@ class TestNixlTransferEngineAccuracy(NixlTransferEngineBase):
             num_examples=200,
             max_tokens=2048,
             num_threads=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_gsm8k_eval(args)

@@ -412,6 +412,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
     kv_status_msg_carries_reason = True
+    # ABORT handler defers the ack until the transfer worker drains.
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,
@@ -832,6 +834,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         interleave num_groups per token, peers select via head_group_idx.
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         decode_tp_size = decode_kv_args.decode_tp_size
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
         prefill_tp_size = self.attn_tp_size
@@ -842,39 +848,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
         bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
 
         if prefill_tp_size > decode_tp_size:
             # Multiple prefill ranks feed one decode rank: each prefill rank sends
             # all its src heads to a specific head-range in the decode rank.
-            src_replication = max(1, prefill_tp_size // total_kv_heads)
-            local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
+            _, num_heads_to_send, dst_head_start, _ = compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                decode_kv_args.decode_tp_rank,
+                total_kv_heads,
+            )
             num_groups = 1
-            num_heads_to_send = src_heads_per_rank
             head_group_idx = 0
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
             dst_head_offset = dst_head_start * bytes_per_head_slice
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
-            #
-            # Under GQA the decode side can have MORE attn-TP ranks than there are
-            # KV heads (decode_tp_size > total_kv_heads). In that case consecutive
-            # decode ranks replicate a shared KV head, so the src dlist must
-            # interleave one group per UNIQUE source head-slice, not one per decode
-            # rank -- otherwise it addresses past the registered KV region and
-            # prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
-            #
-            # Reuse the shared replicated-KV head map (integer division under
-            # replication, not modulo) that the mooncake backend already relies
-            # on, so the two backends stay in sync.
-            from sglang.srt.disaggregation.common.staging_buffer import (
-                compute_head_slice_params,
-            )
-
             src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
                 prefill_tp_size,
                 decode_tp_size,
@@ -882,9 +874,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.decode_tp_rank,
                 total_kv_heads,
             )
-            # num_groups (distinct head-groups packed in one prefill rank's src
-            # region) and head_group_idx (this peer's group) are NIXL-specific and
-            # not returned by the shared helper, so derive them here.
+            # One group per UNIQUE head-slice, not per decode rank: replicating
+            # ranks share one, and over-counting addresses past the registered
+            # KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
             dst_replication = max(1, decode_tp_size // total_kv_heads)
             num_groups = decode_tp_size // prefill_tp_size // dst_replication
             head_group_idx = src_head_start // dst_heads_per_rank
@@ -1026,6 +1018,59 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
+    def _build_transfer_dst_indices(
+        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+    ) -> List[int]:
+        """Map source entries to destination entries for this transfer.
+
+        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
+        All other layouts use explicit layer IDs, or positional pairing for non-PP.
+        """
+        use_pp_mla_offsets = (
+            self.pp_size > 1
+            and n_src != n_dst
+            and not self.kv_args.kv_layer_ids
+            and not peer_info.dst_kv_layer_ids
+            and self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.mla_compression_ratios
+        )
+        if not use_pp_mla_offsets:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            return [j for _, j in pairs]
+
+        start, end = self._mla_kv_entry_span_with_pp(n_src)
+        # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
+        # span is a matched-pp stage above 0, whose entries start at its own index 0.
+        if end > n_dst:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            return [j for _, j in pairs]
+
+        indices = list(range(start, end))
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+        if src_item_lens != dst_item_lens:
+            # Disagreeing cell sizes mean the peers did not build the same KV geometry;
+            # writing anyway would silently corrupt the peer's pool.
+            raise RuntimeError(
+                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
+                f"prefill over layers [{start}, {end}): prefill item_lens="
+                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+            )
+        return indices
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
@@ -1110,14 +1155,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
-            pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
-                allow_positional_fallback=self.pp_size == 1,
+            dst_indices = self._build_transfer_dst_indices(
+                peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
-            dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
@@ -1819,6 +1859,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
+            pack_capacity_bytes=rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
 
@@ -2612,6 +2653,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.BLOCK_SCALE,
+                StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
@@ -2647,17 +2690,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_layer_ids=dst_lids,
                     dst_item_lens=dst_lens,
                 )
-            elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
+            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+                # Compacted layer lists require equal TP and PP=1 on both peers.
                 if self.pp_size is not None and self.pp_size > 1:
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
+                        "PD disagg: PP>1 not supported for MiniMax state yet."
                     )
                 if self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
+                        "state yet."
                     )
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
@@ -3029,7 +3071,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        def bootstrap_thread_guarded():
+            try:
+                bootstrap_thread()
+            except Exception:
+                logger.exception(
+                    "prefill bootstrap_thread died on engine_rank=%s; requests to "
+                    "this rank will time out in KVPoll.Bootstrapping",
+                    self.kv_args.engine_rank,
+                )
+                raise
+
+        threading.Thread(target=bootstrap_thread_guarded).start()
 
 
 class NixlKVSender(CommonKVSender):
