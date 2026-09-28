@@ -125,8 +125,9 @@ Add `--image-path first_frame.png` to condition the video on an image. Frame
 counts align to `8n+1`; width and height must be divisible by 32. The 4-step
 preview is a different checkpoint and is not supported by this pipeline.
 
-For offline weights, pass the directory containing `config.yaml` and
-`checkpoints/SANA_Video_2.0_5B_720p.pth` as `--model-path`, and set
+For offline weights, keep the model directory name, such as
+`/path/to/SANA-Video_2.0_5B_720p`, and pass it as `--model-path`. That directory
+must contain `config.yaml` and `checkpoints/SANA_Video_2.0_5B_720p.pth`. Set
 `--component-paths.text_encoder /path/to/gemma-2-2b-it` and
 `--component-paths.vae /path/to/ltx-2.3-vae`. The latter directory may contain
 the `vae` subdirectory or the VAE files directly. Without these overrides,
