@@ -13,30 +13,19 @@
 # ==============================================================================
 """`--enable-page-major-kv-layout` full-attention backend allowlist.
 
-Two-way gate (see `_handle_page_major_kv_layout`), because the unified pool
-exposes per-layer views and nothing else:
-  * unified-memory MLA models allow the whole wired
-    paged MLA family -- `fa3`, `flashinfer`'s MLA backend, `trtllm_mla` with
-    its `cutedsl_mla` / `tokenspeed_mla` subclasses, and `flashmla` (ps=64
-    snap);
-  * unified-memory MHA/SWA models allow `fa3` /
-    `fa4` / `flashinfer` / `trtllm_mha` alongside Triton;
-  * plain `--enable-page-major-kv-layout` without the unified pool keeps the
-    envelope-strided 4-D views only the stride-aware Triton kernels read.
+`handle_page_major_kv_layout` gates two ways, because the per-layer views the
+unified pool exposes are all the allowlisted backends can read: an MLA arm, an
+MHA/SWA arm, and no page-major arm at all without the unified pool. `fa3` is
+the resolved default on pre-Blackwell hosts, so its absence from an arm makes
+`--enable-unified-memory` fail to boot under its own default configuration.
 
-The same handler also screens the pool itself: asymmetric K/V rows are not
-admitted yet, so an asymmetric-K/V model (MiMoV2: head_dim 192 != v_head_dim
-128) cannot run `--enable-unified-memory` at all and is rejected on EVERY
-backend, Triton included. MLA models are exempt -- their sub-pool keeps
-one latent row per layer, and several MLA configs (Kimi-Linear: head_dim 72,
-v_head_dim 128) report asymmetric dims while running the unified pool today.
-
-Pinned here so no arm silently widens to an unwired backend (`cutlass_mla`,
-`aiter`) and no arm silently narrows: `fa3` is the resolved default on
-pre-Blackwell hosts, so its absence from an arm makes `--enable-unified-memory`
-fail to boot under its own default configuration.
-
-    python -m pytest test/registered/unit/server_args/test_page_major_backend_allowlist.py -v
+The same handler screens the pool itself: asymmetric K/V rows are not admitted
+yet (the token-major views can hold them, but the backends' read and write
+paths are not audited for them), so an asymmetric-K/V model (MiMoV2: head_dim
+192 != v_head_dim 128) is rejected on EVERY backend, Triton included. MLA
+models are exempt -- their sub-pool keeps one latent row per layer, and real
+MLA configs (Kimi-Linear: head_dim 72, v_head_dim 128) report asymmetric dims
+while running the unified pool today.
 """
 
 import unittest
@@ -119,8 +108,8 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         the MLA nor the MHA arm can narrow away."""
         for use_mla in (True, False):
             self.assertTrue(_accepts("triton", use_mla=use_mla))
-        # Asymmetric K/V rows are not admitted yet; that is a property of the
-        # model, not of the backend, so the screen rejects even Triton.
+        # The asymmetric-K/V screen is a property of the model, not of the
+        # backend, so it rejects even Triton.
         self.assertFalse(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
 
     def test_per_layer_view_mla_backends_allowed_under_unified_mla(self):
@@ -145,8 +134,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             )
 
     def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
-        """head_dim != v_head_dim (MiMoV2): not admitted under the unified pool
-        yet. The rejection is the POOL's, not a backend's, so it must fire on
+        """The rejection is the POOL's, not a backend's, so it must fire on
         every backend -- Triton included."""
         for backend in ("triton",) + self.PER_LAYER_VIEW_MHA_BACKENDS:
             self.assertFalse(

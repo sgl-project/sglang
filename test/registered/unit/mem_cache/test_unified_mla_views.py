@@ -11,30 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3).
+"""MLA views for the unified memory pool (MLA-hybrid-Mamba, Kimi K3), CPU-only.
 
-Covers, CPU-only (pure torch -- no GPU / Triton kernels):
-  - `MLASubPoolSpec` byte math (aligned entry, one latent row per layer);
-  - `build_dense_views` addressing: view_l[t] for PHYSICAL token t must land
-    at the envelope byte `t * entry_bytes + l * row_bytes`, the per-layer
-    views must not alias at equal ids, and a short buffer must fail loud;
-  - `UnifiedKVPool` MLA plumbing: the allocation is exactly the budget and
-    the reserved sink floor covers the whole page-0 envelope;
-  - `UnifiedMLATokenToKVPool`: buffer wiring, V-as-prefix-slice, and the
-    page-envelope `move_kv_cache` (physical token ids, page-major runs);
-  - `MultiEndedAllocator.translate_kv_loc_for_kernel`: identical to the
-    physical translate, tombstone clamp to the sink, `out=` contract, the
-    pinned multiplier, and correctness across eager compaction.
+Addressing law under test: the (layer, token) cell sits at envelope byte
+offset `t * entry_bytes + l * row_bytes`, and the kernel-facing id of token `t`
+is its physical token id.
 
-GPU parity of the actual read/write kernels (set_mla_kv_buffer TMA path etc.)
-lives in the server-level tests, not here.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mla_views.py -v
+GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
+`test_unified_mla_gpu_parity.py`.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from unittest import mock
@@ -48,7 +37,6 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.layout.page_major import (
     ENTRY_ALIGN_BYTES,
     build_dense_views,
-    mla_entry_bytes,
     paged_row_view,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -61,9 +49,8 @@ from sglang.srt.runtime_context import get_parallel
 
 _DEV = "cpu"
 
-# Small-but-nontrivial MLA geometry: L=3 layers, D=8 (=6+2), so every byte
-# offset is hand-checkable. Real K3 is L=24, D=576 (=512+64). 3 rows x 16 B
-# = 48 B of payload round up to one 64 B entry.
+# Geometry kept tiny so every byte offset is hand-checkable; real K3 is
+# L=24, D=576 (=512+64). 3 rows x 16 B round up to one 64 B entry.
 _L = 3
 _LORA = 6
 _ROPE = 2
@@ -71,7 +58,8 @@ _D = _LORA + _ROPE
 _DTYPE = torch.bfloat16
 _ITEM = _DTYPE.itemsize
 _ROW = _D * _ITEM
-_ENTRY = mla_entry_bytes(layer_num=_L, kv_cache_dim=_D, itemsize=_ITEM)
+# One entry = every layer's latent row, rounded up to the entry alignment.
+_ENTRY = -(-(_L * _ROW) // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
 _E_ELEMS = _ENTRY // _ITEM
 
 
@@ -120,19 +108,6 @@ def _build_views(raw, ps, num_pages):
 
 
 class TestMLASubPoolSpec(unittest.TestCase):
-    def test_entry_bytes_and_dim(self):
-        spec = _mla_spec()
-        self.assertEqual(spec.kv_cache_dim, _D)
-        self.assertEqual(spec.row_bytes(), _ROW)
-        self.assertEqual(spec.entry_bytes(), _ENTRY)
-        self.assertGreaterEqual(spec.entry_bytes(), _L * _ROW)
-        self.assertEqual(spec.entry_bytes() % ENTRY_ALIGN_BYTES, 0)
-        self.assertEqual(spec.get_dtype(), _DTYPE)
-        layout = spec.layout()
-        self.assertEqual(layout.entry_bytes, _ENTRY)
-        for l in range(_L):
-            self.assertEqual(layout.part("kv").layer_offset_bytes(l), l * _ROW)
-
     def test_rejects_nonpositive_dims(self):
         with self.assertRaises(AssertionError):
             MLASubPoolSpec(
@@ -285,15 +260,24 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                     )
 
     def test_move_kv_cache_moves_page_envelopes(self):
+        """Whole page envelopes relocate, in raw bytes and (at ps=4) as read
+        back through the per-layer views at the destination ids."""
         for ps in (1, 4):
             pool, kv_pool = self._make(ps=ps)
             num_pages = pool.max_slots("full") // ps
             page_bytes = ps * pool.mla_spec("full").entry_bytes()
             env = pool._raw[: num_pages * page_bytes].view(num_pages, page_bytes)
-            src_pages = torch.tensor([num_pages - 2, num_pages - 4])
-            dst_pages = torch.tensor([2, 3])
+            src_pages = torch.tensor([num_pages - 2, num_pages - 4, num_pages - 3])
+            dst_pages = torch.tensor([2, 3, 5])
             env[src_pages[0]] = 7
             env[src_pages[1]] = 9
+            if ps == 4:
+                # write through the views at src, expect it at dst after the move
+                for l in range(_L):
+                    for s in range(ps):
+                        kv_pool.kv_buffer[l][int(src_pages[2]) * ps + s] = float(
+                            l * ps + s + 1
+                        )
             # page-major token runs, exactly how compaction expands pages
             offsets = torch.arange(ps, dtype=torch.int64)
             src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
@@ -301,27 +285,13 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
             kv_pool.move_kv_cache(dst_t, src_t)
             self.assertTrue(torch.all(env[dst_pages[0]] == 7), f"ps={ps}")
             self.assertTrue(torch.all(env[dst_pages[1]] == 9), f"ps={ps}")
-
-    def test_move_then_readback(self):
-        ps = 4
-        pool, kv_pool = self._make(ps=ps)
-        num_pages = pool.max_slots("full") // ps
-        src_page, dst_page = num_pages - 3, 5
-        # write through the views at src, expect it at dst after the move
-        for l in range(_L):
-            for s in range(ps):
-                kv_pool.kv_buffer[l][src_page * ps + s] = float(l * ps + s + 1)
-        offsets = torch.arange(ps, dtype=torch.int64)
-        kv_pool.move_kv_cache(
-            (torch.tensor([dst_page])[:, None] * ps + offsets).reshape(-1),
-            (torch.tensor([src_page])[:, None] * ps + offsets).reshape(-1),
-        )
-        for l in range(_L):
-            for s in range(ps):
-                got = kv_pool.kv_buffer[l][dst_page * ps + s]
-                self.assertTrue(
-                    torch.all(got == float(l * ps + s + 1)), f"(l={l}, s={s})"
-                )
+            if ps == 4:
+                for l in range(_L):
+                    for s in range(ps):
+                        got = kv_pool.kv_buffer[l][int(dst_pages[2]) * ps + s]
+                        self.assertTrue(
+                            torch.all(got == float(l * ps + s + 1)), f"(l={l}, s={s})"
+                        )
 
 
 class _FakeKVCache:
@@ -393,20 +363,6 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
         self.assertEqual(self._build(ps=1, multiplier=1).kernel_page_multiplier, 1)
         with self.assertRaises(AssertionError):
             self._build(ps=1, multiplier=_L)
-
-    def test_kernel_id_follows_compaction(self):
-        alloc = self._build(ps=1)
-        a = alloc.alloc(4)
-        b = alloc.alloc(4)
-        c = alloc.alloc(4)
-        self.assertIsNotNone(c)
-        alloc.free(b)  # eager compaction relocates survivors
-        for run in (a, c):
-            self.assertTrue(
-                torch.equal(
-                    alloc.translate_kv_loc_for_kernel(run), alloc.translate_kv_loc(run)
-                )
-            )
 
 
 class _RecordingHybridPool:

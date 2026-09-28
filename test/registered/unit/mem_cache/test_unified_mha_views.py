@@ -11,31 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MHA K/V views for the unified memory pool (token-major dense views).
-
-Covers, CPU-only (pure torch -- no GPU / Triton kernels):
-  - `MHASubPoolSpec.layout()`: K and V of every layer sit at fixed offsets
-    inside one slot entry, K and V rows may differ in width, alignment is
-    enforced at construction;
-  - `build_dense_views` addressing: view_l[t] for PHYSICAL token t must land
-    exactly at the byte the envelope formula assigns to (page, slot, layer,
-    K|V) -- cross-checked against an independent 4-D (page, slot) description;
-  - K and V of one token share ONE id (the per-layer origin shift does the
-    disambiguation), with no aliasing across the 2L views;
-  - a too-short buffer and misaligned rows fail loud at construction.
+"""MHA K/V views for the unified memory pool (token-major dense views), CPU-only.
 
 Addressing law under test:
 
     byte(t, l, K) = t * entry_bytes + l * (k_row + v_row)
     byte(t, l, V) = byte(t, l, K) + k_row
     t = page * page_size + slot      (the physical token id IS the kernel id)
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mha_views.py -v
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -46,7 +33,6 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     ENTRY_ALIGN_BYTES,
     build_dense_views,
-    mha_entry_bytes,
     paged_view,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -57,12 +43,10 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
-# import), not on the tensors it is handed, so cases driving it must build on
-# the platform's device. The rest of this file is byte arithmetic, so CPU.
+# import), not on the tensors it is handed, so cases driving it build there.
 _STORE_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Small-but-nontrivial MHA geometry: L=2 layers, H=2 heads, D=4, so every byte
-# offset is hand-checkable. One entry = 2 layers x (K row + V row) = 64 B.
+# Geometry kept tiny so every byte offset is hand-checkable.
 _L = 2
 _H = 2
 _D = 4
@@ -71,9 +55,16 @@ _ITEM = _DTYPE.itemsize
 _HAS_FP8 = hasattr(torch, "float8_e4m3fn")
 _K_ROW = _H * _D * _ITEM
 _V_ROW = _H * _D * _ITEM
-_ENTRY = mha_entry_bytes(
-    layer_num=_L, head_num=_H, head_dim=_D, v_head_dim=_D, itemsize=_ITEM
-)
+
+
+def _entry_bytes(head_dim=_D, v_head_dim=_D):
+    """One slot's K and V rows across every layer, rounded up to the entry
+    alignment -- derived here, not read back from the spec under test."""
+    rows = _L * _H * (head_dim + v_head_dim) * _ITEM
+    return -(-rows // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
+
+
+_ENTRY = _entry_bytes()
 assert _ENTRY == _L * (_K_ROW + _V_ROW)  # no alignment pad at this geometry
 
 
@@ -112,13 +103,7 @@ def _reference_paged_views(
     against a second, independently derived description of the same bytes."""
     k_row = _H * head_dim * _ITEM
     v_row = _H * v_head_dim * _ITEM
-    entry = mha_entry_bytes(
-        layer_num=_L,
-        head_num=_H,
-        head_dim=head_dim,
-        v_head_dim=v_head_dim,
-        itemsize=_ITEM,
-    )
+    entry = _entry_bytes(head_dim, v_head_dim)
     as_dtype_view = raw.view(_DTYPE)
     k_views, v_views = [], []
     for layer in range(_L):
@@ -153,14 +138,8 @@ class TestMHASpecSurface(unittest.TestCase):
                 layout.part("v").layer_offset_bytes(l), l * (_K_ROW + _V_ROW) + _K_ROW
             )
 
-    def test_entry_bytes_matches_layout_helper_and_is_aligned(self):
-        spec = _mha_spec()
-        self.assertEqual(
-            spec.entry_bytes(),
-            mha_entry_bytes(
-                layer_num=_L, head_num=_H, head_dim=_D, v_head_dim=_D, itemsize=_ITEM
-            ),
-        )
+    def test_entry_bytes_matches_the_closed_form_and_is_aligned(self):
+        self.assertEqual(_mha_spec().entry_bytes(), _ENTRY)
         # 48 B of rows round up to one 64 B entry; the parts still fit inside.
         padded = MHASubPoolSpec(
             name="full",
@@ -273,13 +252,7 @@ class TestMHAViews(unittest.TestCase):
     def test_asymmetric_views_address_their_own_rows(self):
         head_dim, v_head_dim = 8, 4
         k_row, v_row = _H * head_dim * _ITEM, _H * v_head_dim * _ITEM
-        entry = mha_entry_bytes(
-            layer_num=_L,
-            head_num=_H,
-            head_dim=head_dim,
-            v_head_dim=v_head_dim,
-            itemsize=_ITEM,
-        )
+        entry = _entry_bytes(head_dim, v_head_dim)
         ps, num_pages = 4, 3
         raw = _make_raw(ps, num_pages, entry=entry)
         dk, dv = _build_views(raw, ps, num_pages, head_dim, v_head_dim)

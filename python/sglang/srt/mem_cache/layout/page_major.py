@@ -154,20 +154,6 @@ def build_dense_views(
     return views
 
 
-def mha_entry_bytes(
-    *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
-) -> int:
-    """Bytes occupied by one slot across all layers (K and V), aligned."""
-    k_row_bytes = head_num * head_dim * itemsize
-    v_row_bytes = head_num * v_head_dim * itemsize
-    return align_entry_bytes(layer_num * (k_row_bytes + v_row_bytes))
-
-
-def mla_entry_bytes(*, layer_num: int, kv_cache_dim: int, itemsize: int) -> int:
-    """Bytes occupied by one MLA slot across all layers (latent rows), aligned."""
-    return align_entry_bytes(layer_num * kv_cache_dim * itemsize)
-
-
 def mamba_entry_bytes(
     *,
     layer_num: int,

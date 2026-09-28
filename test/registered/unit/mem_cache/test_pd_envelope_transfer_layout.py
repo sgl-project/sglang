@@ -18,18 +18,25 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
+    ENTRY_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     build_dense_views,
     build_page_major_mamba_views,
     mamba_entry_bytes,
-    mha_entry_bytes,
-    mla_entry_bytes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _entry_bytes(row_bytes_per_layer, layer_num):
+    """One slot's rows across every layer, rounded up to the entry alignment --
+    derived here, not read back from the layout under test."""
+    return (
+        -(-(row_bytes_per_layer * layer_num) // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
+    )
 
 
 class TestMLAEnvelopeTransferAddressing(CustomTestCase):
@@ -40,9 +47,7 @@ class TestMLAEnvelopeTransferAddressing(CustomTestCase):
         layer_num, page_size, kv_dim, num_pages = 3, 4, 8, 6
         store_dtype = torch.bfloat16
         row_bytes = kv_dim * store_dtype.itemsize
-        entry_bytes = mla_entry_bytes(
-            layer_num=layer_num, kv_cache_dim=kv_dim, itemsize=store_dtype.itemsize
-        )
+        entry_bytes = _entry_bytes(row_bytes, layer_num)
         page_bytes = page_size * entry_bytes
         layout = DenseEntryLayout(
             entry_bytes=entry_bytes,
@@ -93,15 +98,9 @@ class TestMHAEnvelopeTransferAddressing(CustomTestCase):
     def test_page_envelope_matches_per_layer_views(self):
         layer_num, page_size, head_num, head_dim, num_pages = 3, 4, 2, 8, 6
         store_dtype = torch.bfloat16
-        entry_bytes = mha_entry_bytes(
-            layer_num=layer_num,
-            head_num=head_num,
-            head_dim=head_dim,
-            v_head_dim=head_dim,
-            itemsize=store_dtype.itemsize,
-        )
-        page_bytes = page_size * entry_bytes
         row_bytes = head_num * head_dim * store_dtype.itemsize
+        entry_bytes = _entry_bytes(2 * row_bytes, layer_num)
+        page_bytes = page_size * entry_bytes
         self.assertEqual(page_bytes, page_size * 2 * layer_num * row_bytes)
 
         layout = DenseEntryLayout(
@@ -166,15 +165,9 @@ class TestMHAEnvelopeTransferAddressing(CustomTestCase):
         makes a physical page id a valid PD transfer index after compaction."""
         layer_num, page_size, head_num, head_dim, num_pages = 2, 2, 1, 8, 4
         store_dtype = torch.bfloat16
-        entry_bytes = mha_entry_bytes(
-            layer_num=layer_num,
-            head_num=head_num,
-            head_dim=head_dim,
-            v_head_dim=head_dim,
-            itemsize=store_dtype.itemsize,
-        )
-        page_bytes = page_size * entry_bytes
         row_bytes = head_num * head_dim * store_dtype.itemsize
+        entry_bytes = _entry_bytes(2 * row_bytes, layer_num)
+        page_bytes = page_size * entry_bytes
         layout = DenseEntryLayout(
             entry_bytes=entry_bytes,
             parts=(
