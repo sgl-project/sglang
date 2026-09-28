@@ -11,6 +11,7 @@ length finish. Drives the real `Req.update_finish_state`; pure CPU."""
 
 import unittest
 from array import array
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -208,15 +209,7 @@ class TestSpecOvershootCacheLen(CustomTestCase):
             self.assertEqual(req.owned_kv_len(), 5)
 
     def test_abort_stopless_keeps_committed_len(self):
-        # A running request aborted via set_finish_with_abort has no
-        # finished_len (update_finish_state only clears to_finish). The origin
-        # is collapsed to [0] so the prefill is cheap, but the committed prefix
-        # is unrelated to the visible tokens at release time. Preserve
-        # kv_committed_len (HEAD behavior) instead of clamping to the visible
-        # output; clamping yields effective=3 vs allocated=100 and trips the
-        # overallocated-KV assert in _release_overallocated_kv_indices.
-        from unittest import mock
-
+        """An abort keeps kv_committed_len; clamping trips the overalloc assert."""
         req = _make_req([101, 102], max_new_tokens=10, vocab_size=10_000)
         req.kv.kv_committed_len = 100
         req.kv.kv_allocated_len = 100
